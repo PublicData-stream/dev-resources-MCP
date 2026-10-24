@@ -1,0 +1,172 @@
+//! Startup-only schema registration. No dynamically loaded code or remote schemas.
+use crate::{ServerError, config::SourceOffer};
+use devres_domain::Result;
+use futures::{FutureExt, future::BoxFuture};
+use rmcp::model::Tool;
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, future::Future, sync::Arc};
+use tokio_util::sync::CancellationToken;
+
+type Invoke = dyn Fn(Value, CancellationToken) -> BoxFuture<'static, Result<Value>> + Send + Sync;
+type ResourceRead =
+    dyn Fn(String, CancellationToken) -> BoxFuture<'static, Result<Value>> + Send + Sync;
+pub(crate) struct RegisteredTool {
+    pub definition: Tool,
+    pub validator: jsonschema::Validator,
+    pub invoke: Arc<Invoke>,
+}
+#[derive(Default)]
+pub struct ToolRegistry {
+    pub(crate) tools: BTreeMap<String, RegisteredTool>,
+    pub(crate) resource_reader: Option<Arc<ResourceRead>>,
+}
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Register a trusted, bounded, read-only tool before listeners bind.
+    pub fn register<F, Fut>(
+        &mut self,
+        descriptor: Value,
+        handler: F,
+    ) -> std::result::Result<(), ServerError>
+    where
+        F: Fn(Value, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        ensure_serialized_limit(&descriptor, 64 * 1024)?;
+        let tool: Tool = serde_json::from_value(descriptor.clone())?;
+        let name = tool.name.as_ref();
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+            || self.tools.len() >= 64
+            || self.tools.contains_key(name)
+        {
+            return Err("invalid, duplicate, or excessive tool registration".into());
+        }
+        let schema = descriptor
+            .get("inputSchema")
+            .ok_or("missing input schema")?;
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err("tool schema must describe an object".into());
+        }
+        reject_external_refs(schema)?;
+        let validator = jsonschema::validator_for(schema).map_err(|_| "invalid tool schema")?;
+        if descriptor.pointer("/annotations/readOnlyHint") != Some(&Value::Bool(true)) {
+            return Err("tools must declare readOnlyHint".into());
+        }
+        self.tools.insert(
+            name.to_owned(),
+            RegisteredTool {
+                definition: tool,
+                validator,
+                invoke: Arc::new(move |value, cancel| handler(value, cancel).boxed()),
+            },
+        );
+        Ok(())
+    }
+    pub fn with_resource_reader<F, Fut>(&mut self, reader: F)
+    where
+        F: Fn(String, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        self.resource_reader = Some(Arc::new(move |uri, cancel| reader(uri, cancel).boxed()));
+    }
+    pub fn register_research(
+        &mut self,
+        research: Arc<devres_adapters::Research>,
+    ) -> std::result::Result<(), ServerError> {
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            let name = descriptor
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("missing tool name")?
+                .to_owned();
+            let research = research.clone();
+            self.register(descriptor, move |value, _cancel| {
+                let research = research.clone();
+                let name = name.clone();
+                async move { research.call(&name, value).await }
+            })?;
+        }
+        self.with_resource_reader(move |uri, _cancel| {
+            let research = research.clone();
+            async move { research.read_resource(&uri).await }
+        });
+        Ok(())
+    }
+}
+fn reject_external_refs(value: &Value) -> std::result::Result<(), ServerError> {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "$ref" && value.as_str().is_none_or(|v| !v.starts_with('#')) {
+                    return Err("external schema references are forbidden".into());
+                }
+                reject_external_refs(value)?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                reject_external_refs(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+/// Count bytes without allocating a second copy of caller-controlled result bodies.
+pub(crate) fn ensure_serialized_limit(
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> std::result::Result<(), ServerError> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("serialized result exceeds limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counter(limit), value)?;
+    Ok(())
+}
+pub fn server_info(source: &SourceOffer) -> Value {
+    json!({"product":"dev-resources-MCP","version":env!("CARGO_PKG_VERSION"),"license":SourceOffer::LICENSE,"licenseUrl":SourceOffer::LICENSE_URL,"sourceUrl":source.url(),"transports":["streamable-http","webtransport-v1"],"protocolVersions":["2026-07-28","2025-11-25"]})
+}
+pub fn server_info_registry(source: SourceOffer) -> std::result::Result<ToolRegistry, ServerError> {
+    let mut registry = ToolRegistry::new();
+    registry.register(json!({"name":"server_info","description":"Read service identity, license, corresponding source, and supported protocols.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}), move |_, _| {
+        let source = source.clone(); async move { Ok(server_info(&source)) }
+    })?;
+    Ok(registry)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn registration_rejects_duplicates_and_external_refs() {
+        let mut registry =
+            server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
+        let descriptor = serde_json::to_value(&registry.tools["server_info"].definition).unwrap();
+        assert!(
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .is_err()
+        );
+        let descriptor = json!({"name":"bad","inputSchema":{"type":"object","properties":{"input":{"$ref":"https://evil.test/schema"}}},"annotations":{"readOnlyHint":true}});
+        assert!(
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .is_err()
+        );
+    }
+}

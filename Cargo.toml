@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/domain", "crates/application", "crates/adapters", "apps/server"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "AGPL-3.0-only"
+repository = "https://github.com/PublicData-stream/dev-resources-MCP"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"

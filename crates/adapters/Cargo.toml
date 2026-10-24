@@ -1,0 +1,34 @@
+[package]
+name = "devres-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+[lints]
+workspace = true
+[dependencies]
+devres-domain = { version = "0.0.0", path = "../domain" }
+devres-application = { version = "0.0.0", path = "../application" }
+async-trait = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+futures = "0.3"
+sha2 = "0.11"
+hex = "0.4"
+fs2 = "0.4"
+httpdate = "1"
+tokio = { version = "1", features = ["process", "fs", "time", "sync", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "json"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
+tar = "0.4"
+flate2 = "1"
+rustsec = { version = "=0.33.0", default-features = false }
+semver = "1"
+toml = "0.9"
+url = "2"
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "net"] }
+axum = "0.8"
