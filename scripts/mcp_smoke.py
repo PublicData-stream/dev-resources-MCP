@@ -90,7 +90,10 @@ class Client:
     def tool(self, name, arguments):
         result = self.call("tools/call", {"name": name, "arguments": arguments})
         if result.get("isError"):
-            raise AssertionError(f"tool {name} failed: {result.get('structuredContent', {}).get('code')}")
+            error = result.get("structuredContent", {})
+            # Server contract guarantees sanitized errors. Never log arguments,
+            # entire response bodies, submitted lockfiles, or dependency graphs.
+            raise AssertionError(f"tool {name} failed: {error.get('code')}: {error.get('message')}")
         return result.get("structuredContent", result)
 
 

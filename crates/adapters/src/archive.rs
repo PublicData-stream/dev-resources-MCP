@@ -102,6 +102,7 @@ pub fn inspect(
         root,
         selected,
         Instant::now() + Duration::from_secs(15),
+        None,
     )
 }
 
@@ -111,6 +112,7 @@ fn inspect_until(
     root: &str,
     selected: Option<&str>,
     deadline: Instant,
+    git_revision: Option<&str>,
 ) -> Result<Inspection> {
     if bytes.len() > MAX_COMPRESSED {
         return Err(Error::capacity("Compressed archive exceeds 32 MiB."));
@@ -150,6 +152,32 @@ fn inspect_until(
             let mut entry =
                 entry.map_err(|_| Error::integrity("Invalid or oversized archive member."))?;
             let kind = entry.header().entry_type();
+            if kind.is_pax_global_extensions() {
+                // GitHub's immutable Git snapshots begin with a PAX commit
+                // comment. Admit only that exact non-path-setting metadata;
+                // published crate archives retain the stricter default policy.
+                let revision = git_revision.ok_or_else(|| {
+                    Error::integrity("Global archive metadata is unsupported for published crates.")
+                })?;
+                if index != 0
+                    || entry.path_bytes().as_ref() != b"pax_global_header"
+                    || entry.size() != 52
+                {
+                    return Err(Error::integrity(
+                        "Unsupported Git snapshot global metadata.",
+                    ));
+                }
+                let mut comment = [0u8; 52];
+                entry
+                    .read_exact(&mut comment)
+                    .map_err(|_| Error::integrity("Invalid Git snapshot commit metadata."))?;
+                if comment.as_slice() != format!("52 comment={revision}\n").as_bytes() {
+                    return Err(Error::integrity(
+                        "Git snapshot comment does not match its captured revision.",
+                    ));
+                }
+                continue;
+            }
             if !kind.is_file() && !kind.is_dir() {
                 return Err(Error::integrity(
                     "Archive links, devices, and special members are unsupported.",
@@ -226,7 +254,16 @@ pub fn advisory_files(
     root: &str,
     deadline: Instant,
 ) -> Result<Vec<(String, Vec<u8>)>> {
-    inspect_until(bytes, checksum, root, None, deadline)?;
+    let revision = root
+        .strip_prefix("advisory-db-")
+        .filter(|value| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|v| v.is_ascii_hexdigit() && !v.is_ascii_uppercase())
+        })
+        .ok_or_else(|| Error::integrity("Invalid immutable RustSec archive root."))?;
+    inspect_until(bytes, checksum, root, None, deadline, Some(revision))?;
     let decoder = MultiGzDecoder::new(bytes);
     let budget = BudgetReader {
         inner: decoder,
@@ -375,5 +412,66 @@ mod tests {
         gzip.write_all(&tar.into_inner().unwrap()).unwrap();
         let bytes = gzip.finish().unwrap();
         assert!(inspect(&bytes, &sha256(&bytes), "example-1.0.0", None).is_err());
+    }
+
+    #[test]
+    fn git_commit_metadata_exception_is_narrow_and_never_applies_to_crates() {
+        const ROOT: &str = "advisory-db-84d943a6deeb8cc6c6f632531aaf4f1c62275239";
+        let fixture = include_bytes!("../tests/fixtures/rustsec/git-snapshot-minimal.tar.gz");
+        // Generic published-crate inspection must still reject global metadata.
+        assert!(inspect(fixture, &sha256(fixture), ROOT, None).is_err());
+        let mut raw = Vec::new();
+        MultiGzDecoder::new(&fixture[..])
+            .read_to_end(&mut raw)
+            .unwrap();
+        let validate = |bytes: Vec<u8>| {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&bytes).unwrap();
+            let compressed = encoder.finish().unwrap();
+            advisory_files(
+                &compressed,
+                &sha256(&compressed),
+                ROOT,
+                Instant::now() + Duration::from_secs(15),
+            )
+        };
+        assert_eq!(validate(raw.clone()).unwrap().len(), 1);
+
+        let mut wrong_comment = raw.clone();
+        wrong_comment[512 + 11] = b'f';
+        assert!(validate(wrong_comment).is_err());
+
+        let mut path_override = raw.clone();
+        path_override[512..564].fill(b'x');
+        path_override[512..520].copy_from_slice(b"52 path=");
+        path_override[520..526].copy_from_slice(b"../../");
+        path_override[563] = b'\n';
+        assert!(validate(path_override).is_err());
+
+        let mut duplicate = raw[..1024].to_vec();
+        duplicate.extend_from_slice(&raw);
+        assert!(validate(duplicate).is_err());
+
+        let mut late = raw[1024..1536].to_vec();
+        late.extend_from_slice(&raw[..1024]);
+        late.extend_from_slice(&raw[1536..]);
+        assert!(validate(late).is_err());
+
+        // A valid Git comment never permits a subsequent link or unsafe path.
+        for link in [true, false] {
+            let mut hostile = raw.clone();
+            let header = &mut hostile[1536..2048];
+            if link {
+                header[156] = b'2';
+            } else {
+                header[..100].fill(0);
+                let name = format!("{ROOT}/../outside");
+                header[..name.len()].copy_from_slice(name.as_bytes());
+            }
+            header[148..156].fill(b' ');
+            let checksum: usize = header.iter().map(|v| *v as usize).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            assert!(validate(hostile).is_err());
+        }
     }
 }

@@ -650,6 +650,19 @@ mod tests {
         );
     }
     #[test]
+    fn curated_official_git_snapshot_preserves_commit_metadata_and_advisory_identity() {
+        let bytes = include_bytes!("../tests/fixtures/rustsec/git-snapshot-minimal.tar.gz");
+        let root = "advisory-db-84d943a6deeb8cc6c6f632531aaf4f1c62275239";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let files =
+            archive::advisory_files(bytes, &archive::sha256(bytes), root, deadline).unwrap();
+        let advisories = parse_files(files, deadline).unwrap();
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].metadata.id.to_string(), "RUSTSEC-2022-0039");
+        assert_eq!(advisories[0].metadata.package.as_str(), "odbc");
+        assert_eq!(summary(&advisories[0])["classification"], "informational");
+    }
+    #[test]
     fn audits_only_registry_entries_and_never_persists_input() {
         let text = "version = 4\n[[package]]\nname = \"example\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n[[package]]\nname = \"private-project\"\nversion = \"1.0.0\"\n";
         let lockfile = parse_lockfile(text).unwrap();
