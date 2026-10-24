@@ -14,6 +14,8 @@ pub(crate) struct FixtureStore {
     pub versions: Vec<VersionRecord>,
     pub contents: Vec<ContentRecord>,
     pub captures: HashMap<String, StoredCapture>,
+    pub artifacts: Mutex<HashMap<String, Artifact>>,
+    pub artifact_reads: AtomicU64,
 }
 fn unused<T>() -> Result<T> {
     Err(Error::unavailable("Unused fixture operation."))
@@ -69,8 +71,14 @@ impl CrateCorpusStore for FixtureStore {
     async fn save_artifact(&self, _: &Artifact, _: bool) -> Result<()> {
         unused()
     }
-    async fn artifact(&self, _: &str) -> Result<Option<Artifact>> {
-        unused()
+    async fn artifact(&self, id: &str) -> Result<Option<Artifact>> {
+        self.artifact_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .artifacts
+            .lock()
+            .map_err(|_| unavailable())?
+            .get(id)
+            .cloned())
     }
     async fn latest_artifact(&self, _: &str) -> Result<Option<Artifact>> {
         unused()
@@ -144,7 +152,7 @@ impl CrateCorpusStore for FixtureStore {
             return Ok(Vec::new());
         }
         Ok(vec![
-            json!({"version":version,"kind":kind,"target":if kind=="json"{target.unwrap_or("x86_64-unknown-linux-gnu")}else{""},"version_asserted":true,"target_asserted":true,"unresolved_references":*self.unresolved_references.lock().map_err(|_|unavailable())?,"complete_for_eligible_text":true,"skipped_binary":*self.skipped_binary.lock().map_err(|_|unavailable())?,"skipped_oversized":0}),
+            json!({"version":version,"kind":kind,"source_capture":if kind=="json"{if version=="1.9.0"{"8".repeat(64)}else{"3".repeat(64)}}else if version=="1.9.0"{"f".repeat(64)}else{"b".repeat(64)},"target":if kind=="json"{target.unwrap_or("x86_64-unknown-linux-gnu")}else{""},"version_asserted":true,"target_asserted":true,"unresolved_references":*self.unresolved_references.lock().map_err(|_|unavailable())?,"complete_for_eligible_text":true,"skipped_binary":*self.skipped_binary.lock().map_err(|_|unavailable())?,"skipped_oversized":0}),
         ])
     }
     async fn put_enrichment(&self, _: &str, _: &str, _: &[(String, Value)]) -> Result<()> {
@@ -247,6 +255,57 @@ pub(crate) fn fixture() -> Arc<FixtureStore> {
             body: b"transport source fixture".to_vec().into(),
         },
     )]);
+    let raw = |id: &str, key: &str, url: &str, media_type: &str| {
+        let body_hash = hash(format!("Synthetic raw fixture {key}").as_bytes());
+        Artifact {
+            capture: Capture {
+                id: id.repeat(64),
+                key: key.into(),
+                source_url: url.into(),
+                body_hash,
+                media_type: media_type.into(),
+                retrieved_at: now,
+                validated_at: now,
+            },
+            bytes: 128,
+            provenance: json!({"fixture":true}),
+        }
+    };
+    let artifacts = [
+        raw(
+            "3",
+            "cargo:docs-json:example:1.10.0:x86_64-unknown-linux-gnu",
+            "https://docs.rs/crate/example/1.10.0/x86_64-unknown-linux-gnu/json/61.gz",
+            "application/gzip",
+        ),
+        raw(
+            "8",
+            "cargo:docs-json:example:1.9.0:x86_64-unknown-linux-gnu",
+            "https://docs.rs/crate/example/1.9.0/x86_64-unknown-linux-gnu/json/61.gz",
+            "application/gzip",
+        ),
+        raw(
+            "9",
+            "cargo:docs-html:example:1.10.0",
+            "https://docs.rs/crate/example/1.10.0/download",
+            "application/zip",
+        ),
+        raw(
+            "b",
+            "cargo:archive:example:1.10.0:fixture",
+            "https://static.crates.io/crates/example/example-1.10.0.crate",
+            "application/gzip",
+        ),
+        raw(
+            "f",
+            "cargo:archive:example:1.9.0:fixture",
+            "https://static.crates.io/crates/example/example-1.9.0.crate",
+            "application/gzip",
+        ),
+    ]
+    .into_iter()
+    .map(|artifact| (artifact.capture.id.clone(), artifact))
+    .collect();
     Arc::new(FixtureStore {
         snapshot: Mutex::new(snapshot),
         qualified: Mutex::new(true),
@@ -259,6 +318,7 @@ pub(crate) fn fixture() -> Arc<FixtureStore> {
             readme.target = String::new();
             readme.path = "README.md".into();
             readme.kind = "readme".into();
+            readme.archive_capture = "b".repeat(64);
             readme.attributes = json!({});
             let mut source = readme.clone();
             source.id = "5".repeat(64);
@@ -267,13 +327,22 @@ pub(crate) fn fixture() -> Arc<FixtureStore> {
             let mut previous = source.clone();
             previous.id = "6".repeat(64);
             previous.version = "1.9.0".into();
+            previous.archive_capture = "f".repeat(64);
             let mut previous_api = row.clone();
             previous_api.id = "7".repeat(64);
             previous_api.version = "1.9.0".into();
+            previous_api.archive_capture = "8".repeat(64);
             previous_api.attributes["signature"] = json!({"input":"u16"});
-            vec![row, readme, source, previous, previous_api]
+            let mut rustdoc = row.clone();
+            rustdoc.id = "a".repeat(64);
+            rustdoc.kind = "rustdoc".into();
+            rustdoc.path = "example/index.html".into();
+            rustdoc.archive_capture = "9".repeat(64);
+            vec![row, readme, source, previous, previous_api, rustdoc]
         },
         captures,
+        artifacts: Mutex::new(artifacts),
+        artifact_reads: AtomicU64::new(0),
     })
 }
 

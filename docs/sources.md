@@ -28,6 +28,10 @@ are not recorded as absence. Valid stale public captures can be returned through
 seven days with their original validation time; older data is unavailable/incomplete.
 RustSec snapshots older than 24 hours are explicitly stale. Requested historical
 captures are fixed evidence, not claims of current completeness.
+Documentation/API freshness uses the original docs.rs capture's validation time,
+not the lifetime of its derived text. Default queries reject selected documentation
+older than seven days; explicit historical snapshots and capture resources remain
+readable. Results expose the original source capture and its 24-hour stale state.
 
 The RFC index endpoint was checked on 2026-10-24: the root `rfc-index.xml`
 returns XML; the older `/in-notes/rfc-index.xml` returns 404. Keep endpoint tests

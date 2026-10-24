@@ -10,7 +10,11 @@ use devres_application::{
 use devres_domain::{Error, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::PathBuf,
+    sync::Arc,
+};
 
 pub struct CrateResearch {
     store: Arc<dyn CrateCorpusStore>,
@@ -166,9 +170,75 @@ impl CrateResearch {
         }
         Ok(snapshot)
     }
-    async fn search(&self, snapshot: &Snapshot, spec: SearchSpec) -> Result<Value> {
+    async fn mutable_source(&self, id: &str, historical: bool) -> Result<Value> {
+        let artifact = self.store.artifact(id).await?.ok_or_else(|| {
+            Error::unavailable("Documentation source capture metadata is unavailable.")
+        })?;
+        if artifact.capture.id != id || artifact.capture.validated_at < 0 {
+            return Err(Error::integrity(
+                "Documentation source capture identity is invalid.",
+            ));
+        }
+        if !historical
+            && devres_domain::unix_now().saturating_sub(artifact.capture.validated_at) > 7 * 86400
+        {
+            return Err(Error::unavailable(
+                "Selected documentation source is older than seven days; select an explicit historical snapshot.",
+            ));
+        }
+        let mut metadata = capture_json(&artifact.capture, 86400);
+        // Raw JSON gzip and HTML ZIP artifacts require typed projections.
+        metadata["resource_uri"] = Value::Null;
+        Ok(metadata)
+    }
+    async fn selected_source(
+        &self,
+        row: &ContentRecord,
+        historical: bool,
+    ) -> Result<Option<Value>> {
+        if matches!(row.kind.as_str(), "rustdoc" | "api") {
+            Ok(Some(
+                self.mutable_source(&row.archive_capture, historical)
+                    .await?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+    async fn search(
+        &self,
+        snapshot: &Snapshot,
+        spec: SearchSpec,
+        historical: bool,
+    ) -> Result<Value> {
         let mut result =
             crate_index::search(self.root.clone(), snapshot.index_manifest.clone(), spec).await?;
+        let mut sources = HashMap::<String, Value>::new();
+        let items = result["items"]
+            .as_array_mut()
+            .ok_or_else(|| Error::integrity("Malformed crate search page."))?;
+        for item in items {
+            if item["document"]["class"] == "content"
+                && matches!(
+                    item["document"]["record"]["kind"].as_str(),
+                    Some("rustdoc" | "api")
+                )
+            {
+                let id = item["document"]["record"]["archive_capture"]
+                    .as_str()
+                    .ok_or_else(|| Error::integrity("Documentation source capture is absent."))?
+                    .to_owned();
+                let source = match sources.get(&id) {
+                    Some(value) => value.clone(),
+                    None => {
+                        let value = self.mutable_source(&id, historical).await?;
+                        sources.insert(id, value.clone());
+                        value
+                    }
+                };
+                item["source_capture"] = source;
+            }
+        }
         result["snapshot"] = snapshot_json(snapshot);
         Ok(result)
     }
@@ -212,16 +282,27 @@ impl CrateResearch {
             .await?;
         match rows.len() {
             0 => Err(Error::not_found("Document is absent from this snapshot.")),
-            1 => rows
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::not_found("Document is absent.")),
+            1 => {
+                let row = rows
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::not_found("Document is absent."))?;
+                self.selected_source(&row, input.snapshot.is_some()).await?;
+                Ok(row)
+            }
             _ => Err(Error::invalid(
                 "Multiple documents match; select an exact path and target.",
             )),
         }
     }
-    async fn text(&self, row: &ContentRecord, offset: usize, limit: usize) -> Result<Value> {
+    async fn text(
+        &self,
+        row: &ContentRecord,
+        offset: usize,
+        limit: usize,
+        historical: bool,
+    ) -> Result<Value> {
+        let source = self.selected_source(row, historical).await?;
         let captured = self.retrieval.read_capture(&row.capture).await?;
         if captured.body.len() > 4 * 1024 * 1024 {
             return Err(Error::capacity("Research document exceeds 4 MiB."));
@@ -229,9 +310,11 @@ impl CrateResearch {
         let text = std::str::from_utf8(&captured.body)
             .map_err(|_| Error::integrity("Research document is not UTF-8."))?;
         let page = text_page(text, offset, limit)?;
-        Ok(
-            json!({"document":row,"page":page,"capture":capture_json(&captured.capture,365*86400),"resource_uri":format!("devres://capture/{}?offset={offset}&limit={limit}",row.capture),"metadata_capture":row.metadata_capture,"archive_capture":row.archive_capture,"license_notice":"Captured content retains its original copyright and licensing."}),
-        )
+        let mut result = json!({"document":row,"page":page,"capture":capture_json(&captured.capture,365*86400),"resource_uri":format!("devres://capture/{}?offset={offset}&limit={limit}",row.capture),"metadata_capture":row.metadata_capture,"archive_capture":row.archive_capture,"license_notice":"Captured content retains its original copyright and licensing."});
+        if let Some(source) = source {
+            result["source_capture"] = source;
+        }
+        Ok(result)
     }
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
         let schema = schemas()
@@ -258,9 +341,13 @@ impl CrateResearch {
         match tool {
             "crate_versions" => {
                 input.name()?;
-                self.search(&snapshot, input.spec("version")?).await
+                self.search(&snapshot, input.spec("version")?, input.snapshot.is_some())
+                    .await
             }
-            "crate_catalog_search" => self.search(&snapshot, input.spec("version")?).await,
+            "crate_catalog_search" => {
+                self.search(&snapshot, input.spec("version")?, input.snapshot.is_some())
+                    .await
+            }
             "crate_content_search" | "crate_api_search" => {
                 if input.query.as_ref().is_none_or(|s| s.trim().is_empty()) {
                     return Err(Error::invalid("A nonempty search query is required."));
@@ -269,7 +356,7 @@ impl CrateResearch {
                 if tool == "crate_api_search" {
                     spec.kind = Some("api".into());
                 }
-                self.search(&snapshot, spec).await
+                self.search(&snapshot, spec, input.snapshot.is_some()).await
             }
             "crate_document_get" => {
                 let (offset, limit) = input.page(true)?;
@@ -286,7 +373,9 @@ impl CrateResearch {
                 let row = self
                     .document(&snapshot, &input, kind, input.version()?)
                     .await?;
-                let mut result = self.text(&row, offset, limit).await?;
+                let mut result = self
+                    .text(&row, offset, limit, input.snapshot.is_some())
+                    .await?;
                 result["snapshot"] = snapshot_json(&snapshot);
                 Ok(result)
             }
@@ -305,8 +394,11 @@ impl CrateResearch {
                         Some(&row.target),
                     )
                     .await?;
+                let source_capture = self
+                    .mutable_source(&row.archive_capture, input.snapshot.is_some())
+                    .await?;
                 Ok(
-                    json!({"item":row,"observed_signature":row.attributes["signature"],"relationships":row.attributes["relationships"],"projection_coverage":projection_coverage,"snapshot":snapshot_json(&snapshot),"resource_uri":format!("devres://capture/{}",row.capture),"assessment_scope":"observed captured rustdoc API; no build or compatibility certification"}),
+                    json!({"item":row,"observed_signature":row.attributes["signature"],"relationships":row.attributes["relationships"],"projection_coverage":projection_coverage,"source_capture":source_capture,"snapshot":snapshot_json(&snapshot),"resource_uri":format!("devres://capture/{}",row.capture),"assessment_scope":"observed captured rustdoc API; no build or compatibility certification"}),
                 )
             }
             "crate_dependencies" => self.dependencies(&snapshot, &input).await,
@@ -352,7 +444,9 @@ impl CrateResearch {
                     cursor: input.cursor.clone(),
                     ..Default::default()
                 };
-                let mut result = self.search(snapshot, spec).await?;
+                let mut result = self
+                    .search(snapshot, spec, input.snapshot.is_some())
+                    .await?;
                 result["dependency_scope"] =
                     json!("declared package-name references; version constraints are not resolved");
                 Ok(result)
@@ -393,6 +487,31 @@ impl CrateResearch {
                 input.target.as_deref(),
             )
             .await?;
+        if old.len() > 1000
+            || new.len() > 1000
+            || serde_json::to_vec(&(&old, &new))
+                .map_err(|_| Error::integrity("Malformed comparison coverage."))?
+                .len()
+                > 128 * 1024
+        {
+            return Err(Error::capacity(
+                "Comparison projection metadata exceeds its budget; select a target.",
+            ));
+        }
+        let mut source_captures = BTreeMap::new();
+        if kind == "api" {
+            for summary in old.iter().chain(&new) {
+                let id = summary["source_capture"].as_str().ok_or_else(|| {
+                    Error::unavailable("API projection source capture metadata is unavailable.")
+                })?;
+                if !source_captures.contains_key(id) {
+                    source_captures.insert(
+                        id.to_owned(),
+                        self.mutable_source(id, input.snapshot.is_some()).await?,
+                    );
+                }
+            }
+        }
         let qualified = |rows: &[Value]| -> Result<BTreeSet<String>> {
             if rows.is_empty() {
                 return Err(Error::unavailable(
@@ -429,7 +548,9 @@ impl CrateResearch {
                 "Compared versions have different captured target coverage.",
             ));
         }
-        Ok(json!({"before":old,"after":new,"qualified":true}))
+        Ok(
+            json!({"before":old,"after":new,"qualified":true,"source_captures":source_captures.into_values().collect::<Vec<_>>()}),
+        )
     }
     async fn selected_path_coverage(
         &self,
@@ -437,6 +558,7 @@ impl CrateResearch {
         before: &ContentRecord,
         after: &ContentRecord,
         kind: &str,
+        historical: bool,
     ) -> Result<Value> {
         if before.target != after.target {
             return Err(Error::unavailable(
@@ -471,7 +593,15 @@ impl CrateResearch {
             ));
         }
         let mut projections = Vec::new();
+        let mut source_captures = BTreeMap::new();
         for item in [before, after] {
+            if !source_captures.contains_key(&item.archive_capture) {
+                source_captures.insert(
+                    item.archive_capture.clone(),
+                    self.mutable_source(&item.archive_capture, historical)
+                        .await?,
+                );
+            }
             let rows = self
                 .store
                 .projection_status(
@@ -482,6 +612,16 @@ impl CrateResearch {
                     Some(&item.target),
                 )
                 .await?;
+            if rows.len() > 1000
+                || serde_json::to_vec(&rows)
+                    .map_err(|_| Error::integrity("Malformed API projection coverage."))?
+                    .len()
+                    > 128 * 1024
+            {
+                return Err(Error::capacity(
+                    "API projection metadata exceeds its budget; select a target.",
+                ));
+            }
             if rows.is_empty()
                 || rows.iter().any(|row| {
                     row["version_asserted"] != true
@@ -496,7 +636,7 @@ impl CrateResearch {
             projections.push(rows);
         }
         Ok(
-            json!({"scope":"selected_captured_paths","qualified":true,"normalization":"complete_for_selected_items","before":projections[0],"after":projections[1]}),
+            json!({"scope":"selected_captured_paths","qualified":true,"normalization":"complete_for_selected_items","before":projections[0],"after":projections[1],"source_captures":source_captures.into_values().collect::<Vec<_>>()}),
         )
     }
     async fn compare(&self, snapshot: &Snapshot, input: &Input) -> Result<Value> {
@@ -581,8 +721,14 @@ impl CrateResearch {
                 };
                 coverage = Some(match (&left, &right) {
                     (Some(left), Some(right)) => {
-                        self.selected_path_coverage(snapshot, left, right, kind)
-                            .await?
+                        self.selected_path_coverage(
+                            snapshot,
+                            left,
+                            right,
+                            kind,
+                            input.snapshot.is_some(),
+                        )
+                        .await?
                     }
                     _ => {
                         self.comparison_coverage(snapshot, input, before, after, kind)
@@ -608,11 +754,17 @@ impl CrateResearch {
                 } else {
                     let (offset, limit) = input.page(true)?;
                     let old = match &left {
-                        Some(row) => Some(self.text(row, offset, limit).await?),
+                        Some(row) => Some(
+                            self.text(row, offset, limit, input.snapshot.is_some())
+                                .await?,
+                        ),
                         None => None,
                     };
                     let new = match &right {
-                        Some(row) => Some(self.text(row, offset, limit).await?),
+                        Some(row) => Some(
+                            self.text(row, offset, limit, input.snapshot.is_some())
+                                .await?,
+                        ),
                         None => None,
                     };
                     json!({"changed":old.as_ref().map(|r|&r["capture"]["body_hash"])!=new.as_ref().map(|r|&r["capture"]["body_hash"]),"before":old,"after":new,"comparison_scope":"exact path; equality checks the complete captured text, output is paged"})
@@ -901,7 +1053,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(readme["page"]["text"], "transport");
-        assert_eq!(readme["archive_capture"], "3".repeat(64));
+        assert_eq!(readme["archive_capture"], "b".repeat(64));
         let reverse = research
             .call(
                 "crate_dependencies",
@@ -1030,5 +1182,261 @@ mod tests {
         let retrieval = Arc::new(Retrieval::new(incomplete.clone(), Arc::new(NoNetwork)));
         let research = CrateResearch::new(incomplete, retrieval, root.path().to_path_buf());
         assert_eq!(research.call("crate_compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","path":"example::send"})).await.unwrap_err().code,"unavailable");
+    }
+    fn age_raw_source(store: &crate::crate_index::tests::FixtureStore, id: &str, seconds: i64) {
+        store
+            .artifacts
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .capture
+            .validated_at = devres_domain::unix_now() - seconds;
+    }
+    #[tokio::test]
+    async fn mutable_get_and_compare_use_raw_source_age_and_preserve_explicit_history() {
+        let root = tempfile::tempdir().unwrap();
+        let store = fixture();
+        let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
+        let research = CrateResearch::new(store.clone(), retrieval, root.path().to_path_buf());
+        let api = json!({"name":"example","version":"1.10.0","path":"example::send"});
+        let docs = json!({"name":"example","version":"1.10.0","kind":"rustdoc","path":"example/index.html"});
+        age_raw_source(&store, &"3".repeat(64), 2 * 86400);
+        age_raw_source(&store, &"9".repeat(64), 2 * 86400);
+        let result = research.call("crate_api_get", api.clone()).await.unwrap();
+        assert_eq!(result["source_capture"]["id"], "3".repeat(64));
+        assert_eq!(result["source_capture"]["stale"], true);
+        let text = research
+            .call("crate_document_get", docs.clone())
+            .await
+            .unwrap();
+        assert_eq!(text["source_capture"]["id"], "9".repeat(64));
+        assert_eq!(text["source_capture"]["stale"], true);
+        assert_eq!(text["capture"]["stale"], false);
+        for path in [Some("example::send"), None] {
+            let mut input =
+                json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api"});
+            if let Some(path) = path {
+                input["path"] = json!(path);
+            }
+            let compared = research.call("crate_compare", input).await.unwrap();
+            let source = compared["comparison_coverage"]["source_captures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|capture| capture["id"] == "3".repeat(64))
+                .unwrap();
+            assert_eq!(source["stale"], true);
+            assert_eq!(
+                source["validated_at"],
+                result["source_capture"]["validated_at"]
+            );
+        }
+        age_raw_source(&store, &"3".repeat(64), 8 * 86400);
+        age_raw_source(&store, &"9".repeat(64), 8 * 86400);
+        age_raw_source(&store, &"b".repeat(64), 8 * 86400);
+        for (tool, input) in [
+            ("crate_api_get", api.clone()),
+            ("crate_document_get", docs.clone()),
+        ] {
+            let error = research.call(tool, input.clone()).await.unwrap_err();
+            assert_eq!(error.code, "unavailable");
+            assert!(error.message.contains("explicit historical snapshot"));
+            let mut pinned = input;
+            pinned["snapshot"] = json!("c".repeat(64));
+            assert_eq!(
+                research.call(tool, pinned).await.unwrap()["source_capture"]["stale"],
+                true
+            );
+        }
+        for path in [Some("example::send"), None] {
+            let mut compare =
+                json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api"});
+            if let Some(path) = path {
+                compare["path"] = json!(path);
+            }
+            assert_eq!(
+                research
+                    .call("crate_compare", compare.clone())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "unavailable"
+            );
+            compare["snapshot"] = json!("c".repeat(64));
+            assert!(research.call("crate_compare", compare).await.is_ok());
+        }
+        let before = store
+            .artifact_reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            research
+                .call(
+                    "crate_document_get",
+                    json!({"name":"example","version":"1.10.0","kind":"source","path":"src/lib.rs"})
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            research
+                .call(
+                    "crate_dependencies",
+                    json!({"name":"example","version":"1.10.0"})
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .artifact_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+        store.artifacts.lock().unwrap().remove(&"3".repeat(64));
+        let mut pinned = api;
+        pinned["snapshot"] = json!("c".repeat(64));
+        assert_eq!(
+            research
+                .call("crate_api_get", pinned)
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
+    }
+    #[tokio::test]
+    async fn search_freshness_checks_only_selected_mutable_hits_and_deduplicates_raw_ids() {
+        let _serial = crate_index::TEST_BUILD.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture_store = Arc::try_unwrap(fixture()).ok().unwrap();
+        let mut alias = fixture_store
+            .contents
+            .iter()
+            .find(|row| row.kind == "api" && row.version == "1.10.0")
+            .unwrap()
+            .clone();
+        alias.id = "c".repeat(64);
+        alias.path = "example::send_alias".into();
+        fixture_store.contents.push(alias);
+        let store = Arc::new(fixture_store);
+        let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let manifest = crate_index::build(
+            store.clone(),
+            retrieval.clone(),
+            root.path().to_path_buf(),
+            snapshot,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        store.snapshot.lock().unwrap().index_manifest = manifest;
+        let research = CrateResearch::new(store.clone(), retrieval, root.path().to_path_buf());
+        age_raw_source(&store, &"3".repeat(64), 8 * 86400);
+        age_raw_source(&store, &"9".repeat(64), 8 * 86400);
+        assert_eq!(
+            research
+                .call(
+                    "crate_api_search",
+                    json!({"query":"transport","name":"example"})
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
+        let fresh = research
+            .call(
+                "crate_api_search",
+                json!({"query":"transport","version":"1.9.0"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh["total"], 1);
+        assert_eq!(fresh["items"][0]["source_capture"]["stale"], false);
+        assert!(
+            research
+                .call(
+                    "crate_content_search",
+                    json!({"query":"source","kind":"source"})
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            research
+                .call(
+                    "crate_content_search",
+                    json!({"query":"source","kind":"rustdoc"})
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
+        let historical = research
+            .call(
+                "crate_content_search",
+                json!({"query":"source","kind":"rustdoc","snapshot":"c".repeat(64)}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(historical["items"][0]["source_capture"]["stale"], true);
+        store
+            .artifact_reads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let historical = research
+            .call(
+                "crate_api_search",
+                json!({"query":"transport","version":"1.10.0","snapshot":"c".repeat(64)}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(historical["total"], 2);
+        assert_eq!(historical["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .artifact_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        age_raw_source(&store, &"3".repeat(64), 2 * 86400);
+        let stale = research
+            .call(
+                "crate_api_search",
+                json!({"query":"transport","version":"1.10.0"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale["items"][0]["source_capture"]["stale"], true);
+        let before = store
+            .artifact_reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            research
+                .call("crate_catalog_search", json!({"name":"example"}))
+                .await
+                .unwrap()["total"],
+            2
+        );
+        assert_eq!(
+            store
+                .artifact_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+        store.artifacts.lock().unwrap().remove(&"3".repeat(64));
+        assert_eq!(
+            research
+                .call(
+                    "crate_api_search",
+                    json!({"query":"transport","version":"1.10.0","snapshot":"c".repeat(64)})
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
     }
 }

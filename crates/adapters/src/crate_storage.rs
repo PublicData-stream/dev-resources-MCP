@@ -626,7 +626,7 @@ impl CrateCorpusStore for PgBlobStore {
         target: Option<&str>,
     ) -> Result<Vec<Value>> {
         self.fence().await?;
-        let rows:Vec<Json<Value>>=sqlx::query_scalar("SELECT summary FROM devres_crate_generations WHERE published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 AND summary->>'name'=$2 AND summary->>'version'=$3 AND summary->>'kind'=$4 AND ($5::text IS NULL OR summary->>'target'=$5) GROUP BY COALESCE(summary->>'job_key',id)) ORDER BY summary->>'target'").bind(cutoff).bind(name).bind(version).bind(kind).bind(target).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let rows:Vec<Json<Value>>=sqlx::query_scalar("SELECT summary FROM devres_crate_generations WHERE published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 AND summary->>'name'=$2 AND summary->>'version'=$3 AND summary->>'kind'=$4 AND ($5::text IS NULL OR summary->>'target'=$5) GROUP BY COALESCE(summary->>'job_key',id)) ORDER BY summary->>'target' LIMIT 1001").bind(cutoff).bind(name).bind(version).bind(kind).bind(target).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         Ok(rows.into_iter().map(|j| j.0).collect())
     }
     async fn commit_enrichment(&self, artifact: &str) -> Result<()> {
