@@ -48,6 +48,8 @@ pub struct PgBlobStore {
     read_budget: Arc<Semaphore>,
     // A dedicated non-reconnecting connection holds the single-server fence.
     owner: Mutex<PgConnection>,
+    owner_pid: i32,
+    owner_started: String,
     artifact_budget: std::sync::OnceLock<Arc<crate::bulk::BulkArtifactStore>>,
 }
 fn storage_error() -> Error {
@@ -77,6 +79,10 @@ impl PgBlobStore {
                 "Only one serving instance may own this database",
             ));
         }
+        let identity=sqlx::query("SELECT pid,EXTRACT(EPOCH FROM backend_start)::text AS started FROM pg_stat_activity WHERE pid=pg_backend_pid()")
+            .fetch_one(&mut owner).await.map_err(|_|storage_error())?;
+        let owner_pid = identity.try_get("pid").map_err(|_| storage_error())?;
+        let owner_started = identity.try_get("started").map_err(|_| storage_error())?;
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .acquire_timeout(std::time::Duration::from_secs(5))
@@ -156,6 +162,8 @@ impl PgBlobStore {
             root,
             read_budget: Arc::new(Semaphore::new(128)),
             owner: Mutex::new(owner),
+            owner_pid,
+            owner_started,
             artifact_budget: std::sync::OnceLock::new(),
         })
     }
@@ -173,12 +181,17 @@ impl PgBlobStore {
     }
 
     async fn fence(&self) -> Result<()> {
-        self.owner
-            .lock()
-            .await
-            .ping()
-            .await
-            .map_err(|_| Error::unavailable("Storage ownership lost; restart required"))
+        // Reads and supervision must not wait behind a bulk publication on the owner
+        // connection. Verify its exact live backend and advisory lock independently;
+        // backend_start also prevents PID reuse from impersonating a lost owner.
+        let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid=1 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)")
+            .bind(self.owner_pid).bind(&self.owner_started).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        if !owned {
+            return Err(Error::unavailable(
+                "Storage ownership lost; restart required",
+            ));
+        }
+        Ok(())
     }
     async fn blob(&self, content_hash: &str) -> Result<Body> {
         if !valid_hash(content_hash) {

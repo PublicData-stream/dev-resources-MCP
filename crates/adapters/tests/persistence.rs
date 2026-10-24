@@ -61,6 +61,41 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
             record: record(v, false),
         })
         .collect();
+    let blocker = sqlx::PgPool::connect(&database).await.unwrap();
+    let mut blocked = blocker.begin().await.unwrap();
+    sqlx::query("SELECT id FROM devres_crate_inventories WHERE id=$1 FOR UPDATE")
+        .bind(&epoch.id)
+        .fetch_one(&mut *blocked)
+        .await
+        .unwrap();
+    let publication = store.stage_crate(&epoch.id, "example", &records, "ex/am/example");
+    let serving = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let health =
+            tokio::time::timeout(std::time::Duration::from_secs(1), store.check_health()).await;
+        let retained = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.capture(&metadata.id),
+        )
+        .await;
+        blocked.rollback().await.unwrap();
+        assert!(
+            health
+                .expect("busy owner must not block storage supervision")
+                .is_ok()
+        );
+        assert_eq!(
+            retained
+                .expect("retained reads must not wait for bulk publication")
+                .unwrap()
+                .body
+                .as_ref(),
+            raw.as_bytes()
+        );
+    };
+    let (published, ()) = tokio::join!(publication, serving);
+    published.unwrap();
+    blocker.close().await;
     store
         .stage_crate(&epoch.id, "example", &records, "ex/am/example")
         .await
@@ -906,7 +941,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         store.capture(&original_id).await.unwrap().body,
         b"v1 retained capture"
     );
-    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
+    sqlx::query("SELECT pg_terminate_backend(pid,5000) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
         .execute(&fixture_pool).await.unwrap();
     assert!(store.save_dataset("catalogue", &dataset).await.is_err());
     assert!(store.schedule(std::slice::from_ref(&job)).await.is_err());
@@ -1024,7 +1059,7 @@ async fn permanent_history_revalidation_and_integrity() {
         b"second"
     );
     let maintenance = sqlx::PgPool::connect(&url).await.unwrap();
-    let terminated: Vec<bool> = sqlx::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
+    let terminated: Vec<bool> = sqlx::query_scalar("SELECT pg_terminate_backend(pid,5000) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
         .fetch_all(&maintenance).await.unwrap();
     assert_eq!(terminated, vec![true]);
     assert!(store.check_health().await.is_err());
