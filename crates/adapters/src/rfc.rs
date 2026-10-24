@@ -65,6 +65,7 @@ pub struct Record {
     pub working_group: String,
     pub doi: String,
     pub formats: Vec<String>,
+    pub unsupported_formats: Vec<String>,
     pub series: Vec<String>,
     pub updates: Vec<String>,
     pub obsoletes: Vec<String>,
@@ -212,12 +213,18 @@ fn record_from_node(node: Node) -> Result<Record> {
             .iter()
             .filter(|child| child.name == "file-format")
         {
-            let value = match normalized(&child.text).to_ascii_lowercase().as_str() {
-                "ascii" | "txt" => "txt",
+            let original = normalized(&child.text);
+            let value = match original.to_ascii_lowercase().as_str() {
+                "ascii" | "text" | "txt" => "txt",
                 "html" => "html",
                 "xml" => "xml",
                 "pdf" => "pdf",
-                _ => continue,
+                _ => {
+                    if !original.is_empty() && !record.unsupported_formats.contains(&original) {
+                        record.unsupported_formats.push(original);
+                    }
+                    continue;
+                }
             }
             .to_owned();
             if !record.formats.contains(&value) {
@@ -1009,11 +1016,60 @@ pub(crate) fn parse_errata(bytes: &[u8]) -> Result<Vec<Value>> {
         return Err(Error::capacity("RFC errata exceeds byte limit."));
     }
     let deadline = Instant::now() + Duration::from_secs(15);
-    let records: Vec<Value> = serde_json::from_slice(bytes)
-        .map_err(|_| Error::integrity("Malformed RFC errata JSON."))?;
-    if records.len() > 50_000 {
-        return Err(Error::capacity("RFC errata exceeds record limit."));
+    struct BoundedRecords<'a> {
+        deadline: Instant,
+        capacity: &'a std::cell::Cell<bool>,
     }
+    impl<'de> serde::de::Visitor<'de> for BoundedRecords<'_> {
+        type Value = Vec<Value>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a bounded RFC errata array")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut records = Vec::new();
+            while let Some(raw) = sequence.next_element::<&'de serde_json::value::RawValue>()? {
+                if records.len() >= 50000
+                    || raw.get().len() > MAX_ENTRY
+                    || Instant::now() >= self.deadline
+                {
+                    self.capacity.set(true);
+                    return Err(serde::de::Error::custom("RFC errata capacity exceeded"));
+                }
+                let record: Value =
+                    serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                if record.as_object().is_some_and(|object| object.len() > 64) {
+                    self.capacity.set(true);
+                    return Err(serde::de::Error::custom(
+                        "RFC errata field capacity exceeded",
+                    ));
+                }
+                records.push(record);
+            }
+            Ok(records)
+        }
+    }
+    let capacity = std::cell::Cell::new(false);
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let records = serde::Deserializer::deserialize_seq(
+        &mut decoder,
+        BoundedRecords {
+            deadline,
+            capacity: &capacity,
+        },
+    )
+    .map_err(|_| {
+        if capacity.get() {
+            Error::capacity("RFC errata exceeds processing bounds.")
+        } else {
+            Error::integrity("Malformed RFC errata JSON.")
+        }
+    })?;
+    decoder
+        .end()
+        .map_err(|_| Error::integrity("Trailing RFC errata JSON."))?;
     let mut ids = HashSet::new();
     for record in &records {
         if Instant::now() >= deadline {

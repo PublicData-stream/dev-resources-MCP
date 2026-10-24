@@ -29,6 +29,17 @@ fn rich_metadata_preserves_source_precision_and_all_relationships() {
     assert_eq!(record.published, "May 2021");
     assert_eq!(record.publication.as_deref(), Some("2021-05"));
     assert_eq!(record.formats, ["txt", "html", "xml", "pdf"]);
+    let modern = parse_index(
+        &String::from_utf8(xml.to_vec())
+            .unwrap()
+            .replace(
+                "<file-format>ASCII</file-format>",
+                "<file-format>TEXT</file-format>",
+            )
+            .into_bytes(),
+    )
+    .unwrap();
+    assert_eq!(modern[0].formats, ["txt", "html", "xml", "pdf"]);
     assert_eq!(record.series, ["STD0001", "BCP0002", "FYI0003"]);
     assert_eq!(record.stream, "IETF");
     assert_eq!(record.area, "Transport");
@@ -358,4 +369,26 @@ async fn legacy_search_admits_schema_sized_unicode_queries_and_statuses() {
         .unwrap_err();
         assert_eq!(error.code, expected);
     }
+}
+
+#[test]
+fn errata_sequence_and_individual_records_are_bounded_before_materialization() {
+    let too_many = format!("[{}]", vec!["{}"; 50001].join(","));
+    assert_eq!(
+        parse_errata(too_many.as_bytes()).unwrap_err().code,
+        "capacity"
+    );
+    let oversized = format!("[{{\"notes\":\"{}\"}}]", "a".repeat(256 * 1024));
+    assert_eq!(
+        parse_errata(oversized.as_bytes()).unwrap_err().code,
+        "capacity"
+    );
+    assert!(parse_errata(b"[] []").is_err());
+    let records = parse_index(&index(&entry(
+        "RFC9000",
+        "<format><file-format>TEXT</file-format><file-format>PS</file-format></format>",
+    )))
+    .unwrap();
+    assert_eq!(records[0].formats, ["txt"]);
+    assert_eq!(records[0].unsupported_formats, ["PS"]);
 }

@@ -393,7 +393,13 @@ impl RfcCorpus {
             .iter()
             .filter(|d| unix_now().saturating_sub(d.capture.validated_at) > 7 * 86400)
             .count();
+        let unsupported: usize = catalogue
+            .records
+            .iter()
+            .map(|r| r["unsupported_formats"].as_array().map_or(0, Vec::len))
+            .sum();
         let complete = captured == expected
+            && unsupported == 0
             && expired == 0
             && unix_now().saturating_sub(catalogue.capture.validated_at) <= 7 * 86400
             && errata
@@ -528,7 +534,7 @@ impl RfcCorpus {
             .into_iter()
             .take(20)
             .collect::<BTreeMap<_, _>>();
-        let coverage = json!({"expected_representations":expected,"captured_representations":captured,"missing_representations":expected.saturating_sub(captured),"stale_representations":stale,"expired_representations":expired,"documents":catalogue.records.len(),"searchable_documents":selected.len(),"no_extractable_text":missing_text,"acquisition_complete":complete,"search_complete":missing_text==0&&expired==0,"processing_error_count":error_count,"processing_errors":error_sample,"catalogue_validated_at":catalogue.capture.validated_at,"errata_validated_at":errata.as_ref().map(|e|e.capture.validated_at)});
+        let coverage = json!({"expected_representations":expected,"unsupported_formats":unsupported,"captured_representations":captured,"missing_representations":expected.saturating_sub(captured),"stale_representations":stale,"expired_representations":expired,"documents":catalogue.records.len(),"searchable_documents":selected.len(),"no_extractable_text":missing_text,"acquisition_complete":complete,"search_complete":missing_text==0&&expired==0,"processing_error_count":error_count,"processing_errors":error_sample,"catalogue_validated_at":catalogue.capture.validated_at,"errata_validated_at":errata.as_ref().map(|e|e.capture.validated_at)});
         let search_documents = selected.into_values().collect::<Vec<_>>();
         let identity = serde_json::to_vec(&(
             PROCESSOR_VERSION,
