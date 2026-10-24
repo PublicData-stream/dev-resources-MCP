@@ -3,28 +3,52 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Validated version tag; empty for ordinary CI
+        type: string
+        default: ''
   schedule:
     - cron: '41 3 * * 1'
 permissions:
   contents: read
+env:
+  RELEASE_TAG: ${{ inputs.release-tag || '' }}
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   rust:
+    name: rust (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+        include:
+          - runner: ubuntu-26.04
+            arch: amd64
+          - runner: ubuntu-26.04-arm
+            arch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Prepare release sources
+        if: env.RELEASE_TAG != ''
+        run: |
+          scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA"
+          python3 scripts/release_contract.py stamp --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
       - name: Isolate pinned toolchain
         run: echo "RUSTUP_HOME=$RUNNER_TEMP/devres-rustup" >> "$GITHUB_ENV"
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Verify native architecture
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+        run: scripts/check-native-platform.sh "$PLATFORM"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -33,7 +57,38 @@ jobs:
       - name: PostgreSQL persistence
         run: scripts/test-postgres.sh
       - name: Build and smoke native runtime image
-        run: scripts/test-image.sh
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+        run: scripts/test-image.sh --platform "$PLATFORM"
+      - name: Install OCI artifact tools
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Build and smoke separate native images
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+        run: |
+          version=0.0.0
+          if [[ -n $RELEASE_TAG ]]; then
+            version=$(python3 scripts/release_contract.py verify-stamped --tag "$RELEASE_TAG" --commit "$GITHUB_SHA")
+          fi
+          for target in server probe audit-worker; do
+            scripts/test-image.sh --platform "$PLATFORM" --target "$target" \
+              --revision "$GITHUB_SHA" --version "$version" \
+              --oci-output "$RUNNER_TEMP/oci-images/$target"
+            if [[ -n $RELEASE_TAG ]]; then
+              python3 scripts/release_images.py verify --directory "$RUNNER_TEMP/oci-images/$target" \
+                --target "$target" --arch "${PLATFORM#linux/}" --tag "$RELEASE_TAG" \
+                --commit "$GITHUB_SHA" --output "$RUNNER_TEMP/verified-$target.json"
+            fi
+          done
+      - name: Retain tested release images
+        if: env.RELEASE_TAG != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oci-images-${{ matrix.arch }}
+          path: ${{ runner.temp }}/oci-images/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
   dependencies:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -41,6 +96,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Prepare release sources
+        if: env.RELEASE_TAG != ''
+        run: |
+          scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA"
+          python3 scripts/release_contract.py stamp --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
       - run: echo "RUSTUP_HOME=$RUNNER_TEMP/devres-rustup" >> "$GITHUB_ENV"
       - run: rustup toolchain install 1.99.1 --profile minimal
       - run: cargo install cargo-audit --version 0.22.2 --locked
@@ -54,6 +116,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Prepare release sources
+        if: env.RELEASE_TAG != ''
+        run: |
+          scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA"
+          python3 scripts/release_contract.py stamp --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
       - run: echo "RUSTUP_HOME=$RUNNER_TEMP/devres-rustup" >> "$GITHUB_ENV"
       - run: rustup toolchain install 1.99.1 --profile minimal
       - name: Install edge native build prerequisites

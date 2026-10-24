@@ -77,6 +77,79 @@ A local gate does not establish arm64 execution or native browser/ChatGPT UI
 interoperability. Native architecture CI, image publication, production certificates,
 provider coverage, and production deployment require their own evidence.
 
+## Native images and versioned releases
+
+Native CI pairs `ubuntu-26.04` with `linux/amd64` and `ubuntu-26.04-arm` with
+`linux/arm64`. It checks the host, Rust compiler and Docker daemon architecture
+before building. Local amd64 checks do not establish ARM64 execution.
+
+```sh
+scripts/check-native-platform.sh linux/amd64
+scripts/test-image.sh --platform linux/amd64
+scripts/test-image.sh --platform linux/amd64 --target server
+scripts/test-image.sh --platform linux/amd64 --target probe
+scripts/test-image.sh --platform linux/amd64 --target audit-worker
+```
+
+Use `linux/arm64` on an ARM64 Linux host. Explicit foreign-platform builds require
+operator-provided emulation and must be reported as emulated. The native guard
+rejects a foreign host even when emulation is installed. `--image IMAGE` checks an
+existing image without rebuilding or deleting it. `--oci-output /absolute/new/path`
+builds an OCI archive first, loads and smokes that exact archive, and retains its
+checksums and content digests. This path requires `skopeo`, Buildx OCI export and a
+Docker image store capable of loading OCI archives (the native CI uses the
+containerd image store). It cannot be combined with `--image`.
+Temporary containers have no network, a read-only filesystem and no capabilities.
+The worker uses synthetic public fixtures; no submitted package code is executed.
+
+The release workflow publishes these families under `ghcr.io/publicdata-stream`,
+each with amd64 and ARM64 descriptors:
+
+| Image | Executables |
+| --- | --- |
+| `dev-resources-server` | Server plus its required sibling audit worker |
+| `dev-resources-probe` | WebTransport acceptance client |
+| `dev-resources-audit-worker` | Private stdin/stdout helper; no remote worker service |
+
+The default Dockerfile target remains the combined compatibility image. Explicit
+`--target server`, `--target probe`, and `--target audit-worker` select the separate
+images. No Kubernetes manifest or runtime configuration automatically selects them.
+
+Publication is triggered only by an annotated version-tag push whose commit is in
+main history: `vX.Y.Z`, `vX.Y.Z-beta.N`, or `vX.Y.Z-build.<8-lowercase-hex-commit>`.
+Numeric SemVer identifiers cannot have leading zeros; a build tag must match the
+commit prefix. There are no `latest`, branch, major or minor image aliases.
+Maintainers must protect these version tags against movement and deletion.
+
+Main retains Cargo version `0.0.0`. Each release CI checkout stamps the version
+without `v` into first-party manifests, path dependencies, lock entries and exact
+license exceptions. Third-party resolutions are unchanged. Fresh full CI and all
+six separate image gates must succeed before registry-writing jobs start. The
+tested OCI artifacts are promoted without rebuilding. Immutable platform tags
+`VERSION-amd64` and `VERSION-arm64` support an index at `VERSION`, where `VERSION`
+is the complete Git tag including `v`. Matching artifact retries are idempotent;
+conflicting tags/assets fail rather than overwrite. A partial publication is not a
+successful release, even when some platform images are already available.
+
+The GitHub Release contains `source.tar.gz`, its SHA-256 file, release identity,
+and three JSON image-digest records. The source archive includes the exact stamped
+manifests used for building; the ordinary Git tag archive retains placeholders.
+Build the extracted archive with `docker build --target server .`; when using
+`scripts/test-image.sh` to build it, supply `--revision` and `--version` from
+`release.json` because the archive has no Git history.
+Beta/build releases are marked prerelease. Set the configured `source.url` to an
+accessible offer for this exact corresponding source before independent deployment.
+
+Before the first independently authorized publication, verify organization package
+permissions and set all three GHCR packages public (new packages default private).
+After publication, verify native job completion, provenance, source assets, index
+and platform digests, and anonymous pulls of both platforms. An authenticated pull
+alone does not prove public availability. CI retains tested image/source artifacts
+for seven days and index-digest artifacts for thirty days; published GitHub Release
+assets remain the durable corresponding-source distribution. Never delete retained
+public captures as part of image/test cleanup. Roll back a deployment by selecting
+a previously verified digest through a separately authorized deployment operation.
+
 ## Persistent operation and recovery
 
 Deploy one serving replica with Recreate updates. PostgreSQL 18 and the blob

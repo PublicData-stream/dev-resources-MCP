@@ -1,0 +1,182 @@
+name: Versioned multi-architecture images
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+jobs:
+  contract:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      tag-object: ${{ steps.identity.outputs.tag-object }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate identity and retain corresponding source
+        id: identity
+        run: |
+          object=$(scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA")
+          echo "tag-object=$object" >> "$GITHUB_OUTPUT"
+          python3 scripts/release_contract.py stamp --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
+          python3 scripts/release_contract.py archive --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/source"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: corresponding-source
+          path: ${{ runner.temp }}/source/
+          if-no-files-found: error
+          retention-days: 7
+  ci:
+    needs: contract
+    uses: ./.github/workflows/ci.yml
+    with:
+      release-tag: ${{ github.ref_name }}
+  platforms:
+    needs: [contract, ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [server, probe, audit-worker]
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: oci-images-${{ matrix.arch }}
+          path: ${{ runner.temp }}/oci-images
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Authenticate registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          printf '%s' "$REGISTRY_TOKEN" | docker login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+      - name: Promote exact tested artifact
+        id: promote
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          TAG_OBJECT: ${{ needs.contract.outputs.tag-object }}
+        run: |
+          python3 scripts/release_images.py promote --directory "$RUNNER_TEMP/oci-images/$TARGET" \
+            --target "$TARGET" --arch "$ARCH" --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
+            --tag-object "$TAG_OBJECT" --output "$RUNNER_TEMP/promoted/$TARGET-$ARCH.json"
+      - name: Attest platform image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/dev-resources-${{ matrix.target }}
+          subject-digest: ${{ steps.promote.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: promoted-${{ matrix.target }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/promoted/
+          if-no-files-found: error
+          retention-days: 7
+  indexes:
+    needs: [contract, platforms]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [server, probe, audit-worker]
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: promoted-${{ matrix.target }}-*
+          path: ${{ runner.temp }}/promoted
+          merge-multiple: true
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Authenticate registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          printf '%s' "$REGISTRY_TOKEN" | docker login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+      - name: Publish verified platform index
+        id: index
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG_OBJECT: ${{ needs.contract.outputs.tag-object }}
+        run: |
+          python3 scripts/release_images.py merge --directory "$RUNNER_TEMP/promoted" \
+            --target "$TARGET" --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
+            --tag-object "$TAG_OBJECT" --output "$RUNNER_TEMP/digests/$TARGET.json"
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/dev-resources-${{ matrix.target }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.target }}
+          path: ${{ runner.temp }}/digests/
+          if-no-files-found: error
+          retention-days: 30
+  source-release:
+    needs: [contract, indexes]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: corresponding-source
+          path: ${{ runner.temp }}/source
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - name: Publish corresponding source and release digests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_OBJECT: ${{ needs.contract.outputs.tag-object }}
+        run: |
+          scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA" "$TAG_OBJECT"
+          python3 scripts/publish-source-release.py --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
+            --source "$RUNNER_TEMP/source" --digests "$RUNNER_TEMP/digests"

@@ -12,6 +12,12 @@ scripts/test-image.sh
 scripts/test-postgres.sh
 ```
 
+Named `server`, `probe` and `audit-worker` Dockerfile targets also build separate
+images for both architectures. The server image retains the audit worker required
+by its local subprocess contract. Plain `docker build .` retains the original
+combined image. See [native builds and release gates](../docs/operations.md#native-images-and-versioned-releases)
+for explicit platform checks, version-tagged GHCR names and corresponding source.
+
 Use the pinned Rust toolchain, a C/C++ compiler, CMake, Perl, pkg-config, OpenSSL,
 Python 3, Git, and Docker for edge acceptance. OxiBelt is built from the immutable
 revision named in `scripts/build-oxibelt.sh`. An optional `OXIBELT_SOURCE` checkout
