@@ -42,3 +42,6 @@ Health is private. Public clients use HTTPS `/mcp`; native WebTransport clients 
 MDN, W3C, Chromium documentation, npm, full-corpus search, a graphical app, and public
 citation web pages are future work. The repository is AGPL-3.0-only; upstream source
 materials retain their own terms. See [notices](THIRD-PARTY-NOTICES.md).
+
+[Initialization validation](docs/initialization-evidence.md) records the checks
+actually executed, source evidence, and the remaining proof boundaries.

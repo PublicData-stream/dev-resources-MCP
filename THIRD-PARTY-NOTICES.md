@@ -47,3 +47,7 @@ the published packages' `.cargo_vcs_info.json`. `provenance.json` records packag
 repository, revision and path. This is licensing provenance, not proof that archive
 contents match a Git tree. The image collector includes these alongside packaged
 notices. No dependency implementation is vendored by this supplement.
+
+A small actual RustSec Git snapshot fixture and its original CC0 terms are retained
+with [capture provenance](crates/adapters/tests/fixtures/rustsec/README.md). Its
+synthetic negative mutations are labeled separately; it is not a full database.

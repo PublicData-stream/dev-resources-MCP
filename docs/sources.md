@@ -43,7 +43,12 @@ Do not relicense archived sources as AGPL or infer unrestricted reuse from publi
 availability. New providers require a profile covering identity, supported operations,
 terms, rate limits, freshness, failure semantics, provenance and bounded fixtures.
 
-Offline fixtures are labeled synthetic. A bounded live smoke proves only the named
+Synthetic fixtures are labeled as such. Curated upstream captures retain source
+provenance, capture hashes, and applicable terms. A bounded live smoke proves only the named
 records at its observation time; it is not whole-source coverage, load testing,
-provider endorsement, or permission for bulk ingestion. No scheduled full crawler,
+provider endorsement, or permission for bulk ingestion. RustSec Git snapshots may start with one 52-byte PAX global commit-comment header.
+Only an exact first header matching the captured immutable revision is admitted;
+crate archives keep their stricter special-member policy.
+
+No scheduled full crawler,
 corpus index, or provider synchronization daemon is part of this foundation.

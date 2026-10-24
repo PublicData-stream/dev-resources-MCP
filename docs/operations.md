@@ -114,3 +114,18 @@ supplied private lockfile is needed. It has a five-minute bound, no crawling, an
 fewer than twenty application HTTP attempts per provider including retry allowances.
 Actual adapter requests, source timestamps, and resulting captures define the
 observation. Passing this smoke is not full-source acceptance or a load test.
+
+## Offline captured RustSec replay
+
+An additional opt-in test accepts operator-supplied `head.json` and `bundle.tar.gz`
+public captures. It performs no network requests and verifies parser/research
+compatibility for the captured revision, not current provider freshness:
+
+```sh
+DEVRES_RUSTSEC_REPLAY_DIR=/path/to/public-captures \
+  cargo test --locked -p devres-adapters --test rustsec_replay -- --ignored
+```
+
+The ordinary suite uses the small curated, attributed Git-header fixture. Full
+public database downloads are not committed. See the
+[initialization evidence](initialization-evidence.md) for actual executed gates.
