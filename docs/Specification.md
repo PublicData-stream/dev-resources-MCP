@@ -64,6 +64,11 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | `crate_corpus_status` | Aggregate acquisition, processing, storage and snapshot coverage; no public controls |
 | `advisory_lookup` | Crate/version; matched advisories, withdrawals and informational state |
 | `audit_lockfile` | Supplied Cargo.lock text; supported matches, unassessed entries, completeness/freshness |
+| `advisory_get` | Canonical advisory ID, representation and optional snapshot; structured metadata and original source byte page |
+| `advisory_catalog_search` | Local query, conjunctive metadata/platform filters, representation and snapshot/cursor paging |
+| `advisory_history` | Canonical ID, optional exact Git ref and frozen history view; parent-relative changes |
+| `advisory_snapshots` | Paginated immutable ref observations or commit snapshots; optional exact ref/representation |
+| `advisory_corpus_status` | Aggregate collection, freshness, parsing, storage and history coverage; no administrative controls |
 
 Tool discovery supplies authoritative JSON input schemas. Unknown fields fail.
 Retrieval and validation timestamps are Unix seconds.
@@ -148,6 +153,52 @@ qualified per-side projection coverage and compatible schema versions. Changes a
 observations, not semantic-version or security certifications.
 
 ## Audits and failure
+
+RustSec collection runs independently of public requests: current main metadata and
+immutable archives refresh hourly, and full official Git branch/tag ancestry
+synchronizes daily. These are scheduling targets. All advisory tools read published
+local evidence; bootstrap can therefore return unavailable/incomplete results while
+serving remains ready. Failed current processing preserves the last published default.
+
+The default representation is canonical RustSec Markdown/TOML. Explicit OSV
+assessments require `format="osv"` and `advisory_snapshot`; representations are never
+combined. Historical Git snapshots identify complete commit-tree inventories, their
+parents, processing generation and coverage. Development branches and imported
+ancestors are historical assessments with `complete=false`. Only fully covered,
+freshly validated main/archive or official OSV-tip observations qualify as complete.
+Processing/import time does not refresh historical evidence.
+
+New advisory research tools accept `format` (`rustsec` or `osv`) and immutable
+`snapshot` selectors where applicable. Existing lookup/audit use `advisory_snapshot`,
+including retained legacy head-capture aliases. Explicit historical snapshots remain
+readable after seven days and return supported matches with incomplete assessment.
+Unsupported historical source remains raw evidence with explicit processing gaps.
+
+Catalog filters combine with AND: exact `name`, canonical `id`, exact `alias`,
+`classification`, `category`, `informational`, `os`, `arch`, and inclusive
+`date_from`/`date_through` (`YYYY-MM-DD`). OS/architecture selection includes records
+without that restriction; unknown applicability is not unrestricted applicability.
+Dates use RustSec advisory dates or OSV published dates, not import time. Query
+terms use case-insensitive AND substrings. Lists default to 20 and cap at 100;
+new tools accept offsets through 10,000 and snapshot/query-bound cursors beyond
+that window. Cursor continuation allows a changed page size.
+
+History and snapshot discovery return a frozen integer `history_snapshot` publication
+cutoff. History reports changes against each ordered Git parent; absence differs
+from withdrawal. Ref observations retain branch/tag movements and deletions.
+Full history covers all ancestry reachable from observed advertised branches/tags,
+including previously observed roots; it cannot reconstruct already-unreachable
+objects. OSV and rendered-site branches are retained, but rendered content is inert.
+
+OSV matching supports crates.io SEMVER event ranges and explicit version lists.
+Unsupported range kinds, historical schemas and malformed constraints remain
+coverage gaps; supported matches can still be returned without claiming complete
+assessment. OSV withdrawal and RustSec informational metadata remain separate from
+active vulnerability counts.
+
+`devres://advisory/<format>/<id>/<snapshot>` reads the same original source with
+bounded UTF-8 byte paging. Citations retain source revision, member path/hash and
+original notices; references are never fetched or executed.
 
 Only supported crates.io registry identities are assessed. Git, local/path, and
 alternative registries are unassessed rather than matched by name alone. Reports

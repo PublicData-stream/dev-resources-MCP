@@ -54,17 +54,25 @@ async fn main() -> Result<(), ServerError> {
     let crate_corpus = Arc::new(devres_adapters::CrateCorpus::new(
         store.clone(),
         retrieval.clone(),
-        broker,
+        broker.clone(),
         &config.storage.blob_dir,
         config.crates.clone(),
     )?);
     store.attach_artifact_budget(crate_corpus.artifact_budget())?;
     crate_corpus.recover_stages().await?;
+    let advisory_corpus = Arc::new(devres_adapters::AdvisoryCorpus::new(
+        retrieval.clone(),
+        store.clone(),
+        broker,
+        &config.storage.blob_dir,
+        config.rustsec.clone(),
+    )?);
     let research = Arc::new(
         devres_adapters::Research::new(retrieval)
             .await?
             .with_corpus(corpus.clone())
-            .with_crate_corpus(crate_corpus.clone()),
+            .with_crate_corpus(crate_corpus.clone())
+            .with_advisory_corpus(advisory_corpus.clone()),
     );
     if let Some((command, manifest)) = crate_command {
         let shutdown = CancellationToken::new();
@@ -115,6 +123,16 @@ async fn main() -> Result<(), ServerError> {
     })?;
     server.register_worker("crate-collector", move |shutdown| async move {
         crate_corpus.run(shutdown).await.map_err(Into::into)
+    })?;
+    let current = advisory_corpus.clone();
+    server.register_worker("rustsec-current", move |shutdown| async move {
+        current.run_current(shutdown).await.map_err(Into::into)
+    })?;
+    server.register_worker("rustsec-history", move |shutdown| async move {
+        advisory_corpus
+            .run_history(shutdown)
+            .await
+            .map_err(Into::into)
     })?;
     server.register_endpoint(HttpEndpoint {
         bind: config.http.bind,

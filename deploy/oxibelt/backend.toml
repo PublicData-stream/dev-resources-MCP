@@ -5,6 +5,8 @@ url = "https://github.com/PublicData-stream/dev-resources-MCP"
 enabled = false
 [crates]
 enabled = false
+[rustsec]
+enabled = false
 [http]
 bind = "0.0.0.0:8080"
 allowed_hosts = ["backend:8080"]

@@ -109,6 +109,7 @@ async fn official_snapshot_replays_through_research_without_network() {
     )))
     .await
     .unwrap();
+    research.refresh_advisories().await.unwrap();
     let result = research
         .call("advisory_lookup", json!({"name":"itoa","version":"1.0.15"}))
         .await

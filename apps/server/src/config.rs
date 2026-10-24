@@ -312,12 +312,15 @@ pub struct Config {
     pub rfc: devres_adapters::RfcConfig,
     #[serde(default)]
     pub crates: devres_adapters::CrateConfig,
+    #[serde(default)]
+    pub rustsec: devres_adapters::RustSecConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
         self.limits.validate()?;
         self.rfc.validate()?;
         self.crates.validate()?;
+        self.rustsec.validate()?;
         for access in [
             AccessPolicy {
                 allowed_hosts: self.http.allowed_hosts.clone(),

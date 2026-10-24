@@ -24,7 +24,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -41,7 +41,13 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const AUTH_HEADER: &str = "x-devres-git-token";
+pub(crate) const AUTH_HEADER: &str = "x-devres-git-token";
+#[cfg(test)]
+static COMPRESSED_UPLOADS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) fn compressed_upload_count() -> u64 {
+    COMPRESSED_UPLOADS.load(Ordering::Acquire)
+}
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_RECORD: usize = 16 * 1024 * 1024;
 const MAX_MANIFEST: usize = 2 * 1024 * 1024;
@@ -629,7 +635,7 @@ impl Drop for OwnedStage {
     }
 }
 
-fn base_command() -> Command {
+pub(crate) fn base_command() -> Command {
     let mut command = Command::new("/usr/bin/git");
     command
         .env_clear()
@@ -686,14 +692,14 @@ fn base_command() -> Command {
     command.process_group(0);
     command
 }
-struct ManagedChild {
-    child: Child,
+pub(crate) struct ManagedChild {
+    pub(crate) child: Child,
     group: Pid,
-    finished: bool,
+    pub(crate) finished: bool,
     group_live: bool,
 }
 impl ManagedChild {
-    fn spawn(mut command: Command) -> Result<Self> {
+    pub(crate) fn spawn(mut command: Command) -> Result<Self> {
         let mut child = command
             .spawn()
             .map_err(|_| Error::unavailable("Trusted registry Git executable unavailable."))?;
@@ -714,7 +720,7 @@ impl ManagedChild {
             }
         }
     }
-    async fn terminate(&mut self) -> Result<()> {
+    pub(crate) async fn terminate(&mut self) -> Result<()> {
         if self.group_live {
             match killpg(self.group, Signal::SIGKILL) {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
@@ -747,7 +753,7 @@ impl Drop for ManagedChild {
         }
     }
 }
-async fn run_command(
+pub(crate) async fn run_command(
     mut command: Command,
     max_output: usize,
     shutdown: &CancellationToken,
@@ -787,16 +793,19 @@ async fn run_command(
 
 #[derive(Clone)]
 struct RelayState {
+    rustsec: bool,
     broker: Arc<BulkBroker>,
     secret: String,
     shutdown: CancellationToken,
     failure: CancellationToken,
+    failure_reason: Arc<StdMutex<Option<Error>>>,
     deadline: Instant,
 }
-struct Relay {
-    url: String,
-    secret: String,
-    task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+pub(crate) struct Relay {
+    pub(crate) url: String,
+    pub(crate) secret: String,
+    pub(crate) task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    pub(crate) failure_reason: Arc<StdMutex<Option<Error>>>,
     shutdown: CancellationToken,
 }
 struct RelayListener {
@@ -896,6 +905,16 @@ async fn start_relay(
     failure: CancellationToken,
     deadline: Instant,
 ) -> Result<Relay> {
+    start_source_relay(broker, shutdown, failure, deadline, false).await
+}
+
+pub(crate) async fn start_source_relay(
+    broker: Arc<BulkBroker>,
+    shutdown: CancellationToken,
+    failure: CancellationToken,
+    deadline: Instant,
+    rustsec: bool,
+) -> Result<Relay> {
     let mut random = [0_u8; 32];
     tokio::fs::File::open("/dev/urandom")
         .await
@@ -904,11 +923,14 @@ async fn start_relay(
         .await
         .map_err(|_| git_error())?;
     let secret = hex::encode(random);
+    let failure_reason = Arc::new(StdMutex::new(None));
     let state = RelayState {
+        rustsec,
         broker,
         secret: secret.clone(),
         shutdown: shutdown.clone(),
         failure,
+        failure_reason: failure_reason.clone(),
         deadline,
     };
     let router = relay_router(state);
@@ -931,6 +953,7 @@ async fn start_relay(
         url: format!("http://127.0.0.1:{}/registry.git", address.port()),
         secret,
         task: Some(task),
+        failure_reason,
         shutdown,
     })
 }
@@ -986,26 +1009,87 @@ async fn upload_pack(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    forward_git(state, GitOperation::UploadPack, body.to_vec()).await
+    let body = match decode_upload_body(&body, headers.get(axum::http::header::CONTENT_ENCODING)) {
+        Ok(body) => body,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    forward_git(state, GitOperation::UploadPack, body).await
+}
+/// Git compresses larger POST requests; the relay forwards canonical decoded bytes.
+/// Both compressed and expanded input retain the same private request-size bound.
+fn decode_upload_body(body: &[u8], encoding: Option<&axum::http::HeaderValue>) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if body.len() > MAX_REQUEST {
+        return Err(Error::capacity("Git request exceeds its byte budget."));
+    }
+    match encoding {
+        None => Ok(body.to_vec()),
+        Some(value) if value == "gzip" => {
+            let decoder = flate2::read::MultiGzDecoder::new(body);
+            let mut bytes = Vec::new();
+            decoder
+                .take(MAX_REQUEST as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Error::invalid("Invalid compressed Git request."))?;
+            if bytes.len() > MAX_REQUEST {
+                return Err(Error::capacity(
+                    "Expanded Git request exceeds its byte budget.",
+                ));
+            }
+            #[cfg(test)]
+            COMPRESSED_UPLOADS.fetch_add(1, Ordering::AcqRel);
+            Ok(bytes)
+        }
+        Some(_) => Err(Error::invalid("Unsupported Git request content encoding.")),
+    }
 }
 async fn forward_git(state: RelayState, operation: GitOperation, body: Vec<u8>) -> Response {
     let request = BulkRequest {
-        source: BulkSource::RegistryGit(operation),
+        source: if state.rustsec {
+            BulkSource::RustSecGit(operation)
+        } else {
+            BulkSource::RegistryGit(operation)
+        },
         validators: Validators::default(),
         max_bytes: bulk::MAX_ARTIFACT_BYTES,
         deadline: state.deadline,
         body,
     };
-    let response = match state.broker.open(request, state.shutdown.clone()).await {
+    let operation_name = match operation {
+        GitOperation::Advertisement => "advertisement",
+        GitOperation::UploadPack => "upload-pack",
+    };
+    let result = state.broker.open(request, state.shutdown.clone()).await;
+    let response = match result {
         Ok(response) if response.status == 200 => response,
-        _ => {
+        other => {
+            let error = match other {
+                Ok(response) => Error::unavailable(format!(
+                    "Git {operation_name} upstream returned HTTP {}.",
+                    response.status
+                )),
+                Err(error) => Error::new(
+                    &error.code,
+                    format!("Git {operation_name}: {}", error.message),
+                ),
+            };
+            if let Ok(mut reason) = state.failure_reason.lock() {
+                *reason = Some(error);
+            }
             state.failure.cancel();
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
     let failure = state.failure;
+    let reason = state.failure_reason;
     let stream = response.stream.map(move |item| {
         item.map_err(|error| {
+            if let Ok(mut reason) = reason.lock() {
+                *reason = Some(Error::new(
+                    &error.code,
+                    format!("Git {operation_name} stream: {}", error.message),
+                ));
+            }
             failure.cancel();
             std::io::Error::other(error.message)
         })
@@ -1257,7 +1341,7 @@ fn index_name(path: &str) -> Result<Option<String>> {
     }
     Ok(Some(name.into()))
 }
-async fn delimited<R: AsyncBufRead + Unpin>(
+pub(crate) async fn delimited<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     delimiter: u8,
     limit: usize,
@@ -1292,13 +1376,13 @@ async fn delimited<R: AsyncBufRead + Unpin>(
         }
     }
 }
-fn valid_oid(value: &str) -> bool {
+pub(crate) fn valid_oid(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
-fn parse_oid_line(bytes: &[u8]) -> Result<String> {
+pub(crate) fn parse_oid_line(bytes: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::integrity("Invalid registry Git revision."))?
         .trim_end_matches('\n');
@@ -1307,14 +1391,14 @@ fn parse_oid_line(bytes: &[u8]) -> Result<String> {
     }
     Ok(text.into())
 }
-fn valid_pack_name(name: &str) -> bool {
+pub(crate) fn valid_pack_name(name: &str) -> bool {
     name.strip_prefix("pack-")
         .and_then(|value| value.split_once('.'))
         .is_some_and(|(hash, suffix)| {
             valid_oid(hash) && matches!(suffix, "pack" | "idx" | "rev" | "bitmap" | "keep")
         })
 }
-fn recover_working_stages(repository: &Path) -> Result<()> {
+pub(crate) fn recover_working_stages(repository: &Path) -> Result<()> {
     // A single fenced mutator owns these private temporary files. No immutable
     // archive object or observed snapshot ref is considered disposable.
     directory_size(repository, u64::MAX)?;
@@ -1376,14 +1460,14 @@ fn remove_regular_stage(path: &Path) -> Result<()> {
         _ => Err(Error::integrity("Invalid registry Git staging member.")),
     }
 }
-fn real_directory(path: &Path) -> Result<()> {
+pub(crate) fn real_directory(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| git_error())?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(Error::integrity("Invalid registry Git directory."));
     }
     Ok(())
 }
-fn directory_size(root: &Path, max_bytes: u64) -> Result<u64> {
+pub(crate) fn directory_size(root: &Path, max_bytes: u64) -> Result<u64> {
     let mut pending = vec![root.to_owned()];
     let mut files = 0usize;
     let mut bytes = 0_u64;
@@ -1415,7 +1499,7 @@ fn directory_size(root: &Path, max_bytes: u64) -> Result<u64> {
     }
     Ok(bytes)
 }
-async fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) async fn sync_directory(path: &Path) -> Result<()> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
         .await
@@ -1618,10 +1702,12 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         let state = RelayState {
+            rustsec: false,
             broker: Arc::new(BulkBroker::new(Default::default()).unwrap()),
             secret: "fixture-secret".into(),
             shutdown: CancellationToken::new(),
             failure: CancellationToken::new(),
+            failure_reason: Arc::new(StdMutex::new(None)),
             deadline: Instant::now() + Duration::from_secs(1),
         };
         let router = relay_router(state);
@@ -1966,5 +2052,63 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(archive.path()).unwrap().count(), 0);
         server.abort();
+    }
+    #[test]
+    fn compressed_upload_requests_preserve_pkt_lines_and_expansion_limits() {
+        use std::io::Write;
+        let body = b"0014command=ls-refs\n00010009peel\n0000";
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(body).unwrap();
+        let bytes = gzip.finish().unwrap();
+        assert_eq!(
+            decode_upload_body(&bytes, Some(&axum::http::HeaderValue::from_static("gzip")))
+                .unwrap(),
+            body
+        );
+        assert!(
+            decode_upload_body(
+                &bytes,
+                Some(&axum::http::HeaderValue::from_static("deflate"))
+            )
+            .is_err()
+        );
+        let encoding = axum::http::HeaderValue::from_static("gzip");
+        let mut bad_crc = bytes.clone();
+        let crc = bad_crc.len() - 8;
+        bad_crc[crc] ^= 1;
+        assert!(
+            decode_upload_body(&bad_crc, Some(&encoding)).is_err(),
+            "CRC mismatch must fail closed"
+        );
+        assert!(
+            decode_upload_body(&bytes[..bytes.len() - 1], Some(&encoding)).is_err(),
+            "truncated trailer must fail closed"
+        );
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(b"trailing garbage");
+        assert!(
+            decode_upload_body(&trailing, Some(&encoding)).is_err(),
+            "trailing non-gzip bytes must fail closed"
+        );
+        let exact = vec![b'x'; MAX_REQUEST];
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&exact).unwrap();
+        assert_eq!(
+            decode_upload_body(&gzip.finish().unwrap(), Some(&encoding)).unwrap(),
+            exact,
+            "exact expanded boundary must remain usable"
+        );
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&vec![b'x'; MAX_REQUEST + 1]).unwrap();
+        let oversized = gzip.finish().unwrap();
+        assert_eq!(
+            decode_upload_body(
+                &oversized,
+                Some(&axum::http::HeaderValue::from_static("gzip"))
+            )
+            .unwrap_err()
+            .code,
+            "capacity"
+        );
     }
 }

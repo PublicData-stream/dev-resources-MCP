@@ -21,6 +21,14 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | nix | Signal/process features terminate and reap the owned fixed Git process group on cancellation. Killing only the immediate child can leave Git helpers running; no caller-selected executable or package process is admitted. |
 | rustsec, semver | Maintained canonical advisory parsing and version matching rather than reimplementing affected ranges. Disable rustsec defaults, including Git, index lookup, and automatic fix support. |
 | tracing/subscriber | Aggregate operational logging without request bodies or audit inputs. |
+
+RustSec history reuses the existing external Git/mediated HTTPS boundary without
+enabling RustSec crate Git or fix features. OSV import/matching uses bounded serde
+JSON and semver with the primary OSV evaluation rules; RustSec's export-oriented
+OSV types are not an import matcher. This module adds no dependency packages or
+build scripts. Upstream representation notices remain separate from AGPL code.
+The adapter's opt-in acceptance probe enables Tokio signal handling to cancel
+owned Git work cleanly; the server already enables that feature in this workspace.
 | rcgen, tempfile | Test-only disposable certificates and storage; not operator certificate provisioning. |
 
 The resolved graph includes proc-macro build code and native cryptography build

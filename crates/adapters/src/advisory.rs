@@ -20,6 +20,7 @@ const MAX_LOCKFILE: usize = 1024 * 1024;
 pub struct Advisories {
     retrieval: Arc<Retrieval>,
     parsed: Mutex<Option<Arc<Snapshot>>>,
+    corpus: Option<Arc<crate::AdvisoryCorpus>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -28,6 +29,12 @@ struct Snapshot {
     bundle: Capture,
     revision: String,
     advisories: Vec<Advisory>,
+    #[serde(default)]
+    osv: Vec<Value>,
+    #[serde(default)]
+    assessment: Option<Value>,
+    #[serde(skip)]
+    searchable: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +44,8 @@ pub struct LookupInput {
     pub version: String,
     #[serde(default)]
     pub advisory_snapshot: Option<String>,
+    #[serde(default = "rustsec_format")]
+    pub format: String,
     #[serde(default)]
     pub offset: usize,
     #[serde(default = "list_limit")]
@@ -49,21 +58,135 @@ pub struct AuditInput {
     pub lockfile: String,
     #[serde(default)]
     pub advisory_snapshot: Option<String>,
+    #[serde(default = "rustsec_format")]
+    pub format: String,
     #[serde(default)]
     pub offset: usize,
     #[serde(default = "list_limit")]
     pub limit: usize,
 }
 
+fn rustsec_format() -> String {
+    "rustsec".into()
+}
 impl Advisories {
     pub fn new(retrieval: Arc<Retrieval>) -> Self {
         Self {
             retrieval,
             parsed: Mutex::new(None),
+            corpus: None,
         }
     }
 
+    pub fn with_corpus(mut self, corpus: Arc<crate::AdvisoryCorpus>) -> Self {
+        self.corpus = Some(corpus);
+        self
+    }
+    async fn local_snapshot(&self, selected: Option<&str>, format: &str) -> Result<Arc<Snapshot>> {
+        if !matches!(format, "rustsec" | "osv") {
+            return Err(Error::invalid("Unsupported advisory representation."));
+        }
+        if let Some(corpus) = &self.corpus {
+            let permit = archive::admit()?;
+            let mut cache = self.parsed.lock().await;
+            let snapshot = corpus
+                .store
+                .advisory_snapshot(selected, format)
+                .await?
+                .ok_or_else(|| {
+                    if selected.is_some() {
+                        Error::not_found("Advisory snapshot not found for the selected format.")
+                    } else {
+                        Error::unavailable("No published advisory snapshot is available.")
+                    }
+                })?;
+            if selected.is_none() && !snapshot.assessment_complete(now()) {
+                return Err(Error::unavailable(
+                    "Default advisory snapshot is expired or incomplete.",
+                ));
+            }
+            if let Some(cached) = cache.as_ref()
+                && cached.metadata()["id"] == snapshot.id
+            {
+                return Ok(cached.clone());
+            }
+            let format = format.to_owned();
+            let parsed = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let metadata = crate::advisory_research::snapshot_metadata(&snapshot);
+                let mut captures = snapshot.captures.iter();
+                let fallback = Capture {
+                    id: snapshot.id.clone(),
+                    key: "rustsec:history".into(),
+                    source_url: format!(
+                        "https://github.com/rustsec/advisory-db/tree/{}",
+                        snapshot.revision
+                    ),
+                    body_hash: snapshot.id.clone(),
+                    media_type: "application/json".into(),
+                    retrieved_at: snapshot.created_at,
+                    validated_at: snapshot.validated_at.unwrap_or(0),
+                };
+                let head = captures.next().cloned().unwrap_or_else(|| fallback.clone());
+                let bundle = captures.next().cloned().unwrap_or(fallback);
+                let (advisories, osv) = if format == "rustsec" {
+                    let files = snapshot
+                        .records
+                        .into_iter()
+                        .filter(|r| r.metadata["processing"] != "unsupported")
+                        .map(|r| (r.path, r.body.into_bytes()))
+                        .collect::<Vec<_>>();
+                    let advisories = if files.is_empty() {
+                        vec![]
+                    } else {
+                        parse_files(
+                            files,
+                            std::time::Instant::now() + std::time::Duration::from_secs(15),
+                        )?
+                    };
+                    (advisories, vec![])
+                } else {
+                    (
+                        vec![],
+                        snapshot.records.into_iter().map(|r| r.metadata).collect(),
+                    )
+                };
+                let searchable = search_projection(&advisories);
+                Ok(Arc::new(Snapshot {
+                    head,
+                    bundle,
+                    revision: snapshot.revision,
+                    advisories,
+                    osv,
+                    assessment: Some(metadata),
+                    searchable,
+                }))
+            })
+            .await
+            .map_err(|_| Error::unavailable("Advisory projection worker failed."))??;
+            *cache = Some(parsed.clone());
+            return Ok(parsed);
+        }
+        if format != "rustsec" {
+            return Err(Error::unavailable(
+                "No published OSV snapshot is available.",
+            ));
+        }
+        let parsed = self.parsed.lock().await;
+        let snapshot = parsed
+            .as_ref()
+            .filter(|s| selected.is_none_or(|id| s.head.id == id))
+            .cloned()
+            .ok_or_else(|| Error::unavailable("No published advisory snapshot is available."))?;
+        if selected.is_none() && !snapshot.assessment_complete() {
+            return Err(Error::unavailable("Default advisory snapshot is expired."));
+        }
+        Ok(snapshot)
+    }
     async fn snapshot(&self, selected: Option<&str>, force: bool) -> Result<Arc<Snapshot>> {
+        if !force {
+            return self.local_snapshot(selected, "rustsec").await;
+        }
         let head = match selected {
             Some(id) => {
                 let stored = self.retrieval.read_capture(id).await?;
@@ -133,7 +256,10 @@ impl Advisories {
             head: head.capture,
             bundle: bundle.capture,
             revision,
+            searchable: search_projection(&advisories),
             advisories,
+            osv: vec![],
+            assessment: None,
         });
         *parsed = Some(snapshot.clone());
         Ok(snapshot)
@@ -141,11 +267,19 @@ impl Advisories {
 
     /// Private administrative operation; not registered as a public MCP tool.
     pub async fn refresh(&self) -> Result<Value> {
+        if let Some(corpus) = &self.corpus {
+            return corpus.refresh_current().await;
+        }
         let snapshot = self.snapshot(None, true).await?;
         Ok(json!({"snapshot":snapshot.metadata(),"advisories":snapshot.advisories.len()}))
     }
 
     pub async fn lookup(&self, input: LookupInput) -> Result<Value> {
+        if input.format == "osv" && input.advisory_snapshot.is_none() {
+            return Err(Error::invalid(
+                "OSV assessment requires an explicit advisory_snapshot.",
+            ));
+        }
         validate_name(&input.name)?;
         let version = validate_version(&input.version)?;
         let page = Page {
@@ -154,7 +288,7 @@ impl Advisories {
         }
         .checked()?;
         let snapshot = match self
-            .snapshot(input.advisory_snapshot.as_deref(), false)
+            .local_snapshot(input.advisory_snapshot.as_deref(), &input.format)
             .await
         {
             Ok(snapshot) => snapshot,
@@ -172,21 +306,34 @@ impl Advisories {
         let query = Query::new()
             .collection(Collection::Crates)
             .package_name(name)
-            .package_version(version)
+            .package_version(version.clone())
             .package_source(rustsec::SourceId::default());
         let found = snapshot
             .advisories
             .iter()
             .filter(|advisory| query.matches(advisory))
             .collect::<Vec<_>>();
-        let items = found
+        let mut summaries = found.iter().map(|a| summary(a)).collect::<Vec<_>>();
+        let mut matching_complete = true;
+        for record in &snapshot.osv {
+            let result = crate::advisory_osv::matches(record, &input.name, &version);
+            matching_complete &= result.complete;
+            if result.matched {
+                summaries.push(crate::advisory_osv::summary_for_match(
+                    record,
+                    &input.name,
+                    &version,
+                ));
+            }
+        }
+        let items = summaries
             .iter()
             .skip(page.offset)
             .take(page.limit)
-            .map(|advisory| summary(advisory))
+            .cloned()
             .collect::<Vec<_>>();
         Ok(
-            json!({"complete":true,"name":input.name,"version":input.version,"items":items,"total":found.len(),"offset":page.offset,"next_offset":next_offset(page,found.len()),"snapshot":snapshot.metadata(),"assessment_scope":"known RustSec advisories in the identified snapshot; not a safety certification"}),
+            json!({"complete":snapshot.assessment_complete()&&matching_complete,"status":if snapshot.assessment_complete()&&matching_complete {"assessed"} else {"incomplete"},"name":input.name,"version":input.version,"items":items,"total":summaries.len(),"offset":page.offset,"next_offset":next_offset(page,summaries.len()),"snapshot":snapshot.metadata(),"assessment_scope":"known advisories in the identified snapshot; not a safety certification"}),
         )
     }
 
@@ -203,27 +350,23 @@ impl Advisories {
             .split_whitespace()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let found = snapshot
-            .advisories
-            .iter()
-            .filter(|advisory| {
-                let text = format!(
-                    "{} {} {} {}",
-                    advisory.metadata.id,
-                    advisory.metadata.package,
-                    advisory.title(),
-                    advisory.description()
-                )
-                .to_lowercase();
-                terms.iter().all(|term| text.contains(term))
-            })
-            .collect::<Vec<_>>();
-        Ok(
-            json!({"items":found.iter().skip(page.offset).take(page.limit).map(|advisory|summary(advisory)).collect::<Vec<_>>(),"total":found.len(),"offset":page.offset,"next_offset":next_offset(page,found.len()),"snapshot":snapshot.metadata()}),
-        )
+        tokio::task::spawn_blocking(move|| {
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(15);
+            let mut found=Vec::new();
+            for (index,text) in snapshot.searchable.iter().enumerate() {
+                if std::time::Instant::now()>=deadline{return Err(Error::capacity("Advisory search deadline exceeded."));}
+                if terms.iter().all(|term|text.contains(term)){found.push(index);}
+            }
+            Ok(json!({"items":found.iter().skip(page.offset).take(page.limit).map(|index|summary(&snapshot.advisories[*index])).collect::<Vec<_>>(),"total":found.len(),"offset":page.offset,"next_offset":next_offset(page,found.len()),"snapshot":snapshot.metadata()}))
+        }).await.map_err(|_|Error::unavailable("Advisory search worker failed."))?
     }
 
     pub async fn audit(&self, input: AuditInput) -> Result<Value> {
+        if input.format == "osv" && input.advisory_snapshot.is_none() {
+            return Err(Error::invalid(
+                "OSV assessment requires an explicit advisory_snapshot.",
+            ));
+        }
         if input.lockfile.len() > MAX_LOCKFILE {
             return Err(Error::invalid(
                 "Cargo.lock must contain at most 1048576 UTF-8 bytes.",
@@ -235,7 +378,7 @@ impl Advisories {
         }
         .checked()?;
         let snapshot = match self
-            .snapshot(input.advisory_snapshot.as_deref(), false)
+            .local_snapshot(input.advisory_snapshot.as_deref(), &input.format)
             .await
         {
             Ok(snapshot) => snapshot,
@@ -250,18 +393,77 @@ impl Advisories {
     }
 }
 
+fn search_projection(advisories: &[Advisory]) -> Vec<String> {
+    advisories
+        .iter()
+        .map(|advisory| {
+            format!(
+                "{} {} {} {}",
+                advisory.metadata.id,
+                advisory.metadata.package,
+                advisory.title(),
+                advisory.description()
+            )
+            .to_lowercase()
+        })
+        .collect()
+}
+
 fn next_offset(page: Page, total: usize) -> Option<usize> {
     let next = page.offset.saturating_add(page.limit);
     if next < total { Some(next) } else { None }
 }
 
 impl Snapshot {
+    fn assessment_complete(&self) -> bool {
+        if let Some(metadata) = &self.assessment {
+            return metadata["complete"] == true
+                && metadata["historical"] != true
+                && metadata["validated_at"]
+                    .as_i64()
+                    .is_some_and(|time| time <= now() && now().saturating_sub(time) <= 7 * 86400);
+        }
+        (!self.advisories.is_empty() || !self.osv.is_empty())
+            && now().saturating_sub(self.head.validated_at) <= 7 * 86400
+            && self.head.validated_at <= now()
+    }
+
     fn metadata(&self) -> Value {
+        if let Some(metadata) = &self.assessment {
+            let mut metadata = metadata.clone();
+            metadata["assessment_complete"] = json!(self.assessment_complete());
+            metadata["stale"] = json!(
+                metadata["validated_at"]
+                    .as_i64()
+                    .is_none_or(|time| time > now() || now().saturating_sub(time) > 86400)
+            );
+            metadata["expired"] = json!(
+                metadata["validated_at"]
+                    .as_i64()
+                    .is_none_or(|time| time > now() || now().saturating_sub(time) > 7 * 86400)
+            );
+            if metadata.get("head_capture").is_some() {
+                metadata["head_capture"] = capture_json(&self.head, 86400);
+            }
+            if metadata.get("bundle_capture").is_some() {
+                metadata["bundle_capture"] = capture_json(&self.bundle, 365 * 86400);
+            }
+            if let Some(captures) = metadata.get_mut("captures").and_then(Value::as_array_mut) {
+                for capture in captures {
+                    capture["stale"] = json!(
+                        capture["validated_at"]
+                            .as_i64()
+                            .is_none_or(|time| time > now() || now().saturating_sub(time) > 86400)
+                    );
+                }
+            }
+            return metadata;
+        }
         json!({"id":self.head.id,"revision":self.revision,"validated_at":self.head.validated_at,"stale":now().saturating_sub(self.head.validated_at)>86400,"head_capture":capture_json(&self.head,86400),"bundle_capture":capture_json(&self.bundle,365*86400),"source_url":format!("https://github.com/RustSec/advisory-db/tree/{}",self.revision),"license_notice":"RustSec CC0-1.0, except explicitly attributed imported GHSA content under CC-BY-4.0; each advisory retains its license and URL."})
     }
 }
 
-fn parse_files(
+pub(crate) fn parse_files(
     files: Vec<(String, Vec<u8>)>,
     deadline: std::time::Instant,
 ) -> Result<Vec<Advisory>> {
@@ -438,13 +640,6 @@ pub fn audit_worker_main() -> std::io::Result<()> {
             .map_err(|_| Error::invalid("Invalid audit worker request."))
             .and_then(|request| {
                 let page = request.page.checked()?;
-                if request.snapshot.advisories.is_empty()
-                    || now().saturating_sub(request.snapshot.head.validated_at) > 7 * 86400
-                {
-                    return Err(Error::unavailable(
-                        "RustSec snapshot is missing or too old.",
-                    ));
-                }
                 let lockfile = parse_lockfile(&request.lockfile)?;
                 audit_with_snapshot(&lockfile, &request.snapshot, page)
             })
@@ -463,7 +658,7 @@ pub fn audit_worker_main() -> std::io::Result<()> {
     std::io::stdout().lock().write_all(&output.bytes)
 }
 
-fn summary(advisory: &Advisory) -> Value {
+pub(crate) fn summary(advisory: &Advisory) -> Value {
     let classification = if advisory.withdrawn() {
         "withdrawn"
     } else if advisory.metadata.informational.is_some() {
@@ -532,6 +727,7 @@ fn audit_with_snapshot(lockfile: &Lockfile, snapshot: &Snapshot, page: Page) -> 
     let mut vulnerabilities = 0usize;
     let mut informational = 0usize;
     let mut withdrawn = 0usize;
+    let mut matching_complete = true;
     // Index public advisories by package to avoid package*database unbounded work.
     let mut index = std::collections::HashMap::<&str, Vec<&Advisory>>::new();
     for advisory in &snapshot.advisories {
@@ -576,9 +772,30 @@ fn audit_with_snapshot(lockfile: &Lockfile, snapshot: &Snapshot, page: Page) -> 
             }
             findings.record(||json!({"package":package.name,"version":package.version,"advisory":summary(advisory)}))?;
         }
+        for record in &snapshot.osv {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::capacity("Audit time budget exceeded."));
+            }
+            let matched =
+                crate::advisory_osv::matches(record, package.name.as_str(), &package.version);
+            matching_complete &= matched.complete;
+            if matched.matched {
+                let advisory = crate::advisory_osv::summary_for_match(
+                    record,
+                    package.name.as_str(),
+                    &package.version,
+                );
+                match advisory["classification"].as_str() {
+                    Some("withdrawn") => withdrawn += 1,
+                    Some("informational") => informational += 1,
+                    _ => vulnerabilities += 1,
+                }
+                findings.record(||json!({"package":package.name,"version":package.version,"advisory":advisory}))?;
+            }
+        }
     }
     let stale = now().saturating_sub(snapshot.head.validated_at) > 86400;
-    let complete = unassessed == 0;
+    let complete = unassessed == 0 && snapshot.assessment_complete() && matching_complete;
     let status = if vulnerabilities > 0 {
         "known_vulnerabilities"
     } else if !complete {
@@ -632,7 +849,10 @@ mod tests {
             head: capture.clone(),
             bundle: capture,
             revision: "c".repeat(40),
+            searchable: search_projection(&advisories),
             advisories,
+            osv: vec![],
+            assessment: None,
         }
     }
     #[test]
@@ -648,6 +868,24 @@ mod tests {
             summary(&advisory(false, true))["classification"],
             "informational"
         );
+    }
+    #[test]
+    fn cached_snapshot_and_worker_recompute_expired_freshness() {
+        let mut snapshot = snapshot(vec![advisory(false, false)]);
+        snapshot.head.validated_at = now() - 7 * 86400 - 1;
+        snapshot.assessment = Some(
+            json!({"complete":true,"historical":false,"validated_at":snapshot.head.validated_at,"assessment_complete":true,"stale":false,"expired":false,"head_capture":{},"captures":[{"validated_at":snapshot.head.validated_at,"stale":false}]}),
+        );
+        assert!(!snapshot.assessment_complete());
+        let metadata = snapshot.metadata();
+        assert_eq!(metadata["stale"], true);
+        assert_eq!(metadata["expired"], true);
+        assert_eq!(metadata["head_capture"]["stale"], true);
+        assert_eq!(metadata["captures"][0]["stale"], true);
+        let lockfile=parse_lockfile("version = 4\n[[package]]\nname = \"example\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
+        let report = audit_with_snapshot(&lockfile, &snapshot, Page::default()).unwrap();
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["vulnerability_count"], 1);
     }
     #[test]
     fn curated_official_git_snapshot_preserves_commit_metadata_and_advisory_identity() {

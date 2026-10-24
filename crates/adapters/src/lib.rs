@@ -1,5 +1,9 @@
 //! Network, durable storage, and source-specific research adapters.
 mod advisory;
+mod advisory_corpus;
+pub mod advisory_git;
+mod advisory_osv;
+mod advisory_research;
 mod archive;
 pub mod bulk;
 mod cargo;
@@ -19,7 +23,9 @@ mod rfc_tools;
 mod storage;
 /// Private bounded helper entrypoint; never registered as an MCP tool.
 pub use advisory::audit_worker_main;
+pub use advisory_corpus::AdvisoryCorpus;
 pub use crate_corpus::{CrateConfig, CrateCorpus};
+pub use devres_application::advisory::RustSecConfig;
 pub use network::HttpFetcher;
 pub use research::Research;
 pub use rfc_corpus::{RfcConfig, RfcCorpus};

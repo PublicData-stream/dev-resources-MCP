@@ -13,7 +13,8 @@ shared transfer slot. Both paths share provider host clocks.
 | RFC Editor | [Official XML metadata index](https://www.rfc-editor.org/rfc-index.xml), errata JSON, and advertised TXT/HTML/XML/PDF; default 24-hour refresh | All observed valid bodies, source URL, content hash, observation times and transport assurance |
 | crates.io | Search API at most 1 request/second; sparse/index default 1 attempt/second; static CDN default 5 attempts/second; hourly Git inventory and daily public metadata dump | Search/index/Git evidence, exact archive captures and dump provenance |
 | docs.rs | Exact-version all-target HTML ZIP and per-target rustdoc JSON; default 1 attempt/second, one transfer, daily revalidation | Raw artifacts, observed formats/targets, inert text/API projections and processing coverage |
-| RustSec | Fixed official GitHub head then immutable codeload bundle; 24-hour freshness | Head capture/revision, bundle capture, notices |
+| RustSec | Fixed official GitHub head then immutable codeload bundle; hourly revalidation, 24-hour freshness | Head capture/revision, bundle capture, notices |
+| RustSec history/OSV | Daily full official HTTPS Git branch/tag synchronization | Ref manifests, all reachable objects/parents, raw representations and notices |
 
 API/docs.rs hosts retain at most one attempt/second. Official Git/sparse-index and
 static.crates.io budgets are independently configurable; defaults are one and five
@@ -28,6 +29,10 @@ are not recorded as absence. Valid stale public captures can be returned through
 seven days with their original validation time; older data is unavailable/incomplete.
 RustSec snapshots older than 24 hours are explicitly stale. Requested historical
 captures are fixed evidence, not claims of current completeness.
+RustSec reads use published local snapshots; collection owns provider traffic.
+Historical assessment returns supported findings with incomplete coverage rather
+than claiming current completeness. Current maintenance requires a successful
+validation and does not report stale fallback as refresh success.
 Documentation/API freshness uses the original docs.rs capture's validation time,
 not the lifetime of its derived text. Default queries reject selected documentation
 older than seven days; explicit historical snapshots and capture resources remain
@@ -85,6 +90,22 @@ docs.rs hosting does not relicense packages. HTML and JSON are untrusted data an
 never cause local `cargo doc`, rustdoc, package builds or executable loading.
 
 ## Terms and evidence
+
+RustSec history uses only `https://github.com/rustsec/advisory-db.git` smart-HTTP
+advertisement/upload-pack operations through the private relay. It fetches advertised
+branches and tags with full ancestry, excluding pull-request/internal namespaces.
+GitHub attempts remain bounded to one per second, sharing the host clock and retry
+owner. No repository checkout, submodule, hook, credential helper, bundle redirect,
+or arbitrary destination is allowed. Previously observed roots remain retained
+after ref movement/deletion; already-unreachable upstream objects are unobserved.
+
+The official `osv` branch is normalized against the
+[OSV schema](https://github.com/ossf/osv-schema/blob/main/docs/schema.md), preserving
+extensions, original JSON and per-record notices. Only supported crates.io SEMVER
+and explicit-version constraints are assessed. Uninterpreted constraints remain
+gaps. Canonical RustSec and OSV exports are distinct representations and are never
+unioned into duplicate vulnerability findings. Rendered site content remains inert
+raw evidence.
 
 Follow [crates.io data access](https://crates.io/data-access),
 [Cargo index format](https://doc.rust-lang.org/cargo/reference/registry-index.html),

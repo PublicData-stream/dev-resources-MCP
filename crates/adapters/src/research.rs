@@ -13,6 +13,7 @@ use std::{
 pub struct Research {
     retrieval: Arc<Retrieval>,
     advisory: advisory::Advisories,
+    advisory_research: Option<crate::advisory_research::AdvisoryResearch>,
     corpus: Option<std::sync::Arc<RfcCorpus>>,
     crate_corpus: Option<std::sync::Arc<crate::CrateCorpus>>,
 }
@@ -101,6 +102,7 @@ impl Research {
     pub async fn new(retrieval: Arc<Retrieval>) -> Result<Self> {
         Ok(Self {
             advisory: advisory::Advisories::new(retrieval.clone()),
+            advisory_research: None,
             retrieval,
             corpus: None,
             crate_corpus: None,
@@ -115,12 +117,30 @@ impl Research {
         self.crate_corpus = Some(corpus);
         self
     }
+    pub fn with_advisory_corpus(mut self, corpus: Arc<crate::AdvisoryCorpus>) -> Self {
+        self.advisory_research = Some(crate::advisory_research::AdvisoryResearch::new(
+            corpus.store.clone(),
+        ));
+        self.advisory = self.advisory.with_corpus(corpus);
+        self
+    }
 
     pub async fn refresh_advisories(&self) -> Result<Value> {
         self.advisory.refresh().await
     }
 
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if crate::advisory_research::schemas()
+            .iter()
+            .any(|schema| schema["name"] == tool)
+        {
+            return self
+                .advisory_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Advisory corpus storage is not configured."))?
+                .call(tool, input)
+                .await;
+        }
         if crate::crate_research::schemas()
             .iter()
             .any(|s| s["name"].as_str() == Some(tool))
@@ -308,6 +328,14 @@ impl Research {
                 json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":output["page"]["text"]}]}),
             );
         }
+        if url.host_str() == Some("advisory") {
+            return self
+                .advisory_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Advisory corpus storage is not configured."))?
+                .read_resource(uri)
+                .await;
+        }
         if url.host_str() == Some("rfc") {
             let input = rfc_tools::format_from_uri(&url)?;
             let value = rfc_tools::format_get(
@@ -477,17 +505,18 @@ fn schemas() -> Vec<Value> {
     add(
         "advisory_lookup",
         "Match RustSec advisories to a crates.io package/version. Reports stale, withdrawn and informational advisory state explicitly.",
-        json!({"name":text,"version":text,"advisory_snapshot":capture,"offset":offset,"limit":limit}),
+        json!({"name":text,"version":text,"advisory_snapshot":capture,"format":{"enum":["rustsec","osv"],"default":"rustsec"},"offset":offset,"limit":limit}),
         vec!["name", "version"],
     );
     add(
         "audit_lockfile",
         "Audit supplied Cargo.lock against a captured RustSec database. Input, dependency lists and results remain request-local. Resubmit input and advisory_snapshot for pagination.",
-        json!({"lockfile":{"type":"string","minLength":1,"maxLength":1048576},"advisory_snapshot":capture,"offset":offset,"limit":limit}),
+        json!({"lockfile":{"type":"string","minLength":1,"maxLength":1048576},"advisory_snapshot":capture,"format":{"enum":["rustsec","osv"],"default":"rustsec"},"offset":offset,"limit":limit}),
         vec!["lockfile"],
     );
     tools.extend(rfc_tools::schemas());
     tools.extend(crate::crate_research::schemas());
+    tools.extend(crate::advisory_research::schemas());
     tools
 }
 #[derive(Deserialize)]

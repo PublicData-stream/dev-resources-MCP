@@ -97,8 +97,21 @@ impl AdvisoryStore for PgBlobStore {
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let identities: Vec<_> = records.iter().map(|(id, _)| id.clone()).collect();
+        let existing: std::collections::HashSet<String> =
+            sqlx::query_scalar("SELECT id FROM devres_advisory_records WHERE id=ANY($1::text[])")
+                .bind(&identities)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?
+                .into_iter()
+                .collect();
+        let new_records: Vec<_> = records
+            .iter()
+            .filter(|(id, _)| !existing.contains(id))
+            .collect();
         // Chunking avoids giant SQL parameters while all memberships remain atomic.
-        for chunk in records.chunks(250) {
+        for chunk in new_records.chunks(250) {
             let ids: Vec<_> = chunk.iter().map(|(id, _)| id.clone()).collect();
             let data: Vec<_> = chunk.iter().map(|(_, v)| Json(v.clone())).collect();
             sqlx::query("INSERT INTO devres_advisory_records(id,data) SELECT * FROM UNNEST($1::text[],$2::jsonb[]) ON CONFLICT DO NOTHING")

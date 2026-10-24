@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -73,6 +73,7 @@ pub enum BulkSource {
         operation: DocsOperation,
     },
     RegistryGit(GitOperation),
+    RustSecGit(GitOperation),
 }
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
@@ -100,6 +101,8 @@ impl BulkSource {
                 };
                 Ok(format!("https://docs.rs/crate/{name}/{version}/{suffix}"))
             }
+            Self::RustSecGit(GitOperation::Advertisement) => Ok("https://github.com/rustsec/advisory-db.git/info/refs?service=git-upload-pack".into()),
+            Self::RustSecGit(GitOperation::UploadPack) => Ok("https://github.com/rustsec/advisory-db.git/git-upload-pack".into()),
             Self::RegistryGit(GitOperation::Advertisement) => Ok("https://github.com/rust-lang/crates.io-index.git/info/refs?service=git-upload-pack".into()),
             Self::RegistryGit(GitOperation::UploadPack) => Ok("https://github.com/rust-lang/crates.io-index.git/git-upload-pack".into()),
         }
@@ -108,15 +111,17 @@ impl BulkSource {
         match self {
             Self::DatabaseDump | Self::CrateArchive { .. } => "static.crates.io",
             Self::Documentation { .. } => "docs.rs",
-            Self::RegistryGit(_) => "github.com",
+            Self::RegistryGit(_) | Self::RustSecGit(_) => "github.com",
         }
     }
     fn media_type(&self) -> &'static str {
         match self {
-            Self::RegistryGit(GitOperation::Advertisement) => {
+            Self::RegistryGit(GitOperation::Advertisement)
+            | Self::RustSecGit(GitOperation::Advertisement) => {
                 "application/x-git-upload-pack-advertisement"
             }
-            Self::RegistryGit(GitOperation::UploadPack) => "application/x-git-upload-pack-result",
+            Self::RegistryGit(GitOperation::UploadPack)
+            | Self::RustSecGit(GitOperation::UploadPack) => "application/x-git-upload-pack-result",
             Self::Documentation {
                 operation: DocsOperation::Status,
                 ..
@@ -187,6 +192,8 @@ pub struct BulkBroker {
     bulk_slots: Arc<Semaphore>,
     foreground_slots: Arc<Semaphore>,
     documentation_slots: Arc<Semaphore>,
+    attempt_budget: Option<usize>,
+    attempts: AtomicUsize,
     #[cfg(test)]
     test_origin: Option<url::Url>,
 }
@@ -231,9 +238,23 @@ impl BulkBroker {
             documentation_slots: Arc::new(Semaphore::new(1)),
             rates: Mutex::new(HashMap::new()),
             config,
+            attempt_budget: None,
+            attempts: AtomicUsize::new(0),
             #[cfg(test)]
             test_origin: None,
         })
+    }
+
+    /// Private acceptance harness bound; normal serving has no global attempt cap.
+    pub fn with_attempt_budget(mut self, limit: usize) -> Result<Self> {
+        if limit == 0 || limit > 1_000_000 {
+            return Err(Error::invalid("Invalid source attempt budget."));
+        }
+        self.attempt_budget = Some(limit);
+        Ok(self)
+    }
+    pub fn attempt_count(&self) -> usize {
+        self.attempts.load(Ordering::Acquire)
     }
 
     /// Existing bounded fetches use this same host clock, with their own two slots.
@@ -241,6 +262,14 @@ impl BulkBroker {
         self.admit(host, false).await
     }
     async fn admit(&self, host: &str, bulk: bool) -> Result<AttemptPermit> {
+        self.admit_rate(host, bulk, None).await
+    }
+    async fn admit_rate(
+        &self,
+        host: &str,
+        bulk: bool,
+        forced_rate: Option<u32>,
+    ) -> Result<AttemptPermit> {
         let host = admitted_host(host)?;
         let documentation = if host == "docs.rs" {
             Some(
@@ -267,11 +296,11 @@ impl BulkBroker {
             let mut rates = self.rates.lock().await;
             let now = Instant::now();
             let scheduled = rates.get(host).copied().unwrap_or(now).max(now);
-            let per_second = match host {
+            let per_second = forced_rate.unwrap_or(match host {
                 "static.crates.io" => self.config.static_requests_per_second,
                 "index.crates.io" | "github.com" => self.config.index_requests_per_second,
                 _ => self.config.other_requests_per_second,
-            };
+            });
             rates.insert(
                 host.to_owned(),
                 scheduled + Duration::from_secs_f64(1.0 / f64::from(per_second)),
@@ -279,6 +308,15 @@ impl BulkBroker {
             scheduled
         };
         tokio::time::sleep_until(scheduled).await;
+        self.attempts
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                if self.attempt_budget.is_some_and(|limit| count >= limit) {
+                    None
+                } else {
+                    count.checked_add(1)
+                }
+            })
+            .map_err(|_| Error::capacity("Source attempt budget exhausted."))?;
         Ok(AttemptPermit {
             _transfer: transfer,
             _documentation: documentation,
@@ -299,6 +337,7 @@ impl BulkBroker {
         let upload = matches!(
             request.source,
             BulkSource::RegistryGit(GitOperation::UploadPack)
+                | BulkSource::RustSecGit(GitOperation::UploadPack)
         );
         if request.body.len() > 1024 * 1024 || (!upload && !request.body.is_empty()) {
             return Err(Error::invalid("Invalid bulk request body."));
@@ -319,7 +358,11 @@ impl BulkBroker {
             let permit = bounded(
                 &shutdown,
                 request.deadline,
-                self.admit(request.source.host(), true),
+                self.admit_rate(
+                    request.source.host(),
+                    true,
+                    matches!(request.source, BulkSource::RustSecGit(_)).then_some(1),
+                ),
             )
             .await?;
             let mut builder = if upload {
@@ -328,7 +371,10 @@ impl BulkBroker {
                 self.client.get(&url)
             };
             builder = builder.header(reqwest::header::ACCEPT, request.source.media_type());
-            if matches!(request.source, BulkSource::RegistryGit(_)) {
+            if matches!(
+                request.source,
+                BulkSource::RegistryGit(_) | BulkSource::RustSecGit(_)
+            ) {
                 builder = builder.header("Git-Protocol", "version=2");
                 if upload {
                     builder = builder.header(
@@ -1232,5 +1278,61 @@ mod tests {
         release_send.send(()).unwrap();
         done_receive.await.unwrap();
         assert_eq!(store.accounted_bytes(), Some(64));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn rustsec_git_reserves_one_second_even_when_registry_rate_is_raised() {
+        let broker = BulkBroker::new(BulkConfig {
+            index_requests_per_second: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            BulkSource::RustSecGit(GitOperation::Advertisement)
+                .url()
+                .unwrap(),
+            "https://github.com/rustsec/advisory-db.git/info/refs?service=git-upload-pack"
+        );
+        assert_eq!(
+            BulkSource::RustSecGit(GitOperation::UploadPack)
+                .url()
+                .unwrap(),
+            "https://github.com/rustsec/advisory-db.git/git-upload-pack"
+        );
+        let started = Instant::now();
+        let _rustsec = broker
+            .admit_rate("github.com", true, Some(1))
+            .await
+            .unwrap();
+        let _registry = broker.admit_foreground("github.com").await.unwrap();
+        assert!(Instant::now().duration_since(started) >= Duration::from_secs(1));
+        let _second = broker
+            .admit_rate("github.com", true, Some(1))
+            .await
+            .unwrap();
+        let next = broker.rates.lock().await["github.com"];
+        assert!(next.duration_since(Instant::now()) >= Duration::from_secs(1));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn explicit_attempt_budget_is_shared_by_foreground_and_bulk() {
+        let broker = BulkBroker::new(BulkConfig::default())
+            .unwrap()
+            .with_attempt_budget(2)
+            .unwrap();
+        let _foreground = broker.admit_foreground("api.github.com").await.unwrap();
+        let _bulk = broker
+            .admit_rate("github.com", true, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(broker.attempt_count(), 2);
+        assert_eq!(
+            broker
+                .admit_foreground("codeload.github.com")
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "capacity"
+        );
+        assert_eq!(broker.attempt_count(), 2);
     }
 }

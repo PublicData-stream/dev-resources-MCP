@@ -123,6 +123,26 @@ snapshot. Requests never rebuild indexes or launch collection work.
 
 ## Privacy and isolation
 
+RustSec has independent supervised current/archive and Git-history lanes. Application
+ports own public snapshot/freshness policy; adapters acquire and normalize sources.
+Public research and assessment never initiate acquisition. Current archive parsing
+must succeed before the default pointer moves. Immutable membership hashes/counts
+reject replacement, append and reordering under an existing snapshot ID.
+
+The Git history lane reuses the mediated Git subprocess/transport boundary, with
+separate full branch/tag manifests and a bare repository under `rustsec-history`.
+Permanent packs/manifests can reconstruct disposable Git state without network.
+Ref observations, commit parents and parsing generations remain distinct. Backfill
+checkpoints member progress, deduplicates parsed content, and preserves raw records
+when supported normalization fails. Acquisition completeness, finished processing,
+projection completeness and assessment freshness are separate states.
+
+RustSec main archives and OSV exports have separate snapshots/matchers. OSV is used
+only when explicitly selected for assessment; an imported ancestor never becomes
+fresh because it was processed recently. Research admission bounds concurrent
+snapshot materialization; search/parser admission remains held by blocking workers
+through cancellation. Captured text and references remain inert.
+
 Audit text goes directly from request dispatch to bounded in-memory parsing and
 matching against a public RustSec snapshot in a fixed private analysis helper.
 The helper is killed when its owning request is canceled or times out; no package

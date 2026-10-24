@@ -6,7 +6,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls`, `limits`, `rfc`, and `crates` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, `rfc`, `crates`, and `rustsec` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -142,6 +142,37 @@ failures remain explicit search gaps; they do not discard retained source bodies
 
 `limits.rate_limit` defaults to enabled with 100 calls/second and burst 100.
 An optional `verified_tunnel` calls-per-second/burst override requires edge mTLS.
+## RustSec defaults
+
+Omitting `[rustsec]` enables supervised current-advisory collection and full Git
+history processing. `enabled=false` pauses both lanes without deleting retained
+evidence; local research and bounded legacy-capture recovery remain available.
+Disposable harnesses explicitly disable this collector too.
+
+| `rustsec` field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Supervised collection and history processing |
+| `current_refresh_secs` | `3600` | Official main head/archive revalidation target |
+| `history_refresh_secs` | `86400` | Full official branch/tag synchronization target |
+| `collection_interval_secs` | `1` | Delay between resumable worker iterations |
+| `max_git_bytes` | `8589934592` | Disposable bare repository bound, 8 GiB |
+| `min_free_bytes` | `1073741824` | Free-space reserve for history acquisition |
+| `max_archive_storage_bytes` | omitted | Optional quota for permanent Git-history artifacts |
+
+Intervals accept 1..31622400 seconds; Git storage accepts 1 MiB..128 GiB. The reserve
+must be at least 64 MiB; a configured artifact quota must be at least the reserve.
+This history-artifact quota excludes PostgreSQL projections and current generic
+head/archive captures, which retain their existing storage accounting. Limits pause
+new work and never authorize deletion of permanent evidence.
+
+RustSec Git attempts use at most one attempt/second on the shared GitHub host clock,
+including retries. History runs one processing worker, with up to 1,000 commits or
+15 seconds per iteration and resumable member checkpoints. Git acquisition has a
+one-hour budget; manifests cap at 4 MiB, advertised refs at 10,000, commits at
+1,000,000 and tree members at 100,000. Advisory records cap at 1 MiB each and 64 MiB
+per representation snapshot; raw Git retention and successful projection are
+separate coverage states. No full-corpus capacity benchmark is implied.
+
 These limits regulate callers, not provider traffic. Upstream attempts have their
 own source-specific host budgets. Existing foreground retrieval retains a
 two-transfer bound; private crate acquisition has its separately configured bulk
