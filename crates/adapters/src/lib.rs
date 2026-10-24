@@ -3,6 +3,8 @@ mod advisory;
 mod archive;
 pub mod bulk;
 mod cargo;
+pub mod crate_docs;
+pub mod crate_dump;
 pub mod crate_git;
 mod network;
 mod research;

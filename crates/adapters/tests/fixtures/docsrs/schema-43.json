@@ -1,0 +1,159 @@
+{
+  "root": 0,
+  "crate_version": "1.2.3",
+  "includes_private": false,
+  "index": {
+    "0": {
+      "id": 0,
+      "crate_id": 0,
+      "name": "renamed_library",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "module": {
+          "is_crate": true,
+          "items": [
+            1,
+            2,
+            4
+          ],
+          "is_stripped": false
+        }
+      }
+    },
+    "1": {
+      "id": 1,
+      "crate_id": 0,
+      "name": "hidden",
+      "span": null,
+      "visibility": "default",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "module": {
+          "is_crate": false,
+          "items": [
+            3
+          ],
+          "is_stripped": false
+        }
+      }
+    },
+    "2": {
+      "id": 2,
+      "crate_id": 0,
+      "name": "alias",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "hidden::work",
+          "name": "alias",
+          "id": 3,
+          "is_glob": false
+        }
+      }
+    },
+    "3": {
+      "id": 3,
+      "crate_id": 0,
+      "name": "work",
+      "span": null,
+      "visibility": "public",
+      "docs": "Compute a value. Never execute this example.",
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "function": {
+          "sig": {
+            "inputs": [
+              [
+                "value",
+                {
+                  "primitive": "u32"
+                }
+              ]
+            ],
+            "output": {
+              "primitive": "u32"
+            },
+            "is_c_variadic": false
+          },
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "header": {
+            "is_const": false,
+            "is_unsafe": false,
+            "is_async": false,
+            "abi": "Rust"
+          },
+          "has_body": true
+        }
+      }
+    },
+    "4": {
+      "id": 4,
+      "crate_id": 0,
+      "name": "PublicType",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [
+        "#[non_exhaustive]"
+      ],
+      "deprecation": null,
+      "inner": {
+        "struct": {
+          "kind": "unit",
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "impls": []
+        }
+      }
+    }
+  },
+  "paths": {
+    "0": {
+      "crate_id": 0,
+      "path": [
+        "renamed_library"
+      ],
+      "kind": "module"
+    },
+    "3": {
+      "crate_id": 0,
+      "path": [
+        "renamed_library",
+        "hidden",
+        "work"
+      ],
+      "kind": "function"
+    },
+    "4": {
+      "crate_id": 0,
+      "path": [
+        "renamed_library",
+        "PublicType"
+      ],
+      "kind": "struct"
+    }
+  },
+  "external_crates": {},
+  "format_version": 43
+}
