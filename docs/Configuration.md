@@ -56,6 +56,13 @@ Individual tokens must be shorter than 65,530 bytes. Indexes cap at 32 GiB and
 coverage gaps. Parsing/search workers check 15-second budgets; individual search
 engine operations are not preemptible. No full-corpus capacity benchmark is implied.
 
+Errata JSON is streamed with at most 50,000 records, 256 KiB per raw record,
+64 top-level fields and bounded nested structure. Unsupported advertised formats
+remain visible in metadata and coverage rather than being counted as captured.
+HTML extraction feeds 4 KiB chunks, limits unfinished tokens to 16 KiB, attributes
+to 128 per tag, nesting to 256, tags to 200,000 and tokens to 500,000. These are
+explicit rejection boundaries; scripts, styles and external resources are inert.
+
 | `limits` field | Default |
 | --- | --- |
 | `max_message_bytes` | 8 MiB |

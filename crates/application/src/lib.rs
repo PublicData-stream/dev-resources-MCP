@@ -429,4 +429,70 @@ mod tests {
             "unavailable"
         );
     }
+
+    #[tokio::test]
+    async fn foreground_priority_releases_on_cancellation_without_background_io() {
+        struct Blocked {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Fetcher for Blocked {
+            async fn fetch(
+                &self,
+                _: &FetchRequest,
+                _: Option<&Validators>,
+            ) -> Result<FetchResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(FetchResponse {
+                    status: 200,
+                    body: b"public fixture".to_vec(),
+                    validators: Validators::default(),
+                })
+            }
+        }
+        struct Valid;
+        #[async_trait]
+        impl ResponseValidator for Valid {
+            async fn validate(
+                &self,
+                _: &FetchRequest,
+                response: FetchResponse,
+            ) -> Result<FetchResponse> {
+                Ok(response)
+            }
+        }
+        let fetcher = Arc::new(Blocked {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let retrieval = Arc::new(Retrieval::new(
+            Arc::new(MemoryStore::default()),
+            fetcher.clone(),
+        ));
+        let foreground = retrieval.clone();
+        let task = tokio::spawn(async move { foreground.get(request()).await });
+        fetcher.entered.notified().await;
+        assert!(retrieval.foreground_active());
+        assert_eq!(
+            retrieval
+                .get_background_validated(request(), &Valid)
+                .await
+                .unwrap_err()
+                .code,
+            "capacity"
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!retrieval.foreground_active());
+        let mut invalid = request();
+        invalid.max_bytes = 0;
+        assert!(retrieval.get(invalid).await.is_err());
+        assert!(!retrieval.foreground_active());
+    }
 }

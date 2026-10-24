@@ -172,6 +172,8 @@ staging/reserved headroom. Each file caps at 16 MiB; the total budget must be
 1..128 GiB and the entire import has a 24-hour deadline. SIGINT/SIGTERM cancel it
 and reap the owned child. Missing/failed mirror files remain gaps; deletion never
 removes history. Unauthenticated rsync evidence never replaces HTTPS heads.
+The staging monitor checks every 250 ms and can overshoot the transfer budget
+between checks; oversize imports are rejected and per-file headroom is reserved.
 
 Startup removes recognized abandoned index staging directories while holding the
 exclusive storage fence; it never deletes published index directories. If a derived
