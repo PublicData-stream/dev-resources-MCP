@@ -152,6 +152,41 @@ a previously verified digest through a separately authorized deployment operatio
 
 ## Persistent operation and recovery
 
+RFC collection is enabled when `[rfc]` is omitted. To pause scheduling, set
+`enabled = false` in `[rfc]` and restart; retained jobs/captures remain intact.
+The tracked edge/minikube harness explicitly pauses collection. `rfc_corpus_status`
+reports missing representations, failures and the default snapshot; `latest_partial`
+identifies newer incomplete evidence for explicit queries. Coverage is observed
+evidence, not proof of whole-provider coverage.
+
+For an explicitly requested bulk bootstrap, stop serving first and invoke:
+
+```sh
+devres-server import-rfcs /etc/devres/server.toml --max-bytes 8589934592
+```
+
+This private command opts into the fixed official rsync mirror over TCP 873. It
+requires `/usr/bin/rsync` (included in server/combined images), metadata/errata HTTPS
+access, at most 1 MiB/second transfer, and disk for twice the byte budget plus
+staging/reserved headroom. Each file caps at 16 MiB; the total budget must be
+1..128 GiB and the entire import has a 24-hour deadline. SIGINT/SIGTERM cancel it
+and reap the owned child. Missing/failed mirror files remain gaps; deletion never
+removes history. Unauthenticated rsync evidence never replaces HTTPS heads.
+
+Startup removes recognized abandoned index staging directories while holding the
+exclusive storage fence; it never deletes published index directories. If a derived
+index is corrupt, stop serving and run `devres-server rebuild-rfc-index CONFIG.toml`.
+This creates a new immutable snapshot from archived source captures without using
+the corrupt base. The older snapshot remains immutable and fails explicitly if its
+files are damaged. Keep the original archive for investigation.
+
+Schema v2 upgrades are forward-only. Take a coordinated database/blob backup before
+upgrading. Include `rfc-indexes`; restore snapshots with their exact derived manifests
+and source captures. To roll back to v1 software, restore a matching pre-upgrade
+database and blobs in isolation rather than downgrading tables. Fixture checks and
+bounded live smoke establish neither production capacity nor real full-corpus
+acquisition. All live acceptance runs keep collection paused.
+
 Deploy one serving replica with Recreate updates. PostgreSQL 18 and the blob
 filesystem are one logical backup unit. Provision both before starting the service.
 Stop the server and any maintenance writers before taking a PostgreSQL dump and

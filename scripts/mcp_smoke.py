@@ -166,6 +166,8 @@ def live(client):
     # No user-supplied package, URL, lockfile, or bulk enumeration is accepted.
     started = time.monotonic()
     signal.alarm(300)
+    status = client.tool("rfc_corpus_status", {})
+    assert status.get("collection_enabled") is False, "bounded live smoke requires paused automatic RFC collection"
     rfc_search = client.tool("rfc_search", {"query": "QUIC", "offset": 0, "limit": 3})
     assert rfc_search.get("items") and rfc_search.get("total", 0) > 0, "RFC discovery returned no matching documents"
     assert rfc_search.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/rfc-index.xml", "RFC discovery did not use the canonical index"
@@ -173,6 +175,20 @@ def live(client):
     assert rfc.get("id") == "rfc:9000", "wrong RFC identity"
     assert rfc.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/rfc/rfc9000.txt"
     assert "9000" in rfc.get("page", {}).get("text", "") and "QUIC" in rfc["page"]["text"], "RFC response did not contain the selected document"
+    metadata_rfc = client.tool("rfc_metadata", {"number": 9000})
+    assert metadata_rfc.get("metadata", {}).get("number") == 9000
+    assert metadata_rfc.get("snapshot"), "RFC metadata did not pin a snapshot"
+    for format_name in ("txt", "html", "xml", "pdf"):
+        representation = client.tool("rfc_format_get", {"number": 9000, "format": format_name, "limit": 1024})
+        assert representation.get("format") == format_name and representation.get("assurance") == "https"
+        captured = representation.get("capture", {}).get("id")
+        assert captured, "RFC format omitted its capture"
+        pinned = client.tool("rfc_format_get", {"number": 9000, "format": format_name, "capture": captured, "limit": 1024})
+        assert pinned == representation, "capture-pinned RFC format changed"
+    errata_rfc = client.tool("rfc_errata", {"number": 9000, "limit": 1})
+    assert errata_rfc.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/errata.json"
+    fulltext_rfc = client.tool("rfc_fulltext_search", {"query": "multiplexed", "limit": 3})
+    assert fulltext_rfc.get("snapshot") and any(item.get("number") == 9000 for item in fulltext_rfc.get("items", [])), "fixed RFC text did not enter the partial search snapshot"
     crate_search = client.tool("crate_search", {"query": "itoa", "offset": 0, "limit": 3})
     assert crate_search.get("items") and crate_search.get("total", 0) > 0, "crate discovery returned no packages"
     metadata = client.tool("crate_metadata", {"name": "itoa", "version": "1.0.15"})

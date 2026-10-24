@@ -97,6 +97,7 @@ async fn main() -> Result<(), ServerError> {
     if !instructions.contains("AGPL-3.0-only") {
         return Err("missing license offer".into());
     }
+    let mut has_rfc_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -115,6 +116,11 @@ async fn main() -> Result<(), ServerError> {
             json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
         )
         .await?;
+        if method == "tools/list" {
+            has_rfc_corpus = value["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "rfc_corpus_status"));
+        }
         if method == "tools/list"
             && !value["result"]["tools"]
                 .as_array()
@@ -132,6 +138,22 @@ async fn main() -> Result<(), ServerError> {
             if !instructions.contains(source) {
                 return Err("source offer mismatch".into());
             }
+        }
+    }
+    if has_rfc_corpus {
+        let mut params = json!({"name":"rfc_corpus_status","arguments":{}});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let result = exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":params}),
+        )
+        .await?;
+        if !result["result"]["structuredContent"]["collection_enabled"].is_boolean() {
+            return Err("RFC corpus status was not available through WebTransport".into());
         }
     }
     connection.close(0_u32.into(), b"probe complete");

@@ -41,6 +41,13 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | `fetch` | `rfc:<number>`, `crate:<name>@<version>`, or immutable `devres://` resource URI |
 | `rfc_search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc_get` | RFC number and byte page; published text |
+| `rfc_metadata` | RFC number, optional research snapshot; rich official metadata |
+| `rfc_catalog_search` | Metadata query, conjunctive filters and snapshot-based paging |
+| `rfc_fulltext_search` | Technical AND tokens or English phrases/OR/exclusions; filters, assurance and pinned snapshot |
+| `rfc_format_get` | RFC number, txt/html/xml/pdf, optional capture; source text or base64 PDF byte page |
+| `rfc_errata` | RFC number, optional status/type and snapshot; original errata records |
+| `rfc_series_get` | STD/BCP/FYI number and snapshot; constituent RFC metadata |
+| `rfc_corpus_status` | Aggregate collection, freshness, failures and snapshot coverage; no administrative controls |
 | `crate_search` | Query and page; bounded upstream crate search |
 | `crate_metadata` | Exact crate name/version; dependency declarations, features, yanked state, checksum |
 | `crate_source_list` | Exact crate version; verified source file listing |
@@ -54,6 +61,32 @@ List pages default to 20 entries and cap at 100. Text pages cap at 32 KiB and co
 UTF-8 bytes; offsets must be character boundaries. Reuse returned capture IDs for
 stable pagination. Search sources have separate ranking/paging, not one global rank.
 Direct dependencies are declarations, not a solved transitive graph.
+
+RFC research filters combine with AND: status, author substring, keyword substring,
+stream, area, working group, series membership and inclusive `YYYY-MM` publication
+bounds. Missing publication precision cannot satisfy a date bound. RFC query and
+filter strings cap at 256 Unicode characters. Generic `search` remains metadata-only.
+
+Full-text defaults to lowercase technical tokens with document-level AND. English
+mode adds stemming and stopwords and accepts quoted phrases, `OR`, and minus
+exclusions. Field/range/regex/wildcard syntax is unsupported. Reuse the returned
+snapshot for stable pages; ranking is score descending then RFC number ascending.
+TXT supplies searchable text, with inert XML/HTML fallback; PDF text extraction is
+unsupported. Coverage identifies missing or unextractable documents.
+
+Collection starts automatically while serving and is resumable. Serving remains
+ready during bootstrap; research exposes immutable partial snapshots. Once a complete
+snapshot exists, it remains the default until a newer complete one is published;
+status exposes newer partial IDs for explicit selection. Snapshot completeness
+describes coverage at publication. An expired default snapshot is unavailable;
+explicit historical snapshots remain readable. Rsync evidence has separate provenance
+and lower assurance. Research prefers HTTPS and labels rsync fallback; legacy RFC
+tools exclusively use HTTPS.
+
+`devres://rfc/<number>/<format>/<capture>` provides typed format resources with
+optional offset/limit. PDF pages contain base64-encoded bytes; other formats are
+inert source text. Decoded PDF pages cap at 32 KiB. Generic capture resources reject
+PDF and archive binaries even if their bytes happen to be valid UTF-8.
 
 `devres://capture/<id>` reads public capture text. `devres://source/...` identifies
 verified source content pinned to both metadata and archive captures. Binary

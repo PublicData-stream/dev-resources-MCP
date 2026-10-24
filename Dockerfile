@@ -3,6 +3,7 @@ FROM rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b65
 RUN apt-get update && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
+ENV CARGO_TARGET_DIR=/buildcache/rust/target
 COPY . .
 RUN cargo build --workspace --bins --release --locked --jobs 2
 RUN python3 scripts/collect-notices.py /notices
@@ -19,19 +20,23 @@ USER 65532:65532
 WORKDIR /data
 
 FROM runtime-base AS probe
-COPY --from=build /src/target/release/devres-probe /usr/local/bin/
+COPY --from=build /buildcache/rust/target/release/devres-probe /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/devres-probe"]
 
 FROM runtime-base AS audit-worker
-COPY --from=build /src/target/release/devres-audit-worker /usr/local/bin/
+COPY --from=build /buildcache/rust/target/release/devres-audit-worker /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/devres-audit-worker"]
 
 FROM runtime-base AS server
-COPY --from=build /src/target/release/devres-server /src/target/release/devres-audit-worker /usr/local/bin/
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends rsync \
+    && rm -rf /var/lib/apt/lists/*
+USER 65532:65532
+COPY --from=build /buildcache/rust/target/release/devres-server /buildcache/rust/target/release/devres-audit-worker /usr/local/bin/
 EXPOSE 8080/tcp 4433/udp
 ENTRYPOINT ["/usr/local/bin/devres-server"]
 CMD ["/etc/devres/server.toml"]
 
 # Preserve the original combined image for an unqualified docker build.
 FROM server AS runtime
-COPY --from=build /src/target/release/devres-probe /usr/local/bin/
+COPY --from=build /buildcache/rust/target/release/devres-probe /usr/local/bin/

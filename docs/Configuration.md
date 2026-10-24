@@ -6,7 +6,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls` and `limits` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, and `rfc` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -30,6 +30,31 @@ or verified by the server; a syntactically valid offer is not evidence that the
 corresponding source is actually available.
 
 ## Resource defaults
+
+The optional `[rfc]` table defaults to automatic permanent corpus collection:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Enable supervised collection; false pauses scheduling across restart, preserving jobs and history |
+| `index_refresh_secs` | `86400` | Official metadata refresh interval |
+| `errata_refresh_secs` | `86400` | Official errata refresh interval |
+| `body_refresh_secs` | `86400` | Conditional representation revalidation interval |
+| `collection_interval_secs` | `1` | Minimum delay between worker iterations; does not increase shared provider limits |
+
+Intervals must be 1..31622400 seconds. Catalogue and errata refresh continue while
+body sweeps are backlogged. A configured interval is a scheduling target rather than
+a freshness guarantee. The shared one-attempt/second HTTPS budget and two-transfer
+limit remain in force. Foreground tools remain available when collection is paused.
+Disposable harnesses explicitly set `enabled=false`, including bounded live checks.
+Existing operator configurations that omit `[rfc]` now collect automatically.
+
+RFC index and errata bodies cap at 64 MiB; each document representation and derived
+text caps at 16 MiB. Catalogue parsing caps at 50,000 RFCs. Search has one 64 MiB
+indexing writer and at most two readers; the writer budget is not a process RSS limit.
+Individual tokens must be shorter than 65,530 bytes. Indexes cap at 32 GiB and
+10,000 files with a 2 MiB integrity manifest. Processing budget failures are explicit
+coverage gaps. Parsing/search workers check 15-second budgets; individual search
+engine operations are not preemptible. No full-corpus capacity benchmark is implied.
 
 | `limits` field | Default |
 | --- | --- |

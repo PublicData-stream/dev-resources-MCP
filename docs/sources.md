@@ -8,7 +8,7 @@ reserves its source rate slot. At most two HTTP transfers run concurrently.
 
 | Source | Access and freshness | Permanent evidence |
 | --- | --- | --- |
-| RFC Editor | [Official XML metadata index](https://www.rfc-editor.org/rfc-index.xml) and selected RFC text; 24-hour freshness | Raw bodies, source URL, content hash, observation times |
+| RFC Editor | [Official XML metadata index](https://www.rfc-editor.org/rfc-index.xml), errata JSON, and advertised TXT/HTML/XML/PDF; default 24-hour refresh | All observed valid bodies, source URL, content hash, observation times and transport assurance |
 | crates.io | Search API at most 1 request/second; sparse index for version/dependency/checksum data; CDN for exact archives; one-hour freshness | Index/search/archive captures and provenance |
 | RustSec | Fixed official GitHub head then immutable codeload bundle; 24-hour freshness | Head capture/revision, bundle capture, notices |
 
@@ -26,7 +26,8 @@ The RFC index endpoint was checked on 2026-10-24: the root `rfc-index.xml`
 returns XML; the older `/in-notes/rfc-index.xml` returns 404. Keep endpoint tests
 and source profiles aligned with actual official responses.
 
-RFC search is metadata search, not full-body search. Status, updates, and obsolescence
+Legacy RFC search remains metadata search. Dedicated research tools add local
+full-text search. Status, updates, and obsolescence
 are metadata, not an instruction to replace requested RFC text. Crate source browsing
 verifies a published archive against the selected index checksum, rejects unsafe
 archive members, and does not follow repository URLs from package metadata.
@@ -50,5 +51,15 @@ provider endorsement, or permission for bulk ingestion. RustSec Git snapshots ma
 Only an exact first header matching the captured immutable revision is admitted;
 crate archives keep their stricter special-member policy.
 
-No scheduled full crawler,
-corpus index, or provider synchronization daemon is part of this foundation.
+RFC Editor has a supervised, resumable corpus collector and immutable local search
+snapshots. This exception does not introduce collection daemons for other providers.
+The collector enumerates official metadata, constructs fixed source URLs and archives
+advertised formats. HTTP failures, unsupported formats and processing bounds remain
+explicit gaps; neither a completed sweep nor a zero-result search implies full coverage.
+
+The private opt-in rsync importer uses `rsync.rfc-editor.org::rfcs` as documented in
+[official bulk-download guidance](https://www.rfc-editor.org/series/rfc-download/).
+Unauthenticated rsync observations have separate source identities and assurance;
+they cannot replace HTTPS heads or count as HTTPS verification. Original RFC text
+is never modified by applying errata. Only observed versions are retained; collection
+cannot reconstruct representations that disappeared before observation.

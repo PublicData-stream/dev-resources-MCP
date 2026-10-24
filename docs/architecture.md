@@ -15,14 +15,16 @@ A trusted provider constructs a bounded FetchRequest with a canonical key and UR
 Application admits work and coalesces requests by key, serves fresh durable cache,
 revalidates with HTTP validators, or fetches a new source representation. Upstream
 I/O is outside database transactions and application bookkeeping locks. Canceled
-owners release their work; there are no detached background refreshes. A waiter can
+owners release their work; request retrieval has no detached refreshes. A waiter can
 become the next owner. The HTTPS adapter alone owns bounded retry and throttling.
 
 The store takes a PostgreSQL session advisory lock at startup and rejects a second
 serving owner. The owner connection never reconnects; losing ownership fails storage
 operations until restart. Deployment must use one replica and Recreate updates.
 PostgreSQL stores immutable representation records, mutable source heads, and
-append-only successful-fetch/revalidation observations. Schema version starts at 1.
+append-only successful-fetch/revalidation observations. Schema version 2 adds
+owner-fenced RFC datasets, resumable jobs, import observations and research snapshot
+manifests. Migration preserves v1 capture identities; older binaries reject v2.
 
 Blobs use SHA-256 filenames in an operator-owned directory. Publication writes a
 unique staging file, fsyncs it, hard-links the immutable object without replacing an
@@ -43,6 +45,31 @@ the latest retained validation observation while preserving original retrieval t
 Existing resource content
 never follows a moving head. Source browsing additionally pins the index capture and
 archive capture; checksum verification precedes archive parsing.
+
+## RFC corpus
+
+Application-owned corpus ports separate durable scheduling from PostgreSQL and
+source processing. A supervised serving worker owns RFC collection independently
+of caller cancellation; it shares retrieval coalescing, provider budgets and the
+single storage owner. Provider failures degrade collection status without stopping
+serving. Maintenance commands return before workers/listeners start.
+
+Immutable catalogue/errata projections reference original captures. Jobs retain
+the latest successful capture across failed refreshes. Snapshot manifests freeze
+raw representations, actual searchable sources, coverage, observations and processor
+version. Publication preserves concurrent updates completed during indexing.
+
+Tantivy indexes whole RFCs with positional technical/English fields. A streaming
+writer processes one captured representation at a time. Immutable committed segments
+and integrity manifests live under `blob_dir/rfc-indexes`; fsync and directory
+publication precede the database pointer. Incremental snapshots retain previous
+segments; referenced search history is never garbage-collected. Failures can leave
+unreferenced derived directories, never missing published archives. Derived indexes
+are rebuildable from captures; corruption fails explicitly.
+
+Rsync imports run privately under the same ownership fence with serving stopped.
+They use separate source keys and import observations, never HTTP validation.
+Snapshots prefer HTTPS per representation and label lower-assurance fallback.
 
 ## Privacy and isolation
 

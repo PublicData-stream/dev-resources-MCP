@@ -14,6 +14,9 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | sqlx | PostgreSQL transactions and explicit bound queries; no runtime SQL from callers, no compile-time database access or macros. Memory-only storage would not meet retention requirements. |
 | SHA-256, hex, fs2 | Content-addressed immutable blobs, exact archive checksum verification, and free-space admission. fs2 provides safe filesystem-space calls rather than adding unsafe local FFI. |
 | quick-xml, tar, flate2 | Streaming official RFC metadata and bounded crate/advisory archives. Neither tar extraction nor link following is used. XML general entities and mixed text need parser tests. |
+| html5ever | Streaming HTML tokenization without a DOM, scripting, network or rendering. Direct tokenization avoids CSS dependencies and checks budgets between feeds. Raw captures remain unchanged; fixtures cover entities and active content. |
+| tantivy 0.27 | Embedded positional search over whole RFCs, avoiding PostgreSQL position limits and a separate daemon. Defaults disabled; enable mmap, stemmer, stopwords and LZ4 only. Trusted index paths/schemas, restricted query syntax and verified immutable manifests contain the boundary. Its indexing, compression, tokenizer and proc-macro graph receives current advisory/license/source checks. |
+| base64, tokio-util | Bounded PDF encoding and managed collector/import cancellation. Existing graph packages become direct dependencies; neither enables caller-selected executables. |
 | rustsec, semver | Maintained canonical advisory parsing and version matching rather than reimplementing affected ranges. Disable rustsec defaults, including Git, index lookup, and automatic fix support. |
 | tracing/subscriber | Aggregate operational logging without request bodies or audit inputs. |
 | rcgen, tempfile | Test-only disposable certificates and storage; not operator certificate provisioning. |
