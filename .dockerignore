@@ -1,0 +1,12 @@
+.git
+.agents
+.codex
+.aws
+target
+**/target
+**/.env
+**/*-key.pem
+**/*.key
+**/*.dump
+**/__pycache__
+.cache

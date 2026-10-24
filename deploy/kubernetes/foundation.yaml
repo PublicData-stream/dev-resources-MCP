@@ -1,0 +1,259 @@
+# Local acceptance template. The harness supplies devres-config and devres-tls
+# Secrets plus devres-edge-config ConfigMap. Replace image/credentials/TLS and
+# corresponding-source metadata before any independently authorized deployment.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devres-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devres-postgres
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        runAsNonRoot: true
+      containers:
+        - name: postgres
+          image: postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a
+          env:
+            - {name: POSTGRES_USER, value: devres}
+            - {name: POSTGRES_DB, value: devres}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: devres-config, key: postgres-password}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, devres]}
+            initialDelaySeconds: 3
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: '1', memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: devres-postgres}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: {app: postgres}
+  ports:
+    - {port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: backend}
+  template:
+    metadata:
+      labels: {app: backend}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: backend
+          image: DEVRES_HARNESS_IMAGE
+          imagePullPolicy: Never
+          args: [/fixture/backend.toml]
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - {name: wt, containerPort: 4433, protocol: UDP}
+            - {name: health, containerPort: 9090}
+          readinessProbe:
+            httpGet: {path: /ready, port: health}
+          livenessProbe:
+            httpGet: {path: /live, port: health}
+            initialDelaySeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: '1', memory: 1Gi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /fixture/backend.toml, subPath: backend.toml, readOnly: true}
+            - {name: tls, mountPath: /fixture/cert, readOnly: true}
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          secret: {secretName: devres-config}
+        - name: tls
+          secret: {secretName: devres-tls, defaultMode: 0440}
+        - name: data
+          persistentVolumeClaim: {claimName: devres-data}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  selector: {app: backend}
+  ports:
+    - {name: http, port: 8080, targetPort: http, protocol: TCP}
+    - {name: wt, port: 4433, targetPort: wt, protocol: UDP}
+# Health has no Service port and is never routed by the edge.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: edge}
+  template:
+    metadata:
+      labels: {app: edge}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: edge
+          image: DEVRES_HARNESS_IMAGE
+          imagePullPolicy: Never
+          command: [/bin/sh, -c]
+          args: ['ulimit -s 65536; exec oxibelt --config /fixture/config/oxibelt.toml']
+          ports:
+            - {name: https, containerPort: 8443, protocol: TCP}
+            - {name: quic, containerPort: 8443, protocol: UDP}
+          readinessProbe:
+            tcpSocket: {port: https}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: '1', memory: 768Mi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /fixture/config, readOnly: true}
+            - {name: tls, mountPath: /fixture/cert, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap: {name: devres-edge-config}
+        - name: tls
+          secret: {secretName: devres-tls, defaultMode: 0440}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge
+spec:
+  type: NodePort
+  selector: {app: edge}
+  ports:
+    - {name: https, port: 8443, targetPort: https, nodePort: 30443, protocol: TCP}
+    - {name: quic, port: 8443, targetPort: quic, nodePort: 30443, protocol: UDP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: edge-public
+spec:
+  podSelector:
+    matchLabels: {app: edge}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {port: 8443, protocol: TCP}
+        - {port: 8443, protocol: UDP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-edge-only
+spec:
+  podSelector:
+    matchLabels: {app: backend}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: edge}
+        - podSelector:
+            matchLabels: {app: acceptance-probe}
+      ports:
+        - {port: 8080, protocol: TCP}
+        - {port: 4433, protocol: UDP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-backend-only
+spec:
+  podSelector:
+    matchLabels: {app: postgres}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: backend}
+      ports:
+        - {port: 5432, protocol: TCP}

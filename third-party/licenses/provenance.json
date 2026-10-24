@@ -1,0 +1,53 @@
+[
+  {
+    "packages": [
+      "asn1-rs-impl-0.2.0"
+    ],
+    "repo": "rusticata/asn1-rs",
+    "ref": "a20e5f7319c896737ad0f2557037817b91ad854f",
+    "path": "LICENSE-MIT"
+  },
+  {
+    "packages": [
+      "httlib-huffman-0.3.4"
+    ],
+    "repo": "xpepermint/httlib-rs",
+    "ref": "b7e958aa0f7e0a9a10d8b31f1a782863e85542f8",
+    "path": "LICENSE"
+  },
+  {
+    "packages": [
+      "jsonschema-regex-0.56.0",
+      "jsonschema-value-0.56.0"
+    ],
+    "repo": "Stranger6667/jsonschema",
+    "ref": "1e244c994dd81a1feb7801556a813c6bf2d45dad",
+    "path": "LICENSE"
+  },
+  {
+    "packages": [
+      "uuid-simd-0.8.0",
+      "vsimd-0.8.0"
+    ],
+    "repo": "Nugine/simd",
+    "ref": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+    "path": "LICENSE"
+  },
+  {
+    "packages": [
+      "wtransport-0.7.2",
+      "wtransport-proto-0.7.2"
+    ],
+    "repo": "BiagioFesta/wtransport",
+    "ref": "d022a6ad5f6260cb526e06d8ca42d09516ce6440",
+    "path": "LICENSE-MIT"
+  },
+  {
+    "packages": [
+      "crc-catalog-2.5.0"
+    ],
+    "repo": "akhilles/crc-catalog",
+    "ref": "ed4ad631f22b05055c21a3a4127eb7cf6d75bb62",
+    "path": "LICENSES/MIT.txt"
+  }
+]

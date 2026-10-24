@@ -1,0 +1,23 @@
+[source]
+url = "https://github.com/PublicData-stream/dev-resources-MCP"
+[http]
+bind = "0.0.0.0:8080"
+allowed_hosts = ["backend:8080"]
+allowed_origins = ["https://client.example"]
+[http.tls]
+certificate = "/fixture/cert/backend.pem"
+private_key = "/fixture/cert/backend-key.pem"
+[webtransport]
+bind = "0.0.0.0:4433"
+certificate = "/fixture/cert/backend.pem"
+private_key = "/fixture/cert/backend-key.pem"
+allowed_hosts = ["backend:4433"]
+allowed_origins = ["https://client.example"]
+[health]
+bind = "0.0.0.0:9090"
+[storage]
+database_url = "postgres://devres:fixture-only@postgres/devres"
+blob_dir = "/data/blobs"
+[edge_mtls]
+client_ca_file = "/fixture/cert/client-ca.pem"
+required_client_dns_san = "edge-client"

@@ -1,0 +1,96 @@
+# Qualified source: OxiBelt/OxiBelt@4f3154d8db0e0a49bce7a528c0a0f4c36d169040.
+# This disposable/local example does not select an immutable operational profile.
+# Production operators must independently qualify certificates and exposure.
+[config]
+strict_unknown_fields = true
+[logging]
+level = "warn"
+[runtime]
+linux_only = true
+read_only_rootfs_compatible = true
+memory_only_state = true
+unprivileged_mode = true
+main_runtime = "tokio_hyper"
+direct_h1_io = "tokio_hyper"
+[runtime.workers]
+tokio = 2
+[runtime.accept]
+workers = 1
+reuse_port = false
+[quic.socket]
+workers = 1
+reuse_port = false
+[runtime.hot_reload]
+mode = "off"
+[listeners]
+https_bind = "0.0.0.0:8443"
+http1 = true
+http2 = true
+http3 = true
+[tls]
+cert_chain = "edge.pem"
+private_key = "edge-key.pem"
+[tls.ocsp]
+mode = "disabled"
+[proxy]
+trusted_ca_certs = ["ca.pem"]
+[proxy.auto_upgrade]
+enabled = true
+max_http_version = "h3"
+[proxy.buffering]
+request = "streaming"
+response = "streaming"
+[compression]
+enabled = false
+[cache]
+enabled = false
+[waf]
+enabled = false
+[[upstreams]]
+name = "devres-http"
+origin = "https://backend:8080"
+max_http_version = "h1"
+preserve_host = false
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+[upstreams.tls.client_identity]
+cert_chain = "edge-client.pem"
+private_key = "edge-client-key.pem"
+[upstreams.tls.ech]
+mode = "disabled"
+[[upstreams]]
+name = "devres-wt"
+origin = "https://backend:4433"
+max_http_version = "h3"
+preserve_host = false
+webtransport = true
+webtransport_http3_draft = "draft02"
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+idle_timeout_ms = 65000
+[upstreams.tls.client_identity]
+cert_chain = "edge-client.pem"
+private_key = "edge-client-key.pem"
+[upstreams.tls.ech]
+mode = "disabled"
+[[routes]]
+name = "devres-http"
+hosts = ["edge"]
+upstream = "devres-http"
+compression = "off"
+[routes.limits]
+max_request_body_bytes = 8388608
+[routes.match.path]
+exact = "/mcp"
+[[routes]]
+name = "devres-wt"
+hosts = ["edge"]
+upstream = "devres-wt"
+[routes.match]
+methods = ["CONNECT"]
+protocols = ["webtransport"]
+[routes.match.path]
+exact = "/mcp-wt/v1"
+[routes.actions.cors]
+allow_origins = ["https://client.example"]
+allow_methods = ["CONNECT"]
