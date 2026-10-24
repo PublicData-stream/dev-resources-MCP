@@ -284,3 +284,52 @@ DEVRES_RUSTSEC_REPLAY_DIR=/path/to/public-captures \
 The ordinary suite uses the small curated, attributed Git-header fixture. Full
 public database downloads are not committed. See the
 [initialization evidence](initialization-evidence.md) for actual executed gates.
+
+## RustSec collection and history
+
+Serving supervises hourly current-advisory refresh and daily full branch/tag Git
+synchronization. All public advisory tools are local reads. During bootstrap use
+`advisory_corpus_status` to distinguish a ready service from available source data,
+raw graph acquisition, backfill completion, projection gaps and assessment freshness.
+History processing does not block current publication. Set `[rustsec].enabled=false`
+to pause new scheduling while retaining snapshots and source evidence.
+
+Schema 4 retains deduplicated advisory records and immutable ordered memberships.
+Legacy captures are recovered locally in bounded batches with their recorded source
+times. Unsupported historical formats remain retained raw evidence and incomplete
+projections. Old binaries reject this schema; rollback requires a coordinated
+database/blob restore taken with all writers stopped.
+
+The disposable bare mirror is under `blob_dir/rustsec-history/history.git`;
+permanent content-addressed packs/manifests are in its separate `artifacts`
+directory. Never remove the artifacts directory as mirror cleanup. Offline restore
+verifies all retained graph roots before processing resumes. Quota/free-space
+failures preserve evidence; source errors use persisted bounded retry scheduling.
+
+For a current-only maintenance refresh, stop serving and run:
+
+```sh
+devres-server refresh-advisories CONFIG.toml
+```
+
+This command requires successful source validation; stale fallback is not refresh
+success. Start serving again before running `scripts/live-smoke.sh --live`.
+Disposable harness configurations keep all automatic collectors disabled so bounded
+live acceptance does not accidentally initiate unrelated collection.
+
+An additional opt-in probe operates against **disposable dedicated storage** supplied
+through `DATABASE_URL` and `BLOB_DIR`; never run it alongside a serving storage owner:
+
+```sh
+CARGO_TARGET_DIR=/buildcache/rust/target cargo build --locked -p devres-adapters --example rustsec-probe
+/buildcache/rust/target/debug/examples/rustsec-probe --live current
+/buildcache/rust/target/debug/examples/rustsec-probe --live history
+```
+
+Each invocation enforces a shared maximum of 20 HTTP attempts, including retries,
+without increasing source rates. Current acceptance has a five-minute bound and
+checks a fixed positive `odbc` advisory and original-source detail. Full-history
+acceptance has a one-hour bound, retains resumable checkpoints, and reports traversal
+completion separately from projection completeness. A timeout is incomplete
+acceptance; it does not establish full-source coverage. Probe output contains public
+source provenance and aggregate counts, never a supplied lockfile.

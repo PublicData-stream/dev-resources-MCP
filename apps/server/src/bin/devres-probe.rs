@@ -99,6 +99,7 @@ async fn main() -> Result<(), ServerError> {
     }
     let mut has_rfc_corpus = false;
     let mut has_crate_corpus = false;
+    let mut has_advisory_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -125,6 +126,11 @@ async fn main() -> Result<(), ServerError> {
                 tools
                     .iter()
                     .any(|tool| tool["name"] == "crate_corpus_status")
+            });
+            has_advisory_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool["name"] == "advisory_corpus_status")
             });
         }
         if method == "tools/list"
@@ -176,6 +182,57 @@ async fn main() -> Result<(), ServerError> {
         .await?;
         if !result["result"]["structuredContent"]["collection_enabled"].is_boolean() {
             return Err("Crate corpus status was not available through WebTransport".into());
+        }
+    }
+    if has_advisory_corpus {
+        let mut params = json!({"name":"advisory_corpus_status","arguments":{}});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let result = exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":params}),
+        )
+        .await?;
+        let status = &result["result"]["structuredContent"];
+        if !status["counts"].is_object() {
+            return Err("Advisory corpus status was not available through WebTransport".into());
+        }
+        if let Ok(snapshot) = std::env::var("DEVRES_PROBE_ADVISORY_SNAPSHOT") {
+            if snapshot.len() != 64
+                || !snapshot
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            {
+                return Err("invalid explicit advisory fixture snapshot".into());
+            }
+            let lockfile = "# devres-smoke-private-comment-4d1a8e7c\nversion = 4\n[[package]]\nname = \"example\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+            let mut params = json!({"name":"audit_lockfile","arguments":{"lockfile":lockfile,"advisory_snapshot":&snapshot}});
+            if revision == "2026-07-28" {
+                params["_meta"] = metadata(revision);
+            }
+            let result = exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":params}),
+            )
+            .await?;
+            let report = &result["result"]["structuredContent"];
+            if report["snapshot"]["coverage"]["synthetic"] != true
+                || report["snapshot"]["source_url"]
+                    != "https://fixtures.invalid/devres/storage-probe/advisory"
+                || report["complete"] != true
+                || report["vulnerability_count"] != 1
+                || report["snapshot"]["id"] != snapshot
+                || report
+                    .to_string()
+                    .contains("devres-smoke-private-comment-4d1a8e7c")
+            {
+                return Err("Synthetic advisory assessment failed through WebTransport".into());
+            }
         }
     }
     connection.close(0_u32.into(), b"probe complete");

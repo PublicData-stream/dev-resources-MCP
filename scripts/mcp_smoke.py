@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded native MCP HTTP acceptance. No provider calls unless --live is set."""
 import argparse
+import hashlib
 import http.client
 import json
 import ssl
@@ -11,6 +12,9 @@ import urllib.parse
 MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
 MAX_RESPONSE = 8 * 1024 * 1024
+SYNTHETIC_ADVISORY = "RUSTSEC-2024-0001"
+SYNTHETIC_SNAPSHOT = hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest()
+AUDIT_PRIVACY_MARKER = "devres-smoke-private-comment-4d1a8e7c"
 
 
 def decode_response(response, request_id):
@@ -89,8 +93,8 @@ class Client:
             raise AssertionError(f"{method}: expected successful RPC, HTTP {status}")
         return value["result"]
 
-    def tool(self, name, arguments):
-        result = self.call("tools/call", {"name": name, "arguments": arguments})
+    def tool(self, name, arguments, revision=MODERN):
+        result = self.call("tools/call", {"name": name, "arguments": arguments}, revision)
         if result.get("isError"):
             error = result.get("structuredContent", {})
             # Server contract guarantees sanitized errors. Never log arguments,
@@ -112,6 +116,11 @@ def smoke(client, negative=True):
         assert {"crate_versions", "crate_catalog_search", "crate_document_get", "crate_dependencies",
                 "crate_compare", "crate_content_search", "crate_api_search", "crate_api_get",
                 "crate_corpus_status"} <= names, names
+        assert {"advisory_get", "advisory_catalog_search", "advisory_history",
+                "advisory_snapshots", "advisory_corpus_status"} <= names, names
+        advisories = client.call("tools/call", {"name": "advisory_corpus_status", "arguments": {}}, revision)
+        assert not advisories.get("isError"), "advisory corpus status failed"
+        assert isinstance(advisories.get("structuredContent", {}).get("counts"), dict), "missing advisory corpus counts"
         corpus = client.call("tools/call", {"name": "crate_corpus_status", "arguments": {}}, revision)
         assert not corpus.get("isError"), "crate corpus status failed"
         assert isinstance(corpus.get("structuredContent", {}).get("collection_enabled"), bool)
@@ -128,13 +137,70 @@ def smoke(client, negative=True):
             assert status >= 400 or (value and "error" in value), "boundary accepted invalid request"
 
 
-def require_snapshot(report):
+def require_snapshot(report, allow_synthetic=False):
     assert report.get("complete") is True, "live RustSec assessment was incomplete"
     snapshot = report.get("snapshot", {})
+    assert allow_synthetic or snapshot.get("coverage", {}).get("synthetic") is not True, "synthetic advisory evidence cannot establish live provider acceptance"
     revision = snapshot.get("revision", "")
     assert len(revision) == 40 and all(char in "0123456789abcdef" for char in revision), "missing immutable RustSec revision"
     assert snapshot.get("stale") is False, "live smoke did not establish fresh RustSec data"
     return revision
+
+
+def synthetic_advisory(client):
+    """Exercise seeded public fixture evidence and the actual sibling audit helper.
+
+    Called only after --capture identifies a storage-probe fixture. Ordinary empty
+    startup never requires fixture data and every request remains local.
+    """
+    lockfile = (f"# {AUDIT_PRIVACY_MARKER}\nversion = 4\n[[package]]\n"
+                'name = "example"\nversion = "1.0.0"\n'
+                'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
+    for revision in (MODERN, LEGACY):
+        detail = client.tool("advisory_get", {"id": SYNTHETIC_ADVISORY, "snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        assert detail.get("id") == SYNTHETIC_ADVISORY, "wrong synthetic advisory identity"
+        assert detail.get("snapshot", {}).get("id") == SYNTHETIC_SNAPSHOT, "synthetic advisory snapshot changed"
+        assert detail["snapshot"].get("coverage", {}).get("synthetic") is True, "synthetic evidence lost its fixture label"
+        assert detail.get("source_url") == "https://fixtures.invalid/devres/storage-probe/advisory", "synthetic evidence invented upstream provenance"
+        text = detail.get("page", {}).get("text", "")
+        assert "Synthetic storage-probe advisory" in text, "synthetic advisory body missing"
+        catalog = client.tool("advisory_catalog_search", {"snapshot": SYNTHETIC_SNAPSHOT,
+                              "filters": {"name": "example", "id": SYNTHETIC_ADVISORY}}, revision)
+        assert catalog.get("total") == 1, "synthetic catalog membership changed"
+        lookup = client.tool("advisory_lookup", {"name": "example", "version": "1.0.0",
+                             "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        assert lookup.get("complete") is True and lookup.get("total") == 1, "synthetic vulnerable version was not matched"
+        assert lookup.get("items", [{}])[0].get("id") == SYNTHETIC_ADVISORY, "synthetic lookup matched the wrong advisory"
+        patched = client.tool("advisory_lookup", {"name": "example", "version": "1.0.1",
+                              "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        assert patched.get("complete") is True and patched.get("total") == 0, "synthetic patched version still matched"
+        report = client.tool("audit_lockfile", {"lockfile": lockfile, "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        require_audit(report, detail["snapshot"]["revision"], allow_synthetic=True)
+        assert report.get("snapshot", {}).get("id") == SYNTHETIC_SNAPSHOT, "audit changed its pinned synthetic snapshot"
+        assert report.get("vulnerability_count") == 1 and report.get("total_findings") == 1, "audit helper did not produce the synthetic finding"
+        assert report.get("findings", [{}])[0].get("advisory", {}).get("id") == SYNTHETIC_ADVISORY, "audit helper returned the wrong advisory"
+        assert AUDIT_PRIVACY_MARKER not in json.dumps(report), "audit response reflected the private comment"
+        status_code, invalid = client.exchange("tools/call", {"name": "audit_lockfile", "arguments": {
+                              "lockfile": f"# {AUDIT_PRIVACY_MARKER}\nnot a Cargo.lock",
+                              "advisory_snapshot": SYNTHETIC_SNAPSHOT}}, revision)
+        # http_status::preserve_invalid_params_status rewrites modern errors;
+        # the admitted legacy binding retains HTTP 200 with a JSON-RPC error.
+        expected_status = 400 if revision == MODERN else 200
+        assert status_code == expected_status, f"malformed audit input for {revision} did not return HTTP {expected_status}"
+        assert isinstance(invalid, dict) and invalid.get("error", {}).get("code") == -32602, "malformed audit input did not return a sanitized invalid-params error"
+        assert AUDIT_PRIVACY_MARKER not in json.dumps(invalid), "audit error reflected the private comment"
+        resource = detail.get("resource_uri", "")
+        assert resource.startswith("devres://advisory/rustsec/"), "missing typed advisory resource"
+        for method, params in (("resources/read", {"uri": resource}),
+                               ("tools/call", {"name": "fetch", "arguments": {"id": resource}})):
+            result = client.call(method, params, revision)
+            if method == "tools/call":
+                assert not result.get("isError"), "typed advisory fetch failed"
+                result = result.get("structuredContent", result)
+            assert result.get("contents", [{}])[0].get("text") == text, "typed advisory content changed"
+            assert AUDIT_PRIVACY_MARKER not in json.dumps(result), "advisory resource reflected audit input"
+        status = client.tool("advisory_corpus_status", {}, revision)
+        assert AUDIT_PRIVACY_MARKER not in json.dumps(status), "advisory status reflected audit input"
 
 
 def wait_ready(client, seconds):
@@ -158,8 +224,8 @@ def wait_ready(client, seconds):
     raise AssertionError("edge semantic readiness exceeded its bounded deadline")
 
 
-def require_audit(report, revision):
-    assert require_snapshot(report) == revision, "audit changed advisory snapshot"
+def require_audit(report, revision, allow_synthetic=False):
+    assert require_snapshot(report, allow_synthetic) == revision, "audit changed advisory snapshot"
     assert report.get("package_count") == report.get("assessed_count") == 1, "public fixture package was not assessed"
     assert report.get("unassessed_count") == 0, "public fixture unexpectedly unassessed"
     assert report.get("input_retention") == "request_lifetime_only", "audit privacy contract mismatch"
@@ -269,6 +335,7 @@ def main():
     if options.capture:
         value = client.tool("fetch", {"id": "devres://capture/" + options.capture})
         assert "Synthetic dev-resources persistence acceptance fixture" in json.dumps(value)
+        synthetic_advisory(client)
     if options.live:
         live(client, options.rfc_text_only)
     print("HTTP MCP acceptance passed" + ("; bounded live smoke passed (RFC text only)" if options.live and options.rfc_text_only else "; bounded live smoke passed" if options.live else "; no provider calls"))

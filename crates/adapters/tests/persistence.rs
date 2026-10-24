@@ -4,6 +4,253 @@ use devres_domain::{FetchRequest, FetchResponse, Validators};
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+async fn rustsec_atomic_publication_local_research_history_and_restart() {
+    use async_trait::async_trait;
+    use devres_adapters::{
+        AdvisoryCorpus, Research,
+        bulk::{BulkBroker, BulkConfig},
+    };
+    use devres_application::{
+        Fetcher, Retrieval,
+        advisory::{AdvisoryStore, RustSecConfig},
+    };
+    use devres_domain::{Error, Result};
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    struct Source {
+        bad: AtomicBool,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Fetcher for Source {
+        async fn fetch(
+            &self,
+            request: &FetchRequest,
+            _: Option<&Validators>,
+        ) -> Result<FetchResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let body = if request.key == "rustsec:head" {
+                serde_json::to_vec(&json!({"sha":if self.bad.load(Ordering::Relaxed){"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}else{"84d943a6deeb8cc6c6f632531aaf4f1c62275239"}})).unwrap()
+            } else if request.key.starts_with("rustsec:bundle:") {
+                if self.bad.load(Ordering::Relaxed) {
+                    b"malformed archive".to_vec()
+                } else {
+                    include_bytes!("fixtures/rustsec/git-snapshot-minimal.tar.gz").to_vec()
+                }
+            } else {
+                return Err(Error::integrity("Unexpected fixture destination."));
+            };
+            Ok(FetchResponse {
+                status: 200,
+                body,
+                validators: Validators::default(),
+            })
+        }
+    }
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    sqlx::query("CREATE DATABASE devres_rustsec_fixture")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&base).unwrap();
+    url.set_path("/devres_rustsec_fixture");
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .unwrap(),
+    );
+    let source = Arc::new(Source {
+        bad: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+    });
+    let retrieval = Arc::new(Retrieval::new(store.clone(), source.clone()));
+    let broker = Arc::new(BulkBroker::new(BulkConfig::default()).unwrap());
+    let config = RustSecConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let corpus = Arc::new(
+        AdvisoryCorpus::new(
+            retrieval.clone(),
+            store.clone(),
+            broker,
+            root.path(),
+            config,
+        )
+        .unwrap(),
+    );
+    let research = Research::new(retrieval.clone())
+        .await
+        .unwrap()
+        .with_advisory_corpus(corpus.clone());
+    let empty = research
+        .call("advisory_lookup", json!({"name":"odbc","version":"0.17.0"}))
+        .await
+        .unwrap();
+    assert_eq!(empty["complete"], false);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    let fresh = corpus.refresh_current().await.unwrap();
+    let id = fresh["snapshot"]["id"].as_str().unwrap().to_owned();
+    let lookup = research
+        .call("advisory_lookup", json!({"name":"odbc","version":"0.17.0"}))
+        .await
+        .unwrap();
+    assert_eq!(lookup["complete"], true);
+    assert_eq!(lookup["items"][0]["id"], "RUSTSEC-2022-0039");
+    let calls = source.calls.load(Ordering::Relaxed);
+    let detail = research
+        .call(
+            "advisory_get",
+            json!({"id":"RUSTSEC-2022-0039","snapshot":id}),
+        )
+        .await
+        .unwrap();
+    assert!(detail.to_string().contains("project abandoned"));
+    let alias = fresh["snapshot"]["head_capture"]["id"].as_str().unwrap();
+    assert_eq!(
+        store
+            .advisory_snapshot(Some(alias), "rustsec")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        id
+    );
+    let mut historical = store
+        .advisory_snapshot(Some(&id), "rustsec")
+        .await
+        .unwrap()
+        .unwrap();
+    historical.id = "d".repeat(64);
+    historical.historical = true;
+    historical.validated_at = None;
+    store
+        .publish_advisory_snapshot(&historical, false)
+        .await
+        .unwrap();
+    let old = research
+        .call(
+            "advisory_lookup",
+            json!({"name":"odbc","version":"0.17.0","advisory_snapshot":historical.id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old["complete"], false);
+    assert_eq!(old["items"].as_array().unwrap().len(), 1);
+    let mut collision = historical.clone();
+    collision.records[0].metadata["title"] = json!("changed");
+    assert_eq!(
+        store
+            .publish_advisory_snapshot(&collision, false)
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+    let mut appended = historical.clone();
+    let mut extra = appended.records[0].clone();
+    extra.id = "RUSTSEC-2024-9999".into();
+    appended.records.push(extra);
+    assert_eq!(
+        store
+            .publish_advisory_snapshot(&appended, false)
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+    assert_eq!(
+        store
+            .advisory_snapshot(Some(&historical.id), "rustsec")
+            .await
+            .unwrap()
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
+    store.put_advisory_row("commits",&historical.revision,&json!({"revision":historical.revision,"parents":[],"snapshots":{"rustsec":historical.id}})).await.unwrap();
+    store
+        .put_advisory_row(
+            "refs",
+            "fixture",
+            &json!({"refs":[{"name":"refs/heads/main","peeled_commit":historical.revision}]}),
+        )
+        .await
+        .unwrap();
+    let cutoff = store.advisory_cutoff().await.unwrap();
+    assert_eq!(
+        store
+            .advisory_ref_rows("refs/heads/main", cutoff, 0, 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(source.calls.load(Ordering::Relaxed), calls);
+    let mut synthetic = store
+        .advisory_snapshot(Some(&id), "rustsec")
+        .await
+        .unwrap()
+        .unwrap();
+    synthetic.id = "e".repeat(64);
+    synthetic.coverage["synthetic"] = json!(true);
+    assert_eq!(
+        store
+            .publish_advisory_snapshot(&synthetic, true)
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+    source.bad.store(true, Ordering::Relaxed);
+    assert!(corpus.refresh_current().await.is_err());
+    assert_eq!(
+        store
+            .advisory_snapshot(None, "rustsec")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        id
+    );
+    drop(research);
+    drop(corpus);
+    drop(retrieval);
+    drop(store);
+    let reopened = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .advisory_snapshot(None, "rustsec")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        id
+    );
+    assert_eq!(
+        reopened
+            .advisory_snapshot(Some(&historical.id), "rustsec")
+            .await
+            .unwrap()
+            .unwrap()
+            .records[0]
+            .body,
+        historical.records[0].body
+    );
+    drop(reopened);
+    admin.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn crate_corpus_epochs_generation_visibility_and_restart() {
     use devres_application::crate_corpus::{
         ContentDeltaQuery, ContentFilter, ContentRecord, CrateCorpusStore, VersionRecord,
