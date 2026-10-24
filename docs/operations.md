@@ -64,6 +64,8 @@ public content providers. Disposable CA private keys remain outside image contex
 scripts/test-minikube.sh
 # Same isolated gate plus explicitly authorized fixed public-provider checks:
 scripts/test-minikube.sh --live
+# Narrow RFC recheck after alternate formats passed in the same attempt budget:
+scripts/test-minikube.sh --live --rfc-text-only
 ```
 
 This gate uses rootful Docker and creates a unique minikube profile with Calico,

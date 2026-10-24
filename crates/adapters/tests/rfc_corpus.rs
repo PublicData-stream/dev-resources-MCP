@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 static FIXTURE_PROCESSORS: Mutex<()> = Mutex::const_new(());
 
 const INDEX: &str = "https://www.rfc-editor.org/rfc-index.xml";
-const ERRATA: &str = "https://www.rfc-editor.org/errata.json";
+const ERRATA: &str = "https://www.rfc-editor.org/api/v1/errata.json";
 const TXT: &str = "https://www.rfc-editor.org/rfc/rfc9000.txt";
 const HTML: &str = "https://www.rfc-editor.org/rfc/rfc9000.html";
 const PDF: &str = "https://www.rfc-editor.org/rfc/rfc9000.pdf";
@@ -1044,4 +1044,43 @@ async fn stage_recovery_removes_only_owned_disposable_directories() {
         );
         assert!(outside.path().join("keep").exists());
     }
+}
+
+#[tokio::test]
+async fn collection_traverses_multiple_rfc_identities_and_all_advertised_formats() {
+    let _fixture_processors = FIXTURE_PROCESSORS.lock().await;
+    let harness = Harness::new(true).await;
+    let index=XML_INDEX.replace("</rfc-index>","<rfc-entry><doc-id>RFC9001</doc-id><title>Second research fixture</title><format><file-format>TEXT</file-format></format></rfc-entry></rfc-index>");
+    harness.fixture.responses.lock().await.extend([
+        (INDEX.into(), index.into_bytes()),
+        (TXT.into(), format!("{TEXT} traversalfixture").into_bytes()),
+        (
+            "https://www.rfc-editor.org/rfc/rfc9001.txt".into(),
+            b"RFC9001 traversalfixture second document".to_vec(),
+        ),
+    ]);
+    let token = CancellationToken::new();
+    let corpus = harness.corpus.clone();
+    let signal = token.clone();
+    let worker = tokio::spawn(async move { corpus.run(signal).await });
+    wait_for(|| async { harness.store.documents().await.unwrap().len() == 4 }).await;
+    stop(token, worker).await;
+    let result = harness.corpus.rebuild_index().await.unwrap();
+    assert_eq!(result["coverage"]["documents"], 2);
+    assert_eq!(result["coverage"]["expected_representations"], 4);
+    assert_eq!(result["coverage"]["captured_representations"], 4);
+    assert_eq!(result["coverage"]["acquisition_complete"], true);
+    let found = harness
+        .research
+        .call("rfc_fulltext_search", json!({"query":"traversalfixture"}))
+        .await
+        .unwrap();
+    assert_eq!(found["total"], 2);
+    let numbers = found["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["number"].as_u64())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(numbers, std::collections::BTreeSet::from([9000, 9001]));
 }

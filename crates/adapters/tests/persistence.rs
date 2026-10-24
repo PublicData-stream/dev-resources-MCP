@@ -281,6 +281,28 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         snapshot.id,
         "new partial must not displace complete snapshot"
     );
+    let mut newer_partial = partial.clone();
+    newer_partial.id = "b".repeat(64);
+    store.save_snapshot(&newer_partial).await.unwrap();
+    assert_eq!(
+        store.status().await.unwrap()["latest_partial"]["id"],
+        newer_partial.id,
+        "same-second partial selection follows durable publication order"
+    );
+    let mut newer_complete = snapshot.clone();
+    newer_complete.id = "a".repeat(64);
+    store.save_snapshot(&newer_complete).await.unwrap();
+    assert_eq!(
+        store.snapshot(None).await.unwrap().unwrap().id,
+        newer_complete.id,
+        "same-second complete selection follows publication order, not hash sort"
+    );
+    store.save_snapshot(&snapshot).await.unwrap();
+    assert_eq!(
+        store.snapshot(None).await.unwrap().unwrap().id,
+        newer_complete.id,
+        "idempotent historical publication cannot move the active selection backward"
+    );
     assert_eq!(
         store
             .snapshot(Some(&snapshot.id))

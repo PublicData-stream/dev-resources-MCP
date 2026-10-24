@@ -161,7 +161,7 @@ def require_audit(report, revision):
     assert report.get("status") == expected_status, "audit status did not reflect its assessment"
 
 
-def live(client):
+def live(client, rfc_text_only=False):
     # Fixed requests; adapter admission/retries have their own finite budget.
     # No user-supplied package, URL, lockfile, or bulk enumeration is accepted.
     started = time.monotonic()
@@ -178,7 +178,7 @@ def live(client):
     metadata_rfc = client.tool("rfc_metadata", {"number": 9000})
     assert metadata_rfc.get("metadata", {}).get("number") == 9000
     assert metadata_rfc.get("snapshot"), "RFC metadata did not pin a snapshot"
-    for format_name in ("txt", "html", "xml", "pdf"):
+    for format_name in (("txt",) if rfc_text_only else ("txt", "html", "xml", "pdf")):
         representation = client.tool("rfc_format_get", {"number": 9000, "format": format_name, "limit": 1024})
         assert representation.get("format") == format_name and representation.get("assurance") == "https"
         captured = representation.get("capture", {}).get("id")
@@ -186,7 +186,7 @@ def live(client):
         pinned = client.tool("rfc_format_get", {"number": 9000, "format": format_name, "capture": captured, "limit": 1024})
         assert pinned == representation, "capture-pinned RFC format changed"
     errata_rfc = client.tool("rfc_errata", {"number": 9000, "limit": 1})
-    assert errata_rfc.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/errata.json"
+    assert errata_rfc.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/api/v1/errata.json"
     fulltext_rfc = client.tool("rfc_fulltext_search", {"query": "multiplexed", "limit": 3})
     assert fulltext_rfc.get("snapshot") and any(item.get("number") == 9000 for item in fulltext_rfc.get("items", [])), "fixed RFC text did not enter the partial search snapshot"
     crate_search = client.tool("crate_search", {"query": "itoa", "offset": 0, "limit": 3})
@@ -233,10 +233,13 @@ def main():
     parser.add_argument("--origin", default="https://client.example")
     parser.add_argument("--no-negative", action="store_true")
     parser.add_argument("--live", action="store_true", help="opt in to fixed public-provider requests")
+    parser.add_argument("--rfc-text-only", action="store_true", help="with --live, omit already qualified alternate RFC formats to preserve a shared attempt budget")
     parser.add_argument("--capture", help="verify a pre-existing synthetic capture after restart/restore")
     parser.add_argument("--wait-ready", type=int, choices=range(1, 61), metavar="SECONDS",
                         help="offline server identity readiness only; bounded at 60 seconds")
     options = parser.parse_args()
+    if options.rfc_text_only and not options.live:
+        parser.error("--rfc-text-only requires --live")
     client = Client(options.url, options.ca, options.cert, options.key, options.origin)
     if options.wait_ready:
         wait_ready(client, options.wait_ready)
@@ -247,8 +250,8 @@ def main():
         value = client.tool("fetch", {"id": "devres://capture/" + options.capture})
         assert "Synthetic dev-resources persistence acceptance fixture" in json.dumps(value)
     if options.live:
-        live(client)
-    print("HTTP MCP acceptance passed" + ("; bounded live smoke passed" if options.live else "; no provider calls"))
+        live(client, options.rfc_text_only)
+    print("HTTP MCP acceptance passed" + ("; bounded live smoke passed (RFC text only)" if options.live and options.rfc_text_only else "; bounded live smoke passed" if options.live else "; no provider calls"))
 
 
 if __name__ == "__main__":

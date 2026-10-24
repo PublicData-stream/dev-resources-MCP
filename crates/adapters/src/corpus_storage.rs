@@ -372,7 +372,7 @@ impl RfcCorpusStore for PgBlobStore {
             return Err(Error::invalid("Invalid RFC snapshot identifier"));
         }
         self.fence().await?;
-        let row: Option<Json<Value>> = sqlx::query_scalar("SELECT data FROM devres_rfc_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY complete DESC,created_at DESC,id DESC LIMIT 1")
+        let row: Option<Json<Value>> = sqlx::query_scalar("SELECT data FROM devres_rfc_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY complete DESC,published_order DESC LIMIT 1")
             .bind(id).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
         row.map(|Json(value)| decode(value)).transpose()
     }
@@ -403,7 +403,7 @@ impl RfcCorpusStore for PgBlobStore {
             Ok(json!({"key":row.try_get::<String,_>("source_key").map_err(|_| storage_error())?,"error":row.try_get::<String,_>("last_error").map_err(|_| storage_error())?,"next_due":row.try_get::<i64,_>("due_at").map_err(|_| storage_error())?}))
         }).collect::<Result<Vec<_>>>()?;
         let latest = self.snapshot(None).await?;
-        let partial = sqlx::query("SELECT id,created_at,data->'coverage' AS coverage FROM devres_rfc_snapshots WHERE NOT complete ORDER BY created_at DESC,id DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?.map(|row|Ok::<_,Error>(json!({"id":row.try_get::<String,_>("id").map_err(|_|storage_error())?,"created_at":row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?,"coverage":row.try_get::<Json<Value>,_>("coverage").map_err(|_|storage_error())?.0}))).transpose()?;
+        let partial = sqlx::query("SELECT id,created_at,data->'coverage' AS coverage FROM devres_rfc_snapshots WHERE NOT complete ORDER BY published_order DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?.map(|row|Ok::<_,Error>(json!({"id":row.try_get::<String,_>("id").map_err(|_|storage_error())?,"created_at":row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?,"coverage":row.try_get::<Json<Value>,_>("coverage").map_err(|_|storage_error())?.0}))).transpose()?;
         Ok(
             json!({"jobs":counts,"total_jobs":total_jobs,"captured_documents":captured_documents,"pending_documents":total_jobs-captured_documents,"outstanding_jobs":outstanding_jobs,"errors":errors,"latest_partial":partial,"snapshot":latest.map(|snapshot| json!({"id":snapshot.id,"complete":snapshot.complete,"created_at":snapshot.created_at,"coverage":snapshot.coverage}))}),
         )
@@ -431,10 +431,11 @@ CREATE TABLE devres_rfc_jobs (
 );
 CREATE INDEX devres_rfc_jobs_due ON devres_rfc_jobs(due_at,source_key) WHERE status<>'running';
 CREATE TABLE devres_rfc_snapshots (
+ published_order bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
  id text PRIMARY KEY CHECK(length(id)=64),catalogue_capture text NOT NULL REFERENCES devres_captures(id),
  errata_capture text REFERENCES devres_captures(id),created_at bigint NOT NULL,complete boolean NOT NULL,data jsonb NOT NULL
 );
-CREATE INDEX devres_rfc_snapshots_latest ON devres_rfc_snapshots(complete DESC,created_at DESC,id DESC);
+CREATE INDEX devres_rfc_snapshots_latest ON devres_rfc_snapshots(complete DESC,published_order DESC);
 CREATE TABLE devres_rfc_import_observations (
  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,capture_id text NOT NULL REFERENCES devres_captures(id),
  observed_at bigint NOT NULL,source_url text NOT NULL

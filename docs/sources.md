@@ -26,6 +26,11 @@ The RFC index endpoint was checked on 2026-10-24: the root `rfc-index.xml`
 returns XML; the older `/in-notes/rfc-index.xml` returns 404. Keep endpoint tests
 and source profiles aligned with actual official responses.
 
+The errata download is `https://www.rfc-editor.org/api/v1/errata.json`.
+On 2026-10-24 the older root `/errata.json` returned 302 to that fixed path.
+The adapter constructs the canonical destination directly and continues to reject
+redirect responses and arbitrary query destinations.
+
 Legacy RFC search remains metadata search. Dedicated research tools add local
 full-text search. Status, updates, and obsolescence
 are metadata, not an instruction to replace requested RFC text. Crate source browsing

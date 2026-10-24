@@ -3,8 +3,10 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 live=0
+live_rfc_args=()
 if [[ ${1:-} == --live ]]; then live=1; shift; fi
-test "$#" = 0 || { echo 'usage: scripts/test-minikube.sh [--live]' >&2; exit 2; }
+if (( live )) && [[ ${1:-} == --rfc-text-only ]]; then live_rfc_args=(--rfc-text-only); shift; fi
+test "$#" = 0 || { echo 'usage: scripts/test-minikube.sh [--live [--rfc-text-only]]' >&2; exit 2; }
 if [[ -n ${DEVRES_DOCKER_HOST:-} ]]; then
   unset DOCKER_CONTEXT
   export DOCKER_HOST="$DEVRES_DOCKER_HOST"
@@ -150,6 +152,6 @@ maintenance_stop
 start_backend
 external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
 if (( live )); then
-  external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --live
+  external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --live "${live_rfc_args[@]}"
 fi
 echo 'Real minikube NodePort TCP/UDP, CNI isolation, PVC restart, and coordinated restore passed'

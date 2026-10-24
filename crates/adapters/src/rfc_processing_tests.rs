@@ -392,3 +392,17 @@ fn errata_sequence_and_individual_records_are_bounded_before_materialization() {
     assert_eq!(records[0].formats, ["txt"]);
     assert_eq!(records[0].unsupported_formats, ["PS"]);
 }
+
+#[test]
+#[ignore = "requires operator-supplied public errata JSON; no network"]
+fn captured_official_errata_replay_is_bounded_and_preserves_rfc9000() {
+    let path = std::env::var("DEVRES_RFC_ERRATA_REPLAY").expect("public replay path");
+    let bytes = std::fs::read(path).unwrap();
+    let records = parse_errata(&bytes).unwrap();
+    assert!(!records.is_empty());
+    assert!(records.iter().any(|r| {
+        r["doc-id"]
+            .as_str()
+            .is_some_and(|id| id.trim_start_matches("RFC").parse::<u32>() == Ok(9000))
+    }));
+}

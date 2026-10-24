@@ -57,14 +57,17 @@ serving. Maintenance commands return before workers/listeners start.
 Immutable catalogue/errata projections reference original captures. Jobs retain
 the latest successful capture across failed refreshes. Snapshot manifests freeze
 raw representations, actual searchable sources, coverage, observations and processor
-version. Publication preserves concurrent updates completed during indexing.
+version. A durable database sequence orders publications, including multiple snapshots
+within one second. Publication preserves concurrent updates completed during indexing.
 
 Tantivy indexes whole RFCs with positional technical/English fields. A streaming
 writer processes one captured representation at a time. Immutable committed segments
 and integrity manifests live under `blob_dir/rfc-indexes`; fsync and directory
 publication precede the database pointer. Incremental snapshots retain previous
-segments; referenced search history is never garbage-collected. Failures can leave
-unreferenced derived directories, never missing published archives. Derived indexes
+segments; referenced search history is never garbage-collected. Automatic segment
+merging is disabled so cancellation cannot leave detached merge writes after ownership
+ends; private full rebuild provides compaction. Failures can leave unreferenced derived
+directories, never missing published archives. Derived indexes
 are rebuildable from captures; corruption fails explicitly.
 
 Rsync imports run privately under the same ownership fence with serving stopped.

@@ -19,6 +19,12 @@ class Response(io.BytesIO):
 
 
 class DecodeResponseTests(unittest.TestCase):
+    def test_text_only_rfc_recheck_still_requires_live_opt_in(self):
+        with patch.object(smoke, "Client") as client, patch.object(smoke.signal, "signal"), patch("sys.argv", ["mcp_smoke.py", "--url", "https://edge/mcp", "--rfc-text-only"]), patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                smoke.main()
+            self.assertEqual(result.exception.code, 2)
+            client.assert_not_called()
     def test_sse_ignores_progress_and_stops_at_result(self):
         body = b'data: {"method":"notifications/progress"}\n\ndata: {"id":2,"result":{}}\n\n'
         self.assertEqual(smoke.decode_response(Response(body, "text/event-stream"), 2), {"id": 2, "result": {}})

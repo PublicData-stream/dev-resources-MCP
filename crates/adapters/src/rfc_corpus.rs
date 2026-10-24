@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const INDEX_URL: &str = "https://www.rfc-editor.org/rfc-index.xml";
-pub(crate) const ERRATA_URL: &str = "https://www.rfc-editor.org/errata.json";
+pub(crate) const ERRATA_URL: &str = "https://www.rfc-editor.org/api/v1/errata.json";
 pub(crate) const BODY_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) const PROCESSOR_VERSION: u32 = 1;
 
@@ -76,6 +76,37 @@ pub struct RfcCorpus {
     dirty: AtomicUsize,
     last_snapshot: AtomicI64,
     last_failure: Mutex<Option<Value>>,
+}
+
+// A detached blocking writer must retain the database ownership fence through
+// filesystem writes AND stage cleanup, even after its awaiting task is canceled.
+// Fields drop in declaration order: the builder cleans up before ownership drops.
+struct OwnedIndexBuilder {
+    index: rfc_index::IndexBuilder,
+    _owner: Arc<dyn RfcCorpusStore>,
+}
+impl OwnedIndexBuilder {
+    fn begin(
+        root: &Path,
+        id: &str,
+        base: Option<&str>,
+        owner: Arc<dyn RfcCorpusStore>,
+    ) -> Result<Self> {
+        let index = rfc_index::IndexBuilder::begin_from(root, id, base)?;
+        Ok(Self {
+            index,
+            _owner: owner,
+        })
+    }
+    fn add_document(&mut self, document: rfc_index::IndexDocument) -> Result<()> {
+        self.index.add_document(document)
+    }
+    fn remove_document(&mut self, number: u32) -> Result<()> {
+        self.index.remove_document(number)
+    }
+    fn finish(self) -> Result<String> {
+        self.index.finish()
+    }
 }
 impl RfcCorpus {
     pub fn new(
@@ -468,9 +499,10 @@ impl RfcCorpus {
                     let root = self.root.clone();
                     let id = build_id.clone();
                     let base = previous_path.clone();
+                    let owner = self.store.clone();
                     builder = Some(
                         tokio::task::spawn_blocking(move || {
-                            rfc_index::IndexBuilder::begin_from(&root, &id, base.as_deref())
+                            OwnedIndexBuilder::begin(&root, &id, base.as_deref(), owner)
                         })
                         .await
                         .map_err(|_| Error::unavailable("RFC index worker failed."))??,
@@ -506,9 +538,10 @@ impl RfcCorpus {
         if builder.is_none() && (!removed.is_empty() || previous_path.is_none()) {
             let root = self.root.clone();
             let base = previous_path.clone();
+            let owner = self.store.clone();
             builder = Some(
                 tokio::task::spawn_blocking(move || {
-                    rfc_index::IndexBuilder::begin_from(&root, &build_id, base.as_deref())
+                    OwnedIndexBuilder::begin(&root, &build_id, base.as_deref(), owner)
                 })
                 .await
                 .map_err(|_| Error::unavailable("RFC index worker failed."))??,
@@ -733,6 +766,116 @@ pub(crate) fn valid_snapshot_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestOwner {
+        dropped: Arc<AtomicUsize>,
+        root: PathBuf,
+    }
+    impl Drop for TestOwner {
+        fn drop(&mut self) {
+            let staged =
+                std::fs::read_dir(self.root.join("rfc-indexes")).is_ok_and(|mut entries| {
+                    entries.any(|e| {
+                        e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with(".stage-"))
+                    })
+                });
+            self.dropped
+                .store(if staged { 2 } else { 1 }, Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl RfcCorpusStore for TestOwner {
+        async fn save_dataset(&self, _: &str, _: &Dataset) -> Result<()> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn dataset(&self, _: &str, _: Option<&str>) -> Result<Option<Dataset>> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn schedule(&self, _: &[JobSpec]) -> Result<()> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn claim(&self, _: i64) -> Result<Option<devres_application::corpus::Job>> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn finish(
+            &self,
+            _: &str,
+            _: Option<&devres_domain::Capture>,
+            _: Option<&str>,
+            _: i64,
+        ) -> Result<()> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn documents(&self) -> Result<Vec<Document>> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn save_snapshot(&self, _: &Snapshot) -> Result<()> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn snapshot(&self, _: Option<&str>) -> Result<Option<Snapshot>> {
+            Err(Error::unavailable("Unused test port"))
+        }
+        async fn status(&self) -> Result<Value> {
+            Err(Error::unavailable("Unused test port"))
+        }
+    }
+    #[tokio::test]
+    async fn canceled_blocking_index_writer_retains_owner_through_cleanup() {
+        let _test = crate::rfc_index::TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let owner: Arc<dyn RfcCorpusStore> = Arc::new(TestOwner {
+            dropped: dropped.clone(),
+            root: root.path().to_path_buf(),
+        });
+        let weak = Arc::downgrade(&owner);
+        // Other index unit tests share the single-writer admission; retry only admission.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut builder = loop {
+            match OwnedIndexBuilder::begin(root.path(), &"a".repeat(64), None, owner.clone()) {
+                Ok(builder) => break builder,
+                Err(error) if error.code == "capacity" && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        drop(owner);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.blocking_recv();
+                builder
+                    .add_document(rfc_index::IndexDocument {
+                        number: 1,
+                        text: "public synthetic text".into(),
+                    })
+                    .unwrap();
+                drop(builder);
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(weak.upgrade().is_some());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while dropped.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "stage cleanup must finish before the storage owner is dropped"
+        );
+        assert!(weak.upgrade().is_none());
+    }
     #[test]
     fn defaults_and_pause_are_explicit() {
         assert!(RfcConfig::default().enabled);

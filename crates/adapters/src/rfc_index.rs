@@ -45,6 +45,8 @@ const MANIFEST: &str = "integrity.json";
 static STAGE: AtomicU64 = AtomicU64::new(0);
 static WRITERS: Semaphore = Semaphore::const_new(1);
 static READERS: Semaphore = Semaphore::const_new(2);
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) struct IndexDocument {
     pub number: u32,
@@ -361,6 +363,10 @@ impl IndexBuilder {
             let writer = index
                 .writer_with_options(options)
                 .map_err(|_| unavailable())?;
+            // IndexWriter::drop does not join automatic merge tasks. Prevent
+            // detached merge writes after cancellation releases the store fence.
+            // Full rebuild is the explicit compaction path within file limits.
+            writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
             Ok((index, writer, numbers))
         })();
         match prepared {
@@ -785,7 +791,6 @@ pub(crate) fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn documents(values: &[(u32, &str)]) -> Vec<IndexDocument> {
         values
@@ -798,8 +803,36 @@ mod tests {
     }
 
     #[test]
+    fn repeated_commits_do_not_launch_automatic_merges() {
+        let _test = TEST_SERIAL.blocking_lock();
+        let root = tempfile::tempdir().unwrap();
+        let mut builder = IndexBuilder::begin(root.path(), &"b".repeat(64)).unwrap();
+        for number in 1..=20 {
+            builder
+                .add_document(IndexDocument {
+                    number,
+                    text: "synthetic persistent transport".into(),
+                })
+                .unwrap();
+            builder.writer.as_mut().unwrap().commit().unwrap();
+        }
+        let path = builder.finish().unwrap();
+        let index = Index::open_in_dir(root.path().join(&path)).unwrap();
+        let reader = index.reader().unwrap();
+        assert_eq!(
+            reader.searcher().segment_readers().len(),
+            20,
+            "automatic merges must stay disabled across repeated commits"
+        );
+        assert_eq!(
+            search(root.path(), &path, "transport", TECHNICAL, 0, 100, None).unwrap()["total"],
+            20
+        );
+    }
+
+    #[test]
     fn whole_document_modes_filters_and_stable_pages() {
-        let _test = TEST_LOCK.lock().unwrap();
+        let _test = TEST_SERIAL.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let id = "a".repeat(64);
         let path = build(
@@ -905,7 +938,7 @@ mod tests {
 
     #[test]
     fn preserves_far_apart_terms_late_phrases_and_stopword_positions() {
-        let _test = TEST_LOCK.lock().unwrap();
+        let _test = TEST_SERIAL.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let mut text = String::from("firstmarker ");
         text.push_str(&"padding ".repeat(20_000));
@@ -951,7 +984,7 @@ mod tests {
 
     #[test]
     fn incremental_updates_leave_prior_snapshot_unchanged() {
-        let _test = TEST_LOCK.lock().unwrap();
+        let _test = TEST_SERIAL.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let first = build(
             root.path(),
@@ -995,7 +1028,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_tokens_paths_and_corrupt_artifacts() {
-        let _test = TEST_LOCK.lock().unwrap();
+        let _test = TEST_SERIAL.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         {
             let mut builder = IndexBuilder::begin(root.path(), &"e".repeat(64)).unwrap();
@@ -1039,7 +1072,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn refuses_symlinked_snapshot_files() {
-        let _test = TEST_LOCK.lock().unwrap();
+        let _test = TEST_SERIAL.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let path = build(
             root.path(),

@@ -80,3 +80,55 @@ local storage, with private state, an explicit context and scoped firewall rules
 Configured daemon files and shared caches were not changed. Test profiles, helper
 processes, private networks/state and scoped rules were removed after verification;
 normal Rust/OxiBelt build caches remain available.
+
+## RFC corpus implementation acceptance
+
+Observed on native Linux amd64 on 2026-10-24. This record distinguishes signed
+source, an immutable reviewed working-tree patch, and the artifacts actually tested.
+The signed base is `f02a4cf12f476a0b8de147c4f77beeba3bba3d3e`.
+
+| Evidence | Result |
+| --- | --- |
+| Final workspace fixtures | 88 passed; four opt-in tests excluded from the ordinary run |
+| Strict all-target locked Clippy, formatting, whitespace | Passed |
+| Python script tests | 67 passed |
+| Current cargo-audit and cargo-deny | Passed; duplicate-version warnings remain visible |
+| PostgreSQL 18 acceptance | Two tests passed, including v1 migration, same-second publication order, immutable history, restart, ownership loss and rsync assurance separation |
+| RFC errata offline replay | Passed against all 8,103 records in the captured official response |
+| Independent reviews | MCP/API, Upstream/Storage and Security boundaries closed; explicit index-worker cancellation and merge-policy follow-up reviewed |
+| Native image gates | Combined runtime, server, probe and audit-worker builds/startup/fixture checks passed on amd64 |
+| Pinned OxiBelt | Both MCP revisions over HTTP and WebTransport, including corpus status, identity/trust failures, recovery and private-route isolation passed |
+| Disposable minikube | TCP/UDP NodePorts, CNI isolation, PVC restart and coordinated database/blob restore passed |
+| Bounded live RFC | Metadata and TXT/HTML/XML/PDF passed; corrected canonical errata, TXT and partial full-text research passed in the final narrowed recheck |
+| Other bounded live sources | Fixed itoa 1.0.15 search/metadata/checksum/source checks and fresh RustSec lookup/request-local audit passed |
+| Native ARM64, hosted CI, browser/ChatGPT UI | Not executed in this run |
+| Real full-corpus initialization, publication, deployment | Not performed |
+
+Image, PostgreSQL and edge gates used signed-base plus immutable patch SHA-256
+`19d5e4ab37d29c942f18b5dfbef593d9870504abf7608d0b2279394be73748f0`.
+The final provider-route correction and Kubernetes/live acceptance used patch
+`954084df7bce24b5c82af50f955e40c38d332244251bf96164a4e84223f11aab`
+on the same signed base. The runtime delta was the fixed canonical errata destination
+and its strict outbound allowlist; the remaining delta updated fixtures, documentation
+and the narrower smoke option. A subsequent multi-RFC traversal fixture and this
+record do not change runtime behavior. Local image revision labels identify the
+signed base, so these checks are not a final registry/release artifact claim.
+
+The first live run passed RFC metadata and all four formats, then stopped because
+`/errata.json` returned 302 to `/api/v1/errata.json`. Redirect rejection remained
+in force. One bounded request to each endpoint established the canonical path;
+the 200 response was 11,775,016 bytes with SHA-256
+`23fe2627c26acf3fe70087763fefce39ec9cb5cdfaaaf51977742e844929762c`.
+It was replayed offline rather than committed as a bulk fixture. The final
+`--live --rfc-text-only` run qualified metadata, text, errata and partial full-text
+research without downloading the already-qualified alternate formats again.
+Including retry allowances, the conservative total RFC ceiling was 12 + 2 + 6 = 20
+attempts. Cargo and RustSec each remained below twenty attempts. No provider was
+crawled or load-tested; automatic collection was paused in all live harnesses.
+
+The isolated Docker helper used native local snapshot storage because the configured
+daemon could not extract overlay layers. Temporary checkout path lengths were
+shortened before the first gate to satisfy Unix-socket limits. Task-owned clusters,
+containers, bridges and daemon state were removed; existing Docker contexts and
+production archives were not changed. Source and scope guards protected each
+immutable acceptance checkout.

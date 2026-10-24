@@ -180,6 +180,7 @@ fn allowed_url(value: &str) -> Result<String> {
             "www.rfc-editor.org" | "rfc-editor.org" => {
                 (path == "/rfc-index.xml"
                     || path == "/errata.json"
+                    || path == "/api/v1/errata.json"
                     || path == "/in-notes/rfc-index.xml"
                     || path.strip_prefix("/rfc/rfc").is_some_and(|v| {
                         [".txt", ".json", ".xml", ".html", ".pdf"]
@@ -269,6 +270,11 @@ mod tests {
             assert!(allowed_url(url).is_err(), "{url}");
         }
         assert!(allowed_url("https://index.crates.io/se/rd/serde").is_ok());
+        assert!(allowed_url("https://www.rfc-editor.org/api/v1/errata.json").is_ok());
+        assert!(
+            allowed_url("https://www.rfc-editor.org/api/v1/errata.json?url=https://evil.test")
+                .is_err()
+        );
         assert!(
             allowed_url(
                 "https://static.crates.io/crates/zstd-sys/zstd-sys-2.0.16+zstd.1.5.7.crate"
