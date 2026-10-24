@@ -264,7 +264,9 @@ fn capture_links(value: &serde_json::Value) -> Vec<ContentBlock> {
             .get("resource_uri")
             .and_then(serde_json::Value::as_str)
             && uri.len() <= 16 * 1024
-            && (uri.starts_with("devres://capture/") || uri.starts_with("devres://source/"))
+            && (uri.starts_with("devres://capture/")
+                || uri.starts_with("devres://source/")
+                || uri.starts_with("devres://rfc/"))
             && uris.len() < 20
         {
             uris.insert(uri.to_owned());

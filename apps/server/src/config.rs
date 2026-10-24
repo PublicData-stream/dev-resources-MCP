@@ -308,10 +308,13 @@ pub struct Config {
     pub edge_mtls: Option<EdgeMtlsConfig>,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub rfc: devres_adapters::RfcConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
         self.limits.validate()?;
+        self.rfc.validate()?;
         for access in [
             AccessPolicy {
                 allowed_hosts: self.http.allowed_hosts.clone(),

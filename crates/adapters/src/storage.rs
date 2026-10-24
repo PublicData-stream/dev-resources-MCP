@@ -18,6 +18,9 @@ use tokio::{
     sync::{Mutex, Semaphore},
 };
 
+#[path = "corpus_storage.rs"]
+mod corpus_storage;
+
 const MAX_BLOB: usize = 128 * 1024 * 1024;
 static STAGE: AtomicU64 = AtomicU64::new(0);
 struct StageGuard(PathBuf);
@@ -77,7 +80,7 @@ impl PgBlobStore {
             .connect(database_url)
             .await
             .map_err(|_| storage_error())?;
-        let mut tx = pool.begin().await.map_err(|_| storage_error())?;
+        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         sqlx::raw_sql(SCHEMA)
             .execute(&mut *tx)
             .await
@@ -86,9 +89,22 @@ impl PgBlobStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        if version != 1 {
+        if version == 1 {
+            sqlx::raw_sql(corpus_storage::SCHEMA_V2)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx::query("UPDATE devres_schema SET version=2 WHERE singleton AND version=1")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        } else if version != 2 {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
+        sqlx::query("UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| storage_error())?;
         tx.commit().await.map_err(|_| storage_error())?;
         tokio::fs::create_dir_all(root.as_ref())
             .await
@@ -269,7 +285,7 @@ impl Store for PgBlobStore {
         if !valid_hash(id) {
             return Err(Error::invalid("Invalid capture identifier"));
         }
-        let row = sqlx::query("SELECT c.*, COALESCE((SELECT MAX(o.validated_at) FROM devres_observations o WHERE o.capture_id=c.id),c.retrieved_at) AS capture_validated_at FROM devres_captures c WHERE c.id=$1")
+        let row = sqlx::query("SELECT c.*, GREATEST(COALESCE((SELECT MAX(o.validated_at) FROM devres_observations o WHERE o.capture_id=c.id),c.retrieved_at),COALESCE((SELECT MAX(o.observed_at) FROM devres_rfc_import_observations o WHERE o.capture_id=c.id),c.retrieved_at)) AS capture_validated_at FROM devres_captures c WHERE c.id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -289,6 +305,7 @@ impl Store for PgBlobStore {
                 "Only successful bounded source bodies may be published",
             ));
         }
+        let imported = corpus_storage::imported_source(&request.key, &request.url)?;
         let body_hash = hash(&response.body);
         let id = hash(
             format!(
@@ -306,14 +323,13 @@ impl Store for PgBlobStore {
             .bind(&id).bind(&request.key).bind(&request.url).bind(&body_hash).bind(&request.media_type).bind(now).execute(&mut *tx).await.map_err(|_| storage_error())?;
         sqlx::query("INSERT INTO devres_heads (source_key,capture_id,validated_at,etag,last_modified) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(source_key) DO UPDATE SET capture_id=EXCLUDED.capture_id,validated_at=EXCLUDED.validated_at,etag=EXCLUDED.etag,last_modified=EXCLUDED.last_modified")
             .bind(&request.key).bind(&id).bind(now).bind(&response.validators.etag).bind(&response.validators.last_modified).execute(&mut *tx).await.map_err(|_| storage_error())?;
-        sqlx::query(
-            "INSERT INTO devres_observations (capture_id,validated_at,status) VALUES ($1,$2,200)",
-        )
-        .bind(&id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?;
+        if imported {
+            sqlx::query("INSERT INTO devres_rfc_import_observations(capture_id,observed_at,source_url) VALUES($1,$2,$3)")
+                .bind(&id).bind(now).bind(&request.url).execute(&mut *tx).await.map_err(|_| storage_error())?;
+        } else {
+            sqlx::query("INSERT INTO devres_observations (capture_id,validated_at,status) VALUES ($1,$2,200)")
+                .bind(&id).bind(now).execute(&mut *tx).await.map_err(|_| storage_error())?;
+        }
         tx.commit().await.map_err(|_| storage_error())?;
         drop(owner);
         let mut stored = self.capture(&id).await?;
@@ -327,6 +343,11 @@ impl Store for PgBlobStore {
         validators: Validators,
         now: i64,
     ) -> Result<StoredCapture> {
+        if key.starts_with("rfc:rsync:") {
+            return Err(Error::invalid(
+                "Imported RFC captures cannot receive HTTP revalidation",
+            ));
+        }
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;

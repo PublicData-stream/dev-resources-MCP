@@ -1,9 +1,13 @@
 //! Retrieval policy shared by every transport and research operation.
+pub mod corpus;
 use async_trait::async_trait;
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators};
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::sync::{Mutex, Semaphore};
 
@@ -41,6 +45,17 @@ pub trait Fetcher: Send + Sync {
     ) -> Result<FetchResponse>;
 }
 
+/// Source adapters validate an owned representation before durable head promotion.
+/// Ownership permits bounded blocking validation without duplicating large bodies.
+#[async_trait]
+pub trait ResponseValidator: Send + Sync {
+    async fn validate(
+        &self,
+        request: &FetchRequest,
+        response: FetchResponse,
+    ) -> Result<FetchResponse>;
+}
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
 }
@@ -59,6 +74,7 @@ pub struct Retrieval {
     admission: Semaphore,
     keys: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     negatives: Mutex<HashMap<String, i64>>,
+    foreground: AtomicUsize,
 }
 impl Retrieval {
     pub fn new(store: Arc<dyn Store>, fetcher: Arc<dyn Fetcher>) -> Self {
@@ -76,6 +92,7 @@ impl Retrieval {
             admission: Semaphore::new(32),
             keys: Mutex::new(HashMap::new()),
             negatives: Mutex::new(HashMap::new()),
+            foreground: AtomicUsize::new(0),
         }
     }
     pub async fn read_capture(&self, id: &str) -> Result<StoredCapture> {
@@ -93,6 +110,74 @@ impl Retrieval {
         self.store.capture(id).await
     }
     pub async fn get(&self, request: FetchRequest) -> Result<StoredCapture> {
+        self.get_inner(request, None, false).await
+    }
+    pub async fn get_validated(
+        &self,
+        request: FetchRequest,
+        validator: &dyn ResponseValidator,
+    ) -> Result<StoredCapture> {
+        self.get_inner(request, Some(validator), false).await
+    }
+    pub fn foreground_active(&self) -> bool {
+        self.foreground.load(Ordering::Acquire) > 0
+    }
+    pub async fn get_background_validated(
+        &self,
+        request: FetchRequest,
+        validator: &dyn ResponseValidator,
+    ) -> Result<StoredCapture> {
+        if self.foreground_active() {
+            return Err(Error::capacity("Foreground retrieval has priority"));
+        }
+        self.get_inner(request, Some(validator), true).await
+    }
+    /// Private adapter entrypoint for bounded offline/imported public evidence.
+    /// This does not perform a fetch or create an HTTP observation itself.
+    pub async fn publish_validated(
+        &self,
+        request: FetchRequest,
+        response: FetchResponse,
+        validator: &dyn ResponseValidator,
+    ) -> Result<StoredCapture> {
+        if request.key.is_empty()
+            || request.key.len() > 2048
+            || request.max_bytes == 0
+            || request.max_bytes > 128 * 1024 * 1024
+            || response.status != 200
+            || response.body.len() > request.max_bytes
+        {
+            return Err(Error::invalid("Invalid public import bounds"));
+        }
+        let _permit = self
+            .admission
+            .try_acquire()
+            .map_err(|_| Error::capacity("Retrieval capacity exhausted"))?;
+        let response = validator.validate(&request, response).await?;
+        self.store
+            .publish(&request, response, self.clock.now())
+            .await
+    }
+    async fn get_inner(
+        &self,
+        request: FetchRequest,
+        validator: Option<&dyn ResponseValidator>,
+        background: bool,
+    ) -> Result<StoredCapture> {
+        struct Foreground<'a>(Option<&'a AtomicUsize>);
+        impl Drop for Foreground<'_> {
+            fn drop(&mut self) {
+                if let Some(counter) = self.0 {
+                    counter.fetch_sub(1, Ordering::Release);
+                }
+            }
+        }
+        let _foreground = if background {
+            Foreground(None)
+        } else {
+            self.foreground.fetch_add(1, Ordering::Acquire);
+            Foreground(Some(&self.foreground))
+        };
         if request.key.is_empty()
             || request.key.len() > 2048
             || request.max_bytes == 0
@@ -157,6 +242,10 @@ impl Retrieval {
                 if response.body.len() > request.max_bytes {
                     return Err(Error::capacity("Source body exceeds limit"));
                 }
+                let response = match validator {
+                    Some(validator) => validator.validate(&request, response).await?,
+                    None => response,
+                };
                 drop(existing); // Old bytes are no longer needed after a successful replacement.
                 self.store.publish(&request, response, now).await
             }

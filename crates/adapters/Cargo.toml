@@ -22,6 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "json"] }
 quick-xml = { version = "0.42", features = ["serialize"] }
+base64 = "0.22"
+html5ever = "0.40"
+tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "stemmer", "stopwords", "lz4-compression"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tar = "0.4"
 flate2 = "1"
 rustsec = { version = "=0.33.0", default-features = false }

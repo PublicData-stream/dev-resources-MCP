@@ -178,15 +178,19 @@ fn allowed_url(value: &str) -> Result<String> {
     let allowed = safe
         && match host {
             "www.rfc-editor.org" | "rfc-editor.org" => {
-                path == "/rfc-index.xml"
+                (path == "/rfc-index.xml"
+                    || path == "/errata.json"
                     || path == "/in-notes/rfc-index.xml"
                     || path.strip_prefix("/rfc/rfc").is_some_and(|v| {
-                        [".txt", ".json", ".xml"].iter().any(|suffix| {
-                            v.strip_suffix(suffix).is_some_and(|n| {
-                                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                        [".txt", ".json", ".xml", ".html", ".pdf"]
+                            .iter()
+                            .any(|suffix| {
+                                v.strip_suffix(suffix).is_some_and(|n| {
+                                    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                                })
                             })
-                        })
-                    })
+                    }))
+                    && url.query().is_none()
             }
             "crates.io" => path == "/api/v1/crates",
             "index.crates.io" => {

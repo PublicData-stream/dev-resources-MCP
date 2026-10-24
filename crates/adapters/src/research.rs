@@ -1,6 +1,6 @@
 //! Read-only tool composition. Submitted audit data never enters retrieval/storage.
 
-use crate::{advisory, cargo, rfc};
+use crate::{advisory, cargo, rfc, rfc_corpus::RfcCorpus, rfc_tools};
 use devres_application::Retrieval;
 use devres_domain::{Capture, Error, Result, StoredCapture};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use std::{
 pub struct Research {
     retrieval: Arc<Retrieval>,
     advisory: advisory::Advisories,
+    corpus: Option<std::sync::Arc<RfcCorpus>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -56,7 +57,10 @@ pub(crate) fn now() -> i64 {
 }
 
 pub(crate) fn capture_json(capture: &Capture, ttl: u64) -> Value {
-    let resource_uri = if capture.media_type == "application/gzip" {
+    let resource_uri = if matches!(
+        capture.media_type.as_str(),
+        "application/gzip" | "application/pdf"
+    ) {
         None
     } else {
         Some(format!("devres://capture/{}", capture.id))
@@ -97,7 +101,13 @@ impl Research {
         Ok(Self {
             advisory: advisory::Advisories::new(retrieval.clone()),
             retrieval,
+            corpus: None,
         })
+    }
+
+    pub fn with_corpus(mut self, corpus: std::sync::Arc<RfcCorpus>) -> Self {
+        self.corpus = Some(corpus);
+        self
     }
 
     pub async fn refresh_advisories(&self) -> Result<Value> {
@@ -105,6 +115,25 @@ impl Research {
     }
 
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if matches!(
+            tool,
+            "rfc_metadata"
+                | "rfc_catalog_search"
+                | "rfc_fulltext_search"
+                | "rfc_format_get"
+                | "rfc_errata"
+                | "rfc_series_get"
+                | "rfc_corpus_status"
+        ) {
+            return rfc_tools::call(
+                self.corpus
+                    .as_deref()
+                    .ok_or_else(|| Error::unavailable("RFC corpus storage is not configured."))?,
+                tool,
+                input,
+            )
+            .await;
+        }
         match tool {
             "rfc_search" => rfc::search(&self.retrieval, decode(input)?).await,
             "rfc_get" => rfc::get(&self.retrieval, decode(input)?).await,
@@ -259,6 +288,21 @@ impl Research {
                 json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":output["page"]["text"]}]}),
             );
         }
+        if url.host_str() == Some("rfc") {
+            let input = rfc_tools::format_from_uri(&url)?;
+            let value = rfc_tools::format_get(
+                self.corpus
+                    .as_deref()
+                    .ok_or_else(|| Error::unavailable("RFC corpus storage is not configured."))?,
+                input,
+            )
+            .await?;
+            return Ok(if value["format"] == "pdf" {
+                json!({"contents":[{"uri":uri,"mimeType":"application/pdf","blob":value["page"]["data"]}]})
+            } else {
+                json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":value["page"]["text"]}]})
+            });
+        }
         if url.host_str() != Some("capture") {
             return Err(Error::invalid("Unsupported resource namespace."));
         }
@@ -289,6 +333,14 @@ impl Research {
             }
         }
         let stored = self.retrieval.read_capture(capture_id).await?;
+        if matches!(
+            stored.capture.media_type.as_str(),
+            "application/pdf" | "application/gzip"
+        ) {
+            return Err(Error::invalid(
+                "Binary captures must be read through a typed source tool.",
+            ));
+        }
         let text = std::str::from_utf8(&stored.body).map_err(|_| {
             Error::invalid("Binary captures must be read through a typed source tool.")
         })?;
@@ -414,5 +466,6 @@ fn schemas() -> Vec<Value> {
         json!({"lockfile":{"type":"string","minLength":1,"maxLength":1048576},"advisory_snapshot":capture,"offset":offset,"limit":limit}),
         vec!["lockfile"],
     );
+    tools.extend(rfc_tools::schemas());
     tools
 }
