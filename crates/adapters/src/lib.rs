@@ -1,7 +1,9 @@
 //! Network, durable storage, and source-specific research adapters.
 mod advisory;
 mod archive;
+pub mod bulk;
 mod cargo;
+pub mod crate_git;
 mod network;
 mod research;
 mod rfc;

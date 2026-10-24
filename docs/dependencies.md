@@ -15,8 +15,10 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | SHA-256, hex, fs2 | Content-addressed immutable blobs, exact archive checksum verification, and free-space admission. fs2 provides safe filesystem-space calls rather than adding unsafe local FFI. |
 | quick-xml, tar, flate2 | Streaming official RFC metadata and bounded crate/advisory archives. Neither tar extraction nor link following is used. XML general entities and mixed text need parser tests. |
 | html5ever | Streaming HTML tokenization without a DOM, scripting, network or rendering. Direct tokenization avoids CSS dependencies and checks budgets between feeds. Raw captures remain unchanged; fixtures cover entities and active content. |
-| tantivy 0.27 | Embedded positional search over whole RFCs, avoiding PostgreSQL position limits and a separate daemon. Defaults disabled; enable mmap, stemmer, stopwords and LZ4 only. Trusted index paths/schemas, restricted query syntax and verified immutable manifests contain the boundary. Its indexing, compression, tokenizer and proc-macro graph receives current advisory/license/source checks. |
+| tantivy 0.27 | Embedded positional search over whole RFCs and immutable crate/version/document shards, avoiding PostgreSQL position limits and a separate daemon. Defaults disabled; enable mmap, stemmer, stopwords and LZ4 only. Trusted index paths/schemas, restricted query syntax and verified immutable manifests contain the boundary. Its indexing, compression, tokenizer and proc-macro graph receives current advisory/license/source checks. |
 | base64, tokio-util | Bounded PDF encoding and managed collector/import cancellation. Existing graph packages become direct dependencies; neither enables caller-selected executables. |
+| zip 9.0.0, csv-core | ZIP is needed for the official docs.rs all-target HTML bundle; disabling BZIP2/Deflate would exclude supported provider artifacts. Defaults are disabled; enable only deflate and bzip2, with no encryption/extraction. A hand-written ZIP/decompression stack would duplicate security-sensitive parsing. csv-core supplies allocation-free incremental CSV decoding rather than whole-dump deserialization; an additional strict quoting/size layer rejects malformed input before projection. |
+| nix | Signal/process features terminate and reap the owned fixed Git process group on cancellation. Killing only the immediate child can leave Git helpers running; no caller-selected executable or package process is admitted. |
 | rustsec, semver | Maintained canonical advisory parsing and version matching rather than reimplementing affected ranges. Disable rustsec defaults, including Git, index lookup, and automatic fix support. |
 | tracing/subscriber | Aggregate operational logging without request bodies or audit inputs. |
 | rcgen, tempfile | Test-only disposable certificates and storage; not operator certificate provisioning. |
@@ -42,3 +44,25 @@ are generated from locked metadata, preserving packaged license and notice files
 the pinned toolchain standard-library copyright inventory and license texts are
 included as well. Operating-system packages retain their image-provided copyright
 information.
+
+## Crate corpus dependency boundary
+
+ZIP is pinned to 9.0.0; earlier 8.x candidates failed current advisory admission and
+are not suppressed. The selected deflate feature resolves zlib-rs/zopfli; BZIP2
+uses bzip2 0.6.1 and its Rust libbz2-rs-sys 0.2.5 backend. These parsers inspect
+bounded inert artifacts, including CRCs and central-directory/member identities,
+without extracting paths or enabling encrypted archive support. zip is MIT;
+csv-core is Unlicense/MIT, bzip2 is MIT/Apache-2.0, and original transitive notices
+remain in the build notice inventory. None executes inspected package code.
+
+`deny.toml` contains an exact `libbz2-rs-sys@0.2.5` exception for `bzip2-1.0.6`.
+The actual permissive license text requires preserving copyright/source attribution
+and its endorsement restrictions. The exception owner is repository maintainers,
+reviewed again by 2027-01-24 or on graph changes. It is not a global new license
+allowance or an advisory suppression. Current cargo-audit/cargo-deny results must
+still be reported separately from compilation and fixture acceptance.
+
+Server images additionally need the fixed Git executable for private index object
+processing. Child configuration excludes user/system Git configuration, hooks,
+credential helpers and arbitrary remotes; no worktree or package build is created.
+Operating-system Git and its notices remain separately licensed image contents.

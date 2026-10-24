@@ -16,6 +16,9 @@ exceptions = [
  { crate = "devres-application@0.0.0", allow = ["AGPL-3.0-only"] },
  { crate = "devres-adapters@0.0.0", allow = ["AGPL-3.0-only"] },
  { crate = "devres-server@0.0.0", allow = ["AGPL-3.0-only"] },
+ # ZIP BZIP2 support: reviewed permissive redistribution/attribution terms.
+ # Owner: repository maintainers. Review by 2027-01-24 or on graph changes.
+ { crate = "libbz2-rs-sys@0.2.5", allow = ["bzip2-1.0.6"] },
 ]
 
 [bans]

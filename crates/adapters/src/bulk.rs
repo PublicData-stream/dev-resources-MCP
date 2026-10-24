@@ -1,0 +1,1236 @@
+//! Private fixed-source streaming I/O. Public capture reads retain their smaller limits.
+use devres_domain::{Error, Result, Validators};
+use futures::{Stream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
+use tokio_util::{io::StreamReader, sync::CancellationToken};
+
+pub const CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_RETRY_AFTER: u64 = 5;
+static STAGE: AtomicU64 = AtomicU64::new(0);
+
+pub type BulkStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>;
+
+#[derive(Clone, Debug)]
+pub struct BulkConfig {
+    pub static_requests_per_second: u32,
+    pub index_requests_per_second: u32,
+    pub other_requests_per_second: u32,
+    pub max_transfers: usize,
+    pub min_free_bytes: u64,
+}
+impl Default for BulkConfig {
+    fn default() -> Self {
+        Self {
+            static_requests_per_second: 5,
+            index_requests_per_second: 1,
+            other_requests_per_second: 1,
+            max_transfers: 4,
+            min_free_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum DocsOperation {
+    Status,
+    Platforms,
+    Html,
+    Builds,
+    Json { target: String, format: Option<u32> },
+}
+#[derive(Clone, Copy, Debug)]
+pub enum GitOperation {
+    Advertisement,
+    UploadPack,
+}
+#[derive(Clone, Debug)]
+pub enum BulkSource {
+    DatabaseDump,
+    CrateArchive {
+        name: String,
+        version: String,
+    },
+    Documentation {
+        name: String,
+        version: String,
+        operation: DocsOperation,
+    },
+    RegistryGit(GitOperation),
+}
+impl BulkSource {
+    pub fn url(&self) -> Result<String> {
+        match self {
+            Self::DatabaseDump => Ok("https://static.crates.io/db-dump.tar.gz".into()),
+            Self::CrateArchive { name, version } => {
+                package_identity(name, version)?;
+                Ok(format!("https://static.crates.io/crates/{name}/{name}-{version}.crate"))
+            }
+            Self::Documentation { name, version, operation } => {
+                package_identity(name, version)?;
+                let suffix = match operation {
+                    DocsOperation::Status => "status.json".into(),
+                    DocsOperation::Platforms => "menus/platforms/".into(),
+                    DocsOperation::Html => "download".into(),
+                    DocsOperation::Builds => "builds".into(),
+                    DocsOperation::Json { target, format } => {
+                        if !valid_target(target) { return Err(Error::invalid("Invalid documentation target.")); }
+                        match format {
+                            Some(format) if *format > 0 => format!("{target}/json/{format}.gz"),
+                            Some(_) => return Err(Error::invalid("Invalid documentation format.")),
+                            None => format!("{target}/json.gz"),
+                        }
+                    }
+                };
+                Ok(format!("https://docs.rs/crate/{name}/{version}/{suffix}"))
+            }
+            Self::RegistryGit(GitOperation::Advertisement) => Ok("https://github.com/rust-lang/crates.io-index.git/info/refs?service=git-upload-pack".into()),
+            Self::RegistryGit(GitOperation::UploadPack) => Ok("https://github.com/rust-lang/crates.io-index.git/git-upload-pack".into()),
+        }
+    }
+    pub fn host(&self) -> &'static str {
+        match self {
+            Self::DatabaseDump | Self::CrateArchive { .. } => "static.crates.io",
+            Self::Documentation { .. } => "docs.rs",
+            Self::RegistryGit(_) => "github.com",
+        }
+    }
+    fn media_type(&self) -> &'static str {
+        match self {
+            Self::RegistryGit(GitOperation::Advertisement) => {
+                "application/x-git-upload-pack-advertisement"
+            }
+            Self::RegistryGit(GitOperation::UploadPack) => "application/x-git-upload-pack-result",
+            Self::Documentation {
+                operation: DocsOperation::Status,
+                ..
+            } => "application/json",
+            Self::Documentation {
+                operation: DocsOperation::Platforms | DocsOperation::Builds,
+                ..
+            } => "text/html",
+            Self::Documentation {
+                operation: DocsOperation::Html,
+                ..
+            } => "application/zip",
+            _ => "application/gzip",
+        }
+    }
+}
+fn package_identity(name: &str, version: &str) -> Result<()> {
+    crate::cargo::validate_name(name)?;
+    crate::cargo::validate_version(version)?;
+    Ok(())
+}
+pub fn valid_target(target: &str) -> bool {
+    !target.is_empty()
+        && target.len() <= 128
+        && !target.contains("..")
+        && target
+            .bytes()
+            .all(|v| v.is_ascii_alphanumeric() || b"-_.".contains(&v))
+}
+fn admitted_host(host: &str) -> Result<&str> {
+    match host {
+        "rfc-editor.org" => Ok("www.rfc-editor.org"),
+        "www.rfc-editor.org"
+        | "crates.io"
+        | "index.crates.io"
+        | "static.crates.io"
+        | "api.github.com"
+        | "codeload.github.com"
+        | "github.com"
+        | "docs.rs" => Ok(host),
+        _ => Err(Error::invalid("Source host is not permitted.")),
+    }
+}
+
+pub struct BulkRequest {
+    pub source: BulkSource,
+    pub validators: Validators,
+    pub max_bytes: u64,
+    pub deadline: Instant,
+    /// Only the read-only Git upload-pack operation accepts a request body.
+    pub body: Vec<u8>,
+}
+pub struct BulkResponse {
+    pub status: u16,
+    pub validators: Validators,
+    pub content_length: Option<u64>,
+    pub stream: BulkStream,
+}
+pub struct AttemptPermit {
+    _transfer: OwnedSemaphorePermit,
+    _documentation: Option<OwnedSemaphorePermit>,
+}
+
+pub struct BulkBroker {
+    client: reqwest::Client,
+    config: BulkConfig,
+    rates: Mutex<HashMap<String, Instant>>,
+    bulk_slots: Arc<Semaphore>,
+    foreground_slots: Arc<Semaphore>,
+    documentation_slots: Arc<Semaphore>,
+    #[cfg(test)]
+    test_origin: Option<url::Url>,
+}
+impl BulkBroker {
+    #[cfg(test)]
+    pub(crate) fn fixture(origin: url::Url) -> Result<Self> {
+        if origin.scheme() != "http" || origin.host_str() != Some("127.0.0.1") {
+            return Err(Error::invalid("Fixture broker requires loopback HTTP."));
+        }
+        let mut broker = Self::new(BulkConfig::default())?;
+        broker.client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| Error::unavailable("Fixture HTTP initialization failed."))?;
+        broker.test_origin = Some(origin);
+        Ok(broker)
+    }
+    pub fn new(config: BulkConfig) -> Result<Self> {
+        if !(1..=1000).contains(&config.static_requests_per_second)
+            || !(1..=1000).contains(&config.index_requests_per_second)
+            || config.other_requests_per_second != 1
+            || !(1..=32).contains(&config.max_transfers)
+            || config.min_free_bytes < 64 * 1024 * 1024
+        {
+            return Err(Error::invalid("Invalid bulk transfer limits."));
+        }
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent(
+                "dev-resources-MCP/0.0.0 (+https://github.com/PublicData-stream/dev-resources-MCP)",
+            )
+            .build()
+            .map_err(|_| Error::unavailable("Bulk HTTP initialization failed."))?;
+        Ok(Self {
+            client,
+            bulk_slots: Arc::new(Semaphore::new(config.max_transfers)),
+            foreground_slots: Arc::new(Semaphore::new(2)),
+            documentation_slots: Arc::new(Semaphore::new(1)),
+            rates: Mutex::new(HashMap::new()),
+            config,
+            #[cfg(test)]
+            test_origin: None,
+        })
+    }
+
+    /// Existing bounded fetches use this same host clock, with their own two slots.
+    pub async fn admit_foreground(&self, host: &str) -> Result<AttemptPermit> {
+        self.admit(host, false).await
+    }
+    async fn admit(&self, host: &str, bulk: bool) -> Result<AttemptPermit> {
+        let host = admitted_host(host)?;
+        let documentation = if host == "docs.rs" {
+            Some(
+                self.documentation_slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::unavailable("Documentation admission stopped."))?,
+            )
+        } else {
+            None
+        };
+        let slots = if bulk {
+            &self.bulk_slots
+        } else {
+            &self.foreground_slots
+        };
+        let transfer = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::unavailable("HTTP admission stopped."))?;
+        let scheduled = {
+            let mut rates = self.rates.lock().await;
+            let now = Instant::now();
+            let scheduled = rates.get(host).copied().unwrap_or(now).max(now);
+            let per_second = match host {
+                "static.crates.io" => self.config.static_requests_per_second,
+                "index.crates.io" | "github.com" => self.config.index_requests_per_second,
+                _ => self.config.other_requests_per_second,
+            };
+            rates.insert(
+                host.to_owned(),
+                scheduled + Duration::from_secs_f64(1.0 / f64::from(per_second)),
+            );
+            scheduled
+        };
+        tokio::time::sleep_until(scheduled).await;
+        Ok(AttemptPermit {
+            _transfer: transfer,
+            _documentation: documentation,
+        })
+    }
+
+    pub async fn open(
+        &self,
+        request: BulkRequest,
+        shutdown: CancellationToken,
+    ) -> Result<BulkResponse> {
+        if request.max_bytes == 0
+            || request.max_bytes > MAX_ARTIFACT_BYTES
+            || request.deadline <= Instant::now()
+        {
+            return Err(Error::invalid("Invalid bulk response budget."));
+        }
+        let upload = matches!(
+            request.source,
+            BulkSource::RegistryGit(GitOperation::UploadPack)
+        );
+        if request.body.len() > 1024 * 1024 || (!upload && !request.body.is_empty()) {
+            return Err(Error::invalid("Invalid bulk request body."));
+        }
+        let url = request.source.url()?;
+        #[cfg(test)]
+        let url = if let Some(origin) = &self.test_origin {
+            let original =
+                url::Url::parse(&url).map_err(|_| Error::invalid("Invalid test source."))?;
+            let mut destination = origin.clone();
+            destination.set_path(original.path());
+            destination.set_query(original.query());
+            destination.to_string()
+        } else {
+            url
+        };
+        for attempt in 0..=1 {
+            let permit = bounded(
+                &shutdown,
+                request.deadline,
+                self.admit(request.source.host(), true),
+            )
+            .await?;
+            let mut builder = if upload {
+                self.client.post(&url).body(request.body.clone())
+            } else {
+                self.client.get(&url)
+            };
+            builder = builder.header(reqwest::header::ACCEPT, request.source.media_type());
+            if matches!(request.source, BulkSource::RegistryGit(_)) {
+                builder = builder.header("Git-Protocol", "version=2");
+                if upload {
+                    builder = builder.header(
+                        reqwest::header::CONTENT_TYPE,
+                        "application/x-git-upload-pack-request",
+                    );
+                }
+            }
+            if let Some(etag) = &request.validators.etag {
+                builder = builder.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(modified) = &request.validators.last_modified {
+                builder = builder.header(reqwest::header::IF_MODIFIED_SINCE, modified);
+            }
+            let response = bounded(&shutdown, request.deadline, async {
+                builder
+                    .send()
+                    .await
+                    .map_err(|_| Error::unavailable("Bulk source connection failed."))
+            })
+            .await?;
+            let status = response.status().as_u16();
+            if attempt == 0 && matches!(status, 429 | 500 | 502 | 503 | 504) {
+                let delay = retry_after(response.headers());
+                drop(response);
+                drop(permit);
+                if let Some(delay) = delay {
+                    bounded(&shutdown, request.deadline, async {
+                        tokio::time::sleep(delay).await;
+                        Ok(())
+                    })
+                    .await?;
+                    continue;
+                }
+                return Err(Error::unavailable(
+                    "Bulk source requested a deferred retry.",
+                ));
+            }
+            let validators = response_validators(response.headers());
+            let content_length = response.content_length();
+            if status != 200 {
+                drop(response);
+                drop(permit);
+                return Ok(BulkResponse {
+                    status,
+                    validators,
+                    content_length,
+                    stream: Box::pin(futures::stream::empty()),
+                });
+            }
+            if content_length.is_some_and(|length| length > request.max_bytes) {
+                return Err(Error::capacity("Bulk source exceeds its byte budget."));
+            }
+            let input = response
+                .bytes_stream()
+                .map_err(|_| std::io::Error::other("Bulk source transfer failed."));
+            let reader = StreamReader::new(input);
+            let state = StreamState {
+                reader: Box::pin(reader),
+                _permit: permit,
+                received: 0,
+                max_bytes: request.max_bytes,
+                expected_bytes: content_length,
+                deadline: request.deadline,
+                shutdown,
+            };
+            let stream = futures::stream::try_unfold(state, |mut state| async move {
+                let mut chunk = vec![0; CHUNK_BYTES];
+                let read = bounded(&state.shutdown, state.deadline, async {
+                    state
+                        .reader
+                        .read(&mut chunk)
+                        .await
+                        .map_err(|_| Error::unavailable("Bulk source transfer failed."))
+                })
+                .await?;
+                if read == 0 {
+                    if state
+                        .expected_bytes
+                        .is_some_and(|length| length != state.received)
+                    {
+                        return Err(Error::integrity("Bulk source length mismatch."));
+                    }
+                    return Ok(None);
+                }
+                state.received = state
+                    .received
+                    .checked_add(read as u64)
+                    .filter(|length| *length <= state.max_bytes)
+                    .ok_or_else(|| Error::capacity("Bulk source exceeds its byte budget."))?;
+                chunk.truncate(read);
+                Ok(Some((chunk, state)))
+            });
+            return Ok(BulkResponse {
+                status,
+                validators,
+                content_length,
+                stream: Box::pin(stream),
+            });
+        }
+        Err(Error::unavailable("Bulk source unavailable."))
+    }
+}
+type ByteReader = Pin<Box<dyn tokio::io::AsyncRead + Send>>;
+struct StreamState {
+    reader: ByteReader,
+    _permit: AttemptPermit,
+    received: u64,
+    max_bytes: u64,
+    expected_bytes: Option<u64>,
+    deadline: Instant,
+    shutdown: CancellationToken,
+}
+pub(crate) async fn bounded<T>(
+    shutdown: &CancellationToken,
+    deadline: Instant,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! { biased;
+        _ = shutdown.cancelled() => Err(Error::unavailable("Bulk operation canceled.")),
+        result = tokio::time::timeout_at(deadline, future) => result.map_err(|_| Error::capacity("Bulk operation deadline exceeded."))?,
+    }
+}
+fn response_validators(headers: &reqwest::header::HeaderMap) -> Validators {
+    Validators {
+        etag: headers
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+        last_modified: headers
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    }
+}
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds = match headers.get(reqwest::header::RETRY_AFTER) {
+        None => 1,
+        Some(value) => {
+            let value = value.to_str().ok()?;
+            value.parse::<u64>().ok().or_else(|| {
+                httpdate::parse_http_date(value).ok().map(|date| {
+                    date.duration_since(std::time::SystemTime::now())
+                        .map(|d| d.as_secs().saturating_add(1))
+                        .unwrap_or(1)
+                })
+            })?
+        }
+    };
+    (seconds <= MAX_RETRY_AFTER).then(|| Duration::from_secs(seconds.max(1)))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BulkArtifact {
+    pub body_hash: String,
+    pub bytes: u64,
+    pub relative_path: String,
+}
+pub struct BulkArtifactStore {
+    root: PathBuf,
+    min_free_bytes: u64,
+    quota: Option<Quota>,
+}
+struct Quota {
+    used: Arc<AtomicU64>,
+    limit: u64,
+}
+pub struct ArtifactReservation {
+    used: Option<Arc<AtomicU64>>,
+    bytes: u64,
+    retained: bool,
+}
+impl ArtifactReservation {
+    fn reserve(&mut self, bytes: u64, limit: u64) -> Result<()> {
+        if let Some(used) = &self.used {
+            used.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(bytes).filter(|next| *next <= limit)
+            })
+            .map_err(|_| Error::capacity("Bulk archive quota exhausted; history is preserved."))?;
+            self.bytes += bytes;
+        }
+        Ok(())
+    }
+    /// Call immediately after creating a new immutable hash-named object, even if
+    /// later directory fsync or database publication fails.
+    pub fn retain(mut self) {
+        self.retained = true;
+    }
+}
+impl Drop for ArtifactReservation {
+    fn drop(&mut self) {
+        if !self.retained
+            && let Some(used) = &self.used
+        {
+            used.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+struct Stage(PathBuf);
+impl Drop for Stage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+pub(crate) fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+}
+impl BulkArtifactStore {
+    /// The caller must already hold the database's exclusive storage fence.
+    pub fn new(root: impl AsRef<Path>, min_free_bytes: u64) -> Result<Self> {
+        if min_free_bytes < 64 * 1024 * 1024 {
+            return Err(Error::invalid("Invalid bulk storage headroom."));
+        }
+        let metadata = std::fs::symlink_metadata(root.as_ref()).map_err(|_| storage_error())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Error::integrity("Invalid bulk archive directory."));
+        }
+        Ok(Self {
+            root: std::fs::canonicalize(root).map_err(|_| storage_error())?,
+            min_free_bytes,
+            quota: None,
+        })
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    /// Counts existing hash-named immutable objects; concurrent bulk stages reserve
+    /// quota before writes. Ordinary publishers must share this store's accounting.
+    pub fn with_quota(mut self, max_bytes: Option<u64>) -> Result<Self> {
+        let Some(limit) = max_bytes else {
+            self.quota = None;
+            return Ok(self);
+        };
+        if limit == 0 {
+            return Err(Error::invalid("Artifact quota must be positive."));
+        }
+        let mut used = 0_u64;
+        for entry in std::fs::read_dir(&self.root).map_err(|_| storage_error())? {
+            let entry = entry.map_err(|_| storage_error())?;
+            if !valid_hash(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            if !entry.file_type().map_err(|_| storage_error())?.is_file() {
+                return Err(Error::integrity(
+                    "Invalid immutable artifact filesystem member.",
+                ));
+            }
+            used = used
+                .checked_add(entry.metadata().map_err(|_| storage_error())?.len())
+                .ok_or_else(|| Error::capacity("Artifact quota accounting overflow."))?;
+        }
+        self.quota = Some(Quota {
+            used: Arc::new(AtomicU64::new(used)),
+            limit,
+        });
+        Ok(self)
+    }
+    pub fn accounted_bytes(&self) -> Option<u64> {
+        self.quota
+            .as_ref()
+            .map(|quota| quota.used.load(Ordering::Acquire))
+    }
+    pub fn quota_bytes(&self) -> Option<u64> {
+        self.quota.as_ref().map(|quota| quota.limit)
+    }
+    /// The ordinary small-blob publisher can share the same accounting. Dropping
+    /// an unretained reservation rolls back staging/duplicate charges.
+    pub fn reserve_bytes(&self, bytes: u64) -> Result<ArtifactReservation> {
+        let mut reservation = ArtifactReservation {
+            used: self.quota.as_ref().map(|quota| quota.used.clone()),
+            bytes: 0,
+            retained: false,
+        };
+        reservation.reserve(
+            bytes,
+            self.quota.as_ref().map_or(u64::MAX, |quota| quota.limit),
+        )?;
+        Ok(reservation)
+    }
+    /// Only recognized abandoned regular staging files are disposable.
+    pub async fn recover_stages(&self) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(&self.root)
+            .await
+            .map_err(|_| storage_error())?;
+        while let Some(entry) = entries.next_entry().await.map_err(|_| storage_error())? {
+            let name = entry.file_name();
+            if stage_name(&name.to_string_lossy())
+                && entry
+                    .file_type()
+                    .await
+                    .map_err(|_| storage_error())?
+                    .is_file()
+            {
+                tokio::fs::remove_file(entry.path())
+                    .await
+                    .map_err(|_| storage_error())?;
+            }
+        }
+        sync_directory(&self.root).await
+    }
+    pub async fn capture(
+        &self,
+        response: BulkResponse,
+        expected_hash: Option<&str>,
+        shutdown: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        if response.status != 200 {
+            return Err(if response.status == 404 {
+                Error::not_found("Bulk source not found.")
+            } else {
+                Error::unavailable("Bulk source did not supply a representation.")
+            });
+        }
+        self.publish_stream(response.stream, expected_hash, MAX_ARTIFACT_BYTES, shutdown)
+            .await
+    }
+    pub async fn ingest_file(
+        &self,
+        path: &Path,
+        max_bytes: u64,
+        shutdown: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        if max_bytes == 0 || max_bytes > MAX_ARTIFACT_BYTES {
+            return Err(Error::invalid("Invalid artifact byte budget."));
+        }
+        let metadata = tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|_| storage_error())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > max_bytes {
+            return Err(Error::capacity("Invalid or oversized artifact file."));
+        }
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| storage_error())?;
+        let stream = futures::stream::try_unfold(file, |mut file| async move {
+            let mut chunk = vec![0; CHUNK_BYTES];
+            let read = file.read(&mut chunk).await.map_err(|_| storage_error())?;
+            if read == 0 {
+                return Ok(None);
+            }
+            chunk.truncate(read);
+            Ok(Some((chunk, file)))
+        });
+        self.publish_stream(Box::pin(stream), None, max_bytes, shutdown)
+            .await
+    }
+    pub async fn capture_bytes(
+        &self,
+        bytes: Vec<u8>,
+        shutdown: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(Error::capacity(
+                "In-memory artifact exceeds its byte budget.",
+            ));
+        }
+        let stream = futures::stream::unfold((bytes, 0), |(bytes, offset)| async move {
+            if offset == bytes.len() {
+                return None;
+            }
+            let end = offset.saturating_add(CHUNK_BYTES).min(bytes.len());
+            let chunk = bytes[offset..end].to_vec();
+            Some((Ok(chunk), (bytes, end)))
+        });
+        self.publish_stream(Box::pin(stream), None, MAX_ARTIFACT_BYTES, shutdown)
+            .await
+    }
+    async fn publish_stream(
+        &self,
+        mut stream: BulkStream,
+        expected_hash: Option<&str>,
+        max_bytes: u64,
+        shutdown: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        if expected_hash.is_some_and(|hash| !valid_hash(hash)) {
+            return Err(Error::invalid("Invalid expected artifact checksum."));
+        }
+        let path = self.root.join(format!(
+            ".bulk-stage-{}-{}",
+            std::process::id(),
+            STAGE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let stage = Stage(path.clone());
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+            .map_err(|_| storage_error())?;
+        let mut hash = Sha256::new();
+        let mut bytes = 0_u64;
+        let mut reservation = self.reserve_bytes(0)?;
+        loop {
+            let next = tokio::select! { biased; _ = shutdown.cancelled() => return Err(Error::unavailable("Bulk artifact publication canceled.")), next = stream.next() => next };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = chunk?;
+            if chunk.len() > CHUNK_BYTES {
+                return Err(Error::capacity("Artifact chunk exceeds streaming budget."));
+            }
+            bytes = bytes
+                .checked_add(chunk.len() as u64)
+                .filter(|length| *length <= max_bytes)
+                .ok_or_else(|| Error::capacity("Artifact exceeds byte budget."))?;
+            if fs2::available_space(&self.root).map_err(|_| storage_error())?
+                < self.min_free_bytes.saturating_add(chunk.len() as u64)
+            {
+                return Err(Error::capacity(
+                    "Insufficient archive space; history is preserved.",
+                ));
+            }
+            reservation.reserve(
+                chunk.len() as u64,
+                self.quota.as_ref().map_or(u64::MAX, |quota| quota.limit),
+            )?;
+            tokio::select! { biased; _ = shutdown.cancelled() => return Err(Error::unavailable("Bulk artifact publication canceled.")), result = file.write_all(&chunk) => result.map_err(|_| storage_error())? }
+            hash.update(&chunk);
+        }
+        let body_hash = hex::encode(hash.finalize());
+        if expected_hash.is_some_and(|expected| expected != body_hash) {
+            return Err(Error::integrity("Bulk artifact checksum mismatch."));
+        }
+        file.sync_all().await.map_err(|_| storage_error())?;
+        drop(file);
+        if shutdown.is_cancelled() {
+            return Err(Error::unavailable("Bulk artifact publication canceled."));
+        }
+        let destination = self.root.join(&body_hash);
+        // The filesystem operation and quota ownership transition must have one
+        // owner even if its async waiter is canceled after link creation.
+        let stage_path = stage.0.clone();
+        let created =
+            tokio::task::spawn_blocking(move || retain_link(stage_path, destination, reservation))
+                .await
+                .map_err(|_| storage_error())??;
+        if !created {
+            let existing = self.verify(&body_hash, max_bytes, shutdown.clone()).await?;
+            if existing.bytes != bytes {
+                return Err(Error::integrity("Immutable artifact length mismatch."));
+            }
+        }
+        sync_directory(&self.root).await?;
+        Ok(BulkArtifact {
+            relative_path: body_hash.clone(),
+            body_hash,
+            bytes,
+        })
+    }
+    pub async fn verify(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+        shutdown: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        if !valid_hash(hash) {
+            return Err(Error::invalid("Invalid artifact hash."));
+        }
+        let path = self.root.join(hash);
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|_| storage_error())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > max_bytes {
+            return Err(Error::integrity("Invalid retained artifact."));
+        }
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| storage_error())?;
+        let mut digest = Sha256::new();
+        let mut length = 0_u64;
+        let mut chunk = vec![0; CHUNK_BYTES];
+        loop {
+            let count = tokio::select! { biased; _ = shutdown.cancelled() => return Err(Error::unavailable("Artifact verification canceled.")), result = file.read(&mut chunk) => result.map_err(|_| storage_error())? };
+            if count == 0 {
+                break;
+            }
+            length = length
+                .checked_add(count as u64)
+                .filter(|bytes| *bytes <= max_bytes)
+                .ok_or_else(|| Error::integrity("Retained artifact grew beyond its budget."))?;
+            digest.update(&chunk[..count]);
+        }
+        if length != metadata.len() || hex::encode(digest.finalize()) != hash {
+            return Err(Error::integrity("Retained artifact checksum mismatch."));
+        }
+        Ok(BulkArtifact {
+            body_hash: hash.into(),
+            relative_path: hash.into(),
+            bytes: length,
+        })
+    }
+    pub async fn open(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+        shutdown: CancellationToken,
+    ) -> Result<tokio::fs::File> {
+        self.verify(hash, max_bytes, shutdown).await?;
+        tokio::fs::File::open(self.root.join(hash))
+            .await
+            .map_err(|_| storage_error())
+    }
+}
+fn storage_error() -> Error {
+    Error::unavailable("Bulk artifact storage unavailable.")
+}
+fn retain_link(
+    stage: PathBuf,
+    destination: PathBuf,
+    reservation: ArtifactReservation,
+) -> Result<bool> {
+    match std::fs::hard_link(stage, destination) {
+        Ok(()) => {
+            reservation.retain();
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => Err(storage_error()),
+    }
+}
+async fn sync_directory(path: &Path) -> Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+        .await
+        .map_err(|_| storage_error())?
+        .map_err(|_| storage_error())
+}
+fn stage_name(name: &str) -> bool {
+    name.strip_prefix(".bulk-stage-")
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(pid, counter)| {
+            !pid.is_empty()
+                && !counter.is_empty()
+                && pid.bytes().all(|v| v.is_ascii_digit())
+                && counter.bytes().all(|v| v.is_ascii_digit())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{HeaderValue, StatusCode},
+        response::IntoResponse,
+        routing::get,
+    };
+    async fn mock_broker(router: Router) -> (BulkBroker, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let broker =
+            BulkBroker::fixture(url::Url::parse(&format!("http://{address}")).unwrap()).unwrap();
+        (broker, task)
+    }
+    fn request(max_bytes: u64) -> BulkRequest {
+        BulkRequest {
+            source: BulkSource::DatabaseDump,
+            validators: Validators::default(),
+            max_bytes,
+            deadline: Instant::now() + Duration::from_secs(10),
+            body: Vec::new(),
+        }
+    }
+    #[test]
+    fn constructed_destinations_are_exact_and_reject_untrusted_paths() {
+        assert_eq!(
+            BulkSource::RegistryGit(GitOperation::Advertisement)
+                .url()
+                .unwrap(),
+            "https://github.com/rust-lang/crates.io-index.git/info/refs?service=git-upload-pack"
+        );
+        assert!(
+            BulkSource::Documentation {
+                name: "serde".into(),
+                version: "1.0.0".into(),
+                operation: DocsOperation::Json {
+                    target: "../../evil".into(),
+                    format: None
+                }
+            }
+            .url()
+            .is_err()
+        );
+        assert!(
+            BulkSource::CrateArchive {
+                name: "../serde".into(),
+                version: "1.0.0".into()
+            }
+            .url()
+            .is_err()
+        );
+        assert_eq!(
+            BulkSource::CrateArchive {
+                name: "Inflector".into(),
+                version: "0.11.4".into()
+            }
+            .url()
+            .unwrap(),
+            "https://static.crates.io/crates/Inflector/Inflector-0.11.4.crate"
+        );
+        assert!(
+            BulkSource::CrateArchive {
+                name: "serde".into(),
+                version: "latest".into()
+            }
+            .url()
+            .is_err()
+        );
+        assert_eq!(
+            BulkSource::Documentation {
+                name: "serde".into(),
+                version: "1.0.0".into(),
+                operation: DocsOperation::Json {
+                    target: "x86_64-unknown-linux-gnu".into(),
+                    format: Some(61)
+                }
+            }
+            .url()
+            .unwrap(),
+            "https://docs.rs/crate/serde/1.0.0/x86_64-unknown-linux-gnu/json/61.gz"
+        );
+    }
+    #[tokio::test]
+    async fn artifact_publication_is_immutable_hashed_and_cleans_failed_stages() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BulkArtifactStore::new(root.path(), 64 * 1024 * 1024).unwrap();
+        let artifact = store
+            .capture_bytes(b"public evidence".to_vec(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(artifact.bytes, 15);
+        assert_eq!(
+            store
+                .verify(&artifact.body_hash, 100, CancellationToken::new())
+                .await
+                .unwrap(),
+            artifact
+        );
+        let response = BulkResponse {
+            status: 200,
+            validators: Validators::default(),
+            content_length: Some(3),
+            stream: Box::pin(futures::stream::iter([Ok(b"bad".to_vec())])),
+        };
+        assert!(
+            store
+                .capture(response, Some(&"a".repeat(64)), CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let files: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        tokio::fs::write(root.path().join(&artifact.body_hash), b"corrupt")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .verify(&artifact.body_hash, 100, CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn foreground_and_background_share_one_provider_clock() {
+        let broker = BulkBroker::new(BulkConfig::default()).unwrap();
+        let before = Instant::now();
+        drop(broker.admit_foreground("crates.io").await.unwrap());
+        drop(broker.admit("crates.io", true).await.unwrap());
+        assert!(Instant::now().duration_since(before) >= Duration::from_secs(1));
+        assert!(broker.admit_foreground("untrusted.invalid").await.is_err());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn configurable_index_rates_do_not_raise_api_or_docs_rates() {
+        let config = BulkConfig {
+            index_requests_per_second: 5,
+            ..Default::default()
+        };
+        let broker = BulkBroker::new(config).unwrap();
+        for host in ["index.crates.io", "github.com"] {
+            let before = Instant::now();
+            drop(broker.admit_foreground(host).await.unwrap());
+            drop(broker.admit(host, true).await.unwrap());
+            assert_eq!(
+                Instant::now().duration_since(before),
+                Duration::from_millis(200)
+            );
+        }
+        for host in ["crates.io", "docs.rs"] {
+            let before = Instant::now();
+            drop(broker.admit_foreground(host).await.unwrap());
+            drop(broker.admit(host, true).await.unwrap());
+            assert_eq!(
+                Instant::now().duration_since(before),
+                Duration::from_secs(1)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn cancellation_discards_owned_stage_and_never_removes_history() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BulkArtifactStore::new(root.path(), 64 * 1024 * 1024).unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(store.capture_bytes(vec![1; 10], token).await.is_err());
+        tokio::fs::write(root.path().join(".bulk-stage-1-1"), b"stage")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join(".bulk-stage-unknown"), b"other")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("a".repeat(64)), b"retained")
+            .await
+            .unwrap();
+        store.recover_stages().await.unwrap();
+        assert!(!root.path().join(".bulk-stage-1-1").exists());
+        assert!(root.path().join(".bulk-stage-unknown").exists());
+        assert!(root.path().join("a".repeat(64)).exists());
+    }
+    #[tokio::test]
+    async fn transfer_streams_fixed_chunks_and_preserves_validators() {
+        let length = 3 * CHUNK_BYTES + 19;
+        let router = Router::new().route(
+            "/db-dump.tar.gz",
+            get(move || async move {
+                let mut response = vec![7_u8; length].into_response();
+                response.headers_mut().insert(
+                    reqwest::header::ETAG,
+                    HeaderValue::from_static("\"fixture\""),
+                );
+                response
+            }),
+        );
+        let (broker, task) = mock_broker(router).await;
+        let mut response = broker
+            .open(request(length as u64), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(response.validators.etag.as_deref(), Some("\"fixture\""));
+        let mut observed = 0;
+        while let Some(chunk) = response.stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= CHUNK_BYTES);
+            assert!(chunk.iter().all(|byte| *byte == 7));
+            observed += chunk.len();
+        }
+        assert_eq!(observed, length);
+        assert_eq!(broker.bulk_slots.available_permits(), 4);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn transient_status_has_one_retry_but_absence_and_redirect_do_not() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = calls.clone();
+        let router = Router::new().route(
+            "/db-dump.tar.gz",
+            get(move || {
+                let counted = counted.clone();
+                async move {
+                    if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(reqwest::header::RETRY_AFTER, "0")],
+                            "retry",
+                        )
+                            .into_response()
+                    } else {
+                        b"fixture".to_vec().into_response()
+                    }
+                }
+            }),
+        );
+        let (broker, task) = mock_broker(router).await;
+        let mut response = broker
+            .open(request(100), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(response.stream.next().await.unwrap().unwrap(), b"fixture");
+        task.abort();
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_MODIFIED,
+            StatusCode::FOUND,
+        ] {
+            let calls = Arc::new(AtomicU64::new(0));
+            let counted = calls.clone();
+            let router = Router::new().route(
+                "/db-dump.tar.gz",
+                get(move || {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        (
+                            status,
+                            [(reqwest::header::LOCATION, "https://untrusted.invalid/")],
+                        )
+                    }
+                }),
+            );
+            let (broker, task) = mock_broker(router).await;
+            let mut response = broker
+                .open(request(100), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(response.status, status.as_u16());
+            assert!(response.stream.next().await.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn canceled_stream_releases_transfer_admission() {
+        let router = Router::new().route(
+            "/db-dump.tar.gz",
+            get(|| async {
+                let first =
+                    futures::stream::once(async { Ok::<_, std::io::Error>(vec![1_u8; 10]) });
+                Body::from_stream(first.chain(futures::stream::pending()))
+            }),
+        );
+        let (broker, task) = mock_broker(router).await;
+        let shutdown = CancellationToken::new();
+        let mut response = broker.open(request(100), shutdown.clone()).await.unwrap();
+        assert_eq!(response.stream.next().await.unwrap().unwrap(), vec![1; 10]);
+        shutdown.cancel();
+        assert!(response.stream.next().await.unwrap().is_err());
+        assert_eq!(broker.bulk_slots.available_permits(), 4);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn quota_reservations_are_concurrent_rollback_safe_and_deduplicated() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BulkArtifactStore::new(root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(100))
+            .unwrap();
+        let (first, second) = tokio::join!(
+            store.capture_bytes(vec![1; 64], CancellationToken::new()),
+            store.capture_bytes(vec![2; 64], CancellationToken::new())
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        assert_eq!(store.accounted_bytes(), Some(64));
+        let value = if first.is_ok() { 1 } else { 2 };
+        let store = BulkArtifactStore::new(root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(200))
+            .unwrap();
+        store
+            .capture_bytes(vec![value; 64], CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(store.accounted_bytes(), Some(64));
+        let reservation = store.reserve_bytes(100).unwrap();
+        assert_eq!(store.accounted_bytes(), Some(164));
+        drop(reservation);
+        assert_eq!(store.accounted_bytes(), Some(64));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+    #[tokio::test]
+    async fn canceled_link_waiter_cannot_uncharge_a_new_permanent_object() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            BulkArtifactStore::new(root.path(), 64 * 1024 * 1024)
+                .unwrap()
+                .with_quota(Some(100))
+                .unwrap(),
+        );
+        let stage = root.path().join(".bulk-stage-fixture");
+        let destination = root.path().join("a".repeat(64));
+        std::fs::write(&stage, vec![1; 64]).unwrap();
+        let reservation = store.reserve_bytes(64).unwrap();
+        let (started_send, started_receive) = tokio::sync::oneshot::channel();
+        let (release_send, release_receive) = std::sync::mpsc::channel();
+        let (done_send, done_receive) = tokio::sync::oneshot::channel();
+        let destination_copy = destination.clone();
+        let waiter = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let result = retain_link(stage, destination_copy, reservation);
+                let _ = started_send.send(());
+                let _ = release_receive.recv();
+                let _ = done_send.send(());
+                result
+            })
+            .await
+        });
+        started_receive.await.unwrap();
+        assert!(destination.exists());
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(store.accounted_bytes(), Some(64));
+        release_send.send(()).unwrap();
+        done_receive.await.unwrap();
+        assert_eq!(store.accounted_bytes(), Some(64));
+    }
+}
