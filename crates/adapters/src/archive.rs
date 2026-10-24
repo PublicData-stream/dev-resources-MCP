@@ -39,12 +39,14 @@ pub fn admit() -> Result<OwnedSemaphorePermit> {
         .map_err(|_| Error::capacity("Archive parser capacity exhausted."))
 }
 
-pub async fn inspect_async(
+/// One request can reuse admission across validation-before-publication and its
+/// selected projection. Every blocking worker retains its own shared lease.
+pub(crate) async fn inspect_shared_async(
     bytes: devres_domain::Body,
     checksum: String,
     root: String,
     selected: Option<String>,
-    permit: OwnedSemaphorePermit,
+    permit: Arc<OwnedSemaphorePermit>,
 ) -> Result<Inspection> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -358,6 +360,35 @@ mod tests {
         assert_eq!(view.selected.unwrap(), b"hello");
         assert_eq!(view.members[0].path, "src/lib.rs");
         assert!(inspect(&bytes, &"0".repeat(64), "example-1.0.0", None).is_err());
+    }
+
+    #[test]
+    fn selected_file_limit_does_not_hide_a_valid_archive_listing() {
+        let content = vec![b'x'; MAX_SELECTED as usize + 1];
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(content.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "example-1.0.0/large.txt", &content[..])
+            .unwrap();
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+        gzip.write_all(&tar.into_inner().unwrap()).unwrap();
+        let bytes = gzip.finish().unwrap();
+        assert_eq!(
+            inspect(&bytes, &sha256(&bytes), "example-1.0.0", None)
+                .unwrap()
+                .members[0]
+                .size,
+            MAX_SELECTED + 1
+        );
+        assert_eq!(
+            inspect(&bytes, &sha256(&bytes), "example-1.0.0", Some("large.txt"))
+                .err()
+                .unwrap()
+                .code,
+            "capacity"
+        );
     }
 
     #[test]

@@ -4,10 +4,112 @@ use crate::{
     archive,
     research::{Page, capture_json, ensure_capture, list_limit, text_limit, text_page},
 };
-use devres_application::Retrieval;
-use devres_domain::{Error, FetchRequest, Result, StoredCapture};
+use async_trait::async_trait;
+use devres_application::{ResponseValidator, Retrieval};
+use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::OwnedSemaphorePermit;
+
+const MAX_SEARCH: usize = 2 * 1024 * 1024;
+const MAX_INDEX: usize = 16 * 1024 * 1024;
+type ParserLease = Arc<OwnedSemaphorePermit>;
+
+async fn parse<T: Send + 'static>(
+    lease: ParserLease,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        operation()
+    })
+    .await
+    .map_err(|_| Error::unavailable("Crate parser worker failed."))?
+}
+
+enum Validation {
+    Search,
+    Index(String),
+    Archive { checksum: String, root: String },
+}
+
+struct Validator {
+    validation: Validation,
+    lease: ParserLease,
+}
+
+#[async_trait]
+impl ResponseValidator for Validator {
+    async fn validate(&self, _: &FetchRequest, response: FetchResponse) -> Result<FetchResponse> {
+        let validation = match &self.validation {
+            Validation::Search => Validation::Search,
+            Validation::Index(name) => Validation::Index(name.clone()),
+            Validation::Archive { checksum, root } => Validation::Archive {
+                checksum: checksum.clone(),
+                root: root.clone(),
+            },
+        };
+        parse(self.lease.clone(), move || {
+            match validation {
+                Validation::Search => {
+                    search_document(&response.body)?;
+                }
+                Validation::Index(name) => {
+                    visit_index(&response.body, &name, |_| Ok(()))?;
+                }
+                Validation::Archive { checksum, root } => {
+                    archive::inspect(&response.body, &checksum, &root, None)?;
+                }
+            }
+            Ok(response)
+        })
+        .await
+    }
+}
+
+fn search_document(bytes: &[u8]) -> Result<Value> {
+    if bytes.len() > MAX_SEARCH {
+        return Err(Error::capacity("Crate search response exceeds limit."));
+    }
+    let document: Value = serde_json::from_slice(bytes)
+        .map_err(|_| Error::integrity("Malformed crates.io search response."))?;
+    let crates = document["crates"]
+        .as_array()
+        .filter(|items| items.len() <= 100)
+        .ok_or_else(|| Error::integrity("Invalid crates.io search result list."))?;
+    let total = document["meta"]["total"]
+        .as_u64()
+        .ok_or_else(|| Error::integrity("Crate search total is absent."))?;
+    if total < crates.len() as u64 {
+        return Err(Error::integrity("Crate search total is inconsistent."));
+    }
+    let mut names = HashSet::new();
+    for package in crates {
+        let name = package["name"]
+            .as_str()
+            .ok_or_else(|| Error::integrity("Crate search result lacks a name."))?;
+        validate_name(name)
+            .map_err(|_| Error::integrity("Invalid crate name in search result."))?;
+        let version = package["max_version"]
+            .as_str()
+            .ok_or_else(|| Error::integrity("Crate search result lacks a version."))?;
+        validate_version(version)
+            .map_err(|_| Error::integrity("Invalid version in crate search result."))?;
+        if !names.insert(name.to_ascii_lowercase())
+            || !(package["description"].is_null() || package["description"].is_string())
+        {
+            return Err(Error::integrity(
+                "Invalid or duplicate crate search result.",
+            ));
+        }
+    }
+    Ok(document)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +208,7 @@ pub async fn search(retrieval: &Retrieval, input: SearchInput) -> Result<Value> 
     let upstream_page = page.offset / 100 + 1;
     let within_page = page.offset % 100;
     let key = format!("cargo:search:{}:{upstream_page}", input.query);
+    let lease = Arc::new(archive::admit()?);
     let captured = match input.capture {
         Some(id) => {
             let stored = retrieval.read_capture(&id).await?;
@@ -120,21 +223,26 @@ pub async fn search(retrieval: &Retrieval, input: SearchInput) -> Result<Value> 
                 .append_pair("per_page", "100")
                 .append_pair("page", &upstream_page.to_string());
             retrieval
-                .get(FetchRequest {
-                    key,
-                    url: url.to_string(),
-                    ttl_secs: 3600,
-                    max_bytes: 2 * 1024 * 1024,
-                    media_type: "application/json".into(),
-                })
+                .get_validated(
+                    FetchRequest {
+                        key,
+                        url: url.to_string(),
+                        ttl_secs: 3600,
+                        max_bytes: MAX_SEARCH,
+                        media_type: "application/json".into(),
+                    },
+                    &Validator {
+                        validation: Validation::Search,
+                        lease: lease.clone(),
+                    },
+                )
                 .await?
         }
     };
-    let document: Value = serde_json::from_slice(&captured.body)
-        .map_err(|_| Error::integrity("Malformed crates.io search response."))?;
+    let body = captured.body.clone();
+    let document = parse(lease, move || search_document(&body)).await?;
     let crates = document["crates"]
         .as_array()
-        .filter(|v| v.len() <= 100)
         .ok_or_else(|| Error::integrity("Invalid crates.io search result list."))?;
     let count = page.limit.min(100 - within_page);
     let mut items = Vec::new();
@@ -160,77 +268,228 @@ pub async fn search(retrieval: &Retrieval, input: SearchInput) -> Result<Value> 
     )
 }
 
-async fn index(retrieval: &Retrieval, name: &str, captured: Option<&str>) -> Result<StoredCapture> {
+async fn index(
+    retrieval: &Retrieval,
+    name: &str,
+    captured: Option<&str>,
+    lease: ParserLease,
+) -> Result<StoredCapture> {
     let path = sparse_path(name)?;
     let key = format!("cargo:index:{}", name.to_ascii_lowercase());
     match captured {
         Some(id) => {
             let stored = retrieval.read_capture(id).await?;
-            ensure_capture(&stored, &key)?;
+            ensure_metadata_capture(&stored, name)?;
             Ok(stored)
         }
         None => {
             retrieval
-                .get(FetchRequest {
-                    key,
-                    url: format!("https://index.crates.io/{path}"),
-                    ttl_secs: 3600,
-                    max_bytes: 16 * 1024 * 1024,
-                    media_type: "application/x-ndjson".into(),
-                })
+                .get_validated(
+                    FetchRequest {
+                        key,
+                        url: format!("https://index.crates.io/{path}"),
+                        ttl_secs: 3600,
+                        max_bytes: MAX_INDEX,
+                        media_type: "application/x-ndjson".into(),
+                    },
+                    &Validator {
+                        validation: Validation::Index(name.to_owned()),
+                        lease,
+                    },
+                )
                 .await
         }
     }
 }
 
-pub fn version_record(bytes: &[u8], name: &str, version: &str) -> Result<Value> {
+fn ensure_metadata_capture(stored: &StoredCapture, name: &str) -> Result<()> {
+    let canonical = name.to_ascii_lowercase();
+    if stored.capture.key == format!("cargo:index:{canonical}") {
+        return ensure_capture(stored, &format!("cargo:index:{canonical}"));
+    }
+    let prefix = format!("cargo:git-index:{canonical}:");
+    let revision = stored
+        .capture
+        .key
+        .strip_prefix(&prefix)
+        .filter(|revision| {
+            revision.len() == 40
+                && revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| Error::invalid("Metadata capture belongs to another crate or source."))?;
+    let expected = format!(
+        "https://github.com/rust-lang/crates.io-index/blob/{revision}/{}",
+        sparse_path(name)?
+    );
+    if stored.capture.source_url != expected || stored.capture.media_type != "text/plain" {
+        return Err(Error::integrity(
+            "Imported index provenance does not match its identity.",
+        ));
+    }
+    Ok(())
+}
+
+fn feature_map(value: &Value) -> bool {
+    value.as_object().is_some_and(|features| {
+        features.values().all(|entries| {
+            entries
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(Value::is_string))
+        })
+    })
+}
+
+fn optional_text(value: &Value) -> bool {
+    value.is_null() || value.is_string()
+}
+
+fn validate_record(value: &Value, name: &str) -> Result<String> {
+    let actual_name = value["name"]
+        .as_str()
+        .ok_or_else(|| Error::integrity("Sparse-index name is absent."))?;
+    if !actual_name.eq_ignore_ascii_case(name) {
+        return Err(Error::integrity("Sparse-index crate identity mismatch."));
+    }
+    let version = value["vers"]
+        .as_str()
+        .ok_or_else(|| Error::integrity("Sparse-index version is absent."))?;
+    validate_version(version).map_err(|_| Error::integrity("Invalid sparse-index version."))?;
+    let checksum = value["cksum"]
+        .as_str()
+        .ok_or_else(|| Error::integrity("Sparse-index archive checksum is absent."))?;
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::integrity("Invalid sparse-index archive checksum."));
+    }
+    if !feature_map(&value["features"])
+        || !value["yanked"].is_boolean()
+        || value
+            .get("features2")
+            .is_some_and(|features| !feature_map(features))
+        || value
+            .get("v")
+            .is_some_and(|version| !matches!(version.as_u64(), Some(1 | 2)))
+        || !optional_text(&value["links"])
+        || !optional_text(&value["rust_version"])
+    {
+        return Err(Error::integrity(
+            "Invalid sparse-index feature or schema metadata.",
+        ));
+    }
+    let dependencies = value["deps"]
+        .as_array()
+        .ok_or_else(|| Error::integrity("Sparse-index dependency metadata is absent."))?;
+    for dependency in dependencies {
+        let dependency_name = dependency["name"]
+            .as_str()
+            .ok_or_else(|| Error::integrity("Sparse-index dependency name is absent."))?;
+        validate_name(dependency_name)
+            .map_err(|_| Error::integrity("Invalid sparse-index dependency name."))?;
+        let requirement = dependency["req"]
+            .as_str()
+            .ok_or_else(|| Error::integrity("Sparse-index dependency requirement is absent."))?;
+        if requirement.len() > 4096
+            || semver::VersionReq::parse(requirement).is_err()
+            || !dependency["optional"].is_boolean()
+            || !dependency["default_features"].is_boolean()
+            || !dependency["features"]
+                .as_array()
+                .is_some_and(|features| features.iter().all(Value::is_string))
+            || !optional_text(&dependency["target"])
+            || !optional_text(&dependency["registry"])
+            || !optional_text(&dependency["package"])
+            || !matches!(
+                dependency["kind"].as_str(),
+                None | Some("normal" | "build" | "dev")
+            )
+            || !(dependency["kind"].is_null() || dependency["kind"].is_string())
+        {
+            return Err(Error::integrity(
+                "Invalid sparse-index dependency declaration.",
+            ));
+        }
+        if let Some(package) = dependency["package"].as_str() {
+            validate_name(package)
+                .map_err(|_| Error::integrity("Invalid renamed dependency package."))?;
+        }
+    }
+    Ok(version.to_owned())
+}
+
+/// Visit all versions before accepting a captured index. Unknown additive fields
+/// remain in the raw records, including modern features2 and dependency metadata.
+pub(crate) fn visit_index(
+    bytes: &[u8],
+    name: &str,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
     validate_name(name)?;
-    validate_version(version)?;
+    if bytes.is_empty() {
+        return Err(Error::integrity("Sparse index is empty."));
+    }
+    if bytes.len() > MAX_INDEX {
+        return Err(Error::capacity("Sparse index exceeds 16 MiB."));
+    }
     let text =
         std::str::from_utf8(bytes).map_err(|_| Error::integrity("Sparse index is not UTF-8."))?;
-    let mut selected = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut versions = HashSet::new();
     for (index, line) in text.lines().enumerate() {
-        if index > 50_000 || line.len() > 1024 * 1024 {
-            return Err(Error::capacity("Sparse-index record limit exceeded."));
+        if index >= 50_000 || line.len() > 1024 * 1024 || Instant::now() >= deadline {
+            return Err(Error::capacity(
+                "Sparse-index record or processing limit exceeded.",
+            ));
         }
         let value: Value = serde_json::from_str(line)
             .map_err(|_| Error::integrity("Malformed sparse-index record."))?;
-        let actual_name = value["name"]
-            .as_str()
-            .ok_or_else(|| Error::integrity("Sparse-index name is absent."))?;
-        if !actual_name.eq_ignore_ascii_case(name) {
-            return Err(Error::integrity("Sparse-index crate identity mismatch."));
+        let version = validate_record(&value, name)?;
+        if !versions.insert(version) {
+            return Err(Error::integrity("Duplicate version in sparse index."));
         }
+        visit(value)?;
+    }
+    Ok(())
+}
+
+pub fn version_record(bytes: &[u8], name: &str, version: &str) -> Result<Value> {
+    validate_version(version)?;
+    let mut selected = None;
+    visit_index(bytes, name, |value| {
         if value["vers"].as_str() == Some(version) {
-            if selected.is_some() {
-                return Err(Error::integrity("Duplicate version in sparse index."));
-            }
-            let checksum = value["cksum"]
-                .as_str()
-                .ok_or_else(|| Error::integrity("Sparse-index archive checksum is absent."))?;
-            if checksum.len() != 64 || !checksum.bytes().all(|v| v.is_ascii_hexdigit()) {
-                return Err(Error::integrity("Invalid sparse-index archive checksum."));
-            }
-            if !value["deps"].is_array()
-                || !value["features"].is_object()
-                || !value["yanked"].is_boolean()
-            {
-                return Err(Error::integrity(
-                    "Sparse-index dependency, feature, or yanked metadata is absent.",
-                ));
-            }
             selected = Some(value);
         }
-    }
+        Ok(())
+    })?;
     selected.ok_or_else(|| {
         Error::not_found("Requested crate version is absent from the captured index.")
     })
 }
 
+async fn selected_record(
+    captured: &StoredCapture,
+    name: &str,
+    version: &str,
+    lease: ParserLease,
+) -> Result<Value> {
+    let body = captured.body.clone();
+    let name = name.to_owned();
+    let version = version.to_owned();
+    parse(lease, move || version_record(&body, &name, &version)).await
+}
+
 pub async fn metadata(retrieval: &Retrieval, input: MetadataInput) -> Result<Value> {
     validate_version(&input.version)?;
-    let captured = index(retrieval, &input.name, input.capture.as_deref()).await?;
-    let version = version_record(&captured.body, &input.name, &input.version)?;
+    validate_name(&input.name)?;
+    let lease = Arc::new(archive::admit()?);
+    let captured = index(
+        retrieval,
+        &input.name,
+        input.capture.as_deref(),
+        lease.clone(),
+    )
+    .await?;
+    let version = selected_record(&captured, &input.name, &input.version, lease).await?;
     Ok(
         json!({"id":format!("crate:{}@{}",input.name,input.version),"metadata":version,"capture":capture_json(&captured.capture,3600),"url":format!("https://crates.io/crates/{}/{}",input.name,input.version),"dependency_scope":"published declarations; no dependency resolution, build, or execution"}),
     )
@@ -249,6 +508,7 @@ async fn sources(
     version: &str,
     metadata_id: Option<&str>,
     archive_id: Option<&str>,
+    lease: ParserLease,
 ) -> Result<Sources> {
     validate_version(version)?;
     if metadata_id.is_some() != archive_id.is_some() {
@@ -256,8 +516,8 @@ async fn sources(
             "Supply both metadata_capture and archive_capture, or neither.",
         ));
     }
-    let metadata = index(retrieval, name, metadata_id).await?;
-    let record = version_record(&metadata.body, name, version)?;
+    let metadata = index(retrieval, name, metadata_id, lease.clone()).await?;
+    let record = selected_record(&metadata, name, version, lease.clone()).await?;
     let checksum = record["cksum"]
         .as_str()
         .ok_or_else(|| Error::integrity("Archive checksum is absent."))?
@@ -272,7 +532,7 @@ async fn sources(
     );
     let archive = match archive_id {
         Some(id) => { let stored = retrieval.read_capture(id).await?; ensure_capture(&stored,&key)?; stored },
-        None => retrieval.get(FetchRequest { key,url:format!("https://static.crates.io/crates/{canonical_name}/{canonical_name}-{version}.crate"),ttl_secs:365*86400,max_bytes:archive::MAX_COMPRESSED,media_type:"application/gzip".into() }).await?,
+        None => retrieval.get_validated(FetchRequest { key,url:format!("https://static.crates.io/crates/{canonical_name}/{canonical_name}-{version}.crate"),ttl_secs:365*86400,max_bytes:archive::MAX_COMPRESSED,media_type:"application/gzip".into() }, &Validator { validation: Validation::Archive { checksum: checksum.clone(), root: format!("{canonical_name}-{version}") }, lease }).await?,
     };
     Ok(Sources {
         metadata,
@@ -336,16 +596,17 @@ pub async fn source_list(retrieval: &Retrieval, input: SourceListInput) -> Resul
         limit: input.limit,
     }
     .checked()?;
-    let permit = archive::admit()?;
+    let permit = Arc::new(archive::admit()?);
     let mut source = sources(
         retrieval,
         &input.name,
         &input.version,
         input.metadata_capture.as_deref(),
         input.archive_capture.as_deref(),
+        permit.clone(),
     )
     .await?;
-    let inspected = archive::inspect_async(
+    let inspected = archive::inspect_shared_async(
         std::mem::take(&mut source.archive.body),
         source.checksum.clone(),
         source.root.clone(),
@@ -385,16 +646,20 @@ pub async fn source_read(retrieval: &Retrieval, input: SourceReadInput) -> Resul
     if !archive::valid_relative_path(&input.path) {
         return Err(Error::invalid("Invalid source member path."));
     }
-    let permit = archive::admit()?;
+    if input.limit == 0 || input.limit > 32768 || input.offset > 4 * 1024 * 1024 {
+        return Err(Error::invalid("Source text page exceeds supported bounds."));
+    }
+    let permit = Arc::new(archive::admit()?);
     let mut source = sources(
         retrieval,
         &input.name,
         &input.version,
         input.metadata_capture.as_deref(),
         input.archive_capture.as_deref(),
+        permit.clone(),
     )
     .await?;
-    let inspected = archive::inspect_async(
+    let inspected = archive::inspect_shared_async(
         std::mem::take(&mut source.archive.body),
         source.checksum.clone(),
         source.root.clone(),
@@ -424,6 +689,62 @@ pub async fn source_read(retrieval: &Retrieval, input: SourceReadInput) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn canceled_parser_retains_admission_until_blocking_work_finishes() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, waiting) = std::sync::mpsc::channel();
+        let task = tokio::spawn(parse(lease, move || {
+            started.send(()).unwrap();
+            waiting.recv().unwrap();
+            Ok(())
+        }));
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(slots.try_acquire().is_err());
+        finish.send(()).unwrap();
+        let _permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn imported_metadata_capture_requires_its_actual_git_provenance() {
+        let revision = "a".repeat(40);
+        let mut stored = StoredCapture {
+            capture: devres_domain::Capture {
+                id: "b".repeat(64),
+                key: format!("cargo:git-index:example:{revision}"),
+                source_url: format!(
+                    "https://github.com/rust-lang/crates.io-index/blob/{revision}/ex/am/example"
+                ),
+                body_hash: "c".repeat(64),
+                media_type: "text/plain".into(),
+                retrieved_at: 0,
+                validated_at: 0,
+            },
+            body: Vec::new().into(),
+        };
+        assert!(ensure_metadata_capture(&stored, "Example").is_ok());
+        assert_eq!(
+            ensure_metadata_capture(&stored, "another")
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+        stored.capture.source_url = "https://index.crates.io/ex/am/example".into();
+        assert_eq!(
+            ensure_metadata_capture(&stored, "example")
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+    }
+
     #[test]
     fn sparse_paths_and_input_identity_are_bounded() {
         assert_eq!(sparse_path("A").unwrap(), "1/a");
@@ -435,7 +756,7 @@ mod tests {
     }
     #[test]
     fn exact_version_preserves_yanked_and_dependency_features() {
-        let row = json!({"name":"test","vers":"1.0.0-beta.1","deps":[{"name":"dep","req":"^1","optional":true,"target":"cfg(unix)"}],"cksum":"a".repeat(64),"features":{"feature":["dep"]},"yanked":true});
+        let row = json!({"name":"test","vers":"1.0.0-beta.1","deps":[{"name":"dep","req":"^1","optional":true,"default_features":true,"features":[],"target":"cfg(unix)"}],"cksum":"a".repeat(64),"features":{"feature":["dep"]},"yanked":true});
         let parsed = version_record(row.to_string().as_bytes(), "test", "1.0.0-beta.1").unwrap();
         assert_eq!(parsed["deps"][0]["target"], "cfg(unix)");
         assert_eq!(parsed["yanked"], true);
