@@ -24,7 +24,9 @@ operations until restart. Deployment must use one replica and Recreate updates.
 PostgreSQL stores immutable representation records, mutable source heads, and
 append-only successful-fetch/revalidation observations. Schema version 2 adds
 owner-fenced RFC datasets, resumable jobs, import observations and research snapshot
-manifests. Migration preserves v1 capture identities; older binaries reject v2.
+manifests. Version 3 adds crate inventories, durable acquisition/processing jobs,
+artifact provenance, metadata enrichment, content generations and research snapshots.
+Migrations preserve earlier capture identities; older binaries reject newer schemas.
 
 Blobs use SHA-256 filenames in an operator-owned directory. Publication writes a
 unique staging file, fsyncs it, hard-links the immutable object without replacing an
@@ -73,6 +75,49 @@ are rebuildable from captures; corruption fails explicitly.
 Rsync imports run privately under the same ownership fence with serving stopped.
 They use separate source keys and import observations, never HTTP validation.
 Snapshots prefer HTTPS per representation and label lower-assurance fallback.
+
+## Crate corpus
+
+Application ports expose paged inventory/content access and owner-fenced publication;
+concrete storage and source processing remain adapters. A supervised collector tracks
+all observed crate versions, archives and docs.rs targets while sharing upstream
+admission with foreground tools. Git discovery, raw acquisition, CSV enrichment,
+content projection and search publication commit independently. A failed projection
+never discards its raw capture or makes provisional rows visible.
+
+The index helper operates on an owned bare repository through a private fixed-source
+HTTPS relay. It checks out no package trees and disables caller Git configuration,
+hooks, credentials and arbitrary destinations. Captured Git evidence/manifests allow
+inventory reconstruction; the mutable bare repository is disposable derived state.
+Version records retain their Git revision/path/blob identity and original sparse
+index capture provenance. Inventory creation and last successful validation are
+separate timestamps: an unchanged online revision can become freshly validated,
+while restoring offline evidence does not claim a current provider observation.
+Unsupported records remain explicit inventory gaps.
+
+Bulk I/O streams bytes to content-addressed files with checksums, quota/free-space
+admission, staging cleanup and fsync publication. It does not enlarge generic public
+capture reads. Archive checksums bind crates.io archives to captured index records;
+docs.rs artifacts have HTTPS/capture provenance without falsely claiming a registry
+archive checksum or an immutable build identity. Original package licenses remain.
+
+Raw HTML ZIP and JSON artifacts are never extracted or executed. HTML tokenization
+produces inert text/headings/links. Rustdoc JSON uses bounded streaming passes over
+an owned expanded staging file, one item at a time, to establish envelope identity,
+public paths and normalized signatures. Parent-owned processing generations keep
+callback rows invisible until complete validation. Database dumps similarly stream
+CSV into artifact-scoped staging; SQL is never executed and publication requires the
+complete archive/trailers and required tables to pass.
+
+Immutable crate search shards live under `blob_dir/crate-indexes`. Global BM25 uses
+statistics across the whole pinned snapshot, with deterministic semantic-version
+and identity tie breaks. Per-document index failures are retained as hashed gap
+evidence. A prepared snapshot freezes inventory, content sequence and metadata-dump
+enrichment without replacing the serving default; validated index publication then
+commits exactly that membership. Background prewarming validates retained shard
+files before activation and after restart; foreground cold-open/search work has a
+separate 15-second budget. Newer work completed during indexing belongs to a later
+snapshot. Requests never rebuild indexes or launch collection work.
 
 ## Privacy and isolation
 

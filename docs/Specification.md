@@ -4,8 +4,9 @@
 
 This service is anonymous and read-only with respect to caller data and upstream
 systems. Reads may populate internal public-source caches and permanent archives.
-It supports RFC metadata/text, crates.io metadata/published sources, RustSec
-advisories, and supplied Cargo.lock matching. No public administrative operations,
+It supports RFC metadata/text, crates.io metadata/published sources, local package
+and API research from crates.io/docs.rs captures, RustSec advisories, and supplied
+Cargo.lock matching. No public administrative operations,
 package execution, dependency resolution, arbitrary URL fetching, or user accounts
 are exposed. Missing or unsupported coverage is explicit.
 
@@ -52,6 +53,15 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | `crate_metadata` | Exact crate name/version; dependency declarations, features, yanked state, checksum |
 | `crate_source_list` | Exact crate version; verified source file listing |
 | `crate_source_read` | Exact crate version and archive-relative file path; UTF-8 text page |
+| `crate_versions` | Captured exact versions for a crate in semantic-version order; snapshot paging |
+| `crate_catalog_search` | Local version metadata and conjunctive license/keyword/category/MSRV/yanked filters |
+| `crate_document_get` | Exact captured source, manifest, README, license or rustdoc text; bounded byte page |
+| `crate_dependencies` | Forward declarations or reverse package-name references; no constraint solving |
+| `crate_compare` | Metadata/dependency changes, qualified text/API release changes, or an exact public path |
+| `crate_content_search` | Local source and documentation search with snapshot-wide BM25 |
+| `crate_api_search` | Observed rustdoc API items across captured versions and targets |
+| `crate_api_get` | Exact public path, normalized signature, relationships and capture provenance |
+| `crate_corpus_status` | Aggregate acquisition, processing, storage and snapshot coverage; no public controls |
 | `advisory_lookup` | Crate/version; matched advisories, withdrawals and informational state |
 | `audit_lockfile` | Supplied Cargo.lock text; supported matches, unassessed entries, completeness/freshness |
 
@@ -92,6 +102,50 @@ PDF and archive binaries even if their bytes happen to be valid UTF-8.
 verified source content pinned to both metadata and archive captures. Binary
 captures require typed tools. Resource reads are bounded; citations never identify
 submitted lockfiles or audit reports. Source text remains untrusted content.
+
+## Crate corpus and research
+
+The legacy crate tools retain their request-driven search, sparse-index and
+checksum-verified source behavior. Dedicated research tools use captured local
+snapshots and do not initiate provider traffic. Collection automatically enumerates
+the official Git index, acquires exact archives, imports public database-dump
+metadata, and requests docs.rs documentation for every observed version and published
+target. Hourly index synchronization and daily metadata/documentation refreshes are
+scheduling targets. Missing builds, absent JSON, processing limits and provider
+failures remain explicit coverage gaps; collection does not fabricate missing data.
+
+Retained public evidence is permanent, including oversized archives retained
+without source inspection. Raw retention, checksum agreement, successful parsing,
+search indexing and full-provider coverage are distinct states.
+`processing_cumulative` counts retained published processing generations, including
+historical representations; it is not a current-version completion percentage. Only observed
+representations can be retained; older removed releases or docs.rs builds cannot be
+reconstructed. The latest successfully published research snapshot is the default;
+its metadata inventory, enrichment and content cutoff are frozen with its index.
+Explicit historical snapshots remain fixed evidence. Defaults whose inventory has
+not been validated within seven days are unavailable;
+historical selection does not imply current freshness.
+
+Research defaults to all captured versions. List pages default to 20 and cap at 100;
+text pages cap at 32 KiB. Reuse the returned snapshot and cursor for stable continuation. Search cursors bind
+the exact snapshot and query/filters, allow a changed page size, and continue beyond
+the bounded 10,000-offset window without silently truncating results.
+Ranking is global BM25 over the selected snapshot, then crate name ascending,
+semantic version descending, target, path and stable identity. Technical queries use
+AND tokens; English queries support phrases, OR and exclusions. Filters combine
+with AND; MSRV selects declared minimum versions at or below the requested version,
+not build-tested compatibility. Dependency results contain declarations, not a
+resolved graph. An omitted target is accepted only when the selected document/API
+path is unambiguous.
+
+Documentation is inert text. No HTML scripts/assets, package build steps, repository
+links or rustdoc commands are executed. Structured API projections support rustdoc
+JSON formats 43, 55, 56 and 61; unsupported formats remain retained raw evidence with an
+explicit processing gap. Missing version/target fields in older schemas are reported
+as unasserted. Public paths and signatures retain capture-local ID provenance;
+IDs from different builds are not stable identities. API comparisons require
+qualified per-side projection coverage and compatible schema versions. Changes are
+observations, not semantic-version or security certifications.
 
 ## Audits and failure
 

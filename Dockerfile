@@ -29,7 +29,7 @@ ENTRYPOINT ["/usr/local/bin/devres-audit-worker"]
 
 FROM runtime-base AS server
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends rsync \
+RUN apt-get update && apt-get install -y --no-install-recommends rsync git \
     && rm -rf /var/lib/apt/lists/*
 USER 65532:65532
 COPY --from=build /buildcache/rust/target/release/devres-server /buildcache/rust/target/release/devres-audit-worker /usr/local/bin/

@@ -19,6 +19,24 @@ class Response(io.BytesIO):
 
 
 class DecodeResponseTests(unittest.TestCase):
+    def test_resource_read_routes_by_uri_in_modern_mcp_name_header(self):
+        uri = "devres://source/?name=example&version=1.0.0&path=src%2Flib.rs"
+        response = Response(b'{"jsonrpc":"2.0","id":1,"result":{"contents":[]}}')
+        response.status = 200
+        with patch.object(smoke.http.client, "HTTPConnection") as connection:
+            connection.return_value.getresponse.return_value = response
+            client = smoke.Client("http://fixture.invalid/mcp")
+            client.exchange("resources/read", {"uri": uri})
+            headers = connection.return_value.request.call_args.args[3]
+            self.assertEqual(headers["Mcp-Method"], "resources/read")
+            self.assertEqual(headers["Mcp-Name"], uri)
+        response = Response(b'{"jsonrpc":"2.0","id":1,"result":{"contents":[]}}')
+        response.status = 200
+        with patch.object(smoke.http.client, "HTTPConnection") as connection:
+            connection.return_value.getresponse.return_value = response
+            client = smoke.Client("http://fixture.invalid/mcp")
+            client.exchange("resources/read", {"uri": uri}, smoke.LEGACY)
+            self.assertNotIn("Mcp-Name", connection.return_value.request.call_args.args[3])
     def test_text_only_rfc_recheck_still_requires_live_opt_in(self):
         with patch.object(smoke, "Client") as client, patch.object(smoke.signal, "signal"), patch("sys.argv", ["mcp_smoke.py", "--url", "https://edge/mcp", "--rfc-text-only"]), patch("sys.stderr", io.StringIO()):
             with self.assertRaises(SystemExit) as result:

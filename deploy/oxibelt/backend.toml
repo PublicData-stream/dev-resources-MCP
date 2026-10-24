@@ -3,6 +3,8 @@ url = "https://github.com/PublicData-stream/dev-resources-MCP"
 [rfc]
 # Disposable edge/minikube/live harness: public collection is explicitly paused.
 enabled = false
+[crates]
+enabled = false
 [http]
 bind = "0.0.0.0:8080"
 allowed_hosts = ["backend:8080"]

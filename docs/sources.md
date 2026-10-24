@@ -4,18 +4,25 @@ All provider URLs are constructed by trusted adapters. The HTTP adapter rejects
 arbitrary schemes, hosts, credentials, ports, fragments, escaped paths, and redirects.
 Requests identify the application and repository. One adapter owns retries: at most
 one retry for transient HTTP statuses, respecting bounded Retry-After. Every attempt
-reserves its source rate slot. At most two HTTP transfers run concurrently.
+reserves its source rate slot. Foreground retrieval retains two transfer slots;
+private crate acquisition defaults to four additional bulk slots. docs.rs has one
+shared transfer slot. Both paths share provider host clocks.
 
 | Source | Access and freshness | Permanent evidence |
 | --- | --- | --- |
 | RFC Editor | [Official XML metadata index](https://www.rfc-editor.org/rfc-index.xml), errata JSON, and advertised TXT/HTML/XML/PDF; default 24-hour refresh | All observed valid bodies, source URL, content hash, observation times and transport assurance |
-| crates.io | Search API at most 1 request/second; sparse index for version/dependency/checksum data; CDN for exact archives; one-hour freshness | Index/search/archive captures and provenance |
+| crates.io | Search API at most 1 request/second; sparse/index default 1 attempt/second; static CDN default 5 attempts/second; hourly Git inventory and daily public metadata dump | Search/index/Git evidence, exact archive captures and dump provenance |
+| docs.rs | Exact-version all-target HTML ZIP and per-target rustdoc JSON; default 1 attempt/second, one transfer, daily revalidation | Raw artifacts, observed formats/targets, inert text/API projections and processing coverage |
 | RustSec | Fixed official GitHub head then immutable codeload bundle; 24-hour freshness | Head capture/revision, bundle capture, notices |
 
-Defaults are conservative: all allowed HTTP hosts are throttled to at most one
-request/second. RFC host aliases share a source budget. API limits must not be
-raised beyond the provider's published policy. Cache hits make no source requests;
+API/docs.rs hosts retain at most one attempt/second. Official Git/sparse-index and
+static.crates.io budgets are independently configurable; defaults are one and five
+attempts/second respectively. RFC host aliases share a source budget. API limits
+must not be raised beyond the provider's published policy. Cache hits make no source requests;
 conditional revalidation records the observation without replacing body content.
+Legacy crate search/sparse-index captures have one-hour freshness. Exact archives
+bound to an index checksum may be reused for one year; this does not extend the
+freshness of moving version/yanked metadata.
 Only confirmed 404s receive five-minute negative caching. Network/429/5xx failures
 are not recorded as absence. Valid stale public captures can be returned through
 seven days with their original validation time; older data is unavailable/incomplete.
@@ -37,6 +44,42 @@ are metadata, not an instruction to replace requested RFC text. Crate source bro
 verifies a published archive against the selected index checksum, rejects unsafe
 archive members, and does not follow repository URLs from package metadata.
 
+## Registry and documentation acquisition
+
+The registry collector incrementally reads the fixed official
+[`rust-lang/crates.io-index`](https://github.com/rust-lang/crates.io-index)
+repository through a private HTTPS Git relay. Git runs only against an owned bare
+repository: no package checkout, hooks, caller configuration, credential helper or
+arbitrary remote is admitted. Canonical sparse-index paths supply exact versions,
+dependency declarations, checksums and yanked state. A fixed
+[`static.crates.io/db-dump.tar.gz`](https://static.crates.io/db-dump.tar.gz)
+request supplies public enrichment as described by the
+[official dump format](https://github.com/rust-lang/crates.io/blob/main/crates/crates_io_database_dump/src/readme_for_tarball.md).
+CSV headers/fields and joins are bounded; archive SQL remains inert.
+
+For each observed exact release, docs.rs routes are constructed from captured
+canonical package identity. `/crate/<name>/<version>/menus/platforms/` enumerates
+published targets; `/download` supplies one HTML ZIP with the default target at
+its root; `/<target>/json.gz` supplies the latest available JSON format for that
+target. No `latest`/semver package-version aliases, scraped repository destinations,
+external static assets or automatic redirects are followed. See the official
+[ZIP](https://docs.rs/about/download) and
+[JSON](https://docs.rs/about/rustdoc-json) documentation.
+
+The latest available JSON format per target is collected; every observed format and
+representation is retained. Public routes do not enumerate all historical JSON
+formats, and collection does not claim to reconstruct unseen builds. JSON generation
+started in May 2025; older releases or failed builds may have no JSON. Absent/failed
+builds, unknown formats and parsing bounds remain visible processing gaps and are
+eligible for later revalidation. A body hash identifies captured HTTPS evidence;
+it does not establish an immutable docs.rs build ID or a registry archive checksum.
+
+The docs.rs source/docs inspected do not state a numeric bulk-mirroring allowance.
+The configured conservative default is application policy, not provider permission
+or an endorsement. Preserve package documentation notices and source licenses;
+docs.rs hosting does not relicense packages. HTML and JSON are untrusted data and
+never cause local `cargo doc`, rustdoc, package builds or executable loading.
+
 ## Terms and evidence
 
 Follow [crates.io data access](https://crates.io/data-access),
@@ -57,8 +100,7 @@ Only an exact first header matching the captured immutable revision is admitted;
 crate archives keep their stricter special-member policy.
 
 RFC Editor has a supervised, resumable corpus collector and immutable local search
-snapshots. This exception does not introduce collection daemons for other providers.
-The collector enumerates official metadata, constructs fixed source URLs and archives
+snapshots. Its collector enumerates official metadata, constructs fixed source URLs and archives
 advertised formats. HTTP failures, unsupported formats and processing bounds remain
 explicit gaps; neither a completed sweep nor a zero-result search implies full coverage.
 

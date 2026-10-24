@@ -6,7 +6,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls`, `limits`, and `rfc` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, `rfc`, and `crates` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -63,6 +63,70 @@ HTML extraction feeds 4 KiB chunks, limits unfinished tokens to 16 KiB, attribut
 to 128 per tag, nesting to 256, tags to 200,000 and tokens to 500,000. These are
 explicit rejection boundaries; scripts, styles and external resources are inert.
 
+## Crate corpus defaults
+
+Omitting `[crates]` enables automatic registry/archive/docs.rs collection. Set
+`enabled = false` to pause scheduling while preserving evidence and local research.
+Disposable harnesses explicitly disable both collectors. Existing configurations
+that omit this table begin crate collection after upgrade.
+
+| `crates` field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Supervised permanent collection |
+| `index_refresh_secs` | `3600` | Incremental official Git-index synchronization |
+| `metadata_refresh_secs` | `86400` | Public crates.io database-dump refresh |
+| `documentation_refresh_secs` | `86400` | docs.rs representation revalidation |
+| `collection_interval_secs` | `1` | Worker iteration delay, separate from provider budgets |
+| `publication_interval_secs` | `300` | Research snapshot publication target |
+| `static_requests_per_second` | `5` | Shared static.crates.io admission, including foreground archives |
+| `index_requests_per_second` | `1` | Shared official Git-index/sparse-index admission |
+| `max_bulk_transfers` | `4` | Bulk transfer bound; foreground tools retain two independent slots |
+| `max_processing_workers` | `1` | Separate source/docs projection admission; accepts 1..2 |
+| `max_artifact_bytes` | `34359738368` | Maximum individual archive/docs/dump bulk HTTP body; 32 GiB |
+| `min_free_bytes` | `1073741824` | Free-space reserve for new retained artifacts |
+| `max_archive_storage_bytes` | omitted | Optional retained artifact quota; omission has no quota |
+| `max_git_bytes` | `68719476736` | Disposable bare-index storage bound |
+
+Intervals accept 1..31622400 seconds, static/index admission accepts 1..1000 attempts
+per second, bulk transfers accept 1..32, projection workers accept 1..2, individual
+artifact limits accept 1 MiB..32 GiB, and reserved space must be at least 64 MiB. A set
+artifact quota must be at least the reserve. Git storage accepts 1 MiB..128 GiB.
+A quota or free-space failure pauses admission; it never deletes permanent history.
+Operators must review provider policy and actual capacity before increasing limits.
+The default rate does not establish permission for bulk mirroring or a completion
+schedule. docs.rs/API hosts remain at one attempt per second. docs.rs also has a
+single transfer slot across both foreground and bulk admission.
+
+Git synchronization has a one-hour process budget, at most 10,000 evidence files
+and 10,000,000 enumerated records. Each sparse-index crate body caps at 16 MiB,
+50,000 version records and 1 MiB per record, with a processing deadline. Bounds or
+unsupported records are inventory gaps, not fabricated version metadata.
+
+Bulk artifacts stream to bounded staging files rather than the public capture-body
+read budget; one artifact defaults to 32 GiB and can be lowered with
+`max_artifact_bytes`. This intake setting does not raise inspection limits.
+Source and HTML ZIP inspection still cap
+compressed input at 32 MiB, expanded input at 256 MiB, members at 20,000 and a selected
+source/HTML file at 4 MiB. Oversized raw captures remain retained with processing
+coverage. ZIP parsing admits Stored/Deflate/BZIP2 only, without extraction, links or
+encryption. JSON expansion caps at 256 MiB, each index item at 1 MiB, index entries at
+1,000,000 and nesting at 64. Public-path graph/traversal accounting each caps at
+64 MiB, normalized signatures at 1 MiB and processing at 15 seconds. The platform
+fragment caps at 1 MiB and 1,000 targets.
+
+Database-dump import caps expanded bytes at 512 GiB, tar members at 1,000, raw CSV
+rows at 2 MiB, fields at 1 MiB and columns at 128. Parsing uses 64 KiB chunks and
+bounded batches of at most 1,000 rows/8 MiB through a two-batch queue. Imports have a
+24-hour cancellation/deadline budget. Unknown/non-public columns are not projected;
+SQL files remain inert archive evidence. Only complete validated imports become
+metadata enrichment.
+
+Crate search uses one writer with a 64 MiB per-thread indexing budget, immutable
+shards of at most 50,000 documents, at most 4,096 shards and 10,000 files/32 GiB per
+shard, with a 2 MiB integrity manifest. These are processing limits, not process RSS
+or whole-corpus capacity measurements. Unsupported tokens and bounded processing
+failures remain explicit search gaps; they do not discard retained source bodies.
+
 | `limits` field | Default |
 | --- | --- |
 | `max_message_bytes` | 8 MiB |
@@ -79,7 +143,9 @@ explicit rejection boundaries; scripts, styles and external resources are inert.
 `limits.rate_limit` defaults to enabled with 100 calls/second and burst 100.
 An optional `verified_tunnel` calls-per-second/burst override requires edge mTLS.
 These limits regulate callers, not provider traffic. Upstream attempts have their
-own one-request/second host budgets and two-transfer concurrency bound.
+own source-specific host budgets. Existing foreground retrieval retains a
+two-transfer bound; private crate acquisition has its separately configured bulk
+slots and shares the same host clocks. See crate defaults above.
 
 Zero/invalid limits fail startup. Messages are at most 16 MiB; tool output must
 fit at most one eighth of the configured message size. Buffer capacity must be at

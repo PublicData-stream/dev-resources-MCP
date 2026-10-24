@@ -25,7 +25,9 @@ cleanup removes only its private processes, bridge and data.
 
 The PostgreSQL gate creates a disposable container and database. It verifies
 single-owner exclusion, immutable history, head revalidation, restart recovery,
-recognized staging cleanup, and corrupt-blob detection. It never points tests at
+recognized staging cleanup, and corrupt-blob detection. The crate corpus checks
+also exercise durable inventories, metadata joins, processing generations, frozen
+snapshot publication, restart and derived-document replacement. It never points tests at
 an existing production database. Unit tests require neither Docker nor credentials.
 
 ## Pinned edge
@@ -184,12 +186,53 @@ This creates a new immutable snapshot from archived source captures without usin
 the corrupt base. The older snapshot remains immutable and fails explicitly if its
 files are damaged. Keep the original archive for investigation.
 
-Schema v2 upgrades are forward-only. Take a coordinated database/blob backup before
-upgrading. Include `rfc-indexes`; restore snapshots with their exact derived manifests
-and source captures. To roll back to v1 software, restore a matching pre-upgrade
+Schema v2/v3 upgrades are forward-only. Take a coordinated database/blob backup
+before upgrading. Include `rfc-indexes`, `crate-indexes`, permanent Git evidence,
+dump/docs.rs captures and derived text; restore snapshots with their exact manifests
+and source captures. To roll back to earlier software, restore a matching pre-upgrade
 database and blobs in isolation rather than downgrading tables. Fixture checks and
 bounded live smoke establish neither production capacity nor real full-corpus
 acquisition. All live acceptance runs keep collection paused.
+
+Crate collection is also enabled when `[crates]` is omitted. Set `enabled = false`
+in `[crates]` before running disposable or bounded-live acceptance.
+`crate_corpus_status` separates inventory enumeration, metadata gaps, retained
+artifacts, job failures, projections and search coverage. One successful acquisition
+or completed job does not prove whole-registry ingestion. Bootstrap and revalidation
+may take substantial storage/time; no completion estimate or whole-corpus load
+benchmark is implied.
+
+The hourly Git index and daily public metadata dump are independent clocks. Exact
+archives are checksum-bound; docs.rs representations may change on rebuild and
+missing documentation is retried. Monitor per-kind failures, last successful
+inventory/enrichment/snapshot, storage reserve/quota and explicit processing/index
+gaps. Capacity exhaustion pauses admission while retaining historical evidence;
+provide storage or reduce intake rather than deleting permanent captures.
+
+Stop serving before either private crate maintenance command:
+
+```sh
+devres-server rebuild-crate-index /etc/devres/server.toml
+devres-server import-crate-corpus /etc/devres/server.toml --manifest SHA256
+```
+
+The rebuild uses retained database/capture evidence and publishes a new immutable
+index/snapshot. Large retained search indexes are validated by a cancellable
+background prewarm before activation and after restart; transient bootstrap search
+unavailability is separate from listener readiness and legacy tool availability.
+The import accepts the **body SHA-256 of an already retained Git
+evidence manifest**, not a caller URL, package executable or SQL script. It restores
+and verifies owned index evidence before publishing inventory; unknown/missing
+artifacts fail explicitly. Both commands use the single storage-owner fence and
+support SIGINT/SIGTERM cancellation. They do not authorize publication/deployment
+or whole-provider network acquisition beyond their stated private operation.
+
+Backups must retain raw artifacts even when parsing/indexing is unavailable. Bare
+Git working state and recognized processing stages are disposable; captured Git
+objects/manifests and published indexes are evidence. Package archives and docs.rs
+ZIPs are never extracted. JSON expansion uses an owned bounded staging file and
+removes it on completion/cancellation. Preserve original licensing in exported
+captures and keep any quota accounting consistent across restart.
 
 Deploy one serving replica with Recreate updates. PostgreSQL 18 and the blob
 filesystem are one logical backup unit. Provision both before starting the service.

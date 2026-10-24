@@ -65,6 +65,8 @@ class Client:
             headers["Mcp-Method"] = method
             if "name" in params:
                 headers["Mcp-Name"] = params["name"]
+            elif "uri" in params:
+                headers["Mcp-Name"] = params["uri"]
         args = (self.url.hostname, self.url.port)
         connection = (http.client.HTTPSConnection(*args, context=self.context, timeout=self.timeout)
                       if self.url.scheme == "https" else http.client.HTTPConnection(*args, timeout=self.timeout))
@@ -107,6 +109,12 @@ def smoke(client, negative=True):
         tools = client.call("tools/list", revision=revision)["tools"]
         names = {tool["name"] for tool in tools}
         assert {"server_info", "search", "fetch", "audit_lockfile"} <= names, names
+        assert {"crate_versions", "crate_catalog_search", "crate_document_get", "crate_dependencies",
+                "crate_compare", "crate_content_search", "crate_api_search", "crate_api_get",
+                "crate_corpus_status"} <= names, names
+        corpus = client.call("tools/call", {"name": "crate_corpus_status", "arguments": {}}, revision)
+        assert not corpus.get("isError"), "crate corpus status failed"
+        assert isinstance(corpus.get("structuredContent", {}).get("collection_enabled"), bool)
         info = client.call("tools/call", {"name": "server_info", "arguments": {}}, revision)
         assert not info.get("isError"), "server_info failed"
         identity = info.get("structuredContent", {})
@@ -168,6 +176,7 @@ def live(client, rfc_text_only=False):
     signal.alarm(300)
     status = client.tool("rfc_corpus_status", {})
     assert status.get("collection_enabled") is False, "bounded live smoke requires paused automatic RFC collection"
+    assert client.tool("crate_corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused crate collection"
     rfc_search = client.tool("rfc_search", {"query": "QUIC", "offset": 0, "limit": 3})
     assert rfc_search.get("items") and rfc_search.get("total", 0) > 0, "RFC discovery returned no matching documents"
     assert rfc_search.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/rfc-index.xml", "RFC discovery did not use the canonical index"
@@ -204,6 +213,17 @@ def live(client, rfc_text_only=False):
     assert source.get("path") == "src/lib.rs" and source.get("page", {}).get("text"), "source member was not retrieved"
     assert source.get("checksum_verified") is True and source.get("archive_capture", {}).get("body_hash") == checksum
     assert source.get("metadata_capture", {}).get("id") == metadata.get("capture", {}).get("id"), "source projection changed its metadata capture"
+    pinned = client.tool("crate_source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
+                         "metadata_capture": source["metadata_capture"]["id"],
+                         "archive_capture": source["archive_capture"]["id"], "offset": 0, "limit": 1024})
+    assert pinned == source, "capture-fixed source changed"
+    for method, params in (("resources/read", {"uri": source["resource_uri"]}),
+                           ("tools/call", {"name": "fetch", "arguments": {"id": source["resource_uri"]}})):
+        value = client.call(method, params)
+        if method == "tools/call":
+            assert not value.get("isError"), "pinned source fetch failed"
+            value = value.get("structuredContent", value)
+        assert value.get("contents", [{}])[0].get("text") == source["page"]["text"], "source resource content changed"
     lookup = client.tool("advisory_lookup", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
     revision = require_snapshot(lookup)
     lockfile = ('version = 4\n[[package]]\nname = "itoa"\nversion = "1.0.15"\n'
