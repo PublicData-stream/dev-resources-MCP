@@ -4,6 +4,500 @@ use devres_domain::{FetchRequest, FetchResponse, Validators};
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+async fn crate_corpus_epochs_generation_visibility_and_restart() {
+    use devres_application::crate_corpus::{
+        ContentDeltaQuery, ContentFilter, ContentRecord, CrateCorpusStore, VersionRecord,
+    };
+    use serde_json::json;
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    sqlx::query("CREATE DATABASE devres_crate_storage_fixture")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut parsed = url::Url::parse(&base).unwrap();
+    parsed.set_path("/devres_crate_storage_fixture");
+    let database = parsed.to_string();
+    let root = tempfile::tempdir().unwrap();
+    let store = PgBlobStore::connect(&database, root.path()).await.unwrap();
+    let now = devres_domain::unix_now();
+    let record = |version: &str, yanked: bool| json!({"name":"example","vers":version,"deps":[],"features":{},"yanked":yanked,"cksum":"a".repeat(64)});
+    let raw = format!("{}\n{}\n", record("1.0.0", false), record("2.0.0", false));
+    let metadata = store
+        .import_metadata(
+            "example",
+            &"a".repeat(40),
+            "ex/am/example",
+            &"b".repeat(40),
+            raw.as_bytes(),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .revalidate(&metadata.key, &metadata.id, Validators::default(), now)
+            .await
+            .is_err()
+    );
+    let manifest = store
+        .save_text(
+            "cargo:derived:git-manifest",
+            "https://github.com/rust-lang/crates.io-index.git",
+            "{}",
+            json!({"transport":"git"}),
+            now,
+        )
+        .await
+        .unwrap();
+    let epoch = store.begin_inventory(&"a".repeat(40), now).await.unwrap();
+    let records: Vec<_> = ["1.0.0", "2.0.0"]
+        .into_iter()
+        .map(|v| VersionRecord {
+            name: "example".into(),
+            version: v.into(),
+            metadata_capture: metadata.id.clone(),
+            metadata_status: None,
+            record: record(v, false),
+        })
+        .collect();
+    store
+        .stage_crate(&epoch.id, "example", &records, "ex/am/example")
+        .await
+        .unwrap();
+    assert!(store.latest_inventory().await.unwrap().is_none());
+    assert_eq!(
+        store
+            .pending_inventory()
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor
+            .as_deref(),
+        Some("ex/am/example")
+    );
+    store
+        .commit_inventory(&epoch.id, &manifest.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .versions(&epoch.id, None, None, 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .versions(&epoch.id, None, Some("example@1.0.0"), 10)
+            .await
+            .unwrap()[0]
+            .version,
+        "2.0.0"
+    );
+    assert!(
+        store
+            .version(&epoch.id, "example", "1.0.0")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let before = store
+        .publish_snapshot(&epoch.id, serde_json::Value::Null, now)
+        .await
+        .unwrap();
+    let old_text = store
+        .save_text(
+            "cargo:derived:old-page",
+            "https://docs.rs/crate/example/1.0.0/download",
+            "old docs",
+            json!({}),
+            now,
+        )
+        .await
+        .unwrap();
+    let page = |id: char, path: &str, capture: &str| ContentRecord {
+        id: id.to_string().repeat(64),
+        name: "example".into(),
+        version: "1.0.0".into(),
+        target: "x86_64-unknown-linux-gnu".into(),
+        path: path.into(),
+        kind: "rustdoc".into(),
+        capture: capture.into(),
+        metadata_capture: metadata.id.clone(),
+        archive_capture: manifest.id.clone(),
+        attributes: json!({}),
+    };
+    let gen1 = "c".repeat(64);
+    store
+        .stage_content(
+            &gen1,
+            &[
+                page('d', "example/index.html", &old_text.id),
+                page('e', "example/removed.html", &old_text.id),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .contents(i64::MAX, &ContentFilter::default(), None, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "pending callback rows are invisible"
+    );
+    store
+        .commit_content(&gen1, json!({"job_key":"html:example:1.0.0","documents":2}))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .contents(
+                before.content_sequence,
+                &ContentFilter::default(),
+                None,
+                100
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "late commit cannot mutate old snapshot"
+    );
+    let first = store
+        .publish_snapshot(&epoch.id, serde_json::Value::Null, now + 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .contents(first.content_sequence, &ContentFilter::default(), None, 100)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let new_text = store
+        .save_text(
+            "cargo:derived:new-page",
+            "https://docs.rs/crate/example/1.0.0/download",
+            "rebuilt docs",
+            json!({}),
+            now + 2,
+        )
+        .await
+        .unwrap();
+    store
+        .stage_content(
+            &"f".repeat(64),
+            &[page('0', "example/index.html", &new_text.id)],
+        )
+        .await
+        .unwrap();
+    store
+        .commit_content(
+            &"f".repeat(64),
+            json!({"job_key":"html:example:1.0.0","documents":1}),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .publish_snapshot(&epoch.id, serde_json::Value::Null, now + 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .contents(
+                second.content_sequence,
+                &ContentFilter::default(),
+                None,
+                100
+            )
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "removed docs must disappear after rebuild"
+    );
+    assert_eq!(
+        store
+            .contents(first.content_sequence, &ContentFilter::default(), None, 100)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut api = page('1', "example::run", &old_text.id);
+    api.kind = "api".into();
+    api.attributes = json!({"format_version":61,"signature":{"kind":"function","sig":"fn run()"}});
+    let mut next_api = api.clone();
+    next_api.id = "2".repeat(64);
+    next_api.version = "2.0.0".into();
+    next_api.attributes["signature"] = json!({"kind":"function","sig":"fn run() -> bool"});
+    store
+        .stage_content(&"3".repeat(64), &[api, next_api])
+        .await
+        .unwrap();
+    store
+        .commit_content(&"3".repeat(64), json!({"job_key":"api-fixture"}))
+        .await
+        .unwrap();
+    let comparison = store
+        .publish_snapshot(&epoch.id, serde_json::Value::Null, now + 4)
+        .await
+        .unwrap();
+    let changes = store
+        .content_deltas(&ContentDeltaQuery {
+            cutoff: comparison.content_sequence,
+            name: "example".into(),
+            from_version: "1.0.0".into(),
+            to_version: "2.0.0".into(),
+            target: None,
+            kind: "api".into(),
+            after: None,
+            limit: 20,
+        })
+        .await
+        .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["change"], "changed");
+    assert!(changes[0]["cursor"].is_string());
+    assert!(
+        store
+            .stage_content(
+                &gen1,
+                &[page('9', "example/late-injection.html", &old_text.id)]
+            )
+            .await
+            .is_err(),
+        "published generations reject appended rows"
+    );
+    let default_before = store.snapshot(None).await.unwrap().unwrap();
+    let prepared = store.prepare_snapshot(&epoch.id, now + 5).await.unwrap();
+    assert_eq!(
+        store.snapshot(None).await.unwrap().unwrap().id,
+        default_before.id,
+        "preparation never replaces the default"
+    );
+    store
+        .stage_content(
+            &"4".repeat(64),
+            &[page('8', "example/late.html", &new_text.id)],
+        )
+        .await
+        .unwrap();
+    store
+        .commit_content(&"4".repeat(64), json!({"job_key":"late:independent"}))
+        .await
+        .unwrap();
+    let frozen = store.commit_snapshot(prepared.clone()).await.unwrap();
+    assert_eq!(frozen.content_sequence, prepared.content_sequence);
+    assert!(
+        !store
+            .contents(
+                frozen.content_sequence,
+                &ContentFilter::default(),
+                None,
+                100
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.path == "example/late.html")
+    );
+    store
+        .put_enrichment(
+            &manifest.id,
+            "crates",
+            &[(
+                "1".into(),
+                json!({"id":"1","name":"example","description":"fixture"}),
+            )],
+        )
+        .await
+        .unwrap();
+    store
+        .put_enrichment(
+            &manifest.id,
+            "versions",
+            &[(
+                "2".into(),
+                json!({"id":"2","crate_id":"1","num":"1.0.0","license":"MIT"}),
+            )],
+        )
+        .await
+        .unwrap();
+    store
+        .put_enrichment(
+            &manifest.id,
+            "keywords",
+            &[("3".into(), json!({"id":"3","keyword":"networking"}))],
+        )
+        .await
+        .unwrap();
+    store
+        .put_enrichment(
+            &manifest.id,
+            "categories",
+            &[("4".into(), json!({"id":"4","slug":"network-programming"}))],
+        )
+        .await
+        .unwrap();
+    store
+        .put_enrichment(
+            &manifest.id,
+            "crates_keywords",
+            &[("1:3".into(), json!({"crate_id":"1","keyword_id":"3"}))],
+        )
+        .await
+        .unwrap();
+    store
+        .put_enrichment(
+            &manifest.id,
+            "crates_categories",
+            &[("1:4".into(), json!({"crate_id":"1","category_id":"4"}))],
+        )
+        .await
+        .unwrap();
+    store.commit_enrichment(&manifest.id).await.unwrap();
+    let enrichment = store
+        .enrichment(Some(&manifest.id), "example", "1.0.0")
+        .await
+        .unwrap();
+    assert_eq!(enrichment["keywords"], json!(["networking"]));
+    assert_eq!(enrichment["categories"], json!(["network-programming"]));
+    let second_epoch = store
+        .begin_inventory(&"b".repeat(40), now + 5)
+        .await
+        .unwrap();
+    let updated = VersionRecord {
+        record: record("2.0.0", true),
+        ..records[1].clone()
+    };
+    store
+        .stage_crate(&second_epoch.id, "example", &[updated], "ex/am/example")
+        .await
+        .unwrap();
+    store
+        .commit_inventory(&second_epoch.id, &manifest.id)
+        .await
+        .unwrap();
+    let fresh = store
+        .publish_snapshot(&second_epoch.id, serde_json::Value::Null, now + 6)
+        .await
+        .unwrap();
+    store
+        .begin_inventory(&"b".repeat(40), now + 60)
+        .await
+        .unwrap();
+    let revalidated = store
+        .publish_snapshot(&second_epoch.id, serde_json::Value::Null, now + 61)
+        .await
+        .unwrap();
+    assert_ne!(fresh.id, revalidated.id);
+    assert_eq!(revalidated.inventory.created_at, fresh.inventory.created_at);
+    assert_eq!(revalidated.inventory.validated_at, now + 60);
+    assert_eq!(
+        store
+            .snapshot(Some(&fresh.id))
+            .await
+            .unwrap()
+            .unwrap()
+            .inventory
+            .validated_at,
+        now + 5
+    );
+    let gap_epoch = store
+        .begin_inventory(&"c".repeat(40), now + 70)
+        .await
+        .unwrap();
+    store
+        .stage_gap(&gap_epoch.id, "example", "integrity", "ex/am/example")
+        .await
+        .unwrap();
+    store
+        .commit_inventory(&gap_epoch.id, &manifest.id)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .version(&gap_epoch.id, "example", "2.0.0")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata_status
+            .unwrap()
+            .starts_with("stale_due_to_invalid_update")
+    );
+    let carried = store
+        .begin_inventory(&"d".repeat(40), now + 80)
+        .await
+        .unwrap();
+    store
+        .commit_inventory(&carried.id, &manifest.id)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .version(&carried.id, "example", "2.0.0")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata_status
+            .is_some(),
+        "invalid update gaps persist through unrelated revisions"
+    );
+    assert!(
+        store
+            .version(&second_epoch.id, "example", "1.0.0")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .version(&epoch.id, "example", "1.0.0")
+            .await
+            .unwrap()
+            .unwrap()
+            .record["yanked"],
+        false
+    );
+    assert_eq!(
+        store
+            .version(&second_epoch.id, "example", "2.0.0")
+            .await
+            .unwrap()
+            .unwrap()
+            .record["yanked"],
+        true
+    );
+    let claim = store.claim(now + 10, "archive").await.unwrap().unwrap();
+    drop(store);
+    let store = PgBlobStore::connect(&database, root.path()).await.unwrap();
+    let resumed = store.claim(now + 10, "archive").await.unwrap().unwrap();
+    assert_eq!(claim.key, resumed.key);
+    assert_eq!(resumed.attempts, claim.attempts + 1);
+    assert_eq!(
+        store
+            .snapshot(Some(&first.id))
+            .await
+            .unwrap()
+            .unwrap()
+            .content_sequence,
+        first.content_sequence
+    );
+    assert_eq!(store.capture(&old_text.id).await.unwrap().body, b"old docs");
+    assert!(store.artifact(&old_text.id).await.unwrap().is_some());
+    drop(store);
+    sqlx::query("DROP DATABASE devres_crate_storage_fixture WITH(FORCE)")
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     use devres_application::corpus::{Dataset, Document, JobSpec, RfcCorpusStore, Snapshot};
     use serde_json::json;
@@ -37,7 +531,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
             .fetch_one(&fixture_pool)
             .await
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         store.capture(&original_id).await.unwrap().body,

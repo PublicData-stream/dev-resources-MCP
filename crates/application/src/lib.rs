@@ -1,5 +1,6 @@
 //! Retrieval policy shared by every transport and research operation.
 pub mod corpus;
+pub mod crate_corpus;
 use async_trait::async_trait;
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators};
 use std::{

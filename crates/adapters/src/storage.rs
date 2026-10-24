@@ -20,6 +20,8 @@ use tokio::{
 
 #[path = "corpus_storage.rs"]
 mod corpus_storage;
+#[path = "crate_storage.rs"]
+mod crate_storage;
 
 const MAX_BLOB: usize = 128 * 1024 * 1024;
 static STAGE: AtomicU64 = AtomicU64::new(0);
@@ -46,6 +48,7 @@ pub struct PgBlobStore {
     read_budget: Arc<Semaphore>,
     // A dedicated non-reconnecting connection holds the single-server fence.
     owner: Mutex<PgConnection>,
+    artifact_budget: std::sync::OnceLock<Arc<crate::bulk::BulkArtifactStore>>,
 }
 fn storage_error() -> Error {
     Error::unavailable("Durable storage unavailable")
@@ -98,10 +101,24 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if version != 2 {
+        } else if version != 2 && version != 3 {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
+        if version <= 2 {
+            sqlx::raw_sql(crate_storage::SCHEMA_V3)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx::query("UPDATE devres_schema SET version=3 WHERE singleton")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
         sqlx::query("UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| storage_error())?;
+        sqlx::query("UPDATE devres_crate_jobs SET state='pending' WHERE state='running'")
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
@@ -139,7 +156,16 @@ impl PgBlobStore {
             root,
             read_budget: Arc::new(Semaphore::new(128)),
             owner: Mutex::new(owner),
+            artifact_budget: std::sync::OnceLock::new(),
         })
+    }
+    pub fn attach_artifact_budget(
+        &self,
+        budget: Arc<crate::bulk::BulkArtifactStore>,
+    ) -> Result<()> {
+        self.artifact_budget
+            .set(budget)
+            .map_err(|_| Error::integrity("Archive budget already attached."))
     }
     /// Fail closed if the dedicated serving owner connection is lost.
     pub async fn check_health(&self) -> Result<()> {
@@ -162,8 +188,13 @@ impl PgBlobStore {
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|_| storage_error())?;
-        if !metadata.is_file() || metadata.len() > MAX_BLOB as u64 {
+        if !metadata.is_file() {
             return Err(Error::integrity("Invalid stored blob"));
+        }
+        if metadata.len() > MAX_BLOB as u64 {
+            return Err(Error::capacity(
+                "Bulk binary capture requires typed bounded processing.",
+            ));
         }
         // Charge in MiB, rounded up. The lease lives inside returned shared bytes,
         // not merely around this I/O future, so projections/clones stay bounded.
@@ -211,6 +242,11 @@ impl PgBlobStore {
             std::process::id(),
             STAGE.fetch_add(1, Ordering::Relaxed)
         ));
+        let mut reservation = self
+            .artifact_budget
+            .get()
+            .map(|budget| budget.reserve_bytes(body.len() as u64))
+            .transpose()?;
         let result = async {
             let mut file = tokio::fs::OpenOptions::new()
                 .create_new(true)
@@ -218,15 +254,30 @@ impl PgBlobStore {
                 .open(&stage)
                 .await
                 .map_err(|_| storage_error())?;
-            let _stage_guard = StageGuard(stage.clone());
+            let stage_guard = StageGuard(stage.clone());
             file.write_all(body).await.map_err(|_| storage_error())?;
             file.sync_all().await.map_err(|_| storage_error())?;
             drop(file);
             // hard_link atomically publishes without replacing an existing immutable object.
-            if let Err(error) = tokio::fs::hard_link(&stage, &final_path).await {
-                if error.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(storage_error());
+            let target = final_path.clone();
+            let reservation = reservation.take();
+            let published = tokio::task::spawn_blocking(move || {
+                // Keep staging ownership and quota with the filesystem operation even if its await is canceled.
+                let stage_guard = stage_guard;
+                match std::fs::hard_link(&stage_guard.0, &target) {
+                    Ok(()) => {
+                        if let Some(reservation) = reservation {
+                            reservation.retain();
+                        }
+                        Ok(true)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                    Err(_) => Err(storage_error()),
                 }
+            })
+            .await
+            .map_err(|_| storage_error())??;
+            if !published {
                 self.blob(content_hash).await?;
             }
             let dir = self.root.clone();
@@ -343,7 +394,10 @@ impl Store for PgBlobStore {
         validators: Validators,
         now: i64,
     ) -> Result<StoredCapture> {
-        if key.starts_with("rfc:rsync:") {
+        if key.starts_with("rfc:rsync:")
+            || key.starts_with("cargo:git-index:")
+            || key.starts_with("cargo:derived:")
+        {
             return Err(Error::invalid(
                 "Imported RFC captures cannot receive HTTP revalidation",
             ));
