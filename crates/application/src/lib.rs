@@ -1,4 +1,5 @@
 //! Retrieval policy shared by every transport and research operation.
+pub mod advisory;
 pub mod corpus;
 pub mod crate_corpus;
 use async_trait::async_trait;
@@ -110,15 +111,34 @@ impl Retrieval {
             .map_err(|_| Error::capacity("Retrieval capacity exhausted"))?;
         self.store.capture(id).await
     }
+    /// Local public evidence only. Does not fetch or refresh the selected key.
+    pub async fn latest_capture(&self, key: &str) -> Result<Option<StoredCapture>> {
+        if key.is_empty() || key.len() > 2048 {
+            return Err(Error::invalid("Invalid public capture key."));
+        }
+        let _permit = self
+            .admission
+            .try_acquire()
+            .map_err(|_| Error::capacity("Retrieval capacity exhausted"))?;
+        Ok(self.store.latest(key).await?.map(|cached| cached.stored))
+    }
     pub async fn get(&self, request: FetchRequest) -> Result<StoredCapture> {
-        self.get_inner(request, None, false).await
+        self.get_inner(request, None, false, true).await
     }
     pub async fn get_validated(
         &self,
         request: FetchRequest,
         validator: &dyn ResponseValidator,
     ) -> Result<StoredCapture> {
-        self.get_inner(request, Some(validator), false).await
+        self.get_inner(request, Some(validator), false, true).await
+    }
+    /// Maintenance requires an actual successful validation, not stale fallback.
+    pub async fn get_fresh_validated(
+        &self,
+        request: FetchRequest,
+        validator: &dyn ResponseValidator,
+    ) -> Result<StoredCapture> {
+        self.get_inner(request, Some(validator), false, false).await
     }
     pub fn foreground_active(&self) -> bool {
         self.foreground.load(Ordering::Acquire) > 0
@@ -131,7 +151,7 @@ impl Retrieval {
         if self.foreground_active() {
             return Err(Error::capacity("Foreground retrieval has priority"));
         }
-        self.get_inner(request, Some(validator), true).await
+        self.get_inner(request, Some(validator), true, true).await
     }
     /// Private adapter entrypoint for bounded offline/imported public evidence.
     /// This does not perform a fetch or create an HTTP observation itself.
@@ -164,6 +184,7 @@ impl Retrieval {
         request: FetchRequest,
         validator: Option<&dyn ResponseValidator>,
         background: bool,
+        allow_stale: bool,
     ) -> Result<StoredCapture> {
         struct Foreground<'a>(Option<&'a AtomicUsize>);
         impl Drop for Foreground<'_> {
@@ -236,7 +257,7 @@ impl Retrieval {
             .await
         {
             Ok(response) => response,
-            Err(error) => return self.stale_or_error(existing, now, error),
+            Err(error) => return self.stale_or_error(existing, now, error, allow_stale),
         };
         match response.status {
             200 => {
@@ -266,7 +287,12 @@ impl Retrieval {
                 }
                 Err(Error::not_found("Source record not found"))
             }
-            _ => self.stale_or_error(existing, now, Error::unavailable("Source request failed")),
+            _ => self.stale_or_error(
+                existing,
+                now,
+                Error::unavailable("Source request failed"),
+                allow_stale,
+            ),
         }
     }
     fn stale_or_error(
@@ -274,9 +300,10 @@ impl Retrieval {
         existing: Option<Cached>,
         now: i64,
         error: Error,
+        allow_stale: bool,
     ) -> Result<StoredCapture> {
         // Integrity and admission failures must not be disguised as valid cached results.
-        if error.code != "unavailable" {
+        if error.code != "unavailable" || !allow_stale {
             return Err(error);
         }
         match existing {

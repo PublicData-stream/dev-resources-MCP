@@ -18,6 +18,8 @@ use tokio::{
     sync::{Mutex, Semaphore},
 };
 
+#[path = "advisory_storage.rs"]
+mod advisory_storage;
 #[path = "corpus_storage.rs"]
 mod corpus_storage;
 #[path = "crate_storage.rs"]
@@ -107,7 +109,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if version != 2 && version != 3 {
+        } else if version != 2 && version != 3 && version != 4 {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -116,6 +118,16 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
             sqlx::query("UPDATE devres_schema SET version=3 WHERE singleton")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
+        if version <= 3 {
+            sqlx::raw_sql(advisory_storage::SCHEMA_V4)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx::query("UPDATE devres_schema SET version=4 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;

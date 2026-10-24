@@ -26,6 +26,8 @@ append-only successful-fetch/revalidation observations. Schema version 2 adds
 owner-fenced RFC datasets, resumable jobs, import observations and research snapshot
 manifests. Version 3 adds crate inventories, durable acquisition/processing jobs,
 artifact provenance, metadata enrichment, content generations and research snapshots.
+Version 4 adds owner-fenced advisory observations, deduplicated representations,
+ordered snapshot membership, fixed legacy aliases and resumable Git-history state.
 Migrations preserve earlier capture identities; older binaries reject newer schemas.
 
 Blobs use SHA-256 filenames in an operator-owned directory. Publication writes a
