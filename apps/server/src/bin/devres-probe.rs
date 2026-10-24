@@ -98,6 +98,7 @@ async fn main() -> Result<(), ServerError> {
         return Err("missing license offer".into());
     }
     let mut has_rfc_corpus = false;
+    let mut has_crate_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -120,6 +121,11 @@ async fn main() -> Result<(), ServerError> {
             has_rfc_corpus = value["result"]["tools"]
                 .as_array()
                 .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "rfc_corpus_status"));
+            has_crate_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool["name"] == "crate_corpus_status")
+            });
         }
         if method == "tools/list"
             && !value["result"]["tools"]
@@ -154,6 +160,22 @@ async fn main() -> Result<(), ServerError> {
         .await?;
         if !result["result"]["structuredContent"]["collection_enabled"].is_boolean() {
             return Err("RFC corpus status was not available through WebTransport".into());
+        }
+    }
+    if has_crate_corpus {
+        let mut params = json!({"name":"crate_corpus_status","arguments":{}});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let result = exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":params}),
+        )
+        .await?;
+        if !result["result"]["structuredContent"]["collection_enabled"].is_boolean() {
+            return Err("Crate corpus status was not available through WebTransport".into());
         }
     }
     connection.close(0_u32.into(), b"probe complete");

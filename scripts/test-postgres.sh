@@ -27,4 +27,5 @@ port=$(docker port "$run_id" 5432/tcp | sed 's/.*://')
 export DATABASE_URL="postgres://devres:fixture-only@127.0.0.1:$port/devres"
 export DEVRES_TEST_DATABASE_URL="$DATABASE_URL"
 cargo test --locked -p devres-adapters --test persistence -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib crate_corpus_captured_inventory_acquisition_research_and_restart -- --ignored --test-threads=1
 echo 'Real PostgreSQL persistence checks passed'

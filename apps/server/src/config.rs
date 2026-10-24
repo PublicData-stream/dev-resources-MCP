@@ -310,11 +310,14 @@ pub struct Config {
     pub limits: Limits,
     #[serde(default)]
     pub rfc: devres_adapters::RfcConfig,
+    #[serde(default)]
+    pub crates: devres_adapters::CrateConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
         self.limits.validate()?;
         self.rfc.validate()?;
+        self.crates.validate()?;
         for access in [
             AccessPolicy {
                 allowed_hosts: self.http.allowed_hosts.clone(),
@@ -391,6 +394,37 @@ mod tests {
         limits = Limits::default();
         limits.max_buffer_bytes = 1;
         assert!(limits.validate().is_err());
+    }
+    #[test]
+    fn crate_collection_defaults_and_pause_configuration_are_explicit() {
+        let defaults: devres_adapters::CrateConfig = toml::from_str("").unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.index_refresh_secs, 3600);
+        assert_eq!(defaults.static_requests_per_second, 5);
+        assert_eq!(defaults.index_requests_per_second, 1);
+        defaults.validate().unwrap();
+        let paused: devres_adapters::CrateConfig = toml::from_str("enabled=false").unwrap();
+        assert!(!paused.enabled);
+        paused.validate().unwrap();
+        assert!(
+            toml::from_str::<devres_adapters::CrateConfig>(
+                "arbitrary_url='https://private.invalid'"
+            )
+            .is_err()
+        );
+        for bad in [
+            "index_refresh_secs=0",
+            "max_bulk_transfers=0",
+            "index_requests_per_second=0",
+            "min_free_bytes=1",
+        ] {
+            assert!(
+                toml::from_str::<devres_adapters::CrateConfig>(bad)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
     }
     #[tokio::test]
     async fn invalid_config_never_echoes_credential_bearing_input() {

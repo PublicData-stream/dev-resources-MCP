@@ -22,12 +22,14 @@ async fn main() -> Result<(), ServerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::new("devres_server=info"))
         .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (refresh, rebuild, import, config_path) = match args.as_slice() {
-        [path] => (false, false, None, path),
-        [command, path] if command == "refresh-advisories" => (true, false, None, path),
-        [command,path] if command=="rebuild-rfc-index" => (false,true,None,path),
-        [command, path, flag, budget] if command == "import-rfcs" && flag == "--max-bytes" => (false, false, Some(budget.parse::<u64>().map_err(|_| "invalid RFC import byte budget")?), path),
-        _ => return Err("usage: devres-server [refresh-advisories] CONFIG.toml | import-rfcs CONFIG.toml --max-bytes N".into()),
+    let (refresh, rebuild, import, crate_command, config_path) = match args.as_slice() {
+        [path] => (false, false, None, None, path),
+        [command, path] if command == "refresh-advisories" => (true, false, None, None, path),
+        [command,path] if command=="rebuild-rfc-index" => (false,true,None,None,path),
+        [command,path] if command=="rebuild-crate-index" => (false,false,None,Some(("rebuild",None)),path),
+        [command,path,flag,hash] if command=="import-crate-corpus" && flag=="--manifest" => (false,false,None,Some(("import",Some(hash.as_str()))),path),
+        [command, path, flag, budget] if command == "import-rfcs" && flag == "--max-bytes" => (false, false, Some(budget.parse::<u64>().map_err(|_| "invalid RFC import byte budget")?), None, path),
+        _ => return Err("usage: devres-server CONFIG.toml | refresh-advisories CONFIG.toml | rebuild-rfc-index CONFIG.toml | rebuild-crate-index CONFIG.toml | import-crate-corpus CONFIG.toml --manifest SHA256 | import-rfcs CONFIG.toml --max-bytes N".into()),
     };
     let config = Config::load(Path::new(config_path)).await?;
     let store = Arc::new(
@@ -37,7 +39,10 @@ async fn main() -> Result<(), ServerError> {
         )
         .await?,
     );
-    let fetcher = Arc::new(devres_adapters::HttpFetcher::new()?);
+    let broker = Arc::new(devres_adapters::bulk::BulkBroker::new(
+        config.crates.bulk_config(),
+    )?);
+    let fetcher = Arc::new(devres_adapters::HttpFetcher::with_broker(broker.clone())?);
     let retrieval = Arc::new(devres_application::Retrieval::new(store.clone(), fetcher));
     let corpus = Arc::new(devres_adapters::RfcCorpus::new(
         retrieval.clone(),
@@ -46,11 +51,40 @@ async fn main() -> Result<(), ServerError> {
         config.rfc.clone(),
     )?);
     corpus.recover_stages().await?;
+    let crate_corpus = Arc::new(devres_adapters::CrateCorpus::new(
+        store.clone(),
+        retrieval.clone(),
+        broker,
+        &config.storage.blob_dir,
+        config.crates.clone(),
+    )?);
+    store.attach_artifact_budget(crate_corpus.artifact_budget())?;
+    crate_corpus.recover_stages().await?;
     let research = Arc::new(
         devres_adapters::Research::new(retrieval)
             .await?
-            .with_corpus(corpus.clone()),
+            .with_corpus(corpus.clone())
+            .with_crate_corpus(crate_corpus.clone()),
     );
+    if let Some((command, manifest)) = crate_command {
+        let shutdown = CancellationToken::new();
+        let signal = shutdown.clone();
+        let signal_task = tokio::spawn(async move {
+            shutdown_signal().await;
+            signal.cancel();
+        });
+        let result = if command == "rebuild" {
+            crate_corpus.rebuild_index(shutdown).await
+        } else {
+            crate_corpus
+                .import_inventory(manifest.ok_or("missing inventory manifest")?, shutdown)
+                .await
+        };
+        signal_task.abort();
+        let _ = signal_task.await;
+        println!("{}", result?);
+        return Ok(());
+    }
     if refresh {
         research.refresh_advisories().await?;
         println!("RustSec public advisory snapshot refreshed.");
@@ -78,6 +112,9 @@ async fn main() -> Result<(), ServerError> {
     let mut server = ServerBuilder::new(registry, config.limits, config.source.url);
     server.register_worker("rfc-collector", move |shutdown| async move {
         corpus.run(shutdown).await.map_err(Into::into)
+    })?;
+    server.register_worker("crate-collector", move |shutdown| async move {
+        crate_corpus.run(shutdown).await.map_err(Into::into)
     })?;
     server.register_endpoint(HttpEndpoint {
         bind: config.http.bind,

@@ -38,6 +38,46 @@ impl Fetcher for NoNetwork {
 }
 
 #[tokio::test]
+async fn zip_captures_never_become_generic_text_resources() {
+    let captured = StoredCapture {
+        capture: Capture {
+            id: "c".repeat(64),
+            key: "cargo:docs-html:synthetic:1.0.0".into(),
+            source_url: "https://fixtures.invalid/documentation.zip".into(),
+            body_hash: "d".repeat(64),
+            media_type: "application/zip".into(),
+            retrieved_at: 0,
+            validated_at: 0,
+        },
+        body: [b'P', b'K', 5, 6]
+            .into_iter()
+            .chain([0; 18])
+            .collect::<Vec<_>>()
+            .into(),
+    };
+    assert!(std::str::from_utf8(&captured.body).is_ok());
+    let research = Research::new(Arc::new(Retrieval::new(
+        Arc::new(PublicFixture(captured)),
+        Arc::new(NoNetwork),
+    )))
+    .await
+    .unwrap();
+    let uri = format!("devres://capture/{}", "c".repeat(64));
+    assert_eq!(
+        research.read_resource(&uri).await.unwrap_err().code,
+        "invalid_input"
+    );
+    assert_eq!(
+        research
+            .call("fetch", json!({"id":uri}))
+            .await
+            .unwrap_err()
+            .code,
+        "invalid_input"
+    );
+}
+
+#[tokio::test]
 async fn generic_fetch_preserves_embedded_page_and_applies_explicit_overrides() {
     let captured = StoredCapture {
         capture: Capture {

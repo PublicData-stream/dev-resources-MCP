@@ -153,6 +153,34 @@ pub fn server_info_registry(source: SourceOffer) -> std::result::Result<ToolRegi
 mod tests {
     use super::*;
     #[test]
+    fn all_research_tools_pass_real_startup_registration() {
+        let mut registry =
+            server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .unwrap();
+        }
+        for name in [
+            "crate_versions",
+            "crate_catalog_search",
+            "crate_document_get",
+            "crate_dependencies",
+            "crate_compare",
+            "crate_content_search",
+            "crate_api_search",
+            "crate_api_get",
+            "crate_corpus_status",
+        ] {
+            assert!(registry.tools.contains_key(name));
+            assert!(
+                !registry.tools[name]
+                    .validator
+                    .is_valid(&json!({"unexpected":"field"}))
+            );
+        }
+    }
+    #[test]
     fn registration_rejects_duplicates_and_external_refs() {
         let mut registry =
             server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();

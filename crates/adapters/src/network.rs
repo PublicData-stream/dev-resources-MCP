@@ -14,6 +14,7 @@ pub struct HttpFetcher {
     client: reqwest::Client,
     limits: Mutex<HashMap<String, Instant>>,
     slots: Semaphore,
+    broker: Option<std::sync::Arc<crate::bulk::BulkBroker>>,
 }
 impl HttpFetcher {
     pub fn new() -> Result<Self> {
@@ -31,7 +32,13 @@ impl HttpFetcher {
             client,
             limits: Mutex::new(HashMap::new()),
             slots: Semaphore::new(2),
+            broker: None,
         })
+    }
+    pub fn with_broker(broker: std::sync::Arc<crate::bulk::BulkBroker>) -> Result<Self> {
+        let mut fetcher = Self::new()?;
+        fetcher.broker = Some(broker);
+        Ok(fetcher)
     }
     async fn attempt(
         &self,
@@ -39,7 +46,13 @@ impl HttpFetcher {
         validators: Option<&Validators>,
         host: &str,
     ) -> Result<(FetchResponse, u64)> {
-        let scheduled = {
+        let _shared_attempt = match &self.broker {
+            Some(broker) => Some(broker.admit_foreground(host).await?),
+            None => None,
+        };
+        let scheduled = if self.broker.is_some() {
+            Instant::now()
+        } else {
             let mut limits = self.limits.lock().await;
             let now = Instant::now();
             let scheduled = *limits.entry(host.to_owned()).or_insert(now);

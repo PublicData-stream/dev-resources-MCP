@@ -14,6 +14,7 @@ pub struct Research {
     retrieval: Arc<Retrieval>,
     advisory: advisory::Advisories,
     corpus: Option<std::sync::Arc<RfcCorpus>>,
+    crate_corpus: Option<std::sync::Arc<crate::CrateCorpus>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -59,7 +60,7 @@ pub(crate) fn now() -> i64 {
 pub(crate) fn capture_json(capture: &Capture, ttl: u64) -> Value {
     let resource_uri = if matches!(
         capture.media_type.as_str(),
-        "application/gzip" | "application/pdf"
+        "application/gzip" | "application/pdf" | "application/zip"
     ) {
         None
     } else {
@@ -102,11 +103,16 @@ impl Research {
             advisory: advisory::Advisories::new(retrieval.clone()),
             retrieval,
             corpus: None,
+            crate_corpus: None,
         })
     }
 
     pub fn with_corpus(mut self, corpus: std::sync::Arc<RfcCorpus>) -> Self {
         self.corpus = Some(corpus);
+        self
+    }
+    pub fn with_crate_corpus(mut self, corpus: std::sync::Arc<crate::CrateCorpus>) -> Self {
+        self.crate_corpus = Some(corpus);
         self
     }
 
@@ -115,6 +121,20 @@ impl Research {
     }
 
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if crate::crate_research::schemas()
+            .iter()
+            .any(|s| s["name"].as_str() == Some(tool))
+        {
+            let corpus = self
+                .crate_corpus
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Crate corpus storage is not configured."))?;
+            if tool == "crate_corpus_status" {
+                let _: EmptyInput = decode(input)?;
+                return corpus.status().await;
+            }
+            return corpus.research().call(tool, input).await;
+        }
         if matches!(
             tool,
             "rfc_metadata"
@@ -335,7 +355,7 @@ impl Research {
         let stored = self.retrieval.read_capture(capture_id).await?;
         if matches!(
             stored.capture.media_type.as_str(),
-            "application/pdf" | "application/gzip"
+            "application/pdf" | "application/gzip" | "application/zip"
         ) {
             return Err(Error::invalid(
                 "Binary captures must be read through a typed source tool.",
@@ -467,5 +487,9 @@ fn schemas() -> Vec<Value> {
         vec!["lockfile"],
     );
     tools.extend(rfc_tools::schemas());
+    tools.extend(crate::crate_research::schemas());
     tools
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyInput {}
