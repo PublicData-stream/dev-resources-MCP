@@ -389,7 +389,17 @@ impl AdvisoryResearch {
             };
             after = row.sequence;
             scanned += 1;
-            let mut data = row.data;
+            let mut data = if kind == "commits" {
+                self.store
+                    .advisory_commit(&row.key, Some(cutoff))
+                    .await?
+                    .ok_or_else(|| {
+                        Error::integrity("Advisory graph row is absent at its selected cutoff.")
+                    })?
+                    .data
+            } else {
+                row.data
+            };
             if kind == "refs" {
                 if let Some(format) = input.format.as_deref() {
                     let refs = data
@@ -542,7 +552,15 @@ impl AdvisoryResearch {
         gaps: &mut usize,
         cutoff: i64,
     ) -> Result<Vec<Value>> {
+        let row = self
+            .store
+            .advisory_commit(&row.key, Some(cutoff))
+            .await?
+            .ok_or_else(|| {
+                Error::integrity("Advisory graph row is absent at its selected cutoff.")
+            })?;
         let Some(child_id) = row.data["snapshots"][format].as_str() else {
+            *gaps += 1;
             return Ok(Vec::new());
         };
         let child = self.snapshot(Some(child_id), format).await?;
@@ -576,7 +594,7 @@ impl AdvisoryResearch {
             let revision = parent
                 .as_str()
                 .ok_or_else(|| Error::integrity("Invalid stored advisory parent."))?;
-            let parent_row = self.store.advisory_row("commits", revision).await?;
+            let parent_row = self.store.advisory_commit(revision, Some(cutoff)).await?;
             let parent_id = parent_row
                 .as_ref()
                 .filter(|v| v.sequence <= cutoff)
@@ -1518,5 +1536,115 @@ mod tests {
                 .unwrap()
                 .contains("github.com/rustsec/advisory-db/tree/")
         );
+    }
+
+    #[tokio::test]
+    async fn processing_generations_overlay_new_views_without_changing_frozen_cursors() {
+        let store = Arc::new(Memory::default());
+        let parent_v1 = snapshot('a', vec![record("RUSTSEC-2024-0001", "original parent")]);
+        let child_v1 = snapshot('b', vec![record("RUSTSEC-2024-0001", "changed child")]);
+        add_commit(&store, &parent_v1, &[]).await;
+        add_commit(&store, &child_v1, &[&parent_v1.revision]).await;
+        let research = AdvisoryResearch::new(store.clone());
+        let old_discovery = research
+            .call("advisory_snapshots", json!({"limit":1}))
+            .await
+            .unwrap();
+        let old_history = research
+            .call(
+                "advisory_history",
+                json!({"id":"RUSTSEC-2024-0001","limit":1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_discovery["history_snapshot"], 2);
+        assert_eq!(old_history["history_snapshot"], 2);
+
+        let mut parent_v2 = parent_v1.clone();
+        parent_v2.id = "c".repeat(64);
+        parent_v2.coverage["processor_version"] = json!(2);
+        let mut child_v2 = child_v1.clone();
+        child_v2.id = "d".repeat(64);
+        child_v2.coverage["processor_version"] = json!(2);
+        store
+            .publish_advisory_snapshot(&parent_v2, false)
+            .await
+            .unwrap();
+        store
+            .publish_advisory_snapshot(&child_v2, false)
+            .await
+            .unwrap();
+        for processed in [&parent_v2, &child_v2] {
+            store.put_advisory_row("processing", &format!("{}:2", processed.revision),
+                &json!({"revision":processed.revision,"processor_version":2,"snapshots":{"rustsec":processed.id},"projection_complete":true})).await.unwrap();
+        }
+
+        let frozen_discovery = research
+            .call(
+                "advisory_snapshots",
+                json!({"cursor":old_discovery["next_cursor"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(frozen_discovery["history_snapshot"], 2);
+        assert_eq!(
+            frozen_discovery["items"][0]["snapshots"]["rustsec"],
+            child_v1.id
+        );
+        assert_eq!(frozen_discovery["items"][0]["sequence"], 2);
+        let frozen_history = research
+            .call(
+                "advisory_history",
+                json!({"id":"RUSTSEC-2024-0001","cursor":old_history["next_cursor"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(frozen_history["items"][0]["snapshot"], child_v1.id);
+        assert_eq!(frozen_history["items"][0]["parent_snapshot"], parent_v1.id);
+
+        let latest_discovery = research
+            .call("advisory_snapshots", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(latest_discovery["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            latest_discovery["items"][0]["snapshots"]["rustsec"],
+            parent_v2.id
+        );
+        assert_eq!(
+            latest_discovery["items"][1]["snapshots"]["rustsec"],
+            child_v2.id
+        );
+        assert_eq!(latest_discovery["items"][1]["processor_version"], 2);
+        assert_eq!(latest_discovery["items"][1]["sequence"], 2);
+        let latest_history = research
+            .call("advisory_history", json!({"id":"RUSTSEC-2024-0001"}))
+            .await
+            .unwrap();
+        assert_eq!(latest_history["items"][0]["snapshot"], parent_v2.id);
+        assert_eq!(latest_history["items"][1]["snapshot"], child_v2.id);
+        assert_eq!(latest_history["items"][1]["parent_snapshot"], parent_v2.id);
+        assert_eq!(latest_history["items"][1]["change"], "changed");
+    }
+
+    #[tokio::test]
+    async fn raw_graph_without_eligible_projection_is_a_reported_history_gap() {
+        let store = Arc::new(Memory::default());
+        let revision = "a".repeat(40);
+        store
+            .put_advisory_row(
+                "commits",
+                &revision,
+                &json!({"revision":revision,"parents":[],"processor_version":2}),
+            )
+            .await
+            .unwrap();
+        let result = AdvisoryResearch::new(store)
+            .call("advisory_history", json!({"id":"RUSTSEC-2024-0001"}))
+            .await
+            .unwrap();
+        assert!(result["items"].as_array().unwrap().is_empty());
+        assert_eq!(result["projection_gaps"], 1);
+        assert!(result["next_cursor"].is_null());
     }
 }

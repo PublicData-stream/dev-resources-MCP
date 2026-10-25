@@ -1,7 +1,10 @@
 //! Owner-fenced schema-v4 advisory snapshots. Public evidence only.
 use super::{PgBlobStore, hash, storage_error, valid_hash};
 use async_trait::async_trait;
-use devres_application::advisory::{AdvisoryRecord, AdvisoryRow, AdvisorySnapshot, AdvisoryStore};
+use devres_application::advisory::{
+    ADVISORY_PROCESSOR_VERSION, AdvisoryProjectionState, AdvisoryRecord, AdvisoryRow,
+    AdvisorySnapshot, AdvisoryStore,
+};
 use devres_domain::{Error, Result};
 use serde_json::{Value, json};
 use sqlx::{Connection, Row, types::Json};
@@ -209,6 +212,30 @@ impl AdvisoryStore for PgBlobStore {
         sqlx::query("SELECT sequence,key,data FROM devres_advisory_rows WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) ORDER BY sequence LIMIT $4")
             .bind(kind).bind(after).bind(cutoff).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
     }
+    async fn advisory_projection_state(
+        &self,
+        id: &str,
+        format: &str,
+    ) -> Result<Option<AdvisoryProjectionState>> {
+        self.fence().await?;
+        if !valid_hash(id) || !matches!(format, "rustsec" | "osv") {
+            return Err(Error::invalid("Invalid advisory snapshot selector."));
+        }
+        let data: Option<Json<Value>> = sqlx::query_scalar("SELECT jsonb_build_object('complete',data->'complete','processor_version',COALESCE(data->'coverage'->'processor_version','1'::jsonb)) FROM devres_advisory_snapshots WHERE id=$1 AND format=$2")
+            .bind(id).bind(format).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+        data.map(|Json(data)| {
+            Ok(AdvisoryProjectionState {
+                complete: data["complete"]
+                    .as_bool()
+                    .ok_or_else(|| Error::integrity("Invalid advisory projection coverage."))?,
+                processor_version: data["processor_version"]
+                    .as_u64()
+                    .and_then(|version| u32::try_from(version).ok())
+                    .ok_or_else(|| Error::integrity("Invalid advisory processing version."))?,
+            })
+        })
+        .transpose()
+    }
     async fn advisory_row(&self, kind: &str, value: &str) -> Result<Option<AdvisoryRow>> {
         self.fence().await?;
         key(kind, value)?;
@@ -227,6 +254,44 @@ impl AdvisoryStore for PgBlobStore {
             .fetch_one(&self.pool)
             .await
             .map_err(|_| storage_error())
+    }
+    async fn advisory_commit(
+        &self,
+        revision: &str,
+        cutoff: Option<i64>,
+    ) -> Result<Option<AdvisoryRow>> {
+        self.fence().await?;
+        key("commits", revision)?;
+        if cutoff.is_some_and(|value| value < 0) {
+            return Err(Error::invalid("Invalid advisory publication cutoff."));
+        }
+        // Exact generation keys use the existing primary index. The graph's sequence
+        // stays fixed while projections are selected at the caller's frozen cutoff.
+        let keys = (1..=ADVISORY_PROCESSOR_VERSION)
+            .map(|version| format!("{revision}:{version}"))
+            .collect::<Vec<_>>();
+        let Some(found) = sqlx::query("SELECT c.sequence,c.key,c.data,p.sequence AS processing_sequence,p.key AS processing_key,p.data AS processing_data FROM devres_advisory_rows c LEFT JOIN LATERAL (SELECT sequence,key,data FROM devres_advisory_rows WHERE kind='processing' AND key=ANY($3::text[]) AND ($2::bigint IS NULL OR sequence<=$2) ORDER BY sequence DESC LIMIT 1) p ON true WHERE c.kind='commits' AND c.key=$1 AND ($2::bigint IS NULL OR c.sequence<=$2)")
+            .bind(revision).bind(cutoff).bind(keys).fetch_optional(&self.pool).await.map_err(|_|storage_error())? else {return Ok(None);};
+        let projection = found
+            .try_get::<Option<Json<Value>>, _>("processing_data")
+            .map_err(|_| storage_error())?
+            .map(|data| {
+                Ok::<_, Error>(AdvisoryRow {
+                    sequence: found
+                        .try_get("processing_sequence")
+                        .map_err(|_| storage_error())?,
+                    key: found
+                        .try_get("processing_key")
+                        .map_err(|_| storage_error())?,
+                    data: data.0,
+                })
+            })
+            .transpose()?;
+        let mut result = row(found)?;
+        if let Some(projection) = projection {
+            result.apply_processing(&projection)?;
+        }
+        Ok(Some(result))
     }
     async fn advisory_rows_by_keys(&self, kind: &str, keys: &[String]) -> Result<Vec<AdvisoryRow>> {
         self.fence().await?;

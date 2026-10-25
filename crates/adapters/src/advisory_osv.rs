@@ -513,14 +513,32 @@ fn range_matches(range: &Value, version: &Version) -> MatchResult {
         (Some(a), Some(b)) => a.cmp_precedence(b),
     };
     timeline.sort_by(|a, b| boundary_order(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
-    // The specification does not define the order of simultaneous conflicting
-    // introduction/fix events. Preserve this ambiguity as incomplete coverage.
-    if timeline.windows(2).any(|pair| {
-        pair[0].1 == 0
-            && pair[1].1 == 1
-            && boundary_order(&pair[0].0, &pair[1].0) == Ordering::Equal
-    }) {
-        return incomplete;
+    // Equal introduction/fix boundaries can encode empty [v,v) intervals. Such
+    // pairs are usable when balanced; an already-open interval needs its own
+    // closing event. Otherwise a shared boundary may instead mean closing one
+    // range and reopening another, whose ambiguous order must remain a gap.
+    let mut open = false;
+    let mut start = 0;
+    while start < timeline.len() {
+        let mut end = start + 1;
+        while end < timeline.len()
+            && boundary_order(&timeline[start].0, &timeline[end].0) == Ordering::Equal
+        {
+            end += 1;
+        }
+        let group = &timeline[start..end];
+        let introduced = group.iter().filter(|(_, kind)| *kind == 0).count();
+        let fixed = group.iter().filter(|(_, kind)| *kind == 1).count();
+        if introduced > 0 && fixed > 0 && fixed != introduced + usize::from(open) {
+            return incomplete;
+        }
+        if introduced > 0 {
+            open = true;
+        }
+        if group.iter().any(|(_, kind)| *kind != 0) {
+            open = false;
+        }
+        start = end;
     }
     let mut matched = false;
     for (boundary, kind) in timeline {
@@ -631,6 +649,149 @@ mod tests {
         );
     }
     #[test]
+    fn observed_zero_width_event_shapes_preserve_real_affected_intervals() {
+        // Synthetic metadata with the event shapes observed in the official OSV
+        // export. These are matcher fixtures, not complete provider captures.
+        type Case<'a> = (&'a str, &'a str, Value, &'a [&'a str], &'a [&'a str]);
+        let cases: [Case<'_>; 5] = [
+            (
+                "RUSTSEC-2022-0012",
+                "arrow2",
+                json!([{"introduced":"0.0.0-0"},{"fixed":"0.7.1"},{"introduced":"0.8.0"},{"fixed":"0.8.2"},{"introduced":"0.9.0"},{"fixed":"0.9.2"},{"introduced":"0.10.0"},{"fixed":"0.10.0"}]),
+                &["0.0.0-0", "0.7.0", "0.8.0", "0.8.1", "0.9.1"],
+                &["0.7.1", "0.8.2", "0.9.2", "0.10.0", "0.10.1"],
+            ),
+            (
+                "RUSTSEC-2023-0039",
+                "buffered-reader",
+                json!([{"introduced":"0"},{"fixed":"1.0.2"},{"introduced":"1.1.0"},{"fixed":"1.1.5"},{"introduced":"1.2.0"},{"fixed":"1.2.0"}]),
+                &["0.0.0-0", "1.0.1", "1.1.0", "1.1.4"],
+                &["1.0.2", "1.1.5", "1.2.0", "1.3.0"],
+            ),
+            (
+                "RUSTSEC-2024-0399",
+                "rustls",
+                json!([{"introduced":"0.23.0"},{"fixed":"0.23.0"},{"introduced":"0.23.13"},{"fixed":"0.23.18"}]),
+                &["0.23.13", "0.23.17"],
+                &["0.22.99", "0.23.0", "0.23.1", "0.23.12", "0.23.18"],
+            ),
+            (
+                "RUSTSEC-2026-0149",
+                "wasmtime-wasi",
+                json!([{"introduced":"0"},{"fixed":"24.0.9"},{"introduced":"25.0.0"},{"fixed":"36.0.10"},{"introduced":"37.0.0"},{"fixed":"44.0.2"},{"introduced":"45.0.0"},{"fixed":"45.0.0"}]),
+                &["23.0.0", "24.0.8", "25.0.0", "36.0.9", "37.0.0", "44.0.1"],
+                &[
+                    "24.0.9", "24.1.0", "36.0.10", "36.9.9", "44.0.2", "45.0.0", "46.0.0",
+                ],
+            ),
+            (
+                "RUSTSEC-2026-0276",
+                "apimock",
+                json!([{"introduced":"0"},{"fixed":"4.8.1"},{"introduced":"5.0.0"},{"fixed":"5.0.0"}]),
+                &["4.0.0", "4.8.0"],
+                &["4.8.1", "4.9.0", "5.0.0", "5.1.0"],
+            ),
+        ];
+        for (id, name, events, affected, unaffected) in cases {
+            let mut value = record(events);
+            value["id"] = json!(id);
+            value["summary"] = json!("Synthetic metadata using observed OSV event shape");
+            value["affected"][0]["package"]["name"] = json!(name);
+            let normalized = normalize(&format!("crates/{id}.json"), &value.to_string()).unwrap();
+            assert_eq!(normalized.metadata["matching_complete"], true, "{id}");
+            for version in affected {
+                assert_eq!(
+                    matches(
+                        &normalized.metadata,
+                        name,
+                        &Version::parse(version).unwrap()
+                    ),
+                    MatchResult {
+                        matched: true,
+                        complete: true
+                    },
+                    "{id} {version}"
+                );
+            }
+            for version in unaffected {
+                assert_eq!(
+                    matches(
+                        &normalized.metadata,
+                        name,
+                        &Version::parse(version).unwrap()
+                    ),
+                    MatchResult {
+                        matched: false,
+                        complete: true
+                    },
+                    "{id} {version}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn isolated_equal_introduction_and_fix_are_empty_even_when_unsorted() {
+        for events in [
+            json!([{"introduced":"1.0.0"},{"fixed":"1.0.0"}]),
+            json!([{"fixed":"1.0.0"},{"introduced":"1.0.0"}]),
+            json!([{"introduced":"1.0.0-alpha.1+first"},{"fixed":"1.0.0-alpha.1+second"}]),
+        ] {
+            let value = record(events);
+            for version in ["0.9.0", "1.0.0-alpha.1", "1.0.0", "1.0.1"] {
+                assert_eq!(
+                    matched(&value, version),
+                    MatchResult {
+                        matched: false,
+                        complete: true
+                    }
+                );
+            }
+        }
+        // One fix closes the earlier interval; the equal pair contributes no
+        // affected versions at or after that shared boundary.
+        let value = record(
+            json!([{"introduced":"0"},{"fixed":"1.0.0"},{"introduced":"1.0.0"},{"fixed":"1.0.0"}]),
+        );
+        assert_eq!(
+            matched(&value, "0.9.0"),
+            MatchResult {
+                matched: true,
+                complete: true
+            }
+        );
+        assert_eq!(
+            matched(&value, "1.0.0"),
+            MatchResult {
+                matched: false,
+                complete: true
+            }
+        );
+        assert_eq!(
+            matched(&value, "1.0.1"),
+            MatchResult {
+                matched: false,
+                complete: true
+            }
+        );
+    }
+    #[test]
+    fn ambiguous_overlapping_boundaries_and_mixed_event_objects_remain_incomplete() {
+        for events in [
+            json!([{"introduced":"0"},{"fixed":"1.0.0"},{"introduced":"1.0.0"},{"fixed":"2.0.0"}]),
+            json!([{"introduced":"1.0.0"},{"introduced":"1.0.0"},{"fixed":"1.0.0"}]),
+            json!([{"introduced":"0"},{"fixed":"1.0.0"},{"last_affected":"2.0.0"}]),
+            json!([{"introduced":"1.0.0","limit":"2.0.0"}]),
+        ] {
+            assert_eq!(
+                matched(&record(events), "1.5.0"),
+                MatchResult {
+                    matched: false,
+                    complete: false
+                }
+            );
+        }
+    }
+    #[test]
     fn multiple_package_names_remain_queryable() {
         let mut value = record(json!([{"introduced":"0"}]));
         value["affected"]
@@ -695,7 +856,7 @@ mod tests {
             json!([]),
             json!([{"fixed":"1.0.0"}]),
             json!([{"introduced":"0"},{"fixed":"1.0.0"},{"last_affected":"2.0.0"}]),
-            json!([{"introduced":"1.0.0"},{"fixed":"1.0.0"}]),
+            json!([{"introduced":"0"},{"fixed":"1.0.0"},{"introduced":"1.0.0"},{"fixed":"2.0.0"}]),
             json!([{"introduced":"0","fixed":"1.0.0"}]),
             json!([{"introduced":"0"},{"mystery":"1.0.0"}]),
             json!([{"introduced":"0"},{"fixed":"garbage"}]),

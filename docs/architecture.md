@@ -136,6 +136,9 @@ Ref observations, commit parents and parsing generations remain distinct. Backfi
 checkpoints member progress, deduplicates parsed content, and preserves raw records
 when supported normalization fails. Acquisition completeness, finished processing,
 projection completeness and assessment freshness are separate states.
+Normalization upgrades publish immutable processing generations from retained raw
+evidence. Existing snapshot IDs and history cursors retain their original projection;
+new discovery resolves the latest generation visible at its publication cutoff.
 
 RustSec main archives and OSV exports have separate snapshots/matchers. OSV is used
 only when explicitly selected for assessment; an imported ancestor never becomes

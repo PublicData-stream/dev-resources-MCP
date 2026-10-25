@@ -4,6 +4,9 @@ use devres_domain::{Capture, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A normalization change publishes new immutable projections of retained evidence.
+pub const ADVISORY_PROCESSOR_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdvisoryRecord {
     pub id: String,
@@ -31,6 +34,12 @@ pub struct AdvisorySnapshot {
     pub committed_at: i64,
 }
 
+/// Small immutable descriptor used to avoid materializing unchanged inventories.
+pub struct AdvisoryProjectionState {
+    pub processor_version: u32,
+    pub complete: bool,
+}
+
 impl AdvisorySnapshot {
     pub fn assessment_complete(&self, now: i64) -> bool {
         self.complete
@@ -53,6 +62,48 @@ pub struct AdvisoryRow {
     pub data: Value,
 }
 
+impl AdvisoryRow {
+    /// A processing generation changes projections, never the retained Git graph.
+    pub fn apply_processing(&mut self, projection: &Self) -> Result<()> {
+        let data = projection
+            .data
+            .as_object()
+            .ok_or_else(|| Error::integrity("Invalid advisory processing evidence."))?;
+        let version = data
+            .get("processor_version")
+            .and_then(Value::as_u64)
+            .filter(|version| (1..=u64::from(ADVISORY_PROCESSOR_VERSION)).contains(version))
+            .ok_or_else(|| Error::integrity("Invalid advisory processing version."))?;
+        if data.get("revision").and_then(Value::as_str) != Some(self.key.as_str())
+            || projection.key != format!("{}:{version}", self.key)
+            || !data.get("snapshots").is_some_and(Value::is_object)
+            || !data
+                .get("projection_complete")
+                .is_some_and(Value::is_boolean)
+            || data
+                .get("parent_snapshots")
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(Error::integrity("Invalid advisory processing identity."));
+        }
+        let target = self
+            .data
+            .as_object_mut()
+            .ok_or_else(|| Error::integrity("Invalid advisory commit evidence."))?;
+        for field in [
+            "processor_version",
+            "snapshots",
+            "parent_snapshots",
+            "projection_complete",
+        ] {
+            if let Some(value) = data.get(field) {
+                target.insert(field.into(), value.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Every method accepts public-source evidence only. Writes are owner-fenced.
 #[async_trait]
 pub trait AdvisoryStore: Send + Sync {
@@ -66,6 +117,28 @@ pub trait AdvisoryStore: Send + Sync {
         id: Option<&str>,
         format: &str,
     ) -> Result<Option<AdvisorySnapshot>>;
+    async fn advisory_projection_state(
+        &self,
+        id: &str,
+        format: &str,
+    ) -> Result<Option<AdvisoryProjectionState>> {
+        self.advisory_snapshot(Some(id), format)
+            .await?
+            .map(|snapshot| {
+                let processor_version = match snapshot.coverage.get("processor_version") {
+                    None => 1,
+                    Some(version) => version
+                        .as_u64()
+                        .ok_or_else(|| Error::integrity("Invalid advisory processing version."))?,
+                };
+                Ok(AdvisoryProjectionState {
+                    processor_version: u32::try_from(processor_version)
+                        .map_err(|_| Error::integrity("Invalid advisory processing version."))?,
+                    complete: snapshot.complete,
+                })
+            })
+            .transpose()
+    }
     async fn advisory_rows(
         &self,
         kind: &str,
@@ -74,6 +147,39 @@ pub trait AdvisoryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<AdvisoryRow>>;
     async fn advisory_row(&self, kind: &str, key: &str) -> Result<Option<AdvisoryRow>>;
+    /// Resolve processing at a frozen publication cutoff without rewriting the graph.
+    async fn advisory_commit(
+        &self,
+        revision: &str,
+        cutoff: Option<i64>,
+    ) -> Result<Option<AdvisoryRow>> {
+        if cutoff.is_some_and(|value| value < 0) {
+            return Err(Error::invalid("Invalid advisory publication cutoff."));
+        }
+        let Some(mut row) = self.advisory_row("commits", revision).await? else {
+            return Ok(None);
+        };
+        if cutoff.is_some_and(|limit| row.sequence > limit) {
+            return Ok(None);
+        }
+        let mut latest: Option<AdvisoryRow> = None;
+        for version in 1..=ADVISORY_PROCESSOR_VERSION {
+            if let Some(projection) = self
+                .advisory_row("processing", &format!("{revision}:{version}"))
+                .await?
+                && cutoff.is_none_or(|limit| projection.sequence <= limit)
+                && latest
+                    .as_ref()
+                    .is_none_or(|old| projection.sequence > old.sequence)
+            {
+                latest = Some(projection);
+            }
+        }
+        if let Some(projection) = latest {
+            row.apply_processing(&projection)?;
+        }
+        Ok(Some(row))
+    }
     async fn advisory_rows_by_keys(&self, kind: &str, keys: &[String]) -> Result<Vec<AdvisoryRow>> {
         if keys.len() > 16 {
             return Err(Error::invalid("Advisory cache batch exceeds 16 records."));
@@ -148,6 +254,38 @@ impl RustSecConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    #[test]
+    fn processing_cannot_replace_graph_fields_or_accept_malformed_identity() {
+        let graph = AdvisoryRow {
+            sequence: 7,
+            key: "a".repeat(40),
+            data: json!({"parents":["retained"],"committed_at":10,"snapshots":{"osv":"old"}}),
+        };
+        let projection = AdvisoryRow {
+            sequence: 9,
+            key: format!("{}:2", graph.key),
+            data: json!({"revision":graph.key,"processor_version":2,"snapshots":{"osv":"new"},"projection_complete":true,"parents":[],"committed_at":99}),
+        };
+        let mut merged = graph.clone();
+        merged.apply_processing(&projection).unwrap();
+        assert_eq!(merged.sequence, 7);
+        assert_eq!(merged.data["parents"], graph.data["parents"]);
+        assert_eq!(merged.data["committed_at"], 10);
+        assert_eq!(merged.data["snapshots"]["osv"], "new");
+        for data in [
+            json!([]),
+            json!({"revision":"wrong","processor_version":2,"snapshots":{},"projection_complete":true}),
+            json!({"revision":graph.key,"processor_version":2,"snapshots":[],"projection_complete":true}),
+        ] {
+            let mut invalid = projection.clone();
+            invalid.data = data;
+            assert_eq!(
+                graph.clone().apply_processing(&invalid).unwrap_err().code,
+                "integrity"
+            );
+        }
+    }
     #[test]
     fn freshness_boundaries_and_history_do_not_depend_on_import_time() {
         let mut snapshot = AdvisorySnapshot {

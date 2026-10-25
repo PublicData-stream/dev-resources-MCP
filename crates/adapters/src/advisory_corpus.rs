@@ -2,7 +2,9 @@
 use crate::{advisory, advisory_git::AdvisoryHistory, archive, bulk::BulkBroker};
 use devres_application::{
     ResponseValidator, Retrieval,
-    advisory::{AdvisoryRecord, AdvisorySnapshot, AdvisoryStore, RustSecConfig},
+    advisory::{
+        ADVISORY_PROCESSOR_VERSION, AdvisoryRecord, AdvisorySnapshot, AdvisoryStore, RustSecConfig,
+    },
 };
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture};
 use serde_json::{Value, json};
@@ -136,7 +138,7 @@ pub(crate) fn normalize_records(
         .iter()
         .filter(|r| r.metadata["processing"] != "unsupported")
         .count();
-    let coverage = json!({"complete":gaps.is_empty()&&matching_complete,"enumerated":enumerated,"parsed":parsed,"retained_records":records.len(),"gaps":gaps,"matching_complete":matching_complete,"processor_version":1});
+    let coverage = json!({"complete":gaps.is_empty()&&matching_complete,"enumerated":enumerated,"parsed":parsed,"retained_records":records.len(),"gaps":gaps,"matching_complete":matching_complete,"processor_version":ADVISORY_PROCESSOR_VERSION});
     Ok((records, coverage))
 }
 
@@ -235,7 +237,7 @@ impl AdvisoryCorpus {
             committed_at: 0,
         };
         // Processing time does not change an observation's immutable identity.
-        snapshot.id=digest(&serde_json::to_vec(&json!({"revision":snapshot.revision,"format":"rustsec","validated_at":snapshot.validated_at,"captures":snapshot.captures.iter().map(|c|&c.id).collect::<Vec<_>>(),"historical":historical,"processor_version":1})).map_err(|_|Error::integrity("RustSec snapshot identity failed."))?);
+        snapshot.id=digest(&serde_json::to_vec(&json!({"revision":snapshot.revision,"format":"rustsec","validated_at":snapshot.validated_at,"captures":snapshot.captures.iter().map(|c|&c.id).collect::<Vec<_>>(),"historical":historical,"processor_version":ADVISORY_PROCESSOR_VERSION})).map_err(|_|Error::integrity("RustSec snapshot identity failed."))?);
         // Same observation after restart must retain exactly the same descriptor.
         if let Some(existing) = self
             .store

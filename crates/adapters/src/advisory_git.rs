@@ -7,7 +7,9 @@ use crate::{
         run_command, valid_oid, valid_pack_name,
     },
 };
-use devres_application::advisory::{AdvisorySnapshot, AdvisoryStore, RustSecConfig};
+use devres_application::advisory::{
+    ADVISORY_PROCESSOR_VERSION, AdvisorySnapshot, AdvisoryStore, RustSecConfig,
+};
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -74,6 +76,22 @@ struct HistoryState {
     complete: bool,
     #[serde(default = "default_true")]
     projection_complete: bool,
+    #[serde(default = "legacy_processor_version")]
+    processor_version: u32,
+}
+fn legacy_processor_version() -> u32 {
+    1
+}
+fn reset_processor(state: &mut HistoryState) -> bool {
+    if state.processor_version == ADVISORY_PROCESSOR_VERSION {
+        return false;
+    }
+    state.offset = 0;
+    state.processed = 0;
+    state.complete = false;
+    state.projection_complete = true;
+    state.processor_version = ADVISORY_PROCESSOR_VERSION;
+    true
 }
 fn default_true() -> bool {
     true
@@ -218,7 +236,14 @@ impl AdvisoryHistory {
             .and_then(|value| value["next_attempt"].as_i64())
             .is_some_and(|time| time > devres_domain::unix_now())
         {
-            return Ok(());
+            let active = self.state("history").await?;
+            let latest = self.state("history-latest").await?;
+            if active
+                .or(latest)
+                .is_none_or(|state| state.processor_version == ADVISORY_PROCESSOR_VERSION)
+            {
+                return Ok(());
+            }
         }
         let result = self.tick_inner(shutdown.clone()).await;
         if !shutdown.is_cancelled() {
@@ -244,11 +269,34 @@ impl AdvisoryHistory {
     }
     async fn tick_inner(&self, shutdown: CancellationToken) -> Result<()> {
         self.artifacts.recover_stages().await?;
-        let active = self.state("history").await?;
+        let mut active = self.state("history").await?;
+        let active_reset = active.as_mut().is_some_and(reset_processor);
+        if active_reset {
+            self.store
+                .set_advisory_state(
+                    "history",
+                    &serde_json::to_value(&active).map_err(|_| failure())?,
+                )
+                .await?;
+        }
         let mut latest = self
             .state("history-latest")
             .await?
             .or_else(|| active.clone());
+        let latest_reset = latest.as_mut().is_some_and(reset_processor);
+        if latest_reset {
+            self.store
+                .set_advisory_state(
+                    "history-latest",
+                    &serde_json::to_value(&latest).map_err(|_| failure())?,
+                )
+                .await?;
+        }
+        if active_reset || (active.is_none() && latest_reset) {
+            self.store
+                .set_advisory_state("history-commit", &json!({}))
+                .await?;
+        }
         if latest.as_ref().is_none_or(|state| {
             devres_domain::unix_now().saturating_sub(state.observed_at)
                 >= self.config.history_refresh_secs as i64
@@ -410,6 +458,7 @@ impl AdvisoryHistory {
             total: total_commits,
             complete: false,
             projection_complete: true,
+            processor_version: ADVISORY_PROCESSOR_VERSION,
         };
         self.store
             .set_advisory_state(
@@ -818,7 +867,7 @@ impl AdvisoryHistory {
             state.processed += 1;
             let row = self
                 .store
-                .advisory_row("commits", &commit.oid)
+                .advisory_commit(&commit.oid, None)
                 .await?
                 .ok_or_else(failure)?;
             state.projection_complete &= row.data["projection_complete"] == true;
@@ -861,10 +910,66 @@ impl AdvisoryHistory {
     ) -> Result<bool> {
         if self
             .store
-            .advisory_row("commits", &commit.oid)
+            .advisory_row(
+                "processing",
+                &format!("{}:{}", commit.oid, ADVISORY_PROCESSOR_VERSION),
+            )
             .await?
             .is_some()
         {
+            return Ok(true);
+        }
+        // Graph reads also validate storage before starting a retained-object operation.
+        let raw = self.store.advisory_row("commits", &commit.oid).await?;
+        let mut progress = self
+            .store
+            .advisory_state("history-commit")
+            .await?
+            .unwrap_or_else(|| json!({}));
+        if progress["revision"] != commit.oid
+            || progress["processor_version"] != ADVISORY_PROCESSOR_VERSION
+        {
+            progress = json!({"revision":commit.oid,"processor_version":ADVISORY_PROCESSOR_VERSION,"snapshots":{},"format":"rustsec","index":0});
+        }
+        let mut snapshots: BTreeMap<String, String> =
+            serde_json::from_value(progress["snapshots"].clone())
+                .map_err(|_| Error::integrity("Invalid RustSec commit processing checkpoint."))?;
+        // The v2 correction changes only previously incomplete OSV semantics.
+        // Reuse unchanged immutable projections, retaining their original provenance.
+        if ADVISORY_PROCESSOR_VERSION == 2 {
+            for format in ["rustsec", "osv"] {
+                if snapshots.contains_key(format) {
+                    continue;
+                }
+                let Some(id) = raw
+                    .as_ref()
+                    .and_then(|row| row.data["snapshots"][format].as_str())
+                else {
+                    continue;
+                };
+                if self
+                    .store
+                    .advisory_projection_state(id, format)
+                    .await?
+                    .is_some_and(|state| {
+                        state.processor_version == 1 && (format == "rustsec" || state.complete)
+                    })
+                {
+                    snapshots.insert(format.into(), id.to_owned());
+                }
+            }
+        }
+        if Instant::now() >= deadline || shutdown.is_cancelled() {
+            progress["snapshots"] = serde_json::to_value(&snapshots).map_err(|_| failure())?;
+            self.store
+                .set_advisory_state("history-commit", &progress)
+                .await?;
+            return Ok(false);
+        }
+        if snapshots.len() == 2 {
+            let complete = self.projection_completeness(&snapshots).await?;
+            self.publish_processing(commit, observation, snapshots, complete)
+                .await?;
             return Ok(true);
         }
         let bytes = match self
@@ -892,17 +997,6 @@ impl AdvisoryHistory {
                 return Ok(true);
             }
         };
-        let mut progress = self
-            .store
-            .advisory_state("history-commit")
-            .await?
-            .unwrap_or_else(|| json!({}));
-        if progress["revision"] != commit.oid {
-            progress = json!({"revision":commit.oid,"snapshots":{},"format":"rustsec","index":0});
-        }
-        let mut snapshots: BTreeMap<String, String> =
-            serde_json::from_value(progress["snapshots"].clone())
-                .map_err(|_| Error::integrity("Invalid RustSec commit processing checkpoint."))?;
         for format in ["rustsec", "osv"] {
             if snapshots.contains_key(format) {
                 continue;
@@ -970,6 +1064,38 @@ impl AdvisoryHistory {
                         .await?;
                     let mut cached: HashMap<_, _> =
                         rows.into_iter().map(|row| (row.key, row.data)).collect();
+                    let missing: Vec<_> = selected[index..end]
+                        .iter()
+                        .zip(&keys)
+                        .filter(|(_, key)| !cached.contains_key(*key))
+                        .map(|(member, key)| {
+                            Ok((key.clone(), projection_key_version(member, format, 1)?))
+                        })
+                        .collect::<Result<_>>()?;
+                    if !missing.is_empty() {
+                        let legacy_keys: Vec<_> =
+                            missing.iter().map(|(_, key)| key.clone()).collect();
+                        let mut legacy: HashMap<_, _> = self
+                            .store
+                            .advisory_rows_by_keys("git-projections", &legacy_keys)
+                            .await?
+                            .into_iter()
+                            .map(|row| (row.key, row.data))
+                            .collect();
+                        for (key, old_key) in missing {
+                            if let Some(mut data) =
+                                legacy.remove(&old_key).filter(reusable_v1_projection)
+                            {
+                                data["coverage"]["processor_version"] =
+                                    json!(ADVISORY_PROCESSOR_VERSION);
+                                data["coverage"]["reused_processor_version"] = json!(1);
+                                self.store
+                                    .put_advisory_row("git-projections", &key, &data)
+                                    .await?;
+                                cached.insert(key, data);
+                            }
+                        }
+                    }
                     prefetched = keys
                         .into_iter()
                         .map(|key| {
@@ -1017,11 +1143,12 @@ impl AdvisoryHistory {
                                 json!({"records":[],"coverage":{"complete":false,"gaps":[{"path":member.path,"code":error.code}]}})
                             }
                         };
-                        let value = if encoded(&value)?.len() > 4 * 1024 * 1024 {
+                        let mut value = if encoded(&value)?.len() > 4 * 1024 * 1024 {
                             json!({"records":[],"coverage":{"complete":false,"gaps":[{"path":member.path,"code":"capacity"}]}})
                         } else {
                             value
                         };
+                        value["coverage"]["processor_version"] = json!(ADVISORY_PROCESSOR_VERSION);
                         self.store
                             .put_advisory_row("git-projections", &key, &value)
                             .await?;
@@ -1083,8 +1210,8 @@ impl AdvisoryHistory {
             }
             let finished = index == selected.len();
             let complete = finished && gap_count == 0;
-            let coverage = json!({"complete":complete,"enumerated":selected.len(),"processed":index-omitted,"omitted":omitted,"parsed":records.iter().filter(|record|record.metadata["processing"]!="unsupported").count(),"retained_records":records.len(),"gaps":gaps,"gap_count":gap_count,"git_observation":observation,"source_url":SOURCE,"graph_complete":true});
-            let identity = json!({"revision":commit.oid,"format":format,"processor":1,"records":records.iter().map(|record|(&record.path,&record.body_hash)).collect::<Vec<_>>(),"processed":index,"complete":complete});
+            let coverage = json!({"complete":complete,"enumerated":selected.len(),"processed":index-omitted,"omitted":omitted,"parsed":records.iter().filter(|record|record.metadata["processing"]!="unsupported").count(),"retained_records":records.len(),"gaps":gaps,"gap_count":gap_count,"git_observation":observation,"source_url":SOURCE,"graph_complete":true,"processor_version":ADVISORY_PROCESSOR_VERSION});
+            let identity = json!({"revision":commit.oid,"format":format,"processor":ADVISORY_PROCESSOR_VERSION,"records":records.iter().map(|record|(&record.path,&record.body_hash)).collect::<Vec<_>>(),"processed":index,"complete":complete});
             let id = digest(&encoded(&identity)?);
             let snapshot = AdvisorySnapshot {
                 id: id.clone(),
@@ -1111,39 +1238,62 @@ impl AdvisoryHistory {
                     .await?;
             }
             if !finished {
-                progress = json!({"revision":commit.oid,"format":format,"index":index,"partial":id,"snapshots":snapshots});
+                progress = json!({"revision":commit.oid,"processor_version":ADVISORY_PROCESSOR_VERSION,"format":format,"index":index,"partial":id,"snapshots":snapshots});
                 self.store
                     .set_advisory_state("history-commit", &progress)
                     .await?;
                 return Ok(false);
             }
             snapshots.insert(format.into(), id);
-            progress =
-                json!({"revision":commit.oid,"format":"osv","index":0,"snapshots":snapshots});
+            progress = json!({"revision":commit.oid,"processor_version":ADVISORY_PROCESSOR_VERSION,"format":"osv","index":0,"snapshots":snapshots});
             self.store
                 .set_advisory_state("history-commit", &progress)
                 .await?;
         }
-        let mut parent_snapshots = BTreeMap::new();
-        for parent in &commit.parents {
-            if let Some(row) = self.store.advisory_row("commits", parent).await? {
-                parent_snapshots.insert(parent.clone(), row.data["snapshots"].clone());
-            }
-        }
-        let mut projection_complete = true;
-        for (format, id) in &snapshots {
-            projection_complete &= self
-                .store
-                .advisory_snapshot(Some(id), format)
-                .await?
-                .is_some_and(|snapshot| snapshot.complete);
-        }
-        self.store.put_advisory_row("commits",&commit.oid,&json!({"projection_complete":projection_complete,"revision":commit.oid,"parents":commit.parents,"committed_at":commit.timestamp,"snapshots":snapshots,"parent_snapshots":parent_snapshots,"first_observation":observation})).await?;
-        self.store
-            .set_advisory_state("history-commit", &json!({}))
+        let projection_complete = self.projection_completeness(&snapshots).await?;
+        self.publish_processing(commit, observation, snapshots, projection_complete)
             .await?;
         Ok(true)
     }
+    async fn projection_completeness(&self, snapshots: &BTreeMap<String, String>) -> Result<bool> {
+        let mut complete = true;
+        for (format, id) in snapshots {
+            complete &= self
+                .store
+                .advisory_projection_state(id, format)
+                .await?
+                .ok_or_else(|| Error::integrity("Published advisory projection is missing."))?
+                .complete;
+        }
+        Ok(complete)
+    }
+    async fn publish_processing(
+        &self,
+        commit: &Commit,
+        observation: &str,
+        snapshots: BTreeMap<String, String>,
+        projection_complete: bool,
+    ) -> Result<()> {
+        if self
+            .store
+            .advisory_row("commits", &commit.oid)
+            .await?
+            .is_none()
+        {
+            self.store.put_advisory_row("commits",&commit.oid,&json!({"revision":commit.oid,"parents":commit.parents,"committed_at":commit.timestamp,"first_observation":observation})).await?;
+        }
+        let mut parent_snapshots = BTreeMap::new();
+        for parent in &commit.parents {
+            if let Some(row) = self.store.advisory_commit(parent, None).await? {
+                parent_snapshots.insert(parent.clone(), row.data["snapshots"].clone());
+            }
+        }
+        self.store.put_advisory_row("processing",&format!("{}:{}",commit.oid,ADVISORY_PROCESSOR_VERSION),&json!({"revision":commit.oid,"processor_version":ADVISORY_PROCESSOR_VERSION,"snapshots":snapshots,"parent_snapshots":parent_snapshots,"projection_complete":projection_complete})).await?;
+        self.store
+            .set_advisory_state("history-commit", &json!({}))
+            .await
+    }
+
     async fn publish_commit_gap(
         &self,
         commit: &Commit,
@@ -1153,7 +1303,7 @@ impl AdvisoryHistory {
         let mut snapshots = BTreeMap::new();
         for format in ["rustsec", "osv"] {
             let id = digest(&encoded(
-                &json!({"revision":commit.oid,"format":format,"processor":1,"inventory_gap":code}),
+                &json!({"revision":commit.oid,"format":format,"processor":ADVISORY_PROCESSOR_VERSION,"inventory_gap":code}),
             )?);
             if self
                 .store
@@ -1171,7 +1321,7 @@ impl AdvisoryHistory {
                     complete: false,
                     records: Vec::new(),
                     captures: Vec::new(),
-                    coverage: json!({"complete":false,"inventory_complete":false,"graph_complete":true,"gaps":[{"code":code}],"gap_count":1,"git_observation":observation,"source_url":SOURCE}),
+                    coverage: json!({"complete":false,"inventory_complete":false,"graph_complete":true,"gaps":[{"code":code}],"gap_count":1,"git_observation":observation,"source_url":SOURCE,"processor_version":ADVISORY_PROCESSOR_VERSION}),
                     parents: commit.parents.clone(),
                     committed_at: commit.timestamp,
                 };
@@ -1179,19 +1329,12 @@ impl AdvisoryHistory {
                     .publish_advisory_snapshot(&snapshot, false)
                     .await?;
             }
-            snapshots.insert(format, id);
+            snapshots.insert(format.to_owned(), id);
         }
-        let mut parent_snapshots = BTreeMap::new();
-        for parent in &commit.parents {
-            if let Some(row) = self.store.advisory_row("commits", parent).await? {
-                parent_snapshots.insert(parent.clone(), row.data["snapshots"].clone());
-            }
-        }
-        self.store.put_advisory_row("commits",&commit.oid,&json!({"revision":commit.oid,"parents":commit.parents,"committed_at":commit.timestamp,"snapshots":snapshots,"parent_snapshots":parent_snapshots,"projection_complete":false,"first_observation":observation})).await?;
-        self.store
-            .set_advisory_state("history-commit", &json!({}))
+        self.publish_processing(commit, observation, snapshots, false)
             .await
     }
+
     async fn publish_processed_refs(
         &self,
         manifest: &Manifest,
@@ -1203,7 +1346,7 @@ impl AdvisoryHistory {
             let Some(commit) = reference.peeled_commit.as_deref() else {
                 continue;
             };
-            let Some(row) = self.store.advisory_row("commits", commit).await? else {
+            let Some(row) = self.store.advisory_commit(commit, None).await? else {
                 continue;
             };
             reference.snapshots =
@@ -1215,7 +1358,7 @@ impl AdvisoryHistory {
                 snapshot.validated_at = Some(manifest.observed_at);
                 snapshot.historical = false;
                 snapshot.id = digest(&encoded(
-                    &json!({"historical_snapshot":id,"observation":observation}),
+                    &json!({"historical_snapshot":id,"observation":observation,"processor_version":ADVISORY_PROCESSOR_VERSION}),
                 )?);
                 if snapshot.records.is_empty() {
                     snapshot.complete = false;
@@ -1240,7 +1383,7 @@ impl AdvisoryHistory {
             .await?
             .ok_or_else(|| Error::integrity("RustSec raw ref observation missing."))?
             .sequence;
-        self.store.put_advisory_row("refs",&format!("{observation}:processed"),&json!({"id":observation,"observation_sequence":observation_sequence,"observed_at":manifest.observed_at,"refs":refs,"complete":true,"processing_finished":true,"projection_complete":projection_complete,"history_scope":"advertised_heads_and_tags_reachable_ancestry","total_commits":manifest.total_commits})).await
+        self.store.put_advisory_row("refs",&format!("{observation}:processed:{ADVISORY_PROCESSOR_VERSION}"),&json!({"id":observation,"processor_version":ADVISORY_PROCESSOR_VERSION,"observation_sequence":observation_sequence,"observed_at":manifest.observed_at,"refs":refs,"complete":true,"processing_finished":true,"projection_complete":projection_complete,"history_scope":"advertised_heads_and_tags_reachable_ancestry","total_commits":manifest.total_commits})).await
     }
 }
 fn add_gap(gaps: &mut Vec<serde_json::Value>, count: &mut u64, path: &str, code: &str) {
@@ -1322,9 +1465,28 @@ fn parse_tree(bytes: &[u8]) -> Result<Vec<TreeMember>> {
     Ok(members)
 }
 fn projection_key(member: &TreeMember, format: &str) -> Result<String> {
+    projection_key_version(member, format, ADVISORY_PROCESSOR_VERSION)
+}
+fn projection_key_version(member: &TreeMember, format: &str, version: u32) -> Result<String> {
     Ok(digest(&encoded(
-        &json!({"oid":member.oid,"path":member.path,"mode":member.mode,"format":format,"processor":1}),
+        &json!({"oid":member.oid,"path":member.path,"mode":member.mode,"format":format,"processor":version}),
     )?))
+}
+// Version two only repairs previously incomplete OSV intervals. Future processors
+// must explicitly decide which earlier semantic projections are safe to migrate.
+fn reusable_v1_projection(data: &serde_json::Value) -> bool {
+    ADVISORY_PROCESSOR_VERSION == 2
+        && data["coverage"]["complete"] == true
+        && data["coverage"]["gaps"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && data["records"].as_array().is_some_and(|records| {
+            !records.is_empty()
+                && records.iter().all(|record| {
+                    record["metadata"]["matching_complete"] != false
+                        && record["metadata"]["processing"] != "unsupported"
+                })
+        })
 }
 fn relevant_path(path: &str, format: &str) -> bool {
     path.starts_with("crates/")
@@ -1834,11 +1996,7 @@ mod tests {
                     && reference.peeled_commit.as_deref() == Some(first.as_str()))
         );
         complete(&target, &mut state).await;
-        let first_row = memory
-            .advisory_row("commits", &first)
-            .await
-            .unwrap()
-            .unwrap();
+        let first_row = memory.advisory_commit(&first, None).await.unwrap().unwrap();
         let first_snapshot = memory
             .advisory_snapshot(first_row.data["snapshots"]["rustsec"].as_str(), "rustsec")
             .await
@@ -1848,7 +2006,7 @@ mod tests {
         assert!(first_snapshot.historical);
         assert!(!first_snapshot.assessment_complete(devres_domain::unix_now()));
         let removed_row = memory
-            .advisory_row("commits", &removed)
+            .advisory_commit(&removed, None)
             .await
             .unwrap()
             .unwrap();
@@ -1858,16 +2016,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(removed_snapshot.records.is_empty());
-        let merge_row = memory
-            .advisory_row("commits", &merge)
-            .await
-            .unwrap()
-            .unwrap();
+        let merge_row = memory.advisory_commit(&merge, None).await.unwrap().unwrap();
         assert_eq!(merge_row.data["parents"].as_array().unwrap().len(), 2);
         assert!(merge_row.data["parent_snapshots"][&first].is_null());
         assert!(merge_row.data["parent_snapshots"][&removed].is_object());
         let orphan_row = memory
-            .advisory_row("commits", &orphan)
+            .advisory_commit(&orphan, None)
             .await
             .unwrap()
             .unwrap();
@@ -2072,7 +2226,7 @@ mod tests {
                 .unwrap()
         );
         let row = memory
-            .advisory_row("commits", &revision)
+            .advisory_commit(&revision, None)
             .await
             .unwrap()
             .unwrap();
@@ -2344,7 +2498,7 @@ mod tests {
                 .unwrap()
         );
         let row = memory
-            .advisory_row("commits", &revision)
+            .advisory_commit(&revision, None)
             .await
             .unwrap()
             .unwrap();
@@ -2519,7 +2673,7 @@ mod tests {
                         .unwrap()
                 );
                 let row = memory
-                    .advisory_row("commits", &revision)
+                    .advisory_commit(&revision, None)
                     .await
                     .unwrap()
                     .unwrap();
@@ -2633,6 +2787,7 @@ mod tests {
             total: total_commits,
             complete: false,
             projection_complete: true,
+            processor_version: ADVISORY_PROCESSOR_VERSION,
         };
         let file = history
             .artifacts
@@ -2716,5 +2871,439 @@ mod tests {
                 .is_none(),
             "normal batch yield must not schedule provider failure backoff"
         );
+    }
+    #[tokio::test]
+    async fn generation_replay_preserves_raw_cutoffs_and_original_validation_without_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = Arc::new(Memory::default());
+        let broker = Arc::new(
+            BulkBroker::fixture(url::Url::parse("http://127.0.0.1:9").unwrap())
+                .unwrap()
+                .with_attempt_budget(1)
+                .unwrap(),
+        );
+        let history =
+            AdvisoryHistory::new(memory.clone(), broker.clone(), root.path(), config()).unwrap();
+        let shutdown = CancellationToken::new();
+        history
+            .initialize(&shutdown, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let path = "crates/RUSTSEC-2024-0001.json";
+        let body=br#"{"id":"RUSTSEC-2024-0001","modified":"2024-01-01T00:00:00Z","published":"2024-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"crates.io","name":"example"},"ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.0"},{"fixed":"1.0.0"}]}]}]}"#;
+        let revision = commit(&history, Some(path), body, &[]).await;
+        update(&history, "refs/heads/osv", &revision).await;
+        history
+            .run(
+                &["repack", "-a", "-d", "--no-write-bitmap-index"],
+                4096,
+                &shutdown,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let (commits, total_commits) = history
+            .capture_commit_order(&shutdown, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let packs = history.capture_packs(shutdown.clone()).await.unwrap();
+        let observed_at = devres_domain::unix_now() - 3600;
+        let manifest = Manifest {
+            version: 1,
+            source_url: SOURCE.into(),
+            observed_at,
+            refs: vec![RefEvidence {
+                name: "refs/heads/osv".into(),
+                oid: revision.clone(),
+                object_type: "commit".into(),
+                peeled_commit: Some(revision.clone()),
+                snapshots: BTreeMap::new(),
+            }],
+            roots: vec![revision.clone()],
+            packs,
+            commits,
+            total_commits,
+        };
+        let artifact = history
+            .artifacts
+            .capture_bytes(encoded(&manifest).unwrap(), shutdown.clone())
+            .await
+            .unwrap();
+        let observation = artifact.body_hash.clone();
+        memory.put_advisory_row("refs",&observation,&json!({"id":observation,"observed_at":observed_at,"refs":manifest.refs,"manifest":artifact})).await.unwrap();
+        let tree = history
+            .run(
+                &["ls-tree", "-r", "-z", &revision],
+                4096,
+                &shutdown,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let members = parse_tree(&tree).unwrap();
+        let member = &members[0];
+        let (mut old_records, mut old_coverage) =
+            crate::advisory_corpus::normalize_records(vec![(path.into(), body.to_vec())], "osv")
+                .unwrap();
+        assert_eq!(
+            old_coverage["complete"], true,
+            "empty OSV interval is supported by generation two"
+        );
+        old_records[0].metadata["matching_complete"] = json!(false);
+        old_coverage["complete"] = json!(false);
+        old_coverage["matching_complete"] = json!(false);
+        old_coverage["processor_version"] = json!(1);
+        let old_cache = json!({"records":old_records,"coverage":old_coverage});
+        let old_key = projection_key_version(member, "osv", 1).unwrap();
+        memory
+            .put_advisory_row("git-projections", &old_key, &old_cache)
+            .await
+            .unwrap();
+        let old_id = "a".repeat(64);
+        let old_snapshot = AdvisorySnapshot {
+            id: old_id.clone(),
+            revision: revision.clone(),
+            format: "osv".into(),
+            created_at: observed_at,
+            validated_at: None,
+            historical: true,
+            complete: false,
+            records: serde_json::from_value(old_cache["records"].clone()).unwrap(),
+            captures: Vec::new(),
+            coverage: old_cache["coverage"].clone(),
+            parents: Vec::new(),
+            committed_at: 1767225600,
+        };
+        memory
+            .publish_advisory_snapshot(&old_snapshot, false)
+            .await
+            .unwrap();
+        let raw = json!({"revision":revision,"parents":[],"committed_at":1767225600,"snapshots":{"osv":old_id},"parent_snapshots":{},"projection_complete":false,"first_observation":observation});
+        memory
+            .put_advisory_row("commits", &revision, &raw)
+            .await
+            .unwrap();
+        memory.put_advisory_row("processing",&format!("{revision}:1"),&json!({"revision":revision,"processor_version":1,"snapshots":{"osv":old_id},"parent_snapshots":{},"projection_complete":false})).await.unwrap();
+        let cutoff = memory.advisory_cutoff().await.unwrap();
+        let raw_sequence = memory
+            .advisory_row("commits", &revision)
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence;
+        let legacy_state = HistoryState {
+            manifest: artifact,
+            observation_id: observation.clone(),
+            observed_at,
+            offset: manifest.commits.bytes,
+            processed: 1,
+            total: 1,
+            complete: true,
+            projection_complete: false,
+            processor_version: 1,
+        };
+        let mut legacy_value = serde_json::to_value(&legacy_state).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("processor_version");
+        assert_eq!(
+            serde_json::from_value::<HistoryState>(legacy_value.clone())
+                .unwrap()
+                .processor_version,
+            1
+        );
+        memory
+            .set_advisory_state("history", &legacy_value)
+            .await
+            .unwrap();
+        memory
+            .set_advisory_state("history-latest", &legacy_value)
+            .await
+            .unwrap();
+        memory.set_advisory_state("history-commit",&json!({"revision":revision,"format":"osv","index":1,"partial":old_id,"snapshots":{},"processor_version":1})).await.unwrap();
+        memory
+            .set_advisory_state(
+                "history-retry",
+                &json!({"next_attempt":devres_domain::unix_now()+300,"code":"capacity"}),
+            )
+            .await
+            .unwrap();
+        history.tick(shutdown.clone()).await.unwrap();
+        let current = memory.advisory_state("history").await.unwrap().unwrap();
+        assert_eq!(current["processor_version"], ADVISORY_PROCESSOR_VERSION);
+        assert_eq!(current["processed"], 1);
+        assert_eq!(current["complete"], true);
+        assert_eq!(current["observed_at"], observed_at);
+        assert_eq!(broker.attempt_count(), 0);
+        let frozen = memory
+            .advisory_commit(&revision, Some(cutoff))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.sequence, raw_sequence);
+        assert_eq!(frozen.data["snapshots"]["osv"], old_id);
+        assert_eq!(frozen.data["processor_version"], 1);
+        let latest = memory
+            .advisory_commit(&revision, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.sequence, raw_sequence);
+        assert_eq!(latest.data["processor_version"], ADVISORY_PROCESSOR_VERSION);
+        assert_ne!(latest.data["snapshots"]["osv"], old_id);
+        let projected = memory
+            .advisory_snapshot(latest.data["snapshots"]["osv"].as_str(), "osv")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(projected.complete);
+        assert_eq!(projected.records[0].metadata["matching_complete"], true);
+        assert_eq!(
+            projected.coverage["processor_version"],
+            ADVISORY_PROCESSOR_VERSION
+        );
+        let raw_after = memory
+            .advisory_row("commits", &revision)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw_after.sequence, raw_sequence);
+        assert_eq!(raw_after.data, raw);
+        assert_eq!(
+            serde_json::to_value(
+                memory
+                    .advisory_snapshot(Some(&old_id), "osv")
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(old_snapshot).unwrap()
+        );
+        assert_eq!(
+            memory
+                .advisory_row("git-projections", &old_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            old_cache
+        );
+        let promoted = memory
+            .advisory_snapshot(None, "osv")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.validated_at, Some(observed_at));
+        assert!(!promoted.historical);
+        assert!(
+            memory
+                .advisory_row(
+                    "refs",
+                    &format!("{observation}:processed:{ADVISORY_PROCESSOR_VERSION}")
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let restarted =
+            AdvisoryHistory::new(memory.clone(), broker.clone(), root.path(), config()).unwrap();
+        restarted.tick(shutdown).await.unwrap();
+        assert_eq!(broker.attempt_count(), 0);
+        assert_eq!(
+            memory.advisory_state("history").await.unwrap().unwrap(),
+            current
+        );
+    }
+    #[tokio::test]
+    async fn complete_mode_sensitive_v1_cache_is_reused_with_v2_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = Arc::new(Memory::default());
+        let history = AdvisoryHistory::new(
+            memory.clone(),
+            Arc::new(BulkBroker::new(Default::default()).unwrap()),
+            root.path(),
+            config(),
+        )
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        history
+            .initialize(&shutdown, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let path = "crates/example/RUSTSEC-2024-0001.md";
+        let revision = commit(&history, Some(path), advisory(), &[]).await;
+        let tree = history
+            .run(
+                &["ls-tree", "-r", "-z", &revision],
+                4096,
+                &shutdown,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let members = parse_tree(&tree).unwrap();
+        let member = &members[0];
+        let (mut records, mut coverage) = crate::advisory_corpus::normalize_records(
+            vec![(path.into(), advisory().to_vec())],
+            "rustsec",
+        )
+        .unwrap();
+        assert_eq!(coverage["complete"], true);
+        records[0].metadata["fixture_legacy_projection"] = json!(true);
+        coverage["processor_version"] = json!(1);
+        let legacy = json!({"records":records,"coverage":coverage});
+        let old_key = projection_key_version(member, "rustsec", 1).unwrap();
+        memory
+            .put_advisory_row("git-projections", &old_key, &legacy)
+            .await
+            .unwrap();
+        let commit = Commit {
+            oid: revision.clone(),
+            parents: Vec::new(),
+            timestamp: 1767225600,
+        };
+        assert!(
+            history
+                .process_commit(
+                    &commit,
+                    &"b".repeat(64),
+                    &shutdown,
+                    Instant::now() + Duration::from_secs(10),
+                    MAX_PROJECTED_RECORDS
+                )
+                .await
+                .unwrap()
+        );
+        let current_key = projection_key(member, "rustsec").unwrap();
+        assert_ne!(old_key, current_key);
+        let reused = memory
+            .advisory_row("git-projections", &current_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+        assert_eq!(
+            reused["coverage"]["processor_version"],
+            ADVISORY_PROCESSOR_VERSION
+        );
+        assert_eq!(reused["coverage"]["reused_processor_version"], 1);
+        assert_eq!(reused["records"], legacy["records"]);
+        assert_eq!(
+            memory
+                .advisory_row("git-projections", &old_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            legacy
+        );
+        let row = memory
+            .advisory_commit(&revision, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = memory
+            .advisory_snapshot(row.data["snapshots"]["rustsec"].as_str(), "rustsec")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.complete);
+        assert_eq!(
+            snapshot.coverage["processor_version"],
+            ADVISORY_PROCESSOR_VERSION
+        );
+        assert_eq!(
+            snapshot.records[0].metadata["fixture_legacy_projection"],
+            true
+        );
+        assert!(
+            memory
+                .advisory_row("commits", &revision)
+                .await
+                .unwrap()
+                .unwrap()
+                .data["snapshots"]
+                .is_null(),
+            "new graph evidence must not embed mutable projections"
+        );
+    }
+    #[tokio::test]
+    async fn unchanged_v1_snapshots_reuse_without_git_tree_or_new_snapshot_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = Arc::new(Memory::default());
+        let broker = Arc::new(
+            BulkBroker::fixture(url::Url::parse("http://127.0.0.1:9").unwrap())
+                .unwrap()
+                .with_attempt_budget(1)
+                .unwrap(),
+        );
+        let history =
+            AdvisoryHistory::new(memory.clone(), broker.clone(), root.path(), config()).unwrap();
+        let revision = "c".repeat(40);
+        let canonical = "a".repeat(64);
+        let osv = "b".repeat(64);
+        for (format, id, complete) in [("rustsec", &canonical, false), ("osv", &osv, true)] {
+            memory.publish_advisory_snapshot(&AdvisorySnapshot{id:id.clone(),revision:revision.clone(),format:format.into(),created_at:1,validated_at:None,historical:true,complete,records:Vec::new(),captures:Vec::new(),coverage:json!({"complete":complete,"processor_version":1,"fixture":"synthetic unchanged generation-one projection"}),parents:Vec::new(),committed_at:1},false).await.unwrap();
+        }
+        let raw = json!({"revision":revision,"parents":[],"committed_at":1,"snapshots":{"rustsec":canonical,"osv":osv},"parent_snapshots":{},"projection_complete":false});
+        memory
+            .put_advisory_row("commits", &revision, &raw)
+            .await
+            .unwrap();
+        let cutoff = memory.advisory_cutoff().await.unwrap();
+        assert!(
+            !history.repository().exists(),
+            "reuse fixture must not have a Git repository to read"
+        );
+        assert!(
+            history
+                .process_commit(
+                    &Commit {
+                        oid: revision.clone(),
+                        parents: Vec::new(),
+                        timestamp: 1
+                    },
+                    &"d".repeat(64),
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(10),
+                    MAX_PROJECTED_RECORDS
+                )
+                .await
+                .unwrap()
+        );
+        let latest = memory
+            .advisory_commit(&revision, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.data["processor_version"], ADVISORY_PROCESSOR_VERSION);
+        assert_eq!(latest.data["snapshots"], raw["snapshots"]);
+        assert_eq!(latest.data["projection_complete"], false);
+        assert_eq!(
+            memory.snapshots.lock().await.len(),
+            2,
+            "reuse must not mint duplicate snapshots"
+        );
+        assert_eq!(
+            memory
+                .advisory_commit(&revision, Some(cutoff))
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            raw
+        );
+        assert_eq!(
+            memory
+                .advisory_row("commits", &revision)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            raw
+        );
+        assert_eq!(broker.attempt_count(), 0);
     }
 }

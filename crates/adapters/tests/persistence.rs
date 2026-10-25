@@ -193,6 +193,94 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
         1
     );
     assert_eq!(source.calls.load(Ordering::Relaxed), calls);
+    let original = store
+        .advisory_commit(&historical.revision, Some(cutoff))
+        .await
+        .unwrap()
+        .unwrap();
+    let projection_state = store
+        .advisory_projection_state(&historical.id, "rustsec")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(projection_state.processor_version, 2);
+    assert_eq!(projection_state.complete, historical.complete);
+    assert!(
+        store
+            .advisory_projection_state(&"9".repeat(64), "rustsec")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut reprocessed = historical.clone();
+    reprocessed.id = "f".repeat(64);
+    reprocessed.coverage["processor_version"] = json!(2);
+    store
+        .publish_advisory_snapshot(&reprocessed, false)
+        .await
+        .unwrap();
+    store.put_advisory_row("processing", &format!("{}:2", historical.revision),
+        &json!({"revision":historical.revision,"processor_version":2,"snapshots":{"rustsec":reprocessed.id},"projection_complete":true})).await.unwrap();
+    let frozen = store
+        .advisory_commit(&historical.revision, Some(cutoff))
+        .await
+        .unwrap()
+        .unwrap();
+    let latest = store
+        .advisory_commit(&historical.revision, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frozen.data, original.data);
+    assert_eq!(latest.sequence, original.sequence);
+    assert_eq!(latest.data["snapshots"]["rustsec"], reprocessed.id);
+    assert_eq!(
+        store
+            .advisory_row("commits", &historical.revision)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        original.data
+    );
+    assert_eq!(
+        store
+            .advisory_snapshot(Some(&historical.id), "rustsec")
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage,
+        historical.coverage
+    );
+    let malformed_revision = "c".repeat(40);
+    store
+        .put_advisory_row(
+            "commits",
+            &malformed_revision,
+            &json!({"revision":malformed_revision,"parents":[],"snapshots":{}}),
+        )
+        .await
+        .unwrap();
+    let before_malformed = store.advisory_cutoff().await.unwrap();
+    store
+        .put_advisory_row("processing", &format!("{malformed_revision}:2"), &json!([]))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .advisory_commit(&malformed_revision, Some(before_malformed))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .advisory_commit(&malformed_revision, None)
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
     let mut synthetic = store
         .advisory_snapshot(Some(&id), "rustsec")
         .await
@@ -226,6 +314,24 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
     let reopened = PgBlobStore::connect(url.as_str(), root.path())
         .await
         .unwrap();
+    assert_eq!(
+        reopened
+            .advisory_commit(&historical.revision, Some(cutoff))
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        original.data
+    );
+    assert_eq!(
+        reopened
+            .advisory_commit(&historical.revision, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        latest.data
+    );
     assert_eq!(
         reopened
             .advisory_snapshot(None, "rustsec")
