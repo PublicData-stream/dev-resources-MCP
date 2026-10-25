@@ -19,6 +19,20 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+fn acceptance_phase(phase: &'static str) {
+    let _ = writeln!(std::io::stderr().lock(), "{}", json!({"phase":phase}));
+}
+
+fn historical_phase(phase: &'static str, repository: &str, case: &str) {
+    // Repository and case come only from the fixed sampler keys, never a query,
+    // document, resource URI, or upstream/error text.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        json!({"phase":phase,"repository":repository,"case":case})
+    );
+}
+
 async fn processing_permit<'a>(
     gate: &'a tokio::sync::RwLock<()>,
     cancel: &CancellationToken,
@@ -686,6 +700,7 @@ async fn historical_samples(
     root: &Path,
     cancel: CancellationToken,
 ) -> Result<Value> {
+    acceptance_phase("frozen_history_selection");
     let mut samples = BTreeMap::<(String, String), Snapshot>::new();
     for repository in [Repo::Content, Repo::Compat] {
         let observation = frozen_history(store, repository).await?;
@@ -736,6 +751,7 @@ async fn historical_samples(
         if !seen.insert(snapshot.id.clone()) {
             continue;
         }
+        historical_phase("historical_members", &repository, &case);
         let members = mdn_inventory::members(store, &snapshot.inventory, 1_000_000).await?;
         let selected = members
             .iter()
@@ -758,6 +774,7 @@ async fn historical_samples(
             .as_ref()
             .and_then(|r| r["source_path"].as_str())
             .unwrap_or(&member.path);
+        historical_phase("historical_source", &repository, &case);
         let source=research.call("mdn_get",json!({"repository":repository,"snapshot":snapshot.id,"path":source_path,"representation":"source","limit":128})).await?;
         if source["provenance"]["revision"] != snapshot.revision {
             return Err(Error::integrity(
@@ -767,11 +784,14 @@ async fn historical_samples(
         let uri = source["resource_uri"]
             .as_str()
             .ok_or_else(|| Error::integrity("Historical source resource missing."))?;
+        historical_phase("historical_resource", &repository, &case);
         research.read_resource(&format!("{uri}?limit=128")).await?;
         let mut searched = false;
         if member.kind == "article" && member.projection.is_some() {
+            historical_phase("historical_document", &repository, &case);
             research.call("mdn_get",json!({"repository":repository,"snapshot":snapshot.id,"path":member.path,"limit":128})).await?;
             if !member.gaps.iter().any(|g| g == "search_index_gap") {
+                historical_phase("historical_search", &repository, &case);
                 let result = research
                     .call(
                         "mdn_search",
@@ -790,6 +810,7 @@ async fn historical_samples(
                 .path
                 .strip_prefix("@features/")
                 .ok_or_else(|| Error::integrity("Historical BCD feature identity invalid."))?;
+            historical_phase("historical_compatibility", &repository, &case);
             research
                 .call(
                     "mdn_compat_get",
@@ -797,6 +818,7 @@ async fn historical_samples(
                 )
                 .await?;
             if !member.gaps.iter().any(|g| g == "search_index_gap") {
+                historical_phase("historical_compatibility_search", &repository, &case);
                 let result = research
                     .call(
                         "mdn_compat_search",
@@ -906,12 +928,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         let research=corpus.research();
         let frozen=store.mdn_state("default-view").await?.ok_or_else(||Error::unavailable("Frozen MDN view missing."))?;
+        acceptance_phase("current_search");
         let found=research.call("mdn_search",json!({"query":"fetch","limit":3,"snapshot":frozen})).await?;
         if found["total"].as_u64().unwrap_or(0)==0{return Err(Error::integrity("Fixed MDN search found no evidence."));}
+        acceptance_phase("current_document");
         let document=research.call("mdn_get",json!({"slug":"Web/API/Window/fetch","snapshot":frozen})).await?;
+        acceptance_phase("current_compatibility");
         let feature=research.call("mdn_compat_get",json!({"feature":"api.fetch","snapshot":frozen})).await?;
+        acceptance_phase("current_resource");
         research.read_resource(document["resource_uri"].as_str().ok_or_else(||Error::integrity("MDN resource missing."))?).await?;
-        let mut verification=if full{verify(store.as_ref(),&blob,cancel.clone()).await?}else{Value::Null};
+        let mut verification=if full{acceptance_phase("all_snapshot_verification");verify(store.as_ref(),&blob,cancel.clone()).await?}else{Value::Null};
         if full{verification["historical_samples"]=historical_samples(store.as_ref(),research.as_ref(),&blob,cancel.clone()).await?;}
         Ok(json!({"stage":"complete","full_history":full,"attempts_upper_bound":broker.attempt_count(),"attempts_this_invocation":broker.attempt_count().saturating_sub(initial_attempts),"document":document["provenance"],"compatibility":feature["provenance"],"verification":verification,"status":store.mdn_state("status").await?}))
     }.await;
