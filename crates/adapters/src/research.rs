@@ -16,6 +16,7 @@ pub struct Research {
     advisory_research: Option<crate::advisory_research::AdvisoryResearch>,
     corpus: Option<std::sync::Arc<RfcCorpus>>,
     crate_corpus: Option<std::sync::Arc<crate::CrateCorpus>>,
+    mdn_research: Option<Arc<crate::mdn_research::MdnResearch>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -106,6 +107,7 @@ impl Research {
             retrieval,
             corpus: None,
             crate_corpus: None,
+            mdn_research: None,
         })
     }
 
@@ -125,11 +127,27 @@ impl Research {
         self
     }
 
+    pub fn with_mdn_research(mut self, research: Arc<crate::mdn_research::MdnResearch>) -> Self {
+        self.mdn_research = Some(research);
+        self
+    }
+
     pub async fn refresh_advisories(&self) -> Result<Value> {
         self.advisory.refresh().await
     }
 
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if crate::mdn_research::schemas()
+            .iter()
+            .any(|schema| schema["name"] == tool)
+        {
+            return self
+                .mdn_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?
+                .call(tool, input)
+                .await;
+        }
         if crate::advisory_research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
@@ -195,8 +213,8 @@ impl Research {
             limit: input.limit,
         }
         .checked()?;
-        if input.sources.is_empty() || input.sources.len() > 3 {
-            return Err(Error::invalid("Select one to three sources."));
+        if input.sources.is_empty() || input.sources.len() > 4 {
+            return Err(Error::invalid("Select one to four sources."));
         }
         let mut results = Vec::new();
         let mut unique = std::collections::HashSet::new();
@@ -231,9 +249,18 @@ impl Research {
                     .await
                 }
                 "rustsec" => self.advisory.search(&input.query, page).await,
+                "mdn" => match self.mdn_research.as_ref() {
+                    Some(research) => research
+                        .call(
+                            "mdn_search",
+                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                        )
+                        .await,
+                    None => Err(Error::unavailable("MDN corpus storage is not configured.")),
+                },
                 _ => {
                     return Err(Error::invalid(
-                        "Search sources are rfc, cargo, and rustsec.",
+                        "Search sources are rfc, cargo, rustsec, and mdn.",
                     ));
                 }
             };
@@ -272,6 +299,17 @@ impl Research {
             }
             let value = self.read_resource(uri.as_str()).await?;
             return Ok(value);
+        }
+        if let Some(feature) = input.id.strip_prefix("mdn-compat:") {
+            return self
+                .mdn_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?
+                .call("mdn_compat_get", json!({"feature":feature,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(20)}))
+                .await;
+        }
+        if let Some(slug) = input.id.strip_prefix("mdn:") {
+            return self.mdn_research.as_ref().ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?.call("mdn_get",json!({"slug":slug,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(32768)})).await;
         }
         if let Some(number) = input.id.strip_prefix("rfc:") {
             let number = number
@@ -320,6 +358,14 @@ impl Research {
             || url.fragment().is_some()
         {
             return Err(Error::invalid("Invalid capture resource URI."));
+        }
+        if url.host_str() == Some("mdn") {
+            return self
+                .mdn_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?
+                .read_resource(uri)
+                .await;
         }
         if url.host_str() == Some("source") {
             let input = cargo::source_input_from_uri(&url)?;
@@ -456,13 +502,13 @@ fn schemas() -> Vec<Value> {
     };
     add(
         "search",
-        "Search RFC metadata, crates.io packages, or RustSec advisories. Sources are independent; errors and freshness are explicit.",
-        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec"]},"minItems":1,"maxItems":3,"uniqueItems":true},"offset":offset,"limit":limit}),
+        "Search RFC metadata, crates.io packages, RustSec advisories, or local MDN documents. Sources are independent; errors and freshness are explicit.",
+        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn"]},"minItems":1,"maxItems":4,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(
         "fetch",
-        "Retrieve rfc:<number>, crate:<name>@<version>, or a capture-fixed devres resource URI. Text offsets count UTF-8 bytes.",
+        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
         json!({"id":{"type":"string","minLength":1,"maxLength":16384},"offset":text_offset,"limit":text_limit}),
         vec!["id"],
     );
@@ -517,6 +563,7 @@ fn schemas() -> Vec<Value> {
     tools.extend(rfc_tools::schemas());
     tools.extend(crate::crate_research::schemas());
     tools.extend(crate::advisory_research::schemas());
+    tools.extend(crate::mdn_research::schemas());
     tools
 }
 #[derive(Deserialize)]

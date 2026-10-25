@@ -135,3 +135,36 @@ Unauthenticated rsync observations have separate source identities and assurance
 they cannot replace HTTPS heads or count as HTTPS verification. Original RFC text
 is never modified by applying errata. Only observed versions are retained; collection
 cannot reconstruct representations that disappeared before observation.
+
+## Mozilla Developer Network
+
+MDN acquisition admits only the official HTTPS Git advertisement/upload-pack
+operations for `https://github.com/mdn/content.git` and
+`https://github.com/mdn/browser-compat-data.git`. It reuses the private fixed-source
+relay and GitHub host admission; no arbitrary remote, automatic redirect, caller
+Git configuration, credential helper, checkout, hook or submodule is admitted.
+All advertised branch/tag ancestry and future observed roots are retained.
+Hourly ref validation is a scheduling target, not a provider endorsement or
+completion-time guarantee. Revalidation changes observation time, not old captures.
+
+English prose, guides/references, legacy HTML and redirects come from `content`;
+feature support and browser/engine release mappings come from BCD. Other repository
+members remain retained raw evidence. Translated repositories and external
+specification/baseline/live-demo datasets are not acquired. Source macros, schemas,
+links, embedded scripts and package manifests are data, never instructions or
+executables. Unknown historical representations remain processing gaps.
+
+Preserve the versioned repository license/notices and source revision/path in
+responses and fixtures. [MDN content licensing](https://github.com/mdn/content/blob/main/LICENSE.md)
+distinguishes CC-BY-SA 2.5 prose, post-August-20-2010 CC0 examples, and older MIT
+examples; do not infer a code example's contribution date from a recent edit.
+[BCD](https://github.com/mdn/browser-compat-data/blob/main/LICENSE) is CC0-1.0.
+[Its schema](https://github.com/mdn/browser-compat-data/blob/main/schemas/compat-data-schema.md)
+and [browser metadata](https://github.com/mdn/browser-compat-data/blob/main/schemas/browsers-schema.md)
+define original support evidence. Rust mirror handlers preserve original values,
+label derivation and use pinned engine/release mappings; missing/obsolete semantics
+are not fabricated. No browser-version compatibility certification is provided.
+
+Ordinary checks use synthetic fixtures with explicit provenance. Bounded live
+acceptance and full frozen-observation backfill are separate commands/evidence;
+neither authorizes production deployment or demonstrates native client UI support.

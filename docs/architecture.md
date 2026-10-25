@@ -160,3 +160,41 @@ agreement with captured registry metadata, not package safety or Git provenance.
 Routine tests use mocks, synthetic fixtures, temporary directories and controlled
 clocks. Real PostgreSQL, OxiBelt, minikube, and live providers have separate gates.
 Backup/restore must coordinate database and blobs while every writer is stopped.
+
+## MDN corpus
+
+Application MDN ports own collection configuration, immutable evidence rows,
+source snapshots, combined views and paged discovery. Adapters own fixed Git
+transport, pure Markdown/YAML/HTML/BCD projection, persistent path inventories,
+PostgreSQL publication and Tantivy search. Schema 5 adds owner-fenced immutable
+rows and private resumable state without changing earlier capture identities.
+
+Each commit inventory is a content-addressed tree. Wide directories split into
+bounded hash-radix nodes so one changed article does not copy a large directory
+map for every historical commit. Raw source, synthetic feature/browser memberships
+and ambiguity markers remain distinct. Projection identities include processing
+version and source context; unchanged features moved between files cannot collide
+with immutable index documents. Includes bind their actual selected-tree inputs;
+reverse dependency observations invalidate unchanged callers, including callers
+whose earlier include processing failed.
+
+Acquisition retains complete packs, commit order, refs and observation manifests.
+Bare Git state is reconstructable derived state. Current-main publication and
+historical processing share owner-fenced bookkeeping and bounded processing;
+source I/O never runs inside database transactions. Completed commit prefixes and
+member checkpoints resume after interruption. Processing-version changes restart
+backfill without replacing old projections.
+
+Indexes contain unique context-qualified projections, not one repeated full tree
+per commit. Immutable linked manifests share shards. Selected-ID filtering applies
+before counts, ranking, snippets and paging; native token-count fields and memoized
+selected document frequencies keep historical BM25 separate from other revisions.
+Shared shard readers avoid duplicating cumulative historical statistics. A durable
+index checkpoint precedes mutable manifest/cursor movement, preventing duplicate
+postings on replay. Unsupported individual index inputs become explicit gaps.
+
+Only fully accounted, indexed component snapshots can form an atomic default view.
+Independent content/BCD revisions and online observation identities are frozen in
+that view. Historical pairing requires explicit selection. Offline rebuilding
+publishes new derived generations and current views while preserving original
+snapshot IDs, including explicitly failing corrupt historical indexes.

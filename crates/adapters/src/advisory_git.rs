@@ -341,7 +341,7 @@ impl AdvisoryHistory {
             stop.clone(),
             transport_failure.clone(),
             deadline,
-            true,
+            crate_git::GitSource::RustSec,
         )
         .await?;
         let mut command = self.command();

@@ -74,3 +74,24 @@ Server images additionally need the fixed Git executable for private index objec
 processing. Child configuration excludes user/system Git configuration, hooks,
 credential helpers and arbitrary remotes; no worktree or package build is created.
 Operating-system Git and its notices remain separately licensed image contents.
+
+## MDN processing dependencies
+
+`pulldown-cmark 0.13.5` provides bounded pull-event Markdown parsing instead of
+inventing a Markdown grammar or running MDN's npm build. It is MIT licensed;
+default features are disabled, including executable/HTML-generation/SIMD extras.
+Its packaged build script is inactive without the generation-test feature.
+`yaml-rust2 0.13.0` provides the YAML event interface needed to reject aliases,
+duplicate keys, excess nesting and oversized front matter before constructing a
+bounded JSON projection. It is MIT OR Apache-2.0, has no build script, and defaults
+are disabled (including encoding detection). This avoids the deprecated
+serde_yaml implementation and a bespoke YAML parser. Both parse untrusted retained
+source only; neither performs network or filesystem access in the projection path.
+
+The locked additions include arraydeque 0.5.1, hashlink 0.12.2 and unicase 2.10.0;
+original permissive notices remain in the generated notice inventory. Direct
+`sha1 0.11.0` was already resolved in the graph and verifies Git's native object
+identity on every raw read; SHA-256 remains the archive/projection addressing hash.
+No Git dependencies, upstream build tools or source-selected executables are added.
+Current cargo-audit and cargo-deny admission remains mandatory and separate from
+compilation and provider acceptance.

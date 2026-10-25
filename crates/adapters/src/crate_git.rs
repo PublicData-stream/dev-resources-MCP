@@ -791,9 +791,27 @@ pub(crate) async fn run_command(
     result
 }
 
+/// Closed set of repositories admitted by the private Git relay.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GitSource {
+    Registry,
+    RustSec,
+    MdnContent,
+    MdnCompat,
+}
+impl GitSource {
+    fn request(self, operation: GitOperation) -> BulkSource {
+        match self {
+            Self::Registry => BulkSource::RegistryGit(operation),
+            Self::RustSec => BulkSource::RustSecGit(operation),
+            Self::MdnContent => BulkSource::MdnContentGit(operation),
+            Self::MdnCompat => BulkSource::MdnCompatGit(operation),
+        }
+    }
+}
 #[derive(Clone)]
 struct RelayState {
-    rustsec: bool,
+    source: GitSource,
     broker: Arc<BulkBroker>,
     secret: String,
     shutdown: CancellationToken,
@@ -905,7 +923,7 @@ async fn start_relay(
     failure: CancellationToken,
     deadline: Instant,
 ) -> Result<Relay> {
-    start_source_relay(broker, shutdown, failure, deadline, false).await
+    start_source_relay(broker, shutdown, failure, deadline, GitSource::Registry).await
 }
 
 pub(crate) async fn start_source_relay(
@@ -913,7 +931,7 @@ pub(crate) async fn start_source_relay(
     shutdown: CancellationToken,
     failure: CancellationToken,
     deadline: Instant,
-    rustsec: bool,
+    source: GitSource,
 ) -> Result<Relay> {
     let mut random = [0_u8; 32];
     tokio::fs::File::open("/dev/urandom")
@@ -925,7 +943,7 @@ pub(crate) async fn start_source_relay(
     let secret = hex::encode(random);
     let failure_reason = Arc::new(StdMutex::new(None));
     let state = RelayState {
-        rustsec,
+        source,
         broker,
         secret: secret.clone(),
         shutdown: shutdown.clone(),
@@ -1045,11 +1063,7 @@ fn decode_upload_body(body: &[u8], encoding: Option<&axum::http::HeaderValue>) -
 }
 async fn forward_git(state: RelayState, operation: GitOperation, body: Vec<u8>) -> Response {
     let request = BulkRequest {
-        source: if state.rustsec {
-            BulkSource::RustSecGit(operation)
-        } else {
-            BulkSource::RegistryGit(operation)
-        },
+        source: state.source.request(operation),
         validators: Validators::default(),
         max_bytes: bulk::MAX_ARTIFACT_BYTES,
         deadline: state.deadline,
@@ -1702,7 +1716,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         let state = RelayState {
-            rustsec: false,
+            source: GitSource::Registry,
             broker: Arc::new(BulkBroker::new(Default::default()).unwrap()),
             secret: "fixture-secret".into(),
             shutdown: CancellationToken::new(),

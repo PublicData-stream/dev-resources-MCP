@@ -5,7 +5,8 @@
 This service is anonymous and read-only with respect to caller data and upstream
 systems. Reads may populate internal public-source caches and permanent archives.
 It supports RFC metadata/text, crates.io metadata/published sources, local package
-and API research from crates.io/docs.rs captures, RustSec advisories, and supplied
+and API research from crates.io/docs.rs captures, MDN content/browser compatibility,
+RustSec advisories, and supplied
 Cargo.lock matching. No public administrative operations,
 package execution, dependency resolution, arbitrary URL fetching, or user accounts
 are exposed. Missing or unsupported coverage is explicit.
@@ -38,8 +39,8 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | Tool | Inputs and result |
 | --- | --- |
 | `server_info` | Identity, supported revisions, licensing and corresponding-source URL |
-| `search` | Query, selected `rfc`/`cargo`/`rustsec` sources, offset/limit; source-specific results/errors |
-| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, or immutable `devres://` resource URI |
+| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
+| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, or immutable `devres://` resource URI |
 | `rfc_search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc_get` | RFC number and byte page; published text |
 | `rfc_metadata` | RFC number, optional research snapshot; rich official metadata |
@@ -69,6 +70,14 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | `advisory_history` | Canonical ID, optional exact Git ref and frozen history view; parent-relative changes |
 | `advisory_snapshots` | Paginated immutable ref observations or commit snapshots; optional exact ref/representation |
 | `advisory_corpus_status` | Aggregate collection, freshness, parsing, storage and history coverage; no administrative controls |
+| `mdn_search` | Local English document search, conjunctive metadata filters, technical/English query mode and pinned cursor |
+| `mdn_get` | Exactly one slug or repository path; projected text, original source or bytes, optional immutable snapshot and explicit compatibility snapshot |
+| `mdn_compat_search` | Local compatibility feature search with browser/status filters and pinned cursor |
+| `mdn_compat_get` | Exact BCD feature, original and derived support evidence; bounded browser-statement page |
+| `mdn_browser_get` | Captured browser metadata and paged releases/engine mappings |
+| `mdn_history` | Parent-relative changes for exactly one path, slug or feature; frozen publication cutoff and cursor |
+| `mdn_snapshots` | Commit snapshots or advertised ref observations for content/compat; optional exact ref filter for observations |
+| `mdn_corpus_status` | Aggregate acquisition, history, projection, index, freshness and failure state; no administrative controls |
 
 Tool discovery supplies authoritative JSON input schemas. Unknown fields fail.
 Retrieval and validation timestamps are Unix seconds.
@@ -212,3 +221,61 @@ Invalid protocol/schema input is rejected before dispatch. Application failures 
 sanitized typed codes such as invalid_input, not_found, unavailable, capacity, and
 integrity. Oversized results fail explicitly rather than silently claiming complete
 coverage. Cancellation suppresses late responses and releases admission.
+
+## MDN content and compatibility
+
+Serving automatically collects the fixed official `mdn/content` and
+`mdn/browser-compat-data` Git repositories. English articles, legacy HTML, redirects,
+compatibility features, and browser releases are processed as inert data. All
+advertised branches/tags and reachable ancestry are retained, including observed
+ref movements/deletions and previously observed roots. Pull-request/internal refs
+and already-unreachable upstream objects are outside that acquisition scope.
+
+Current-main collection has priority over resumable ancestry processing. Serving
+remains ready during bootstrap; MDN reads can be unavailable until publication.
+Every processed commit receives an immutable inventory and research snapshot.
+Unchanged raw objects, projections, directory nodes and postings are shared.
+Acquisition, raw-member accounting, supported projection, indexing and whole-source
+acceptance are separate states. Unsupported formats, malformed metadata, unknown
+macros, bounded processing and ambiguous compatibility identities remain explicit
+coverage gaps, with original source evidence retained. Deletion never removes
+historical evidence. A completed job or zero-result search does not establish
+complete rendered-site coverage.
+
+The default view atomically freezes independently validated content-main and
+compatibility-main snapshots. Failure preserves the previous view. Successful
+online validation marks evidence stale after 24 hours; omitted/default selection
+fails beyond seven days. Historical snapshots/views remain readable. Reprocessing
+and offline restoration do not refresh source validation time. Historical content
+snapshots receive BCD enrichment only with explicit `compatibility_snapshot`;
+commit timestamps never infer a cross-repository pairing.
+
+Document projections preserve source metadata, headings, links and inert examples.
+Trusted Rust handlers expand common reference/status macros and bounded
+same-snapshot includes. Navigation/live-demo/unknown macros and unresolved includes
+are labeled gaps. Compatibility expansion uses the explicitly pinned BCD evidence.
+No MDN/npm build scripts, template JavaScript, demos, external assets or linked
+specifications are executed or fetched. Compatibility results preserve original
+statements and separately identify derived mirror mappings from captured browser
+release/engine metadata. Flags, prefixes, notes, partial support, removals, unknown
+versions and unresolved mirrors are not converted into browser-version verdicts.
+
+MDN search follows the technical/English query conventions above, uses conjunctive
+filters, and ranks with BM25 over only the selected snapshot membership. Ties use
+slug, source path and projection identity. Search-index gaps do not suppress raw
+retrieval or poison later publications. Offset paging accepts at most 10,000;
+snapshot/query-bound cursors continue beyond that window and allow a changed limit.
+`mdn_history` records changes against each ordered parent, including merges.
+Entries label processing generations; normalization upgrades retain older evidence.
+Discovery freezes `history_snapshot`; follow `next_cursor` even if a bounded scan
+returns no matching records. Lists default to 20 and cap at 100.
+
+`mdn_get` accepts `repository="content"` (default) or `"compat"`. Projected text,
+original `source`, and explicit `bytes` pages cap at 32 KiB. UTF-8 text offsets must
+be character boundaries. Binary/oversized source uses base64 byte pages, verified
+against retained evidence. Resources use
+`devres://mdn/<repository>/<snapshot>/<representation>/<base64url-identity>`;
+representations include text/source/bytes and typed feature/browser records.
+Paired text resources also bind `compatibility_snapshot`. Citations carry source
+revision/path, original notices and attribution; MDN material is not relicensed
+as first-party AGPL code. Discovery supplies authoritative strict schemas.

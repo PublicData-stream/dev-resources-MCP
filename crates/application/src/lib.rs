@@ -2,6 +2,7 @@
 pub mod advisory;
 pub mod corpus;
 pub mod crate_corpus;
+pub mod mdn;
 use async_trait::async_trait;
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators};
 use std::{

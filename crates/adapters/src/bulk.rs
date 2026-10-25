@@ -74,6 +74,8 @@ pub enum BulkSource {
     },
     RegistryGit(GitOperation),
     RustSecGit(GitOperation),
+    MdnContentGit(GitOperation),
+    MdnCompatGit(GitOperation),
 }
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
@@ -101,6 +103,10 @@ impl BulkSource {
                 };
                 Ok(format!("https://docs.rs/crate/{name}/{version}/{suffix}"))
             }
+            Self::MdnContentGit(GitOperation::Advertisement) => Ok("https://github.com/mdn/content.git/info/refs?service=git-upload-pack".into()),
+            Self::MdnContentGit(GitOperation::UploadPack) => Ok("https://github.com/mdn/content.git/git-upload-pack".into()),
+            Self::MdnCompatGit(GitOperation::Advertisement) => Ok("https://github.com/mdn/browser-compat-data.git/info/refs?service=git-upload-pack".into()),
+            Self::MdnCompatGit(GitOperation::UploadPack) => Ok("https://github.com/mdn/browser-compat-data.git/git-upload-pack".into()),
             Self::RustSecGit(GitOperation::Advertisement) => Ok("https://github.com/rustsec/advisory-db.git/info/refs?service=git-upload-pack".into()),
             Self::RustSecGit(GitOperation::UploadPack) => Ok("https://github.com/rustsec/advisory-db.git/git-upload-pack".into()),
             Self::RegistryGit(GitOperation::Advertisement) => Ok("https://github.com/rust-lang/crates.io-index.git/info/refs?service=git-upload-pack".into()),
@@ -111,17 +117,26 @@ impl BulkSource {
         match self {
             Self::DatabaseDump | Self::CrateArchive { .. } => "static.crates.io",
             Self::Documentation { .. } => "docs.rs",
-            Self::RegistryGit(_) | Self::RustSecGit(_) => "github.com",
+            Self::RegistryGit(_)
+            | Self::RustSecGit(_)
+            | Self::MdnContentGit(_)
+            | Self::MdnCompatGit(_) => "github.com",
         }
     }
     fn media_type(&self) -> &'static str {
         match self {
             Self::RegistryGit(GitOperation::Advertisement)
-            | Self::RustSecGit(GitOperation::Advertisement) => {
+            | Self::RustSecGit(GitOperation::Advertisement)
+            | Self::MdnContentGit(GitOperation::Advertisement)
+            | Self::MdnCompatGit(GitOperation::Advertisement) => {
                 "application/x-git-upload-pack-advertisement"
             }
             Self::RegistryGit(GitOperation::UploadPack)
-            | Self::RustSecGit(GitOperation::UploadPack) => "application/x-git-upload-pack-result",
+            | Self::RustSecGit(GitOperation::UploadPack)
+            | Self::MdnContentGit(GitOperation::UploadPack)
+            | Self::MdnCompatGit(GitOperation::UploadPack) => {
+                "application/x-git-upload-pack-result"
+            }
             Self::Documentation {
                 operation: DocsOperation::Status,
                 ..
@@ -194,6 +209,7 @@ pub struct BulkBroker {
     documentation_slots: Arc<Semaphore>,
     attempt_budget: Option<usize>,
     attempts: AtomicUsize,
+    attempt_observer: Option<Arc<dyn Fn(usize) -> Result<()> + Send + Sync>>,
     #[cfg(test)]
     test_origin: Option<url::Url>,
 }
@@ -240,6 +256,7 @@ impl BulkBroker {
             config,
             attempt_budget: None,
             attempts: AtomicUsize::new(0),
+            attempt_observer: None,
             #[cfg(test)]
             test_origin: None,
         })
@@ -255,6 +272,19 @@ impl BulkBroker {
     }
     pub fn attempt_count(&self) -> usize {
         self.attempts.load(Ordering::Acquire)
+    }
+    /// Trusted private acceptance accounting; persistence must succeed before I/O.
+    pub fn with_attempt_observer(
+        mut self,
+        initial: usize,
+        observer: Arc<dyn Fn(usize) -> Result<()> + Send + Sync>,
+    ) -> Result<Self> {
+        if self.attempt_budget.is_none_or(|limit| initial > limit) {
+            return Err(Error::invalid("Invalid resumed source attempt budget."));
+        }
+        self.attempts.store(initial, Ordering::Release);
+        self.attempt_observer = Some(observer);
+        Ok(self)
     }
 
     /// Existing bounded fetches use this same host clock, with their own two slots.
@@ -308,7 +338,8 @@ impl BulkBroker {
             scheduled
         };
         tokio::time::sleep_until(scheduled).await;
-        self.attempts
+        let previous = self
+            .attempts
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 if self.attempt_budget.is_some_and(|limit| count >= limit) {
                     None
@@ -317,6 +348,9 @@ impl BulkBroker {
                 }
             })
             .map_err(|_| Error::capacity("Source attempt budget exhausted."))?;
+        if let Some(observer) = &self.attempt_observer {
+            observer(previous + 1)?;
+        }
         Ok(AttemptPermit {
             _transfer: transfer,
             _documentation: documentation,
@@ -338,6 +372,8 @@ impl BulkBroker {
             request.source,
             BulkSource::RegistryGit(GitOperation::UploadPack)
                 | BulkSource::RustSecGit(GitOperation::UploadPack)
+                | BulkSource::MdnContentGit(GitOperation::UploadPack)
+                | BulkSource::MdnCompatGit(GitOperation::UploadPack)
         );
         if request.body.len() > 1024 * 1024 || (!upload && !request.body.is_empty()) {
             return Err(Error::invalid("Invalid bulk request body."));
@@ -361,7 +397,13 @@ impl BulkBroker {
                 self.admit_rate(
                     request.source.host(),
                     true,
-                    matches!(request.source, BulkSource::RustSecGit(_)).then_some(1),
+                    matches!(
+                        request.source,
+                        BulkSource::RustSecGit(_)
+                            | BulkSource::MdnContentGit(_)
+                            | BulkSource::MdnCompatGit(_)
+                    )
+                    .then_some(1),
                 ),
             )
             .await?;
@@ -373,7 +415,10 @@ impl BulkBroker {
             builder = builder.header(reqwest::header::ACCEPT, request.source.media_type());
             if matches!(
                 request.source,
-                BulkSource::RegistryGit(_) | BulkSource::RustSecGit(_)
+                BulkSource::RegistryGit(_)
+                    | BulkSource::RustSecGit(_)
+                    | BulkSource::MdnContentGit(_)
+                    | BulkSource::MdnCompatGit(_)
             ) {
                 builder = builder.header("Git-Protocol", "version=2");
                 if upload {
@@ -538,9 +583,11 @@ pub struct BulkArtifactStore {
     min_free_bytes: u64,
     quota: Option<Quota>,
 }
+#[derive(Clone)]
 struct Quota {
     used: Arc<AtomicU64>,
     limit: u64,
+    roots: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
 }
 pub struct ArtifactReservation {
     used: Option<Arc<AtomicU64>>,
@@ -614,25 +661,39 @@ impl BulkArtifactStore {
         if limit == 0 {
             return Err(Error::invalid("Artifact quota must be positive."));
         }
-        let mut used = 0_u64;
-        for entry in std::fs::read_dir(&self.root).map_err(|_| storage_error())? {
-            let entry = entry.map_err(|_| storage_error())?;
-            if !valid_hash(&entry.file_name().to_string_lossy()) {
-                continue;
-            }
-            if !entry.file_type().map_err(|_| storage_error())?.is_file() {
-                return Err(Error::integrity(
-                    "Invalid immutable artifact filesystem member.",
-                ));
-            }
-            used = used
-                .checked_add(entry.metadata().map_err(|_| storage_error())?.len())
-                .ok_or_else(|| Error::capacity("Artifact quota accounting overflow."))?;
-        }
+        let used = retained_bytes(&self.root)?;
         self.quota = Some(Quota {
             used: Arc::new(AtomicU64::new(used)),
             limit,
+            roots: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::from([
+                self.root.clone(),
+            ]))),
         });
+        Ok(self)
+    }
+    /// Attach another owned archive directory to the same retention quota before
+    /// starting publishers. Each canonical directory is counted exactly once,
+    /// including when another handle is reconstructed for an already attached root.
+    /// All publishers into those directories must use this shared budget.
+    pub fn with_shared_budget(mut self, other: &Self) -> Result<Self> {
+        let Some(quota) = &other.quota else {
+            self.quota = None;
+            return Ok(self);
+        };
+        {
+            let mut roots = quota.roots.lock().map_err(|_| storage_error())?;
+            if !roots.contains(&self.root) {
+                let bytes = retained_bytes(&self.root)?;
+                quota
+                    .used
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                        used.checked_add(bytes)
+                    })
+                    .map_err(|_| Error::capacity("Artifact quota accounting overflow."))?;
+                roots.insert(self.root.clone());
+            }
+        }
+        self.quota = Some(quota.clone());
         Ok(self)
     }
     pub fn accounted_bytes(&self) -> Option<u64> {
@@ -880,6 +941,24 @@ impl BulkArtifactStore {
             .await
             .map_err(|_| storage_error())
     }
+}
+fn retained_bytes(root: &Path) -> Result<u64> {
+    let mut used = 0_u64;
+    for entry in std::fs::read_dir(root).map_err(|_| storage_error())? {
+        let entry = entry.map_err(|_| storage_error())?;
+        if !valid_hash(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        if !entry.file_type().map_err(|_| storage_error())?.is_file() {
+            return Err(Error::integrity(
+                "Invalid immutable artifact filesystem member.",
+            ));
+        }
+        used = used
+            .checked_add(entry.metadata().map_err(|_| storage_error())?.len())
+            .ok_or_else(|| Error::capacity("Artifact quota accounting overflow."))?;
+    }
+    Ok(used)
 }
 fn storage_error() -> Error {
     Error::unavailable("Bulk artifact storage unavailable.")
@@ -1244,6 +1323,67 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
     #[tokio::test]
+    async fn shared_quota_counts_three_roots_once_and_recovers_after_restart() {
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let third_root = tempfile::tempdir().unwrap();
+        let first = BulkArtifactStore::new(first_root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(128))
+            .unwrap();
+        let second = BulkArtifactStore::new(second_root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&first)
+            .unwrap();
+        let third = BulkArtifactStore::new(third_root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&first)
+            .unwrap();
+        for (store, byte) in [(&first, 1), (&second, 2), (&third, 3)] {
+            store
+                .capture_bytes(vec![byte; 32], CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(first.accounted_bytes(), Some(96));
+        assert_eq!(second.accounted_bytes(), Some(96));
+        assert_eq!(third.accounted_bytes(), Some(96));
+        assert!(
+            second
+                .capture_bytes(vec![4; 64], CancellationToken::new())
+                .await
+                .is_err()
+        );
+        third
+            .capture_bytes(vec![3; 32], CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(first.accounted_bytes(), Some(96));
+        drop((first, second, third));
+        let first = BulkArtifactStore::new(first_root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(128))
+            .unwrap();
+        let second = BulkArtifactStore::new(second_root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&first)
+            .unwrap();
+        let third = BulkArtifactStore::new(third_root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&first)
+            .unwrap();
+        let duplicate = BulkArtifactStore::new(second_root.path(), 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&third)
+            .unwrap();
+        assert_eq!(duplicate.accounted_bytes(), Some(96));
+        assert_eq!(second.accounted_bytes(), Some(96));
+        let held = third.reserve_bytes(32).unwrap();
+        assert!(first.reserve_bytes(1).is_err());
+        drop(held);
+        assert_eq!(first.accounted_bytes(), Some(96));
+    }
+    #[tokio::test]
     async fn canceled_link_waiter_cannot_uncharge_a_new_permanent_object() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -1278,6 +1418,35 @@ mod tests {
         release_send.send(()).unwrap();
         done_receive.await.unwrap();
         assert_eq!(store.accounted_bytes(), Some(64));
+    }
+    #[test]
+    fn mdn_git_destinations_and_wire_types_are_fixed() {
+        for (source, url, media) in [
+            (
+                BulkSource::MdnContentGit(GitOperation::Advertisement),
+                "https://github.com/mdn/content.git/info/refs?service=git-upload-pack",
+                "application/x-git-upload-pack-advertisement",
+            ),
+            (
+                BulkSource::MdnContentGit(GitOperation::UploadPack),
+                "https://github.com/mdn/content.git/git-upload-pack",
+                "application/x-git-upload-pack-result",
+            ),
+            (
+                BulkSource::MdnCompatGit(GitOperation::Advertisement),
+                "https://github.com/mdn/browser-compat-data.git/info/refs?service=git-upload-pack",
+                "application/x-git-upload-pack-advertisement",
+            ),
+            (
+                BulkSource::MdnCompatGit(GitOperation::UploadPack),
+                "https://github.com/mdn/browser-compat-data.git/git-upload-pack",
+                "application/x-git-upload-pack-result",
+            ),
+        ] {
+            assert_eq!(source.url().unwrap(), url);
+            assert_eq!(source.host(), "github.com");
+            assert_eq!(source.media_type(), media);
+        }
     }
     #[tokio::test(start_paused = true)]
     async fn rustsec_git_reserves_one_second_even_when_registry_rate_is_raised() {

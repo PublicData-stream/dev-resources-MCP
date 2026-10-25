@@ -197,4 +197,33 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn mdn_selectors_and_generic_source_defaults_remain_strict() {
+        let mut registry =
+            server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .unwrap();
+        }
+        assert!(registry.tools.len() <= 64);
+        let get = &registry.tools["mdn_get"].validator;
+        assert!(get.is_valid(&json!({"slug":"Web/API/Window/fetch"})));
+        assert!(!get.is_valid(&json!({})));
+        assert!(!get.is_valid(&json!({"slug":"A","path":"B"})));
+        assert!(!get.is_valid(&json!({"slug":"A","url":"https://example.com"})));
+        let history = &registry.tools["mdn_history"].validator;
+        assert!(history.is_valid(&json!({"feature":"api.fetch","repository":"compat"})));
+        assert!(!history.is_valid(&json!({"slug":"A","path":"B"})));
+        assert!(
+            registry.tools["search"]
+                .validator
+                .is_valid(&json!({"query":"fetch","sources":["mdn"]}))
+        );
+        assert!(
+            !registry.tools["search"]
+                .validator
+                .is_valid(&json!({"query":"fetch","sources":["arbitrary"]}))
+        );
+    }
 }

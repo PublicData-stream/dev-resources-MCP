@@ -3,7 +3,8 @@
 Anonymous, read-only developer knowledge and Rust package research over Streamable
 HTTP and a custom WebTransport binding. It provides RFC research, crates.io
 metadata and verified sources, local package and API research from retained
-crates.io/docs.rs captures, RustSec matching, and supplied Cargo.lock auditing.
+crates.io/docs.rs captures, MDN content and browser compatibility research,
+RustSec matching, and supplied Cargo.lock auditing.
 
 Public upstream captures and provenance are permanent. Submitted lockfiles and audit
 reports remain request-local. The service never builds or executes inspected packages. RFC and crate collection
@@ -42,7 +43,7 @@ Health is private. Public clients use HTTPS `/mcp`; native WebTransport clients 
 [Configuration](docs/Configuration.md), [Operations](docs/operations.md), and
 [Sources](docs/sources.md). Changes follow [Contributing](CONTRIBUTING.md).
 
-MDN, W3C, Chromium documentation, npm, a graphical app, and public citation web
+W3C, Chromium documentation, npm, a graphical app, and public citation web
 pages are future work. The repository is AGPL-3.0-only; upstream source
 materials retain their own terms. See [notices](THIRD-PARTY-NOTICES.md).
 

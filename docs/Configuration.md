@@ -6,7 +6,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls`, `limits`, `rfc`, `crates`, and `rustsec` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, and `mdn` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -200,3 +200,50 @@ Run one serving replica. Use Recreate updates and stop all writers before backup
 or restore. A dedicated database ownership fence prevents a second server; lost
 ownership requires restart. Size storage for permanent history and retain at least
 64 MiB of free blob headroom. See [Operations](operations.md).
+
+## MDN defaults
+
+Omitting `[mdn]` enables permanent collection and complete advertised branch/tag
+ancestry processing for both official repositories. `enabled=false` pauses
+scheduling while preserving local research and all evidence. Disposable and bounded
+live harnesses explicitly disable MDN as well as the existing collectors.
+
+| `mdn` field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Supervised current collection and history processing |
+| `ref_refresh_secs` | `3600` | Official branch/tag observation target |
+| `collection_interval_secs` | `1` | Delay between resumable iterations |
+| `publication_interval_secs` | `300` | Historical snapshot/index publication target; current main has priority |
+| `max_processing_workers` | `1` | Processing admission ceiling, accepts 1..2; inventory/publication updates are serialized |
+| `max_git_bytes` | `8589934592` | Disposable bare storage per repository, 8 GiB |
+| `min_free_bytes` | `1073741824` | Archive/Git admission reserve, 1 GiB |
+| `max_archive_storage_bytes` | omitted | Shared optional quota for retained content/compat Git artifacts and raw members |
+
+Intervals accept 1..31622400 seconds, Git storage 1 MiB..128 GiB, and the reserve
+must be at least 64 MiB. A quota must be at least the reserve. Shared quota
+accounting is reconstructed across all three artifact directories at startup.
+The quota excludes PostgreSQL, disposable mirrors and derived indexes; monitor
+those separately. Limits stop new admissions without deleting permanent objects.
+GitHub attempts retain the existing shared one-attempt/second host budget and
+single HTTPS retry owner.
+
+Git operations have a one-hour budget; manifests cap at 4 MiB, observed refs at
+10,000, retained roots at 100,000 and reachable commits at 1,000,000. Commit-order
+evidence caps at 128 MiB. Read operations check 15-second budgets. Unsupported Git
+paths/types are retained with reversible path evidence; symlinks and submodules
+are never followed.
+
+Article/BCD projections cap input and expanded text at 4 MiB, front matter at
+64 KiB, structured nesting at 64, normalized BCD output at 8 MiB and diagnostics at 256,
+macros at 10,000, include depth at 16 and included
+members at 128. Processing checks a 15-second budget. Larger raw source remains
+retained and readable through typed byte pages. Search uses a 64 MiB writer,
+50,000-document immutable shards, at most 4,096 shard generations, and two admitted
+readers. Per-shard limits remain 32 GiB/10,000 files with 2 MiB integrity manifests.
+Selected snapshot membership caps at 1,000,000 members/64 MiB metadata. These are
+rejection boundaries, not measured process RSS or whole-corpus capacity.
+Immutable database write groups cap at 1,000 rows/16 MiB and commit under the
+existing ownership fence before their inventory/checkpoint pointers advance.
+
+Schema 5 is forward-only. Preserve MDN raw artifacts, retained Git evidence,
+projection records, inventories and `mdn-indexes` in coordinated backups.

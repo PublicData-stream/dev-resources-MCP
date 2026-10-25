@@ -7,6 +7,9 @@ enabled = false
 enabled = false
 [rustsec]
 enabled = false
+
+[mdn]
+enabled = false
 [http]
 bind = "0.0.0.0:8080"
 allowed_hosts = ["backend:8080"]
