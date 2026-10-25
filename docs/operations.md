@@ -334,3 +334,83 @@ acceptance has a one-hour bound, retains resumable checkpoints, and reports trav
 completion separately from projection completeness. A timeout is incomplete
 acceptance; it does not establish full-source coverage. Probe output contains public
 source provenance and aggregate counts, never a supplied lockfile.
+
+## MDN collection, repair and full acceptance
+
+Omitted `[mdn]` starts current-main acquisition and resumable complete advertised
+branch/tag ancestry processing for both repositories. Set `enabled=false` to pause
+scheduling without deleting evidence. `mdn_corpus_status` is aggregate-only;
+`mdn_snapshots` exposes frozen commit/ref discovery and `mdn_history` provides
+parent-relative source changes. Main publication has priority over backfill.
+Unknown historical formats/macros and individual index limits remain explicit
+projection gaps; they do not imply missing raw Git evidence.
+
+Stop serving before private offline index maintenance:
+
+```sh
+devres-server rebuild-mdn-index /etc/devres/server.toml
+```
+
+This uses retained index/projection evidence and publishes new immutable derived
+snapshot generations. The older snapshot identifiers remain fixed, including
+explicit failure if their derived files are corrupt. Rebuild does not fetch sources
+or refresh validation time. Keep the damaged evidence for investigation. Schema 5
+requires coordinated PostgreSQL/blob backup; older binaries reject it. Backups
+include `mdn/content/artifacts`, `mdn/compat/artifacts`, `mdn/raw-artifacts`, MDN
+projection/inventory rows and `mdn-indexes`. Bare `history.git` directories are
+reconstructable working state; artifact directories are permanent evidence.
+
+The ordinary PostgreSQL, image, edge and minikube gates use explicitly labeled
+synthetic MDN/BCD data. They exercise pinned search/get/compatibility/resources,
+HTTP/WebTransport parity, persistence restart and coordinated restore while all
+collectors are disabled. They never establish upstream/full-source acceptance.
+
+Explicit source acceptance uses separate retained storage:
+
+```sh
+CARGO_TARGET_DIR=/buildcache/rust/target scripts/accept-mdn.sh --live current
+CARGO_TARGET_DIR=/buildcache/rust/target scripts/accept-mdn.sh --live full
+# Reuse the printed task-owned directory; perform no new source acquisition:
+DEVRES_MDN_ACCEPTANCE_ROOT=/tmp/devres-mdn-retained.EXAMPLE \
+  CARGO_TARGET_DIR=/buildcache/rust/target scripts/accept-mdn.sh --resume full
+```
+
+Each initial invocation creates its own PostgreSQL directory and blobs under `/tmp`
+and freezes both official ref observations. The script stops only its labeled
+container; it retains database files, raw evidence, projections, indexes and
+checkpoints after failure or success. Do not place these artifacts in disposable
+fixture cleanup paths. The low-level example requires dedicated `DATABASE_URL`,
+`BLOB_DIR` and the matching ownership marker; never point it at production storage.
+The driver requires Docker and passwordless `sudo` for fixed read-only storage
+accounting of the container-owned PostgreSQL directory.
+
+The durable attempt ledger reserves at most 20 shared upstream HTTP attempts,
+including retries, before requests are sent. Restart does not renew the allowance;
+`--resume` requires both frozen observations and performs no network acquisition.
+Older acceptance directories without a ledger conservatively reserve the entire
+20-attempt allowance. Existing bounded live smoke keeps its separate original
+ceiling and fixed records.
+
+Full acceptance measures database/WAL, mirrors, raw/artifact storage, stages and
+indexes against a combined 256 GiB working budget and preserves at least 10 GiB
+free space. A two-second storage monitor retries transient file-movement races;
+this polling measurement is not a kernel filesystem quota. Per-operation budgets,
+source admission and cancellation remain active. There is no total processing-time
+cap. Capacity exhaustion pauses work and is incomplete acceptance, never permission
+to delete permanent history.
+
+Completion requires both frozen ancestry queues to finish, every commit snapshot
+to have accounted coverage, validated latest index artifacts, and pinned current
+and deterministic historical document/BCD/source/resource research checks. The
+runner retains `acceptance.json` on success and reports projection gaps separately.
+A bounded clone, successful current query or completed individual job does not
+establish that result. Native architecture CI, registry publication, browser/client
+UI interoperability and production deployment remain separate acceptance evidence.
+
+On FUSE-backed hosts, a task-owned native filesystem image may back the retained
+acceptance directory. Keep the image, `volume.json` and any original pre-migration
+copy together. When `volume.json` exists, the driver refuses an unmounted `native`
+volume instead of initializing replacement storage. Restore only the recorded
+owned mount (with `loop,nodev,nosuid,noexec`) before resuming; image removal is not
+fixture cleanup. Storage accounting includes retained original copies, and the
+backing filesystem must also keep the stated free-space reserve.
