@@ -129,6 +129,18 @@ start_backend() {
   k rollout status deployment/backend --timeout=120s
   wait_edge
 }
+mdn_content=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest())')
+mdn_compat=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest())')
+advisory_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest())')
+seeded_webtransport() {
+  for revision in 2026-07-28 2025-11-25; do
+    external env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
+      DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" devres-probe https://edge:30443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
+    k exec trusted-probe -- env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
+      DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
+      /fixture/cert/edge-client.pem /fixture/cert/edge-client-key.pem
+  done
+}
 stop_backend
 maintenance_start
 before=$(k exec storage-maintenance -- storage-probe write)
@@ -136,6 +148,7 @@ capture=${before%% *}
 maintenance_stop
 start_backend
 external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
+seeded_webtransport
 stop_backend
 maintenance_start
 test "$(k exec storage-maintenance -- storage-probe read)" = "$before"
@@ -151,6 +164,7 @@ test "$(k exec storage-maintenance -- storage-probe read)" = "$before"
 maintenance_stop
 start_backend
 external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
+seeded_webtransport
 if (( live )); then
   external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --live "${live_rfc_args[@]}"
 fi

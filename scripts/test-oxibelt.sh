@@ -101,6 +101,33 @@ expect_failure probe devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/c
 expect_failure probe devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/wrong-ca.pem 2026-07-28 https://client.example
 expect_failure probe devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28 https://untrusted.invalid
 expect_failure probe devres-probe https://edge:8443/wrong /fixture/cert/ca.pem 2026-07-28 https://client.example
+# Seed only task-owned public synthetic evidence while the serving fence is released.
+mdn_content=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest())')
+mdn_compat=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest())')
+advisory_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest())')
+fixture_storage() { docker run --rm --network "$run_id" -v "$run_id-data:/data" \
+  -e DATABASE_URL=postgres://devres:fixture-only@postgres/devres -e BLOB_DIR=/data/blobs \
+  --entrypoint storage-probe "$image" "$1"; }
+docker stop --time 15 "$run_id-backend" >/dev/null
+docker rm "$run_id-backend" >/dev/null
+before=$(fixture_storage write)
+capture=${before%% *}
+backend
+probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --wait-ready 30
+probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
+for revision in 2026-07-28 2025-11-25; do
+  probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
+  probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
+    /fixture/cert/edge-client.pem /fixture/cert/edge-client-key.pem
+done
+docker stop --time 15 "$run_id-backend" >/dev/null
+docker rm "$run_id-backend" >/dev/null
+test "$(fixture_storage read)" = "$before"
+backend
+probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --wait-ready 30
+probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
 # Change only backend CA trust. Both transports must reject, then recover.
 docker rm -f "$run_id-edge" >/dev/null
 docker run --rm --network none --user 0 -v "$run_id-fixture:/fixture" --entrypoint sh "$image" \

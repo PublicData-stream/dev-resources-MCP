@@ -12,6 +12,9 @@ import urllib.parse
 MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
 MAX_RESPONSE = 8 * 1024 * 1024
+SYNTHETIC_MDN_CONTENT = hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest()
+SYNTHETIC_MDN_COMPAT = hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest()
+SYNTHETIC_MDN_TEXT = "Synthetic MDN storage fixture"
 SYNTHETIC_ADVISORY = "RUSTSEC-2024-0001"
 SYNTHETIC_SNAPSHOT = hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest()
 AUDIT_PRIVACY_MARKER = "devres-smoke-private-comment-4d1a8e7c"
@@ -118,6 +121,14 @@ def smoke(client, negative=True):
                 "crate_corpus_status"} <= names, names
         assert {"advisory_get", "advisory_catalog_search", "advisory_history",
                 "advisory_snapshots", "advisory_corpus_status"} <= names, names
+        assert {"mdn_search", "mdn_get", "mdn_compat_search", "mdn_compat_get",
+                "mdn_browser_get", "mdn_history", "mdn_snapshots", "mdn_corpus_status"} <= names, names
+        mdn = client.tool("mdn_corpus_status", {}, revision)
+        assert isinstance(mdn.get("collection_enabled"), bool), "MDN collection status missing"
+        mdn_schema = next(tool["inputSchema"] for tool in tools if tool["name"] == "mdn_get")
+        assert mdn_schema.get("additionalProperties") is False and len(mdn_schema.get("oneOf", [])) == 2, "MDN document selector schema missing"
+        code, rejected = client.exchange("tools/call", {"name": "mdn_get", "arguments": {"slug": "Web/Fixture", "url": "https://untrusted.invalid"}}, revision)
+        assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "MDN schema admitted an arbitrary destination"
         advisories = client.call("tools/call", {"name": "advisory_corpus_status", "arguments": {}}, revision)
         assert not advisories.get("isError"), "advisory corpus status failed"
         assert isinstance(advisories.get("structuredContent", {}).get("counts"), dict), "missing advisory corpus counts"
@@ -203,6 +214,45 @@ def synthetic_advisory(client):
         assert AUDIT_PRIVACY_MARKER not in json.dumps(status), "advisory status reflected audit input"
 
 
+def synthetic_mdn(client):
+    """Exercise retained synthetic MDN evidence without network acquisition."""
+    for revision in (MODERN, LEGACY):
+        arguments = {"slug": "Web/Fixture", "snapshot": SYNTHETIC_MDN_CONTENT,
+                     "compatibility_snapshot": SYNTHETIC_MDN_COMPAT}
+        detail = client.tool("mdn_get", arguments, revision)
+        assert detail.get("provenance", {}).get("snapshot") == SYNTHETIC_MDN_CONTENT, "MDN document snapshot changed"
+        assert detail["provenance"].get("coverage", {}).get("synthetic") is True, "MDN fixture lost its synthetic label"
+        assert detail.get("source_url", "").startswith("https://fixtures.invalid/"), "MDN fixture invented upstream provenance"
+        assert SYNTHETIC_MDN_TEXT in detail.get("page", {}).get("text", ""), "MDN fixture text missing"
+        assert "fixture_browser" in detail["page"]["text"], "pinned BCD table was not expanded"
+        found = client.tool("mdn_search", {"query": "fetch", "snapshot": SYNTHETIC_MDN_CONTENT}, revision)
+        assert found.get("total") == 1 and found["results"][0].get("slug") == "Web/Fixture", "MDN selected-snapshot search changed"
+        compat = client.tool("mdn_compat_get", {"feature": "api.fixtureFetch", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
+        assert compat.get("original", {}).get("fixture_browser", {}).get("version_added") == "1", "synthetic BCD statement changed"
+        assert compat.get("resolved") == compat.get("original"), "explicit BCD evidence was incorrectly transformed"
+        features = client.tool("mdn_compat_search", {"query": "fetch", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
+        assert features.get("total") == 1, "synthetic BCD feature did not enter its index"
+        browser = client.tool("mdn_browser_get", {"browser": "fixture_browser", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
+        assert browser.get("releases", [{}])[0].get("version") == "1", "synthetic browser release changed"
+        original = client.tool("mdn_get", {"slug": "Web/Fixture", "snapshot": SYNTHETIC_MDN_CONTENT,
+                                           "representation": "source"}, revision)
+        assert original.get("page", {}).get("text", "").startswith("---\ntitle: Synthetic MDN"), "original MDN Markdown was replaced by a projection"
+        for selected in (detail, original):
+            resource = selected.get("resource_uri", "")
+            assert resource.startswith("devres://mdn/content/"), "missing immutable MDN resource"
+            for method, params in (("resources/read", {"uri": resource}),
+                                   ("tools/call", {"name": "fetch", "arguments": {"id": resource}})):
+                result = client.call(method, params, revision)
+                if method == "tools/call":
+                    assert not result.get("isError"), "typed MDN fetch failed"
+                    result = result.get("structuredContent", result)
+                content = result.get("contents", [{}])[0]
+                assert content.get("text") == selected["page"]["text"], "immutable MDN resource changed"
+                assert content.get("_meta", {}).get("provenance", {}).get("coverage", {}).get("synthetic") is True, "resource lost MDN fixture provenance"
+                assert content.get("_meta", {}).get("license"), "resource dropped source attribution"
+        assert AUDIT_PRIVACY_MARKER not in json.dumps(client.tool("mdn_corpus_status", {}, revision)), "MDN status reflected audit input"
+
+
 def wait_ready(client, seconds):
     """Wait only for offline semantic routing readiness, never replay source work."""
     deadline = time.monotonic() + seconds
@@ -243,6 +293,7 @@ def live(client, rfc_text_only=False):
     status = client.tool("rfc_corpus_status", {})
     assert status.get("collection_enabled") is False, "bounded live smoke requires paused automatic RFC collection"
     assert client.tool("crate_corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused crate collection"
+    assert client.tool("mdn_corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused MDN collection"
     rfc_search = client.tool("rfc_search", {"query": "QUIC", "offset": 0, "limit": 3})
     assert rfc_search.get("items") and rfc_search.get("total", 0) > 0, "RFC discovery returned no matching documents"
     assert rfc_search.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/rfc-index.xml", "RFC discovery did not use the canonical index"
@@ -336,6 +387,7 @@ def main():
         value = client.tool("fetch", {"id": "devres://capture/" + options.capture})
         assert "Synthetic dev-resources persistence acceptance fixture" in json.dumps(value)
         synthetic_advisory(client)
+        synthetic_mdn(client)
     if options.live:
         live(client, options.rfc_text_only)
     print("HTTP MCP acceptance passed" + ("; bounded live smoke passed (RFC text only)" if options.live and options.rfc_text_only else "; bounded live smoke passed" if options.live else "; no provider calls"))

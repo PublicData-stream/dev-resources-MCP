@@ -186,3 +186,64 @@ class SyntheticAdvisoryTests(unittest.TestCase):
     def test_invalid_audit_error_must_not_reflect_private_comment(self):
         with self.assertRaisesRegex(AssertionError, "audit error reflected"):
             smoke.synthetic_advisory(SyntheticClient(leak_invalid=True))
+
+class SyntheticMdnClient:
+    def __init__(self, false_provenance=False, wrong_support=False):
+        self.calls = []
+        self.false_provenance = false_provenance
+        self.wrong_support = wrong_support
+        self.resources = {}
+
+    def tool(self, name, arguments, revision=smoke.MODERN):
+        self.calls.append((name, revision))
+        if name == "mdn_corpus_status":
+            return {"collection_enabled": False}
+        expected = (smoke.SYNTHETIC_MDN_COMPAT if name in
+                    ("mdn_compat_get", "mdn_compat_search", "mdn_browser_get") else smoke.SYNTHETIC_MDN_CONTENT)
+        if arguments.get("snapshot") != expected:
+            raise AssertionError("MDN fixture request did not pin its source snapshot")
+        if name == "mdn_get":
+            original = arguments.get("representation") == "source"
+            text = ("---\ntitle: Synthetic MDN storage fixture\n---\nsource" if original else
+                    smoke.SYNTHETIC_MDN_TEXT + "\nfixture_browser: version_added=1")
+            uri = f"devres://mdn/content/{expected}/{'source' if original else 'text'}/Zml4dHVyZQ"
+            provenance = {"snapshot": expected, "coverage": {"synthetic": True}}
+            self.resources[uri] = {"text": text, "_meta": {"provenance": provenance,
+                                                          "license": {"synthetic": True}}}
+            return {"provenance": provenance, "source_url": ("https://github.com/mdn/content" if self.false_provenance else
+                    "https://fixtures.invalid/mdn/content"), "page": {"text": text}, "resource_uri": uri}
+        if name == "mdn_search":
+            return {"total": 1, "results": [{"slug": "Web/Fixture"}]}
+        if name == "mdn_compat_get":
+            statement = {"fixture_browser": {"version_added": "2" if self.wrong_support else "1"}}
+            return {"original": statement, "resolved": statement}
+        if name == "mdn_compat_search":
+            return {"total": 1}
+        if name == "mdn_browser_get":
+            return {"releases": [{"version": "1"}]}
+        raise AssertionError("unexpected MDN fixture operation")
+
+    def call(self, method, params, revision=smoke.MODERN):
+        self.calls.append((method, revision))
+        if method == "resources/read":
+            return {"contents": [self.resources[params["uri"]]]}
+        if method == "tools/call" and params["name"] == "fetch":
+            return {"structuredContent": {"contents": [self.resources[params["arguments"]["id"]]]}}
+        raise AssertionError("unexpected MDN fixture RPC")
+
+
+class SyntheticMdnTests(unittest.TestCase):
+    def test_seeded_mdn_exercises_both_revisions_and_original_resources(self):
+        client = SyntheticMdnClient()
+        smoke.synthetic_mdn(client)
+        self.assertEqual({revision for name, revision in client.calls if name == "mdn_get"},
+                         {smoke.MODERN, smoke.LEGACY})
+        self.assertEqual(sum(name == "resources/read" for name, _ in client.calls), 4)
+
+    def test_synthetic_mdn_cannot_claim_upstream_provenance(self):
+        with self.assertRaisesRegex(AssertionError, "invented upstream"):
+            smoke.synthetic_mdn(SyntheticMdnClient(false_provenance=True))
+
+    def test_changed_compatibility_evidence_fails_acceptance(self):
+        with self.assertRaisesRegex(AssertionError, "statement changed"):
+            smoke.synthetic_mdn(SyntheticMdnClient(wrong_support=True))

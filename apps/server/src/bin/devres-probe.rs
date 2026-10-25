@@ -100,6 +100,7 @@ async fn main() -> Result<(), ServerError> {
     let mut has_rfc_corpus = false;
     let mut has_crate_corpus = false;
     let mut has_advisory_corpus = false;
+    let mut has_mdn_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -126,6 +127,20 @@ async fn main() -> Result<(), ServerError> {
                 tools
                     .iter()
                     .any(|tool| tool["name"] == "crate_corpus_status")
+            });
+            has_mdn_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
+                [
+                    "mdn_search",
+                    "mdn_get",
+                    "mdn_compat_search",
+                    "mdn_compat_get",
+                    "mdn_browser_get",
+                    "mdn_history",
+                    "mdn_snapshots",
+                    "mdn_corpus_status",
+                ]
+                .iter()
+                .all(|name| tools.iter().any(|tool| tool["name"] == *name))
             });
             has_advisory_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 tools
@@ -235,11 +250,168 @@ async fn main() -> Result<(), ServerError> {
             }
         }
     }
+    if has_mdn_corpus {
+        let status = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            8,
+            "mdn_corpus_status",
+            json!({}),
+        )
+        .await?;
+        if !status["collection_enabled"].is_boolean() {
+            return Err("MDN corpus status missing through WebTransport".into());
+        }
+        if let Ok(snapshot) = std::env::var("DEVRES_PROBE_MDN_SNAPSHOT") {
+            let compatibility = std::env::var("DEVRES_PROBE_MDN_COMPAT_SNAPSHOT")?;
+            for id in [&snapshot, &compatibility] {
+                if id.len() != 64
+                    || !id
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                {
+                    return Err("Invalid explicit synthetic MDN snapshot".into());
+                }
+            }
+            let detail=tool_exchange(&mut send,&mut reader,&budget,revision,9,"mdn_get",json!({"slug":"Web/Fixture","snapshot":snapshot,"compatibility_snapshot":compatibility})).await?;
+            if detail["provenance"]["snapshot"] != snapshot
+                || detail["provenance"]["coverage"]["synthetic"] != true
+                || !detail["source_url"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("https://fixtures.invalid/"))
+                || !detail["page"]["text"].as_str().is_some_and(|s| {
+                    s.contains("Synthetic MDN storage fixture") && s.contains("fixture_browser")
+                })
+            {
+                return Err("Synthetic MDN document mismatch through WebTransport".into());
+            }
+            let found = tool_exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                revision,
+                10,
+                "mdn_search",
+                json!({"query":"fetch","snapshot":snapshot}),
+            )
+            .await?;
+            if found["total"] != 1 || found["results"][0]["slug"] != "Web/Fixture" {
+                return Err("Synthetic MDN search mismatch through WebTransport".into());
+            }
+            let compat = tool_exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                revision,
+                11,
+                "mdn_compat_get",
+                json!({"feature":"api.fixtureFetch","snapshot":compatibility}),
+            )
+            .await?;
+            if compat["original"]["fixture_browser"]["version_added"] != "1"
+                || compat["resolved"] != compat["original"]
+            {
+                return Err("Synthetic BCD evidence mismatch through WebTransport".into());
+            }
+            let browser = tool_exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                revision,
+                12,
+                "mdn_browser_get",
+                json!({"browser":"fixture_browser","snapshot":compatibility}),
+            )
+            .await?;
+            if browser["releases"][0]["version"] != "1" {
+                return Err("Synthetic browser release mismatch through WebTransport".into());
+            }
+            let original = tool_exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                revision,
+                13,
+                "mdn_get",
+                json!({"slug":"Web/Fixture","snapshot":snapshot,"representation":"source"}),
+            )
+            .await?;
+            if !original["page"]["text"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("---\ntitle: Synthetic MDN"))
+            {
+                return Err("Original MDN source lost through WebTransport".into());
+            }
+            let features = tool_exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                revision,
+                14,
+                "mdn_compat_search",
+                json!({"query":"fetch","snapshot":compatibility}),
+            )
+            .await?;
+            if features["total"] != 1 {
+                return Err("Synthetic BCD search mismatch through WebTransport".into());
+            }
+            for (id, selected) in [(15, &detail), (16, &original)] {
+                let uri = selected["resource_uri"]
+                    .as_str()
+                    .ok_or("Missing immutable MDN resource")?;
+                let mut params = json!({"uri":uri});
+                if revision == "2026-07-28" {
+                    params["_meta"] = metadata(revision);
+                }
+                let resource = exchange(
+                    &mut send,
+                    &mut reader,
+                    &budget,
+                    json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":params}),
+                )
+                .await?;
+                let content = &resource["result"]["contents"][0];
+                if content["text"] != selected["page"]["text"]
+                    || content["_meta"]["provenance"]["coverage"]["synthetic"] != true
+                    || !content["_meta"]["license"].is_object()
+                {
+                    return Err(
+                        "Immutable MDN resource lost content or attribution through WebTransport"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
     connection.close(0_u32.into(), b"probe complete");
     endpoint.close(0_u32.into(), b"probe complete");
     timeout(Duration::from_secs(2), endpoint.wait_idle()).await?;
     println!("WebTransport {revision}: discovery, tool listing, and server identity verified.");
     Ok(())
+}
+async fn tool_exchange(
+    send: &mut wtransport::SendStream,
+    reader: &mut FrameReader<wtransport::RecvStream>,
+    budget: &Arc<Semaphore>,
+    revision: &str,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, ServerError> {
+    let mut params = json!({"name":name,"arguments":arguments});
+    if revision == "2026-07-28" {
+        params["_meta"] = metadata(revision);
+    }
+    let result = exchange(
+        send,
+        reader,
+        budget,
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":params}),
+    )
+    .await?;
+    Ok(result["result"]["structuredContent"].clone())
 }
 fn metadata(revision: &str) -> Value {
     json!({"io.modelcontextprotocol/protocolVersion":revision,"io.modelcontextprotocol/clientInfo":{"name":"devres-probe","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}})
