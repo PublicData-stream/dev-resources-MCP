@@ -49,3 +49,5 @@ materials retain their own terms. See [notices](THIRD-PARTY-NOTICES.md).
 
 [Initialization validation](docs/initialization-evidence.md) records the checks
 actually executed, source evidence, and the remaining proof boundaries.
+[MDN validation](docs/mdn-acceptance-evidence.md) separates synthetic transport and
+persistence checks from retained full-source acceptance.
