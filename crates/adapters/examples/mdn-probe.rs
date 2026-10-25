@@ -19,6 +19,22 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+async fn processing_permit<'a>(
+    gate: &'a tokio::sync::RwLock<()>,
+    cancel: &CancellationToken,
+) -> Result<tokio::sync::RwLockReadGuard<'a, ()>> {
+    let guard = tokio::select! {
+        _ = cancel.cancelled() => return Err(Error::unavailable("MDN acceptance paused; evidence retained.")),
+        guard = gate.read() => guard,
+    };
+    if cancel.is_cancelled() {
+        return Err(Error::unavailable(
+            "MDN acceptance paused; evidence retained.",
+        ));
+    }
+    Ok(guard)
+}
+
 fn attempt_accounting(root: &Path, live: bool) -> Result<(usize, AttemptObserver)> {
     let path = root.join("attempts");
     if !path.exists() {
@@ -152,6 +168,22 @@ async fn budget(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_accounting_cannot_resume_a_waiting_processing_slice() {
+        let gate = tokio::sync::RwLock::new(());
+        let measuring = gate.write().await;
+        let cancel = CancellationToken::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), processing_permit(&gate, &cancel))
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        assert!(processing_permit(&gate, &cancel).await.is_err());
+        drop(measuring);
+        assert!(processing_permit(&gate, &cancel).await.is_err());
+    }
 
     #[test]
     fn durable_attempts_survive_resume_and_reject_over_budget() {
@@ -440,18 +472,40 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     corpus.recover(cancel.clone()).await?;
     let monitor_root = root.clone();
     let monitor_cancel = cancel.clone();
+    // Measure between resumable slices. No collector writes continue while an
+    // accounting command runs; a timeout still cancels the entire invocation.
+    let storage_gate = Arc::new(tokio::sync::RwLock::new(()));
+    let monitor_gate = storage_gate.clone();
     let monitor = tokio::spawn(async move {
         loop {
-            tokio::select! {_=monitor_cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(2))=>{if let Err(error)=budget(&monitor_root).await{monitor_cancel.cancel();return Err(error)}}}
+            tokio::select! {_=monitor_cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(2))=>{
+                let _guard = tokio::select! {
+                    _ = monitor_cancel.cancelled() => return Ok(()),
+                    guard = monitor_gate.write() => guard,
+                };
+                if let Err(error)=budget(&monitor_root).await{monitor_cancel.cancel();return Err(error)}
+            }}
         }
     });
     let result:Result<Value>=async{
-        for repo in [Repo::Content,Repo::Compat]{if store.mdn_state(&format!("{}-observation",repo.as_str())).await?.is_none(){if !live{return Err(Error::unavailable("Offline resume requires both frozen observations."));}corpus.synchronize(repo,cancel.clone()).await?;}}
+        for repo in [Repo::Content, Repo::Compat] {
+            if store.mdn_state(&format!("{}-observation", repo.as_str())).await?.is_none() {
+                if !live { return Err(Error::unavailable("Offline resume requires both frozen observations.")); }
+                let _guard = processing_permit(&storage_gate, &cancel).await?;
+                corpus.synchronize(repo, cancel.clone()).await?;
+            }
+        }
         let mut last=Instant::now();
         loop {
             if cancel.is_cancelled(){return Err(Error::unavailable("MDN acceptance paused; evidence retained."));}
-            let current=corpus.process_current(cancel.clone()).await?;
-            let history=if full{corpus.process_history(cancel.clone()).await?}else{true};
+            let current={
+                let _guard=processing_permit(&storage_gate, &cancel).await?;
+                corpus.process_current(cancel.clone()).await?
+            };
+            let history=if full{
+                let _guard=processing_permit(&storage_gate, &cancel).await?;
+                corpus.process_history(cancel.clone()).await?
+            }else{true};
             if last.elapsed()>=Duration::from_secs(30){println!("{}",json!({"stage":"processing","attempts_upper_bound":broker.attempt_count(),"attempts_this_invocation":broker.attempt_count().saturating_sub(initial_attempts),"status":store.mdn_state("status").await?}));last=Instant::now();}
             if current&&history{break}tokio::task::yield_now().await;
         }

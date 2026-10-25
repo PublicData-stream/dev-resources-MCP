@@ -382,7 +382,8 @@ checkpoints after failure or success. Do not place these artifacts in disposable
 fixture cleanup paths. The low-level example requires dedicated `DATABASE_URL`,
 `BLOB_DIR` and the matching ownership marker; never point it at production storage.
 The driver requires Docker and passwordless `sudo` for fixed read-only storage
-accounting of the container-owned PostgreSQL directory.
+accounting of the container-owned PostgreSQL directory. It builds and runs the
+locked release probe so full-history processing does not use a debug executable.
 
 The durable attempt ledger reserves at most 20 shared upstream HTTP attempts,
 including retries, before requests are sent. Restart does not renew the allowance;
@@ -393,7 +394,11 @@ ceiling and fixed records.
 
 Full acceptance measures database/WAL, mirrors, raw/artifact storage, stages and
 indexes against a combined 256 GiB working budget and preserves at least 10 GiB
-free space. A two-second storage monitor retries transient file-movement races;
+free space. The monitor waits two seconds between checks, waits for the current
+acquisition or resumable processing slice to finish, and pauses collector writes
+while measuring storage. A measurement has a
+30-second deadline; timeouts stop acceptance. Transient file-movement failures
+receive bounded retries while processing remains paused;
 this polling measurement is not a kernel filesystem quota. Per-operation budgets,
 source admission and cancellation remain active. There is no total processing-time
 cap. Capacity exhaustion pauses work and is incomplete acceptance, never permission
