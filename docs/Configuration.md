@@ -127,27 +127,13 @@ shard, with a 2 MiB integrity manifest. These are processing limits, not process
 or whole-corpus capacity measurements. Unsupported tokens and bounded processing
 failures remain explicit search gaps; they do not discard retained source bodies.
 
-| `limits` field | Default |
-| --- | --- |
-| `max_message_bytes` | 8 MiB |
-| `max_tool_result_bytes` | 256 KiB |
-| `max_buffer_bytes` | 64 MiB |
-| `max_in_flight` | 32 |
-| `max_connections` | 128 |
-| `max_calls_per_connection` | 8 |
-| `io_timeout_secs` | 10 |
-| `call_timeout_secs` | 30 |
-| `idle_timeout_secs` | 60 |
-| `shutdown_timeout_secs` | 15 |
-
-`limits.rate_limit` defaults to enabled with 100 calls/second and burst 100.
-An optional `verified_tunnel` calls-per-second/burst override requires edge mTLS.
 ## RustSec defaults
 
 Omitting `[rustsec]` enables supervised current-advisory collection and full Git
 history processing. `enabled=false` pauses both lanes without deleting retained
 evidence; local research and bounded legacy-capture recovery remain available.
-Disposable harnesses explicitly disable this collector too.
+Disposable harnesses explicitly disable this collector too. Existing configurations
+that omit this table begin RustSec collection after upgrade.
 
 | `rustsec` field | Default | Meaning |
 | --- | --- | --- |
@@ -170,9 +156,29 @@ including retries. History runs one processing worker, with up to 1,000 commits 
 15 seconds per iteration and resumable member checkpoints. Git acquisition has a
 one-hour budget; manifests cap at 4 MiB, advertised refs at 10,000, commits at
 1,000,000 and tree members at 100,000. Advisory records cap at 1 MiB each and 64 MiB
-per representation snapshot; raw Git retention and successful projection are
+per representation snapshot, with at most 20,000 retained records. Advisory
+history queries process at most 100 parents per merge; larger requests fail with
+capacity rather than omitting parents. Research admits two concurrent snapshot
+readers and bounds cursor tokens to 16 KiB. Raw Git retention and successful projection are
 separate coverage states. No full-corpus capacity benchmark is implied.
 
+## Request and storage limits
+
+| `limits` field | Default |
+| --- | --- |
+| `max_message_bytes` | 8 MiB |
+| `max_tool_result_bytes` | 256 KiB |
+| `max_buffer_bytes` | 64 MiB |
+| `max_in_flight` | 32 |
+| `max_connections` | 128 |
+| `max_calls_per_connection` | 8 |
+| `io_timeout_secs` | 10 |
+| `call_timeout_secs` | 30 |
+| `idle_timeout_secs` | 60 |
+| `shutdown_timeout_secs` | 15 |
+
+`limits.rate_limit` defaults to enabled with 100 calls/second and burst 100.
+An optional `verified_tunnel` calls-per-second/burst override requires edge mTLS.
 These limits regulate callers, not provider traffic. Upstream attempts have their
 own source-specific host budgets. Existing foreground retrieval retains a
 two-transfer bound; private crate acquisition has its separately configured bulk

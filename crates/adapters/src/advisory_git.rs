@@ -781,7 +781,13 @@ impl AdvisoryHistory {
             };
             let commit = parse_commit_line(&line)?;
             if !self
-                .process_commit(&commit, &state.observation_id, &shutdown, deadline, 1000)
+                .process_commit(
+                    &commit,
+                    &state.observation_id,
+                    &shutdown,
+                    deadline,
+                    MAX_PROJECTED_RECORDS,
+                )
                 .await?
             {
                 break;

@@ -327,7 +327,8 @@ CARGO_TARGET_DIR=/buildcache/rust/target cargo build --locked -p devres-adapters
 ```
 
 Each invocation enforces a shared maximum of 20 HTTP attempts, including retries,
-without increasing source rates. Current acceptance has a five-minute bound and
+without increasing source rates. `DEVRES_RUSTSEC_PROBE_ATTEMPTS` can lower this
+ceiling to 1..20 attempts. Current acceptance has a five-minute bound and
 checks a fixed positive `odbc` advisory and original-source detail. Full-history
 acceptance has a one-hour bound, retains resumable checkpoints, and reports traversal
 completion separately from projection completeness. A timeout is incomplete
