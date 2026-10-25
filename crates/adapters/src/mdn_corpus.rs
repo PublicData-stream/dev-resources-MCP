@@ -744,7 +744,7 @@ impl MdnCorpus {
                 member.gaps.push("projection_member_limit".into());
             } else {
                 let body = git
-                    .read_blob(&entry.oid, 4 * 1024 * 1024, cancel.clone())
+                    .read_blob_known_length(&entry.oid, bytes, 4 * 1024 * 1024, cancel.clone())
                     .await?;
                 let artifact = self.raw.capture_bytes(body.clone(), cancel.clone()).await?;
                 raw = encoded(&artifact)?;

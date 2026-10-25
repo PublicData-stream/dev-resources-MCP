@@ -40,5 +40,5 @@ port=$(docker port "$run_id" 5432/tcp | sed 's/.*://')
 export DATABASE_URL="postgres://devres:acceptance-only@127.0.0.1:$port/devres"
 export BLOB_DIR="$DEVRES_MDN_ACCEPTANCE_ROOT/blobs"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/buildcache/rust/target}
-cargo build --locked -p devres-adapters --example mdn-probe
-"$CARGO_TARGET_DIR/debug/examples/mdn-probe" "$@"
+cargo build --release --locked -p devres-adapters --example mdn-probe
+"$CARGO_TARGET_DIR/release/examples/mdn-probe" "$@"

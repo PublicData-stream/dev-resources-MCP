@@ -967,13 +967,47 @@ impl MdnGit {
         }
         let deadline = Instant::now() + READ_RUNTIME;
         let length = self.blob_length(oid, &cancel, deadline).await?;
+        self.read_blob_at_length(oid, length, max_bytes, &cancel, deadline)
+            .await
+    }
+    /// Use a size already observed from this owned repository, without a second
+    /// metadata subprocess. The actual body length and Git object hash are still
+    /// verified before any bytes are returned.
+    pub async fn read_blob_known_length(
+        &self,
+        oid: &str,
+        length: u64,
+        max_bytes: usize,
+        cancel: CancellationToken,
+    ) -> Result<Vec<u8>> {
+        check_oid(oid)?;
+        if max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
+            return Err(Error::invalid("Invalid MDN blob read budget."));
+        }
+        self.read_blob_at_length(
+            oid,
+            length,
+            max_bytes,
+            &cancel,
+            Instant::now() + READ_RUNTIME,
+        )
+        .await
+    }
+    async fn read_blob_at_length(
+        &self,
+        oid: &str,
+        length: u64,
+        max_bytes: usize,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
         if length > max_bytes as u64 {
             return Err(Error::capacity(
                 "MDN blob exceeds the projection input budget.",
             ));
         }
         let bytes = self
-            .run(&["cat-file", "blob", oid], max_bytes, &cancel, deadline)
+            .run(&["cat-file", "blob", oid], max_bytes, cancel, deadline)
             .await?;
         if bytes.len() as u64 != length {
             return Err(Error::integrity("MDN blob length mismatch."));
@@ -1712,6 +1746,35 @@ pub(crate) mod tests {
                 .unwrap(),
             b"second\n"
         );
+        assert_eq!(
+            git.read_blob_known_length(&blob, 7, 1024, CancellationToken::new())
+                .await
+                .unwrap(),
+            b"second\n"
+        );
+        for length in [6, 8] {
+            assert_eq!(
+                git.read_blob_known_length(&blob, length, 1024, CancellationToken::new())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "integrity"
+            );
+        }
+        assert_eq!(
+            git.read_blob_known_length(&blob, 7, 6, CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code,
+            "capacity"
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            git.read_blob_known_length(&blob, 7, 1024, cancelled)
+                .await
+                .is_err()
+        );
         let mut compressed =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         compressed.write_all(b"blob 7\0tamper\n").unwrap();
@@ -1729,6 +1792,13 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             git.read_blob(&blob, 1024, CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        assert_eq!(
+            git.read_blob_known_length(&blob, 7, 1024, CancellationToken::new())
                 .await
                 .unwrap_err()
                 .code,
