@@ -12,6 +12,13 @@ if [[ -z ${DEVRES_MDN_ACCEPTANCE_ROOT:-} ]]; then
   printf 'devres-mdn-retained-acceptance-v1\n' > "$DEVRES_MDN_ACCEPTANCE_ROOT/owner-v1"
 fi
 test "$(cat "$DEVRES_MDN_ACCEPTANCE_ROOT/owner-v1")" = devres-mdn-retained-acceptance-v1 || { echo 'Unowned acceptance directory' >&2; exit 1; }
+DEVRES_MDN_ACCEPTANCE_ROOT=$(cd -- "$DEVRES_MDN_ACCEPTANCE_ROOT" && pwd -P)
+exec 9> "$DEVRES_MDN_ACCEPTANCE_ROOT/acceptance.lock"
+flock -n 9 || { echo 'Retained MDN acceptance is already running for this directory' >&2; exit 1; }
+for mdn_owner_label in devres.mdn-acceptance-owner devres.mdn-integrity-owner; do
+  mdn_running=$(docker ps -q --filter "label=$mdn_owner_label=$DEVRES_MDN_ACCEPTANCE_ROOT")
+  [[ -z $mdn_running ]] || { echo 'Retained MDN PostgreSQL is still running for this directory' >&2; exit 1; }
+done
 if [[ -f $DEVRES_MDN_ACCEPTANCE_ROOT/volume.json ]] && ! mountpoint -q "$DEVRES_MDN_ACCEPTANCE_ROOT/native"; then
   echo 'Retained native volume is not mounted; restore the mount recorded in volume.json before resuming' >&2
   exit 1
@@ -20,7 +27,10 @@ mkdir -p "$DEVRES_MDN_ACCEPTANCE_ROOT/blobs" "$DEVRES_MDN_ACCEPTANCE_ROOT/postgr
 run_id="devres-mdn-acceptance-$$"
 cleanup() {
   status=$?
-  if [[ $(docker inspect --format '{{index .Config.Labels "devres.mdn-acceptance-owner"}}' "$run_id" 2>/dev/null) == "$DEVRES_MDN_ACCEPTANCE_ROOT" ]]; then docker rm -f "$run_id" >/dev/null 2>&1 || true; fi
+  if [[ $(docker inspect --format '{{index .Config.Labels "devres.mdn-acceptance-owner"}}' "$run_id" 2>/dev/null) == "$DEVRES_MDN_ACCEPTANCE_ROOT" ]]; then
+    docker stop --time 30 "$run_id" >/dev/null 2>&1 || true
+    docker rm -f "$run_id" >/dev/null 2>&1 || true
+  fi
   echo "Retained MDN evidence: $DEVRES_MDN_ACCEPTANCE_ROOT" >&2
   exit "$status"
 }

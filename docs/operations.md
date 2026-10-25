@@ -381,9 +381,14 @@ container; it retains database files, raw evidence, projections, indexes and
 checkpoints after failure or success. Do not place these artifacts in disposable
 fixture cleanup paths. The low-level example requires dedicated `DATABASE_URL`,
 `BLOB_DIR` and the matching ownership marker; never point it at production storage.
-The driver requires Docker and passwordless `sudo` for fixed read-only storage
+The driver requires Docker, `flock`, and passwordless `sudo` for fixed read-only storage
 accounting of the container-owned PostgreSQL directory. It builds and runs the
 locked release probe so full-history processing does not use a debug executable.
+The script holds an exclusive directory lock through container cleanup and its
+child processes. A second invocation fails before starting PostgreSQL; wait for
+the previous invocation to exit before resuming the same directory. A surviving
+owned PostgreSQL container also prevents restart. Cleanup requests a graceful
+PostgreSQL shutdown before removing only the owned container.
 
 The durable attempt ledger reserves at most 20 shared upstream HTTP attempts,
 including retries, before requests are sent. Restart does not renew the allowance;
