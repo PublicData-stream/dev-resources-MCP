@@ -694,7 +694,11 @@ impl MdnIndex {
                         return Err(integrity());
                     }
                     register(&index)?;
-                    let reader = index.reader().map_err(|_| failure())?;
+                    let reader = index
+                        .reader_builder()
+                        .reload_policy(tantivy::ReloadPolicy::Manual)
+                        .try_into()
+                        .map_err(|_| failure())?;
                     let searcher = reader.searcher();
                     if searcher.num_docs() != shard.documents as u64 {
                         return Err(integrity());
