@@ -20,8 +20,8 @@ use tantivy::{
     collector::{Collector, Count, SegmentCollector, TopDocs},
     indexer::IndexWriterOptions,
     query::{
-        AllQuery, Bm25StatisticsProvider, BooleanQuery, Occur, PhraseQuery, Query, TermQuery,
-        TermSetQuery,
+        AllQuery, Bm25StatisticsProvider, BooleanQuery, EnableScoring, Occur, PhraseQuery, Query,
+        TermQuery, TermSetQuery, Weight,
     },
     schema::{
         FAST, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
@@ -783,9 +783,16 @@ impl MdnIndex {
         }
         let s = schema();
         let idfield = field(&s, "id")?;
-        let member_query: Box<dyn Query> = Box::new(TermSetQuery::new(
-            members.iter().map(|id| Term::from_field_text(idfield, id)),
-        ));
+        let member_query: Box<dyn Query> = Box::new(
+            PreparedQuery::new(
+                Box::new(TermSetQuery::new(
+                    members.iter().map(|id| Term::from_field_text(idfield, id)),
+                )),
+                &s,
+            )
+            .map_err(|_| integrity())?,
+        );
+        check(cancel, deadline)?;
         let opened = self.open(reference, cancel, deadline)?;
         let mut technical = 0u64;
         let mut english = 0u64;
@@ -859,7 +866,17 @@ impl MdnIndex {
                 )),
             ));
         }
-        let query = BooleanQuery::new(clauses);
+        let query: Box<dyn Query> = if spec.query.is_some() {
+            Box::new(BooleanQuery::new(clauses))
+        } else {
+            // Exact-filter requests rank only by the stable tie field. Their
+            // scores are discarded, so prepare without unused BM25 statistics.
+            Box::new(
+                PreparedQuery::new(Box::new(BooleanQuery::new(clauses)), &s)
+                    .map_err(|_| check(cancel, deadline).err().unwrap_or_else(failure))?,
+            )
+        };
+        check(cancel, deadline)?;
         let fingerprint = hash(
             &serde_json::to_vec(&(
                 reference,
@@ -929,7 +946,7 @@ impl MdnIndex {
                         rank
                     }
                 });
-            let (count, hits) = statistics.search(searcher, &query, &(Count, top))?;
+            let (count, hits) = statistics.search(searcher, query.as_ref(), &(Count, top))?;
             if broken.load(AtomicOrdering::Relaxed) {
                 return Err(integrity());
             }
@@ -1046,6 +1063,77 @@ impl SegmentCollector for SegmentTotals {
     }
 }
 static CACHE: OnceLock<Mutex<HashMap<String, Arc<Opened>>>> = OnceLock::new();
+/// A schema-only non-scoring weight shared across verified identical schemas.
+/// Used only for membership and exact-filter queries, never scored text queries.
+#[derive(Clone)]
+struct PreparedQuery {
+    query: Arc<dyn Query>,
+    weight: Arc<dyn Weight>,
+}
+impl PreparedQuery {
+    fn new(query: Box<dyn Query>, schema: &Schema) -> tantivy::Result<Self> {
+        let weight = query.weight(EnableScoring::disabled_from_schema(schema))?;
+        Ok(Self {
+            query: Arc::from(query),
+            weight: Arc::from(weight),
+        })
+    }
+}
+impl std::fmt::Debug for PreparedQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedQuery")
+    }
+}
+impl Query for PreparedQuery {
+    fn weight(&self, _: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.clone()))
+    }
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.query.query_terms(visitor);
+    }
+}
+impl Weight for PreparedQuery {
+    fn scorer(
+        &self,
+        reader: &tantivy::SegmentReader,
+        boost: tantivy::Score,
+    ) -> tantivy::Result<Box<dyn tantivy::query::Scorer>> {
+        self.weight.scorer(reader, boost)
+    }
+    fn explain(
+        &self,
+        reader: &tantivy::SegmentReader,
+        doc: tantivy::DocId,
+    ) -> tantivy::Result<tantivy::query::Explanation> {
+        self.weight.explain(reader, doc)
+    }
+    fn count(&self, reader: &tantivy::SegmentReader) -> tantivy::Result<u32> {
+        self.weight.count(reader)
+    }
+    fn for_each(
+        &self,
+        reader: &tantivy::SegmentReader,
+        callback: &mut dyn FnMut(tantivy::DocId, tantivy::Score),
+    ) -> tantivy::Result<()> {
+        self.weight.for_each(reader, callback)
+    }
+    fn for_each_no_score(
+        &self,
+        reader: &tantivy::SegmentReader,
+        callback: &mut dyn FnMut(&[tantivy::DocId]),
+    ) -> tantivy::Result<()> {
+        self.weight.for_each_no_score(reader, callback)
+    }
+    fn for_each_pruning(
+        &self,
+        threshold: tantivy::Score,
+        reader: &tantivy::SegmentReader,
+        callback: &mut dyn FnMut(tantivy::DocId, tantivy::Score) -> tantivy::Score,
+    ) -> tantivy::Result<()> {
+        self.weight.for_each_pruning(threshold, reader, callback)
+    }
+}
+
 struct SelectedStatistics<'a> {
     opened: &'a Opened,
     membership: Box<dyn Query>,
@@ -1288,6 +1376,131 @@ mod tests {
             text: text.into(),
             metadata: json!({"status":["experimental"]}),
         }
+    }
+    #[tokio::test]
+    async fn prepared_membership_and_exact_filters_keep_cross_shard_counts_and_cursor_order() {
+        struct NoScoringStatistics;
+        impl Bm25StatisticsProvider for NoScoringStatistics {
+            fn total_num_tokens(&self, _: Field) -> tantivy::Result<u64> {
+                Err(tantivy::TantivyError::InvalidArgument(
+                    "unused statistics requested".into(),
+                ))
+            }
+            fn total_num_docs(&self) -> tantivy::Result<u64> {
+                Err(tantivy::TantivyError::InvalidArgument(
+                    "unused statistics requested".into(),
+                ))
+            }
+            fn doc_freq(&self, _: &Term) -> tantivy::Result<u64> {
+                Err(tantivy::TantivyError::InvalidArgument(
+                    "unused statistics requested".into(),
+                ))
+            }
+        }
+        let _gate = TEST_GATE.lock().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let index = MdnIndex::new(dir.path()).expect("index");
+        let mut a = doc("prepared-a", "SelectedA", "fetch network");
+        let mut b = doc("prepared-b", "SelectedB", "fetch requests network");
+        a.path = "shared/source.json".into();
+        b.path = a.path.clone();
+        let stale = doc("prepared-stale", "Stale", "fetch stale network");
+        let mut reference = None;
+        for document in [a.clone(), stale, b.clone()] {
+            reference = Some(
+                index
+                    .publish(reference.as_ref(), vec![document], CancellationToken::new())
+                    .await
+                    .expect("independent shard"),
+            );
+        }
+        let reference = reference.unwrap();
+        let ids = BTreeSet::from([a.id.clone(), b.id.clone()]);
+        let cancel = CancellationToken::new();
+        let opened = index
+            .open(
+                &reference,
+                &cancel,
+                Instant::now() + Duration::from_secs(15),
+            )
+            .expect("verified shards");
+        let s = schema();
+        let plain = TermSetQuery::new(
+            ids.iter()
+                .map(|id| Term::from_field_text(field(&s, "id").unwrap(), id)),
+        );
+        let prepared =
+            PreparedQuery::new(Box::new(plain.clone()), &s).expect("prepared membership");
+        let exact = PreparedQuery::new(
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(prepared.clone())),
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field(&s, "path").unwrap(), &a.path),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ])),
+            &s,
+        )
+        .expect("prepared exact filter");
+        let mut total = 0;
+        for shard in &opened.shards {
+            let baseline = shard
+                .searcher
+                .search(&plain, &TokenTotals)
+                .expect("unprepared totals");
+            let reused = shard
+                .searcher
+                .search(&prepared, &TokenTotals)
+                .expect("reused totals");
+            assert_eq!(
+                reused, baseline,
+                "one weight applies to independent searchers and their native token columns"
+            );
+            total += reused.0;
+            let (matches, hits) = shard
+                .searcher
+                .search_with_statistics_provider(
+                    &exact,
+                    &(Count, TopDocs::with_limit(10).order_by_score()),
+                    &NoScoringStatistics,
+                )
+                .expect("exact filters must not request BM25 statistics");
+            assert_eq!(matches as u64, reused.0);
+            assert_eq!(hits.len(), matches);
+        }
+        assert_eq!(total, 2);
+        let spec = SearchSpec {
+            filters: BTreeMap::from([
+                ("path".into(), a.path),
+                ("status".into(), "experimental".into()),
+            ]),
+            limit: 1,
+            ..Default::default()
+        };
+        let first = index
+            .search(
+                &reference,
+                ids.clone(),
+                spec.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("exact first page");
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["results"][0]["slug"], "SelectedA");
+        assert_eq!(first["results"][0]["score"], 0.0);
+        let mut next = spec;
+        next.cursor = Some(first["next_cursor"].as_str().expect("cursor").into());
+        let second = index
+            .search(&reference, ids, next, CancellationToken::new())
+            .await
+            .expect("exact second page");
+        assert_eq!(second["results"][0]["slug"], "SelectedB");
+        assert_eq!(second["results"][0]["score"], 0.0);
+        assert!(second["next_cursor"].is_null());
     }
     #[tokio::test]
     async fn statistics_search_preserves_deadline_cancellation_and_hides_unrelated_errors() {
