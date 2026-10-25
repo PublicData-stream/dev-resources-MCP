@@ -97,6 +97,13 @@ fn digest(bytes: &[u8]) -> String {
 fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|_| Error::integrity("RustSec evidence encoding failed."))
 }
+// Only the shared bounded-operation deadline marker is a scheduling yield.
+// Quotas, output limits and integrity failures remain failures even at this instant.
+fn batch_deadline_exhausted(error: &Error, deadline: Instant) -> bool {
+    error.code == "capacity"
+        && error.message == "Bulk operation deadline exceeded."
+        && Instant::now() >= deadline
+}
 struct CommitOrderStage(PathBuf);
 impl Drop for CommitOrderStage {
     fn drop(&mut self) {
@@ -743,7 +750,15 @@ impl AdvisoryHistory {
         state: &mut HistoryState,
         shutdown: CancellationToken,
     ) -> Result<()> {
-        let deadline = Instant::now() + BATCH_RUNTIME;
+        self.process_batch_until(state, shutdown, Instant::now() + BATCH_RUNTIME)
+            .await
+    }
+    async fn process_batch_until(
+        &self,
+        state: &mut HistoryState,
+        shutdown: CancellationToken,
+        deadline: Instant,
+    ) -> Result<()> {
         let manifest = self
             .read_manifest(&state.manifest, shutdown.clone())
             .await?;
@@ -769,8 +784,12 @@ impl AdvisoryHistory {
             if Instant::now() >= deadline || shutdown.is_cancelled() {
                 break;
             }
-            let Some(line) = delimited(&mut reader, b'\n', 64 * 1024, &shutdown, deadline).await?
-            else {
+            let line = match delimited(&mut reader, b'\n', 64 * 1024, &shutdown, deadline).await {
+                Ok(line) => line,
+                Err(error) if batch_deadline_exhausted(&error, deadline) => break,
+                Err(error) => return Err(error),
+            };
+            let Some(line) = line else {
                 if state.processed != state.total {
                     return Err(Error::integrity(
                         "RustSec commit-order evidence is truncated.",
@@ -780,7 +799,7 @@ impl AdvisoryHistory {
                 break;
             };
             let commit = parse_commit_line(&line)?;
-            if !self
+            match self
                 .process_commit(
                     &commit,
                     &state.observation_id,
@@ -788,9 +807,12 @@ impl AdvisoryHistory {
                     deadline,
                     MAX_PROJECTED_RECORDS,
                 )
-                .await?
+                .await
             {
-                break;
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) if batch_deadline_exhausted(&error, deadline) => break,
+                Err(error) => return Err(error),
             }
             state.offset += line.len() as u64 + 1;
             state.processed += 1;
@@ -977,12 +999,8 @@ impl AdvisoryHistory {
                                 .await
                             {
                                 Ok(bytes) => bytes,
-                                Err(error) if error.code == "capacity" => {
-                                    if Instant::now() >= deadline {
-                                        break;
-                                    }
-                                    Vec::new()
-                                }
+                                Err(error) if batch_deadline_exhausted(&error, deadline) => break,
+                                Err(error) if error.code == "capacity" => Vec::new(),
                                 Err(error) => return Err(error),
                             }
                         } else {
@@ -1391,6 +1409,8 @@ mod tests {
         defaults: Mutex<BTreeMap<String, String>>,
         projection_prefetches: Mutex<Vec<usize>>,
         single_projection_reads: Mutex<usize>,
+        commit_lookup_delay: Mutex<Option<Duration>>,
+        commit_lookup_failure: Mutex<Option<Error>>,
     }
     #[async_trait]
     impl AdvisoryStore for Memory {
@@ -1475,6 +1495,15 @@ mod tests {
                 .collect())
         }
         async fn advisory_row(&self, kind: &str, key: &str) -> Result<Option<AdvisoryRow>> {
+            if kind == "commits" {
+                let delay = self.commit_lookup_delay.lock().await.take();
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                if let Some(error) = self.commit_lookup_failure.lock().await.take() {
+                    return Err(error);
+                }
+            }
             if kind == "git-projections" {
                 *self.single_projection_reads.lock().await += 1;
             }
@@ -2525,5 +2554,167 @@ mod tests {
                 2
             );
         }
+    }
+    #[tokio::test]
+    async fn batch_deadline_yields_last_checkpoint_and_resumes_without_hiding_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = Arc::new(Memory::default());
+        let history = AdvisoryHistory::new(
+            memory.clone(),
+            Arc::new(BulkBroker::new(Default::default()).unwrap()),
+            root.path(),
+            config(),
+        )
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        history
+            .initialize(&shutdown, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let first = commit(
+            &history,
+            Some("crates/example/RUSTSEC-2024-0001.md"),
+            advisory(),
+            &[],
+        )
+        .await;
+        let second = commit(&history, None, b"", &[&first]).await;
+        update(&history, "refs/heads/main", &second).await;
+        history
+            .run(
+                &["repack", "-a", "-d", "--no-write-bitmap-index"],
+                4096,
+                &shutdown,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let (commits, total_commits) = history
+            .capture_commit_order(&shutdown, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let packs = history.capture_packs(shutdown.clone()).await.unwrap();
+        let manifest = Manifest {
+            version: 1,
+            source_url: SOURCE.into(),
+            observed_at: devres_domain::unix_now(),
+            refs: vec![RefEvidence {
+                name: "refs/heads/main".into(),
+                oid: second.clone(),
+                object_type: "commit".into(),
+                peeled_commit: Some(second.clone()),
+                snapshots: BTreeMap::new(),
+            }],
+            roots: vec![second],
+            packs,
+            commits,
+            total_commits,
+        };
+        let artifact = history
+            .artifacts
+            .capture_bytes(encoded(&manifest).unwrap(), shutdown.clone())
+            .await
+            .unwrap();
+        let observation = artifact.body_hash.clone();
+        memory
+            .put_advisory_row(
+                "refs",
+                &observation,
+                &json!({"id":observation,"refs":manifest.refs,"manifest":artifact}),
+            )
+            .await
+            .unwrap();
+        let mut state = HistoryState {
+            manifest: artifact,
+            observation_id: observation.clone(),
+            observed_at: manifest.observed_at,
+            offset: 0,
+            processed: 0,
+            total: total_commits,
+            complete: false,
+            projection_complete: true,
+        };
+        let file = history
+            .artifacts
+            .open(
+                &manifest.commits.body_hash,
+                128 * 1024 * 1024,
+                shutdown.clone(),
+            )
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(file);
+        let line = delimited(
+            &mut reader,
+            b'\n',
+            64 * 1024,
+            &shutdown,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let first_commit = parse_commit_line(&line).unwrap();
+        assert!(
+            history
+                .process_commit(
+                    &first_commit,
+                    &observation,
+                    &shutdown,
+                    Instant::now() + Duration::from_secs(10),
+                    MAX_PROJECTED_RECORDS
+                )
+                .await
+                .unwrap()
+        );
+        state.offset = line.len() as u64 + 1;
+        state.processed = 1;
+        let previous_offset = state.offset;
+        *memory.commit_lookup_failure.lock().await = Some(Error::capacity(
+            "Fixture quota exhausted before batch deadline.",
+        ));
+        let failure = history
+            .process_batch_until(
+                &mut state,
+                shutdown.clone(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "capacity");
+        assert!(failure.message.contains("quota"));
+        assert_eq!(state.processed, 1);
+        assert_eq!(state.offset, previous_offset);
+        *memory.commit_lookup_delay.lock().await = Some(Duration::from_millis(300));
+        history
+            .process_batch_until(
+                &mut state,
+                shutdown.clone(),
+                Instant::now() + Duration::from_millis(200),
+            )
+            .await
+            .unwrap();
+        assert!(
+            memory.commit_lookup_delay.lock().await.is_none(),
+            "forced deadline must race inside commit processing"
+        );
+        assert_eq!(state.processed, 1);
+        assert_eq!(state.offset, previous_offset);
+        assert!(!state.complete);
+        let retained = memory.advisory_state("history").await.unwrap().unwrap();
+        assert_eq!(retained["processed"], 1);
+        assert_eq!(retained["offset"], previous_offset);
+        history.process_batch(&mut state, shutdown).await.unwrap();
+        assert!(state.complete);
+        assert_eq!(state.processed, 2);
+        assert!(state.offset > previous_offset);
+        assert!(
+            memory
+                .advisory_state("history-retry")
+                .await
+                .unwrap()
+                .is_none(),
+            "normal batch yield must not schedule provider failure backoff"
+        );
     }
 }
