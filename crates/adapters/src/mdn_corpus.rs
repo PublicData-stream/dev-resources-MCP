@@ -907,7 +907,6 @@ impl MdnCorpus {
                                 metadata,
                             };
                             let mut data = encoded(&doc)?;
-                            data["source_oid"] = json!(entry.oid);
                             data["source_path"] = json!(entry.path);
                             data["processor_version"] = json!(PROCESSOR_VERSION);
                             let index =
@@ -1328,6 +1327,110 @@ impl MdnCorpus {
         self.update_status().await?;
         Ok(complete)
     }
+    /// Repair only the already selected source pair during offline maintenance.
+    /// Its observation evidence and freshness remain exactly the same.
+    async fn repair_rebuilt_default(&self) -> Result<()> {
+        let Some(selected) = self.store.mdn_state("default-view").await? else {
+            return Ok(());
+        };
+        let selected = selected
+            .as_str()
+            .filter(|id| crate::bulk::valid_hash(id))
+            .ok_or_else(|| Error::integrity("Invalid MDN default view identity."))?;
+        let row = self
+            .store
+            .mdn_get("views", selected)
+            .await?
+            .ok_or_else(|| Error::integrity("Missing MDN default view."))?;
+        let mut view: View = decoded(row.data)?;
+        let identity = inventory::digest(
+            &serde_json::to_vec(&(
+                &view.content,
+                &view.compatibility,
+                &view.content_observation,
+                &view.compatibility_observation,
+                view.validated_at,
+            ))
+            .map_err(|_| Error::integrity("Invalid MDN default view."))?,
+        );
+        if view.id != selected || view.id != identity || view.validated_at <= 0 {
+            return Err(Error::integrity("Invalid MDN default view identity."));
+        }
+        let mut repaired = Vec::with_capacity(2);
+        for (id, repository) in [(&view.content, "content"), (&view.compatibility, "compat")] {
+            if !crate::bulk::valid_hash(id) {
+                return Err(Error::integrity("Invalid MDN default snapshot identity."));
+            }
+            let row = self
+                .store
+                .mdn_get("snapshots", id)
+                .await?
+                .ok_or_else(|| Error::integrity("Missing MDN default snapshot."))?;
+            let original: Snapshot = decoded(row.data)?;
+            if original.id != *id
+                || original.repository != repository
+                || original.revision.len() != 40
+                || !original
+                    .revision
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || original.index.is_null()
+                || original.coverage["accounted"] != true
+                || original.coverage["synthetic"] == true
+            {
+                return Err(Error::integrity("Invalid MDN default snapshot identity."));
+            }
+            let key = format!(
+                "rebuild-alias:{repository}:{}:{}",
+                original.revision, original.processor_version
+            );
+            let alias =
+                self.store.mdn_state(&key).await?.ok_or_else(|| {
+                    Error::integrity("Missing MDN rebuilt default snapshot alias.")
+                })?;
+            let alias = alias
+                .as_str()
+                .filter(|id| crate::bulk::valid_hash(id))
+                .ok_or_else(|| Error::integrity("Invalid MDN rebuilt default snapshot alias."))?;
+            let row = self
+                .store
+                .mdn_get("snapshots", alias)
+                .await?
+                .ok_or_else(|| Error::integrity("Missing MDN rebuilt default snapshot."))?;
+            let snapshot: Snapshot = decoded(row.data)?;
+            if snapshot.id != alias
+                || snapshot.repository != repository
+                || snapshot.revision != original.revision
+                || snapshot.processor_version != original.processor_version
+                || snapshot.inventory != original.inventory
+                || snapshot.index.is_null()
+                || snapshot.coverage["accounted"] != true
+                || snapshot.coverage["synthetic"] == true
+            {
+                return Err(Error::integrity(
+                    "Invalid MDN rebuilt default snapshot evidence.",
+                ));
+            }
+            repaired.push(snapshot.id);
+        }
+        if view.content == repaired[0] && view.compatibility == repaired[1] {
+            return Ok(());
+        }
+        view.content = repaired.remove(0);
+        view.compatibility = repaired.remove(0);
+        view.id = inventory::digest(
+            &serde_json::to_vec(&(
+                &view.content,
+                &view.compatibility,
+                &view.content_observation,
+                &view.compatibility_observation,
+                view.validated_at,
+            ))
+            .map_err(|_| Error::integrity("Invalid MDN rebuilt default view."))?,
+        );
+        self.store.mdn_publish_view(&view).await
+    }
+
     /// Private offline maintenance: new derived generations never replace history.
     pub async fn rebuild_index(&self, cancel: CancellationToken) -> Result<Value> {
         let _guard = self.processing.lock().await;
@@ -1458,6 +1561,7 @@ impl MdnCorpus {
         self.store
             .mdn_set_state("index-checkpoint", &Value::Null)
             .await?;
+        self.repair_rebuilt_default().await?;
         self.publish_default().await?;
         self.update_status().await?;
         Ok(

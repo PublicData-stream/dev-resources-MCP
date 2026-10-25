@@ -177,6 +177,10 @@ version and source context; unchanged features moved between files cannot collid
 with immutable index documents. Includes bind their actual selected-tree inputs;
 reverse dependency observations invalidate unchanged callers, including callers
 whose earlier include processing failed.
+Generation 3 excludes the article's raw Git OID from its stored normalized
+projection. Identical normalized documents can share projections and search
+postings across formatting edits; the selected inventory member supplies the
+public raw OID. Earlier generation captures remain fixed and readable.
 
 Acquisition retains complete packs, commit order, refs and observation manifests.
 Bare Git state is reconstructable derived state. Current-main publication and
@@ -207,3 +211,6 @@ Independent content/BCD revisions and online observation identities are frozen i
 that view. Historical pairing requires explicit selection. Offline rebuilding
 publishes new derived generations and current views while preserving original
 snapshot IDs, including explicitly failing corrupt historical indexes.
+If collection is disabled during an upgrade, rebuilding can repair the existing
+older-generation default through its own aliases and frozen observations without
+renewing validation time or waiting for the new processing generation.

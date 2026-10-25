@@ -1222,7 +1222,7 @@ async fn mdn_corpus_history_resets_legacy_processing_generation_without_new_sour
             .await
             .expect("observation")
             .expect("captured");
-        fixture.store.mdn_set_state(&format!("{}-history",repo.as_str()),&json!({"observation":observation,"offset":observation.commits.bytes,"processed":observation.total_commits,"complete":true,"processor_version":0})).await.expect("legacy completed checkpoint");
+        fixture.store.mdn_set_state(&format!("{}-history",repo.as_str()),&json!({"observation":observation,"offset":observation.commits.bytes,"processed":observation.total_commits,"complete":true,"processor_version":2})).await.expect("legacy completed checkpoint");
     }
     let attempts = fixture.corpus.broker.attempt_count();
     fixture.server.abort();
@@ -1390,4 +1390,718 @@ async fn mdn_corpus_bcd_normalized_output_overflow_is_raw_retained_source_gap() 
         raw["page"]["text"],
         std::str::from_utf8(&bytes[..32]).expect("ASCII source")
     );
+}
+
+#[tokio::test]
+async fn mdn_corpus_style_only_html_edits_share_projection_but_pin_source_and_old_generation() {
+    const HTML_PATH: &str = "files/en-us/web/api/stable_style/index.html";
+    const ORIGINAL: &[u8] = b"---\ntitle: Stable style\nslug: Web/API/StableStyle\npage-type: guide\n---\n<h1>Stable style</h1><div class=\"note\" style=\"color: red\">Stable semantic content.</div>";
+    const RESTYLED: &[u8] = b"---\ntitle: Stable style\nslug: Web/API/StableStyle\npage-type: guide\n---\n<h1>Stable style</h1><div class=\"note\" style=\"color: blue\">Stable semantic content.</div>";
+    let fixture = Fixture::new().await;
+    fixture.current().await;
+    fixture.server.abort();
+    let attempts = fixture.corpus.broker.attempt_count();
+    // Write only disposable local Git objects after the frozen baseline; no
+    // synchronization or provider requests are needed to replay these trees.
+    let first_revision = commit_map(
+        &fixture.corpus.content,
+        &BTreeMap::from([(HTML_PATH, ORIGINAL.to_vec())]),
+        &[&fixture.content_revision],
+    )
+    .await;
+    let second_revision = commit_map(
+        &fixture.corpus.content,
+        &BTreeMap::from([(HTML_PATH, RESTYLED.to_vec())]),
+        &[&first_revision],
+    )
+    .await;
+    let mut snapshots = Vec::new();
+    for revision in [&first_revision, &second_revision] {
+        let mut done = false;
+        for _ in 0..30 {
+            if fixture
+                .corpus
+                .process_commit(Repo::Content, revision, false, CancellationToken::new())
+                .await
+                .expect("process retained HTML")
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "retained HTML commit finishes within fixture slices");
+        fixture
+            .corpus
+            .flush(CancellationToken::new())
+            .await
+            .expect("publish retained snapshot");
+        snapshots.push(
+            fixture
+                .corpus
+                .snapshot(Repo::Content, revision)
+                .await
+                .expect("snapshot lookup")
+                .expect("published snapshot"),
+        );
+    }
+    let first = &snapshots[0];
+    let second = &snapshots[1];
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.processor_version, 3);
+    assert_eq!(second.processor_version, 3);
+    let first_member = inventory::get(fixture.store.as_ref(), &first.inventory, HTML_PATH)
+        .await
+        .expect("first inventory")
+        .expect("first article");
+    let second_member = inventory::get(fixture.store.as_ref(), &second.inventory, HTML_PATH)
+        .await
+        .expect("second inventory")
+        .expect("second article");
+    assert_ne!(first_member.oid, second_member.oid);
+    assert_ne!(first_member.raw, second_member.raw);
+    assert_eq!(
+        first_member.projection, second_member.projection,
+        "style-only edits share normalized projections"
+    );
+    assert_eq!(
+        first.index, second.index,
+        "no duplicate index generation is needed"
+    );
+    let projection_id = first_member.projection.as_ref().expect("shared projection");
+    let projection = fixture
+        .store
+        .mdn_get("projections", projection_id)
+        .await
+        .expect("projection row")
+        .expect("retained projection")
+        .data;
+    assert!(
+        projection.get("source_oid").is_none(),
+        "source identity is not part of normalized evidence"
+    );
+    let indexed: IndexDocument = decoded(
+        fixture
+            .store
+            .mdn_get("index-documents", projection_id)
+            .await
+            .expect("index row")
+            .expect("shared index document")
+            .data,
+    )
+    .expect("index document");
+    assert_eq!(&indexed.id, projection_id);
+    let style_documents = fixture
+        .store
+        .rows
+        .lock()
+        .expect("rows")
+        .iter()
+        .filter(|((kind, _), row)| kind == "index-documents" && row.data["path"] == HTML_PATH)
+        .count();
+    assert_eq!(
+        style_documents, 1,
+        "both revisions use the same index document ID"
+    );
+    let mut text_resources = Vec::new();
+    let mut source_resources = Vec::new();
+    for (snapshot, member, source) in [
+        (first, &first_member, ORIGINAL),
+        (second, &second_member, RESTYLED),
+    ] {
+        let text = fixture
+            .text("Web/API/StableStyle", Some(&snapshot.id))
+            .await;
+        assert_eq!(text["oid"], member.oid);
+        assert_eq!(text["document"]["source_oid"], member.oid);
+        assert!(
+            text["page"]["text"]
+                .as_str()
+                .expect("normalized text")
+                .contains("Stable semantic content.")
+        );
+        let by_path = fixture
+            .corpus
+            .research()
+            .call("mdn_get", json!({"path":HTML_PATH,"snapshot":snapshot.id}))
+            .await
+            .expect("pinned path text");
+        assert_eq!(by_path["document"]["source_oid"], member.oid);
+        let text_uri = text["resource_uri"].as_str().expect("text URI").to_owned();
+        let resource = fixture
+            .corpus
+            .research()
+            .read_resource(&text_uri)
+            .await
+            .expect("pinned text resource");
+        assert_eq!(resource["contents"][0]["text"], text["page"]["text"]);
+        assert_eq!(
+            resource["contents"][0]["_meta"]["provenance"]["snapshot"],
+            snapshot.id
+        );
+        text_resources.push(text_uri);
+        let raw = fixture
+            .corpus
+            .research()
+            .call(
+                "mdn_get",
+                json!({"path":HTML_PATH,"snapshot":snapshot.id,"representation":"source"}),
+            )
+            .await
+            .expect("pinned raw HTML");
+        assert_eq!(raw["oid"], member.oid);
+        assert_eq!(
+            raw["page"]["text"],
+            std::str::from_utf8(source).expect("source UTF8")
+        );
+        let raw_uri = raw["resource_uri"].as_str().expect("source URI").to_owned();
+        assert_eq!(
+            fixture
+                .corpus
+                .research()
+                .read_resource(&raw_uri)
+                .await
+                .expect("original resource")["contents"][0]["text"],
+            std::str::from_utf8(source).expect("source UTF8")
+        );
+        source_resources.push(raw_uri);
+    }
+    assert_ne!(text_resources[0], text_resources[1]);
+    assert_ne!(source_resources[0], source_resources[1]);
+
+    // A retained generation-2 snapshot has its original projection and index;
+    // selecting its immutable ID must preserve the stored metadata verbatim.
+    let mut legacy_projection = projection.clone();
+    legacy_projection["processor_version"] = json!(2);
+    legacy_projection["source_oid"] = json!(first_member.oid);
+    let legacy_id =
+        inventory::digest(&serde_json::to_vec(&legacy_projection).expect("legacy encoding"));
+    fixture
+        .store
+        .mdn_put("projections", &legacy_id, &legacy_projection)
+        .await
+        .expect("retained v2 projection");
+    fixture
+        .store
+        .mdn_put(
+            "projection-headers",
+            &legacy_id,
+            &json!({"slug":"Web/API/StableStyle"}),
+        )
+        .await
+        .expect("retained v2 header");
+    let mut legacy_indexed = indexed;
+    legacy_indexed.id = legacy_id.clone();
+    fixture
+        .store
+        .mdn_put(
+            "index-documents",
+            &legacy_id,
+            &encoded(&legacy_indexed).expect("legacy document"),
+        )
+        .await
+        .expect("retained v2 index document");
+    let mut legacy_member = first_member.clone();
+    legacy_member.projection = Some(legacy_id.clone());
+    let legacy_inventory = inventory::update(
+        fixture.store.as_ref(),
+        &first.inventory,
+        HTML_PATH,
+        Some(legacy_member),
+    )
+    .await
+    .expect("retained v2 inventory");
+    let legacy_index = fixture
+        .corpus
+        .index
+        .publish(None, vec![legacy_indexed], CancellationToken::new())
+        .await
+        .expect("retained v2 index");
+    let mut legacy = first.clone();
+    legacy.id = inventory::digest(
+        &serde_json::to_vec(&("content", &first_revision, 2_u32, &legacy_inventory))
+            .expect("legacy identity"),
+    );
+    legacy.inventory = legacy_inventory;
+    legacy.processor_version = 2;
+    legacy.index = legacy_index;
+    let retained_snapshot = encoded(&legacy).expect("legacy snapshot");
+    fixture
+        .store
+        .mdn_put("snapshots", &legacy.id, &retained_snapshot)
+        .await
+        .expect("retained v2 snapshot");
+    fixture
+        .store
+        .mdn_put(
+            "snapshot-keys",
+            &format!("content:{first_revision}:2"),
+            &json!(legacy.id),
+        )
+        .await
+        .expect("retained v2 key");
+    let old = fixture.text("Web/API/StableStyle", Some(&legacy.id)).await;
+    let mut expected_metadata = legacy_projection.clone();
+    expected_metadata
+        .as_object_mut()
+        .expect("legacy metadata")
+        .remove("text");
+    assert_eq!(old["document"], expected_metadata);
+    assert_eq!(old["provenance"]["processor_version"], 2);
+    assert_eq!(old["document"]["source_oid"], first_member.oid);
+    assert_eq!(
+        fixture
+            .corpus
+            .research()
+            .call(
+                "mdn_get",
+                json!({"snapshot":legacy.id,"path":HTML_PATH,"representation":"source"})
+            )
+            .await
+            .expect("legacy original")["page"]["text"],
+        std::str::from_utf8(ORIGINAL).unwrap()
+    );
+    assert_eq!(
+        fixture
+            .corpus
+            .research()
+            .call(
+                "mdn_search",
+                json!({"snapshot":legacy.id,"query":"semantic"})
+            )
+            .await
+            .expect("legacy index remains readable")["results"]
+            .as_array()
+            .expect("legacy hits")
+            .len(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mdn_get("snapshots", &legacy.id)
+            .await
+            .expect("retained snapshot")
+            .expect("exists")
+            .data,
+        retained_snapshot
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mdn_get("projections", &legacy_id)
+            .await
+            .expect("retained projection")
+            .expect("exists")
+            .data,
+        legacy_projection
+    );
+    assert_eq!(
+        fixture.corpus.broker.attempt_count(),
+        attempts,
+        "generation processing and pinned reads use no provider requests"
+    );
+}
+
+#[tokio::test]
+async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renewing_sources() {
+    let fixture = Fixture::new().await;
+    assert!(
+        !fixture.corpus.config.enabled,
+        "collection remains disabled"
+    );
+    fixture.current().await;
+    let current_view_id = fixture
+        .store
+        .mdn_state("default-view")
+        .await
+        .unwrap()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut old_view: View = decoded(
+        fixture
+            .store
+            .mdn_get("views", &current_view_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    let mut originals = Vec::new();
+    let mut remove_keys = Vec::new();
+    for (repo, id) in [
+        (Repo::Content, &old_view.content),
+        (Repo::Compat, &old_view.compatibility),
+    ] {
+        let mut snapshot: Snapshot = decoded(
+            fixture
+                .store
+                .mdn_get("snapshots", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        remove_keys.push(("snapshots".to_owned(), snapshot.id.clone()));
+        remove_keys.push((
+            "snapshot-keys".to_owned(),
+            snapshot_key(repo, &snapshot.revision),
+        ));
+        snapshot.processor_version = 2;
+        snapshot.id = inventory::digest(
+            &serde_json::to_vec(&(
+                repo.as_str(),
+                &snapshot.revision,
+                2_u32,
+                &snapshot.inventory,
+            ))
+            .unwrap(),
+        );
+        fixture
+            .store
+            .mdn_put("snapshots", &snapshot.id, &encoded(&snapshot).unwrap())
+            .await
+            .unwrap();
+        fixture
+            .store
+            .mdn_put(
+                "snapshot-keys",
+                &format!("{}:{}:2", repo.as_str(), snapshot.revision),
+                &json!(snapshot.id),
+            )
+            .await
+            .unwrap();
+        originals.push(snapshot);
+    }
+    // The disposable store now models an installation whose only published
+    // processing generation is 2; generation 3 has never been collected.
+    {
+        let mut rows = fixture.store.rows.lock().unwrap();
+        for key in remove_keys {
+            rows.remove(&key);
+        }
+        rows.retain(|(kind, _), _| kind != "views");
+    }
+    fixture
+        .store
+        .states
+        .lock()
+        .unwrap()
+        .retain(|key, _| !key.starts_with("prepared:") && !key.starts_with("work:"));
+    old_view.content = originals[0].id.clone();
+    old_view.compatibility = originals[1].id.clone();
+    old_view.validated_at -= 60;
+    old_view.id = inventory::digest(
+        &serde_json::to_vec(&(
+            &old_view.content,
+            &old_view.compatibility,
+            &old_view.content_observation,
+            &old_view.compatibility_observation,
+            old_view.validated_at,
+        ))
+        .unwrap(),
+    );
+    fixture.store.mdn_publish_view(&old_view).await.unwrap();
+    assert!(
+        fixture
+            .corpus
+            .snapshot(Repo::Content, &fixture.content_revision)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .corpus
+            .snapshot(Repo::Compat, &fixture.compat_revision)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let old_view_data = encoded(&old_view).unwrap();
+    let old_snapshot_data = encoded(&originals[0]).unwrap();
+    let target = fixture._root.path().join("target");
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(target.join(originals[0].index["path"].as_str().unwrap())).unwrap(),
+    )
+    .unwrap();
+    let damaged = target
+        .join("mdn-indexes/shards")
+        .join(manifest["shard"]["id"].as_str().unwrap())
+        .join("meta.json");
+    std::fs::write(&damaged, b"corrupt legacy default fixture index").unwrap();
+    for index in 0..5 {
+        fixture
+            .corpus
+            .index
+            .publish(
+                None,
+                vec![IndexDocument {
+                    id: inventory::digest(format!("legacy-default-evict-{index}").as_bytes()),
+                    kind: "article".into(),
+                    slug: format!("Eviction{index}"),
+                    title: "Disposable reader eviction".into(),
+                    path: format!("eviction-{index}"),
+                    text: "Unrelated synthetic projection.".into(),
+                    metadata: json!({}),
+                }],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        fixture
+            .corpus
+            .research()
+            .call("mdn_search", json!({"query":"network"}))
+            .await
+            .is_err()
+    );
+    fixture.server.abort();
+    let attempts = fixture.corpus.broker.attempt_count();
+    let rebuilt = fixture
+        .corpus
+        .rebuild_index(CancellationToken::new())
+        .await
+        .expect("offline legacy-default repair");
+    assert_eq!(rebuilt["snapshots"], 2);
+    assert_eq!(rebuilt["network_requests"], 0);
+    let selected_id = fixture
+        .store
+        .mdn_state("default-view")
+        .await
+        .unwrap()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let selected: View = decoded(
+        fixture
+            .store
+            .mdn_get("views", &selected_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    assert_ne!(selected.id, old_view.id);
+    assert_ne!(selected.content, old_view.content);
+    assert_ne!(selected.compatibility, old_view.compatibility);
+    assert_eq!(selected.content_observation, old_view.content_observation);
+    assert_eq!(
+        selected.compatibility_observation,
+        old_view.compatibility_observation
+    );
+    assert_eq!(
+        selected.validated_at, old_view.validated_at,
+        "derived repair cannot renew source freshness"
+    );
+    assert_eq!(
+        selected.id,
+        inventory::digest(
+            &serde_json::to_vec(&(
+                &selected.content,
+                &selected.compatibility,
+                &selected.content_observation,
+                &selected.compatibility_observation,
+                selected.validated_at
+            ))
+            .unwrap()
+        )
+    );
+    for (id, original) in [
+        (&selected.content, &originals[0]),
+        (&selected.compatibility, &originals[1]),
+    ] {
+        let repaired: Snapshot = decoded(
+            fixture
+                .store
+                .mdn_get("snapshots", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        assert_eq!(repaired.processor_version, 2);
+        assert_eq!(repaired.repository, original.repository);
+        assert_eq!(repaired.revision, original.revision);
+        assert_eq!(repaired.inventory, original.inventory);
+        assert_eq!(repaired.coverage["rebuild_of"], original.id);
+        assert_eq!(
+            fixture
+                .store
+                .mdn_state(&format!(
+                    "rebuild-alias:{}:{}:2",
+                    original.repository, original.revision
+                ))
+                .await
+                .unwrap()
+                .unwrap(),
+            json!(id)
+        );
+    }
+    assert_eq!(
+        fixture
+            .store
+            .rows
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(kind, _)| kind == "views")
+            .count(),
+        2,
+        "one repaired view supplements the retained old pair"
+    );
+    let search = fixture
+        .corpus
+        .research()
+        .call("mdn_search", json!({"query":"network"}))
+        .await
+        .expect("repaired omitted-snapshot search");
+    assert!(
+        search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == FETCH_PATH)
+    );
+    assert_eq!(
+        fixture
+            .corpus
+            .research()
+            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .await
+            .expect("same compatibility source")["original"]["chrome"]["version_added"],
+        "42"
+    );
+    assert!(
+        fixture
+            .corpus
+            .research()
+            .call(
+                "mdn_search",
+                json!({"query":"network","snapshot":originals[0].id})
+            )
+            .await
+            .is_err(),
+        "immutable old pinned index remains broken"
+    );
+    assert_eq!(
+        fixture
+            .corpus
+            .research()
+            .call(
+                "mdn_get",
+                json!({"path":FETCH_PATH,"snapshot":originals[0].id,"representation":"source"})
+            )
+            .await
+            .expect("retained old raw source")["page"]["text"],
+        std::str::from_utf8(FETCH).unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mdn_get("views", &old_view.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        old_view_data
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mdn_get("snapshots", &originals[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        old_snapshot_data
+    );
+    assert_eq!(
+        std::fs::read(&damaged).unwrap(),
+        b"corrupt legacy default fixture index"
+    );
+    // A mismatched private alias cannot swap repositories or processing
+    // generations into the existing pair, even in the in-memory fixture store.
+    let content_alias = format!("rebuild-alias:content:{}:2", originals[0].revision);
+    fixture
+        .store
+        .mdn_set_state(&content_alias, &json!(selected.compatibility))
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .corpus
+            .repair_rebuilt_default()
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mdn_state("default-view")
+            .await
+            .unwrap()
+            .unwrap(),
+        json!(selected.id)
+    );
+    let mut wrong_version: Snapshot = decoded(
+        fixture
+            .store
+            .mdn_get("snapshots", &selected.content)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+    )
+    .unwrap();
+    wrong_version.id = inventory::digest(b"wrong-generation disposable rebuild alias");
+    wrong_version.processor_version = 3;
+    fixture
+        .store
+        .mdn_put(
+            "snapshots",
+            &wrong_version.id,
+            &encoded(&wrong_version).unwrap(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mdn_set_state(&content_alias, &json!(wrong_version.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .corpus
+            .repair_rebuilt_default()
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mdn_state("default-view")
+            .await
+            .unwrap()
+            .unwrap(),
+        json!(selected.id)
+    );
+    fixture
+        .store
+        .mdn_set_state(&content_alias, &json!(selected.content))
+        .await
+        .unwrap();
+    assert_eq!(fixture.corpus.broker.attempt_count(), attempts);
 }

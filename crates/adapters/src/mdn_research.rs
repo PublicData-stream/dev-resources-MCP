@@ -587,6 +587,11 @@ impl MdnResearch {
             let mut metadata = projection.clone();
             if let Some(object) = metadata.as_object_mut() {
                 object.remove("text");
+                // Generation 3 shares normalized articles across source-only edits.
+                // Their public source identity belongs to the selected member.
+                if selection.snapshot.processor_version >= 3 && member.kind == "article" {
+                    object.insert("source_oid".into(), json!(member.oid));
+                }
             }
             result["document"] = metadata;
             if let Some(compat) = &selection.compatibility
