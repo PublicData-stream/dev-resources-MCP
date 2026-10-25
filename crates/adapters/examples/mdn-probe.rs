@@ -2,11 +2,11 @@
 use devres_adapters::{
     MdnCorpus, PgBlobStore,
     bulk::{BulkBroker, BulkConfig},
-    mdn_git::Repo,
+    mdn_git::{CommitOrder, MdnGit, Observation, Repo},
     mdn_index::MdnIndex,
     mdn_inventory,
 };
-use devres_application::mdn::{MdnConfig, MdnStore, Snapshot};
+use devres_application::mdn::{MdnConfig, MdnStore, PROCESSOR_VERSION, Snapshot};
 use devres_domain::{Error, Result};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -168,6 +168,269 @@ async fn budget(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use devres_application::mdn::{MdnRow, View};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct HistoryStore {
+        rows: Mutex<BTreeMap<(String, String), MdnRow>>,
+        states: Mutex<BTreeMap<String, Value>>,
+    }
+    impl HistoryStore {
+        fn insert(&self, kind: &str, key: &str, data: Value) {
+            let mut rows = self.rows.lock().unwrap();
+            let sequence = rows.len() as i64 + 1;
+            rows.insert(
+                (kind.into(), key.into()),
+                MdnRow {
+                    sequence,
+                    key: key.into(),
+                    data,
+                },
+            );
+        }
+        fn snapshot(&self, commit: &CommitOrder, version: u32, suffix: &str) -> Snapshot {
+            let snapshot = Snapshot {
+                id: mdn_inventory::digest(
+                    format!("{}:{version}:{suffix}", commit.revision).as_bytes(),
+                ),
+                repository: "content".into(),
+                revision: commit.revision.clone(),
+                tree: "a".repeat(40),
+                parents: commit.parents.clone(),
+                committed_at: commit.committed_at,
+                inventory: mdn_inventory::digest(commit.revision.as_bytes()),
+                processor_version: version,
+                index: json!({"fixture":suffix}),
+                coverage: json!({"accounted":true}),
+            };
+            self.insert(
+                "snapshots",
+                &snapshot.id,
+                serde_json::to_value(&snapshot).unwrap(),
+            );
+            snapshot
+        }
+        fn original(&self, snapshot: &Snapshot) {
+            self.insert(
+                "snapshot-keys",
+                &format!(
+                    "content:{}:{}",
+                    snapshot.revision, snapshot.processor_version
+                ),
+                json!(snapshot.id),
+            );
+        }
+    }
+    #[async_trait]
+    impl MdnStore for HistoryStore {
+        async fn mdn_cutoff(&self) -> Result<i64> {
+            panic!("sampler must not discover unrelated history")
+        }
+        async fn mdn_get(&self, kind: &str, key: &str) -> Result<Option<MdnRow>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(kind.into(), key.into()))
+                .cloned())
+        }
+        async fn mdn_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
+            self.insert(kind, key, data.clone());
+            Ok(self.mdn_get(kind, key).await?.unwrap().sequence)
+        }
+        async fn mdn_rows(&self, _: &str, _: i64, _: usize, _: Option<i64>) -> Result<Vec<MdnRow>> {
+            panic!("sampler must not scan generations or unrelated revisions")
+        }
+        async fn mdn_state(&self, key: &str) -> Result<Option<Value>> {
+            Ok(self.states.lock().unwrap().get(key).cloned())
+        }
+        async fn mdn_set_state(&self, _: &str, _: &Value) -> Result<()> {
+            panic!("read-only sampler")
+        }
+        async fn mdn_publish_view(&self, _: &View) -> Result<()> {
+            panic!("read-only sampler")
+        }
+    }
+    fn commit(n: u32) -> CommitOrder {
+        CommitOrder {
+            revision: format!("{n:040x}"),
+            parents: if n == 2 {
+                vec!["a".repeat(40), "b".repeat(40)]
+            } else {
+                Vec::new()
+            },
+            committed_at: i64::from(n),
+        }
+    }
+    #[tokio::test]
+    async fn frozen_samples_ignore_legacy_duplicates_and_extra_revisions_use_current_alias() {
+        let store = HistoryStore::default();
+        let commits: Vec<_> = (1..=5).map(commit).collect();
+        let mut current = Vec::new();
+        for commit in &commits {
+            let legacy = store.snapshot(commit, 2, "corrupt-old-index");
+            store.original(&legacy);
+            store.snapshot(commit, 2, "retained-repaired-index");
+            let snapshot = store.snapshot(commit, PROCESSOR_VERSION, "original");
+            store.original(&snapshot);
+            current.push(snapshot);
+        }
+        let repaired = store.snapshot(&commits[2], PROCESSOR_VERSION, "repaired");
+        store.states.lock().unwrap().insert(
+            format!(
+                "rebuild-alias:content:{}:{PROCESSOR_VERSION}",
+                commits[2].revision
+            ),
+            json!(repaired.id),
+        );
+        let unrelated =
+            store.snapshot(&commit(99), PROCESSOR_VERSION, "outside-frozen-observation");
+        store.original(&unrelated);
+        let mut samples = HistorySamples::new(5, Some(commits[3].revision.clone())).unwrap();
+        for commit in &commits {
+            samples.push(&store, "content", commit).await.unwrap();
+        }
+        let selected = samples.finish().unwrap();
+        assert_eq!(selected["oldest"].id, current[0].id);
+        assert_eq!(selected["recent"].id, current[4].id);
+        assert_eq!(selected["middle"].id, repaired.id);
+        assert_eq!(selected["merge"].id, current[1].id);
+        assert_eq!(selected["advertised_tip"].id, current[3].id);
+        assert!(
+            selected
+                .values()
+                .all(|s| s.processor_version == PROCESSOR_VERSION
+                    && s.revision != unrelated.revision)
+        );
+        let mut incomplete = HistorySamples::new(5, None).unwrap();
+        incomplete
+            .push(&store, "content", &commits[0])
+            .await
+            .unwrap();
+        assert!(
+            incomplete
+                .push(&store, "content", &commits[0])
+                .await
+                .is_err()
+        );
+        assert!(incomplete.finish().is_err());
+    }
+    #[tokio::test]
+    async fn missing_or_invalid_current_generation_never_falls_back_to_legacy() {
+        let store = HistoryStore::default();
+        let commit = commit(1);
+        let legacy = store.snapshot(&commit, 2, "readable-legacy");
+        store.original(&legacy);
+        assert!(
+            canonical_history_snapshot(&store, "content", &commit)
+                .await
+                .is_err()
+        );
+        let current = store.snapshot(&commit, PROCESSOR_VERSION, "current");
+        store.original(&current);
+        let key = format!(
+            "rebuild-alias:content:{}:{PROCESSOR_VERSION}",
+            commit.revision
+        );
+        store
+            .states
+            .lock()
+            .unwrap()
+            .insert(key.clone(), json!(legacy.id));
+        assert!(
+            canonical_history_snapshot(&store, "content", &commit)
+                .await
+                .is_err()
+        );
+        store
+            .states
+            .lock()
+            .unwrap()
+            .insert(key.clone(), json!("f".repeat(64)));
+        assert!(
+            canonical_history_snapshot(&store, "content", &commit)
+                .await
+                .is_err()
+        );
+        store.states.lock().unwrap().remove(&key);
+        let mut misbound = store.snapshot(&commit, PROCESSOR_VERSION, "wrong-inventory");
+        misbound.inventory = "e".repeat(64);
+        store.insert(
+            "snapshots",
+            &misbound.id,
+            serde_json::to_value(&misbound).unwrap(),
+        );
+        store
+            .states
+            .lock()
+            .unwrap()
+            .insert(key.clone(), json!(misbound.id));
+        assert!(
+            canonical_history_snapshot(&store, "content", &commit)
+                .await
+                .is_err()
+        );
+        store.states.lock().unwrap().remove(&key);
+        let mut invalid = current.clone();
+        invalid.index = Value::Null;
+        store.insert(
+            "snapshots",
+            &current.id,
+            serde_json::to_value(invalid).unwrap(),
+        );
+        assert!(
+            canonical_history_snapshot(&store, "content", &commit)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn wrong_generation_history_and_selected_corrupt_index_fail() {
+        let store = Arc::new(HistoryStore::default());
+        let artifact = json!({"body_hash":"a".repeat(64),"bytes":1,"relative_path":"fixture"});
+        let observation = json!({"repo":"content","observed_at":1,"refs":[],"roots":[],"manifest":artifact,"commits":artifact,"total_commits":1,"main_revision":commit(1).revision});
+        store.states.lock().unwrap().insert(
+            "content-history".into(),
+            json!({"processor_version":2,"complete":true,"processed":1,"observation":observation}),
+        );
+        assert!(frozen_history(store.as_ref(), Repo::Content).await.is_err());
+        store
+            .states
+            .lock()
+            .unwrap()
+            .get_mut("content-history")
+            .unwrap()["processor_version"] = json!(PROCESSOR_VERSION);
+        assert_eq!(
+            frozen_history(store.as_ref(), Repo::Content)
+                .await
+                .unwrap()
+                .total_commits,
+            1
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut current = store.snapshot(&commit(1), PROCESSOR_VERSION, "corrupt-current-index");
+        current.inventory = mdn_inventory::empty(store.as_ref()).await.unwrap();
+        store.insert(
+            "snapshots",
+            &current.id,
+            serde_json::to_value(&current).unwrap(),
+        );
+        store.original(&current);
+        let selected = canonical_history_snapshot(store.as_ref(), "content", &commit(1))
+            .await
+            .unwrap();
+        let research = devres_adapters::mdn_research::MdnResearch::new(store, root.path()).unwrap();
+        let error = research
+            .call(
+                "mdn_search",
+                json!({"snapshot":selected.id,"query":"fixture"}),
+            )
+            .await
+            .expect_err("a selected current index failure stays fatal; no legacy fallback");
+        assert_eq!(error.code, "integrity");
+    }
 
     #[tokio::test]
     async fn failed_accounting_cannot_resume_a_waiting_processing_slice() {
@@ -257,87 +520,219 @@ async fn verify(store: &dyn MdnStore, root: &Path, cancel: CancellationToken) ->
         json!({"snapshots_verified":snapshots,"historical_projection_gap_memberships":gaps,"latest_index_verified":true}),
     )
 }
+async fn frozen_history(store: &dyn MdnStore, repository: Repo) -> Result<Observation> {
+    let state = store
+        .mdn_state(&format!("{}-history", repository.as_str()))
+        .await?
+        .ok_or_else(|| Error::unavailable("MDN frozen history missing."))?;
+    let observation: Observation = mdn_inventory::decode(state["observation"].clone())?;
+    if state["processor_version"].as_u64() != Some(u64::from(PROCESSOR_VERSION))
+        || state["complete"] != true
+        || state["processed"].as_u64() != Some(observation.total_commits as u64)
+        || observation.repo != repository
+        || !(1..=1_000_000).contains(&observation.total_commits)
+    {
+        return Err(Error::integrity(
+            "Current-generation frozen MDN history is incomplete.",
+        ));
+    }
+    Ok(observation)
+}
+
+async fn canonical_history_snapshot(
+    store: &dyn MdnStore,
+    repository: &str,
+    commit: &CommitOrder,
+) -> Result<Snapshot> {
+    fn valid_id(id: &str) -> bool {
+        id.len() == 64
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+    let key = format!("{repository}:{}:{PROCESSOR_VERSION}", commit.revision);
+    let original = store
+        .mdn_get("snapshot-keys", &key)
+        .await?
+        .ok_or_else(|| Error::integrity("Current-generation historical snapshot missing."))?;
+    let original_id = original
+        .data
+        .as_str()
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| Error::integrity("Invalid historical snapshot alias."))?;
+    let original: Snapshot = mdn_inventory::decode(
+        store
+            .mdn_get("snapshots", original_id)
+            .await?
+            .ok_or_else(|| Error::integrity("Current-generation historical snapshot missing."))?
+            .data,
+    )?;
+    if original.id != original_id
+        || original.repository != repository
+        || original.revision != commit.revision
+        || original.processor_version != PROCESSOR_VERSION
+        || original.parents != commit.parents
+        || original.committed_at != commit.committed_at
+        || original.index.is_null()
+        || original.coverage["accounted"] != true
+        || original.coverage["synthetic"] == true
+    {
+        return Err(Error::integrity(
+            "Invalid current-generation historical evidence.",
+        ));
+    }
+    let Some(alias) = store.mdn_state(&format!("rebuild-alias:{key}")).await? else {
+        return Ok(original);
+    };
+    let id = alias
+        .as_str()
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| Error::integrity("Invalid historical rebuild alias."))?;
+    let repaired: Snapshot = mdn_inventory::decode(
+        store
+            .mdn_get("snapshots", id)
+            .await?
+            .ok_or_else(|| Error::integrity("Historical rebuilt snapshot missing."))?
+            .data,
+    )?;
+    if repaired.id != id
+        || repaired.repository != original.repository
+        || repaired.revision != original.revision
+        || repaired.processor_version != original.processor_version
+        || repaired.tree != original.tree
+        || repaired.parents != original.parents
+        || repaired.committed_at != original.committed_at
+        || repaired.inventory != original.inventory
+        || repaired.index.is_null()
+        || repaired.coverage["accounted"] != true
+        || repaired.coverage["synthetic"] == true
+    {
+        return Err(Error::integrity("Invalid historical rebuilt evidence."));
+    }
+    Ok(repaired)
+}
+
+struct HistorySamples {
+    total: usize,
+    tip: Option<String>,
+    // Fixed-width identities keep the maximum one-million-commit set bounded.
+    seen: BTreeSet<[u8; 20]>,
+    samples: BTreeMap<String, Snapshot>,
+}
+impl HistorySamples {
+    fn new(total: usize, tip: Option<String>) -> Result<Self> {
+        if !(1..=1_000_000).contains(&total) {
+            return Err(Error::integrity("Invalid frozen MDN history size."));
+        }
+        Ok(Self {
+            total,
+            tip,
+            seen: BTreeSet::new(),
+            samples: BTreeMap::new(),
+        })
+    }
+    async fn push(
+        &mut self,
+        store: &dyn MdnStore,
+        repository: &str,
+        commit: &CommitOrder,
+    ) -> Result<()> {
+        let mut oid = [0u8; 20];
+        if commit.revision.len() != 40
+            || hex::decode_to_slice(&commit.revision, &mut oid).is_err()
+            || !self.seen.insert(oid)
+            || self.seen.len() > self.total
+        {
+            return Err(Error::integrity("Invalid or duplicate frozen MDN commit."));
+        }
+        let snapshot = canonical_history_snapshot(store, repository, commit).await?;
+        for (case, oldest) in [("oldest", true), ("recent", false)] {
+            if self.samples.get(case).is_none_or(|previous| {
+                let key = (snapshot.committed_at, &snapshot.revision);
+                let before = (previous.committed_at, &previous.revision);
+                if oldest { key < before } else { key > before }
+            }) {
+                self.samples.insert(case.into(), snapshot.clone());
+            }
+        }
+        if self.seen.len() - 1 == self.total / 2 {
+            self.samples.insert("middle".into(), snapshot.clone());
+        }
+        if snapshot.parents.len() > 1 {
+            self.samples
+                .entry("merge".into())
+                .or_insert_with(|| snapshot.clone());
+        }
+        if self.tip.as_ref() == Some(&snapshot.revision) {
+            self.samples.insert("advertised_tip".into(), snapshot);
+        }
+        Ok(())
+    }
+    fn finish(self) -> Result<BTreeMap<String, Snapshot>> {
+        if self.seen.len() != self.total
+            || (self.tip.is_some() && !self.samples.contains_key("advertised_tip"))
+        {
+            return Err(Error::integrity(
+                "Frozen MDN history snapshot count mismatch.",
+            ));
+        }
+        Ok(self.samples)
+    }
+}
+
 async fn historical_samples(
     store: &dyn MdnStore,
     research: &devres_adapters::mdn_research::MdnResearch,
+    root: &Path,
     cancel: CancellationToken,
 ) -> Result<Value> {
-    let mut totals = BTreeMap::new();
-    let mut tips = BTreeMap::new();
-    for repository in ["content", "compat"] {
-        let state = store
-            .mdn_state(&format!("{repository}-history"))
-            .await?
-            .ok_or_else(|| Error::unavailable("MDN frozen history missing."))?;
-        totals.insert(
-            repository.to_owned(),
-            state["observation"]["total_commits"].as_u64().unwrap_or(0),
-        );
-        if let Some(reference) = state["observation"]["refs"].as_array().and_then(|refs| {
-            refs.iter()
-                .find(|r| r["name"] != "refs/heads/main" && r["peeled_commit"].is_string())
-        }) {
-            tips.insert(
-                repository.to_owned(),
-                reference["peeled_commit"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            );
-        }
-    }
-    let mut counts = BTreeMap::<String, u64>::new();
     let mut samples = BTreeMap::<(String, String), Snapshot>::new();
-    let mut after = 0;
-    loop {
-        if cancel.is_cancelled() {
-            return Err(Error::unavailable("Historical verification canceled."));
+    for repository in [Repo::Content, Repo::Compat] {
+        let observation = frozen_history(store, repository).await?;
+        let tip = observation
+            .refs
+            .iter()
+            .find(|reference| {
+                reference.name != "refs/heads/main" && reference.peeled_commit.is_some()
+            })
+            .and_then(|reference| reference.peeled_commit.clone());
+        let mut selected = HistorySamples::new(observation.total_commits, tip)?;
+        let git = MdnGit::new(
+            root,
+            repository,
+            8 * 1024 * 1024 * 1024,
+            64 * 1024 * 1024,
+            None,
+        )?;
+        let mut offset = 0;
+        while offset < observation.commits.bytes {
+            if cancel.is_cancelled() {
+                return Err(Error::unavailable("Historical verification canceled."));
+            }
+            let page = git
+                .commit_page(&observation, offset, 1000, cancel.clone())
+                .await?;
+            if page.next_offset <= offset || page.next_offset > observation.commits.bytes {
+                return Err(Error::integrity("Invalid frozen MDN commit page."));
+            }
+            for commit in page.commits {
+                if cancel.is_cancelled() {
+                    return Err(Error::unavailable("Historical verification canceled."));
+                }
+                selected.push(store, repository.as_str(), &commit).await?;
+            }
+            offset = page.next_offset;
         }
-        let rows = store.mdn_rows("snapshots", after, 250, None).await?;
-        if rows.is_empty() {
-            break;
-        }
-        for row in rows {
-            after = row.sequence;
-            let snapshot: Snapshot = mdn_inventory::decode(row.data)?;
-            let count = counts.entry(snapshot.repository.clone()).or_default();
-            let oldest = (snapshot.repository.clone(), "oldest".into());
-            if samples
-                .get(&oldest)
-                .is_none_or(|s| snapshot.committed_at < s.committed_at)
-            {
-                samples.insert(oldest, snapshot.clone());
-            }
-            let recent = (snapshot.repository.clone(), "recent".into());
-            if samples
-                .get(&recent)
-                .is_none_or(|s| snapshot.committed_at > s.committed_at)
-            {
-                samples.insert(recent, snapshot.clone());
-            }
-            if *count == totals.get(&snapshot.repository).copied().unwrap_or(0) / 2 {
-                samples.insert(
-                    (snapshot.repository.clone(), "middle".into()),
-                    snapshot.clone(),
-                );
-            }
-            if snapshot.parents.len() > 1 {
-                samples
-                    .entry((snapshot.repository.clone(), "merge".into()))
-                    .or_insert_with(|| snapshot.clone());
-            }
-            if tips.get(&snapshot.repository) == Some(&snapshot.revision) {
-                samples.insert(
-                    (snapshot.repository.clone(), "advertised_tip".into()),
-                    snapshot.clone(),
-                );
-            }
-            *count += 1;
+        for (case, snapshot) in selected.finish()? {
+            samples.insert((repository.as_str().into(), case), snapshot);
         }
     }
     let mut historical = Vec::new();
     let mut seen = BTreeSet::new();
     for ((repository, case), snapshot) in samples {
+        if cancel.is_cancelled() {
+            return Err(Error::unavailable("Historical verification canceled."));
+        }
         if !seen.insert(snapshot.id.clone()) {
             continue;
         }
@@ -416,7 +811,7 @@ async fn historical_samples(
                 searched = true;
             }
         }
-        historical.push(json!({"case":case,"repository":repository,"snapshot":snapshot.id,"revision":snapshot.revision,"path":source_path,"search_verified":searched,"raw_resource_verified":true}));
+        historical.push(json!({"case":case,"repository":repository,"snapshot":snapshot.id,"revision":snapshot.revision,"processor_version":snapshot.processor_version,"path":source_path,"search_verified":searched,"raw_resource_verified":true}));
     }
     Ok(json!(historical))
 }
@@ -517,7 +912,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let feature=research.call("mdn_compat_get",json!({"feature":"api.fetch","snapshot":frozen})).await?;
         research.read_resource(document["resource_uri"].as_str().ok_or_else(||Error::integrity("MDN resource missing."))?).await?;
         let mut verification=if full{verify(store.as_ref(),&blob,cancel.clone()).await?}else{Value::Null};
-        if full{verification["historical_samples"]=historical_samples(store.as_ref(),research.as_ref(),cancel.clone()).await?;}
+        if full{verification["historical_samples"]=historical_samples(store.as_ref(),research.as_ref(),&blob,cancel.clone()).await?;}
         Ok(json!({"stage":"complete","full_history":full,"attempts_upper_bound":broker.attempt_count(),"attempts_this_invocation":broker.attempt_count().saturating_sub(initial_attempts),"document":document["provenance"],"compatibility":feature["provenance"],"verification":verification,"status":store.mdn_state("status").await?}))
     }.await;
     cancel.cancel();
