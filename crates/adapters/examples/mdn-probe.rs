@@ -6,7 +6,7 @@ use devres_adapters::{
     mdn_index::MdnIndex,
     mdn_inventory,
 };
-use devres_application::mdn::{MdnConfig, MdnStore, PROCESSOR_VERSION, Snapshot};
+use devres_application::mdn::{MdnConfig, MdnStore, Member, PROCESSOR_VERSION, Snapshot};
 use devres_domain::{Error, Result};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -446,6 +446,67 @@ mod tests {
         assert_eq!(error.code, "integrity");
     }
 
+    #[test]
+    fn historical_members_prefer_searchable_then_projected_evidence_for_both_repositories() {
+        for (repository, kind) in [("content", "article"), ("compat", "feature")] {
+            let unprojected = Member {
+                path: "unprojected".into(),
+                oid: "a".repeat(40),
+                mode: "100644".into(),
+                kind: kind.into(),
+                projection: None,
+                raw: Some(json!({"source_path":"unprojected"})),
+                gaps: vec!["projection_member_limit".into()],
+            };
+            let mut gap = unprojected.clone();
+            gap.path = "projected-gap".into();
+            gap.projection = Some("b".repeat(64));
+            gap.gaps = vec!["search_index_gap".into()];
+            let mut searchable = gap.clone();
+            searchable.path = "searchable".into();
+            searchable.gaps.clear();
+            let members = [unprojected.clone(), gap.clone(), searchable];
+            let (selected, reason) = select_historical_member(&members, repository);
+            assert_eq!(selected.unwrap().path, "searchable");
+            assert_eq!(reason, None);
+            let (selected, reason) = select_historical_member(&members[..2], repository);
+            assert_eq!(selected.unwrap().path, "projected-gap");
+            assert_eq!(reason, Some("search_index_gap"));
+            let (selected, reason) = select_historical_member(&members[..1], repository);
+            assert_eq!(selected.unwrap().path, "unprojected");
+            assert!(
+                reason.is_some(),
+                "raw-only fallback explicitly lacks a normalized search check"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_member_raw_fallback_and_empty_cases_have_explicit_reasons() {
+        let raw = Member {
+            path: "README".into(),
+            oid: "a".repeat(40),
+            mode: "100644".into(),
+            kind: "retained".into(),
+            projection: None,
+            raw: Some(json!({"source_path":"README"})),
+            gaps: Vec::new(),
+        };
+        let members = [raw.clone()];
+        let (selected, reason) = select_historical_member(&members, "content");
+        assert_eq!(selected.unwrap().path, "README");
+        assert_eq!(reason, Some("no_projected_article_in_snapshot"));
+        let mut unsupported = raw;
+        unsupported.raw = Some(json!({"raw_path_hex":"ff"}));
+        let members = [unsupported];
+        let (selected, reason) = select_historical_member(&members, "compat");
+        assert!(selected.is_none());
+        assert_eq!(reason, Some("no_supported_source_member"));
+        let (selected, reason) = select_historical_member(&[], "content");
+        assert!(selected.is_none());
+        assert_eq!(reason, Some("empty_snapshot"));
+    }
+
     #[tokio::test]
     async fn failed_accounting_cannot_resume_a_waiting_processing_slice() {
         let gate = tokio::sync::RwLock::new(());
@@ -694,6 +755,45 @@ impl HistorySamples {
     }
 }
 
+fn select_historical_member<'a>(
+    members: &'a [Member],
+    repository: &str,
+) -> (Option<&'a Member>, Option<&'static str>) {
+    let kind = if repository == "content" {
+        "article"
+    } else {
+        "feature"
+    };
+    let projected = |member: &&Member| member.kind == kind && member.projection.is_some();
+    let selected = members
+        .iter()
+        .find(|member| {
+            projected(member) && !member.gaps.iter().any(|gap| gap == "search_index_gap")
+        })
+        .or_else(|| members.iter().find(projected))
+        .or_else(|| members.iter().find(|member| member.kind == kind))
+        .or_else(|| {
+            members.iter().find(|member| {
+                member
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| raw["raw_path_hex"].is_null())
+            })
+        });
+    let reason = match selected {
+        None if members.is_empty() => Some("empty_snapshot"),
+        None => Some("no_supported_source_member"),
+        Some(member) if member.kind == kind && member.projection.is_some() => member
+            .gaps
+            .iter()
+            .any(|gap| gap == "search_index_gap")
+            .then_some("search_index_gap"),
+        Some(_) if repository == "content" => Some("no_projected_article_in_snapshot"),
+        Some(_) => Some("no_projected_feature_in_snapshot"),
+    };
+    (selected, reason)
+}
+
 async fn historical_samples(
     store: &dyn MdnStore,
     research: &devres_adapters::mdn_research::MdnResearch,
@@ -753,22 +853,12 @@ async fn historical_samples(
         }
         historical_phase("historical_members", &repository, &case);
         let members = mdn_inventory::members(store, &snapshot.inventory, 1_000_000).await?;
-        let selected = members
-            .iter()
-            .find(|m| {
-                m.kind
-                    == if repository == "content" {
-                        "article"
-                    } else {
-                        "feature"
-                    }
-            })
-            .or_else(|| {
-                members.iter().find(|m| {
-                    m.raw.is_some() && m.raw.as_ref().is_some_and(|r| r["raw_path_hex"].is_null())
-                })
-            });
-        let Some(member) = selected else { continue };
+        let (selected, search_inapplicability_reason) =
+            select_historical_member(&members, &repository);
+        let Some(member) = selected else {
+            historical.push(json!({"case":case,"repository":repository,"snapshot":snapshot.id,"revision":snapshot.revision,"processor_version":snapshot.processor_version,"path":null,"search_verified":false,"raw_resource_verified":false,"search_inapplicability_reason":search_inapplicability_reason,"raw_inapplicability_reason":search_inapplicability_reason}));
+            continue;
+        };
         let source_path = member
             .raw
             .as_ref()
@@ -805,7 +895,7 @@ async fn historical_samples(
                 }
                 searched = true;
             }
-        } else if member.kind == "feature" {
+        } else if member.kind == "feature" && member.projection.is_some() {
             let key = member
                 .path
                 .strip_prefix("@features/")
@@ -833,7 +923,7 @@ async fn historical_samples(
                 searched = true;
             }
         }
-        historical.push(json!({"case":case,"repository":repository,"snapshot":snapshot.id,"revision":snapshot.revision,"processor_version":snapshot.processor_version,"path":source_path,"search_verified":searched,"raw_resource_verified":true}));
+        historical.push(json!({"case":case,"repository":repository,"snapshot":snapshot.id,"revision":snapshot.revision,"processor_version":snapshot.processor_version,"path":source_path,"search_verified":searched,"raw_resource_verified":true,"search_inapplicability_reason":search_inapplicability_reason,"raw_inapplicability_reason":null}));
     }
     Ok(json!(historical))
 }
