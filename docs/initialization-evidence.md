@@ -132,3 +132,82 @@ shortened before the first gate to satisfy Unix-socket limits. Task-owned cluste
 containers, bridges and daemon state were removed; existing Docker contexts and
 production archives were not changed. Source and scope guards protected each
 immutable acceptance checkout.
+
+## RustSec processing module acceptance
+
+Observed on native Linux amd64 on 2026-10-24/25. Implementation commits are
+`3591bd6`, `ae56513`, `a944717`, `d1cc1ac`, `daf0380`, and `73f88e4`,
+GPG-signed locally with the assistance trailer.
+No push, hosted Actions result, registry publication or production deployment is
+claimed. The following gates concern this module, independently of earlier records.
+
+| Evidence | Result |
+| --- | --- |
+| Rust 1.99.1 formatting and strict workspace Clippy | Passed, all targets and locked resolution |
+| Workspace fixture/transport tests | 210 passed; nine explicitly opt-in tests remained separate |
+| Python acceptance/release helpers | 75 passed |
+| Current cargo-audit and cargo-deny | Passed; duplicate-version warnings retained; no new dependency packages |
+| Real PostgreSQL persistence | Four tests passed, including v1-to-v4 migration, immutable membership/append rejection, failed-publication preservation, explicit historical selection, synthetic-default rejection, generation cutoffs, malformed-projection rejection and restart |
+| PostgreSQL crate pipeline regression | Passed separately against the same native PostgreSQL 18.6 fallback |
+| Full captured RustSec offline replay | Passed, with no network during replay |
+| Live current RustSec | 1,332 advisories normalized; fixed positive `odbc` lookup and original-source detail passed in two source attempts |
+| Full Git acquisition | All advertised branches/tags and reachable ancestry captured; 6,091 commits, three attempts after the framing fix |
+| Full Git backfill | All 6,091 captured commits processed; generation-two replay also finished with zero source attempts; unsupported historical formats remain explicit projection gaps |
+| Native pinned OxiBelt/backend transports | Both MCP revisions passed over direct/proxied HTTP and WebTransport; actual audit helper, explicit nondefault fixtures, typed resources, privacy sentinels and restart persistence passed |
+| Configured Docker PostgreSQL harness | Blocked before container startup: rootful overlay mount returned invalid argument; rootless extraction returned permission denied |
+| Docker OxiBelt and minikube harnesses | Both stopped at the same overlay image-build failure, before new edge/cluster/CNI acceptance |
+| Native arm64, hosted CI and production | Not executed in this run |
+
+The successful current snapshot identifies official revision
+`21d909e4c8bd4e14c7aea58bf980c881a0053ab1`. Its captured head body SHA-256 is
+`a297bb034e79aaa5aef813338ec419bd18ea53c5ec72d205de5cfe688ad1a80b` and bundle
+SHA-256 is `e3ca3600f749e9234738584caad6a115278997f6c6528053faebc108465d8774`.
+Bulk source data is retained outside the repository rather than committed as fixtures.
+
+Independent agent reviews covered MCP/API, Upstream/Storage and Security Boundary
+changes and their callers. Review fixes include immutable ordered membership,
+cached freshness, bounded snapshot reads, sparse-offset continuation, explicit OSV
+authority, OSV limit/event evaluation, Git stage/crash recovery, mode-sensitive
+projection caching and synthetic fixture isolation. Agent review is not human
+GitHub approval.
+
+The first live Git runs exposed gzip-compressed upload-pack requests being forwarded
+without their encoding. The relay now bounded-decompresses those requests. A real
+32-ref Git fixture confirms the compressed path, and corruption/truncation/trailing
+data/expansion limits have regressions. Successful Git acquisition used three
+attempts; including earlier bounded application diagnostics and current acquisition,
+the application-level RustSec acceptance traffic was fifteen attempts. Dependency
+advisory admission and earlier planning reads are separate operations.
+
+Native PostgreSQL 18.6 came from the pinned image already used by the harness.
+Its trusted binaries/libraries ran in disposable loopback-only storage because both
+configured Docker daemons failed overlay mounting. Native edge/transport checks
+used the existing pinned OxiBelt revision and disposable TLS identities. These
+fallbacks do not establish Docker container isolation, CNI/NodePort behavior,
+Kubernetes backup/restore, a production load capacity, or a replacement hosted CI run.
+
+History acceptance preserves raw unsupported formats and reports projection gaps;
+finished traversal and successful parsing are distinct. Interrupted probe runs
+resumed the same retained observation without provider requests. Processing used an
+optimized local probe after the ordinary unoptimized fixture suites passed.
+
+Processing generation two supports the five zero-width OSV interval shapes found
+in the captured official export. It publishes separate immutable processing rows,
+keeps raw graph rows and old snapshot IDs fixed, and resolves projections at each
+history cursor's publication cutoff. Only unchanged generation-one projections are
+reused; incomplete OSV projections are parsed again. A fixture proves that unchanged
+projection reuse needs no Git repository, and PostgreSQL proves fixed views across
+restart and rejects malformed projection identities.
+
+The full generation-two replay resolved all 6,091 commits from the same retained
+observation with zero provider attempts, including a checkpoint-preserving restart.
+It retained 9,950 deduplicated representations and 16,920 snapshots, including
+intermediate checkpoints and prior generations. The official OSV-tip projection
+contains 1,333 records and is complete; its snapshot ID is
+`7b3885967eaba3287e6bab7a1a7ff1f7eb3ea76b4b89efea95dd67c47069fefa`.
+Actual MCP lookup and request-local audit passed against that explicitly selected
+snapshot under both protocol revisions. The original generation-one OSV snapshot
+remains readable and incomplete, while canonical history discovery/page reads pass.
+Whole-history projection completeness remains false because unsupported historical
+formats are retained as gaps; this does not prevent the fully covered, freshly
+source-validated OSV tip from qualifying independently.
