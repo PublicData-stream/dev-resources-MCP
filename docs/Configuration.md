@@ -247,6 +247,9 @@ existing ownership fence before their inventory/checkpoint pointers advance.
 Each private processing slice may cache at most 4,096 verified inventory nodes
 with 8 MiB of serialized node/key data. This cache excludes publication state and
 does not replace storage fencing on public reads.
+Per-entry immutable write staging caps at 1,000 rows/8 MiB. A larger valid row
+flushes the queue and uses the existing 16 MiB write-group limit directly. An
+entry's inventory root advances only after every staged group commits.
 
 Schema 5 is forward-only. Preserve MDN raw artifacts, retained Git evidence,
 projection records, inventories and `mdn-indexes` in coordinated backups.

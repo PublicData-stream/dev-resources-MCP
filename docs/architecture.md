@@ -188,6 +188,11 @@ Private processing slices reuse a bounded cache of hash-verified immutable nodes
 New nodes enter it only after their write group commits. Public research keeps
 its independent storage fencing, and every checkpoint/default publication still
 uses the owner connection.
+Per-entry staging groups immutable node/projection writes without holding a
+database transaction across source I/O. Staged reads stay private and cannot enter
+the durable-node cache. The buffer cannot write state or publish views; all groups
+must commit before its completed root reaches the caller's checkpoint. Interrupted
+groups may leave unreferenced immutable rows, which replay reuses.
 
 Indexes contain unique context-qualified projections, not one repeated full tree
 per commit. Immutable linked manifests share shards. Selected-ID filtering applies

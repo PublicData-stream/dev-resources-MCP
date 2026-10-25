@@ -27,6 +27,7 @@ pub fn valid_path(path: &str) -> bool {
 /// FIFO admission bounds both serialized evidence and retained node identities.
 pub(crate) struct NodeCache {
     enabled: bool,
+    admit_writes: bool,
     nodes: BTreeMap<String, (InventoryNode, usize)>,
     order: VecDeque<String>,
     bytes: usize,
@@ -35,10 +36,14 @@ impl NodeCache {
     pub(crate) fn new() -> Self {
         Self {
             enabled: true,
+            admit_writes: true,
             nodes: BTreeMap::new(),
             order: VecDeque::new(),
             bytes: 0,
         }
+    }
+    pub(crate) fn defer_writes(&mut self) {
+        self.admit_writes = false;
     }
     fn disabled() -> Self {
         Self {
@@ -84,13 +89,14 @@ pub(crate) async fn node_cached(
         .mdn_get("nodes", id)
         .await?
         .ok_or_else(|| Error::integrity("MDN inventory node missing."))?;
+    let durable = row.sequence > 0;
     let node: InventoryNode = decode(row.data)?;
     let bytes =
         serde_json::to_vec(&node).map_err(|_| Error::integrity("Invalid MDN inventory."))?;
     if digest(&bytes) != id {
         return Err(Error::integrity("MDN inventory hash mismatch."));
     }
-    if cache.enabled {
+    if cache.enabled && durable {
         cache.insert(id.to_owned(), node.clone(), bytes.len());
     }
     Ok(node)
@@ -181,7 +187,7 @@ impl<'a> Staged<'a> {
             nodes,
             ..
         } = self;
-        if !cache.enabled {
+        if !cache.enabled || !cache.admit_writes {
             drop(nodes);
             return store.mdn_put_many(&rows).await;
         }

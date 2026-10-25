@@ -56,6 +56,9 @@ pub struct MdnCorpus {
     processors: Arc<Semaphore>,
 }
 
+#[path = "mdn_buffer.rs"]
+mod buffer;
+
 #[cfg(test)]
 #[path = "mdn_corpus_tests.rs"]
 mod tests;
@@ -642,7 +645,12 @@ impl MdnCorpus {
             .await?;
         Ok(true)
     }
-    async fn projection(&self, mut data: Value, indexed: Option<IndexDocument>) -> Result<String> {
+    async fn projection(
+        &self,
+        store: &dyn MdnStore,
+        mut data: Value,
+        indexed: Option<IndexDocument>,
+    ) -> Result<String> {
         data["processor_version"] = json!(PROCESSOR_VERSION);
         let id = inventory::digest(
             &serde_json::to_vec(&data).map_err(|_| Error::integrity("Invalid MDN projection."))?,
@@ -659,7 +667,7 @@ impl MdnCorpus {
         let header = Value::Object(header);
         writes
             .push(
-                self.store.as_ref(),
+                store,
                 MdnWrite {
                     kind: "projections".into(),
                     key: id.clone(),
@@ -669,7 +677,7 @@ impl MdnCorpus {
             .await?;
         writes
             .push(
-                self.store.as_ref(),
+                store,
                 MdnWrite {
                     kind: "projection-headers".into(),
                     key: id.clone(),
@@ -681,7 +689,7 @@ impl MdnCorpus {
             doc.id = id.clone();
             writes
                 .push(
-                    self.store.as_ref(),
+                    store,
                     MdnWrite {
                         kind: "index-documents".into(),
                         key: id.clone(),
@@ -690,7 +698,7 @@ impl MdnCorpus {
                 )
                 .await?;
         }
-        writes.flush(self.store.as_ref()).await?;
+        writes.flush(store).await?;
         Ok(id)
     }
     async fn apply_entry(
@@ -702,21 +710,28 @@ impl MdnCorpus {
         entry: TreeEntry,
         cancel: CancellationToken,
     ) -> Result<()> {
+        cache.defer_writes();
+        let buffered = buffer::BufferedMdnStore::new(self.store.as_ref());
+        let store: &dyn MdnStore = &buffered;
+        let published_root = root;
+        let mut next_root = published_root.clone();
+        let root = &mut next_root;
         let path = if inventory::valid_path(&entry.path) {
             entry.path.clone()
         } else {
             format!("@unsupported/{}", inventory::digest(entry.path.as_bytes()))
         };
         // BCD synthetic members are removed along with their original source file.
-        if let Some(old) = inventory::get_cached(self.store.as_ref(), root, &path, cache).await?
+        if let Some(old) = inventory::get_cached(store, root, &path, cache).await?
             && old.kind == "bcd"
             && let Some(id) = old.projection
-            && let Some(row) = self.store.mdn_get("projections", &id).await?
+            && let Some(row) = store.mdn_get("projections", &id).await?
         {
             for (field, prefix) in [("features", "@features"), ("browsers", "@browsers")] {
                 if let Some(keys) = row.data[field].as_array() {
                     for key in keys.iter().filter_map(Value::as_str) {
                         self.update_identity(
+                            store,
                             cache,
                             root,
                             &format!("{prefix}/{key}"),
@@ -729,7 +744,9 @@ impl MdnCorpus {
             }
         }
         if entry.removed {
-            *root = inventory::update_cached(self.store.as_ref(), root, &path, None, cache).await?;
+            *root = inventory::update_cached(store, root, &path, None, cache).await?;
+            buffered.flush().await?;
+            *published_root = next_root;
             return Ok(());
         }
         let git = self.git(repo);
@@ -899,7 +916,7 @@ impl MdnCorpus {
                                 member.gaps.push("search_index_gap".into());
                                 data["index_gap"] = json!(true);
                             }
-                            match self.projection(data, index).await {
+                            match self.projection(store, data, index).await {
                                 Ok(id) => member.projection = Some(id),
                                 Err(error)
                                     if error.code == "capacity"
@@ -953,7 +970,7 @@ impl MdnCorpus {
                                     admitted_index(index, cancel.clone(), &self.processors).await?;
                                 let gap = index.is_none();
                                 let id = self
-                                    .projection(json!({"key":key,"data":feature.data,"index_gap":gap,"source_path":entry.path}), index)
+                                    .projection(store, json!({"key":key,"data":feature.data,"index_gap":gap,"source_path":entry.path}), index)
                                     .await?;
                                 let m = Member {
                                     path: synthetic.clone(),
@@ -968,17 +985,25 @@ impl MdnCorpus {
                                         Vec::new()
                                     },
                                 };
-                                self.update_identity(cache, root, &synthetic, &entry.path, Some(m))
-                                    .await?;
+                                self.update_identity(
+                                    store,
+                                    cache,
+                                    root,
+                                    &synthetic,
+                                    &entry.path,
+                                    Some(m),
+                                )
+                                .await?;
                                 features.push(key);
                             }
                             for browser in doc.browsers {
                                 let key = browser.key.clone();
                                 let synthetic = format!("@browsers/{key}");
                                 let id = self
-                                    .projection(json!({"key":key,"data":browser.data,"source_path":entry.path}), None)
+                                    .projection(store, json!({"key":key,"data":browser.data,"source_path":entry.path}), None)
                                     .await?;
                                 self.update_identity(
+                                    store,
                                     cache,
                                     root,
                                     &synthetic,
@@ -998,6 +1023,7 @@ impl MdnCorpus {
                             }
                             member.projection = Some(
                                 self.projection(
+                                    store,
                                     json!({"features":features,"browsers":browsers}),
                                     None,
                                 )
@@ -1023,7 +1049,7 @@ impl MdnCorpus {
                                 }
                             }
                             member.projection = Some(
-                                self.projection(json!({"redirects":redirects}), None)
+                                self.projection(store, json!({"redirects":redirects}), None)
                                     .await?,
                             );
                         }
@@ -1032,12 +1058,14 @@ impl MdnCorpus {
                 }
             }
         }
-        *root =
-            inventory::update_cached(self.store.as_ref(), root, &path, Some(member), cache).await?;
+        *root = inventory::update_cached(store, root, &path, Some(member), cache).await?;
+        buffered.flush().await?;
+        *published_root = next_root;
         Ok(())
     }
     async fn update_identity(
         &self,
+        store: &dyn MdnStore,
         cache: &mut inventory::NodeCache,
         root: &mut String,
         path: &str,
@@ -1045,11 +1073,10 @@ impl MdnCorpus {
         member: Option<Member>,
     ) -> Result<()> {
         let marker_path = format!("@ambiguities/{}", inventory::digest(path.as_bytes()));
-        let marker = inventory::get_cached(self.store.as_ref(), root, &marker_path, cache).await?;
+        let marker = inventory::get_cached(store, root, &marker_path, cache).await?;
         let had_marker = marker.is_some();
         let mut candidates: BTreeMap<String, Member> = if let Some(marker) = marker {
-            let projection = self
-                .store
+            let projection = store
                 .mdn_get(
                     "projections",
                     marker
@@ -1063,7 +1090,7 @@ impl MdnCorpus {
         } else {
             BTreeMap::new()
         };
-        if let Some(old) = inventory::get_cached(self.store.as_ref(), root, path, cache).await? {
+        if let Some(old) = inventory::get_cached(store, root, path, cache).await? {
             let owner = old
                 .raw
                 .as_ref()
@@ -1077,26 +1104,23 @@ impl MdnCorpus {
             candidates.insert(source.to_owned(), member);
         }
         if candidates.len() <= 1 {
-            *root = inventory::update_cached(
-                self.store.as_ref(),
-                root,
-                path,
-                candidates.into_values().next(),
-                cache,
-            )
-            .await?;
+            *root =
+                inventory::update_cached(store, root, path, candidates.into_values().next(), cache)
+                    .await?;
             if had_marker {
-                *root =
-                    inventory::update_cached(self.store.as_ref(), root, &marker_path, None, cache)
-                        .await?;
+                *root = inventory::update_cached(store, root, &marker_path, None, cache).await?;
             }
         } else {
             let id = self
-                .projection(json!({"identity":path,"candidates":candidates}), None)
+                .projection(
+                    store,
+                    json!({"identity":path,"candidates":candidates}),
+                    None,
+                )
                 .await?;
-            *root = inventory::update_cached(self.store.as_ref(), root, path, None, cache).await?;
+            *root = inventory::update_cached(store, root, path, None, cache).await?;
             *root = inventory::update_cached(
-                self.store.as_ref(),
+                store,
                 root,
                 &marker_path,
                 Some(Member {
