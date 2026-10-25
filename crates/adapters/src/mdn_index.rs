@@ -790,6 +790,7 @@ impl MdnIndex {
         let mut technical = 0u64;
         let mut english = 0u64;
         let mut count = 0u64;
+        let mut selected_shards = Vec::new();
         for shard in &opened.shards {
             check(cancel, deadline)?;
             let totals = shard
@@ -799,12 +800,20 @@ impl MdnIndex {
             count = count.checked_add(totals.0).ok_or_else(capacity)?;
             technical = technical.checked_add(totals.1).ok_or_else(capacity)?;
             english = english.checked_add(totals.2).ok_or_else(capacity)?;
+            if totals.0 > 0 {
+                selected_shards.push(shard.clone());
+            }
         }
         if count != members.len() as u64 {
             return Err(Error::integrity(
                 "MDN snapshot references missing or duplicate index projections.",
             ));
         }
+        // All shards were verified and counted above. A shard with no selected
+        // members contributes neither hits nor selected document frequencies.
+        let opened = Opened {
+            shards: selected_shards,
+        };
         let statistics = SelectedStatistics {
             opened: &opened,
             membership: member_query.box_clone(),
@@ -920,9 +929,7 @@ impl MdnIndex {
                         rank
                     }
                 });
-            let (count, hits) = searcher
-                .search_with_statistics_provider(&query, &(Count, top), &statistics)
-                .map_err(|_| failure())?;
+            let (count, hits) = statistics.search(searcher, &query, &(Count, top))?;
             if broken.load(AtomicOrdering::Relaxed) {
                 return Err(integrity());
             }
@@ -1048,6 +1055,22 @@ struct SelectedStatistics<'a> {
     cancel: &'a CancellationToken,
     deadline: Instant,
     frequencies: Mutex<BTreeMap<Term, u64>>,
+}
+impl SelectedStatistics<'_> {
+    fn search<C: Collector>(
+        &self,
+        searcher: &Searcher,
+        query: &dyn Query,
+        collector: &C,
+    ) -> Result<C::Fruit> {
+        searcher
+            .search_with_statistics_provider(query, collector, self)
+            .map_err(|_| {
+                check(self.cancel, self.deadline)
+                    .err()
+                    .unwrap_or_else(failure)
+            })
+    }
 }
 impl Bm25StatisticsProvider for SelectedStatistics<'_> {
     fn total_num_tokens(&self, f: Field) -> tantivy::Result<u64> {
@@ -1267,6 +1290,79 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn statistics_search_preserves_deadline_cancellation_and_hides_unrelated_errors() {
+        let _gate = TEST_GATE.lock().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let index = MdnIndex::new(dir.path()).expect("index");
+        let document = doc("statistics-boundary", "Network", "network evidence");
+        let reference = index
+            .publish(None, vec![document.clone()], CancellationToken::new())
+            .await
+            .expect("published shard");
+        let cancel = CancellationToken::new();
+        let opened = index
+            .open(
+                &reference,
+                &cancel,
+                Instant::now() + Duration::from_secs(15),
+            )
+            .expect("opened shard");
+        let s = schema();
+        let membership = TermSetQuery::new([Term::from_field_text(
+            field(&s, "id").unwrap(),
+            &document.id,
+        )]);
+        let mut statistics = SelectedStatistics {
+            opened: &opened,
+            membership: Box::new(membership),
+            count: 1,
+            technical: 4,
+            english: 4,
+            cancel: &cancel,
+            deadline: Instant::now() + Duration::from_secs(15),
+            frequencies: Mutex::new(BTreeMap::new()),
+        };
+        let query = TermQuery::new(
+            Term::from_field_text(field(&s, "technical").unwrap(), "network"),
+            IndexRecordOption::WithFreqs,
+        );
+        let searcher = &opened.shards[0].searcher;
+        assert_eq!(
+            statistics
+                .search(searcher, &query, &TopDocs::with_limit(1).order_by_score())
+                .expect("healthy statistics")
+                .len(),
+            1
+        );
+        statistics.frequencies.lock().unwrap().clear();
+        statistics.deadline = Instant::now() - Duration::from_millis(1);
+        let expired = statistics
+            .search(searcher, &query, &TopDocs::with_limit(1).order_by_score())
+            .expect_err("deadline fails inside statistics provider");
+        assert_eq!(expired.code, "capacity");
+        assert_eq!(expired.message, capacity().message);
+        statistics.deadline = Instant::now() + Duration::from_secs(15);
+        cancel.cancel();
+        let cancelled = statistics
+            .search(searcher, &query, &TopDocs::with_limit(1).order_by_score())
+            .expect_err("cancellation fails inside statistics provider");
+        assert_eq!(cancelled.code, "cancelled");
+        assert_eq!(cancelled.message, "MDN search canceled.");
+        let healthy = CancellationToken::new();
+        statistics.cancel = &healthy;
+        let without_positions = field(&s, "kind").unwrap();
+        let invalid = tantivy::query::PhraseQuery::new(vec![
+            Term::from_field_text(without_positions, "private-source-token"),
+            Term::from_field_text(without_positions, "private-query-token"),
+        ]);
+        let hidden = statistics
+            .search(searcher, &invalid, &TopDocs::with_limit(1).order_by_score())
+            .expect_err("unrelated real Tantivy schema failure");
+        assert_eq!(hidden.code, "unavailable");
+        assert_eq!(hidden.message, failure().message);
+        assert!(!hidden.message.contains("private"));
+    }
+    #[tokio::test]
     async fn snapshots_filter_history_before_rank_count_and_paging() {
         let _gate = TEST_GATE.lock().await;
         let dir = tempfile::tempdir().expect("temp");
@@ -1425,16 +1521,21 @@ mod tests {
             .publish(None, vec![selected.clone()], CancellationToken::new())
             .await
             .expect("first");
-        let ids = BTreeSet::from([selected.id.clone()]);
+        let other = doc("selected-other", "OtherSelected", "fetch requests network");
+        let first = index
+            .publish(Some(&first), vec![other.clone()], CancellationToken::new())
+            .await
+            .expect("second selected shard");
+        let ids = BTreeSet::from([selected.id.clone(), other.id.clone()]);
         let spec = SearchSpec {
-            query: Some("fetch".into()),
+            query: Some("fetch network".into()),
             ..Default::default()
         };
         let baseline = index
             .search(&first, ids.clone(), spec.clone(), CancellationToken::new())
             .await
             .expect("baseline");
-        let mut current = first;
+        let mut current = first.clone();
         for batch in 0..8 {
             let documents = (0..16)
                 .map(|n| {
@@ -1451,13 +1552,58 @@ mod tests {
                 .expect("history");
         }
         let observed = index
-            .search(&current, ids, spec, CancellationToken::new())
+            .search(
+                &current,
+                ids.clone(),
+                spec.clone(),
+                CancellationToken::new(),
+            )
             .await
             .expect("selected");
-        assert_eq!(observed["total"], 1);
+        assert_eq!(observed["total"], 2);
         assert_eq!(
-            observed["results"][0]["score"],
-            baseline["results"][0]["score"]
+            observed["results"], baseline["results"],
+            "stale shards cannot change selected ranking, scores, or source payloads"
+        );
+        let mut filtered = spec.clone();
+        filtered.filters.insert("path".into(), other.path.clone());
+        let filtered_before = index
+            .search(
+                &first,
+                ids.clone(),
+                filtered.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("filtered baseline");
+        let filtered_after = index
+            .search(&current, ids.clone(), filtered, CancellationToken::new())
+            .await
+            .expect("filtered history");
+        assert_eq!(filtered_after["results"], filtered_before["results"]);
+        let mut missing = ids.clone();
+        missing.insert(hash(b"unretained selected member"));
+        assert_eq!(
+            index
+                .search(&current, missing, spec.clone(), CancellationToken::new())
+                .await
+                .expect_err("missing member")
+                .code,
+            "integrity"
+        );
+        let mut duplicate = selected.clone();
+        duplicate.text.push_str(" altered duplicate identity");
+        let duplicated = index
+            .publish(Some(&current), vec![duplicate], CancellationToken::new())
+            .await
+            .expect("duplicate fixture shard");
+        assert_eq!(
+            index
+                .search(&duplicated, ids, spec, CancellationToken::new())
+                .await
+                .expect_err("duplicate selected membership")
+                .message,
+            "MDN snapshot references missing or duplicate index projections."
         );
         let mut bad = doc("bad", "Bad", &"x".repeat(MAX_TOKEN_LEN + 1));
         assert_eq!(
