@@ -326,6 +326,7 @@ impl MdnCorpus {
                 Ok(true)
             };
         }
+        let mut cache = inventory::NodeCache::new();
         let git = self.git(repo);
         let commit = git.commit(revision, cancel.clone()).await?;
         let key = work_key(repo, revision);
@@ -363,8 +364,15 @@ impl MdnCorpus {
                 return Err(Error::unavailable("MDN processing canceled."));
             }
             let path = entry.path.clone();
-            self.apply_entry(repo, revision, &mut work.root, entry, cancel.clone())
-                .await?;
+            self.apply_entry(
+                &mut cache,
+                repo,
+                revision,
+                &mut work.root,
+                entry,
+                cancel.clone(),
+            )
+            .await?;
             work.changed.push(path);
             work.offset = seen;
             if work.changed.len() > 100_000 {
@@ -403,10 +411,12 @@ impl MdnCorpus {
                 }
             }
             for path in candidates.difference(&changed) {
-                if let Some(member) = inventory::get(self.store.as_ref(), &work.root, path).await?
+                if let Some(member) =
+                    inventory::get_cached(self.store.as_ref(), &work.root, path, &mut cache).await?
                     && member.kind == "article"
                 {
                     self.apply_entry(
+                        &mut cache,
                         repo,
                         revision,
                         &mut work.root,
@@ -424,7 +434,7 @@ impl MdnCorpus {
                 }
             }
         }
-        let root = inventory::node(self.store.as_ref(), &work.root).await?;
+        let root = inventory::node_cached(self.store.as_ref(), &work.root, &mut cache).await?;
         let id = inventory::digest(
             &serde_json::to_vec(&(repo.as_str(), revision, PROCESSOR_VERSION, &work.root))
                 .map_err(|_| Error::integrity("Invalid MDN snapshot identity."))?,
@@ -450,6 +460,7 @@ impl MdnCorpus {
             .await?;
         self.enqueue(repo, revision).await?;
         self.store.mdn_set_state(&key, &Value::Null).await?;
+        drop(cache);
         if history {
             self.publish_changes(repo, revision, cancel).await
         } else {
@@ -484,6 +495,7 @@ impl MdnCorpus {
             after.parents.iter().map(|s| Some(s.as_str())).collect()
         };
         let started = tokio::time::Instant::now();
+        let mut cache = inventory::NodeCache::new();
         for (parent_index, parent) in parents.into_iter().enumerate() {
             let before = match parent {
                 Some(p) => match self.snapshot(repo, p).await? {
@@ -513,10 +525,15 @@ impl MdnCorpus {
                 }
                 let path = &entry.path;
                 let old = match &before {
-                    Some(s) => inventory::get(self.store.as_ref(), &s.inventory, path).await?,
+                    Some(s) => {
+                        inventory::get_cached(self.store.as_ref(), &s.inventory, path, &mut cache)
+                            .await?
+                    }
                     None => None,
                 };
-                let new = inventory::get(self.store.as_ref(), &after.inventory, path).await?;
+                let new =
+                    inventory::get_cached(self.store.as_ref(), &after.inventory, path, &mut cache)
+                        .await?;
                 let mut paths = BTreeSet::from([path.to_owned()]);
                 for member in [&old, &new]
                     .into_iter()
@@ -539,10 +556,24 @@ impl MdnCorpus {
                 }
                 for path in paths {
                     let old = match &before {
-                        Some(s) => inventory::get(self.store.as_ref(), &s.inventory, &path).await?,
+                        Some(s) => {
+                            inventory::get_cached(
+                                self.store.as_ref(),
+                                &s.inventory,
+                                &path,
+                                &mut cache,
+                            )
+                            .await?
+                        }
                         None => None,
                     };
-                    let new = inventory::get(self.store.as_ref(), &after.inventory, &path).await?;
+                    let new = inventory::get_cached(
+                        self.store.as_ref(),
+                        &after.inventory,
+                        &path,
+                        &mut cache,
+                    )
+                    .await?;
                     if old == new {
                         continue;
                     }
@@ -664,6 +695,7 @@ impl MdnCorpus {
     }
     async fn apply_entry(
         &self,
+        cache: &mut inventory::NodeCache,
         repo: Repo,
         revision: &str,
         root: &mut String,
@@ -676,7 +708,7 @@ impl MdnCorpus {
             format!("@unsupported/{}", inventory::digest(entry.path.as_bytes()))
         };
         // BCD synthetic members are removed along with their original source file.
-        if let Some(old) = inventory::get(self.store.as_ref(), root, &path).await?
+        if let Some(old) = inventory::get_cached(self.store.as_ref(), root, &path, cache).await?
             && old.kind == "bcd"
             && let Some(id) = old.projection
             && let Some(row) = self.store.mdn_get("projections", &id).await?
@@ -684,14 +716,20 @@ impl MdnCorpus {
             for (field, prefix) in [("features", "@features"), ("browsers", "@browsers")] {
                 if let Some(keys) = row.data[field].as_array() {
                     for key in keys.iter().filter_map(Value::as_str) {
-                        self.update_identity(root, &format!("{prefix}/{key}"), &entry.path, None)
-                            .await?;
+                        self.update_identity(
+                            cache,
+                            root,
+                            &format!("{prefix}/{key}"),
+                            &entry.path,
+                            None,
+                        )
+                        .await?;
                     }
                 }
             }
         }
         if entry.removed {
-            *root = inventory::update(self.store.as_ref(), root, &path, None).await?;
+            *root = inventory::update_cached(self.store.as_ref(), root, &path, None, cache).await?;
             return Ok(());
         }
         let git = self.git(repo);
@@ -930,7 +968,7 @@ impl MdnCorpus {
                                         Vec::new()
                                     },
                                 };
-                                self.update_identity(root, &synthetic, &entry.path, Some(m))
+                                self.update_identity(cache, root, &synthetic, &entry.path, Some(m))
                                     .await?;
                                 features.push(key);
                             }
@@ -941,6 +979,7 @@ impl MdnCorpus {
                                     .projection(json!({"key":key,"data":browser.data,"source_path":entry.path}), None)
                                     .await?;
                                 self.update_identity(
+                                    cache,
                                     root,
                                     &synthetic,
                                     &entry.path,
@@ -993,18 +1032,20 @@ impl MdnCorpus {
                 }
             }
         }
-        *root = inventory::update(self.store.as_ref(), root, &path, Some(member)).await?;
+        *root =
+            inventory::update_cached(self.store.as_ref(), root, &path, Some(member), cache).await?;
         Ok(())
     }
     async fn update_identity(
         &self,
+        cache: &mut inventory::NodeCache,
         root: &mut String,
         path: &str,
         source: &str,
         member: Option<Member>,
     ) -> Result<()> {
         let marker_path = format!("@ambiguities/{}", inventory::digest(path.as_bytes()));
-        let marker = inventory::get(self.store.as_ref(), root, &marker_path).await?;
+        let marker = inventory::get_cached(self.store.as_ref(), root, &marker_path, cache).await?;
         let had_marker = marker.is_some();
         let mut candidates: BTreeMap<String, Member> = if let Some(marker) = marker {
             let projection = self
@@ -1022,7 +1063,7 @@ impl MdnCorpus {
         } else {
             BTreeMap::new()
         };
-        if let Some(old) = inventory::get(self.store.as_ref(), root, path).await? {
+        if let Some(old) = inventory::get_cached(self.store.as_ref(), root, path, cache).await? {
             let owner = old
                 .raw
                 .as_ref()
@@ -1036,22 +1077,25 @@ impl MdnCorpus {
             candidates.insert(source.to_owned(), member);
         }
         if candidates.len() <= 1 {
-            *root = inventory::update(
+            *root = inventory::update_cached(
                 self.store.as_ref(),
                 root,
                 path,
                 candidates.into_values().next(),
+                cache,
             )
             .await?;
             if had_marker {
-                *root = inventory::update(self.store.as_ref(), root, &marker_path, None).await?;
+                *root =
+                    inventory::update_cached(self.store.as_ref(), root, &marker_path, None, cache)
+                        .await?;
             }
         } else {
             let id = self
                 .projection(json!({"identity":path,"candidates":candidates}), None)
                 .await?;
-            *root = inventory::update(self.store.as_ref(), root, path, None).await?;
-            *root = inventory::update(
+            *root = inventory::update_cached(self.store.as_ref(), root, path, None, cache).await?;
+            *root = inventory::update_cached(
                 self.store.as_ref(),
                 root,
                 &marker_path,
@@ -1064,6 +1108,7 @@ impl MdnCorpus {
                     raw: None,
                     gaps: vec!["ambiguous_compatibility_identity".into()],
                 }),
+                cache,
             )
             .await?;
         }

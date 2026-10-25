@@ -184,6 +184,10 @@ historical processing share owner-fenced bookkeeping and bounded processing;
 source I/O never runs inside database transactions. Completed commit prefixes and
 member checkpoints resume after interruption. Processing-version changes restart
 backfill without replacing old projections.
+Private processing slices reuse a bounded cache of hash-verified immutable nodes.
+New nodes enter it only after their write group commits. Public research keeps
+its independent storage fencing, and every checkpoint/default publication still
+uses the owner connection.
 
 Indexes contain unique context-qualified projections, not one repeated full tree
 per commit. Immutable linked manifests share shards. Selected-ID filtering applies

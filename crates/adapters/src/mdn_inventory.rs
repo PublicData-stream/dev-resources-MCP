@@ -4,7 +4,7 @@ use devres_application::mdn::{
 };
 use devres_domain::{Error, Result};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -23,16 +23,75 @@ pub fn valid_path(path: &str) -> bool {
             .all(|s| !s.is_empty() && s != "." && s != ".." && !s.contains('\\'))
         && path.split('/').count() <= 64
 }
+/// Worker-local immutable evidence only. Never cache ownership or publication state.
+/// FIFO admission bounds both serialized evidence and retained node identities.
+pub(crate) struct NodeCache {
+    enabled: bool,
+    nodes: BTreeMap<String, (InventoryNode, usize)>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+impl NodeCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            enabled: true,
+            nodes: BTreeMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::new()
+        }
+    }
+    fn get(&self, id: &str) -> Option<InventoryNode> {
+        self.nodes.get(id).map(|(node, _)| node.clone())
+    }
+    fn insert(&mut self, id: String, node: InventoryNode, serialized_bytes: usize) {
+        const MAX_NODES: usize = 4096;
+        const MAX_BYTES: usize = 8 * 1024 * 1024;
+        let bytes = serialized_bytes.saturating_add(id.len());
+        if !self.enabled || bytes > MAX_BYTES || self.nodes.contains_key(&id) {
+            return;
+        }
+        while self.nodes.len() >= MAX_NODES || self.bytes.saturating_add(bytes) > MAX_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, old_bytes)) = self.nodes.remove(&oldest) {
+                self.bytes -= old_bytes;
+            }
+        }
+        self.bytes += bytes;
+        self.order.push_back(id.clone());
+        self.nodes.insert(id, (node, bytes));
+    }
+}
 pub async fn node(store: &dyn MdnStore, id: &str) -> Result<InventoryNode> {
+    node_cached(store, id, &mut NodeCache::disabled()).await
+}
+pub(crate) async fn node_cached(
+    store: &dyn MdnStore,
+    id: &str,
+    cache: &mut NodeCache,
+) -> Result<InventoryNode> {
+    if let Some(node) = cache.get(id) {
+        return Ok(node);
+    }
     let row = store
         .mdn_get("nodes", id)
         .await?
         .ok_or_else(|| Error::integrity("MDN inventory node missing."))?;
     let node: InventoryNode = decode(row.data)?;
-    if digest(&serde_json::to_vec(&node).map_err(|_| Error::integrity("Invalid MDN inventory."))?)
-        != id
-    {
+    let bytes =
+        serde_json::to_vec(&node).map_err(|_| Error::integrity("Invalid MDN inventory."))?;
+    if digest(&bytes) != id {
         return Err(Error::integrity("MDN inventory hash mismatch."));
+    }
+    if cache.enabled {
+        cache.insert(id.to_owned(), node.clone(), bytes.len());
     }
     Ok(node)
 }
@@ -66,28 +125,30 @@ pub async fn put_node(store: &dyn MdnStore, node: &InventoryNode) -> Result<Stri
 /// Partitioning may read a newly staged child before it exists in PostgreSQL.
 struct Staged<'a> {
     store: &'a dyn MdnStore,
-    nodes: BTreeMap<String, InventoryNode>,
+    cache: &'a mut NodeCache,
+    nodes: BTreeMap<String, (InventoryNode, usize)>,
     rows: Vec<MdnWrite>,
     bytes: usize,
 }
 impl<'a> Staged<'a> {
-    fn new(store: &'a dyn MdnStore) -> Self {
+    fn new(store: &'a dyn MdnStore, cache: &'a mut NodeCache) -> Self {
         Self {
             store,
+            cache,
             nodes: BTreeMap::new(),
             rows: Vec::new(),
             bytes: 0,
         }
     }
-    async fn node(&self, id: &str) -> Result<InventoryNode> {
+    async fn node(&mut self, id: &str) -> Result<InventoryNode> {
         match self.nodes.get(id) {
-            Some(node) => Ok(node.clone()),
-            None => node(self.store, id).await,
+            Some((node, _)) => Ok(node.clone()),
+            None => node_cached(self.store, id, self.cache).await,
         }
     }
     fn put(&mut self, node: &InventoryNode) -> Result<String> {
         let (id, encoded) = encoded_node(node)?;
-        if let Some(retained) = self.nodes.get(&id) {
+        if let Some((retained, _)) = self.nodes.get(&id) {
             if retained != node {
                 return Err(Error::integrity("MDN staged node identity collision."));
             }
@@ -109,15 +170,27 @@ impl<'a> Staged<'a> {
             key: id.clone(),
             data: encoded.data,
         });
-        self.nodes.insert(id.clone(), node.clone());
+        self.nodes.insert(id.clone(), (node.clone(), encoded.bytes));
         Ok(id)
     }
     async fn commit(self) -> Result<()> {
         let Self {
-            store, rows, nodes, ..
+            store,
+            cache,
+            rows,
+            nodes,
+            ..
         } = self;
-        drop(nodes);
-        store.mdn_put_many(&rows).await
+        if !cache.enabled {
+            drop(nodes);
+            return store.mdn_put_many(&rows).await;
+        }
+        store.mdn_put_many(&rows).await?;
+        // A failed write must never expose staged evidence through the cache.
+        for (id, (node, bytes)) in nodes {
+            cache.insert(id, node, bytes);
+        }
+        Ok(())
     }
 }
 
@@ -128,6 +201,7 @@ async fn child(
     store: &dyn MdnStore,
     mut n: InventoryNode,
     part: &str,
+    cache: &mut NodeCache,
 ) -> Result<Option<InventoryNode>> {
     let hash = digest(part.as_bytes());
     let mut depth = 0;
@@ -139,20 +213,28 @@ async fn child(
         let Some(id) = n.buckets.get(nibble) else {
             return Ok(None);
         };
-        n = node(store, id).await?;
+        n = node_cached(store, id, cache).await?;
     }
     match n.children.get(part) {
-        Some(id) => Ok(Some(node(store, id).await?)),
+        Some(id) => Ok(Some(node_cached(store, id, cache).await?)),
         None => Ok(None),
     }
 }
 pub async fn get(store: &dyn MdnStore, root: &str, path: &str) -> Result<Option<Member>> {
+    get_cached(store, root, path, &mut NodeCache::disabled()).await
+}
+pub(crate) async fn get_cached(
+    store: &dyn MdnStore,
+    root: &str,
+    path: &str,
+    cache: &mut NodeCache,
+) -> Result<Option<Member>> {
     if !valid_path(path) {
         return Err(Error::invalid("Invalid MDN member path."));
     }
-    let mut n = node(store, root).await?;
+    let mut n = node_cached(store, root, cache).await?;
     for part in path.split('/') {
-        let Some(next) = child(store, n, part).await? else {
+        let Some(next) = child(store, n, part, cache).await? else {
             return Ok(None);
         };
         n = next;
@@ -258,11 +340,20 @@ pub async fn update(
     path: &str,
     member: Option<Member>,
 ) -> Result<String> {
+    update_cached(store, root, path, member, &mut NodeCache::disabled()).await
+}
+pub(crate) async fn update_cached(
+    store: &dyn MdnStore,
+    root: &str,
+    path: &str,
+    member: Option<Member>,
+    cache: &mut NodeCache,
+) -> Result<String> {
     if !valid_path(path) {
         return Err(Error::invalid("Invalid MDN member path."));
     }
     let mut stack = Vec::new();
-    let mut current = node(store, root).await?;
+    let mut current = node_cached(store, root, cache).await?;
     for part in path.split('/') {
         let hash = digest(part.as_bytes());
         let mut depth = 0;
@@ -273,14 +364,14 @@ pub async fn update(
                 .to_owned();
             depth += 1;
             let next = match current.buckets.get(&key) {
-                Some(id) => node(store, id).await?,
+                Some(id) => node_cached(store, id, cache).await?,
                 None => InventoryNode::default(),
             };
             stack.push((current, Edge::Bucket(key), depth - 1));
             current = next;
         }
         let next = match current.children.get(part) {
-            Some(id) => node(store, id).await?,
+            Some(id) => node_cached(store, id, cache).await?,
             None => InventoryNode::default(),
         };
         stack.push((current, Edge::Child(part.into()), depth));
@@ -289,7 +380,7 @@ pub async fn update(
     if current.member == member {
         return Ok(root.to_owned());
     }
-    let mut staged = Staged::new(store);
+    let mut staged = Staged::new(store, cache);
     let mut previous = current.clone();
     let before = counts(current.member.as_ref());
     let after = counts(member.as_ref());
@@ -393,6 +484,7 @@ mod tests {
     struct Memory {
         rows: Mutex<BTreeMap<String, MdnRow>>,
         singles: AtomicUsize,
+        reads: AtomicUsize,
         batches: AtomicUsize,
         fail_batch: AtomicBool,
     }
@@ -403,6 +495,7 @@ mod tests {
         }
         async fn mdn_get(&self, kind: &str, key: &str) -> Result<Option<MdnRow>> {
             assert_eq!(kind, "nodes");
+            self.reads.fetch_add(1, Ordering::Relaxed);
             Ok(self.rows.lock().expect("rows").get(key).cloned())
         }
         async fn mdn_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
@@ -472,6 +565,157 @@ mod tests {
             raw: None,
             gaps: Vec::new(),
         }
+    }
+    #[tokio::test]
+    async fn cached_updates_preserve_golden_hash_partitioning_and_public_reads() {
+        let store = Memory::default();
+        let initial = empty(&store).await.expect("empty");
+        let mut cache = NodeCache::new();
+        let mut root = update_cached(&store, &initial, "a/b/c", Some(member("a/b/c")), &mut cache)
+            .await
+            .expect("cached update");
+        assert_eq!(
+            root,
+            "59cc157dfa306cdebe2c26b81c8f786ce50dc412dbf66dff817e6f799c2fff27"
+        );
+        let reads = store.reads.load(Ordering::Relaxed);
+        assert_eq!(
+            get_cached(&store, &root, "a/b/c", &mut cache)
+                .await
+                .expect("cache hit"),
+            Some(member("a/b/c"))
+        );
+        assert_eq!(
+            store.reads.load(Ordering::Relaxed),
+            reads,
+            "successful staged nodes are cached"
+        );
+        assert_eq!(
+            get(&store, &root, "a/b/c").await.expect("public lookup"),
+            Some(member("a/b/c"))
+        );
+        assert!(
+            store.reads.load(Ordering::Relaxed) > reads,
+            "public lookups retain store fences"
+        );
+        let mut reference = root.clone();
+        for n in 0..70 {
+            let path = format!("directory/member-{n:03}");
+            root = update_cached(&store, &root, &path, Some(member(&path)), &mut cache)
+                .await
+                .expect("cached partition");
+            reference = update(&store, &reference, &path, Some(member(&path)))
+                .await
+                .expect("reference partition");
+            assert_eq!(root, reference, "cache cannot change inventory identity");
+        }
+        assert_eq!(
+            members(&store, &root, 100)
+                .await
+                .expect("retained membership")
+                .len(),
+            71
+        );
+        assert!(
+            get_cached(&store, &initial, "a/b/c", &mut cache)
+                .await
+                .expect("old root")
+                .is_none()
+        );
+    }
+    #[test]
+    fn node_cache_fifo_enforces_both_capacity_limits() {
+        let mut cache = NodeCache::new();
+        let mut first = String::new();
+        for n in 0..4097 {
+            let node = InventoryNode {
+                member: Some(member(&format!("entry-{n}"))),
+                ..InventoryNode::default()
+            };
+            let (id, encoded) = encoded_node(&node).expect("encoded node");
+            if n == 0 {
+                first = id.clone();
+            }
+            cache.insert(id, node, encoded.bytes);
+        }
+        assert_eq!(cache.nodes.len(), 4096);
+        assert!(
+            !cache.nodes.contains_key(&first),
+            "FIFO evicts the oldest admission"
+        );
+        let mut cache = NodeCache::new();
+        for n in 0..10 {
+            let mut m = member(&format!("large-{n}"));
+            m.raw = Some(json!({"body":"x".repeat(1024 * 1024)}));
+            let node = InventoryNode {
+                member: Some(m),
+                ..InventoryNode::default()
+            };
+            let (id, encoded) = encoded_node(&node).expect("encoded node");
+            cache.insert(id, node, encoded.bytes);
+            assert!(cache.bytes <= 8 * 1024 * 1024);
+            assert!(cache.nodes.len() <= 4096);
+        }
+        assert_eq!(cache.nodes.len(), 7, "serialized-byte budget also evicts");
+        let mut m = member("oversized");
+        m.raw = Some(json!({"body":"x".repeat(8 * 1024 * 1024)}));
+        let node = InventoryNode {
+            member: Some(m),
+            ..InventoryNode::default()
+        };
+        let (id, encoded) = encoded_node(&node).expect("encoded node");
+        let before = (cache.nodes.len(), cache.bytes);
+        cache.insert(id.clone(), node, encoded.bytes);
+        assert!(!cache.nodes.contains_key(&id));
+        assert_eq!((cache.nodes.len(), cache.bytes), before);
+    }
+    #[tokio::test]
+    async fn corrupt_reads_and_failed_writes_never_admit_nodes_to_cache() {
+        let store = Memory::default();
+        let initial = empty(&store).await.expect("empty");
+        let mut cache = NodeCache::new();
+        node_cached(&store, &initial, &mut cache)
+            .await
+            .expect("verified empty");
+        let before = cache.nodes.keys().cloned().collect::<Vec<_>>();
+        let mut staged = Staged::new(&store, &mut cache);
+        let pending = staged
+            .put(&InventoryNode {
+                member: Some(member("not-committed")),
+                ..InventoryNode::default()
+            })
+            .expect("stage");
+        store.fail_batch.store(true, Ordering::Relaxed);
+        assert_eq!(
+            staged.commit().await.expect_err("failed write").code,
+            "unavailable"
+        );
+        assert_eq!(cache.nodes.keys().cloned().collect::<Vec<_>>(), before);
+        assert!(!cache.nodes.contains_key(&pending));
+        assert!(
+            store
+                .mdn_get("nodes", &pending)
+                .await
+                .expect("failed row absent")
+                .is_none()
+        );
+        let corrupt = "f".repeat(64);
+        store
+            .mdn_put(
+                "nodes",
+                &corrupt,
+                &value(&InventoryNode::default()).expect("encode"),
+            )
+            .await
+            .expect("corrupt fixture");
+        assert_eq!(
+            node_cached(&store, &corrupt, &mut cache)
+                .await
+                .expect_err("hash mismatch")
+                .code,
+            "integrity"
+        );
+        assert!(!cache.nodes.contains_key(&corrupt));
     }
     #[tokio::test]
     async fn path_writes_one_group_preserves_hash_and_skips_no_op_updates() {

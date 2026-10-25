@@ -244,6 +244,9 @@ Selected snapshot membership caps at 1,000,000 members/64 MiB metadata. These ar
 rejection boundaries, not measured process RSS or whole-corpus capacity.
 Immutable database write groups cap at 1,000 rows/16 MiB and commit under the
 existing ownership fence before their inventory/checkpoint pointers advance.
+Each private processing slice may cache at most 4,096 verified inventory nodes
+with 8 MiB of serialized node/key data. This cache excludes publication state and
+does not replace storage fencing on public reads.
 
 Schema 5 is forward-only. Preserve MDN raw artifacts, retained Git evidence,
 projection records, inventories and `mdn-indexes` in coordinated backups.
