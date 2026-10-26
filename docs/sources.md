@@ -193,6 +193,17 @@ crawling. Every frozen observation has finite catalog, ref and publication inven
 new discoveries belong to later observations. Already-unreachable objects and
 unadvertised/disappeared publications cannot be reconstructed.
 
+Publication discovery retains the literal source links and their roles. Qualified
+edition and document navigation, published support data (including TXT, IDL and
+JSON), and explicitly advertised alternate representations authorize acquisition.
+An edition-directory prefix alone does not authorize linked images or ordinary
+references. A bare reference matching an existing local anchor remains a malformed
+local reference; discovery does not invent a missing fragment delimiter. Classification
+applies equally to successful and failed HTTP observations. Metadata-policy repair
+creates linked evidence and a successor inventory while preserving the original
+freeze, failures, source observations and validation times; uncertain or genuinely
+unavailable publication obligations remain incomplete.
+
 GitHub attempts share the existing host clock. WHATWG publication attempts have a
 shared one-per-second budget with the existing single retry owner. Catalog/ref
 validation targets one hour and moving publications one day. These conservative

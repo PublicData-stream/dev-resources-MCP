@@ -4,8 +4,8 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
 case "${1:-}:${2:-}:$#" in
-  --live:current:2|--live:full:2|--resume:full:2) ;;
-  *) echo 'usage: scripts/accept-whatwg.sh --live current|full | --resume full' >&2; exit 2 ;;
+  --live:current:2|--live:full:2|--resume:full:2|--recover:full:2|--resume-recovery:full:2) ;;
+  *) echo 'usage: scripts/accept-whatwg.sh --live current|full | --resume full | --recover full | --resume-recovery full' >&2; exit 2 ;;
 esac
 if [[ ${DEVRES_TMP_STATE:-} != 1 ]]; then
   exec "$repo/scripts/with-tmp-state.sh" "$0" "$@"
@@ -26,7 +26,7 @@ if root == Path('/tmp') or Path('/tmp') not in root.parents or root.stat().st_ui
 marker = root / 'owner-v1'
 if marker.is_symlink() or not marker.is_file() or marker.read_bytes() != b'devres-whatwg-retained-acceptance-v1\n':
     raise SystemExit('Unowned WHATWG acceptance directory')
-for name in ('postgres', 'blobs', 'acceptance.lock', 'frozen.json'):
+for name in ('postgres', 'blobs', 'acceptance.lock', 'frozen.json', 'recovery-current.json'):
     if (root / name).is_symlink():
         raise SystemExit('Retained acceptance state must not be symlinked')
 print(root)
@@ -36,8 +36,11 @@ export DEVRES_WHATWG_ACCEPTANCE_ROOT
 printf 'Retained WHATWG evidence: %s\n' "$DEVRES_WHATWG_ACCEPTANCE_ROOT" >&2
 exec 9> "$DEVRES_WHATWG_ACCEPTANCE_ROOT/acceptance.lock"
 flock -n 9 || { echo 'Retained WHATWG acceptance is already running for this directory' >&2; exit 1; }
-if [[ $1 == --resume ]]; then
+if [[ $1 == --resume || $1 == --recover || $1 == --resume-recovery ]]; then
   [[ -f $DEVRES_WHATWG_ACCEPTANCE_ROOT/frozen.json ]] || { echo 'resume requires a retained frozen observation' >&2; exit 1; }
+  if [[ $1 == --resume-recovery ]]; then
+    [[ -f $DEVRES_WHATWG_ACCEPTANCE_ROOT/recovery-current.json ]] || { echo 'recovery resume requires a retained successor pointer' >&2; exit 1; }
+  fi
 elif [[ -e $DEVRES_WHATWG_ACCEPTANCE_ROOT/frozen.json ]]; then
   echo 'Frozen observation already exists; use --resume full or a new retained directory' >&2; exit 1
 fi

@@ -31,6 +31,8 @@ const MAX_PROJECTION: u64 = 256 * 1024 * 1024;
 const MAX_PUBLICATIONS: usize = 100_000;
 const MAX_MEMBERS: usize = 1_000_000;
 
+mod recovery;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Publication {
     id: String,
@@ -49,6 +51,10 @@ struct Publication {
     metadata_version: u32,
     #[serde(default)]
     metadata_parent: Option<String>,
+    #[serde(default)]
+    advertisements: Vec<catalog::PublicationAdvertisement>,
+    #[serde(default)]
+    exclusions: Vec<catalog::PublicationExclusion>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Frozen {
@@ -57,6 +63,8 @@ struct Frozen {
     observations: BTreeMap<String, Observation>,
     publications: Vec<String>,
     mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<recovery::Lineage>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Work {
@@ -70,6 +78,8 @@ struct FreezeWork {
     observations: BTreeMap<String, Observation>,
     publications: Vec<String>,
     mode: String,
+    #[serde(default)]
+    metadata_policy: u32,
     standard_offset: usize,
     queue: VecDeque<(String, PublicationUrl)>,
     seen: BTreeSet<String>,
@@ -1520,6 +1530,16 @@ impl WhatwgCorpus {
         url: PublicationUrl,
         cancel: CancellationToken,
     ) -> Result<Publication> {
+        self.capture_publication_inner(standard, url, cancel, true)
+            .await
+    }
+    async fn capture_publication_inner(
+        &self,
+        standard: &Standard,
+        url: PublicationUrl,
+        cancel: CancellationToken,
+        publish_head: bool,
+    ) -> Result<Publication> {
         url.validate()?;
         let response = self
             .broker
@@ -1536,13 +1556,22 @@ impl WhatwgCorpus {
             .await?;
         let status = response.status;
         let observed_at = devres_domain::unix_now();
-        let (artifact, links, repositories, gaps) = if status == 200 {
+        let (artifact, links, repositories, advertisements, exclusions, gaps) = if status == 200 {
             let artifact = self.raw.capture(response, None, cancel.clone()).await?;
             if url.kind() != catalog::PublicationKind::Html {
-                (Some(artifact), Vec::new(), Vec::new(), Vec::new())
+                (
+                    Some(artifact),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
             } else if artifact.bytes > MAX_SOURCE as u64 {
                 (
                     Some(artifact),
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     vec!["publication_metadata_input_limit".into()],
@@ -1562,11 +1591,15 @@ impl WhatwgCorpus {
                         Some(artifact),
                         metadata.links,
                         metadata.repositories,
+                        metadata.advertisements,
+                        metadata.exclusions,
                         Vec::new(),
                     ),
                     Err(error) if error.code == "cancelled" => return Err(error),
                     Err(error) => (
                         Some(artifact),
+                        Vec::new(),
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         vec![format!("publication_metadata_{}", error.code)],
@@ -1576,6 +1609,8 @@ impl WhatwgCorpus {
         } else {
             (
                 None,
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 vec![format!("publication_http_{status}")],
@@ -1606,6 +1641,8 @@ impl WhatwgCorpus {
             links,
             gaps,
             repositories,
+            advertisements,
+            exclusions,
             chunk_hashes,
             metadata_version: catalog::METADATA_VERSION,
             metadata_parent: None,
@@ -1613,12 +1650,14 @@ impl WhatwgCorpus {
         self.store
             .whatwg_put("publications", &id, &encode(&publication)?)
             .await?;
-        self.store
-            .whatwg_set_state(
-                &state_key("publication", publication.url.as_str()),
-                &json!(id),
-            )
-            .await?;
+        if publish_head {
+            self.store
+                .whatwg_set_state(
+                    &state_key("publication", publication.url.as_str()),
+                    &json!(id),
+                )
+                .await?;
+        }
         Ok(publication)
     }
     /// Reinterpret retained bytes; no source request or validation timestamp changes.
@@ -1626,6 +1665,15 @@ impl WhatwgCorpus {
         &self,
         old: &Publication,
         cancel: CancellationToken,
+    ) -> Result<Publication> {
+        self.repair_publication_metadata_inner(old, cancel, true)
+            .await
+    }
+    async fn repair_publication_metadata_inner(
+        &self,
+        old: &Publication,
+        cancel: CancellationToken,
+        publish_head: bool,
     ) -> Result<Publication> {
         let mut repaired = old.clone();
         repaired.metadata_version = catalog::METADATA_VERSION;
@@ -1639,6 +1687,8 @@ impl WhatwgCorpus {
         if old.url.kind() != catalog::PublicationKind::Html {
             repaired.links.clear();
             repaired.repositories.clear();
+            repaired.advertisements.clear();
+            repaired.exclusions.clear();
         } else if artifact.bytes > MAX_SOURCE as u64 {
             repaired
                 .gaps
@@ -1655,11 +1705,15 @@ impl WhatwgCorpus {
                 Ok(metadata) => {
                     repaired.links = metadata.links;
                     repaired.repositories = metadata.repositories;
+                    repaired.advertisements = metadata.advertisements;
+                    repaired.exclusions = metadata.exclusions;
                 }
                 Err(error) if error.code == "cancelled" => return Err(error),
                 Err(error) => {
                     repaired.links.clear();
                     repaired.repositories.clear();
+                    repaired.advertisements.clear();
+                    repaired.exclusions.clear();
                     repaired
                         .gaps
                         .push(format!("publication_metadata_{}", error.code));
@@ -1675,6 +1729,8 @@ impl WhatwgCorpus {
                 catalog::METADATA_VERSION,
                 &repaired.links,
                 &repaired.repositories,
+                &repaired.advertisements,
+                &repaired.exclusions,
                 &repaired.gaps,
             ))
             .map_err(|_| failure())?,
@@ -1682,12 +1738,14 @@ impl WhatwgCorpus {
         self.store
             .whatwg_put("publications", &repaired.id, &encode(&repaired)?)
             .await?;
-        self.store
-            .whatwg_set_state(
-                &state_key("publication", repaired.url.as_str()),
-                &json!(repaired.id),
-            )
-            .await?;
+        if publish_head {
+            self.store
+                .whatwg_set_state(
+                    &state_key("publication", repaired.url.as_str()),
+                    &json!(repaired.id),
+                )
+                .await?;
+        }
         Ok(repaired)
     }
     async fn repair_freeze_metadata(
@@ -1739,7 +1797,11 @@ impl WhatwgCorpus {
                 ));
             }
             if work.mode == "full" {
-                for url in catalog::advertised(&standard, &repaired.url, &repaired.links) {
+                for url in catalog::qualified_advertised(
+                    &standard,
+                    &repaired.url,
+                    &repaired.advertisements,
+                ) {
                     if work.seen.insert(url.as_str().into()) {
                         work.queue.push_back((standard.id.clone(), url));
                     }
@@ -2077,11 +2139,17 @@ impl WhatwgCorpus {
                 observations: BTreeMap::new(),
                 publications: Vec::new(),
                 mode: mode.into(),
+                metadata_policy: catalog::METADATA_VERSION,
                 standard_offset: 0,
                 queue: VecDeque::new(),
                 seen: BTreeSet::new(),
             }
         };
+        if work.metadata_policy != catalog::METADATA_VERSION {
+            return Err(Error::unavailable(
+                "Legacy WHATWG freeze work requires explicit publication-policy recovery; no queued request was admitted.",
+            ));
+        }
         self.repair_freeze_metadata(&mut work, cancel.clone())
             .await?;
         while work.standard_offset < work.catalog.standards.len() {
@@ -2110,7 +2178,11 @@ impl WhatwgCorpus {
             }
             work.observations.insert(resolved.id.clone(), observation);
             if mode == "full" {
-                for url in catalog::advertised(&resolved, &publication.url, &publication.links) {
+                for url in catalog::qualified_advertised(
+                    &resolved,
+                    &publication.url,
+                    &publication.advertisements,
+                ) {
                     if work.seen.insert(url.as_str().into()) {
                         work.queue.push_back((resolved.id.clone(), url));
                     }
@@ -2144,7 +2216,11 @@ impl WhatwgCorpus {
                 .capture_publication(standard, url, cancel.clone())
                 .await?;
             if mode == "full" {
-                for url in catalog::advertised(standard, &publication.url, &publication.links) {
+                for url in catalog::qualified_advertised(
+                    standard,
+                    &publication.url,
+                    &publication.advertisements,
+                ) {
                     if work.seen.insert(url.as_str().into()) {
                         work.queue.push_back((standard_id.clone(), url));
                     }
@@ -2172,6 +2248,7 @@ impl WhatwgCorpus {
             observations: work.observations,
             publications: work.publications,
             mode: mode.into(),
+            lineage: None,
         };
         let value = encode(&frozen)?;
         self.store.whatwg_put("frozen", &id, &value).await?;
@@ -2393,6 +2470,7 @@ impl WhatwgCorpus {
             .unwrap_or(0) as usize
             % catalog.standards.len();
         let original = catalog.standards[offset].clone();
+        let mut frontier = self.publication_frontier(&original.id).await?;
         self.store
             .whatwg_set_state(
                 &state_key("current-attempt", &original.id),
@@ -2426,6 +2504,15 @@ impl WhatwgCorpus {
         } else {
             self.capture_publication(&original, url, cancel.clone())
                 .await?
+        };
+        let publication = if publication.status == 200
+            && publication.url.kind() == catalog::PublicationKind::Html
+            && publication.metadata_version < catalog::METADATA_VERSION
+        {
+            self.repair_publication_metadata(&publication, cancel.clone())
+                .await?
+        } else {
+            publication
         };
         self.store
             .whatwg_set_state(
@@ -2475,13 +2562,6 @@ impl WhatwgCorpus {
                 )
                 .await?;
         }
-        let mut frontier: Vec<String> = self
-            .store
-            .whatwg_state(&state_key("frontier", &standard.id))
-            .await?
-            .map(decode)
-            .transpose()?
-            .unwrap_or_default();
         let paths = self
             .git(&standard.repository)?
             .publication_paths(&observation, cancel.clone())
@@ -2491,7 +2571,9 @@ impl WhatwgCorpus {
                 frontier.push(url.as_str().into());
             }
         }
-        for url in catalog::advertised(&standard, &publication.url, &publication.links) {
+        for url in
+            catalog::qualified_advertised(&standard, &publication.url, &publication.advertisements)
+        {
             if !frontier.iter().any(|s| s == url.as_str()) {
                 frontier.push(url.as_str().into());
             }
@@ -2501,8 +2583,7 @@ impl WhatwgCorpus {
                 "WHATWG edition frontier exceeds its bound.",
             ));
         }
-        self.store
-            .whatwg_set_state(&state_key("frontier", &standard.id), &encode(&frontier)?)
+        self.retain_publication_frontier(&standard.id, &frontier)
             .await?;
         self.store
             .whatwg_set_state(
@@ -2536,14 +2617,7 @@ impl WhatwgCorpus {
             .unwrap_or(0) as usize
             % catalog.standards.len();
         let standard = &catalog.standards[offset];
-        let frontier_key = state_key("frontier", &standard.id);
-        let mut frontier: Vec<String> = self
-            .store
-            .whatwg_state(&frontier_key)
-            .await?
-            .map(decode)
-            .transpose()?
-            .unwrap_or_default();
+        let mut frontier = self.publication_frontier(&standard.id).await?;
         if !frontier.is_empty() {
             let url = PublicationUrl::new(&frontier[0])?;
             let previous = self
@@ -2579,11 +2653,24 @@ impl WhatwgCorpus {
                 )
             };
             if let Some(publication) = publication {
+                let publication = if publication.status == 200
+                    && publication.url.kind() == catalog::PublicationKind::Html
+                    && publication.metadata_version < catalog::METADATA_VERSION
+                {
+                    self.repair_publication_metadata(&publication, cancel.clone())
+                        .await?
+                } else {
+                    publication
+                };
                 if publication.status == 200 {
                     self.process_publication(standard, &publication, cancel.clone())
                         .await?;
                     frontier.remove(0);
-                    for url in catalog::advertised(standard, &publication.url, &publication.links) {
+                    for url in catalog::qualified_advertised(
+                        standard,
+                        &publication.url,
+                        &publication.advertisements,
+                    ) {
                         if self
                             .store
                             .whatwg_state(&state_key("publication", url.as_str()))
@@ -2600,8 +2687,7 @@ impl WhatwgCorpus {
             } else {
                 frontier.rotate_left(1);
             }
-            self.store
-                .whatwg_set_state(&frontier_key, &encode(&frontier)?)
+            self.retain_publication_frontier(&standard.id, &frontier)
                 .await?;
         }
         if let Some(value) = self
@@ -2810,13 +2896,14 @@ mod tests {
     use devres_application::whatwg::{Row, Write, validate_whatwg_writes};
     use std::sync::{
         Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     #[derive(Default)]
-    struct Memory {
+    pub(super) struct Memory {
         rows: StdMutex<BTreeMap<(String, String), Row>>,
         state: StdMutex<BTreeMap<String, Value>>,
         index_read_fault: StdMutex<Option<&'static str>>,
+        pub(super) fail_recovery_state_after: AtomicUsize,
     }
     #[async_trait]
     impl WhatwgStore for Memory {
@@ -2914,6 +3001,15 @@ mod tests {
             Ok(self.state.lock().expect("state").get(key).cloned())
         }
         async fn whatwg_set_state(&self, key: &str, data: &Value) -> Result<()> {
+            if key.starts_with("recovering:")
+                && self.fail_recovery_state_after.load(Ordering::Acquire) > 0
+                && self
+                    .fail_recovery_state_after
+                    .fetch_sub(1, Ordering::AcqRel)
+                    == 1
+            {
+                return Err(Error::unavailable("Synthetic recovery checkpoint failure."));
+            }
             self.state
                 .lock()
                 .expect("state")
@@ -3215,6 +3311,7 @@ mod tests {
             observations: BTreeMap::from([("dom".into(), observation)]),
             publications: vec![publication],
             mode: "full".into(),
+            lineage: None,
         };
         let legacy_history = state_key("frozen-history", &format!("{}:dom", frozen.id));
         let legacy_offset = frozen.observations["dom"].commits.bytes;
@@ -3379,6 +3476,7 @@ mod tests {
             observations: frozen_work.observations,
             publications: frozen_work.publications,
             mode: "full".into(),
+            metadata_policy: catalog::METADATA_VERSION,
             standard_offset: 1,
             queue: VecDeque::new(),
             seen: BTreeSet::from([incomplete.url.as_str().to_owned()]),
@@ -3560,6 +3658,8 @@ mod tests {
             repositories: Vec::new(),
             metadata_version: catalog::METADATA_VERSION,
             metadata_parent: None,
+            advertisements: Vec::new(),
+            exclusions: Vec::new(),
         };
         corpus
             .store

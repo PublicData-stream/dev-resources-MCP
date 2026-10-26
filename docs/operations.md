@@ -463,6 +463,42 @@ disposable fixtures; `/tmp` persistence depends on the host's cleanup policy.
 DEVRES_WHATWG_ACCEPTANCE_ROOT=/tmp/RETAINED_WHATWG_DIRECTORY   scripts/with-local-docker.sh scripts/accept-whatwg.sh --resume full
 ```
 
+When a metadata or discovery-policy correction changes the qualified publication
+inventory, use the explicit recovery path:
+
+```sh
+DEVRES_WHATWG_ACCEPTANCE_ROOT=/tmp/RETAINED_WHATWG_DIRECTORY   scripts/with-local-docker.sh scripts/accept-whatwg.sh --recover full
+DEVRES_WHATWG_ACCEPTANCE_ROOT=/tmp/RETAINED_WHATWG_DIRECTORY   scripts/with-local-docker.sh scripts/accept-whatwg.sh --resume-recovery full
+```
+
+Recovery reinterprets retained publication bytes and records a successor linked to
+the original freeze. It preserves the original `frozen.json`, `acceptance.json`,
+failed observations, catalog, Git roots, raw hashes and validation times. Every
+inherited publication candidate receives an audited disposition using its source
+role, independently of HTTP status. Ordinary linked images and malformed local
+references do not become publication obligations. A genuinely advertised but
+unavailable publication still blocks completion.
+
+`--recover full` may fetch only newly required qualified publications through the
+normal broker and pacing; it does not revalidate the catalog or Git observations.
+An unresolved inventory keeps its checkpoint and failure evidence without publishing
+a closed successor. Repeat that command to continue recovery. A closed successor is
+saved as `frozen-recovery-ID.json`; `recovery-current.json` selects it for the offline
+`--resume-recovery full` command. Content-addressed recovery receipts are retained
+separately, with `recovery-acceptance.json` pointing to the latest receipt. Preserve
+these manifests, receipts and qualification evidence with the original captures.
+Failed or cancelled recovery invocations also retain content-addressed failure
+records, selected by `last-recovery-failure.json`.
+Completed source snapshots and projections can be reused; metadata repair does not
+establish fresh upstream validation. Original `--resume full` still addresses the
+original freeze and its original obligations.
+
+Nonempty discovery queues from an older or unversioned admission policy cannot
+authorize requests under the new policy. They fail closed and remain retained.
+Use the explicit recovery path for a completed parent freeze. If an older run has
+no frozen parent yet, retain its directory and use a fresh isolated directory for
+a new capture rather than treating its queued URLs as current-policy authority.
+
 Full acceptance exceeds the fixed-record smoke request budget and is a separate
 explicit operation using normal pacing, not a load test. Reports separate catalog/ref
 accounting, raw acquisition, historical processing, index coverage and public research.

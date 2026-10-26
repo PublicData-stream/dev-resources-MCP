@@ -9,7 +9,7 @@ use url::Url;
 
 pub const CATALOG_REPOSITORY: &str = "whatwg/sg";
 pub const CATALOG_PATH: &str = "db.json";
-pub const METADATA_VERSION: u32 = 2;
+pub const METADATA_VERSION: u32 = 3;
 
 pub fn publication_host(host: &str) -> bool {
     host.strip_suffix(".spec.whatwg.org")
@@ -254,7 +254,98 @@ pub fn current_publication(standard: &Standard) -> Result<PublicationUrl> {
     Ok(url)
 }
 
-/// Follow only advertised publication classes on this standard's qualified host.
+fn known_document_path(standard: &Standard, path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let family = lower.starts_with("/review-drafts/")
+        || lower.starts_with("/commit-snapshots/")
+        || lower.starts_with("/multipage/")
+        || lower.starts_with("/dev/");
+    family && (lower.ends_with(".html") || lower.ends_with(".htm"))
+        || standard.id == "bluetooth" && matches!(path, "/scanning.html" | "/tests.html")
+}
+
+fn edition_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    let path = path.trim_start_matches('/');
+    if matches!(
+        path,
+        "dev/" | "multipage/" | "single-page.html" | "single-page/"
+    ) {
+        return true;
+    }
+    let Some(directory) = path.strip_suffix('/') else {
+        return false;
+    };
+    if let Some(date) = directory.strip_prefix("review-drafts/") {
+        return date.len() == 7
+            && date.as_bytes()[4] == b'-'
+            && date[..4]
+                .bytes()
+                .chain(date[5..].bytes())
+                .all(|b| b.is_ascii_digit())
+            && date[5..]
+                .parse::<u8>()
+                .is_ok_and(|month| (1..=12).contains(&month));
+    }
+    directory
+        .strip_prefix("commit-snapshots/")
+        .is_some_and(|commit| {
+            !commit.is_empty()
+                && commit.len() <= 128
+                && commit
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        })
+}
+
+/// Follow positive source-role advertisements; HTTP status never qualifies a link.
+pub fn qualified_advertised(
+    standard: &Standard,
+    base: &PublicationUrl,
+    advertisements: &[PublicationAdvertisement],
+) -> Vec<PublicationUrl> {
+    if base.kind() != PublicationKind::Html {
+        return Vec::new();
+    }
+    let Ok(origin) = Url::parse(base.as_str()) else {
+        return Vec::new();
+    };
+    let mut found = std::collections::BTreeMap::new();
+    for advertisement in advertisements {
+        let Ok(url) = origin.join(&advertisement.href) else {
+            continue;
+        };
+        if url.host_str() != Some(base.host()) {
+            continue;
+        }
+        let path = url.path();
+        let lower = path.to_ascii_lowercase();
+        let accepted = match advertisement.role {
+            AdvertisementRole::EditionNavigation => edition_path(path),
+            AdvertisementRole::DocumentNavigation => known_document_path(standard, path),
+            AdvertisementRole::PublishedSupportData => {
+                lower.ends_with(".txt") || lower.ends_with(".idl") || lower.ends_with(".json")
+            }
+            AdvertisementRole::ExplicitRepresentation => true,
+        };
+        if accepted && let Ok(value) = PublicationUrl::new(url.as_str()) {
+            found.insert(value.as_str().to_owned(), value);
+        }
+    }
+    // These are reviewed catalog seeds, not source-edge witnesses.
+    for seed in [
+        PublicationUrl::new(&standard.url),
+        current_publication(standard),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        found.insert(seed.as_str().to_owned(), seed);
+    }
+    found.into_values().collect()
+}
+
+/// Strict legacy route wrapper. Runtime discovery consumes typed source roles.
 pub fn advertised(
     standard: &Standard,
     base: &PublicationUrl,
@@ -275,15 +366,12 @@ pub fn advertised(
             continue;
         }
         let path = url.path();
-        let publication = path.ends_with(".pdf")
-            || path.contains("/review-drafts/")
-            || path.contains("/commit-snapshots/")
-            || path == "/dev/"
-            || path == "/multipage/"
-            || path == "/single-page.html"
-            || path == "/single-page/"
-            || (path.starts_with("/multipage/") && path.ends_with(".html"))
-            || (standard.id == "bluetooth" && matches!(path, "/scanning.html" | "/tests.html"));
+        let lower = path.to_ascii_lowercase();
+        let publication = lower.ends_with(".pdf")
+            || edition_path(path)
+            || known_document_path(standard, path)
+            || ((lower.ends_with(".txt") || lower.ends_with(".idl") || lower.ends_with(".json"))
+                && (lower.contains("/review-drafts/") || lower.contains("/commit-snapshots/")));
         if !publication {
             continue;
         }
@@ -297,366 +385,50 @@ pub fn advertised(
     found.into_values().collect()
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvertisementRole {
+    EditionNavigation,
+    DocumentNavigation,
+    PublishedSupportData,
+    ExplicitRepresentation,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicationAdvertisement {
+    pub href: String,
+    pub role: AdvertisementRole,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionRole {
+    EmbeddedAsset,
+    ExampleReference,
+    MalformedLocalReference,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicationExclusion {
+    pub href: String,
+    pub role: ExclusionRole,
+    pub source_anchor: Option<String>,
+    pub target_anchor: Option<String>,
+}
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct PublicationMetadata {
     pub links: Vec<String>,
     pub repositories: Vec<String>,
+    pub advertisements: Vec<PublicationAdvertisement>,
+    pub exclusions: Vec<PublicationExclusion>,
 }
-/// Extract source-repository metadata and header links, never arbitrary body repositories.
+mod metadata;
+
+/// Extract bounded source metadata and role-qualified publication edges, without execution.
 pub fn publication_metadata(
     bytes: &[u8],
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<PublicationMetadata> {
-    use html5ever::{
-        tendril::StrTendril,
-        tokenizer::{
-            BufferQueue, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
-        },
-    };
-    use std::cell::RefCell;
-    struct State {
-        result: PublicationMetadata,
-        heading: bool,
-        tokens: usize,
-        error: bool,
-        completed: usize,
-        link_keys: BTreeSet<String>,
-        link_bytes: usize,
-        definition: Option<String>,
-        source_context: bool,
-        body_started: bool,
-        template_depth: usize,
-        raw_hidden: Option<String>,
-        header_tag: Option<String>,
-        header_depth: usize,
-        anchor_repository: Option<String>,
-        anchor_label: String,
-    }
-    struct Sink<'a> {
-        state: RefCell<State>,
-        cancel: &'a tokio_util::sync::CancellationToken,
-    }
-    impl TokenSink for Sink<'_> {
-        type Handle = ();
-        fn process_token(&self, token: Token, _: u64) -> TokenSinkResult<()> {
-            let mut state = self.state.borrow_mut();
-            state.tokens += 1;
-            if !matches!(token, Token::ParseError(_) | Token::EOFToken) {
-                state.completed += 1;
-            }
-            if self.cancel.is_cancelled() || state.tokens > 4_000_000 {
-                state.error = true;
-                return TokenSinkResult::Continue;
-            }
-            if let Token::TagToken(tag) = &token {
-                if state.raw_hidden.as_deref() == Some(&*tag.name) && tag.kind == TagKind::EndTag {
-                    state.raw_hidden = None;
-                    return TokenSinkResult::Continue;
-                }
-                if state.raw_hidden.is_none() && tag.kind == TagKind::StartTag {
-                    let raw = match &*tag.name {
-                        "script" => Some(html5ever::tokenizer::states::RawKind::ScriptData),
-                        "style" | "iframe" | "xmp" | "noembed" | "noframes" | "noscript" => {
-                            Some(html5ever::tokenizer::states::RawKind::Rawtext)
-                        }
-                        "title" | "textarea" => Some(html5ever::tokenizer::states::RawKind::Rcdata),
-                        _ => None,
-                    };
-                    if let Some(raw) = raw {
-                        state.raw_hidden = Some(tag.name.to_string());
-                        return TokenSinkResult::RawData(raw);
-                    }
-                }
-            }
-            if state.raw_hidden.is_some() {
-                return TokenSinkResult::Continue;
-            }
-            if let Token::TagToken(tag) = &token
-                && &*tag.name == "template"
-            {
-                if tag.kind == TagKind::StartTag {
-                    state.template_depth = state.template_depth.saturating_add(1);
-                } else {
-                    state.template_depth = state.template_depth.saturating_sub(1);
-                }
-            }
-            if state.template_depth > 0 {
-                return TokenSinkResult::Continue;
-            }
-            if let Token::TagToken(tag) = &token
-                && tag.kind == TagKind::EndTag
-            {
-                if &*tag.name == "a"
-                    && let Some(identity) = state.anchor_repository.take()
-                {
-                    let label = state.anchor_label.to_ascii_lowercase();
-                    let source = label
-                        .split_whitespace()
-                        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
-                        .any(|word| matches!(word, "repository" | "source" | "contribute"));
-                    if source && state.header_depth > 0 && !state.heading {
-                        state.result.repositories.push(identity);
-                    }
-                    state.anchor_label.clear();
-                }
-                if state.header_tag.as_deref() == Some(&*tag.name) {
-                    state.header_depth = state.header_depth.saturating_sub(1);
-                    if state.header_depth == 0 {
-                        state.header_tag = None;
-                        state.anchor_repository = None;
-                        state.anchor_label.clear();
-                    }
-                }
-            }
-            if !state.heading
-                && state.anchor_repository.is_some()
-                && let Token::CharacterTokens(text) = &token
-            {
-                if state.anchor_label.len() + text.len() <= 1024 {
-                    state.anchor_label.push_str(text);
-                } else {
-                    state.error = true;
-                }
-            }
-            if !state.heading
-                && let Token::CharacterTokens(text) = &token
-                && let Some(definition) = &mut state.definition
-            {
-                if definition.len() + text.len() <= 1024 {
-                    definition.push_str(text);
-                } else {
-                    state.error = true;
-                }
-            }
-            if let Token::TagToken(tag) = &token
-                && tag.kind == TagKind::StartTag
-                && !matches!(
-                    &*tag.name,
-                    "html" | "head" | "meta" | "link" | "base" | "template"
-                )
-            {
-                state.body_started = true;
-            }
-            if let Token::TagToken(tag) = &token
-                && tag.kind == TagKind::StartTag
-                && &*tag.name == "dd"
-                && let Some(label) = state.definition.take()
-            {
-                let label = label.to_ascii_lowercase();
-                state.source_context = matches!(
-                    label.trim().trim_end_matches(':').trim(),
-                    "participate"
-                        | "source"
-                        | "source code"
-                        | "source repository"
-                        | "repository"
-                        | "feedback"
-                );
-            }
-            if let Token::TagToken(tag) = &token
-                && tag.kind == TagKind::EndTag
-                && matches!(&*tag.name, "dd" | "dl")
-            {
-                state.source_context = false;
-            }
-            if let Token::TagToken(tag) = &token
-                && tag.kind == TagKind::EndTag
-                && &*tag.name == "dt"
-            {
-                let label = state
-                    .definition
-                    .take()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                state.source_context = matches!(
-                    label.trim().trim_end_matches(':').trim(),
-                    "participate"
-                        | "source"
-                        | "source code"
-                        | "source repository"
-                        | "repository"
-                        | "feedback"
-                );
-            }
-            if let Token::TagToken(tag) = &token
-                && tag.kind == TagKind::StartTag
-            {
-                if &*tag.name == "dt" && !state.heading {
-                    state.definition = Some(String::new());
-                    state.source_context = false;
-                }
-
-                let attribute = |name: &str| {
-                    tag.attrs
-                        .iter()
-                        .find(|a| &*a.name.local == name)
-                        .map(|a| a.value.as_ref())
-                };
-                if state.header_tag.as_deref() == Some(&*tag.name) {
-                    state.header_depth += 1;
-                } else if state.header_depth == 0
-                    && matches!(&*tag.name, "header" | "div")
-                    && (attribute("id") == Some("head")
-                        || attribute("class").is_some_and(|classes| {
-                            classes
-                                .split_ascii_whitespace()
-                                .any(|class| class == "head")
-                        }))
-                {
-                    state.header_tag = Some(tag.name.to_string());
-                    state.header_depth = 1;
-                }
-                if &*tag.name == "h2" {
-                    state.heading = true;
-                    state.definition = None;
-                    state.source_context = false;
-                }
-                if tag.attrs.len() > 128
-                    || tag.name.len() > 256
-                    || tag
-                        .attrs
-                        .iter()
-                        .map(|a| a.name.local.len() + a.value.len())
-                        .sum::<usize>()
-                        > 128 * 1024
-                {
-                    state.error = true;
-                    return TokenSinkResult::Continue;
-                }
-                if &*tag.name == "a"
-                    && let Some(href) = attribute("href")
-                    && href.len() <= 4096
-                {
-                    let candidate = href.split('#').next().unwrap_or_default();
-                    let candidate_path = candidate.split('?').next().unwrap_or_default();
-                    let publication = candidate_path.contains("review-drafts/")
-                        || candidate_path.contains("commit-snapshots/")
-                        || candidate_path.contains("multipage/")
-                        || candidate_path.ends_with(".html")
-                        || candidate_path.ends_with(".pdf")
-                        || candidate_path.ends_with("/dev/")
-                        || candidate_path.ends_with("/single-page/");
-                    if publication && state.link_keys.insert(candidate.to_owned()) {
-                        state.link_bytes += candidate.len();
-                        if state.link_keys.len() > 100_000 || state.link_bytes > 8 * 1024 * 1024 {
-                            state.error = true;
-                        }
-                    }
-                    if !state.heading
-                        && (state.source_context
-                            || attribute("rel").is_some_and(|rel| {
-                                rel.split_ascii_whitespace()
-                                    .any(|v| matches!(v, "source" | "repository"))
-                            }))
-                        && let Some(identity) = repository_url(href)
-                    {
-                        state.result.repositories.push(identity);
-                    } else if !state.heading
-                        && state.header_depth > 0
-                        && let Some(identity) = repository_url(href)
-                    {
-                        state.anchor_repository = Some(identity);
-                        state.anchor_label.clear();
-                    }
-                }
-                if &*tag.name == "meta"
-                    && !state.body_started
-                    && !state.heading
-                    && attribute("name").is_some_and(|s| {
-                        matches!(s, "repository" | "source-repository" | "github-repository")
-                    })
-                    && let Some(content) = attribute("content")
-                    && let Some(identity) = repository_url(content)
-                {
-                    state.result.repositories.push(identity);
-                }
-            }
-            TokenSinkResult::Continue
-        }
-    }
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(Error::capacity(
-            "WHATWG metadata extraction input exceeds its bound.",
-        ));
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| Error::integrity("WHATWG publication is not UTF-8."))?;
-    let tokenizer = Tokenizer::new(
-        Sink {
-            state: RefCell::new(State {
-                result: PublicationMetadata::default(),
-                heading: false,
-                tokens: 0,
-                error: false,
-                completed: 0,
-                link_keys: BTreeSet::new(),
-                link_bytes: 0,
-                definition: None,
-                source_context: false,
-                body_started: false,
-                template_depth: 0,
-                raw_hidden: None,
-                header_tag: None,
-                header_depth: 0,
-                anchor_repository: None,
-                anchor_label: String::new(),
-            }),
-            cancel,
-        },
-        TokenizerOpts::default(),
-    );
-    let input = BufferQueue::default();
-    let mut offset = 0;
-    let mut pending = 0;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while offset < text.len() {
-        if cancel.is_cancelled() {
-            return Err(Error::new(
-                "cancelled",
-                "WHATWG metadata extraction canceled.",
-            ));
-        }
-        let mut end = (offset + 4096).min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(Error::capacity(
-                "WHATWG publication metadata time bound exceeded.",
-            ));
-        }
-        let completed = tokenizer.sink.state.borrow().completed;
-        input.push_back(StrTendril::from_slice(&text[offset..end]));
-        let _ = tokenizer.feed(&input);
-        if tokenizer.sink.state.borrow().completed == completed {
-            pending += end - offset;
-        } else {
-            pending = 0;
-        }
-        if pending > 128 * 1024 {
-            return Err(Error::capacity(
-                "WHATWG publication metadata lexical bound exceeded.",
-            ));
-        }
-        offset = end;
-        if tokenizer.sink.state.borrow().error {
-            return Err(Error::capacity(
-                "WHATWG publication metadata exceeds its bound.",
-            ));
-        }
-    }
-    tokenizer.end();
-    let mut result = tokenizer.sink.state.borrow_mut();
-    if result.error {
-        return Err(Error::capacity(
-            "WHATWG publication metadata exceeds its bound.",
-        ));
-    }
-    result.result.links = std::mem::take(&mut result.link_keys).into_iter().collect();
-    result.result.repositories.sort();
-    result.result.repositories.dedup();
-    Ok(std::mem::take(&mut result.result))
+    metadata::extract(bytes, cancel)
 }
+
 fn repository_url(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     if url.scheme() != "https"
@@ -821,7 +593,20 @@ mod tests {
             publication_metadata(body.as_bytes(), &tokio_util::sync::CancellationToken::new())
                 .expect("bounded inert tag");
         assert_eq!(metadata.repositories, vec!["whatwg/html"]);
-        assert_eq!(metadata.links, vec!["/review-drafts/2026-07/"]);
+        assert_eq!(metadata.links.len(), 4);
+        assert!(metadata.links.iter().any(|href| href.starts_with("data:")));
+        assert!(
+            metadata
+                .links
+                .contains(&"/review-drafts/2026-07/#anchor".into())
+        );
+        assert!(
+            metadata
+                .links
+                .contains(&"/review-drafts/2026-07/#another".into())
+        );
+        assert_eq!(metadata.advertisements.len(), 1);
+        assert_eq!(metadata.advertisements[0].href, "/review-drafts/2026-07/");
         let too_large = format!(
             "<a href=\"data:text/plain,{}\">inert</a>",
             "A".repeat(129 * 1024)
@@ -838,10 +623,267 @@ mod tests {
     }
     #[test]
     fn modern_header_source_labels_exclude_test_and_body_repositories() {
-        let source=br#"<header id=head class=head><nav><a href=https://github.com/foreign/standard><strong>Contribute on GitHub</strong><code>foreign/standard repository</code></a><a href=https://github.com/tests/suite>Tests</a></nav></header><p><a href=https://github.com/body/example>Source repository</a></p><h2>Body</h2>"#;
+        let source=br#"<header id=head class=head><nav><a href=https://github.com/foreign/standard><strong>Contribute on GitHub</strong><code>foreign/standard repository</code></a><a href=https://github.com/tests/suite>Tests</a></nav></header><p><a href=https://github.com/body/example>Source repository</a></p><h2>Body</h2><div class=head><dl><dt>Source:<dd><a rel=source href=https://github.com/evil/reopened>Body example</a></dl></div>"#;
         let metadata = publication_metadata(source, &tokio_util::sync::CancellationToken::new())
             .expect("header metadata");
         assert_eq!(metadata.repositories, vec!["foreign/standard"]);
+    }
+    fn html_standard() -> Standard {
+        Standard {
+            id: "html".into(),
+            title: "HTML".into(),
+            url: "https://html.spec.whatwg.org/".into(),
+            repository: "whatwg/html".into(),
+            metadata: json!({}),
+        }
+    }
+    #[test]
+    fn source_roles_separate_image_examples_and_missing_fragment_references() {
+        let source = br#"<header id=head class=head><h1>HTML</h1></header>
+<h3 id=content>Content</h3><div class=example><p>In the following example we have
+<a href=images/parsing-model-overview.svg>a flowchart</a> in image form.</p></div>
+<p>A page restored from <a href=note-bfcache>back/forward cache</a>.</p>
+<p>As explained <a href=speculative-loading-state-partitioning>below</a>.</p>
+<div id=note-bfcache class=note>Note.</div><h5 id=speculative-loading-state-partitioning>Partitioning</h5>
+<p><a href=unknown-publication>Unknown target must remain unresolved.</a></p>"#;
+        let metadata = publication_metadata(source, &tokio_util::sync::CancellationToken::new())
+            .expect("source roles");
+        assert!(metadata.advertisements.is_empty());
+        assert_eq!(metadata.exclusions.len(), 3);
+        let asset = metadata
+            .exclusions
+            .iter()
+            .find(|edge| edge.href.ends_with(".svg"))
+            .expect("asset");
+        assert_eq!(asset.role, ExclusionRole::EmbeddedAsset);
+        assert_eq!(asset.source_anchor.as_deref(), Some("content"));
+        for href in ["note-bfcache", "speculative-loading-state-partitioning"] {
+            let reference = metadata
+                .exclusions
+                .iter()
+                .find(|edge| edge.href == href)
+                .expect("reference");
+            assert_eq!(reference.role, ExclusionRole::MalformedLocalReference);
+            assert_eq!(reference.target_anchor.as_deref(), Some(href));
+            assert!(metadata.links.iter().any(|raw| raw == href));
+        }
+        assert!(
+            !metadata
+                .exclusions
+                .iter()
+                .any(|edge| edge.href == "unknown-publication")
+        );
+        let standard = html_standard();
+        let base = PublicationUrl::new("https://html.spec.whatwg.org/review-drafts/2025-01/")
+            .expect("base");
+        let targets = qualified_advertised(&standard, &base, &metadata.advertisements);
+        assert!(
+            !targets
+                .iter()
+                .any(|url| url.as_str().contains("note-bfcache") || url.as_str().ends_with(".svg"))
+        );
+        // This policy has no response-status input: a successfully served illustration
+        // remains an illustration, and a missing explicit publication remains advertised.
+        assert!(
+            !advertised(
+                &standard,
+                &base,
+                &[
+                    "images/parsing-model-overview.svg".into(),
+                    "note-bfcache".into()
+                ]
+            )
+            .iter()
+            .any(|url| url.as_str().ends_with(".svg") || url.as_str().contains("note-bfcache"))
+        );
+    }
+    #[test]
+    fn positive_alternates_and_published_data_survive_source_qualification() {
+        let source = br#"<header id=head class=head><link rel=ALTERNATE type=application/octet-stream href=opaque-edition></header>
+<h3 id=body>Body</h3><div id=opaque-edition>Local ID does not defeat a true alternate.</div>
+<p><a href=opaque-edition>Body reference to the same destination.</a></p>
+<nav><a href=/review-drafts/2026-07/>Review draft</a><a href=/multipage/forms.html#forms>Forms</a></nav>
+<a href=/review-drafts/2026-07/index.txt>Text</a><a href=/review-drafts/2026-07/api.idl>IDL</a>
+<a href=/review-drafts/2026-07/data.json>JSON</a><a rel=alternate href=/review-drafts/2026-07/opaque.bin>Raw</a>
+<a href=/indexes.json>Root JSON</a><a href=/index.txt>Root text</a><a href=/interfaces.idl>Root IDL</a>
+<link rel=alternate href=https://evil.invalid/raw.bin>"#;
+        let metadata = publication_metadata(source, &tokio_util::sync::CancellationToken::new())
+            .expect("metadata");
+        assert!(
+            metadata
+                .advertisements
+                .iter()
+                .any(|edge| edge.href == "opaque-edition"
+                    && edge.role == AdvertisementRole::ExplicitRepresentation)
+        );
+        assert!(
+            !metadata
+                .exclusions
+                .iter()
+                .any(|edge| edge.href == "opaque-edition")
+        );
+        assert!(
+            metadata
+                .links
+                .contains(&"/multipage/forms.html#forms".into())
+        );
+        let targets = qualified_advertised(
+            &html_standard(),
+            &PublicationUrl::new("https://html.spec.whatwg.org/").expect("base"),
+            &metadata.advertisements,
+        );
+        for suffix in [
+            "/opaque-edition",
+            "/review-drafts/2026-07/",
+            "/multipage/forms.html",
+            "/index.txt",
+            "/api.idl",
+            "/data.json",
+            "/opaque.bin",
+            "/indexes.json",
+            "/index.txt",
+            "/interfaces.idl",
+        ] {
+            assert!(
+                targets.iter().any(|url| url.as_str().ends_with(suffix)),
+                "missing {suffix}"
+            );
+        }
+        assert!(
+            targets
+                .iter()
+                .all(|url| url.host() == "html.spec.whatwg.org")
+        );
+    }
+    #[test]
+    fn example_only_links_cannot_authorize_even_an_alternate_or_document() {
+        let body = br#"<h3 id=body>Body</h3><div class=example><a href=/review-drafts/2026-07/demo.html>Example HTML</a><a href=/review-drafts/2026-07/demo.pdf>Example PDF</a><a href=/indexes.json>Example JSON</a><a rel=alternate href=/opaque.bin>Example raw alternate</a><a rel=alternate href=/real.bin>Also a real alternate elsewhere</a></div><nav><a rel=alternate href=/real.bin>Published binary edition</a></nav>"#;
+        let metadata =
+            publication_metadata(body, &tokio_util::sync::CancellationToken::new()).expect("roles");
+        assert_eq!(
+            metadata.advertisements,
+            vec![PublicationAdvertisement {
+                href: "/real.bin".into(),
+                role: AdvertisementRole::ExplicitRepresentation
+            }]
+        );
+        for href in [
+            "/review-drafts/2026-07/demo.html",
+            "/review-drafts/2026-07/demo.pdf",
+            "/indexes.json",
+            "/opaque.bin",
+        ] {
+            assert!(metadata.links.contains(&href.into()));
+            assert!(
+                metadata
+                    .exclusions
+                    .iter()
+                    .any(|edge| edge.href == href && edge.role == ExclusionRole::ExampleReference)
+            );
+        }
+        assert!(
+            !metadata
+                .exclusions
+                .iter()
+                .any(|edge| edge.href == "/real.bin")
+        );
+        let targets = qualified_advertised(
+            &html_standard(),
+            &PublicationUrl::new("https://html.spec.whatwg.org/").expect("base"),
+            &metadata.advertisements,
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|url| url.as_str().ends_with("/real.bin"))
+        );
+        assert!(!targets.iter().any(
+            |url| url.as_str().ends_with("/opaque.bin") || url.as_str().ends_with("demo.html")
+        ));
+    }
+    #[test]
+    fn metadata_cancellation_is_not_a_capacity_observation() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        for body in [
+            b"".as_slice(),
+            b"<h3>Body</h3><a href=/indexes.json>Data</a>".as_slice(),
+        ] {
+            assert_eq!(
+                publication_metadata(body, &cancel)
+                    .expect_err("cancelled")
+                    .code,
+                "cancelled"
+            );
+        }
+    }
+    #[test]
+    fn local_id_does_not_reclassify_an_explicit_document_fragment_or_filename() {
+        let body = br#"<h3>Body</h3><div id=chapter></div><div id=data.bin></div><a href=chapter#part>Document fragment</a><a href=data.bin>Unknown file</a>"#;
+        let metadata = publication_metadata(body, &tokio_util::sync::CancellationToken::new())
+            .expect("metadata");
+        assert!(metadata.exclusions.is_empty());
+        assert!(metadata.advertisements.is_empty());
+        assert!(metadata.links.contains(&"chapter#part".into()));
+        assert!(metadata.links.contains(&"data.bin".into()));
+    }
+    #[test]
+    fn forms_h3_body_definition_is_not_header_repository_metadata() {
+        let source = format!(
+            "<header id=head class=head><h1>HTML</h1></header><nav><a href=input.html>Next</a></nav><h3 id=forms>Forms</h3><h4>Labels</h4><dl class=domintro><dt><code>control.labels</code><div class=mdn-anno>{}</div><dd>Returns labels.</dl><a href=input.html#input>Input</a>",
+            "MDN browser-support annotation ".repeat(60)
+        );
+        let metadata = publication_metadata(
+            source.as_bytes(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("body dt is inert to header metadata");
+        assert!(metadata.repositories.is_empty());
+        assert!(
+            metadata
+                .advertisements
+                .iter()
+                .any(|edge| edge.href == "input.html")
+        );
+        let targets = qualified_advertised(
+            &html_standard(),
+            &PublicationUrl::new("https://html.spec.whatwg.org/multipage/forms.html")
+                .expect("base"),
+            &metadata.advertisements,
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|url| url.as_str() == "https://html.spec.whatwg.org/multipage/input.html")
+        );
+        let closed_header = format!(
+            "<header id=head class=head><h1>HTML</h1></header><dl><dt>{}<dd>Body without a heading.</dl>",
+            "ordinary body definition ".repeat(100)
+        );
+        publication_metadata(
+            closed_header.as_bytes(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("closed header ends label admission");
+    }
+    #[test]
+    fn combined_raw_and_typed_metadata_has_an_aggregate_byte_bound() {
+        let mut source = String::from("<h3>Body</h3>");
+        for i in 0..1800 {
+            source.push_str(&format!(
+                "<a href=/review-drafts/2026-07/{}-{i}.html>Document</a>",
+                "a".repeat(2400)
+            ));
+        }
+        assert_eq!(
+            publication_metadata(
+                source.as_bytes(),
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .expect_err("combined metadata exceeds 8 MiB")
+            .code,
+            "capacity"
+        );
     }
     #[test]
     #[ignore = "opt-in local retained public HTML; no provider traffic"]
@@ -855,6 +897,25 @@ mod tests {
                 .repositories
                 .iter()
                 .any(|repository| repository == "whatwg/html")
+        );
+        assert!(!metadata.links.is_empty());
+    }
+    #[test]
+    #[ignore = "opt-in local retained forms HTML; no provider traffic"]
+    fn retained_forms_metadata_replay() {
+        let path = std::env::var("DEVRES_WHATWG_METADATA_FORMS").expect("retained forms path");
+        let body = std::fs::read(path).expect("retained forms HTML");
+        let metadata = publication_metadata(&body, &tokio_util::sync::CancellationToken::new())
+            .expect("forms header/body metadata separation");
+        let urls = qualified_advertised(
+            &html_standard(),
+            &PublicationUrl::new("https://html.spec.whatwg.org/multipage/forms.html")
+                .expect("base"),
+            &metadata.advertisements,
+        );
+        assert!(
+            urls.iter()
+                .any(|url| url.as_str() == "https://html.spec.whatwg.org/multipage/input.html")
         );
         assert!(!metadata.links.is_empty());
     }

@@ -153,6 +153,53 @@ sys.exit(int(os.environ.get('DEVRES_TEST_PROBE_FAIL','0')))
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(self.calls(), [])
 
+    def test_recovery_requires_parent_and_resume_pointer_before_work(self):
+        for flag in ("--recover", "--resume-recovery"):
+            with self.subTest(flag=flag):
+                result = self.run_script(flag, "full")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(self.calls(), [])
+        (self.retained / "frozen.json").write_text('{"version":1,"mode":"full","frozen":{}}')
+        result = self.run_script("--resume-recovery", "full")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_recovery_modes_preserve_original_manifest_and_failure(self):
+        frozen = self.retained / "frozen.json"
+        original = '{"version":1,"mode":"full","frozen":{"fixture":true}}'
+        frozen.write_text(original)
+        failed = self.retained / "acceptance.json"
+        failed.write_text('{"complete":false,"unavailable_publications":8}')
+        (self.retained / "recovery-current.json").write_text(json.dumps({
+            "version": 1, "frozen_id": "b" * 64,
+        }))
+        for flag in ("--recover", "--resume-recovery"):
+            with self.subTest(flag=flag):
+                result = self.run_script(flag, "full")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(["probe", flag, "full"], self.calls())
+                self.assertEqual(frozen.read_text(), original)
+                self.assertEqual(json.loads(failed.read_text()), {
+                    "complete": False, "unavailable_publications": 8,
+                })
+
+    def test_recovery_pointer_symlinks_are_rejected_before_work(self):
+        (self.retained / "frozen.json").write_text('{"version":1,"mode":"full","frozen":{}}')
+        target = self.root / "other-pointer.json"
+        target.write_text('{"version":1}')
+        (self.retained / "recovery-current.json").symlink_to(target)
+        result = self.run_script("--resume-recovery", "full")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(target.read_text(), '{"version":1}')
+
+    def test_recovery_current_is_rejected_before_work(self):
+        for flag in ("--recover", "--resume-recovery"):
+            with self.subTest(flag=flag):
+                result = self.run_script(flag, "current")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.calls(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
