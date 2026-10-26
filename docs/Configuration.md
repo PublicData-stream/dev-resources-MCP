@@ -284,6 +284,8 @@ Raw publication intake caps at 32 GiB, separately from 64 MiB textual projection
 bounds are enforced independently; oversized source remains retained and readable as
 byte pages. Derived projections use content-addressed PostgreSQL text chunks, section/symbol/
 reference objects and persistent Merkle sequences with small per-source manifests;
+each projection memoizes at most 131,072 durable object keys and 8 MiB of key text,
+with additional container/allocator overhead, to avoid repeating storage lookups.
 reconstruction caps at 256 MiB. Search reuses the immutable selected-membership engine with two
 concurrent reader operations, 64 MiB indexing writers and bounded shards/manifests. PDF extraction uses
 one fixed helper process with a 1 GiB address-space ceiling and 60-second wall deadline;

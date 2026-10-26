@@ -4,7 +4,7 @@ use devres_application::whatwg::{
 };
 use devres_domain::{Error, Result};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -486,13 +486,21 @@ pub(crate) struct ProjectionBatch<'a> {
     store: &'a dyn WhatwgStore,
     rows: BTreeMap<(String, String), serde_json::Value>,
     bytes: usize,
+    // Durable identity only, scoped to this projection. Never cache ownership.
+    known: BTreeSet<(String, String)>,
+    known_bytes: usize,
 }
 impl<'a> ProjectionBatch<'a> {
+    const MAX_KNOWN_KEYS: usize = 131_072;
+    // Kind/id string payload; allocator and tree overhead are additional.
+    const MAX_KNOWN_BYTES: usize = 8 * 1024 * 1024;
     pub(crate) fn new(store: &'a dyn WhatwgStore) -> Self {
         Self {
             store,
             rows: BTreeMap::new(),
             bytes: 0,
+            known: BTreeSet::new(),
+            known_bytes: 0,
         }
     }
     pub(crate) async fn put(&mut self, kind: &str, data: serde_json::Value) -> Result<String> {
@@ -518,10 +526,14 @@ impl<'a> ProjectionBatch<'a> {
                 "WHATWG shared projection object exceeds its bound.",
             ));
         }
+        let key = (kind.to_owned(), id.to_owned());
+        if self.known.contains(&key) {
+            return Ok(());
+        }
         if self.bytes + size > 8 * 1024 * 1024 || self.rows.len() >= 1000 {
             self.flush().await?;
         }
-        if self.rows.insert((kind.into(), id.into()), data).is_none() {
+        if self.rows.insert(key, data).is_none() {
             self.bytes += size;
         }
         Ok(())
@@ -546,6 +558,15 @@ impl<'a> ProjectionBatch<'a> {
                 })
                 .collect();
             self.store.whatwg_put_many(&rows).await?;
+            for key in keys {
+                let size = kind.len().saturating_add(key.len());
+                if self.known.len() < Self::MAX_KNOWN_KEYS
+                    && self.known_bytes.saturating_add(size) <= Self::MAX_KNOWN_BYTES
+                    && self.known.insert((kind.clone(), key))
+                {
+                    self.known_bytes += size;
+                }
+            }
         }
         Ok(())
     }
@@ -733,6 +754,274 @@ mod tests {
         reads: AtomicUsize,
         batches: AtomicUsize,
         fail_batch: AtomicBool,
+    }
+    #[derive(Default)]
+    struct ProjectionStore {
+        objects: Mutex<BTreeMap<(String, String), Value>>,
+        lookup_keys: AtomicUsize,
+        fail_read: AtomicBool,
+        fail_write: AtomicBool,
+        owner_lost: AtomicBool,
+    }
+    impl ProjectionStore {
+        fn owner(&self) -> Result<()> {
+            if self.owner_lost.load(Ordering::Relaxed) {
+                Err(Error::unavailable("Synthetic ownership loss."))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait]
+    impl WhatwgStore for ProjectionStore {
+        async fn whatwg_existing(&self, kind: &str, keys: &[String]) -> Result<BTreeSet<String>> {
+            self.owner()?;
+            self.lookup_keys.fetch_add(keys.len(), Ordering::Relaxed);
+            if self.fail_read.swap(false, Ordering::Relaxed) {
+                return Err(Error::unavailable("Synthetic existence failure."));
+            }
+            let objects = self.objects.lock().expect("objects");
+            Ok(keys
+                .iter()
+                .filter(|id| objects.contains_key(&(kind.into(), (*id).clone())))
+                .cloned()
+                .collect())
+        }
+        async fn whatwg_put_many(&self, writes: &[Write]) -> Result<()> {
+            validate_whatwg_writes(writes)?;
+            if writes.is_empty() {
+                return Ok(());
+            }
+            self.owner()?;
+            if self.fail_write.swap(false, Ordering::Relaxed) {
+                return Err(Error::unavailable("Synthetic projection write failure."));
+            }
+            let mut objects = self.objects.lock().expect("objects");
+            for write in writes {
+                if objects
+                    .get(&(write.kind.clone(), write.key.clone()))
+                    .is_some_and(|data| data != &write.data)
+                {
+                    return Err(Error::integrity("Synthetic projection collision."));
+                }
+            }
+            for write in writes {
+                objects.insert((write.kind.clone(), write.key.clone()), write.data.clone());
+            }
+            Ok(())
+        }
+        async fn whatwg_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
+            self.whatwg_put_many(&[Write {
+                kind: kind.into(),
+                key: key.into(),
+                data: data.clone(),
+            }])
+            .await?;
+            Ok(1)
+        }
+        async fn whatwg_get(&self, kind: &str, key: &str) -> Result<Option<Row>> {
+            self.owner()?;
+            Ok(self
+                .objects
+                .lock()
+                .expect("objects")
+                .get(&(kind.into(), key.into()))
+                .map(|data| Row {
+                    sequence: 1,
+                    key: key.into(),
+                    data: data.clone(),
+                }))
+        }
+        async fn whatwg_cutoff(&self) -> Result<i64> {
+            unreachable!("unused projection fixture port")
+        }
+        async fn whatwg_rows(&self, _: &str, _: i64, _: usize, _: Option<i64>) -> Result<Vec<Row>> {
+            unreachable!("unused projection fixture port")
+        }
+        async fn whatwg_state(&self, _: &str) -> Result<Option<Value>> {
+            unreachable!("unused projection fixture port")
+        }
+        async fn whatwg_set_state(&self, _: &str, _: &Value) -> Result<()> {
+            unreachable!("unused projection fixture port")
+        }
+        async fn whatwg_publish_view(&self, _: &View) -> Result<()> {
+            unreachable!("unused projection fixture port")
+        }
+    }
+    async fn shared_projection_fixture(batch: &mut ProjectionBatch<'_>) -> Vec<String> {
+        let lines: Vec<_> = (0..1200)
+            .map(|n| format!("Unchanged clause {n:04}.\n"))
+            .collect();
+        let mut roots = vec![batch.text(&lines.concat()).await.expect("full text")];
+        let mut sections = Vec::new();
+        for (n, group) in lines.chunks(200).enumerate() {
+            let text = batch.text(&group.concat()).await.expect("section text");
+            sections.push(batch.put("projection-sections", json!({"anchor":format!("s{n}"),"title":format!("Section {n}"),"text":text})).await.expect("section"));
+        }
+        roots.push(batch.sequence(&sections).await.expect("section roots"));
+        for group in lines.chunks(300) {
+            roots.push(batch.text(&group.concat()).await.expect("symbol text"));
+        }
+        batch.flush().await.expect("durable projection");
+        roots
+    }
+    #[tokio::test]
+    async fn projection_memo_preserves_cold_and_warm_objects_and_roots() {
+        let reference = ProjectionStore::default();
+        let mut serial = ProjectionBatch::new(&reference);
+        serial.known_bytes = ProjectionBatch::MAX_KNOWN_BYTES;
+        let expected = shared_projection_fixture(&mut serial).await;
+        assert!(
+            serial.known.is_empty(),
+            "capacity fallback retains the original storage path"
+        );
+        let expected_objects = reference.objects.lock().expect("objects").clone();
+        let store = ProjectionStore::default();
+        for _ in 0..2 {
+            store.lookup_keys.store(0, Ordering::Relaxed);
+            let mut batch = ProjectionBatch::new(&store);
+            assert_eq!(shared_projection_fixture(&mut batch).await, expected);
+            assert_eq!(*store.objects.lock().expect("objects"), expected_objects);
+            assert!(
+                store.lookup_keys.load(Ordering::Relaxed)
+                    < reference.lookup_keys.load(Ordering::Relaxed),
+                "shared text across sections and symbols avoids repeated durable lookups"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn projection_memo_caps_fall_back_without_evicting_durable_keys() {
+        for count_bound in [false, true] {
+            let store = ProjectionStore::default();
+            let mut batch = ProjectionBatch::new(&store);
+            let stable = batch
+                .put("projection-chunks", json!("stable"))
+                .await
+                .expect("stable");
+            batch.flush().await.expect("stable durable");
+            if count_bound {
+                for n in 1..ProjectionBatch::MAX_KNOWN_KEYS {
+                    batch.known.insert(("k".into(), format!("{n:x}")));
+                }
+            } else {
+                batch.known_bytes = ProjectionBatch::MAX_KNOWN_BYTES;
+            }
+            let before = (batch.known.len(), batch.known_bytes);
+            let fresh = batch
+                .put("projection-chunks", json!("capacity fallback"))
+                .await
+                .expect("fresh");
+            batch.flush().await.expect("fallback durable");
+            assert_eq!((batch.known.len(), batch.known_bytes), before);
+            assert!(
+                store
+                    .objects
+                    .lock()
+                    .expect("objects")
+                    .contains_key(&("projection-chunks".into(), fresh.clone()))
+            );
+            let reads = store.lookup_keys.load(Ordering::Relaxed);
+            batch
+                .put_id("projection-chunks", &stable, json!("stable"))
+                .await
+                .expect("retained memo entry");
+            batch.flush().await.expect("memo hit");
+            assert_eq!(
+                store.lookup_keys.load(Ordering::Relaxed),
+                reads,
+                "reaching a cap does not evict useful entries"
+            );
+            batch
+                .put_id("projection-chunks", &fresh, json!("capacity fallback"))
+                .await
+                .expect("uncached repeat");
+            batch.flush().await.expect("uncached lookup");
+            assert!(store.lookup_keys.load(Ordering::Relaxed) > reads);
+        }
+    }
+    #[tokio::test]
+    async fn projection_memo_requires_successful_reads_and_writes_before_admission() {
+        for fail_read in [false, true] {
+            let store = ProjectionStore::default();
+            let mut batch = ProjectionBatch::new(&store);
+            let id = batch
+                .put("projection-chunks", json!("retry after failed storage"))
+                .await
+                .expect("pending");
+            if fail_read {
+                store.fail_read.store(true, Ordering::Relaxed);
+            } else {
+                store.fail_write.store(true, Ordering::Relaxed);
+            }
+            assert_eq!(
+                batch.flush().await.expect_err("storage failure").code,
+                "unavailable"
+            );
+            assert!(batch.known.is_empty());
+            assert_eq!(batch.known_bytes, 0);
+            assert!(store.objects.lock().expect("objects").is_empty());
+            batch
+                .put_id(
+                    "projection-chunks",
+                    &id,
+                    json!("retry after failed storage"),
+                )
+                .await
+                .expect("restage failed object");
+            batch.flush().await.expect("retry durable");
+            assert!(
+                batch
+                    .known
+                    .contains(&("projection-chunks".into(), id.clone()))
+            );
+            let reads = store.lookup_keys.load(Ordering::Relaxed);
+            batch
+                .put_id("projection-sequences", &id, json!({"values":[]}))
+                .await
+                .expect("same ID other kind");
+            batch.flush().await.expect("distinct namespace durable");
+            assert!(store.lookup_keys.load(Ordering::Relaxed) > reads);
+            assert_eq!(store.objects.lock().expect("objects").len(), 2);
+        }
+    }
+    #[tokio::test]
+    async fn projection_memo_cannot_bypass_object_bounds_or_descriptor_ownership() {
+        let store = ProjectionStore::default();
+        let mut batch = ProjectionBatch::new(&store);
+        let id = batch
+            .put("projection-chunks", json!("durable"))
+            .await
+            .expect("pending");
+        batch.flush().await.expect("durable");
+        assert_eq!(
+            batch
+                .put_id("projection-chunks", &id, json!("x".repeat(8 * 1024 * 1024)))
+                .await
+                .expect_err("validate even a known ID")
+                .code,
+            "capacity"
+        );
+        store.owner_lost.store(true, Ordering::Relaxed);
+        batch
+            .put_id("projection-chunks", &id, json!("durable"))
+            .await
+            .expect("local duplicate");
+        batch.flush().await.expect("no new objects");
+        assert_eq!(
+            store
+                .whatwg_put("projections", "descriptor", &json!({"text":id}))
+                .await
+                .expect_err("descriptor must still publish through its owner")
+                .code,
+            "unavailable"
+        );
+        assert!(
+            !store
+                .objects
+                .lock()
+                .expect("objects")
+                .contains_key(&("projections".into(), "descriptor".into()))
+        );
     }
     #[async_trait]
     impl WhatwgStore for Memory {
