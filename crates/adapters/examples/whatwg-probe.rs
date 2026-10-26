@@ -492,15 +492,54 @@ async fn verify_research(corpus: Arc<WhatwgCorpus>) -> Result<Value> {
         .ok_or_else(|| Error::integrity("WHATWG acceptance IDL declaration is absent."))?;
     let symbol_uri = symbol["resource_uri"].as_str().ok_or_else(storage_error)?;
     research.read_resource(symbol_uri).await?;
-    let history = research
-        .call("whatwg_history", json!({"standard":"dom","limit":2}))
-        .await?;
-    if history["items"].as_array().is_none_or(Vec::is_empty) {
-        return Err(Error::integrity("WHATWG acceptance history is empty."));
-    }
+    history_with_items(|input| research.call("whatwg_history", input)).await?;
     Ok(
         json!({"view":view.id,"catalog_standards":catalog_total,"default_standards":view.snapshots.len(),"text":true,"raw_bytes":true,"text_resource":true,"search":true,"idl_symbol_resource":true,"history":true,"transport":"local_adapter"}),
     )
+}
+
+// Filtered discovery can scan its bounded global page without finding a match.
+// Keep the same query and observation cutoff while following its continuation.
+async fn history_with_items<F, Fut>(mut call: F) -> Result<Value>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    let mut input = json!({"standard":"dom","limit":2});
+    let mut cutoff = None;
+    for _ in 0..1024 {
+        let page = call(input.clone()).await?;
+        let observed = page["history_snapshot"]
+            .as_i64()
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| Error::integrity("Invalid WHATWG acceptance history cutoff."))?;
+        if cutoff.is_some_and(|value| value != observed) {
+            return Err(Error::integrity(
+                "WHATWG acceptance history cutoff changed.",
+            ));
+        }
+        cutoff = Some(observed);
+        let items = page["items"]
+            .as_array()
+            .ok_or_else(|| Error::integrity("Invalid WHATWG acceptance history page."))?;
+        if !items.is_empty() {
+            return Ok(page);
+        }
+        let cursor = page["next_cursor"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 16384)
+            .ok_or_else(|| Error::integrity("WHATWG acceptance history is empty."))?;
+        if input["cursor"].as_str() == Some(cursor) {
+            return Err(Error::integrity(
+                "WHATWG acceptance history did not advance.",
+            ));
+        }
+        input["cursor"] = json!(cursor);
+        input["history_snapshot"] = json!(observed);
+    }
+    Err(Error::capacity(
+        "WHATWG acceptance history page bound exceeded.",
+    ))
 }
 
 #[tokio::main]
@@ -557,6 +596,73 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn filtered_history_follows_empty_pages_with_fixed_query_and_cutoff() {
+        let mut requests = Vec::new();
+        let pages = [
+            json!({"items":[],"history_snapshot":731,"next_cursor":"first"}),
+            json!({"items":[],"history_snapshot":731,"next_cursor":"second"}),
+            json!({"items":[{"standard":"dom"}],"history_snapshot":731,"next_cursor":null}),
+        ];
+        let found = history_with_items(|input| {
+            let page = pages[requests.len()].clone();
+            requests.push(input);
+            std::future::ready(Ok(page))
+        })
+        .await
+        .expect("matching history after empty filtered pages");
+        assert_eq!(found["items"][0]["standard"], "dom");
+        assert_eq!(
+            requests,
+            vec![
+                json!({"standard":"dom","limit":2}),
+                json!({"standard":"dom","limit":2,"cursor":"first","history_snapshot":731}),
+                json!({"standard":"dom","limit":2,"cursor":"second","history_snapshot":731}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_history_rejects_empty_terminal_and_malformed_pages() {
+        for page in [
+            json!({"items":[],"history_snapshot":731,"next_cursor":null}),
+            json!({"items":null,"history_snapshot":731,"next_cursor":"first"}),
+            json!({"items":[{}],"next_cursor":null}),
+        ] {
+            assert_eq!(
+                history_with_items(|_| std::future::ready(Ok(page.clone())))
+                    .await
+                    .expect_err("no valid history evidence")
+                    .code,
+                "integrity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_history_rejects_changed_cutoff_and_nonadvancing_or_unbounded_cursors() {
+        for changed_cutoff in [false, true] {
+            let mut calls = 0;
+            let error = history_with_items(|_| {
+                calls += 1;
+                std::future::ready(Ok(json!({"items":[],"history_snapshot":if changed_cutoff && calls > 1 {732} else {731},"next_cursor":"first"})))
+            }).await.expect_err("unstable continuation");
+            assert_eq!(error.code, "integrity");
+            assert_eq!(calls, 2);
+        }
+        let mut calls = 0;
+        let error = history_with_items(|_| {
+            calls += 1;
+            std::future::ready(Ok(
+                json!({"items":[],"history_snapshot":731,"next_cursor":format!("cursor-{calls}")}),
+            ))
+        })
+        .await
+        .expect_err("bounded continuation");
+        assert_eq!(error.code, "capacity");
+        assert_eq!(calls, 1024);
+    }
 
     #[test]
     fn recovery_manifests_and_receipts_preserve_original_and_each_attempt() {
