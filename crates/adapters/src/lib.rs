@@ -20,6 +20,7 @@ pub mod mdn_inventory;
 pub mod mdn_processing;
 pub mod mdn_research;
 mod network;
+mod standards_processing;
 pub mod whatwg_catalog;
 pub mod whatwg_corpus;
 pub mod whatwg_git;
