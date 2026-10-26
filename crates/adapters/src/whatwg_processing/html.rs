@@ -37,6 +37,8 @@ struct State {
     tokens: usize,
     completed: usize,
     fragments: usize,
+    #[cfg(test)]
+    fragment_limit: Option<usize>,
     anchors: BTreeSet<String>,
     explicit_anchors: BTreeSet<String>,
     generated: BTreeSet<String>,
@@ -91,6 +93,58 @@ fn block(name: &str) -> bool {
         )
 }
 impl State {
+    fn maximum_fragments(&self) -> usize {
+        let max = MAX_INPUT * 2;
+        #[cfg(test)]
+        let max = self.fragment_limit.unwrap_or(max);
+        max
+    }
+    fn reserve_fragment_bytes(current: &mut usize, bytes: usize, max: usize) -> Result<()> {
+        let next = current.checked_add(bytes).ok_or_else(limit)?;
+        if next > max {
+            return Err(limit());
+        }
+        *current = next;
+        Ok(())
+    }
+    fn reserve_fragments(&mut self, bytes: usize) -> Result<()> {
+        let max = self.maximum_fragments();
+        Self::reserve_fragment_bytes(&mut self.fragments, bytes, max)
+    }
+    fn push_idl_declaration(
+        &mut self,
+        kind: &str,
+        frame: &Frame,
+        declaration: (String, String),
+        budget: &Budget,
+    ) -> Result<()> {
+        budget.check()?;
+        if self.doc.symbols.len() >= MAX_ITEMS {
+            return Err(limit());
+        }
+        let context_bytes = self.section.as_ref().map_or(0, |s| s.1.len());
+        let copied_bytes = kind
+            .len()
+            .saturating_add(frame.anchor.len())
+            .saturating_add(frame.scope.as_deref().map_or(0, str::len))
+            .saturating_add(context_bytes);
+        self.reserve_fragments(copied_bytes)?;
+        self.symbol_contexts.push(
+            self.section
+                .as_ref()
+                .map(|s| s.1.clone())
+                .unwrap_or_default(),
+        );
+        let (name, text) = declaration;
+        self.doc.symbols.push(Symbol {
+            kind: kind.into(),
+            name,
+            anchor: frame.anchor.clone(),
+            text,
+            scope: frame.scope.clone(),
+        });
+        Ok(())
+    }
     fn inert(&self) -> bool {
         self.stack.iter().any(|frame| hidden(&frame.name))
     }
@@ -100,7 +154,8 @@ impl State {
         }
     }
     fn close_frame(&mut self, budget: &Budget) -> Result<()> {
-        let Some(frame) = self.stack.pop() else {
+        budget.check()?;
+        let Some(mut frame) = self.stack.pop() else {
             return Ok(());
         };
         if hidden(&frame.name) || self.inert() {
@@ -109,6 +164,14 @@ impl State {
         if !heading(&frame.name) && frame.kind.is_none() && frame.target.is_none() {
             return Ok(());
         }
+        let text_bytes = self
+            .doc
+            .text
+            .get(frame.start..)
+            .ok_or_else(super::malformed)?
+            .trim()
+            .len();
+        self.reserve_fragments(text_bytes)?;
         let text = self
             .doc
             .text
@@ -116,10 +179,6 @@ impl State {
             .ok_or_else(super::malformed)?
             .trim()
             .to_owned();
-        self.fragments = self.fragments.saturating_add(text.len());
-        if self.fragments > MAX_INPUT * 2 {
-            return Err(limit());
-        }
         if heading(&frame.name) {
             if self.doc.title.is_empty() {
                 self.doc.title = text.clone();
@@ -127,35 +186,29 @@ impl State {
             if let Some(section) = self.section.as_mut() {
                 section.2 = text;
             }
-        } else if let Some(kind) = frame.kind {
+        } else if let Some(kind) = frame.kind.take() {
             if !text.is_empty() {
                 if kind == "idl" {
                     let declarations = idl_declarations(&text, budget)?;
                     if declarations.is_empty() {
                         self.doc.gap("unparsed_idl","An IDL block has no recognized declaration; original block remains in document text.");
                     }
-                    for (name, text) in declarations {
-                        self.symbol_contexts.push(
-                            self.section
-                                .as_ref()
-                                .map(|s| s.1.clone())
-                                .unwrap_or_default(),
-                        );
-                        self.doc.symbols.push(Symbol {
-                            kind: kind.clone(),
-                            name,
-                            anchor: frame.anchor.clone(),
-                            text,
-                            scope: frame.scope.clone(),
-                        });
+                    for declaration in declarations {
+                        self.push_idl_declaration(&kind, &frame, declaration, budget)?;
                     }
                 } else {
+                    if self.doc.symbols.len() >= MAX_ITEMS {
+                        return Err(limit());
+                    }
                     // Labels share the search title's UTF-8 byte bound. The
                     // complete algorithm/definition remains in `text`.
                     let mut end = text.len().min(4096);
                     while !text.is_char_boundary(end) {
                         end -= 1;
                     }
+                    self.reserve_fragments(
+                        end.saturating_add(self.section.as_ref().map_or(0, |s| s.1.len())),
+                    )?;
                     let name = text[..end].to_owned();
                     self.symbol_contexts.push(
                         self.section
@@ -173,6 +226,10 @@ impl State {
                 }
             }
         } else if let Some(target) = frame.target {
+            if self.doc.references.len() >= MAX_ITEMS {
+                return Err(limit());
+            }
+            self.reserve_fragments(self.section.as_ref().map_or(0, |s| s.1.len()))?;
             self.doc.references.push(Reference {
                 source_anchor: self
                     .section
@@ -196,6 +253,9 @@ impl State {
     }
     fn flush_section(&mut self) -> Result<()> {
         if let Some((start, anchor, title, level)) = self.section.take() {
+            if self.doc.sections.len() >= MAX_ITEMS {
+                return Err(limit());
+            }
             let text = self
                 .doc
                 .text
@@ -211,6 +271,42 @@ impl State {
             self.section_levels.push(level);
             if self.doc.sections.len() > MAX_ITEMS {
                 return Err(limit());
+            }
+        }
+        Ok(())
+    }
+    fn expand_respec_references(&mut self, budget: &Budget) -> Result<()> {
+        let max = self.maximum_fragments();
+        for section in &self.doc.sections {
+            let mut remaining = section.text.as_str();
+            while let Some(at) = remaining.find("[[") {
+                budget.check()?;
+                remaining = &remaining[at + 2..];
+                let bounded = &remaining[..remaining
+                    .char_indices()
+                    .nth(512)
+                    .map(|(at, _)| at)
+                    .unwrap_or(remaining.len())];
+                if let Some(end) = bounded.find("]]") {
+                    let citation = bounded[..end].trim_start_matches('[').trim();
+                    if !citation.is_empty() && !citation.chars().any(char::is_control) {
+                        if self.doc.references.len() >= MAX_ITEMS {
+                            return Err(limit());
+                        }
+                        let bytes = section
+                            .anchor
+                            .len()
+                            .saturating_add("respec-biblio:unresolved:".len())
+                            .saturating_add(citation.len().saturating_mul(2));
+                        Self::reserve_fragment_bytes(&mut self.fragments, bytes, max)?;
+                        self.doc.references.push(Reference {
+                            source_anchor: section.anchor.clone(),
+                            target: format!("respec-biblio:unresolved:{citation}"),
+                            label: citation.into(),
+                        });
+                    }
+                    remaining = &remaining[end + 2..];
+                }
             }
         }
         Ok(())
@@ -545,19 +641,23 @@ impl TokenSink for Sink<'_> {
                             return Err(limit());
                         }
                     }
-                    let mut anchor = explicit_anchor.unwrap_or_else(|| {
-                        if heading(&name) {
-                            state
-                                .stack
-                                .iter()
-                                .rev()
-                                .find(|frame| frame.name == "section" && !frame.anchor.is_empty())
-                                .map(|frame| frame.anchor.clone())
-                                .unwrap_or_default()
+                    let mut anchor = if let Some(anchor) = explicit_anchor {
+                        anchor
+                    } else if heading(&name) {
+                        let inherited = state
+                            .stack
+                            .iter()
+                            .rposition(|frame| frame.name == "section" && !frame.anchor.is_empty());
+                        if let Some(at) = inherited {
+                            let bytes = state.stack[at].anchor.len();
+                            state.reserve_fragments(bytes)?;
+                            state.stack[at].anchor.clone()
                         } else {
                             String::new()
                         }
-                    });
+                    } else {
+                        String::new()
+                    };
                     let class = attr("class").unwrap_or_default();
                     let is_idl = class.split_whitespace().any(|c| c == "idl")
                         && (matches!(name.as_str(), "pre" | "xmp")
@@ -613,6 +713,9 @@ impl TokenSink for Sink<'_> {
                             state.doc.gap("unasserted_anchor","Source-only/generated identifiers use local projection anchors; published URL identity is unasserted.");
                         }
                         state.flush_section()?;
+                        if state.doc.sections.len() >= MAX_ITEMS {
+                            return Err(limit());
+                        }
                         let level = match name.as_str() {
                             "h1" => 1,
                             "h2" => 2,
@@ -621,6 +724,7 @@ impl TokenSink for Sink<'_> {
                             "h5" => 5,
                             _ => 6,
                         };
+                        state.reserve_fragments(anchor.len())?;
                         state.section = Some((start, anchor.clone(), String::new(), level));
                     }
                     let target = if !inert && name == "a" {
@@ -768,32 +872,7 @@ pub(super) fn project(source: &str, budget: &Budget) -> Result<ProcessedDocument
         .iter()
         .any(|gap| gap.code == "unexpanded_respec")
     {
-        for section in &state.doc.sections {
-            let mut remaining = section.text.as_str();
-            while let Some(at) = remaining.find("[[") {
-                budget.check()?;
-                remaining = &remaining[at + 2..];
-                let bounded = &remaining[..remaining
-                    .char_indices()
-                    .nth(512)
-                    .map(|(at, _)| at)
-                    .unwrap_or(remaining.len())];
-                if let Some(end) = bounded.find("]]") {
-                    let citation = bounded[..end].trim_start_matches('[').trim();
-                    if !citation.is_empty() && !citation.chars().any(char::is_control) {
-                        state.doc.references.push(Reference {
-                            source_anchor: section.anchor.clone(),
-                            target: format!("respec-biblio:unresolved:{citation}"),
-                            label: citation.into(),
-                        });
-                        if state.doc.references.len() > MAX_ITEMS {
-                            return Err(limit());
-                        }
-                    }
-                    remaining = &remaining[end + 2..];
-                }
-            }
-        }
+        state.expand_respec_references(budget)?;
     }
     Ok(state.doc)
 }
@@ -857,6 +936,326 @@ pub(super) fn project_bikeshed(source: &str, budget: &Budget) -> Result<Processe
 #[cfg(test)]
 mod tests {
     use tokio_util::sync::CancellationToken;
+    fn tokenize_with_fragment_limit(source: &str, max: usize) -> super::State {
+        let budget = super::Budget::new(CancellationToken::new());
+        let tokenizer = super::Tokenizer::new(
+            super::Sink {
+                state: super::RefCell::new(super::State {
+                    fragment_limit: Some(max),
+                    ..Default::default()
+                }),
+                budget: &budget,
+            },
+            super::TokenizerOpts::default(),
+        );
+        let input = super::BufferQueue::default();
+        input.push_back(super::StrTendril::from_slice(source));
+        let _ = tokenizer.feed(&input);
+        tokenizer.end();
+        let mut state = tokenizer.sink.state.into_inner();
+        if state.error.is_none()
+            && let Err(error) = state
+                .close_at(0, &budget)
+                .and_then(|()| state.flush_section())
+        {
+            state.error = Some(error);
+        }
+        state
+    }
+    #[test]
+    fn ordinary_symbol_and_link_context_copies_obey_the_fragment_bound() {
+        for reference in [false, true] {
+            let context = "界".repeat(1024);
+            let exact = 1 + context.len() + usize::from(!reference);
+            for max in [exact - 1, exact] {
+                let mut state = super::State {
+                    doc: super::ProcessedDocument {
+                        text: "x".into(),
+                        ..Default::default()
+                    },
+                    section: Some((0, context.clone(), String::new(), 2)),
+                    fragment_limit: Some(max),
+                    ..Default::default()
+                };
+                state.stack.push(super::Frame {
+                    name: if reference { "a" } else { "dfn" }.into(),
+                    start: 0,
+                    kind: (!reference).then(|| "definition".into()),
+                    anchor: "published-term".into(),
+                    scope: None,
+                    target: reference.then(|| "#x".into()),
+                });
+                let result = state.close_frame(&super::Budget::new(CancellationToken::new()));
+                if max < exact {
+                    assert_eq!(
+                        result.expect_err("context copy exceeds the bound").code,
+                        "capacity"
+                    );
+                    assert_eq!(state.fragments, 1, "only frame text was reserved");
+                    assert!(
+                        state.doc.symbols.is_empty()
+                            && state.doc.references.is_empty()
+                            && state.symbol_contexts.is_empty()
+                    );
+                } else {
+                    result.expect("exact metadata bound");
+                    assert_eq!(state.fragments, exact);
+                    if reference {
+                        assert_eq!(
+                            state.doc.references,
+                            vec![super::Reference {
+                                source_anchor: context.clone(),
+                                target: "#x".into(),
+                                label: "x".into()
+                            }]
+                        );
+                    } else {
+                        assert_eq!(
+                            state.doc.symbols,
+                            vec![super::Symbol {
+                                kind: "definition".into(),
+                                name: "x".into(),
+                                anchor: "published-term".into(),
+                                text: "x".into(),
+                                scope: None
+                            }]
+                        );
+                        assert_eq!(state.symbol_contexts, vec![context.clone()]);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn inherited_heading_anchor_copies_are_guarded_before_temporary_and_retained_clones() {
+        let anchor = "界".repeat(1024);
+        let source = format!("<section id=\"{anchor}\"><h2>x</h2><h2>y</h2></section>");
+        let temporary_limit = 3 * anchor.len();
+        let temporary = tokenize_with_fragment_limit(&source, temporary_limit);
+        assert_eq!(
+            temporary
+                .error
+                .expect("second inherited temporary copy")
+                .code,
+            "capacity"
+        );
+        assert_eq!(temporary.fragments, 2 * anchor.len() + 1);
+        assert!(temporary.doc.sections.is_empty());
+        let retained_limit = 3 * anchor.len() + 1;
+        let retained = tokenize_with_fragment_limit(&source, retained_limit);
+        assert_eq!(
+            retained.error.expect("second retained anchor copy").code,
+            "capacity"
+        );
+        assert_eq!(retained.fragments, retained_limit);
+        assert_eq!(retained.doc.sections.len(), 1);
+        assert!(
+            retained.section.is_none(),
+            "no new retained anchor was allocated"
+        );
+        let admitted = tokenize_with_fragment_limit(&source, 4 * anchor.len() + 2);
+        assert!(admitted.error.is_none());
+        assert_eq!(admitted.fragments, 4 * anchor.len() + 2);
+        assert_eq!(
+            admitted.doc.sections,
+            vec![
+                super::Section {
+                    anchor: anchor.clone(),
+                    title: "x".into(),
+                    text: "x".into()
+                },
+                super::Section {
+                    anchor,
+                    title: "y".into(),
+                    text: "y".into()
+                }
+            ]
+        );
+    }
+    #[test]
+    fn unresolved_bibliography_context_copies_reserve_before_expansion() {
+        let anchor = "界".repeat(1024);
+        let exact = 2 * (anchor.len() + "respec-biblio:unresolved:".len())
+            + 2 * ("alpha".len() + "beta".len());
+        for third in [false, true] {
+            let mut state = super::State {
+                doc: super::ProcessedDocument {
+                    sections: vec![super::Section {
+                        anchor: anchor.clone(),
+                        title: "References".into(),
+                        text: if third {
+                            "[[alpha]][[beta]][[gamma]]"
+                        } else {
+                            "[[alpha]][[beta]]"
+                        }
+                        .into(),
+                    }],
+                    ..Default::default()
+                },
+                fragment_limit: Some(exact),
+                ..Default::default()
+            };
+            let result =
+                state.expand_respec_references(&super::Budget::new(CancellationToken::new()));
+            if third {
+                assert_eq!(
+                    result.expect_err("third bibliography copy").code,
+                    "capacity"
+                );
+            } else {
+                result.expect("exact bibliography bound");
+            }
+            assert_eq!(state.fragments, exact);
+            assert_eq!(
+                state.doc.references,
+                vec![
+                    super::Reference {
+                        source_anchor: anchor.clone(),
+                        target: "respec-biblio:unresolved:alpha".into(),
+                        label: "alpha".into()
+                    },
+                    super::Reference {
+                        source_anchor: anchor.clone(),
+                        target: "respec-biblio:unresolved:beta".into(),
+                        label: "beta".into()
+                    }
+                ]
+            );
+        }
+    }
+    #[test]
+    fn idl_repeated_scope_anchor_and_context_copies_stop_before_budget_overflow() {
+        for field in ["scope", "anchor", "context"] {
+            let large = "界".repeat(1024);
+            let text = "interface Alpha {}; interface Beta {}; interface Gamma {};";
+            let anchor = if field == "anchor" {
+                large.clone()
+            } else {
+                "published-idl".into()
+            };
+            let scope = (field == "scope").then(|| large.clone());
+            let context = if field == "context" {
+                large
+            } else {
+                "published-heading".into()
+            };
+            let copied =
+                "idl".len() + anchor.len() + scope.as_deref().map_or(0, str::len) + context.len();
+            let exact = text.len() + 2 * copied;
+            let mut state = super::State {
+                doc: super::ProcessedDocument {
+                    text: text.into(),
+                    ..Default::default()
+                },
+                section: Some((0, context.clone(), "Heading".into(), 2)),
+                fragment_limit: Some(exact),
+                ..Default::default()
+            };
+            state.stack.push(super::Frame {
+                name: "pre".into(),
+                start: 0,
+                kind: Some("idl".into()),
+                anchor: anchor.clone(),
+                scope: scope.clone(),
+                target: None,
+            });
+            let error = state
+                .close_frame(&super::Budget::new(CancellationToken::new()))
+                .expect_err("third declaration must be rejected before copying metadata");
+            assert_eq!(error.code, "capacity", "{field}");
+            assert_eq!(
+                state.fragments, exact,
+                "{field}: rejection must not reserve beyond the bound"
+            );
+            assert_eq!(state.doc.symbols.len(), 2, "{field}");
+            assert_eq!(
+                state.symbol_contexts,
+                vec![context.clone(), context],
+                "{field}"
+            );
+            for (symbol, name) in state.doc.symbols.iter().zip(["Alpha", "Beta"]) {
+                assert_eq!(symbol.kind, "idl");
+                assert_eq!(symbol.name, name);
+                assert_eq!(symbol.anchor, anchor);
+                assert_eq!(symbol.scope, scope);
+            }
+        }
+    }
+    #[test]
+    fn idl_copy_guard_preserves_exact_bound_fields_and_checks_each_item() {
+        let frame = super::Frame {
+            name: "xmp".into(),
+            start: 0,
+            kind: None,
+            anchor: "published-ä".into(),
+            scope: Some("Scope-界".into()),
+            target: None,
+        };
+        let context = "context-Σ";
+        let copied = "idl".len()
+            + frame.anchor.len()
+            + frame.scope.as_ref().expect("scope").len()
+            + context.len();
+        let mut state = super::State {
+            section: Some((0, context.into(), String::new(), 2)),
+            fragment_limit: Some(copied),
+            ..Default::default()
+        };
+        let cancel = CancellationToken::new();
+        let budget = super::Budget::new(cancel.clone());
+        state
+            .push_idl_declaration(
+                "idl",
+                &frame,
+                ("Example".into(), "interface Example {};".into()),
+                &budget,
+            )
+            .expect("exact copied-byte bound");
+        assert_eq!(state.fragments, copied);
+        assert_eq!(
+            state.doc.symbols,
+            vec![super::Symbol {
+                kind: "idl".into(),
+                name: "Example".into(),
+                anchor: frame.anchor.clone(),
+                text: "interface Example {};".into(),
+                scope: frame.scope.clone()
+            }]
+        );
+        assert_eq!(state.symbol_contexts, vec![context]);
+        state.fragment_limit = Some(copied * 2);
+        cancel.cancel();
+        assert_eq!(
+            state
+                .push_idl_declaration(
+                    "idl",
+                    &frame,
+                    ("Canceled".into(), "interface Canceled {};".into()),
+                    &budget
+                )
+                .expect_err("check cancellation before the next clone")
+                .code,
+            "cancelled"
+        );
+        assert_eq!(state.fragments, copied);
+        assert_eq!(state.doc.symbols.len(), 1);
+        let mut expired = super::Budget::new(CancellationToken::new());
+        expired.deadline = std::time::Instant::now();
+        assert_eq!(
+            state
+                .push_idl_declaration(
+                    "idl",
+                    &frame,
+                    ("Expired".into(), "interface Expired {};".into()),
+                    &expired
+                )
+                .expect_err("check deadline before the next clone")
+                .code,
+            "capacity"
+        );
+        assert_eq!(state.fragments, copied);
+        assert_eq!(state.symbol_contexts.len(), 1);
+    }
     #[test]
     fn mismatched_fetch_and_streams_heading_ends_keep_body_out_of_index_title() {
         use crate::whatwg_index::{IndexDocument, WhatwgIndex};

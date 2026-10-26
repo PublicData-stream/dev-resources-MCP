@@ -57,6 +57,9 @@ impl ProcessedDocument {
         }
     }
     fn validate(&self) -> Result<()> {
+        self.validate_with_limit(MAX_INPUT * 3)
+    }
+    fn validate_with_limit(&self, max_bytes: usize) -> Result<()> {
         let bytes = self
             .text
             .len()
@@ -69,7 +72,12 @@ impl ProcessedDocument {
             .saturating_add(
                 self.symbols
                     .iter()
-                    .map(|s| s.name.len() + s.anchor.len() + s.text.len())
+                    .map(|s| {
+                        s.name.len()
+                            + s.anchor.len()
+                            + s.text.len()
+                            + s.scope.as_deref().map_or(0, str::len)
+                    })
                     .sum::<usize>(),
             )
             .saturating_add(
@@ -78,7 +86,7 @@ impl ProcessedDocument {
                     .map(|r| r.source_anchor.len() + r.target.len() + r.label.len())
                     .sum::<usize>(),
             );
-        if bytes > MAX_INPUT * 3
+        if bytes > max_bytes
             || self.sections.len() > MAX_ITEMS
             || self.symbols.len() > MAX_ITEMS
             || self.references.len() > MAX_ITEMS
@@ -244,6 +252,37 @@ pub fn process_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aggregate_output_budget_counts_scope_utf8_bytes_at_the_exact_bound() {
+        let mut doc = ProcessedDocument {
+            text: "body".into(),
+            symbols: vec![Symbol {
+                kind: "idl".into(),
+                name: "Example".into(),
+                anchor: "published-id".into(),
+                text: "interface Example {};".into(),
+                scope: Some("Scope-界".into()),
+            }],
+            ..Default::default()
+        };
+        let symbol = &doc.symbols[0];
+        let exact = doc.text.len()
+            + symbol.name.len()
+            + symbol.anchor.len()
+            + symbol.text.len()
+            + symbol.scope.as_ref().expect("scope").len();
+        doc.validate_with_limit(exact)
+            .expect("exact UTF-8 byte bound");
+        assert_eq!(
+            doc.validate_with_limit(exact - 1)
+                .expect_err("scope consumes the budget")
+                .code,
+            "capacity"
+        );
+        doc.symbols[0].scope = None;
+        doc.validate_with_limit(exact - 1)
+            .expect("the omitted scope is not charged");
+    }
     #[test]
     fn rendered_semantics_and_inert_assets() {
         let doc=process_document("index.html",br#"<head><title>ignored</title></head><body><h1 id="standard">Standard &amp; API</h1><h2 id="events">Events</h2><p><dfn id="event" data-dfn-for="Window">Event</dfn> is defined.</p><pre class="idl">interface Event {};</pre><a href="https://dom.spec.whatwg.org/#event">the event</a><script>secret()</script><iframe>hidden</iframe>"#,CancellationToken::new()).unwrap();
