@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROCESSOR_VERSION: u32 = 3;
+pub const PROCESSOR_VERSION: u32 = 4;
 pub const WHATWG_WRITE_BATCH_ROWS: usize = 1000;
 pub const WHATWG_WRITE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 

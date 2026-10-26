@@ -466,7 +466,24 @@ impl TokenSink for Sink<'_> {
                         return Err(limit());
                     }
                     if tag.kind == TagKind::EndTag {
-                        if let Some(at) = state.stack.iter().rposition(|frame| frame.name == name) {
+                        let at = if heading(&name) {
+                            // HTML heading end tags close the nearest open heading,
+                            // even when its level differs. Inert content cannot
+                            // close a heading outside its own boundary.
+                            state
+                                .stack
+                                .iter()
+                                .rev()
+                                .take_while(|frame| !hidden(&frame.name))
+                                .position(|frame| heading(&frame.name))
+                                .map(|offset| state.stack.len() - 1 - offset)
+                        } else {
+                            state.stack.iter().rposition(|frame| frame.name == name)
+                        };
+                        if let Some(at) = at {
+                            if heading(&name) && state.stack[at].name != name && !state.inert() {
+                                state.doc.gap("recovered_heading_end_tag", "A mismatched heading end tag was recovered locally; retained source bytes remain unchanged.");
+                            }
                             state.close_at(at, self.budget)?;
                         }
                         if block(&name) && !state.inert() {
@@ -480,16 +497,22 @@ impl TokenSink for Sink<'_> {
                         state.close_at(at, self.budget)?;
                     }
                     // HTML specification sources routinely omit optional end tags.
-                    let implied = state.stack.iter().rposition(|frame| match name.as_str() {
-                        "li" => frame.name == "li",
-                        "dt" | "dd" => matches!(frame.name.as_str(), "dt" | "dd"),
-                        "tr" => frame.name == "tr",
-                        "td" | "th" => matches!(frame.name.as_str(), "td" | "th"),
-                        _ => {
-                            heading(&name) && heading(&frame.name)
-                                || block(&name) && frame.name == "p"
-                        }
-                    });
+                    let implied = state
+                        .stack
+                        .iter()
+                        .rev()
+                        .take_while(|frame| !hidden(&frame.name))
+                        .position(|frame| match name.as_str() {
+                            "li" => frame.name == "li",
+                            "dt" | "dd" => matches!(frame.name.as_str(), "dt" | "dd"),
+                            "tr" => frame.name == "tr",
+                            "td" | "th" => matches!(frame.name.as_str(), "td" | "th"),
+                            _ => {
+                                heading(&name) && heading(&frame.name)
+                                    || block(&name) && frame.name == "p"
+                            }
+                        })
+                        .map(|offset| state.stack.len() - 1 - offset);
                     if let Some(at) = implied {
                         state.close_at(at, self.budget)?;
                     }
@@ -834,6 +857,83 @@ pub(super) fn project_bikeshed(source: &str, budget: &Budget) -> Result<Processe
 #[cfg(test)]
 mod tests {
     use tokio_util::sync::CancellationToken;
+    #[test]
+    fn mismatched_fetch_and_streams_heading_ends_keep_body_out_of_index_title() {
+        use crate::whatwg_index::{IndexDocument, WhatwgIndex};
+        for (standard, markup, anchor, title) in [
+            (
+                "fetch",
+                "<h3 class=no-num id=websocket-protocol oldids=websocket-connections,websocket-opening-handshake,fail-the-websocket-connection,the-websocket-connection-is-established>WebSockets</h2>",
+                "websocket-protocol",
+                "WebSockets",
+            ),
+            (
+                "streams",
+                "<h4 id=\"ws-default-controller-abstract-ops\">Default controllers</h3>",
+                "ws-default-controller-abstract-ops",
+                "Default controllers",
+            ),
+        ] {
+            let body = "Following normative algorithm and paragraph. ".repeat(300);
+            let source = format!("{markup}\n<p>{body}</p>");
+            let doc = super::super::process_document(
+                "review-drafts/example.bs",
+                source.as_bytes(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(doc.sections.len(), 1);
+            assert_eq!(doc.sections[0].anchor, anchor);
+            assert_eq!(doc.sections[0].title, title);
+            assert!(doc.sections[0].text.contains(body.trim()));
+            assert!(doc.text.contains(body.trim()));
+            assert!(
+                doc.gaps
+                    .iter()
+                    .any(|gap| gap.code == "recovered_heading_end_tag")
+            );
+            WhatwgIndex::validate_document(
+                &IndexDocument {
+                    id: "a".repeat(64),
+                    standard: standard.into(),
+                    edition: "review-draft".into(),
+                    path: "review-drafts/example.bs".into(),
+                    title: doc.sections[0].title.clone(),
+                    text: doc.sections[0].text.clone(),
+                    kind: "section".into(),
+                    metadata: serde_json::json!({"anchor":anchor,"chunk":0}),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        }
+    }
+    #[test]
+    fn inert_heading_start_and_end_tags_cannot_close_outer_heading() {
+        for inert in [
+            "<template></h3><h4>hidden</h2></template>",
+            "<template><template><h4>hidden</h3></template></template>",
+            "<script></h3><h4>hidden</h2></script>",
+        ] {
+            let source = format!("<h2 id=outer>Visible{inert} continuation</h2><p>Body.</p>");
+            let doc = super::super::process_document(
+                "index.html",
+                source.as_bytes(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(doc.sections.len(), 1);
+            assert_eq!(doc.sections[0].anchor, "outer");
+            assert_eq!(doc.sections[0].title, "Visible continuation");
+            assert!(doc.sections[0].text.contains("Body."));
+            assert!(!doc.text.contains("hidden"));
+            assert!(
+                !doc.gaps
+                    .iter()
+                    .any(|gap| gap.code == "recovered_heading_end_tag")
+            );
+        }
+    }
     #[test]
     fn unicode_symbol_labels_obey_index_byte_bound_without_losing_text() {
         use crate::whatwg_index::{IndexDocument, WhatwgIndex};

@@ -3025,7 +3025,11 @@ mod tests {
             .whatwg_set_state(&legacy_history, &json!(legacy_offset))
             .await
             .expect("legacy completed v1 checkpoint");
-        let prior_history = state_key("frozen-history", &format!("{}:dom:2", frozen.id));
+        let prior_processor = PROCESSOR_VERSION - 1;
+        let prior_history = state_key(
+            "frozen-history",
+            &format!("{}:dom:{prior_processor}", frozen.id),
+        );
         store
             .whatwg_set_state(&prior_history, &json!(legacy_offset))
             .await
@@ -3036,8 +3040,8 @@ mod tests {
             .whatwg_put("acceptance", &legacy_acceptance_key, &legacy_acceptance)
             .await
             .expect("immutable v1 acceptance evidence");
-        let prior_acceptance_key = format!("{}:full:2", frozen.id);
-        let prior_acceptance = json!({"complete":true,"processor_version":2});
+        let prior_acceptance_key = format!("{}:full:{prior_processor}", frozen.id);
+        let prior_acceptance = json!({"complete":true,"processor_version":prior_processor});
         store
             .whatwg_put("acceptance", &prior_acceptance_key, &prior_acceptance)
             .await
