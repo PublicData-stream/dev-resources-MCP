@@ -187,6 +187,71 @@ fn cancelled(cancel: &CancellationToken) -> Result<()> {
         Ok(())
     }
 }
+
+/// Bound database reads without changing the ordered input of immutable shards.
+struct IndexDocuments<'a> {
+    store: &'a dyn WhatwgStore,
+    ids: &'a [String],
+    position: usize,
+    buffered: VecDeque<Value>,
+}
+impl<'a> IndexDocuments<'a> {
+    fn new(store: &'a dyn WhatwgStore, ids: &'a [String]) -> Self {
+        Self {
+            store,
+            ids,
+            position: 0,
+            buffered: VecDeque::new(),
+        }
+    }
+    async fn next_shard(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<IndexDocument>, Vec<String>)> {
+        let mut documents = Vec::new();
+        let mut ids = Vec::new();
+        let mut bytes = 0;
+        while self.position < self.ids.len() {
+            cancelled(cancel)?;
+            if self.buffered.is_empty() {
+                let end = self.ids.len().min(self.position + 128);
+                let requested = &self.ids[self.position..end];
+                let rows = self
+                    .store
+                    .whatwg_get_many("index-documents", requested)
+                    .await?;
+                cancelled(cancel)?;
+                let mut ordered = BTreeMap::new();
+                for row in rows {
+                    if !requested.contains(&row.key)
+                        || row.data["id"].as_str() != Some(row.key.as_str())
+                        || ordered.insert(row.key, row.data).is_some()
+                    {
+                        return Err(Error::integrity(
+                            "WHATWG selected index document lookup mismatch.",
+                        ));
+                    }
+                }
+                for id in requested {
+                    self.buffered.push_back(ordered.remove(id).ok_or_else(|| {
+                        Error::integrity("WHATWG selected index document is missing.")
+                    })?);
+                }
+            }
+            let data = self.buffered.front().ok_or_else(failure)?;
+            let size = serde_json::to_vec(data).map_err(|_| failure())?.len();
+            if !documents.is_empty() && (documents.len() >= 5000 || bytes + size > 16 * 1024 * 1024)
+            {
+                break;
+            }
+            bytes += size;
+            documents.push(decode(self.buffered.pop_front().ok_or_else(failure)?)?);
+            ids.push(self.ids[self.position].clone());
+            self.position += 1;
+        }
+        Ok((documents, ids))
+    }
+}
 impl WhatwgCorpus {
     async fn publication_chunks(
         &self,
@@ -1153,36 +1218,15 @@ impl WhatwgCorpus {
                 }
             }
         }
-        let mut position = 0;
-        while position < missing.len() || reference.is_none() {
+        let mut pending = IndexDocuments::new(self.store.as_ref(), &missing);
+        while pending.position < missing.len() || reference.is_none() {
             cancelled(&cancel)?;
             if count >= 4090 {
                 return Err(Error::capacity(
                     "WHATWG active index requires too many immutable shards.",
                 ));
             }
-            let mut documents = Vec::new();
-            let mut ids = Vec::new();
-            let mut bytes = 0;
-            while let Some(id) = missing.get(position) {
-                let row = self
-                    .store
-                    .whatwg_get("index-documents", id)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::integrity("WHATWG selected index document is missing.")
-                    })?;
-                let size = serde_json::to_vec(&row.data).map_err(|_| failure())?.len();
-                if !documents.is_empty()
-                    && (documents.len() >= 5000 || bytes + size > 16 * 1024 * 1024)
-                {
-                    break;
-                }
-                bytes += size;
-                documents.push(decode(row.data)?);
-                ids.push(id.clone());
-                position += 1;
-            }
+            let (documents, ids) = pending.next_shard(&cancel).await?;
             let published = self
                 .index
                 .publish_generation(
@@ -2772,6 +2816,7 @@ mod tests {
     struct Memory {
         rows: StdMutex<BTreeMap<(String, String), Row>>,
         state: StdMutex<BTreeMap<String, Value>>,
+        index_read_fault: StdMutex<Option<&'static str>>,
     }
     #[async_trait]
     impl WhatwgStore for Memory {
@@ -2785,6 +2830,38 @@ mod tests {
                 .expect("rows")
                 .get(&(kind.into(), key.into()))
                 .cloned())
+        }
+        async fn whatwg_get_many(&self, kind: &str, keys: &[String]) -> Result<Vec<Row>> {
+            let retained = self.rows.lock().expect("rows");
+            let mut rows: Vec<_> = keys
+                .iter()
+                .rev()
+                .filter_map(|key| retained.get(&(kind.into(), key.clone())).cloned())
+                .collect();
+            if kind == "index-documents" {
+                match *self.index_read_fault.lock().expect("fault") {
+                    Some("missing") => {
+                        rows.pop();
+                    }
+                    Some("duplicate") => {
+                        if let Some(row) = rows.first().cloned() {
+                            rows.push(row);
+                        }
+                    }
+                    Some("unexpected") => {
+                        if let Some(row) = rows.first_mut() {
+                            row.key = inventory::digest(b"unexpected lookup row");
+                        }
+                    }
+                    Some("mismatched") => {
+                        if let Some(row) = rows.first_mut() {
+                            row.data["id"] = json!(inventory::digest(b"mismatched document"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(rows)
         }
         async fn whatwg_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
             let mut rows = self.rows.lock().expect("rows");
@@ -2846,6 +2923,126 @@ mod tests {
         async fn whatwg_publish_view(&self, view: &View) -> Result<()> {
             self.whatwg_put("views", &view.id, &encode(view)?).await?;
             self.whatwg_set_state("default", &encode(view)?).await
+        }
+    }
+    #[tokio::test]
+    async fn prefetched_index_documents_preserve_serial_shards_across_read_and_size_boundaries() {
+        for (count, text_bytes) in [(600, 32768), (5001, 3)] {
+            let store = Memory::default();
+            let mut ids = Vec::new();
+            let mut expected = Vec::<Vec<String>>::new();
+            let mut shard = Vec::new();
+            let mut bytes = 0;
+            for ordinal in 0..count {
+                let id = format!("{ordinal:064x}");
+                let document = IndexDocument {
+                    id: id.clone(),
+                    standard: "dom".into(),
+                    edition: "source".into(),
+                    path: "dom.bs".into(),
+                    title: format!("Section {ordinal}"),
+                    text: "x".repeat(text_bytes),
+                    kind: "section".into(),
+                    metadata: json!({"ordinal":ordinal}),
+                };
+                let data = encode(&document).expect("document");
+                let size = serde_json::to_vec(&data).expect("serial size").len();
+                if !shard.is_empty() && (shard.len() >= 5000 || bytes + size > 16 * 1024 * 1024) {
+                    expected.push(std::mem::take(&mut shard));
+                    bytes = 0;
+                }
+                bytes += size;
+                shard.push(id.clone());
+                store
+                    .whatwg_put("index-documents", &id, &data)
+                    .await
+                    .expect("retain document");
+                ids.push(id);
+            }
+            expected.push(shard);
+            assert_eq!(expected.len(), 2, "exercise the shard boundary");
+            assert_ne!(
+                expected[0].len() % 128,
+                0,
+                "leave prefetched rows for the next shard"
+            );
+            let mut pending = IndexDocuments::new(&store, &ids);
+            for expected_ids in expected {
+                let (documents, actual_ids) = pending
+                    .next_shard(&CancellationToken::new())
+                    .await
+                    .expect("unordered lookup reordered");
+                assert_eq!(actual_ids, expected_ids);
+                assert_eq!(documents.len(), expected_ids.len());
+                for (document, id) in documents.iter().zip(&expected_ids) {
+                    let original = store
+                        .whatwg_get("index-documents", id)
+                        .await
+                        .expect("retained")
+                        .expect("document");
+                    assert_eq!(encode(document).expect("document"), original.data);
+                }
+            }
+            assert_eq!(pending.position, ids.len());
+            assert!(pending.buffered.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn prefetched_index_lookup_corruption_never_publishes_a_snapshot() {
+        let _gate = crate::mdn_index::TEST_GATE.lock().await;
+        for fault in ["missing", "duplicate", "unexpected", "mismatched"] {
+            let root = tempfile::tempdir().expect("root");
+            let store = Arc::new(Memory::default());
+            *store.index_read_fault.lock().expect("fault") = Some(fault);
+            let corpus = WhatwgCorpus::new(
+                store.clone(),
+                Arc::new(BulkBroker::new(Default::default()).expect("broker")),
+                root.path(),
+                WhatwgConfig {
+                    enabled: false,
+                    min_free_bytes: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+            )
+            .expect("corpus");
+            let standard = Standard {
+                id: "dom".into(),
+                title: "DOM".into(),
+                url: "https://dom.spec.whatwg.org/".into(),
+                repository: "whatwg/dom".into(),
+                metadata: json!({}),
+            };
+            let publication = retained_fixture_publication(
+                &corpus,
+                &standard,
+                b"<h2 id=a>Alpha</h2><p>frozen alpha</p><h2 id=b>Beta</h2><p>frozen beta</p>",
+            )
+            .await;
+            let error = corpus
+                .process_publication(&standard, &publication, CancellationToken::new())
+                .await
+                .expect_err("corrupt lookup must fail");
+            assert_eq!(error.code, "integrity", "{fault}");
+            assert!(
+                store
+                    .whatwg_rows("snapshots", 0, 10, None)
+                    .await
+                    .expect("snapshots")
+                    .is_empty(),
+                "{fault}"
+            );
+            assert!(
+                store.whatwg_state("index").await.expect("index").is_none(),
+                "{fault}"
+            );
+            assert!(
+                store
+                    .whatwg_state("index-checkpoint")
+                    .await
+                    .expect("checkpoint")
+                    .is_none(),
+                "{fault}"
+            );
         }
     }
     #[tokio::test]
