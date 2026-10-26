@@ -6,7 +6,7 @@ This service is anonymous and read-only with respect to caller data and upstream
 systems. Reads may populate internal public-source caches and permanent archives.
 It supports RFC metadata/text, crates.io metadata/published sources, local package
 and API research from crates.io/docs.rs captures, MDN content/browser compatibility,
-RustSec advisories, and supplied
+RustSec advisories, WHATWG standards, and supplied
 Cargo.lock matching. No public administrative operations,
 package execution, dependency resolution, arbitrary URL fetching, or user accounts
 are exposed. Missing or unsupported coverage is explicit.
@@ -39,8 +39,8 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | Tool | Inputs and result |
 | --- | --- |
 | `server_info` | Identity, supported revisions, licensing and corresponding-source URL |
-| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
-| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, or immutable `devres://` resource URI |
+| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
+| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, or immutable `devres://` resource URI |
 | `rfc_search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc_get` | RFC number and byte page; published text |
 | `rfc_metadata` | RFC number, optional research snapshot; rich official metadata |
@@ -279,3 +279,84 @@ representations include text/source/bytes and typed feature/browser records.
 Paired text resources also bind `compatibility_snapshot`. Citations carry source
 revision/path, original notices and attribution; MDN material is not relicensed
 as first-party AGPL code. Discovery supplies authoritative strict schemas.
+
+## WHATWG standards research
+
+Serving automatically acquires the entire official standards catalog, its approved
+source repositories, and full advertised branch/tag ancestry. Current publications
+have priority over resumable historical processing. Catalog removals and Git ref
+movements/deletions never remove retained history. The separately identified Web
+NFC predecessor is acquired while the listed WHATWG publication remains an
+independent observation; a placeholder page is not a usable specification.
+
+Automatic additions use the versioned official catalog and explicit source-repository
+metadata from its publication pages. GitHub owner/repository identities, admitted
+publication destinations and their admission evidence are retained. Ordinary links,
+references, tests, scripts and package manifests cannot authorize new destinations.
+Public requests perform local evidence research and never initiate collection.
+
+| Tool | Capability |
+| --- | --- |
+| `whatwg_catalog_search` | Captured standard metadata, publication state and gaps; optional immutable view |
+| `whatwg_search` | Selected-snapshot BM25 over specification sections, with technical/English queries and conjunctive standard/edition/path/kind filters |
+| `whatwg_get` | Projected text, anchored section, original UTF-8 source or base64 byte pages |
+| `whatwg_symbol_search`, `whatwg_symbol_get` | Captured definitions, IDL declarations and explicitly marked algorithms |
+| `whatwg_references` | Captured incoming/outgoing references with explicitly qualified local resolution |
+| `whatwg_snapshots`, `whatwg_history` | Immutable discovery, frozen history pagination, and ordered-parent changes |
+| `whatwg_compare` | Observed source, normalized section or symbol changes between two immutable snapshots |
+| `whatwg_corpus_status` | Separate acquisition, ancestry, projection, indexing, freshness and failure state |
+
+A `view` freezes catalog membership, per-standard snapshots and validation observations
+with its search reference. A document `snapshot` selects one immutable source revision
+or publication representation. These selectors are exclusive. Default evidence becomes
+stale after 24 hours and is unavailable beyond seven days; explicitly historical views
+and snapshots remain readable. Reprocessing and offline restoration do not refresh
+online validation. Unchanged evidence may receive a new successful validation
+observation without changing its original representation.
+
+Canonical current publications are the default search membership. Advertised alternate
+editions, multipage documents, PDFs, review drafts and commit snapshots retain distinct
+identities and are discoverable through snapshots. Original source revisions are not
+implicitly paired with published HTML. Missing publication/revision association,
+unsupported historic syntax, generated constructs and parsing bounds remain explicit
+gaps. Acquisition accounting, supported projection and search coverage are separate.
+
+HTML, Bikeshed, WHATWG source and Markdown are inert data. Sections preserve source
+anchors, tables, examples, definitions, IDL text and marked algorithms. IDL extraction
+is not semantic compilation; algorithm text is not executed. PDF extraction preserves
+page text and raw bytes, with layout/font/image limitations reported. Upstream builds,
+JavaScript, demos, stylesheets, external resources and linked specifications are never
+executed or fetched by projection or research operations.
+
+Lists default to 20 and cap at 100. Offset paging accepts at most 10,000; bound cursors
+continue beyond that window and permit a changed limit. Reuse returned view/snapshot
+selectors for continuation. History cursors also carry the frozen `history_snapshot`
+cutoff; follow `next_cursor` even when a bounded filtered scan returns no entries.
+Text and byte pages cap at 32 KiB; text offsets must be UTF-8 boundaries. Duplicate
+anchors and symbols require disambiguation rather than arbitrary selection.
+
+`devres://whatwg/<standard>/<snapshot>/<representation>/<base64url-path>` identifies
+immutable text/source/bytes or discriminated symbol resources. Citations preserve
+original source URL, revision/path/object identity and applicable versioned notices.
+References outside captured evidence remain unresolved; comparison results do not
+assert normative, browser-compatibility or conformance consequences.
+
+Generated anchored resources use document-local `section_index` or `symbol_index`
+selectors within the immutable snapshot and path. These preserve duplicate identities
+and keep resource URIs bounded even for long Unicode anchors or symbol names. Legacy
+anchor/name selectors remain readable. Advertised plain text and IDL publications
+remain distinct text representations; JSON and other unsupported formats retain
+their raw bytes and explicit projection gaps.
+
+`whatwg_history` defaults to revision history. `history_type="refs"` returns paged
+advertised branch/tag observations; select an exact captured `repository` and
+optionally `ref`. Its cursor freezes both the publication cutoff and position within
+an observation. Repository-qualified history avoids guessing a historical repository
+from a standard's current mapping. Earlier observations preserve refs subsequently
+moved or deleted; absence is not proof that an unreachable object never existed.
+
+Rendered comparisons match anchors after normalizing commit-snapshot and review-draft
+URL prefixes; moving a publication beneath a versioned URL does not itself mark every
+section as removed and added. Original Git member paths stay exact. A retained member
+with failed projection is incomplete comparison evidence, rather than proof that its
+previous sections were removed. Original-source comparison remains available.

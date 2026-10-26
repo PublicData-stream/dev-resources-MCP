@@ -226,4 +226,50 @@ mod tests {
                 .is_valid(&json!({"query":"fetch","sources":["arbitrary"]}))
         );
     }
+
+    #[test]
+    fn whatwg_interfaces_admit_only_local_evidence_selectors() {
+        let mut registry =
+            server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .unwrap();
+        }
+        assert!(
+            registry.tools["whatwg_get"]
+                .validator
+                .is_valid(&json!({"standard":"dom","anchor":"event"}))
+        );
+        assert!(
+            !registry.tools["whatwg_get"]
+                .validator
+                .is_valid(&json!({"standard":"dom","url":"https://example.com"}))
+        );
+        assert!(
+            !registry.tools["whatwg_catalog_search"]
+                .validator
+                .is_valid(&json!({"snapshot":"a".repeat(64)}))
+        );
+        assert!(
+            registry.tools["whatwg_symbol_get"]
+                .validator
+                .is_valid(&json!({"standard":"dom","name":"Event","limit":32768}))
+        );
+        assert!(
+            !registry.tools["whatwg_symbol_get"]
+                .validator
+                .is_valid(&json!({"standard":"dom","name":"Event","limit":32769}))
+        );
+        assert!(
+            !registry.tools["whatwg_corpus_status"]
+                .validator
+                .is_valid(&json!({"enabled":true}))
+        );
+        assert!(
+            registry.tools["search"]
+                .validator
+                .is_valid(&json!({"query":"event","sources":["whatwg"]}))
+        );
+    }
 }

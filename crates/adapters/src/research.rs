@@ -17,6 +17,7 @@ pub struct Research {
     corpus: Option<std::sync::Arc<RfcCorpus>>,
     crate_corpus: Option<std::sync::Arc<crate::CrateCorpus>>,
     mdn_research: Option<Arc<crate::mdn_research::MdnResearch>>,
+    whatwg_research: Option<Arc<crate::whatwg_research::WhatwgResearch>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -108,6 +109,7 @@ impl Research {
             corpus: None,
             crate_corpus: None,
             mdn_research: None,
+            whatwg_research: None,
         })
     }
 
@@ -136,7 +138,25 @@ impl Research {
         self.advisory.refresh().await
     }
 
+    pub fn with_whatwg_corpus(mut self, corpus: Arc<crate::WhatwgCorpus>) -> Self {
+        self.whatwg_research = Some(Arc::new(crate::whatwg_research::WhatwgResearch::new(
+            corpus,
+        )));
+        self
+    }
+
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if crate::whatwg_research::schemas()
+            .iter()
+            .any(|schema| schema["name"] == tool)
+        {
+            return self
+                .whatwg_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("WHATWG corpus storage is not configured."))?
+                .call(tool, input)
+                .await;
+        }
         if crate::mdn_research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
@@ -213,8 +233,8 @@ impl Research {
             limit: input.limit,
         }
         .checked()?;
-        if input.sources.is_empty() || input.sources.len() > 4 {
-            return Err(Error::invalid("Select one to four sources."));
+        if input.sources.is_empty() || input.sources.len() > 5 {
+            return Err(Error::invalid("Select one to five sources."));
         }
         let mut results = Vec::new();
         let mut unique = std::collections::HashSet::new();
@@ -249,6 +269,17 @@ impl Research {
                     .await
                 }
                 "rustsec" => self.advisory.search(&input.query, page).await,
+                "whatwg" => match self.whatwg_research.as_ref() {
+                    Some(research) => research
+                        .call(
+                            "whatwg_search",
+                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                        )
+                        .await,
+                    None => Err(Error::unavailable(
+                        "WHATWG corpus storage is not configured.",
+                    )),
+                },
                 "mdn" => match self.mdn_research.as_ref() {
                     Some(research) => research
                         .call(
@@ -260,7 +291,7 @@ impl Research {
                 },
                 _ => {
                     return Err(Error::invalid(
-                        "Search sources are rfc, cargo, rustsec, and mdn.",
+                        "Search sources are rfc, cargo, rustsec, mdn, and whatwg.",
                     ));
                 }
             };
@@ -306,6 +337,19 @@ impl Research {
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?
                 .call("mdn_compat_get", json!({"feature":feature,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(20)}))
+                .await;
+        }
+        if let Some(id) = input.id.strip_prefix("whatwg:") {
+            let (standard, anchor) = id.split_once('#').map_or((id, None), |(s, a)| (s, Some(a)));
+            let mut args = json!({"standard":standard,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(32768)});
+            if let Some(anchor) = anchor {
+                args["anchor"] = json!(anchor);
+            }
+            return self
+                .whatwg_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("WHATWG corpus storage is not configured."))?
+                .call("whatwg_get", args)
                 .await;
         }
         if let Some(slug) = input.id.strip_prefix("mdn:") {
@@ -364,6 +408,14 @@ impl Research {
                 .mdn_research
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?
+                .read_resource(uri)
+                .await;
+        }
+        if url.host_str() == Some("whatwg") {
+            return self
+                .whatwg_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("WHATWG corpus storage is not configured."))?
                 .read_resource(uri)
                 .await;
         }
@@ -502,13 +554,13 @@ fn schemas() -> Vec<Value> {
     };
     add(
         "search",
-        "Search RFC metadata, crates.io packages, RustSec advisories, or local MDN documents. Sources are independent; errors and freshness are explicit.",
-        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn"]},"minItems":1,"maxItems":4,"uniqueItems":true},"offset":offset,"limit":limit}),
+        "Search RFC metadata, crates.io packages, RustSec advisories, local MDN documents or WHATWG standards. Sources are independent; errors and freshness are explicit.",
+        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg"]},"minItems":1,"maxItems":5,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(
         "fetch",
-        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
+        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
         json!({"id":{"type":"string","minLength":1,"maxLength":16384},"offset":text_offset,"limit":text_limit}),
         vec!["id"],
     );
@@ -564,6 +616,7 @@ fn schemas() -> Vec<Value> {
     tools.extend(crate::crate_research::schemas());
     tools.extend(crate::advisory_research::schemas());
     tools.extend(crate::mdn_research::schemas());
+    tools.extend(crate::whatwg_research::schemas());
     tools
 }
 #[derive(Deserialize)]

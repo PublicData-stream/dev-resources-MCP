@@ -214,3 +214,30 @@ snapshot IDs, including explicitly failing corrupt historical indexes.
 If collection is disabled during an upgrade, rebuilding can repair the existing
 older-generation default through its own aliases and frozen observations without
 renewing validation time or waiting for the new processing generation.
+
+## WHATWG acquisition and research
+
+The WHATWG provider has separate application evidence/configuration contracts and
+adapter catalog, Git, inventory, processing, corpus and research modules. It reuses
+the mediated Git transport and immutable selected-membership BM25 engine while
+keeping provider identities, evidence tables, archive budgets and index roots separate.
+Schema 6 adds owner-fenced WHATWG evidence/private state and atomic catalog-view
+publication. Existing provider tables, capture identities and behavior are preserved.
+
+Catalog-qualified typed destinations mediate acquisition. Bare Git mirrors are
+disposable; retained packs/manifests and observed roots support offline restoration.
+Content-addressed inventories and per-section identities share unchanged history.
+Raw acquisition, projection, indexing and publication advance through durable
+checkpoints; a failed stage does not promote a replacement default.
+
+Publication representations and editable Git revisions have independent identities.
+Catalog views freeze per-standard selections, their successful validation observations
+and the search reference. Reprocessing changes processing generations rather than
+rewriting historical evidence. A fixed first-party subprocess contains PDF parsing;
+source-selected programs and build systems are never executed.
+
+WHATWG derived text, sections, symbols, references and ordered/index memberships use
+content-addressed PostgreSQL chunks/objects and structurally shared Merkle sequences;
+a small manifest identifies each source projection. Schema 6 also maintains exact
+aggregate counters transactionally with immutable inserts. Raw publication artifacts
+have immutable 4 MiB range proofs so byte pages verify bounded local blocks.

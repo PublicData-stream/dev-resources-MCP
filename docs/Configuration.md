@@ -6,7 +6,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, and `mdn` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, `mdn`, and `whatwg` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -253,3 +253,43 @@ entry's inventory root advances only after every staged group commits.
 
 Schema 5 is forward-only. Preserve MDN raw artifacts, retained Git evidence,
 projection records, inventories and `mdn-indexes` in coordinated backups.
+
+## WHATWG defaults
+
+Omitting `[whatwg]` enables current-first permanent collection, full observed Git
+ancestry and resumable historical processing. `enabled=false` pauses scheduling
+without removing evidence or local research. Disposable harnesses disable it explicitly.
+
+| `whatwg` field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Supervised collection and history processing |
+| `catalog_refresh_secs` | `3600` | Official catalog validation target |
+| `ref_refresh_secs` | `3600` | Approved repository branch/tag observation target |
+| `publication_refresh_secs` | `86400` | Moving publication validation target |
+| `collection_interval_secs` | `1` | Delay between resumable worker iterations |
+| `publication_interval_secs` | `300` | Historical publication batching target |
+| `max_processing_workers` | `1` | Processing admission ceiling, accepts 1..2 |
+| `max_git_bytes` | `8589934592` | Disposable bare storage per repository, 8 GiB |
+| `min_free_bytes` | `1073741824` | Free-space admission reserve, 1 GiB |
+| `max_archive_storage_bytes` | omitted | Shared optional quota for permanent WHATWG artifacts |
+
+Interval, Git storage, reserve and quota validation follow the MDN ranges above.
+Quota/headroom failures pause acquisition without deleting history. The artifact
+quota excludes PostgreSQL projections/counters, disposable mirrors and search indexes;
+monitor those separately. Shared GitHub
+admission and a separate shared one-attempt/second publication budget include retries.
+Intervals are scheduling targets, not provider permission or completion guarantees.
+
+Raw publication intake caps at 32 GiB, separately from 64 MiB textual projection inputs. Token, nesting, record, result and processing
+bounds are enforced independently; oversized source remains retained and readable as
+byte pages. Derived projections use content-addressed PostgreSQL text chunks, section/symbol/
+reference objects and persistent Merkle sequences with small per-source manifests;
+reconstruction caps at 256 MiB. Search reuses the immutable selected-membership engine with two
+concurrent reader operations, 64 MiB indexing writers and bounded shards/manifests. PDF extraction uses
+one fixed helper process with a 1 GiB address-space ceiling and 60-second wall deadline;
+original PDFs remain retained when extraction fails or is unsupported.
+
+Schema 6 is forward-only. Coordinated backups include WHATWG raw artifacts, Git
+evidence, projections, immutable inventories and search indexes. Serving storage
+continues to use the configured persistent directory; test/build state follows the
+isolated `/tmp` workflow in [Operations](operations.md).

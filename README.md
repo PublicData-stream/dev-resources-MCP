@@ -4,7 +4,8 @@ Anonymous, read-only developer knowledge and Rust package research over Streamab
 HTTP and a custom WebTransport binding. It provides RFC research, crates.io
 metadata and verified sources, local package and API research from retained
 crates.io/docs.rs captures, MDN content and browser compatibility research,
-RustSec matching, and supplied Cargo.lock auditing.
+WHATWG standards and historical specification research, RustSec matching, and supplied
+Cargo.lock auditing.
 
 Public upstream captures and provenance are permanent. Submitted lockfiles and audit
 reports remain request-local. The service never builds or executes inspected packages. RFC and crate collection

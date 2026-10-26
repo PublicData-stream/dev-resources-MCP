@@ -316,6 +316,8 @@ pub struct Config {
     pub rustsec: devres_adapters::RustSecConfig,
     #[serde(default)]
     pub mdn: devres_adapters::MdnConfig,
+    #[serde(default)]
+    pub whatwg: devres_adapters::WhatwgConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
@@ -324,6 +326,7 @@ impl Config {
         self.crates.validate()?;
         self.rustsec.validate()?;
         self.mdn.validate()?;
+        self.whatwg.validate()?;
         for access in [
             AccessPolicy {
                 allowed_hosts: self.http.allowed_hosts.clone(),

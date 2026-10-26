@@ -95,3 +95,32 @@ identity on every raw read; SHA-256 remains the archive/projection addressing ha
 No Git dependencies, upstream build tools or source-selected executables are added.
 Current cargo-audit and cargo-deny admission remains mandatory and separate from
 compilation and provider acceptance.
+
+## WHATWG PDF processing dependencies
+
+`lopdf 0.46.0` is pinned with default features disabled. It parses retained PDF
+objects and extracts inert page text without a PDF viewer, JavaScript, external
+assets, or executing specification/package build tools. Existing HTML tokenization
+cannot decode PDF content streams; shelling out to an independently provisioned PDF
+renderer would add a larger executable and operating-system dependency boundary.
+The maintained MIT-licensed crate and its resolved transitive notices are included
+in dependency admission and image notice generation. Optional parallel, image,
+date-time integration, and async features are disabled. Its resolved parser,
+encoding, compression and cryptography graph still requires current advisory,
+license and source checks; compilation alone is not admission.
+
+The new locked graph includes `encoding_rs 0.8.42` (permissive
+Apache-2.0/MIT plus BSD-3-Clause notices), `nom 8.0.0`, `rangemap 1.8.0`,
+`weezl 0.2.1`, Brotli decompression and the crate's required PDF cryptography
+support. `lopdf` has no build script. `encoding_rs` has a compiler-version
+configuration build script; `multiversion_no_op` is a compile-time proc macro.
+These execute only as trusted build dependencies, never against inspected source.
+
+PDF parsing occurs exclusively in the fixed first-party `devres-pdf-worker`
+sibling executable. Input and output are bounded, credentials/environment are
+cleared, standard error is suppressed, and the parent cancels/kills/reaps it under
+a 60-second deadline. Existing `nix` gains only the `resource` feature to set a
+1-GiB address-space limit, CPU limit and zero core size before reading untrusted
+bytes. Per-page decompression and overall page/text counts are bounded. Failed,
+encrypted, malformed and image-only decoding remain explicit projection gaps;
+original public PDF captures stay readable independently.

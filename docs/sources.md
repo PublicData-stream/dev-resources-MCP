@@ -168,3 +168,43 @@ are not fabricated. No browser-version compatibility certification is provided.
 Ordinary checks use synthetic fixtures with explicit provenance. Bounded live
 acceptance and full frozen-observation backfill are separate commands/evidence;
 neither authorizes production deployment or demonstrates native client UI support.
+
+## WHATWG standards
+
+The [standards index](https://spec.whatwg.org/) is reconciled with the versioned
+[`whatwg/sg` catalog](https://github.com/whatwg/sg/blob/main/db.json). Its standards
+are in scope; the separate ideas and bibliography sections are not source admission.
+Current mappings use official WHATWG repositories plus the separately labeled
+[`w3c-cg/web-nfc`](https://github.com/w3c-cg/web-nfc) predecessor. The listed NFC
+publication is retained independently, including its observed placeholder state.
+
+Automatic catalog additions admit validated standard publication hosts and explicit
+source-repository metadata from the listed publication, including external GitHub
+owners. Admission retains the exact supporting observation. Normal links, reference
+lists, test repositories, editor profiles and arbitrary caller URLs do not authorize
+collection. Redirects, userinfo, custom ports and unsafe paths remain rejected.
+Git uses only the private advertisement/upload-pack relay; no checkout, hook,
+submodule or credential helper is admitted.
+
+The collector retains advertised branch/tag ancestry and previously observed roots,
+plus advertised HTML editions, multipage documents, review drafts, commit snapshots
+and PDFs. Discovery uses publication navigation/indexes, not unrestricted link
+crawling. Every frozen observation has finite catalog, ref and publication inventories;
+new discoveries belong to later observations. Already-unreachable objects and
+unadvertised/disappeared publications cannot be reconstructed.
+
+GitHub attempts share the existing host clock. WHATWG publication attempts have a
+shared one-per-second budget with the existing single retry owner. Catalog/ref
+validation targets one hour and moving publications one day. These conservative
+application defaults do not claim provider endorsement or a bulk-mirroring allowance.
+
+Preserve each representation's versioned license/notices. The WHATWG
+[publication policy](https://whatwg.org/workstream-policy#publications) describes
+CC-BY-4.0/BSD-3-Clause treatment, while predecessor/community-group material can
+carry different original notices. GitHub license detection is not authoritative;
+public availability does not relicense captured content as first-party AGPL.
+
+Ordinary checks remain synthetic. Fixed-record smoke and explicitly invoked,
+retained full frozen-observation acceptance are separate evidence. Full accounting
+never substitutes for successful projection, complete rendered history, measured
+capacity, hosted native architecture checks or production deployment.

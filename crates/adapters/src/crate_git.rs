@@ -792,20 +792,25 @@ pub(crate) async fn run_command(
 }
 
 /// Closed set of repositories admitted by the private Git relay.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum GitSource {
     Registry,
     RustSec,
     MdnContent,
     MdnCompat,
+    Whatwg(crate::whatwg_git::Repo),
 }
 impl GitSource {
-    fn request(self, operation: GitOperation) -> BulkSource {
+    fn request(&self, operation: GitOperation) -> BulkSource {
         match self {
             Self::Registry => BulkSource::RegistryGit(operation),
             Self::RustSec => BulkSource::RustSecGit(operation),
             Self::MdnContent => BulkSource::MdnContentGit(operation),
             Self::MdnCompat => BulkSource::MdnCompatGit(operation),
+            Self::Whatwg(repo) => BulkSource::WhatwgGit {
+                repository: repo.clone(),
+                operation,
+            },
         }
     }
 }

@@ -76,10 +76,21 @@ pub enum BulkSource {
     RustSecGit(GitOperation),
     MdnContentGit(GitOperation),
     MdnCompatGit(GitOperation),
+    WhatwgGit {
+        repository: crate::whatwg_git::Repo,
+        operation: GitOperation,
+    },
+    WhatwgPublication(crate::whatwg_catalog::PublicationUrl),
 }
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
         match self {
+            Self::WhatwgGit { repository, operation } => {
+                crate::whatwg_git::Repo::new(&repository.as_str())?;
+                let suffix=match operation { GitOperation::Advertisement=>"info/refs?service=git-upload-pack",GitOperation::UploadPack=>"git-upload-pack" };
+                Ok(format!("{}/{suffix}",repository.source_url()))
+            }
+            Self::WhatwgPublication(source) => {source.validate()?; Ok(source.as_str().to_owned())},
             Self::DatabaseDump => Ok("https://static.crates.io/db-dump.tar.gz".into()),
             Self::CrateArchive { name, version } => {
                 package_identity(name, version)?;
@@ -113,8 +124,10 @@ impl BulkSource {
             Self::RegistryGit(GitOperation::UploadPack) => Ok("https://github.com/rust-lang/crates.io-index.git/git-upload-pack".into()),
         }
     }
-    pub fn host(&self) -> &'static str {
+    pub fn host(&self) -> &str {
         match self {
+            Self::WhatwgPublication(source) => source.host(),
+            Self::WhatwgGit { .. } => "github.com",
             Self::DatabaseDump | Self::CrateArchive { .. } => "static.crates.io",
             Self::Documentation { .. } => "docs.rs",
             Self::RegistryGit(_)
@@ -125,18 +138,27 @@ impl BulkSource {
     }
     fn media_type(&self) -> &'static str {
         match self {
-            Self::RegistryGit(GitOperation::Advertisement)
+            Self::WhatwgGit {
+                operation: GitOperation::Advertisement,
+                ..
+            }
+            | Self::RegistryGit(GitOperation::Advertisement)
             | Self::RustSecGit(GitOperation::Advertisement)
             | Self::MdnContentGit(GitOperation::Advertisement)
             | Self::MdnCompatGit(GitOperation::Advertisement) => {
                 "application/x-git-upload-pack-advertisement"
             }
-            Self::RegistryGit(GitOperation::UploadPack)
+            Self::WhatwgGit {
+                operation: GitOperation::UploadPack,
+                ..
+            }
+            | Self::RegistryGit(GitOperation::UploadPack)
             | Self::RustSecGit(GitOperation::UploadPack)
             | Self::MdnContentGit(GitOperation::UploadPack)
             | Self::MdnCompatGit(GitOperation::UploadPack) => {
                 "application/x-git-upload-pack-result"
             }
+            Self::WhatwgPublication(source) => source.media_type(),
             Self::Documentation {
                 operation: DocsOperation::Status,
                 ..
@@ -177,6 +199,7 @@ fn admitted_host(host: &str) -> Result<&str> {
         | "codeload.github.com"
         | "github.com"
         | "docs.rs" => Ok(host),
+        host if crate::whatwg_catalog::publication_host(host) => Ok(host),
         _ => Err(Error::invalid("Source host is not permitted.")),
     }
 }
@@ -325,14 +348,20 @@ impl BulkBroker {
         let scheduled = {
             let mut rates = self.rates.lock().await;
             let now = Instant::now();
-            let scheduled = rates.get(host).copied().unwrap_or(now).max(now);
-            let per_second = forced_rate.unwrap_or(match host {
-                "static.crates.io" => self.config.static_requests_per_second,
-                "index.crates.io" | "github.com" => self.config.index_requests_per_second,
-                _ => self.config.other_requests_per_second,
-            });
+            let whatwg = crate::whatwg_catalog::publication_host(host);
+            let clock = if whatwg { "whatwg-publications" } else { host };
+            let scheduled = rates.get(clock).copied().unwrap_or(now).max(now);
+            let per_second = if whatwg {
+                1
+            } else {
+                forced_rate.unwrap_or(match host {
+                    "static.crates.io" => self.config.static_requests_per_second,
+                    "index.crates.io" | "github.com" => self.config.index_requests_per_second,
+                    _ => self.config.other_requests_per_second,
+                })
+            };
             rates.insert(
-                host.to_owned(),
+                clock.to_owned(),
                 scheduled + Duration::from_secs_f64(1.0 / f64::from(per_second)),
             );
             scheduled
@@ -374,6 +403,10 @@ impl BulkBroker {
                 | BulkSource::RustSecGit(GitOperation::UploadPack)
                 | BulkSource::MdnContentGit(GitOperation::UploadPack)
                 | BulkSource::MdnCompatGit(GitOperation::UploadPack)
+                | BulkSource::WhatwgGit {
+                    operation: GitOperation::UploadPack,
+                    ..
+                }
         );
         if request.body.len() > 1024 * 1024 || (!upload && !request.body.is_empty()) {
             return Err(Error::invalid("Invalid bulk request body."));
@@ -402,6 +435,7 @@ impl BulkBroker {
                         BulkSource::RustSecGit(_)
                             | BulkSource::MdnContentGit(_)
                             | BulkSource::MdnCompatGit(_)
+                            | BulkSource::WhatwgGit { .. }
                     )
                     .then_some(1),
                 ),
@@ -419,6 +453,7 @@ impl BulkBroker {
                     | BulkSource::RustSecGit(_)
                     | BulkSource::MdnContentGit(_)
                     | BulkSource::MdnCompatGit(_)
+                    | BulkSource::WhatwgGit { .. }
             ) {
                 builder = builder.header("Git-Protocol", "version=2");
                 if upload {
@@ -790,7 +825,18 @@ impl BulkArtifactStore {
         bytes: Vec<u8>,
         shutdown: CancellationToken,
     ) -> Result<BulkArtifact> {
-        if bytes.len() > 16 * 1024 * 1024 {
+        self.capture_bytes_bounded(bytes, 16 * 1024 * 1024, shutdown)
+            .await
+    }
+    /// Trusted normalized-document capture with an explicit bounded envelope.
+    /// Ordinary callers retain the original 16 MiB admission limit.
+    pub(crate) async fn capture_bytes_bounded(
+        &self,
+        bytes: Vec<u8>,
+        max_bytes: u64,
+        shutdown: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        if max_bytes == 0 || max_bytes > 256 * 1024 * 1024 || bytes.len() as u64 > max_bytes {
             return Err(Error::capacity(
                 "In-memory artifact exceeds its byte budget.",
             ));
@@ -803,7 +849,7 @@ impl BulkArtifactStore {
             let chunk = bytes[offset..end].to_vec();
             Some((Ok(chunk), (bytes, end)))
         });
-        self.publish_stream(Box::pin(stream), None, MAX_ARTIFACT_BYTES, shutdown)
+        self.publish_stream(Box::pin(stream), None, max_bytes, shutdown)
             .await
     }
     async fn publish_stream(
@@ -1503,5 +1549,62 @@ mod tests {
             "capacity"
         );
         assert_eq!(broker.attempt_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod whatwg_policy_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn whatwg_publication_hosts_share_one_attempt_per_second() {
+        let broker = BulkBroker::new(BulkConfig::default()).expect("broker");
+        let started = Instant::now();
+        drop(
+            broker
+                .admit_rate("dom.spec.whatwg.org", true, Some(100))
+                .await
+                .expect("DOM"),
+        );
+        drop(
+            broker
+                .admit_rate("html.spec.whatwg.org", true, Some(100))
+                .await
+                .expect("HTML"),
+        );
+        assert!(Instant::now().duration_since(started) >= Duration::from_secs(1));
+        drop(
+            broker
+                .admit_rate("w3c-cg.github.io", true, Some(100))
+                .await
+                .expect("predecessor"),
+        );
+        assert!(Instant::now().duration_since(started) >= Duration::from_secs(2));
+    }
+    #[tokio::test]
+    async fn large_normalized_projection_has_an_explicit_archive_limit() {
+        let root = tempfile::tempdir().expect("owned artifacts");
+        let artifacts = BulkArtifactStore::new(root.path(), 64 * 1024 * 1024).expect("artifacts");
+        let bytes = vec![b'a'; 17 * 1024 * 1024];
+        assert_eq!(
+            artifacts
+                .capture_bytes(bytes.clone(), CancellationToken::new())
+                .await
+                .expect_err("old admission remains bounded")
+                .code,
+            "capacity"
+        );
+        let artifact = artifacts
+            .capture_bytes_bounded(bytes, 32 * 1024 * 1024, CancellationToken::new())
+            .await
+            .expect("explicit normalized admission");
+        assert_eq!(artifact.bytes, 17 * 1024 * 1024);
+        artifacts
+            .verify(
+                &artifact.body_hash,
+                32 * 1024 * 1024,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("verified retained projection");
     }
 }

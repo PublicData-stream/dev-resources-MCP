@@ -26,6 +26,8 @@ mod corpus_storage;
 mod crate_storage;
 #[path = "mdn_storage.rs"]
 mod mdn_storage;
+#[path = "whatwg_storage.rs"]
+mod whatwg_storage;
 
 const MAX_BLOB: usize = 128 * 1024 * 1024;
 static STAGE: AtomicU64 = AtomicU64::new(0);
@@ -111,7 +113,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if version != 2 && version != 3 && version != 4 && version != 5 {
+        } else if version != 2 && version != 3 && version != 4 && version != 5 && version != 6 {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -140,6 +142,16 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
             sqlx::query("UPDATE devres_schema SET version=5 WHERE singleton")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
+        if version <= 5 {
+            sqlx::raw_sql(whatwg_storage::SCHEMA_V6)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx::query("UPDATE devres_schema SET version=6 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
