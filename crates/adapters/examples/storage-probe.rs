@@ -120,6 +120,7 @@ async fn seed_mdn(
     {
         return Ok(());
     }
+    std::fs::create_dir_all(root.join("mdn/raw-artifacts"))?;
     let raw = BulkArtifactStore::new(root.join("mdn/raw-artifacts"), 64 * 1024 * 1024)?;
     let mut roots = [
         inventory::empty(store).await?,
@@ -279,11 +280,170 @@ async fn check_mdn(
     Ok(())
 }
 
+const WHATWG_IDENTITY: &[u8] = b"devres:storage-probe:whatwg:v1";
+const WHATWG_SOURCE: &str = "<h1 id=fixture>Synthetic WHATWG storage fixture</h1><p>Offline fixture token research.</p><dfn id=fixture-token>FixtureToken</dfn><script>fixture_hidden_script()</script>";
+async fn seed_whatwg(
+    store: &PgBlobStore,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_adapters::{
+        bulk::BulkArtifactStore,
+        whatwg_index::{IndexDocument, WhatwgIndex},
+        whatwg_inventory as inventory,
+    };
+    use devres_application::whatwg::{Member, PROCESSOR_VERSION, Snapshot, WhatwgStore};
+    use tokio_util::sync::CancellationToken;
+    let id = fixture_hash(WHATWG_IDENTITY);
+    if store.whatwg_get("snapshots", &id).await?.is_some() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(root.join("whatwg/raw-artifacts"))?;
+    let raw = BulkArtifactStore::new(root.join("whatwg/raw-artifacts"), 64 * 1024 * 1024)?;
+    let artifact = raw
+        .capture_bytes(WHATWG_SOURCE.as_bytes().to_vec(), CancellationToken::new())
+        .await?;
+    let document = devres_adapters::whatwg_processing::process_document(
+        "index.html",
+        WHATWG_SOURCE.as_bytes(),
+        CancellationToken::new(),
+    )?;
+    let index_id = fixture_hash(b"devres:storage-probe:whatwg:index:v1");
+    let mut projection = serde_json::to_value(&document)?;
+    projection["index_ids"] = json!([index_id]);
+    let projection_id = fixture_hash(&serde_json::to_vec(&projection)?);
+    store
+        .whatwg_put("projections", &projection_id, &projection)
+        .await?;
+    let empty = inventory::empty(store).await?;
+    let inventory = inventory::update(
+        store,
+        &empty,
+        "index.html",
+        Some(Member {
+            path: "index.html".into(),
+            oid: artifact.body_hash.clone(),
+            mode: "100644".into(),
+            kind: "html".into(),
+            projection: Some(projection_id),
+            raw: Some(json!({"artifact":artifact,"synthetic":true})),
+            gaps: vec![],
+        }),
+    )
+    .await?;
+    let index = WhatwgIndex::new(root)?
+        .publish(
+            None,
+            vec![IndexDocument {
+                id: index_id,
+                standard: "fixture".into(),
+                edition: "synthetic".into(),
+                path: "index.html".into(),
+                title: document.title,
+                text: document.text,
+                kind: "section".into(),
+                metadata: json!({"anchor":"fixture","synthetic":true}),
+            }],
+            CancellationToken::new(),
+        )
+        .await?;
+    let snapshot = Snapshot {
+        id: id.clone(),
+        standard: "fixture".into(),
+        repository: "synthetic/whatwg-fixture".into(),
+        revision: fixture_hash(b"synthetic-whatwg-revision")[..40].into(),
+        tree: fixture_hash(WHATWG_SOURCE.as_bytes()),
+        parents: vec![],
+        committed_at: 0,
+        inventory,
+        processor_version: PROCESSOR_VERSION,
+        index,
+        coverage: json!({"synthetic":true,"accounted":true,"members":1}),
+        source_url: "https://fixtures.invalid/devres/storage-probe/whatwg".into(),
+        representation: "html".into(),
+        validated_at: 0,
+    };
+    store
+        .whatwg_put("snapshots", &id, &serde_json::to_value(snapshot)?)
+        .await?;
+    Ok(())
+}
+async fn check_whatwg(
+    store: std::sync::Arc<PgBlobStore>,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_adapters::{
+        WhatwgCorpus,
+        bulk::{BulkBroker, BulkConfig},
+        whatwg_research::WhatwgResearch,
+    };
+    use devres_application::whatwg::WhatwgConfig;
+    let research = WhatwgResearch::new(std::sync::Arc::new(WhatwgCorpus::new(
+        store,
+        std::sync::Arc::new(BulkBroker::new(BulkConfig::default())?),
+        root,
+        WhatwgConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    )?));
+    let snapshot = fixture_hash(WHATWG_IDENTITY);
+    let detail = research
+        .call(
+            "whatwg_get",
+            json!({"standard":"fixture","snapshot":snapshot}),
+        )
+        .await?;
+    if detail["selection"]["coverage"]["synthetic"] != true
+        || detail["selection"]["source_url"]
+            != "https://fixtures.invalid/devres/storage-probe/whatwg"
+        || !detail["page"]["text"].as_str().is_some_and(|s| {
+            s.contains("Synthetic WHATWG storage fixture") && !s.contains("fixture_hidden_script")
+        })
+    {
+        return Err("Synthetic WHATWG text/provenance mismatch".into());
+    }
+    let source = research
+        .call(
+            "whatwg_get",
+            json!({"standard":"fixture","snapshot":snapshot,"representation":"source"}),
+        )
+        .await?;
+    if source["page"]["text"] != WHATWG_SOURCE {
+        return Err("Synthetic WHATWG original source mismatch".into());
+    }
+    let symbol=research.call("whatwg_symbol_get",json!({"standard":"fixture","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
+    if symbol["page"]["text"] != "FixtureToken" {
+        return Err("Synthetic WHATWG symbol mismatch".into());
+    }
+    for selected in [&detail, &source, &symbol] {
+        let resource = research
+            .read_resource(
+                selected["resource_uri"]
+                    .as_str()
+                    .ok_or("Missing WHATWG fixture resource")?,
+            )
+            .await?;
+        if resource["contents"][0]["text"] != selected["page"]["text"] {
+            return Err("Synthetic WHATWG resource mismatch".into());
+        }
+    }
+    let found = research
+        .call(
+            "whatwg_search",
+            json!({"snapshot":snapshot,"query":"token"}),
+        )
+        .await?;
+    if found["total"] != 1 {
+        return Err("Synthetic WHATWG selected search mismatch".into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = std::env::var("DATABASE_URL")?;
     let root = std::env::var("BLOB_DIR")?;
-    let store = PgBlobStore::connect(&database, &root).await?;
+    let store = std::sync::Arc::new(PgBlobStore::connect(&database, &root).await?);
     let request = FetchRequest {
         key: "fixture:storage-probe".into(),
         url: "https://fixtures.invalid/devres/storage-probe".into(),
@@ -293,8 +453,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let stored = match std::env::args().nth(1).as_deref() {
         Some("write") => {
-            seed_advisory(&store).await?;
-            seed_mdn(&store, std::path::Path::new(&root)).await?;
+            seed_advisory(&store)
+                .await
+                .map_err(|error| format!("Synthetic advisory fixture seeding failed: {error}"))?;
+            seed_mdn(&store, std::path::Path::new(&root))
+                .await
+                .map_err(|error| format!("Synthetic MDN fixture seeding failed: {error}"))?;
+            seed_whatwg(&store, std::path::Path::new(&root))
+                .await
+                .map_err(|error| format!("Synthetic WHATWG fixture seeding failed: {error}"))?;
             store
                 .publish(
                     &request,
@@ -321,6 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     check_advisory(&store).await?;
     check_mdn(&store, std::path::Path::new(&root)).await?;
+    check_whatwg(store.clone(), std::path::Path::new(&root)).await?;
     println!("{} {}", stored.capture.id, stored.capture.body_hash);
     Ok(())
 }

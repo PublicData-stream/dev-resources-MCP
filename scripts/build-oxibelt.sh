@@ -2,8 +2,11 @@
 # Build only an immutable Git archive, never a reference checkout's working tree.
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ ${DEVRES_TMP_STATE:-} != 1 ]]; then
+  exec "$repo/scripts/with-tmp-state.sh" "$0" "$@"
+fi
 revision=4f3154d8db0e0a49bce7a528c0a0f4c36d169040
-scratch=$(mktemp -d)
+scratch=$(mktemp -d "$TMPDIR/devres-oxibelt.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 source_checkout=${OXIBELT_SOURCE:-"$scratch/git"}
 if [[ -z ${OXIBELT_SOURCE:-} ]]; then
@@ -13,7 +16,7 @@ fi
 test "$(git -C "$source_checkout" rev-parse "$revision^{commit}")" = "$revision"
 mkdir "$scratch/source"
 git -C "$source_checkout" archive "$revision" | tar -x -C "$scratch/source"
-target_dir=$(realpath -m -- "${OXIBELT_TARGET_DIR:-$repo/target/oxibelt}")
+target_dir=$(realpath -m -- "${OXIBELT_TARGET_DIR:-$DEVRES_TMP_ROOT/oxibelt-target}")
 OXIBELT_BUILD_VERSION=0.0.0-dev.g4f3154d8 \
 OXIBELT_BUILD_REVISION="$revision" OXIBELT_BUILD_REF=unknown \
 OXIBELT_BUILD_DIRTY=clean OXIBELT_BUILD_KIND=git_development \

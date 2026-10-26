@@ -424,3 +424,60 @@ volume instead of initializing replacement storage. Restore only the recorded
 owned mount (with `loop,nodev,nosuid,noexec`) before resuming; image removal is not
 fixture cleanup. Storage accounting includes retained original copies, and the
 backing filesystem must also keep the stated free-space reserve.
+
+## WHATWG collection and isolated acceptance
+
+WHATWG collection starts automatically unless `[whatwg] enabled=false`. During
+bootstrap listeners can remain ready while local standards research is unavailable.
+Use `whatwg_corpus_status` to inspect acquisition/projection/index gaps separately.
+Stop all serving writers before private maintenance or coordinated backup/restore.
+`devres-server rebuild-whatwg-index CONFIG.toml` rebuilds local retained evidence;
+it does not establish fresh upstream validation.
+
+For this implementation and its acceptance, all generated state is below `/tmp`:
+
+```sh
+export DEVRES_TMP_ROOT=/tmp/devres-whatwg
+scripts/with-tmp-state.sh cargo test --workspace --locked
+scripts/with-local-docker.sh scripts/test-postgres.sh
+scripts/with-local-docker.sh scripts/test-oxibelt.sh
+scripts/with-local-docker.sh scripts/test-minikube.sh
+scripts/with-local-docker.sh scripts/accept-whatwg.sh --live full
+```
+
+The wrapper isolates Cargo/rustup/target, OxiBelt, Python, Docker client, minikube,
+kubeconfig and temporary/cache directories without changing HOME. Seed a required
+toolchain/cache by copying it into that owned state directory; do not hard-link mutable
+cache metadata. The Docker helper confines its separate daemon/containerd data,
+images, volumes, build caches and logs there too. Minikube creates a task-owned profile
+and confines kubectl discovery cache. Existing profiles/daemons are not reused.
+
+`accept-whatwg.sh --live current|full` creates a retained, ownership-marked directory
+under `/tmp`, synchronizes online evidence and saves a frozen observation before
+processing. `--resume full` requires `DEVRES_WHATWG_ACCEPTANCE_ROOT` pointing to that
+retained directory and continues its frozen work. It never replaces the frozen
+observation or deletes its captures/database. Keep retained evidence distinct from
+disposable fixtures; `/tmp` persistence depends on the host's cleanup policy.
+
+```sh
+DEVRES_WHATWG_ACCEPTANCE_ROOT=/tmp/RETAINED_WHATWG_DIRECTORY   scripts/with-local-docker.sh scripts/accept-whatwg.sh --resume full
+```
+
+Full acceptance exceeds the fixed-record smoke request budget and is a separate
+explicit operation using normal pacing, not a load test. Reports separate catalog/ref
+accounting, raw acquisition, historical processing, index coverage and public research.
+A successful full receipt also checks the captured catalog's complete current view,
+DOM text/raw retrieval, search, IDL symbol resources and history through the local
+research adapter; HTTP/WebTransport framing has separate fixture and edge checks.
+A job finishing does not prove missing upstream material exists or unsupported
+representations were projected. Local edge/minikube results do not establish hosted
+ARM64 CI or production acceptance. Commit authority does not authorize deployment.
+
+When `/tmp` itself is backed by a filesystem incompatible with overlay mounts, place
+a task-owned native filesystem mount below `/tmp` and set `DEVRES_DOCKER_STATE_ROOT`
+to it before invoking the Docker helper. This keeps images, volumes and node files
+under `/tmp` while supporting Docker/minikube overlay mounts. Preserve the backing
+image and mount metadata alongside retained acceptance evidence; stop owned containers
+and the dedicated daemon before unmounting it. A `vfs` override is available through
+`DEVRES_DOCKER_STORAGE_DRIVER=vfs` for Docker-only diagnostics, but is not evidence
+that nested Kubernetes container storage supports the underlying filesystem.

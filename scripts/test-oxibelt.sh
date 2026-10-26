@@ -51,7 +51,7 @@ docker run -d --name "$run_id-postgres" --label "devres.test-owner=$run_id" --ne
   -e POSTGRES_USER=devres -e POSTGRES_PASSWORD=fixture-only -e POSTGRES_DB=devres \
   postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a >/dev/null
 for attempt in {1..60}; do
-  if docker exec "$run_id-postgres" pg_isready -U devres >/dev/null 2>&1; then break; fi
+  if docker exec "$run_id-postgres" pg_isready -h 127.0.0.1 -U devres -d devres >/dev/null 2>&1; then break; fi
   if (( attempt == 60 )); then exit 1; fi
   sleep 1
 done
@@ -104,6 +104,7 @@ expect_failure probe devres-probe https://edge:8443/wrong /fixture/cert/ca.pem 2
 # Seed only task-owned public synthetic evidence while the serving fence is released.
 mdn_content=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest())')
 mdn_compat=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest())')
+whatwg_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest())')
 advisory_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest())')
 fixture_storage() { docker run --rm --network "$run_id" -v "$run_id-data:/data" \
   -e DATABASE_URL=postgres://devres:fixture-only@postgres/devres -e BLOB_DIR=/data/blobs \
@@ -117,9 +118,9 @@ probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/ce
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
 for revision in 2026-07-28 2025-11-25; do
   probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
-    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
   probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
-    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
     /fixture/cert/edge-client.pem /fixture/cert/edge-client-key.pem
 done
 docker stop --time 15 "$run_id-backend" >/dev/null

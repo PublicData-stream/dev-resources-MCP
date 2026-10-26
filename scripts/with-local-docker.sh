@@ -4,11 +4,30 @@
 set -euo pipefail
 test "$#" -gt 0 || { echo 'usage: scripts/with-local-docker.sh COMMAND [ARG ...]' >&2; exit 2; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-mkdir -p "$repo/target"
-state=$(mktemp -d "$repo/target/docker-local.XXXXXX")
-runtime_state=$(mktemp -d /tmp/devres-docker-runtime.XXXXXX)
+if [[ ${DEVRES_TMP_STATE:-} != 1 ]]; then
+  exec "$repo/scripts/with-tmp-state.sh" "$0" "$@"
+fi
+storage_root=$(python3 - "${DEVRES_DOCKER_STATE_ROOT:-$DEVRES_TMP_ROOT}" <<'PY'
+from pathlib import Path
+import os
+import sys
+root = Path(sys.argv[1]).resolve(strict=True)
+if Path('/tmp') not in root.parents or root.stat().st_uid != os.getuid():
+    raise SystemExit('isolated Docker state requires an owned directory below /tmp')
+print(root)
+PY
+)
+state=$(mktemp -d "$storage_root/docker-local.XXXXXX")
+runtime_state=$(mktemp -d "$storage_root/docker-runtime.XXXXXX")
+mkdir "$state/tmp"
 bridge="dvrs$$"
-printf '{}\n' > "$state/daemon.json"
+if [[ ${DEVRES_DOCKER_STORAGE_DRIVER:-} == vfs ]]; then
+  printf '{"features":{"containerd-snapshotter":false},"storage-driver":"vfs"}\n' > "$state/daemon.json"
+elif [[ -n ${DEVRES_DOCKER_STORAGE_DRIVER:-} ]]; then
+  echo 'Unsupported isolated Docker storage driver' >&2; exit 2
+else
+  printf '{}\n' > "$state/daemon.json"
+fi
 export DOCKER_HOST="unix://$state/docker.sock"
 export DEVRES_DOCKER_HOST="$DOCKER_HOST"
 unset DOCKER_CONTEXT
@@ -40,7 +59,9 @@ cleanup() {
   if (( bridge_created )); then sudo -n ip link delete "$bridge" 2>/dev/null || true; fi
   # The dedicated daemon exclusively created this directory. Do not touch any
   # configured daemon's data, containers, bridge, or cache.
-  sudo -n rm -rf -- "$state" "$runtime_state"
+  # Retain this dedicated daemon's caches and logs for inspection/reuse. Permanent
+  # acceptance captures live outside these disposable daemon directories.
+  printf 'Retained isolated Docker state: %s\n' "$state" >&2
   exit "$status"
 }
 trap cleanup EXIT
@@ -78,7 +99,7 @@ printf 'version = 3\n' > "$state/containerd.toml"
 # The invoking user owns logs; containerd state and snapshots are private to this run.
 # shellcheck disable=SC2024
 sudo -n sh -c 'echo "$$" > "$1"; shift; exec "$@"' sh "$state/containerd.pid" \
-  containerd --config "$state/containerd.toml" --root "$state/containerd" \
+  env TMPDIR="$state/tmp" XDG_RUNTIME_DIR="$runtime_state" containerd --config "$state/containerd.toml" --root "$state/containerd" \
   --state "$runtime_state/containerd" --address "$runtime_state/containerd.sock" \
   > "$state/containerd.log" 2>&1 &
 container_launcher=$!
@@ -89,7 +110,7 @@ for attempt in {1..20}; do
 done
 # The invoking user owns the state directory and intentionally owns this log.
 # shellcheck disable=SC2024
-sudo -n dockerd --config-file "$state/daemon.json" --data-root "$state/data" \
+sudo -n env TMPDIR="$state/tmp" XDG_RUNTIME_DIR="$runtime_state" dockerd --config-file "$state/daemon.json" --data-root "$state/data" \
   --exec-root "$state/exec" --host "$DOCKER_HOST" --pidfile "$state/daemon.pid" \
   --containerd "$runtime_state/containerd.sock" --containerd-namespace "devres-$$" \
   --containerd-plugins-namespace "devres-plugins-$$" \

@@ -101,6 +101,7 @@ async fn main() -> Result<(), ServerError> {
     let mut has_crate_corpus = false;
     let mut has_advisory_corpus = false;
     let mut has_mdn_corpus = false;
+    let mut has_whatwg_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -138,6 +139,22 @@ async fn main() -> Result<(), ServerError> {
                     "mdn_history",
                     "mdn_snapshots",
                     "mdn_corpus_status",
+                ]
+                .iter()
+                .all(|name| tools.iter().any(|tool| tool["name"] == *name))
+            });
+            has_whatwg_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
+                [
+                    "whatwg_catalog_search",
+                    "whatwg_search",
+                    "whatwg_get",
+                    "whatwg_symbol_search",
+                    "whatwg_symbol_get",
+                    "whatwg_references",
+                    "whatwg_history",
+                    "whatwg_snapshots",
+                    "whatwg_compare",
+                    "whatwg_corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
@@ -382,6 +399,111 @@ async fn main() -> Result<(), ServerError> {
                             .into(),
                     );
                 }
+            }
+        }
+    }
+    if has_whatwg_corpus {
+        let status = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            30,
+            "whatwg_corpus_status",
+            json!({}),
+        )
+        .await?;
+        if !status["collection_enabled"].is_boolean() {
+            return Err("WHATWG corpus status missing through WebTransport".into());
+        }
+    }
+    if let Ok(snapshot) = std::env::var("DEVRES_PROBE_WHATWG_SNAPSHOT") {
+        if !has_whatwg_corpus {
+            return Err("WHATWG discovery missing through WebTransport".into());
+        }
+        if snapshot.len() != 64
+            || !snapshot
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err("Invalid synthetic WHATWG snapshot".into());
+        }
+        let detail = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            31,
+            "whatwg_get",
+            json!({"standard":"fixture","snapshot":snapshot}),
+        )
+        .await?;
+        if detail["selection"]["snapshot"] != snapshot
+            || detail["selection"]["coverage"]["synthetic"] != true
+            || !detail["selection"]["source_url"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("https://fixtures.invalid/"))
+            || !detail["page"]["text"].as_str().is_some_and(|s| {
+                s.contains("Synthetic WHATWG storage fixture")
+                    && !s.contains("fixture_hidden_script")
+            })
+        {
+            return Err(
+                "Synthetic WHATWG document/provenance mismatch through WebTransport".into(),
+            );
+        }
+        let original = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            32,
+            "whatwg_get",
+            json!({"standard":"fixture","snapshot":snapshot,"representation":"source"}),
+        )
+        .await?;
+        if !original["page"]["text"].as_str().is_some_and(|s| {
+            s.starts_with("<h1 id=fixture>") && s.contains("fixture_hidden_script()")
+        }) {
+            return Err("Original WHATWG source changed through WebTransport".into());
+        }
+        let found = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            33,
+            "whatwg_search",
+            json!({"snapshot":snapshot,"query":"token"}),
+        )
+        .await?;
+        if found["total"] != 1 || found["results"][0]["standard"] != "fixture" {
+            return Err("WHATWG snapshot search mismatch through WebTransport".into());
+        }
+        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,34,"whatwg_symbol_get",json!({"standard":"fixture","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
+        if symbol["page"]["text"] != "FixtureToken" {
+            return Err("WHATWG symbol mismatch through WebTransport".into());
+        }
+        for (id, selected) in [(35, &detail), (36, &original), (37, &symbol)] {
+            let uri = selected["resource_uri"]
+                .as_str()
+                .ok_or("Missing immutable WHATWG resource")?;
+            if !uri.starts_with(&format!("devres://whatwg/fixture/{snapshot}/")) {
+                return Err("WHATWG resource lost snapshot binding".into());
+            }
+            let mut params = json!({"uri":uri});
+            if revision == "2026-07-28" {
+                params["_meta"] = metadata(revision);
+            }
+            let resource = exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":params}),
+            )
+            .await?;
+            if resource["result"]["contents"][0]["text"] != selected["page"]["text"] {
+                return Err("Immutable WHATWG resource changed through WebTransport".into());
             }
         }
     }

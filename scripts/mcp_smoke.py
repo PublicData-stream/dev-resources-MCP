@@ -14,6 +14,8 @@ LEGACY = "2025-11-25"
 MAX_RESPONSE = 8 * 1024 * 1024
 SYNTHETIC_MDN_CONTENT = hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest()
 SYNTHETIC_MDN_COMPAT = hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest()
+SYNTHETIC_WHATWG = hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest()
+SYNTHETIC_WHATWG_TEXT = "Synthetic WHATWG storage fixture"
 SYNTHETIC_MDN_TEXT = "Synthetic MDN storage fixture"
 SYNTHETIC_ADVISORY = "RUSTSEC-2024-0001"
 SYNTHETIC_SNAPSHOT = hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest()
@@ -123,6 +125,13 @@ def smoke(client, negative=True):
                 "advisory_snapshots", "advisory_corpus_status"} <= names, names
         assert {"mdn_search", "mdn_get", "mdn_compat_search", "mdn_compat_get",
                 "mdn_browser_get", "mdn_history", "mdn_snapshots", "mdn_corpus_status"} <= names, names
+        assert {"whatwg_catalog_search", "whatwg_search", "whatwg_get", "whatwg_symbol_search",
+                "whatwg_symbol_get", "whatwg_references", "whatwg_history", "whatwg_snapshots",
+                "whatwg_compare", "whatwg_corpus_status"} <= names, names
+        whatwg = client.tool("whatwg_corpus_status", {}, revision)
+        assert isinstance(whatwg.get("collection_enabled"), bool), "WHATWG collection status missing"
+        code, rejected = client.exchange("tools/call", {"name": "whatwg_get", "arguments": {"standard": "fixture", "url": "https://untrusted.invalid"}}, revision)
+        assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "WHATWG schema admitted an arbitrary destination"
         mdn = client.tool("mdn_corpus_status", {}, revision)
         assert isinstance(mdn.get("collection_enabled"), bool), "MDN collection status missing"
         mdn_schema = next(tool["inputSchema"] for tool in tools if tool["name"] == "mdn_get")
@@ -251,6 +260,36 @@ def synthetic_mdn(client):
                 assert content.get("_meta", {}).get("provenance", {}).get("coverage", {}).get("synthetic") is True, "resource lost MDN fixture provenance"
                 assert content.get("_meta", {}).get("license"), "resource dropped source attribution"
         assert AUDIT_PRIVACY_MARKER not in json.dumps(client.tool("mdn_corpus_status", {}, revision)), "MDN status reflected audit input"
+
+
+def synthetic_whatwg(client):
+    """Exercise local synthetic WHATWG snapshots across both negotiated revisions."""
+    for revision in (MODERN, LEGACY):
+        selection = {"standard": "fixture", "snapshot": SYNTHETIC_WHATWG}
+        detail = client.tool("whatwg_get", selection, revision)
+        provenance = detail.get("selection", {})
+        assert provenance.get("snapshot") == SYNTHETIC_WHATWG, "WHATWG snapshot changed"
+        assert provenance.get("coverage", {}).get("synthetic") is True, "WHATWG fixture lost synthetic provenance"
+        assert provenance.get("source_url", "").startswith("https://fixtures.invalid/"), "WHATWG fixture invented upstream provenance"
+        text = detail.get("page", {}).get("text", "")
+        assert SYNTHETIC_WHATWG_TEXT in text and "fixture_hidden_script" not in text, "WHATWG inert text changed"
+        original = client.tool("whatwg_get", {**selection, "representation": "source"}, revision)
+        assert original.get("page", {}).get("text", "").startswith("<h1 id=fixture>"), "WHATWG original source changed"
+        assert "fixture_hidden_script()" in original["page"]["text"], "WHATWG raw source was modified"
+        found = client.tool("whatwg_search", {"snapshot": SYNTHETIC_WHATWG, "query": "token"}, revision)
+        assert found.get("total") == 1 and found["results"][0].get("standard") == "fixture", "WHATWG selected search changed"
+        symbol = client.tool("whatwg_symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
+        assert symbol.get("page", {}).get("text") == "FixtureToken", "WHATWG symbol changed"
+        for selected in (detail, original, symbol):
+            uri = selected.get("resource_uri", "")
+            assert uri.startswith("devres://whatwg/fixture/" + SYNTHETIC_WHATWG + "/"), "WHATWG resource lost snapshot binding"
+            for method, params in (("resources/read", {"uri": uri}),
+                                   ("tools/call", {"name": "fetch", "arguments": {"id": uri}})):
+                value = client.call(method, params, revision)
+                if method == "tools/call":
+                    assert not value.get("isError"), "WHATWG immutable fetch failed"
+                    value = value.get("structuredContent", value)
+                assert value.get("contents", [{}])[0].get("text") == selected["page"]["text"], "WHATWG immutable resource changed"
 
 
 def wait_ready(client, seconds):
@@ -388,6 +427,7 @@ def main():
         assert "Synthetic dev-resources persistence acceptance fixture" in json.dumps(value)
         synthetic_advisory(client)
         synthetic_mdn(client)
+        synthetic_whatwg(client)
     if options.live:
         live(client, options.rfc_text_only)
     print("HTTP MCP acceptance passed" + ("; bounded live smoke passed (RFC text only)" if options.live and options.rfc_text_only else "; bounded live smoke passed" if options.live else "; no provider calls"))

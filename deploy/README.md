@@ -48,8 +48,8 @@ It refuses to reuse a profile and deletes only its own profile/images/fixtures.
 Both gates use disposable certificates and fixed test-only database credentials.
 
 If configured Docker overlay storage is on an incompatible shared filesystem,
-the optional helper starts a separate rootful daemon under ignored `target/`,
-uses a unique bridge and refuses route collisions, then removes its own state:
+the optional helper starts a separate rootful daemon under an owned `/tmp` directory,
+uses a unique bridge and refuses route collisions, then stops its owned processes:
 
 ```sh
 scripts/with-local-docker.sh scripts/test-postgres.sh
@@ -61,8 +61,10 @@ This helper requires passwordless sudo for its task-owned daemon and cleanup.
 Its daemon cannot manage host firewall rules; forwarding/NAT use uniquely named,
 temporary chains restricted to the checked test ranges. Existing IPv4 forwarding
 must already be enabled. Cleanup removes only those chains and hooks.
-It leaves configured daemon configuration and caches unchanged. Its `target/` directory
-must reside on a native filesystem supporting Docker overlay mounts.
+It leaves configured daemon configuration and caches unchanged, retaining its isolated
+state for inspection. `DEVRES_DOCKER_STATE_ROOT` may select an owned native filesystem
+mounted below `/tmp` when the host `/tmp` filesystem does not support overlay mounts.
+All daemon/containerd data, images, volumes and build caches remain below `/tmp`.
 
 Production operators must supply public hostnames, trusted certificates, private
 backend identity/CA material, private credentials, storage capacity/backup policy,

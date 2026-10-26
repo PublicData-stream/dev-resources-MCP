@@ -247,3 +247,68 @@ class SyntheticMdnTests(unittest.TestCase):
     def test_changed_compatibility_evidence_fails_acceptance(self):
         with self.assertRaisesRegex(AssertionError, "statement changed"):
             smoke.synthetic_mdn(SyntheticMdnClient(wrong_support=True))
+
+
+class SyntheticWhatwgClient:
+    def __init__(self, upstream=False, script_leak=False, wrong_symbol=False, changed_resource=False):
+        self.calls = []
+        self.upstream = upstream
+        self.script_leak = script_leak
+        self.wrong_symbol = wrong_symbol
+        self.changed_resource = changed_resource
+        self.resources = {}
+
+    def tool(self, name, arguments, revision=smoke.MODERN):
+        self.calls.append((name, revision))
+        if arguments.get("snapshot") != smoke.SYNTHETIC_WHATWG:
+            raise AssertionError("WHATWG fixture request must pin its snapshot")
+        if name == "whatwg_search":
+            return {"total": 1, "results": [{"standard": "fixture"}]}
+        if name == "whatwg_symbol_get":
+            representation = "symbol"
+            text = "WrongToken" if self.wrong_symbol else "FixtureToken"
+        elif name == "whatwg_get":
+            representation = arguments.get("representation", "text")
+            text = ("<h1 id=fixture>Synthetic WHATWG storage fixture</h1><script>fixture_hidden_script()</script>"
+                    if representation == "source" else smoke.SYNTHETIC_WHATWG_TEXT)
+            if self.script_leak and representation == "text":
+                text += "fixture_hidden_script()"
+        else:
+            raise AssertionError("unexpected WHATWG fixture operation")
+        uri = f"devres://whatwg/fixture/{smoke.SYNTHETIC_WHATWG}/{representation}/aW5kZXguaHRtbA"
+        self.resources[uri] = {"text": "changed" if self.changed_resource else text}
+        return {"selection": {"snapshot": smoke.SYNTHETIC_WHATWG,
+                "source_url": "https://dom.spec.whatwg.org/" if self.upstream else "https://fixtures.invalid/whatwg",
+                "coverage": {"synthetic": True}}, "page": {"text": text}, "resource_uri": uri}
+
+    def call(self, method, params, revision=smoke.MODERN):
+        self.calls.append((method, revision))
+        if method == "resources/read":
+            return {"contents": [self.resources[params["uri"]]]}
+        if method == "tools/call" and params["name"] == "fetch":
+            return {"structuredContent": {"contents": [self.resources[params["arguments"]["id"]]]}}
+        raise AssertionError("unexpected WHATWG fixture RPC")
+
+
+class SyntheticWhatwgTests(unittest.TestCase):
+    def test_fixture_covers_both_revisions_and_all_immutable_representations(self):
+        client = SyntheticWhatwgClient()
+        smoke.synthetic_whatwg(client)
+        self.assertEqual({revision for name, revision in client.calls if name == "whatwg_get"},
+                         {smoke.MODERN, smoke.LEGACY})
+        self.assertEqual(sum(name == "resources/read" for name, _ in client.calls), 6)
+        self.assertEqual(sum(name == "tools/call" for name, _ in client.calls), 6)
+
+    def test_fixture_cannot_claim_official_upstream_provenance(self):
+        with self.assertRaisesRegex(AssertionError, "invented upstream"):
+            smoke.synthetic_whatwg(SyntheticWhatwgClient(upstream=True))
+
+    def test_script_text_leak_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "inert text"):
+            smoke.synthetic_whatwg(SyntheticWhatwgClient(script_leak=True))
+
+    def test_changed_symbol_or_immutable_resource_fails(self):
+        with self.assertRaisesRegex(AssertionError, "symbol changed"):
+            smoke.synthetic_whatwg(SyntheticWhatwgClient(wrong_symbol=True))
+        with self.assertRaisesRegex(AssertionError, "immutable resource changed"):
+            smoke.synthetic_whatwg(SyntheticWhatwgClient(changed_resource=True))
