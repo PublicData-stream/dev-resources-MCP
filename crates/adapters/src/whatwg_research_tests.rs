@@ -636,14 +636,18 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     let source = format!(
         "<h1 id=start>Bounded fixture</h1><h2 id=\"{anchor}\">Large section</h2><p>fixture text</p><dfn id=\"{symbol_anchor}\">{name}</dfn>"
     );
-    let document = crate::whatwg_processing::process_document(
+    let mut document = crate::whatwg_processing::process_document(
         "index.html",
         source.as_bytes(),
         CancellationToken::new(),
     )
     .unwrap();
     assert_eq!(document.sections[1].anchor, anchor);
-    assert_eq!(document.symbols[0].name, name);
+    assert!(document.symbols[0].name.len() <= 4096);
+    assert_eq!(document.symbols[0].text, name);
+    // Retained processor-2 labels used a character bound. Their longer names
+    // must remain readable even after new projections use the byte bound.
+    document.symbols[0].name = name.clone();
     let projection = json!(document);
     let projection_id = digest(&projection).unwrap();
     store
@@ -661,6 +665,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
         .await
         .unwrap();
     snapshot.id = digest(&"maximum Unicode URI fixture").unwrap();
+    snapshot.processor_version = 2;
     snapshot.inventory =
         crate::whatwg_inventory::update(store.as_ref(), &empty, &path, Some(member))
             .await
@@ -747,6 +752,10 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
         assert_eq!(
             read["contents"][0]["_meta"]["provenance"]["snapshot"],
             snapshot.id
+        );
+        assert_eq!(
+            read["contents"][0]["_meta"]["provenance"]["processor_version"],
+            2
         );
         assert_eq!(read["contents"][0]["_meta"]["source_path"], path);
     }

@@ -293,3 +293,6 @@ Schema 6 is forward-only. Coordinated backups include WHATWG raw artifacts, Git
 evidence, projections, immutable inventories and search indexes. Serving storage
 continues to use the configured persistent directory; test/build state follows the
 isolated `/tmp` workflow in [Operations](operations.md).
+Corpus status labels gap totals as covering all retained snapshot generations;
+processor upgrades preserve earlier gaps. A full acceptance receipt verifies its
+named processor against the frozen source inventory separately.

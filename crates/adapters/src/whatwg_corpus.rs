@@ -1934,7 +1934,7 @@ impl WhatwgCorpus {
         let projections = statistics["projection_gaps"].as_u64().unwrap_or(0);
         let publications = statistics["publications"].as_u64().unwrap_or(0);
         let view = self.view(None).await.ok();
-        self.store.whatwg_set_state("status",&json!({"collection_enabled":self.config.enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_standards":catalog.as_ref().map_or(0,|c|c.standards.len()),"snapshots":snapshots,"publications":publications,"projection_gaps":projections,"index_gaps":statistics["index_gaps"],"published_standards":view.as_ref().map_or(0,|v|v.snapshots.len()),"view":view.as_ref().map(|v|&v.id),"validated_at":view.as_ref().map(|v|v.validated_at),"stale":view.as_ref().is_none_or(|v|devres_domain::unix_now().saturating_sub(v.validated_at)>86400),"failure":self.store.whatwg_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes(),"historical_rendering":"source_snapshots_do_not_imply_rendered_publication_coverage"})).await
+        self.store.whatwg_set_state("status",&json!({"processor_version":PROCESSOR_VERSION,"gap_scope":"all_retained_snapshot_generations","collection_enabled":self.config.enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_standards":catalog.as_ref().map_or(0,|c|c.standards.len()),"snapshots":snapshots,"publications":publications,"projection_gaps":projections,"index_gaps":statistics["index_gaps"],"published_standards":view.as_ref().map_or(0,|v|v.snapshots.len()),"view":view.as_ref().map(|v|&v.id),"validated_at":view.as_ref().map(|v|v.validated_at),"stale":view.as_ref().is_none_or(|v|devres_domain::unix_now().saturating_sub(v.validated_at)>86400),"failure":self.store.whatwg_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes(),"historical_rendering":"source_snapshots_do_not_imply_rendered_publication_coverage"})).await
     }
     pub async fn status(&self) -> Result<Value> {
         self.store.whatwg_state("status").await?.ok_or_else(failure)
@@ -3025,12 +3025,23 @@ mod tests {
             .whatwg_set_state(&legacy_history, &json!(legacy_offset))
             .await
             .expect("legacy completed v1 checkpoint");
+        let prior_history = state_key("frozen-history", &format!("{}:dom:2", frozen.id));
+        store
+            .whatwg_set_state(&prior_history, &json!(legacy_offset))
+            .await
+            .expect("completed prior processor checkpoint");
         let legacy_acceptance_key = format!("{}:full", frozen.id);
         let legacy_acceptance = json!({"complete":true,"processor_version":1});
         store
             .whatwg_put("acceptance", &legacy_acceptance_key, &legacy_acceptance)
             .await
             .expect("immutable v1 acceptance evidence");
+        let prior_acceptance_key = format!("{}:full:2", frozen.id);
+        let prior_acceptance = json!({"complete":true,"processor_version":2});
+        store
+            .whatwg_put("acceptance", &prior_acceptance_key, &prior_acceptance)
+            .await
+            .expect("immutable prior processor acceptance evidence");
         assert!(
             corpus
                 .snapshot_for_revision("dom", &standard.repository, &side, "source")
@@ -3050,13 +3061,29 @@ mod tests {
             .expect("offline acceptance");
         assert_eq!(outcome["complete"], true);
         assert_eq!(outcome["git_commits_processed"], 3);
-        assert_eq!(outcome["processor_version"], 2);
+        assert_eq!(outcome["processor_version"], PROCESSOR_VERSION);
         assert_eq!(
             store
                 .whatwg_state(&legacy_history)
                 .await
                 .expect("legacy checkpoint"),
             Some(json!(legacy_offset))
+        );
+        assert_eq!(
+            store
+                .whatwg_state(&prior_history)
+                .await
+                .expect("prior checkpoint"),
+            Some(json!(legacy_offset))
+        );
+        assert_eq!(
+            store
+                .whatwg_get("acceptance", &prior_acceptance_key)
+                .await
+                .expect("prior acceptance")
+                .expect("retained prior processor")
+                .data,
+            prior_acceptance
         );
         assert_eq!(
             store
@@ -3072,9 +3099,9 @@ mod tests {
                 .snapshot_for_revision("dom", &standard.repository, &side, "source")
                 .await
                 .expect("side processed")
-                .expect("v2 side")
+                .expect("current processor side")
                 .processor_version,
-            2
+            PROCESSOR_VERSION
         );
         assert_eq!(
             broker.attempt_count(),

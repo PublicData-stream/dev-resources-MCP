@@ -150,7 +150,13 @@ impl State {
                         });
                     }
                 } else {
-                    let name = text.chars().take(4096).collect();
+                    // Labels share the search title's UTF-8 byte bound. The
+                    // complete algorithm/definition remains in `text`.
+                    let mut end = text.len().min(4096);
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let name = text[..end].to_owned();
                     self.symbol_contexts.push(
                         self.section
                             .as_ref()
@@ -828,6 +834,45 @@ pub(super) fn project_bikeshed(source: &str, budget: &Budget) -> Result<Processe
 #[cfg(test)]
 mod tests {
     use tokio_util::sync::CancellationToken;
+    #[test]
+    fn unicode_symbol_labels_obey_index_byte_bound_without_losing_text() {
+        use crate::whatwg_index::{IndexDocument, WhatwgIndex};
+        for text in [
+            format!("{}\u{2019} suffix", "a".repeat(4095)),
+            format!("{}\u{2019} suffix", "a".repeat(4093)),
+            format!("{} remaining normative text", "\u{754c}".repeat(2000)),
+        ] {
+            let source =
+                format!("<h1 id=standard>Standard</h1><div algorithm id=steps>{text}</div>");
+            let doc = super::super::process_document(
+                "index.bs",
+                source.as_bytes(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            let symbol = &doc.symbols[0];
+            assert!(symbol.name.len() <= 4096);
+            assert!(text.starts_with(&symbol.name));
+            assert_eq!(symbol.text, text);
+            assert!(doc.text.contains(&text));
+            let next = text[symbol.name.len()..].chars().next();
+            assert!(next.is_some_and(|next| symbol.name.len() + next.len_utf8() > 4096));
+            WhatwgIndex::validate_document(
+                &IndexDocument {
+                    id: "a".repeat(64),
+                    standard: "bluetooth".into(),
+                    edition: "source".into(),
+                    path: "index.bs".into(),
+                    title: symbol.name.clone(),
+                    text: symbol.text.clone(),
+                    kind: "symbol".into(),
+                    metadata: serde_json::json!({"anchor":symbol.anchor,"symbol_kind":symbol.kind,"name":symbol.name,"scope":symbol.scope}),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        }
+    }
     #[test]
     fn multiple_idl_declarations_and_bikeshed_headings() {
         let doc=super::super::process_document("api.bs",b"## APIs {#apis}\n<pre class=idl>\ninterface First {};\n// interface Fake {};\ninterface Second {};\ntypedef DOMString Name;\n</pre>\n",CancellationToken::new()).unwrap();
