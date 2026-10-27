@@ -14,6 +14,10 @@ start automatically by default; explicit coverage describes missing, unsupported
 stale, or unprocessed evidence. Completion of a full public corpus is a separate
 operational acceptance claim.
 
+[Customer skills and client packages](docs/customer-plugin.md) provide shared
+research and lockfile-assessment workflows for ChatGPT, Codex, Claude Code, and
+Claude Connectors, with deployment-specific MCP connection packages.
+
 ## Development
 
 Install Rust 1.99.1, Docker, Python 3, OpenSSL, and Git; the cluster gate also
