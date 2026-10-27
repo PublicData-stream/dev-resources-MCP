@@ -26,13 +26,29 @@ def worker_input(valid=True):
             "page": {"offset": 0, "limit": 20}}
 
 
+def npm_worker_input(valid=True):
+    lockfile = json.dumps({"name": SENTINEL, "lockfileVersion": 3,
+                          "packages": {"node_modules/example": {"version": "1.0.0"}}})
+    record = {"schema_version": "1.9.2", "id": "GHSA-image-fixture", "modified": "2026-01-01T00:00:00Z",
+              "affected": [{"package": {"ecosystem": "npm", "name": "example"},
+                            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "2.0.0"}]}]}]}
+    return {"operation": "npm", "phase": "audit",
+            "input": {"lockfile": lockfile if valid else SENTINEL, "lockfile_format": "npm",
+                      "registry_context": {"default": "npmjs"}},
+            "snapshot": {"snapshot": {"id": "a" * 64, "validated_at": int(time.time()),
+                                      "complete": True, "historical": False},
+                         "complete": True, "records": [record]}}
+
+
 def check_worker(mode, stdout, stderr):
     if stderr or SENTINEL.encode() in stdout:
         raise ValueError("Worker reflected private fixture data or wrote stderr")
     report = json.loads(stdout)
-    if mode == "valid":
+    if mode in ("valid", "npm-valid"):
         if set(report) != {"Ok"} or report["Ok"].get("assessed_count") != 1 or report["Ok"].get("vulnerability_count") != 1:
             raise ValueError("Worker did not assess the synthetic advisory")
+        if mode == "npm-valid" and (report["Ok"].get("input_retention") != "request_lifetime_only" or report["Ok"].get("complete") is not True):
+            raise ValueError("npm worker lost request-only assessment qualification")
     elif set(report) != {"Err"} or report["Err"].get("code") != "invalid_input":
         raise ValueError("Worker did not return a sanitized invalid-input result")
 
@@ -101,7 +117,7 @@ def export_metadata(directory, archive_raw, images, platform, target):
 def main(arguments):
     command, *args = arguments
     if command == "input":
-        print(json.dumps(worker_input(args[0] == "valid")))
+        print(json.dumps(npm_worker_input(args[0] == "npm-valid") if args[0].startswith("npm-") else worker_input(args[0] == "valid")))
     elif command == "worker":
         check_worker(args[0], Path(args[1]).read_bytes(), Path(args[2]).read_bytes())
     elif command == "startup":

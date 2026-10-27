@@ -98,7 +98,7 @@ if [[ $target == runtime || $target == probe ]]; then
   python3 scripts/image-fixture.py startup probe "$scratch/stdout" "$scratch/stderr"
 fi
 if [[ $target != probe ]]; then
-  for mode in valid invalid; do
+  for mode in valid invalid npm-valid npm-invalid; do
     python3 scripts/image-fixture.py input "$mode" > "$scratch/input.json"
     run_binary devres-audit-worker < "$scratch/input.json"
     python3 scripts/image-fixture.py worker "$mode" "$scratch/stdout" "$scratch/stderr"

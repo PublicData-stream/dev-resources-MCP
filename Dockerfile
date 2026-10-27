@@ -6,15 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN cp -a /usr/local/cargo /tmp/cargo && cp -a /usr/local/rustup /tmp/rustup
-ENV CARGO_HOME=/tmp/cargo RUSTUP_HOME=/tmp/rustup CARGO_TARGET_DIR=/tmp/rust/target \
+ENV CARGO_HOME=/tmp/cargo RUSTUP_HOME=/tmp/rustup CARGO_TARGET_DIR=/buildcache/rust/target \
     TMPDIR=/tmp XDG_CACHE_HOME=/tmp/cache PYTHONPYCACHEPREFIX=/tmp/python-cache
 COPY . .
 RUN --mount=type=cache,id=devres-registry,target=/tmp/cargo/registry,sharing=locked \
-    --mount=type=cache,id=devres-target-${TARGETARCH}-${TARGETVARIANT},target=/tmp/rust/target,sharing=locked \
+    --mount=type=cache,id=devres-target-${TARGETARCH}-${TARGETVARIANT},target=/buildcache/rust/target,sharing=locked \
     cargo build --workspace --bins --release --locked --jobs 2 \
     && mkdir -p /tmp/build-output \
-    && cp /tmp/rust/target/release/devres-server /tmp/rust/target/release/devres-probe \
-          /tmp/rust/target/release/devres-audit-worker /tmp/rust/target/release/devres-pdf-worker /tmp/build-output/ \
+    && cp /buildcache/rust/target/release/devres-server /buildcache/rust/target/release/devres-probe \
+          /buildcache/rust/target/release/devres-audit-worker /buildcache/rust/target/release/devres-pdf-worker /tmp/build-output/ \
     && python3 scripts/collect-notices.py /notices
 
 FROM ubuntu:26.04@sha256:513c074113a871b51a8d16ab445c88779d6452d937a164fb5cc479f32668a41d AS runtime-base

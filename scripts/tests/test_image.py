@@ -143,7 +143,11 @@ elif args and args[0]=='run':
     if binary.endswith('devres-server'):
         print('Error: No such file or directory',file=sys.stderr);sys.exit(1)
     request=json.load(sys.stdin)
-    if 'SYNTHETIC_PRIVATE_INPUT_SENTINEL' in request['lockfile']:print('{"Err":{"code":"invalid_input"}}')
+    payload=request.get('input',request)
+    if request.get('operation')=='npm':
+        if payload['lockfile']=='SYNTHETIC_PRIVATE_INPUT_SENTINEL':print('{"Err":{"code":"invalid_input"}}')
+        else:print('{"Ok":{"assessed_count":1,"vulnerability_count":1,"complete":true,"input_retention":"request_lifetime_only"}}')
+    elif 'SYNTHETIC_PRIVATE_INPUT_SENTINEL' in payload['lockfile']:print('{"Err":{"code":"invalid_input"}}')
     else:print('{"Ok":{"assessed_count":1,"vulnerability_count":1}}')
 else:sys.exit(1)
 '''
@@ -186,7 +190,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         runs = [call for call in calls if call[0] == "run"]
-        self.assertEqual(len(runs), 4)
+        self.assertEqual(len(runs), 6)
         self.assertFalse(any(call[:2] == ["image", "rm"] or call[0] == "build" for call in calls))
         for call in runs:
             self.assertEqual(call[call.index("--platform") + 1], "linux/arm64")

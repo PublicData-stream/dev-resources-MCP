@@ -7,6 +7,15 @@ if [[ ${1:-} != --live ]]; then
   exit 2
 fi
 shift
+if [[ ${1:-} == --npm ]]; then
+  shift
+  test "$#" = 0 || { echo 'usage: scripts/live-smoke.sh --live --npm' >&2; exit 2; }
+  root=$(mktemp -d /tmp/devres-npm-live.XXXXXX)
+  printf 'devres-npm-live-v1\n' > "$root/owner-v1"
+  chmod 600 "$root/owner-v1"
+  printf 'Retained npm bounded evidence: %s\n' "$root" >&2
+  exec cargo run --locked -p devres-adapters --example npm-live-probe -- --live "$root"
+fi
 if [[ ${1:-} == --chromium ]]; then
   shift
   test "$#" = 0 || { echo 'usage: scripts/live-smoke.sh --live --chromium' >&2; exit 2; }
