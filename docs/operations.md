@@ -517,3 +517,68 @@ image and mount metadata alongside retained acceptance evidence; stop owned cont
 and the dedicated daemon before unmounting it. A `vfs` override is available through
 `DEVRES_DOCKER_STORAGE_DRIVER=vfs` for Docker-only diagnostics, but is not evidence
 that nested Kubernetes container storage supports the underlying filesystem.
+
+## W3C validation and retained acceptance
+
+W3C collection defaults to enabled with current published reports ahead of historical
+work. Set `[w3c] enabled=false` to pause new acquisition while retaining local
+research. Health/metrics remain private; `w3c_corpus_status` reports source coverage,
+license blocks, freshness and processing/index gaps separately.
+
+For this environment, build targets use `/buildcache/rust/target` and all disposable
+state uses `/tmp`. The existing temporary-state wrapper remains unchanged; apply
+shared-cache/build overrides after entering it:
+
+```sh
+shared_cargo_cache=${CARGO_HOME:-"$HOME/.cargo"}
+shared_rustup_cache=${RUSTUP_HOME:-"$HOME/.rustup"}
+export DEVRES_TMP_ROOT=/tmp/devres-w3c
+scripts/with-tmp-state.sh env \
+  CARGO_HOME="$shared_cargo_cache" RUSTUP_HOME="$shared_rustup_cache" \
+  CARGO_TARGET_DIR=/buildcache/rust/target OXIBELT_TARGET_DIR=/buildcache/rust/target \
+  CARGO_BUILD_JOBS=2 scripts/with-local-docker.sh scripts/test-minikube.sh
+```
+
+Launch the disposable daemon with `umask 022`; keep its task-owned parent directory
+private. A daemon inheriting `umask 077` can create non-traversable container roots
+and unreadable PID files. Use the native-filesystem workaround above when `/tmp`
+cannot support nested container storage.
+
+Use the same wrapper for PostgreSQL and OxiBelt checks. Its dedicated Docker daemon
+keeps test images, volumes and caches below `/tmp`; minikube uses a fresh owned
+profile and bundled kubectl, never an operator's configured cluster. Seeded W3C
+fixtures exercise HTTP/WebTransport reads and coordinated restart/restore without
+provider traffic. The tracked backend example disables every collector.
+
+`scripts/live-smoke.sh --live --w3c` is a distinct fixed-record source/parser check.
+It requests CSS Color 4 and retired Canvas 2D metadata, the current dated CSS Color
+publication and an official source-repository advertisement. Attempts, including
+retries, have persisted caps of 20 per provider (W3C and GitHub), with exclusive
+root locking. It retains qualified raw publication evidence and a
+receipt in a new owned `/tmp` directory. A retained licensed body can be replayed
+without another publication request; its receipt distinguishes local file time
+from unknown upstream validation time and does not claim metadata revalidation.
+It does not run a full Git clone, whole
+corpus collection, transport certification or production deployment.
+
+`scripts/accept-w3c.sh --live current|full` explicitly starts retained corpus
+acceptance, with ownership-marked PostgreSQL/blobs and frozen inventories under
+`/tmp`. Run it inside the same isolated Docker/build wrapper. Full work can be
+resumed using `DEVRES_W3C_ACCEPTANCE_ROOT` and `--resume full`. Resume processes the
+same frozen evidence without new source traffic. `--recover full` creates linked
+successor discovery evidence; `--resume-recovery full` continues that successor.
+Original inventories, failures and source validation times remain retained.
+Recovery may fetch newly qualified publications through normal pacing while
+preserving original catalog/ref observations. Both resume modes reject source I/O.
+
+These corpus commands may require substantial time/storage and are separate from
+the bounded smoke. Receipts must distinguish discovery, license qualification,
+acquisition, ancestry, projection and index coverage. A blocked license, missing
+mapping, unavailable edition or unsupported representation does not become a
+successful complete result merely because its metadata was accounted for.
+
+Schema 7 requires a coordinated backup of PostgreSQL, W3C raw artifacts, qualified
+Git evidence, inventories and indexes. Older binaries reject this schema. Restore
+compatible binaries and the coordinated snapshot together; do not attempt a reverse
+migration or discard permanent evidence. Index rebuild is private maintenance via
+`devres-server rebuild-w3c-index CONFIG.toml` and does not renew source validation.
