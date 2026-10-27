@@ -1,0 +1,238 @@
+//! Real PostgreSQL tests; only task-created databases and /tmp blobs are mutated.
+use devres_adapters::PgBlobStore;
+use devres_application::{
+    Store,
+    chromium::{ChromiumStore, Write},
+    w3c::W3cStore,
+};
+use devres_domain::{FetchRequest, FetchResponse, Validators};
+use serde_json::json;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL URL");
+    let admin = sqlx::PgPool::connect(&base).await.expect("fixture admin");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let database = format!("devres_chromium_fixture_{}_{suffix}", std::process::id());
+    assert!(
+        database
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
+        .execute(&admin)
+        .await
+        .expect("owned fixture database");
+    let mut url = url::Url::parse(&base).expect("fixture URL");
+    url.set_path(&format!("/{database}"));
+    let root = tempfile::tempdir_in("/tmp").expect("owned blobs");
+    let inspection = sqlx::PgPool::connect(url.as_str())
+        .await
+        .expect("inspection");
+    let store = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .expect("schema eight");
+    let old = json!({"synthetic":true,"body":"Prior W3C evidence remains immutable"});
+    store
+        .w3c_put("fixtures", "before-chromium", &old)
+        .await
+        .unwrap();
+    let request = FetchRequest {
+        key: "fixture:before-chromium".into(),
+        url: "https://fixtures.invalid/before-chromium".into(),
+        ttl_secs: 3600,
+        max_bytes: 4096,
+        media_type: "text/plain".into(),
+    };
+    let capture = store
+        .publish(
+            &request,
+            FetchResponse {
+                status: 200,
+                body: b"Synthetic retained public evidence".to_vec(),
+                validators: Validators::default(),
+            },
+            1234,
+        )
+        .await
+        .unwrap()
+        .capture;
+    drop(store);
+    wait_owner_release(&inspection).await;
+    let count:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM devres_chromium_evidence)+(SELECT count(*) FROM devres_chromium_state)+(SELECT count(*) FROM devres_chromium_statistics)").fetch_one(&inspection).await.unwrap();
+    assert_eq!(count, 0, "new tables are empty before isolated downgrade");
+    sqlx::raw_sql("DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
+        .execute(&inspection).await.expect("prepare owned schema-seven fixture");
+    let store = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .expect("actual seven to eight upgrade");
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
+            .fetch_one(&inspection)
+            .await
+            .unwrap(),
+        8
+    );
+    assert_eq!(
+        store
+            .w3c_get("fixtures", "before-chromium")
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        old
+    );
+    let retained = store.capture(&capture.id).await.unwrap();
+    assert_eq!(retained.body, b"Synthetic retained public evidence");
+    assert_eq!(retained.capture.validated_at, 1234);
+    assert!(
+        PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .is_err(),
+        "second writer must not acquire ownership"
+    );
+
+    let original = json!({"synthetic":true,"source":"src","revision":"a".repeat(40),"notice":"First-party fixture"});
+    let sequence = store
+        .chromium_put("fixtures", "same", &original)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .chromium_put("fixtures", "same", &original)
+            .await
+            .unwrap(),
+        sequence
+    );
+    assert!(
+        store
+            .chromium_put("fixtures", "same", &json!({"changed":true}))
+            .await
+            .is_err()
+    );
+    let cutoff = store.chromium_cutoff().await.unwrap();
+    store
+        .chromium_put("fixtures", "later", &json!({"later":true}))
+        .await
+        .unwrap();
+    let frozen = store
+        .chromium_rows("fixtures", 0, 100, Some(cutoff))
+        .await
+        .unwrap();
+    assert_eq!(frozen.len(), 1);
+    assert_eq!(frozen[0].key, "same");
+
+    let batch = [
+        Write {
+            kind: "fixtures".into(),
+            key: "atomic-new".into(),
+            data: json!({"new":true}),
+        },
+        Write {
+            kind: "fixtures".into(),
+            key: "same".into(),
+            data: json!({"conflict":true}),
+        },
+    ];
+    assert!(store.chromium_put_many(&batch).await.is_err());
+    assert!(
+        store
+            .chromium_get("fixtures", "atomic-new")
+            .await
+            .unwrap()
+            .is_none(),
+        "colliding batch rolls back"
+    );
+    let state = json!({"frozen_roots":["a".repeat(40)],"pending_parents":["b".repeat(40)],"synthetic":true});
+    store
+        .chromium_set_state("checkpoint", &state)
+        .await
+        .unwrap();
+    assert!(store.chromium_get("../unsafe", "key").await.is_err());
+    assert!(
+        store
+            .chromium_rows("fixtures", 0, 1001, None)
+            .await
+            .is_err()
+    );
+
+    let owner:i32=sqlx::query_scalar("SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&inspection).await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+            .bind(owner)
+            .fetch_one(&inspection)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .chromium_set_state("after-loss", &json!(true))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .chromium_put("fixtures", "after-loss", &json!(true))
+            .await
+            .is_err()
+    );
+    drop(store);
+    wait_owner_release(&inspection).await;
+    let restarted = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .expect("restart");
+    assert_eq!(
+        restarted
+            .chromium_get("fixtures", "same")
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        original
+    );
+    assert_eq!(
+        restarted.chromium_state("checkpoint").await.unwrap(),
+        Some(state)
+    );
+    assert!(
+        restarted
+            .chromium_get("fixtures", "atomic-new")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        restarted
+            .w3c_get("fixtures", "before-chromium")
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        old
+    );
+    drop(restarted);
+    inspection.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database} WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await
+    .expect("remove owned database");
+    admin.close().await;
+}
+
+async fn wait_owner_release(pool: &sqlx::PgPool) {
+    for _ in 0..50 {
+        let count:i64=sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(pool).await.unwrap();
+        if count == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("owned PostgreSQL session did not release its fence");
+}

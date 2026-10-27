@@ -20,6 +20,8 @@ use tokio::{
 
 #[path = "advisory_storage.rs"]
 mod advisory_storage;
+#[path = "chromium_storage.rs"]
+mod chromium_storage;
 #[path = "corpus_storage.rs"]
 mod corpus_storage;
 #[path = "crate_storage.rs"]
@@ -115,7 +117,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if !(2..=7).contains(&version) {
+        } else if !(2..=8).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -164,6 +166,16 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
             sqlx::query("UPDATE devres_schema SET version=7 WHERE singleton")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
+        if version <= 7 {
+            sqlx::raw_sql(chromium_storage::SCHEMA_V8)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx::query("UPDATE devres_schema SET version=8 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;

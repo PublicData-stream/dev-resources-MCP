@@ -919,7 +919,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
             .fetch_one(&fixture_pool)
             .await
             .unwrap(),
-        7
+        8
     );
     assert_eq!(
         store.capture(&original_id).await.unwrap().body,
