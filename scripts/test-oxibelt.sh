@@ -120,9 +120,9 @@ probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/ce
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
 for revision in 2026-07-28 2025-11-25; do
   probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
-    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" DEVRES_PROBE_CHROMIUM_SNAPSHOT="$chromium_snapshot" devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" DEVRES_PROBE_CHROMIUM_SNAPSHOT="$chromium_snapshot" DEVRES_PROBE_NPM_FIXTURE=1 devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
   probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
-    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" DEVRES_PROBE_CHROMIUM_SNAPSHOT="$chromium_snapshot" devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" DEVRES_PROBE_CHROMIUM_SNAPSHOT="$chromium_snapshot" DEVRES_PROBE_NPM_FIXTURE=1 devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
     /fixture/cert/edge-client.pem /fixture/cert/edge-client-key.pem
 done
 docker stop --time 15 "$run_id-backend" >/dev/null

@@ -121,6 +121,15 @@ def smoke(client, negative=True):
                         "clientInfo": {"name": "devres-smoke", "version": "1"}}, revision)
         tools = client.call("tools/list", revision=revision)["tools"]
         names = {tool["name"] for tool in tools}
+        assert {"npm_search", "npm_metadata", "npm_source_list", "npm_source_read",
+                "npm_versions", "npm_catalog_search", "npm_document_get", "npm_dependencies",
+                "npm_compare", "npm_content_search", "npm_contract_get", "npm_history",
+                "npm_snapshots", "npm_corpus_status", "npm_advisory_lookup", "npm_advisory_get",
+                "npm_advisory_catalog_search", "npm_audit_lockfile"} <= names, names
+        npm = client.tool("npm_corpus_status", {}, revision)
+        assert isinstance(npm.get("collection_enabled"), bool), "npm collection status missing"
+        code, rejected = client.exchange("tools/call", {"name": "npm_metadata", "arguments": {"name": "fixture", "version": "1.0.0", "url": "https://untrusted.invalid"}}, revision)
+        assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "npm schema admitted an arbitrary destination"
         assert {"server_info", "search", "fetch", "audit_lockfile"} <= names, names
         assert {"crate_versions", "crate_catalog_search", "crate_document_get", "crate_dependencies",
                 "crate_compare", "crate_content_search", "crate_api_search", "crate_api_get",
@@ -438,6 +447,41 @@ def require_audit(report, revision, allow_synthetic=False):
     assert report.get("status") == expected_status, "audit status did not reflect its assessment"
 
 
+def synthetic_npm(client):
+    """Retained package/advisory evidence and request-only audits; no providers."""
+    for revision in (MODERN, LEGACY):
+        versions = client.tool("npm_versions", {"name": "npm-fixture"}, revision)
+        assert versions["total"] == 2 and versions["items"][0]["version"] == "2.0.0", "npm fixture inventory changed"
+        snapshot = versions["snapshot"]["id"]
+        selection = {"name": "npm-fixture", "version": "1.0.0", "snapshot": snapshot}
+        document = client.tool("npm_document_get", {**selection, "path": "README.md"}, revision)
+        assert "Synthetic npm storage fixture" in document["page"]["text"], "npm fixture document changed"
+        resource = client.call("resources/read", {"uri": document["resource_uri"]}, revision)
+        assert resource["contents"][0]["text"] == document["page"]["text"], "npm resource lost snapshot binding"
+        found = client.tool("npm_content_search", {"snapshot": snapshot, "query": "FixtureToken"}, revision)
+        assert found["total"] > 0, "npm captured content index missing"
+        contracts = client.tool("npm_contract_get", selection, revision)
+        assert "index.d.ts" in json.dumps(contracts), "npm published types contract missing"
+        advisory = client.tool("npm_advisory_lookup", {"name": "npm-fixture", "version": "1.0.0"}, revision)
+        assert advisory["total"] == 1, "npm public advisory fixture missing"
+        advisory_snapshot = advisory["snapshot"]["id"]
+        for format_name, text in (
+            ("npm", json.dumps({"lockfileVersion": 3, "name": AUDIT_PRIVACY_MARKER, "packages": {"node_modules/npm-fixture": {"version": "1.0.0"}}})),
+            ("pnpm", "lockfileVersion: '9.0'\npackages:\n  npm-fixture@1.0.0: {}\n"),
+            ("yarn_classic", '# yarn lockfile v1\n\nnpm-fixture@^1:\n  version "1.0.0"\n'),
+            ("yarn_berry", '__metadata:\n  version: 10\n\n"npm-fixture@npm:^1":\n  version: 1.0.0\n  resolution: "npm-fixture@npm:1.0.0"\n'),
+        ):
+            report = client.tool("npm_audit_lockfile", {"lockfile": text, "lockfile_format": format_name,
+                "advisory_snapshot": advisory_snapshot, "registry_context": {"default": "npmjs"}}, revision)
+            assert report["vulnerability_count"] == 1 and report["input_retention"] == "request_lifetime_only", "npm isolated fixture assessment failed"
+            assert AUDIT_PRIVACY_MARKER not in json.dumps(report), "npm audit reflected private metadata"
+        code, rejected = client.exchange("tools/call", {"name": "npm_audit_lockfile", "arguments": {
+            "lockfile": AUDIT_PRIVACY_MARKER, "lockfile_format": "npm", "advisory_snapshot": advisory_snapshot}}, revision)
+        assert code == (400 if revision == MODERN else 200), "malformed npm input changed its HTTP error mapping"
+        assert isinstance(rejected, dict) and rejected.get("error", {}).get("code") == -32602, "malformed npm input did not return sanitized invalid params"
+        assert AUDIT_PRIVACY_MARKER not in json.dumps(rejected), "npm parser reflected private input"
+
+
 def live(client, rfc_text_only=False):
     # Fixed requests; adapter admission/retries have their own finite budget.
     # No user-supplied package, URL, lockfile, or bulk enumeration is accepted.
@@ -545,6 +589,7 @@ def main():
         synthetic_whatwg(client)
         synthetic_w3c(client)
         synthetic_chromium(client)
+        synthetic_npm(client)
     if options.live:
         live(client, options.rfc_text_only)
     print("HTTP MCP acceptance passed" + ("; bounded live smoke passed (RFC text only)" if options.live and options.rfc_text_only else "; bounded live smoke passed" if options.live else "; no provider calls"))

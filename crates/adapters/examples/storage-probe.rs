@@ -768,6 +768,131 @@ async fn check_chromium(
     Ok(())
 }
 
+fn npm_fixture_archive(
+    version: &str,
+) -> Result<(serde_json::Value, Vec<u8>), Box<dyn std::error::Error>> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use flate2::{Compression, write::GzEncoder};
+    let manifest = json!({"name":"npm-fixture","version":version,"license":"ISC","main":"index.js","types":"index.d.ts","exports":{".":{"types":"./index.d.ts","default":"./index.js"}},"dependencies":{"dependency-example":"^1.0.0"}});
+    let files = [
+        ("package.json", serde_json::to_vec(&manifest)?),
+        (
+            "README.md",
+            format!("Synthetic npm storage fixture {version}\nFixtureToken is inert.\n")
+                .into_bytes(),
+        ),
+        (
+            "index.d.ts",
+            b"export declare const FixtureToken: string;\n".to_vec(),
+        ),
+        (
+            "index.js",
+            b"export const FixtureToken = 'inert';\n".to_vec(),
+        ),
+        ("LICENSE", b"ISC synthetic acceptance fixture\n".to_vec()),
+    ];
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    for (path, bytes) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive.append_data(&mut header, format!("package/{path}"), bytes.as_slice())?;
+    }
+    let bytes = archive.into_inner()?.finish()?;
+    let mut registry = manifest;
+    registry["dist"] = json!({"tarball":format!("https://registry.npmjs.org/npm-fixture/-/npm-fixture-{version}.tgz"),"integrity":format!("sha512-{}",STANDARD.encode(sha2::Sha512::digest(&bytes)))});
+    Ok((registry, bytes))
+}
+
+fn npm_fixture_corpus(
+    store: std::sync::Arc<PgBlobStore>,
+    root: &std::path::Path,
+) -> Result<std::sync::Arc<devres_adapters::NpmCorpus>, Box<dyn std::error::Error>> {
+    Ok(std::sync::Arc::new(devres_adapters::NpmCorpus::new(
+        store,
+        std::sync::Arc::new(devres_adapters::bulk::BulkBroker::new(Default::default())?),
+        root,
+        devres_adapters::NpmConfig {
+            enabled: false,
+            advisories_enabled: false,
+            packages: vec!["npm-fixture".into()],
+            min_free_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        },
+    )?))
+}
+
+async fn seed_npm(
+    store: std::sync::Arc<PgBlobStore>,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_application::npm::NpmStore;
+    if store.npm_state("default-research").await?.is_some() {
+        return Ok(());
+    }
+    let corpus = npm_fixture_corpus(store, root)?;
+    let mut versions = serde_json::Map::new();
+    let mut archives = std::collections::BTreeMap::new();
+    for version in ["1.0.0", "2.0.0"] {
+        let (manifest, bytes) = npm_fixture_archive(version)?;
+        versions.insert(version.into(), manifest);
+        archives.insert(version.into(), bytes);
+    }
+    corpus
+        .import_fixture_package(
+            json!({"name":"npm-fixture","versions":versions,"dist-tags":{"latest":"2.0.0"}}),
+            archives,
+            devres_domain::unix_now(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    corpus.import_fixture_advisories(vec![json!({"schema_version":"1.9.2","id":"GHSA-fixt-ure0-npm0","modified":"2026-01-01T00:00:00Z","published":"2026-01-01T00:00:00Z","summary":"Synthetic npm acceptance fixture","affected":[{"package":{"ecosystem":"npm","name":"npm-fixture"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]})],devres_domain::unix_now()).await?;
+    Ok(())
+}
+
+async fn check_npm(
+    store: std::sync::Arc<PgBlobStore>,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let corpus = npm_fixture_corpus(store, root)?;
+    let research = devres_adapters::npm_research::NpmResearch::new(corpus.clone());
+    let versions = research
+        .call("npm_versions", json!({"name":"npm-fixture"}))
+        .await?;
+    if versions["total"] != 2 || versions["items"][0]["version"] != "2.0.0" {
+        return Err("npm inventory changed after restart/restore".into());
+    }
+    let snapshot = versions["snapshot"]["id"].clone();
+    let document = research
+        .call(
+            "npm_document_get",
+            json!({"name":"npm-fixture","version":"1.0.0","path":"README.md","snapshot":snapshot}),
+        )
+        .await?;
+    if !document["page"]["text"]
+        .as_str()
+        .is_some_and(|v| v.contains("Synthetic npm storage fixture"))
+    {
+        return Err("npm source evidence changed".into());
+    }
+    let matches = research
+        .call(
+            "npm_advisory_lookup",
+            json!({"name":"npm-fixture","version":"1.0.0"}),
+        )
+        .await?;
+    if matches["total"] != 1 {
+        return Err("npm public advisory snapshot changed".into());
+    }
+    let audit = devres_adapters::npm_audit::audit(json!({"lockfile_format":"npm","lockfile":serde_json::to_string(&json!({"lockfileVersion":3,"packages":{"node_modules/npm-fixture":{"version":"1.0.0","resolved":"https://registry.npmjs.org/npm-fixture/-/npm-fixture-1.0.0.tgz"}}}))?,"registry_context":{"default":"npmjs"}}),corpus).await?;
+    if audit["vulnerability_count"] != 1 {
+        return Err("npm isolated audit failed after restart/restore".into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = std::env::var("DATABASE_URL")?;
@@ -795,6 +920,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|error| format!("Synthetic W3C fixture seeding failed: {error}"))?;
             seed_chromium(&store, std::path::Path::new(&root)).await?;
+            seed_npm(store.clone(), std::path::Path::new(&root)).await?;
             store
                 .publish(
                     &request,
@@ -824,6 +950,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_whatwg(store.clone(), std::path::Path::new(&root)).await?;
     check_w3c(store.clone(), std::path::Path::new(&root)).await?;
     check_chromium(store.clone(), std::path::Path::new(&root)).await?;
+    check_npm(store.clone(), std::path::Path::new(&root)).await?;
     println!("{} {}", stored.capture.id, stored.capture.body_hash);
     Ok(())
 }

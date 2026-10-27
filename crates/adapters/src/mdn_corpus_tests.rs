@@ -440,17 +440,35 @@ async fn mdn_corpus_transitive_and_missing_includes_invalidate_unchanged_article
 #[tokio::test]
 async fn mdn_corpus_prepared_snapshot_requeues_after_missing_pending_checkpoint() {
     let fixture = Fixture::new().await;
-    assert!(
-        fixture
+    // Preparation is resumable and may yield at its existing ten-second budget.
+    // Reach the prepared checkpoint without running current publication.
+    let mut prepared = false;
+    for _ in 0..30 {
+        prepared = fixture
             .corpus
             .process_commit(
                 Repo::Content,
                 &fixture.content_revision,
                 false,
-                CancellationToken::new()
+                CancellationToken::new(),
             )
             .await
-            .expect("prepare")
+            .expect("prepare bounded slice");
+        if prepared {
+            break;
+        }
+    }
+    assert!(prepared, "fixture preparation failed to converge");
+    assert!(
+        fixture
+            .store
+            .mdn_state(&format!(
+                "prepared:{}",
+                snapshot_key(Repo::Content, &fixture.content_revision)
+            ))
+            .await
+            .expect("retained prepared checkpoint")
+            .is_some()
     );
     assert!(
         fixture

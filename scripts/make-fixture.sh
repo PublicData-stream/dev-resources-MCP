@@ -33,7 +33,7 @@ cp "$repo/deploy/oxibelt/oxibelt.toml" "$scratch/fixture/config/"
 python3 - "$scratch/fixture/backend.toml" <<'PYFIXTURE'
 import pathlib, re, sys
 p=pathlib.Path(sys.argv[1]); text=p.read_text()
-for provider in ('w3c', 'chromium'):
+for provider in ('w3c', 'chromium', 'npm'):
     header = r"(?m)^\[" + provider + r"\]\s*$"
     if re.search(header, text):
         pattern = r"(?ms)(^\[" + provider + r"\]\s*\n)(.*?)(?=^\[|\Z)"

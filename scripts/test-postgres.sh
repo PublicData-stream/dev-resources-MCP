@@ -31,6 +31,7 @@ cargo test --locked -p devres-adapters --test mdn_persistence -- --ignored --tes
 cargo test --locked -p devres-adapters --test whatwg_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test w3c_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test chromium_persistence -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --test npm_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib mdn_corpus_git_postgres_history_research_restart_and_restore -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib crate_corpus_captured_inventory_acquisition_research_and_restart -- --ignored --test-threads=1
 echo 'Real PostgreSQL persistence checks passed'

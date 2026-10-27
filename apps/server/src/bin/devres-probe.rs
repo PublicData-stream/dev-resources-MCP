@@ -104,6 +104,7 @@ async fn main() -> Result<(), ServerError> {
     let mut has_whatwg_corpus = false;
     let mut has_w3c_corpus = false;
     let mut has_chromium_corpus = false;
+    let mut has_npm_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -197,6 +198,18 @@ async fn main() -> Result<(), ServerError> {
                 tools
                     .iter()
                     .any(|tool| tool["name"] == "advisory_corpus_status")
+            });
+            has_npm_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
+                [
+                    "npm_metadata",
+                    "npm_source_read",
+                    "npm_content_search",
+                    "npm_contract_get",
+                    "npm_audit_lockfile",
+                    "npm_corpus_status",
+                ]
+                .iter()
+                .all(|name| tools.iter().any(|tool| tool["name"] == *name))
             });
         }
         if method == "tools/list"
@@ -674,6 +687,107 @@ async fn main() -> Result<(), ServerError> {
                 != "Synthetic fixture authors"
         {
             return Err("Immutable W3C bytes or notices changed through WebTransport".into());
+        }
+    }
+    if has_npm_corpus {
+        let status = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            90,
+            "npm_corpus_status",
+            json!({}),
+        )
+        .await?;
+        if !status["collection_enabled"].is_boolean() {
+            return Err("npm corpus status missing through WebTransport".into());
+        }
+    }
+    if std::env::var("DEVRES_PROBE_NPM_FIXTURE").as_deref() == Ok("1") {
+        if !has_npm_corpus {
+            return Err("npm discovery missing through WebTransport".into());
+        }
+        let versions = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            91,
+            "npm_versions",
+            json!({"name":"npm-fixture"}),
+        )
+        .await?;
+        if versions["total"] != 2 {
+            return Err("npm fixture inventory changed through WebTransport".into());
+        }
+        let snapshot = versions["snapshot"]["id"].clone();
+        let document = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            92,
+            "npm_document_get",
+            json!({"name":"npm-fixture","version":"1.0.0","snapshot":snapshot,"path":"README.md"}),
+        )
+        .await?;
+        if !document["page"]["text"]
+            .as_str()
+            .is_some_and(|v| v.contains("Synthetic npm storage fixture"))
+        {
+            return Err("npm source changed through WebTransport".into());
+        }
+        let mut params = json!({"uri":document["resource_uri"]});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let resource = exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":93,"method":"resources/read","params":params}),
+        )
+        .await?;
+        if resource["result"]["contents"][0]["text"] != document["page"]["text"] {
+            return Err("npm resource lost snapshot binding through WebTransport".into());
+        }
+        let found = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            94,
+            "npm_content_search",
+            json!({"snapshot":snapshot,"query":"FixtureToken"}),
+        )
+        .await?;
+        if found["total"].as_u64().unwrap_or(0) == 0 {
+            return Err("npm content index missing through WebTransport".into());
+        }
+        let advisory = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            95,
+            "npm_advisory_lookup",
+            json!({"name":"npm-fixture","version":"1.0.0"}),
+        )
+        .await?;
+        if advisory["total"] != 1 {
+            return Err("npm advisory fixture missing through WebTransport".into());
+        }
+        let lockfile = serde_json::to_string(
+            &json!({"lockfileVersion":3,"name":"PRIVATE_NPM_PROBE_MARKER","packages":{"node_modules/npm-fixture":{"version":"1.0.0"}}}),
+        )?;
+        let audit = tool_exchange(&mut send,&mut reader,&budget,revision,96,"npm_audit_lockfile",json!({"lockfile":lockfile,"lockfile_format":"npm","advisory_snapshot":advisory["snapshot"]["id"],"registry_context":{"default":"npmjs"}})).await?;
+        if audit["vulnerability_count"] != 1
+            || audit.to_string().contains("PRIVATE_NPM_PROBE_MARKER")
+        {
+            return Err(
+                "npm isolated assessment failed privacy or matching through WebTransport".into(),
+            );
         }
     }
     if has_chromium_corpus {
