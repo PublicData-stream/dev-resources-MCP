@@ -11,6 +11,7 @@ pub mod chromium_corpus;
 pub mod chromium_index;
 pub mod chromium_inventory;
 pub mod chromium_processing;
+pub mod chromium_research;
 pub mod chromium_source;
 mod crate_corpus;
 pub mod crate_docs;

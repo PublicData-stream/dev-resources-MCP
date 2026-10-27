@@ -320,6 +320,8 @@ pub struct Config {
     pub whatwg: devres_adapters::WhatwgConfig,
     #[serde(default)]
     pub w3c: devres_adapters::W3cConfig,
+    #[serde(default)]
+    pub chromium: devres_adapters::ChromiumConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
@@ -330,6 +332,7 @@ impl Config {
         self.mdn.validate()?;
         self.whatwg.validate()?;
         self.w3c.validate()?;
+        self.chromium.validate()?;
         for access in [
             AccessPolicy {
                 allowed_hosts: self.http.allowed_hosts.clone(),
@@ -432,6 +435,33 @@ mod tests {
         ] {
             assert!(
                 toml::from_str::<devres_adapters::CrateConfig>(bad)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn chromium_configuration_is_automatic_and_has_no_caller_destinations() {
+        let enabled: devres_adapters::ChromiumConfig = toml::from_str("").unwrap();
+        assert!(enabled.enabled);
+        enabled.validate().unwrap();
+        let paused: devres_adapters::ChromiumConfig = toml::from_str("enabled=false").unwrap();
+        assert!(!paused.enabled);
+        paused.validate().unwrap();
+        assert!(
+            toml::from_str::<devres_adapters::ChromiumConfig>(
+                "repository='https://private.invalid/source'"
+            )
+            .is_err()
+        );
+        for input in [
+            "catalog_refresh_secs=0",
+            "max_processing_workers=3",
+            "min_free_bytes=1",
+        ] {
+            assert!(
+                toml::from_str::<devres_adapters::ChromiumConfig>(input)
                     .unwrap()
                     .validate()
                     .is_err()

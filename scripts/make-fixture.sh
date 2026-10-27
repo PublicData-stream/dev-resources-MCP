@@ -29,13 +29,23 @@ chmod 600 "$scratch/fixture/cert/"*-key.pem
 cp "$repo/deploy/oxibelt/backend.toml" "$scratch/fixture/"
 cp "$repo/deploy/oxibelt/oxibelt.toml" "$scratch/fixture/config/"
 
-# Synthetic harnesses never admit W3C provider traffic, regardless of example defaults.
+# Synthetic harnesses never admit provider traffic, regardless of defaults.
 python3 - "$scratch/fixture/backend.toml" <<'PYFIXTURE'
 import pathlib, re, sys
 p=pathlib.Path(sys.argv[1]); text=p.read_text()
-if re.search(r"(?m)^\[w3c\]\s*$",text):
-    text=re.sub(r"(?ms)(^\[w3c\]\s*\n)(.*?)(?=^\[|\Z)",lambda m: m[1]+re.sub(r"(?m)^enabled\s*=.*$","enabled = false",m[2]) if re.search(r"(?m)^enabled\s*=",m[2]) else m[1]+"enabled = false\n"+m[2],text)
-else:
-    text += "\n[w3c]\nenabled = false\n"
+for provider in ('w3c', 'chromium'):
+    header = r"(?m)^\[" + provider + r"\]\s*$"
+    if re.search(header, text):
+        pattern = r"(?ms)(^\[" + provider + r"\]\s*\n)(.*?)(?=^\[|\Z)"
+        def disable(match):
+            body = match[2]
+            if re.search(r"(?m)^enabled\s*=", body):
+                body = re.sub(r"(?m)^enabled\s*=.*$", "enabled = false", body)
+            else:
+                body = "enabled = false\n" + body
+            return match[1] + body
+        text = re.sub(pattern, disable, text)
+    else:
+        text += "\n[" + provider + "]\nenabled = false\n"
 p.write_text(text)
 PYFIXTURE

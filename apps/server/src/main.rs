@@ -25,7 +25,9 @@ async fn main() -> Result<(), ServerError> {
     let mdn_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-mdn-index");
     let whatwg_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-whatwg-index");
     let w3c_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-w3c-index");
-    let args = if mdn_rebuild || whatwg_rebuild || w3c_rebuild {
+    let chromium_rebuild =
+        matches!(args.as_slice(),[command,_] if command=="rebuild-chromium-index");
+    let args = if mdn_rebuild || whatwg_rebuild || w3c_rebuild || chromium_rebuild {
         vec![args[1].clone()]
     } else {
         args
@@ -37,7 +39,7 @@ async fn main() -> Result<(), ServerError> {
         [command,path] if command=="rebuild-crate-index" => (false,false,None,Some(("rebuild",None)),path),
         [command,path,flag,hash] if command=="import-crate-corpus" && flag=="--manifest" => (false,false,None,Some(("import",Some(hash.as_str()))),path),
         [command, path, flag, budget] if command == "import-rfcs" && flag == "--max-bytes" => (false, false, Some(budget.parse::<u64>().map_err(|_| "invalid RFC import byte budget")?), None, path),
-        _ => return Err("usage: devres-server CONFIG.toml | refresh-advisories CONFIG.toml | rebuild-rfc-index CONFIG.toml | rebuild-crate-index CONFIG.toml | rebuild-mdn-index CONFIG.toml | rebuild-whatwg-index CONFIG.toml | rebuild-w3c-index CONFIG.toml | import-crate-corpus CONFIG.toml --manifest SHA256 | import-rfcs CONFIG.toml --max-bytes N".into()),
+        _ => return Err("usage: devres-server CONFIG.toml | refresh-advisories CONFIG.toml | rebuild-rfc-index CONFIG.toml | rebuild-crate-index CONFIG.toml | rebuild-mdn-index CONFIG.toml | rebuild-whatwg-index CONFIG.toml | rebuild-w3c-index CONFIG.toml | rebuild-chromium-index CONFIG.toml | import-crate-corpus CONFIG.toml --manifest SHA256 | import-rfcs CONFIG.toml --max-bytes N".into()),
     };
     let config = Config::load(Path::new(config_path)).await?;
     let store = Arc::new(
@@ -91,11 +93,31 @@ async fn main() -> Result<(), ServerError> {
     whatwg_corpus.initialize_status().await?;
     let w3c_corpus = Arc::new(devres_adapters::W3cCorpus::new(
         store.clone(),
-        broker,
+        broker.clone(),
         &config.storage.blob_dir,
         config.w3c.clone(),
     )?);
     w3c_corpus.initialize_status().await?;
+    let chromium_corpus = Arc::new(devres_adapters::ChromiumCorpus::new(
+        store.clone(),
+        broker,
+        &config.storage.blob_dir,
+        config.chromium.clone(),
+    )?);
+    chromium_corpus.initialize_status().await?;
+    if chromium_rebuild {
+        let shutdown = CancellationToken::new();
+        let signal = shutdown.clone();
+        let task = tokio::spawn(async move {
+            shutdown_signal().await;
+            signal.cancel();
+        });
+        let result = chromium_corpus.rebuild_index(shutdown).await;
+        task.abort();
+        let _ = task.await;
+        println!("{}", result?);
+        return Ok(());
+    }
     if w3c_rebuild {
         let shutdown = CancellationToken::new();
         let signal = shutdown.clone();
@@ -143,7 +165,8 @@ async fn main() -> Result<(), ServerError> {
             .with_advisory_corpus(advisory_corpus.clone())
             .with_mdn_research(mdn_corpus.research())
             .with_whatwg_corpus(whatwg_corpus.clone())
-            .with_w3c_corpus(w3c_corpus.clone()),
+            .with_w3c_corpus(w3c_corpus.clone())
+            .with_chromium_corpus(chromium_corpus.clone()),
     );
     if let Some((command, manifest)) = crate_command {
         let shutdown = CancellationToken::new();
@@ -221,6 +244,19 @@ async fn main() -> Result<(), ServerError> {
     })?;
     server.register_worker("whatwg-history", move |shutdown| async move {
         whatwg_corpus
+            .run_history(shutdown)
+            .await
+            .map_err(Into::into)
+    })?;
+    let chromium_current = chromium_corpus.clone();
+    server.register_worker("chromium-current", move |shutdown| async move {
+        chromium_current
+            .run_current(shutdown)
+            .await
+            .map_err(Into::into)
+    })?;
+    server.register_worker("chromium-history", move |shutdown| async move {
+        chromium_corpus
             .run_history(shutdown)
             .await
             .map_err(Into::into)

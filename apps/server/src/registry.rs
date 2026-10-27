@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
+const MAX_REGISTERED_TOOLS: usize = 128;
+
 type Invoke = dyn Fn(Value, CancellationToken) -> BoxFuture<'static, Result<Value>> + Send + Sync;
 type ResourceRead =
     dyn Fn(String, CancellationToken) -> BoxFuture<'static, Result<Value>> + Send + Sync;
@@ -42,7 +44,7 @@ impl ToolRegistry {
             || !name
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-            || self.tools.len() >= 64
+            || self.tools.len() >= MAX_REGISTERED_TOOLS
             || self.tools.contains_key(name)
         {
             return Err("invalid, duplicate, or excessive tool registration".into());
@@ -206,7 +208,7 @@ mod tests {
                 .register(descriptor, |_, _| async { Ok(json!({})) })
                 .unwrap();
         }
-        assert!(registry.tools.len() <= 64);
+        assert!(registry.tools.len() <= MAX_REGISTERED_TOOLS);
         let get = &registry.tools["mdn_get"].validator;
         assert!(get.is_valid(&json!({"slug":"Web/API/Window/fetch"})));
         assert!(!get.is_valid(&json!({})));
@@ -282,7 +284,7 @@ mod tests {
                 .register(descriptor, |_, _| async { Ok(json!({})) })
                 .unwrap();
         }
-        assert!(registry.tools.len() <= 64);
+        assert!(registry.tools.len() <= MAX_REGISTERED_TOOLS);
         assert!(
             registry.tools["w3c_get"]
                 .validator
@@ -303,5 +305,41 @@ mod tests {
         assert!(registry.tools["search"].validator.is_valid(
             &json!({"query":"color","sources":["rfc","cargo","rustsec","mdn","whatwg","w3c"]})
         ));
+    }
+    #[test]
+    fn chromium_interfaces_bind_documents_and_reject_remote_inputs() {
+        let mut registry =
+            server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .unwrap();
+        }
+        let get = &registry.tools["chromium_get"].validator;
+        assert!(get.is_valid(&json!({"component":"src","path":"docs/README.md"})));
+        for input in [
+            json!({"component":"src"}),
+            json!({"component":"unknown","path":"docs/a.md"}),
+            json!({"component":"src","path":"docs/a.md","url":"https://untrusted.invalid"}),
+            json!({"component":"src","path":"docs/a.md","limit":32769}),
+            json!({"component":"src","path":"docs/a.md","snapshot":"a".repeat(64),"view":"b".repeat(64)}),
+        ] {
+            assert!(!get.is_valid(&input));
+        }
+        assert!(registry.tools["search"].validator.is_valid(&json!({"query":"chromium","sources":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium"]})));
+        assert!(
+            !registry.tools["chromium_corpus_status"]
+                .validator
+                .is_valid(&json!({"enabled":true}))
+        );
+    }
+
+    #[test]
+    fn trusted_registration_capacity_remains_bounded() {
+        let mut registry = ToolRegistry::new();
+        for i in 0..MAX_REGISTERED_TOOLS {
+            registry.register(json!({"name":format!("bounded_{i}"),"inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}), |_,_|async { Ok(json!({})) }).unwrap();
+        }
+        assert!(registry.register(json!({"name":"overflow","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}), |_,_|async { Ok(json!({})) }).is_err());
     }
 }

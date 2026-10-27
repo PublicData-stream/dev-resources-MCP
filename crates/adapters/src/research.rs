@@ -19,6 +19,7 @@ pub struct Research {
     mdn_research: Option<Arc<crate::mdn_research::MdnResearch>>,
     whatwg_research: Option<Arc<crate::whatwg_research::WhatwgResearch>>,
     w3c_research: Option<Arc<crate::w3c_research::W3cResearch>>,
+    chromium_research: Option<Arc<crate::chromium_research::ChromiumResearch>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -112,6 +113,7 @@ impl Research {
             mdn_research: None,
             whatwg_research: None,
             w3c_research: None,
+            chromium_research: None,
         })
     }
 
@@ -152,7 +154,25 @@ impl Research {
         self
     }
 
+    pub fn with_chromium_corpus(mut self, corpus: Arc<crate::ChromiumCorpus>) -> Self {
+        self.chromium_research = Some(Arc::new(crate::chromium_research::ChromiumResearch::new(
+            corpus,
+        )));
+        self
+    }
+
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if crate::chromium_research::schemas()
+            .iter()
+            .any(|schema| schema["name"] == tool)
+        {
+            return self
+                .chromium_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Chromium corpus storage is not configured."))?
+                .call(tool, input)
+                .await;
+        }
         if crate::w3c_research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
@@ -251,8 +271,8 @@ impl Research {
             limit: input.limit,
         }
         .checked()?;
-        if input.sources.is_empty() || input.sources.len() > 6 {
-            return Err(Error::invalid("Select one to six sources."));
+        if input.sources.is_empty() || input.sources.len() > 7 {
+            return Err(Error::invalid("Select one to seven sources."));
         }
         let mut results = Vec::new();
         let mut unique = std::collections::HashSet::new();
@@ -287,6 +307,17 @@ impl Research {
                     .await
                 }
                 "rustsec" => self.advisory.search(&input.query, page).await,
+                "chromium" => match self.chromium_research.as_ref() {
+                    Some(research) => research
+                        .call(
+                            "chromium_search",
+                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                        )
+                        .await,
+                    None => Err(Error::unavailable(
+                        "Chromium corpus storage is not configured.",
+                    )),
+                },
                 "w3c" => match self.w3c_research.as_ref() {
                     Some(research) => research
                         .call(
@@ -318,7 +349,7 @@ impl Research {
                 },
                 _ => {
                     return Err(Error::invalid(
-                        "Search sources are rfc, cargo, rustsec, mdn, whatwg, and w3c.",
+                        "Search sources are rfc, cargo, rustsec, mdn, whatwg, w3c, and chromium.",
                     ));
                 }
             };
@@ -331,6 +362,22 @@ impl Research {
     }
 
     async fn fetch(&self, input: FetchInput) -> Result<Value> {
+        if let Some(id) = input.id.strip_prefix("chromium:") {
+            let (document, anchor) = id.split_once('#').map_or((id, None), |(s, a)| (s, Some(a)));
+            let (component, path) = document.split_once('/').ok_or_else(|| {
+                Error::invalid("Chromium IDs use chromium:<component>/<path>#<anchor>.")
+            })?;
+            let mut args = json!({"component":component,"path":path,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(32768)});
+            if let Some(anchor) = anchor {
+                args["anchor"] = json!(anchor);
+            }
+            return self
+                .chromium_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Chromium corpus storage is not configured."))?
+                .call("chromium_get", args)
+                .await;
+        }
         if let Some(id) = input.id.strip_prefix("w3c:") {
             let (specification, anchor) =
                 id.split_once('#').map_or((id, None), |(s, a)| (s, Some(a)));
@@ -443,6 +490,14 @@ impl Research {
             || url.fragment().is_some()
         {
             return Err(Error::invalid("Invalid capture resource URI."));
+        }
+        if url.host_str() == Some("chromium") {
+            return self
+                .chromium_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Chromium corpus storage is not configured."))?
+                .read_resource(uri)
+                .await;
         }
         if url.host_str() == Some("mdn") {
             return self
@@ -604,12 +659,12 @@ fn schemas() -> Vec<Value> {
     add(
         "search",
         "Search RFC metadata, crates.io packages, RustSec advisories, local MDN documents, WHATWG or W3C standards. Sources are independent; errors and freshness are explicit.",
-        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c"]},"minItems":1,"maxItems":6,"uniqueItems":true},"offset":offset,"limit":limit}),
+        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium"]},"minItems":1,"maxItems":7,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(
         "fetch",
-        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, w3c:<shortname>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
+        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, w3c:<shortname>#<anchor>, chromium:<component>/<path>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
         json!({"id":{"type":"string","minLength":1,"maxLength":16384},"offset":text_offset,"limit":text_limit}),
         vec!["id"],
     );
@@ -667,6 +722,7 @@ fn schemas() -> Vec<Value> {
     tools.extend(crate::mdn_research::schemas());
     tools.extend(crate::whatwg_research::schemas());
     tools.extend(crate::w3c_research::schemas());
+    tools.extend(crate::chromium_research::schemas());
     tools
 }
 #[derive(Deserialize)]
