@@ -2,15 +2,39 @@
 # Both transports through the exact pinned edge. Internal Docker network, no providers.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+supplied_image=
+while (( $# )); do
+  case "$1" in
+    --image) [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo '--image requires an image' >&2; exit 2; }; supplied_image=$2; shift 2 ;;
+    *) echo 'usage: scripts/test-oxibelt.sh [--image IMAGE]' >&2; exit 2 ;;
+  esac
+done
 scratch=$(mktemp -d)
 token=${scratch##*/}
 run_id="devres-edge-$$-${token,,}"
-image="$run_id:local"
+image="${supplied_image:-$run_id:local}"
+# Fixed allowlist only; never copy fixtures, secrets, container inspect, or data.
+diag_capture() {
+  local file=$1; shift
+  timeout 15s "$@" 2>&1 | head -c 65536 > "$diagnostics/$file" || true
+}
+collect_diagnostics() {
+  [[ -n ${DEVRES_E2E_DIAGNOSTICS_DIR:-} ]] || return 0
+  local diagnostics="$DEVRES_E2E_DIAGNOSTICS_DIR/$run_id"
+  mkdir -p -- "$diagnostics" || return 0
+  for component in backend edge postgres; do
+    if [[ $(timeout 15s docker inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$run_id-$component" 2>/dev/null) == "$run_id" ]]; then
+      diag_capture "$component.log" docker logs --tail 100 "$run_id-$component"
+      diag_capture "$component-state.txt" docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$run_id-$component"
+    fi
+  done
+}
 cleanup() {
   status=$?
+  if (( status != 0 )); then collect_diagnostics || true; fi
   if (( status != 0 )); then
-    docker logs "$run_id-backend" >&2 2>/dev/null || true
-    docker logs "$run_id-edge" >&2 2>/dev/null || true
+    timeout 15s docker logs --tail 100 "$run_id-backend" >&2 2>/dev/null || true
+    timeout 15s docker logs --tail 100 "$run_id-edge" >&2 2>/dev/null || true
   fi
   for name in "$run_id-edge" "$run_id-backend" "$run_id-postgres"; do
     if [[ $(docker inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$name" 2>/dev/null) == "$run_id" ]]; then
@@ -25,7 +49,7 @@ cleanup() {
       docker volume rm "$name" >/dev/null 2>&1 || true
     fi
   done
-  if [[ $(docker image inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$image" 2>/dev/null) == "$image" ]]; then
+  if [[ -z $supplied_image ]] && [[ $(docker image inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$image" 2>/dev/null) == "$image" ]]; then
     docker image rm "$image" >/dev/null 2>&1 || true
   fi
   rm -rf -- "$scratch"
@@ -35,7 +59,11 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 scripts/make-fixture.sh "$scratch"
-scripts/build-harness.sh "$scratch" "$image"
+if [[ -z $supplied_image ]]; then
+  scripts/build-harness.sh "$scratch" "$image"
+else
+  docker image inspect "$image" >/dev/null
+fi
 docker network create --internal --label "devres.test-owner=$run_id" "$run_id" >/dev/null
 for volume in "$run_id-fixture" "$run_id-data"; do
   if docker volume inspect "$volume" >/dev/null 2>&1; then

@@ -4,9 +4,16 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 live=0
 live_rfc_args=()
-if [[ ${1:-} == --live ]]; then live=1; shift; fi
-if (( live )) && [[ ${1:-} == --rfc-text-only ]]; then live_rfc_args=(--rfc-text-only); shift; fi
-test "$#" = 0 || { echo 'usage: scripts/test-minikube.sh [--live [--rfc-text-only]]' >&2; exit 2; }
+supplied_image=
+while (( $# )); do
+  case "$1" in
+    --image) [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo '--image requires an image' >&2; exit 2; }; supplied_image=$2; shift 2 ;;
+    --live) live=1; shift ;;
+    --rfc-text-only) live_rfc_args=(--rfc-text-only); shift ;;
+    *) echo 'usage: scripts/test-minikube.sh [--image IMAGE] [--live [--rfc-text-only]]' >&2; exit 2 ;;
+  esac
+done
+if (( ! live && ${#live_rfc_args[@]} )); then echo '--rfc-text-only requires --live' >&2; exit 2; fi
 if [[ -n ${DEVRES_DOCKER_HOST:-} ]]; then
   unset DOCKER_CONTEXT
   export DOCKER_HOST="$DEVRES_DOCKER_HOST"
@@ -19,18 +26,38 @@ token=${token//./-}
 run_id="devres-acceptance-$$-${token,,}"
 profile="$run_id"
 namespace=devres-acceptance
-image="$run_id:local"
+image="${supplied_image:-$run_id:local}"
 created=0
 k() { minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=30s -n "$namespace" "$@"; }
+# Fixed allowlist only; never copy fixtures, secrets, container inspect, or data.
+diag_capture() {
+  local file=$1; shift
+  timeout 15s "$@" 2>&1 | head -c 65536 > "$diagnostics/$file" || true
+}
+collect_diagnostics() {
+  [[ -n ${DEVRES_E2E_DIAGNOSTICS_DIR:-} ]] || return 0
+  local diagnostics="$DEVRES_E2E_DIAGNOSTICS_DIR/$run_id"
+  mkdir -p -- "$diagnostics" || return 0
+  if (( created )); then
+    diag_capture pods.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get pods -o wide
+    diag_capture pvc.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get pvc -o 'custom-columns=NAME:.metadata.name,PHASE:.status.phase,VOLUME:.spec.volumeName,CAPACITY:.status.capacity.storage'
+    diag_capture container-state.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get pods -o 'jsonpath={range .items[*]}{.metadata.name}{" phase="}{.status.phase}{"\n"}{range .status.initContainerStatuses[*]}{.name}{" restarts="}{.restartCount}{" waiting="}{.state.waiting.reason}{" terminated="}{.state.terminated.reason}{" exit="}{.state.terminated.exitCode}{" last="}{.lastState.terminated.reason}{" lastExit="}{.lastState.terminated.exitCode}{"\n"}{end}{range .status.containerStatuses[*]}{.name}{" ready="}{.ready}{" restarts="}{.restartCount}{" waiting="}{.state.waiting.reason}{" terminated="}{.state.terminated.reason}{" exit="}{.state.terminated.exitCode}{" signal="}{.state.terminated.signal}{" last="}{.lastState.terminated.reason}{" lastExit="}{.lastState.terminated.exitCode}{"\n"}{end}{end}'
+    diag_capture events.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get events --field-selector type=Warning --sort-by=.lastTimestamp
+    for component in backend edge postgres; do
+      diag_capture "$component.log" minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" logs "deploy/$component" --tail=100 --limit-bytes=65536
+    done
+  fi
+}
 cleanup() {
   status=$?
+  if (( status != 0 )); then collect_diagnostics || true; fi
   if (( status != 0 && created )); then
     k get pods >&2 2>/dev/null || true
     k logs deploy/backend --tail=40 >&2 2>/dev/null || true
     k logs deploy/edge --tail=40 >&2 2>/dev/null || true
   fi
   if (( created )); then minikube -p "$profile" delete >/dev/null 2>&1 || true; fi
-  if [[ $(docker image inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$image" 2>/dev/null) == "$image" ]]; then
+  if [[ -z $supplied_image ]] && [[ $(docker image inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$image" 2>/dev/null) == "$image" ]]; then
     docker image rm "$image" >/dev/null 2>&1 || true
   fi
   rm -rf -- "$scratch"
@@ -39,15 +66,20 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-for command in minikube docker openssl python3 cargo; do command -v "$command" >/dev/null; done
+for command in minikube docker openssl python3; do command -v "$command" >/dev/null; done
 if minikube profile list -o json | python3 -c 'import json,sys; p=json.load(sys.stdin); sys.exit(not any(v.get("Name")==sys.argv[1] for v in p.get("valid",[])+p.get("invalid",[])))' "$profile"; then
   echo 'Refusing to reuse an existing minikube profile' >&2; exit 1
 fi
 scripts/make-fixture.sh "$scratch"
-scripts/build-harness.sh "$scratch" "$image"
+if [[ -z $supplied_image ]]; then
+  scripts/build-harness.sh "$scratch" "$image"
+else
+  docker image inspect "$image" >/dev/null
+fi
 # Set the cleanup fence before startup so partially created task-owned profiles go away.
 created=1
 minikube -p "$profile" start --driver=docker --container-runtime=containerd --cni=calico \
+  --kubernetes-version="${DEVRES_KUBERNETES_VERSION:-v1.37.0}" \
   --cpus=4 --memory=6144 --subnet=10.223.254.0/24 --keep-context
 minikube -p "$profile" image load "$image"
 k create namespace "$namespace" --dry-run=client -o yaml | k apply -f -
