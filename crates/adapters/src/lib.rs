@@ -7,6 +7,8 @@ mod advisory_research;
 mod archive;
 pub mod bulk;
 mod cargo;
+pub mod chromium_processing;
+pub mod chromium_source;
 mod crate_corpus;
 pub mod crate_docs;
 pub mod crate_dump;

@@ -88,10 +88,12 @@ pub enum BulkSource {
     W3cPublication(crate::w3c_catalog::PublicationUrl),
     W3cApi(crate::w3c_catalog::ApiOperation),
     W3cDiscovery(crate::w3c_discovery::DiscoveryOperation),
+    Chromium(crate::chromium_source::Operation),
 }
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
         match self {
+            Self::Chromium(operation) => operation.url(),
             Self::W3cGit { repository, operation } => {
                 repository.validate()?;
                 let suffix = match operation {
@@ -144,6 +146,7 @@ impl BulkSource {
     }
     pub fn host(&self) -> &str {
         match self {
+            Self::Chromium(operation) => operation.host(),
             Self::W3cGit { repository, .. } => repository.host(),
             Self::W3cPublication(source) => source.host(),
             Self::W3cApi(_) => "api.w3.org",
@@ -160,6 +163,7 @@ impl BulkSource {
     }
     fn media_type(&self) -> &'static str {
         match self {
+            Self::Chromium(operation) => operation.media_type(),
             Self::W3cApi(_) => "application/hal+json",
             Self::W3cDiscovery(operation) => operation.media_type(),
             Self::W3cPublication(source) => source.media_type(),
@@ -249,6 +253,8 @@ pub struct BulkResponse {
     pub status: u16,
     pub validators: Validators,
     pub content_length: Option<u64>,
+    pub next_page: Option<u32>,
+    pub retry_at: Option<i64>,
     pub stream: BulkStream,
 }
 pub struct AttemptPermit {
@@ -264,6 +270,7 @@ pub struct BulkBroker {
     bulk_slots: Arc<Semaphore>,
     foreground_slots: Arc<Semaphore>,
     documentation_slots: Arc<Semaphore>,
+    chromium_slots: Arc<Semaphore>,
     attempt_budget: Option<usize>,
     attempts: AtomicUsize,
     attempt_observer: Option<Arc<dyn Fn(usize) -> Result<()> + Send + Sync>>,
@@ -311,6 +318,7 @@ impl BulkBroker {
             bulk_slots: Arc::new(Semaphore::new(config.max_transfers)),
             foreground_slots: Arc::new(Semaphore::new(2)),
             documentation_slots: Arc::new(Semaphore::new(1)),
+            chromium_slots: Arc::new(Semaphore::new(1)),
             rates: Mutex::new(HashMap::new()),
             config,
             attempt_budget: None,
@@ -359,7 +367,8 @@ impl BulkBroker {
         bulk: bool,
         forced_rate: Option<u32>,
     ) -> Result<AttemptPermit> {
-        self.admit_rate_inner(host, bulk, forced_rate, false).await
+        self.admit_rate_inner(host, bulk, forced_rate, false, false)
+            .await
     }
 
     async fn admit_rate_inner(
@@ -368,9 +377,14 @@ impl BulkBroker {
         bulk: bool,
         forced_rate: Option<u32>,
         w3c: bool,
+        chromium: bool,
     ) -> Result<AttemptPermit> {
         // W3C hosts reach this branch only after typed destination validation in open().
-        let host = if w3c { host } else { admitted_host(host)? };
+        let host = if w3c || chromium {
+            host
+        } else {
+            admitted_host(host)?
+        };
         let documentation = if host == "docs.rs" {
             Some(
                 self.documentation_slots
@@ -401,6 +415,14 @@ impl BulkBroker {
             if w3c {
                 scheduled = scheduled.max(rates.get("w3c-acquisition").copied().unwrap_or(now));
                 rates.insert("w3c-acquisition".into(), scheduled + Duration::from_secs(1));
+            }
+            if chromium {
+                scheduled =
+                    scheduled.max(rates.get("chromium-acquisition").copied().unwrap_or(now));
+                rates.insert(
+                    "chromium-acquisition".into(),
+                    scheduled + Duration::from_secs(1),
+                );
             }
             let per_second = if whatwg {
                 1
@@ -467,6 +489,7 @@ impl BulkBroker {
             return Err(Error::invalid("Invalid bulk request body."));
         }
         let url = request.source.url()?;
+        let chromium = matches!(request.source, BulkSource::Chromium(_));
         let w3c = matches!(
             request.source,
             BulkSource::W3cGit { .. }
@@ -486,6 +509,20 @@ impl BulkBroker {
             url
         };
         for attempt in 0..=1 {
+            let chromium_permit = if chromium {
+                Some(
+                    bounded(&shutdown, request.deadline, async {
+                        self.chromium_slots
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| Error::unavailable("Chromium admission stopped."))
+                    })
+                    .await?,
+                )
+            } else {
+                None
+            };
             let permit = bounded(
                 &shutdown,
                 request.deadline,
@@ -502,10 +539,15 @@ impl BulkBroker {
                     )
                     .then_some(1),
                     w3c,
+                    chromium,
                 ),
             )
             .await?;
-            let client = if w3c { &self.w3c_client } else { &self.client };
+            let client = if w3c || chromium {
+                &self.w3c_client
+            } else {
+                &self.client
+            };
             let mut builder = if upload {
                 client.post(&url).body(request.body.clone())
             } else {
@@ -543,7 +585,23 @@ impl BulkBroker {
             })
             .await?;
             let status = response.status().as_u16();
-            if attempt == 0 && matches!(status, 429 | 500 | 502 | 503 | 504) {
+            let retry_at = match &request.source {
+                BulkSource::Chromium(operation) => {
+                    operation.retry_at(response.headers(), status)?
+                }
+                _ => None,
+            };
+            if let Some(retry_at) = retry_at {
+                let seconds = retry_at.saturating_sub(devres_domain::unix_now()).max(0) as u64;
+                let until = Instant::now() + Duration::from_secs(seconds);
+                let mut rates = self.rates.lock().await;
+                // An exhausted archive API must not suspend independent current
+                // Chromium/Chrome origins. The family retains its normal pace.
+                let clock = request.source.host();
+                let previous = rates.get(clock).copied().unwrap_or(until);
+                rates.insert(clock.into(), previous.max(until));
+            }
+            if attempt == 0 && retry_at.is_none() && matches!(status, 429 | 500 | 502 | 503 | 504) {
                 let delay = retry_after(response.headers());
                 drop(response);
                 drop(permit);
@@ -561,6 +619,10 @@ impl BulkBroker {
             }
             let validators = response_validators(response.headers());
             let content_length = response.content_length();
+            let next_page = match &request.source {
+                BulkSource::Chromium(operation) => operation.next_page(response.headers())?,
+                _ => None,
+            };
             if status != 200 {
                 drop(response);
                 drop(permit);
@@ -568,6 +630,8 @@ impl BulkBroker {
                     status,
                     validators,
                     content_length,
+                    next_page,
+                    retry_at,
                     stream: Box::pin(futures::stream::empty()),
                 });
             }
@@ -581,6 +645,7 @@ impl BulkBroker {
             let state = StreamState {
                 reader: Box::pin(reader),
                 _permit: permit,
+                _chromium_permit: chromium_permit,
                 received: 0,
                 max_bytes: request.max_bytes,
                 expected_bytes: content_length,
@@ -618,6 +683,8 @@ impl BulkBroker {
                 status,
                 validators,
                 content_length,
+                next_page,
+                retry_at,
                 stream: Box::pin(stream),
             });
         }
@@ -628,6 +695,7 @@ type ByteReader = Pin<Box<dyn tokio::io::AsyncRead + Send>>;
 struct StreamState {
     reader: ByteReader,
     _permit: AttemptPermit,
+    _chromium_permit: Option<OwnedSemaphorePermit>,
     received: u64,
     max_bytes: u64,
     expected_bytes: Option<u64>,
@@ -1217,6 +1285,8 @@ mod tests {
             status: 200,
             validators: Validators::default(),
             content_length: Some(3),
+            next_page: None,
+            retry_at: None,
             stream: Box::pin(futures::stream::iter([Ok(b"bad".to_vec())])),
         };
         assert!(
@@ -1684,17 +1754,17 @@ mod w3c_policy_tests {
         let broker = BulkBroker::new(BulkConfig::default()).expect("broker");
         let start = Instant::now();
         let api = broker
-            .admit_rate_inner("api.w3.org", true, Some(1), true)
+            .admit_rate_inner("api.w3.org", true, Some(1), true, false)
             .await
             .expect("API permit");
         drop(api);
         let publication = broker
-            .admit_rate_inner("www.w3.org", true, Some(1), true)
+            .admit_rate_inner("www.w3.org", true, Some(1), true, false)
             .await
             .expect("publication permit");
         drop(publication);
         let git = broker
-            .admit_rate_inner("github.com", true, Some(1), true)
+            .admit_rate_inner("github.com", true, Some(1), true, false)
             .await
             .expect("Git permit");
         drop(git);
