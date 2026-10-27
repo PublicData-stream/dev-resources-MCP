@@ -81,10 +81,28 @@ pub enum BulkSource {
         operation: GitOperation,
     },
     WhatwgPublication(crate::whatwg_catalog::PublicationUrl),
+    W3cGit {
+        repository: crate::w3c_git::Repo,
+        operation: GitOperation,
+    },
+    W3cPublication(crate::w3c_catalog::PublicationUrl),
+    W3cApi(crate::w3c_catalog::ApiOperation),
+    W3cDiscovery(crate::w3c_discovery::DiscoveryOperation),
 }
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
         match self {
+            Self::W3cGit { repository, operation } => {
+                repository.validate()?;
+                let suffix = match operation {
+                    GitOperation::Advertisement => "info/refs?service=git-upload-pack",
+                    GitOperation::UploadPack => "git-upload-pack",
+                };
+                Ok(format!("{}/{suffix}", repository.source_url()))
+            }
+            Self::W3cPublication(source) => { source.validate()?; Ok(source.as_str().to_owned()) },
+            Self::W3cApi(operation) => operation.url(),
+            Self::W3cDiscovery(operation) => operation.url(),
             Self::WhatwgGit { repository, operation } => {
                 crate::whatwg_git::Repo::new(&repository.as_str())?;
                 let suffix=match operation { GitOperation::Advertisement=>"info/refs?service=git-upload-pack",GitOperation::UploadPack=>"git-upload-pack" };
@@ -126,6 +144,10 @@ impl BulkSource {
     }
     pub fn host(&self) -> &str {
         match self {
+            Self::W3cGit { repository, .. } => repository.host(),
+            Self::W3cPublication(source) => source.host(),
+            Self::W3cApi(_) => "api.w3.org",
+            Self::W3cDiscovery(operation) => operation.host(),
             Self::WhatwgPublication(source) => source.host(),
             Self::WhatwgGit { .. } => "github.com",
             Self::DatabaseDump | Self::CrateArchive { .. } => "static.crates.io",
@@ -138,6 +160,17 @@ impl BulkSource {
     }
     fn media_type(&self) -> &'static str {
         match self {
+            Self::W3cApi(_) => "application/hal+json",
+            Self::W3cDiscovery(operation) => operation.media_type(),
+            Self::W3cPublication(source) => source.media_type(),
+            Self::W3cGit {
+                operation: GitOperation::Advertisement,
+                ..
+            } => "application/x-git-upload-pack-advertisement",
+            Self::W3cGit {
+                operation: GitOperation::UploadPack,
+                ..
+            } => "application/x-git-upload-pack-result",
             Self::WhatwgGit {
                 operation: GitOperation::Advertisement,
                 ..
@@ -225,6 +258,7 @@ pub struct AttemptPermit {
 
 pub struct BulkBroker {
     client: reqwest::Client,
+    w3c_client: reqwest::Client,
     config: BulkConfig,
     rates: Mutex<HashMap<String, Instant>>,
     bulk_slots: Arc<Semaphore>,
@@ -249,6 +283,7 @@ impl BulkBroker {
             .build()
             .map_err(|_| Error::unavailable("Fixture HTTP initialization failed."))?;
         broker.test_origin = Some(origin);
+        broker.w3c_client = broker.client.clone();
         Ok(broker)
     }
     pub fn new(config: BulkConfig) -> Result<Self> {
@@ -272,6 +307,7 @@ impl BulkBroker {
             .map_err(|_| Error::unavailable("Bulk HTTP initialization failed."))?;
         Ok(Self {
             client,
+            w3c_client: crate::w3c_network::client()?,
             bulk_slots: Arc::new(Semaphore::new(config.max_transfers)),
             foreground_slots: Arc::new(Semaphore::new(2)),
             documentation_slots: Arc::new(Semaphore::new(1)),
@@ -323,7 +359,18 @@ impl BulkBroker {
         bulk: bool,
         forced_rate: Option<u32>,
     ) -> Result<AttemptPermit> {
-        let host = admitted_host(host)?;
+        self.admit_rate_inner(host, bulk, forced_rate, false).await
+    }
+
+    async fn admit_rate_inner(
+        &self,
+        host: &str,
+        bulk: bool,
+        forced_rate: Option<u32>,
+        w3c: bool,
+    ) -> Result<AttemptPermit> {
+        // W3C hosts reach this branch only after typed destination validation in open().
+        let host = if w3c { host } else { admitted_host(host)? };
         let documentation = if host == "docs.rs" {
             Some(
                 self.documentation_slots
@@ -350,7 +397,11 @@ impl BulkBroker {
             let now = Instant::now();
             let whatwg = crate::whatwg_catalog::publication_host(host);
             let clock = if whatwg { "whatwg-publications" } else { host };
-            let scheduled = rates.get(clock).copied().unwrap_or(now).max(now);
+            let mut scheduled = rates.get(clock).copied().unwrap_or(now).max(now);
+            if w3c {
+                scheduled = scheduled.max(rates.get("w3c-acquisition").copied().unwrap_or(now));
+                rates.insert("w3c-acquisition".into(), scheduled + Duration::from_secs(1));
+            }
             let per_second = if whatwg {
                 1
             } else {
@@ -407,11 +458,22 @@ impl BulkBroker {
                     operation: GitOperation::UploadPack,
                     ..
                 }
+                | BulkSource::W3cGit {
+                    operation: GitOperation::UploadPack,
+                    ..
+                }
         );
         if request.body.len() > 1024 * 1024 || (!upload && !request.body.is_empty()) {
             return Err(Error::invalid("Invalid bulk request body."));
         }
         let url = request.source.url()?;
+        let w3c = matches!(
+            request.source,
+            BulkSource::W3cGit { .. }
+                | BulkSource::W3cPublication(_)
+                | BulkSource::W3cApi(_)
+                | BulkSource::W3cDiscovery(_)
+        );
         #[cfg(test)]
         let url = if let Some(origin) = &self.test_origin {
             let original =
@@ -427,7 +489,7 @@ impl BulkBroker {
             let permit = bounded(
                 &shutdown,
                 request.deadline,
-                self.admit_rate(
+                self.admit_rate_inner(
                     request.source.host(),
                     true,
                     matches!(
@@ -436,15 +498,18 @@ impl BulkBroker {
                             | BulkSource::MdnContentGit(_)
                             | BulkSource::MdnCompatGit(_)
                             | BulkSource::WhatwgGit { .. }
+                            | BulkSource::W3cGit { .. }
                     )
                     .then_some(1),
+                    w3c,
                 ),
             )
             .await?;
+            let client = if w3c { &self.w3c_client } else { &self.client };
             let mut builder = if upload {
-                self.client.post(&url).body(request.body.clone())
+                client.post(&url).body(request.body.clone())
             } else {
-                self.client.get(&url)
+                client.get(&url)
             };
             builder = builder.header(reqwest::header::ACCEPT, request.source.media_type());
             if matches!(
@@ -454,6 +519,7 @@ impl BulkBroker {
                     | BulkSource::MdnContentGit(_)
                     | BulkSource::MdnCompatGit(_)
                     | BulkSource::WhatwgGit { .. }
+                    | BulkSource::W3cGit { .. }
             ) {
                 builder = builder.header("Git-Protocol", "version=2");
                 if upload {
@@ -1606,5 +1672,77 @@ mod whatwg_policy_tests {
             )
             .await
             .expect("verified retained projection");
+    }
+}
+
+#[cfg(test)]
+mod w3c_policy_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn w3c_family_and_github_host_clock_are_both_reserved() {
+        let broker = BulkBroker::new(BulkConfig::default()).expect("broker");
+        let start = Instant::now();
+        let api = broker
+            .admit_rate_inner("api.w3.org", true, Some(1), true)
+            .await
+            .expect("API permit");
+        drop(api);
+        let publication = broker
+            .admit_rate_inner("www.w3.org", true, Some(1), true)
+            .await
+            .expect("publication permit");
+        drop(publication);
+        let git = broker
+            .admit_rate_inner("github.com", true, Some(1), true)
+            .await
+            .expect("Git permit");
+        drop(git);
+        assert!(Instant::now().duration_since(start) >= Duration::from_secs(2));
+        let legacy = broker
+            .admit_foreground("github.com")
+            .await
+            .expect("shared host permit");
+        drop(legacy);
+        assert!(Instant::now().duration_since(start) >= Duration::from_secs(3));
+        // Qualifying a W3C source never expands legacy foreground host admission.
+        assert!(broker.admit_foreground("drafts.csswg.org").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn w3c_uses_validated_typed_paths_and_cannot_supply_post_bodies() {
+        use crate::w3c_catalog::ApiOperation;
+        let source = BulkSource::W3cApi(ApiOperation::Specification {
+            shortname: "css-color-4".into(),
+        });
+        assert_eq!(
+            source.url().expect("typed URL"),
+            "https://api.w3.org/specifications/css-color-4"
+        );
+        assert!(
+            BulkSource::W3cApi(ApiOperation::Specification {
+                shortname: "../private".into()
+            })
+            .url()
+            .is_err()
+        );
+        let broker = BulkBroker::new(BulkConfig::default()).expect("broker");
+        let result = broker
+            .open(
+                BulkRequest {
+                    source,
+                    validators: Validators::default(),
+                    max_bytes: 1024,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    body: b"not Git".to_vec(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            result.err().expect("body rejected before I/O").code,
+            "invalid_input"
+        );
+        assert_eq!(broker.attempt_count(), 0);
     }
 }

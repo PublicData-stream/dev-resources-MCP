@@ -799,6 +799,7 @@ pub(crate) enum GitSource {
     MdnContent,
     MdnCompat,
     Whatwg(crate::whatwg_git::Repo),
+    W3c(crate::w3c_git::Repo),
 }
 impl GitSource {
     fn request(&self, operation: GitOperation) -> BulkSource {
@@ -808,6 +809,10 @@ impl GitSource {
             Self::MdnContent => BulkSource::MdnContentGit(operation),
             Self::MdnCompat => BulkSource::MdnCompatGit(operation),
             Self::Whatwg(repo) => BulkSource::WhatwgGit {
+                repository: repo.clone(),
+                operation,
+            },
+            Self::W3c(repo) => BulkSource::W3cGit {
                 repository: repo.clone(),
                 operation,
             },

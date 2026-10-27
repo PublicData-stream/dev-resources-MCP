@@ -18,6 +18,7 @@ pub struct Research {
     crate_corpus: Option<std::sync::Arc<crate::CrateCorpus>>,
     mdn_research: Option<Arc<crate::mdn_research::MdnResearch>>,
     whatwg_research: Option<Arc<crate::whatwg_research::WhatwgResearch>>,
+    w3c_research: Option<Arc<crate::w3c_research::W3cResearch>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -110,6 +111,7 @@ impl Research {
             crate_corpus: None,
             mdn_research: None,
             whatwg_research: None,
+            w3c_research: None,
         })
     }
 
@@ -145,7 +147,23 @@ impl Research {
         self
     }
 
+    pub fn with_w3c_corpus(mut self, corpus: Arc<crate::W3cCorpus>) -> Self {
+        self.w3c_research = Some(Arc::new(crate::w3c_research::W3cResearch::new(corpus)));
+        self
+    }
+
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if crate::w3c_research::schemas()
+            .iter()
+            .any(|schema| schema["name"] == tool)
+        {
+            return self
+                .w3c_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("W3C corpus storage is not configured."))?
+                .call(tool, input)
+                .await;
+        }
         if crate::whatwg_research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
@@ -233,8 +251,8 @@ impl Research {
             limit: input.limit,
         }
         .checked()?;
-        if input.sources.is_empty() || input.sources.len() > 5 {
-            return Err(Error::invalid("Select one to five sources."));
+        if input.sources.is_empty() || input.sources.len() > 6 {
+            return Err(Error::invalid("Select one to six sources."));
         }
         let mut results = Vec::new();
         let mut unique = std::collections::HashSet::new();
@@ -269,6 +287,15 @@ impl Research {
                     .await
                 }
                 "rustsec" => self.advisory.search(&input.query, page).await,
+                "w3c" => match self.w3c_research.as_ref() {
+                    Some(research) => research
+                        .call(
+                            "w3c_search",
+                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                        )
+                        .await,
+                    None => Err(Error::unavailable("W3C corpus storage is not configured.")),
+                },
                 "whatwg" => match self.whatwg_research.as_ref() {
                     Some(research) => research
                         .call(
@@ -291,7 +318,7 @@ impl Research {
                 },
                 _ => {
                     return Err(Error::invalid(
-                        "Search sources are rfc, cargo, rustsec, mdn, and whatwg.",
+                        "Search sources are rfc, cargo, rustsec, mdn, whatwg, and w3c.",
                     ));
                 }
             };
@@ -304,6 +331,20 @@ impl Research {
     }
 
     async fn fetch(&self, input: FetchInput) -> Result<Value> {
+        if let Some(id) = input.id.strip_prefix("w3c:") {
+            let (specification, anchor) =
+                id.split_once('#').map_or((id, None), |(s, a)| (s, Some(a)));
+            let mut args = json!({"specification":specification,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(32768)});
+            if let Some(anchor) = anchor {
+                args["anchor"] = json!(anchor);
+            }
+            return self
+                .w3c_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("W3C corpus storage is not configured."))?
+                .call("w3c_get", args)
+                .await;
+        }
         if input.id.starts_with("devres://") {
             let mut uri =
                 url::Url::parse(&input.id).map_err(|_| Error::invalid("Invalid resource URI."))?;
@@ -416,6 +457,14 @@ impl Research {
                 .whatwg_research
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("WHATWG corpus storage is not configured."))?
+                .read_resource(uri)
+                .await;
+        }
+        if url.host_str() == Some("w3c") {
+            return self
+                .w3c_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("W3C corpus storage is not configured."))?
                 .read_resource(uri)
                 .await;
         }
@@ -554,13 +603,13 @@ fn schemas() -> Vec<Value> {
     };
     add(
         "search",
-        "Search RFC metadata, crates.io packages, RustSec advisories, local MDN documents or WHATWG standards. Sources are independent; errors and freshness are explicit.",
-        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg"]},"minItems":1,"maxItems":5,"uniqueItems":true},"offset":offset,"limit":limit}),
+        "Search RFC metadata, crates.io packages, RustSec advisories, local MDN documents, WHATWG or W3C standards. Sources are independent; errors and freshness are explicit.",
+        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c"]},"minItems":1,"maxItems":6,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(
         "fetch",
-        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
+        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, w3c:<shortname>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
         json!({"id":{"type":"string","minLength":1,"maxLength":16384},"offset":text_offset,"limit":text_limit}),
         vec!["id"],
     );
@@ -617,6 +666,7 @@ fn schemas() -> Vec<Value> {
     tools.extend(crate::advisory_research::schemas());
     tools.extend(crate::mdn_research::schemas());
     tools.extend(crate::whatwg_research::schemas());
+    tools.extend(crate::w3c_research::schemas());
     tools
 }
 #[derive(Deserialize)]

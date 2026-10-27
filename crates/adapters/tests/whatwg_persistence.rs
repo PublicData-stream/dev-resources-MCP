@@ -53,7 +53,7 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
     let root = tempfile::tempdir().expect("owned fixture blobs");
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("schema six migration");
+        .expect("current schema migration");
     let inspection = sqlx::PgPool::connect(url.as_str())
         .await
         .expect("fixture inspection");
@@ -62,7 +62,7 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
             .fetch_one(&inspection)
             .await
             .expect("schema"),
-        6
+        7
     );
     assert_eq!(
         PgBlobStore::connect(url.as_str(), root.path())

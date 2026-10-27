@@ -3,6 +3,7 @@ pub mod advisory;
 pub mod corpus;
 pub mod crate_corpus;
 pub mod mdn;
+pub mod w3c;
 pub mod whatwg;
 use async_trait::async_trait;
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators};

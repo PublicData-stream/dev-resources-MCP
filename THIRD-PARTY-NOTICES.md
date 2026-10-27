@@ -51,3 +51,17 @@ notices. No dependency implementation is vendored by this supplement.
 A small actual RustSec Git snapshot fixture and its original CC0 terms are retained
 with [capture provenance](crates/adapters/tests/fixtures/rustsec/README.md). Its
 synthetic negative mutations are labeled separately; it is not a full database.
+
+## W3C notice profiles
+
+W3C source notices retain their original terms separately from this repository's
+AGPL license. The fixed required Software and Document NOTICE text used by the
+W3C adapter is attributed to W3C under its
+[2023 Software and Document License](https://www.w3.org/copyright/software-license-2023/).
+The exact repository declaration recognized in synthetic license fixtures was
+observed in the official
+[CSSWG](https://github.com/w3c/csswg-drafts/blob/main/LICENSE.md) and
+[Permissions](https://github.com/w3c/permissions/blob/main/LICENSE.md) repositories.
+It is a notice template, not a blanket authorization for every W3C artifact or
+historical revision. Document-license prose and clearly marked code components
+retain their distinct governing notices; unresolved terms remain metadata only.
