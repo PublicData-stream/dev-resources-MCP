@@ -15,6 +15,17 @@ application contracts; application does not import adapters. Parsers never perfo
 network or filesystem I/O themselves. The small workspace can be split further
 when independent dependencies or ownership justify it.
 
+## Adapter module layout
+
+The adapter crate groups source code, integration tests and examples by provider:
+`mdn`, `rfc`, `crates_io`, `rustsec`, `npm`, `w3c`, `whatwg` and `chromium`.
+Provider namespaces are the canonical Rust imports; existing flat public module
+paths and top-level exports remain supported through re-exports. Shared network,
+archive, bulk, storage, research and standards-processing modules remain at the
+source root. Provider storage files live beside their provider code but remain
+private children of the shared storage module to preserve its ownership boundary.
+Cargo test and example target names remain stable despite their grouped paths.
+
 ## Retrieval and publication
 
 A trusted provider constructs a bounded FetchRequest with a canonical key and URL.

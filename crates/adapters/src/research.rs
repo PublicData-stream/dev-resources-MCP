@@ -1,6 +1,9 @@
 //! Read-only tool composition. Submitted audit data never enters retrieval/storage.
 
-use crate::{advisory, cargo, rfc, rfc_corpus::RfcCorpus, rfc_tools};
+use crate::{
+    crates_io::packages as cargo, rfc::corpus::RfcCorpus, rfc::source as rfc,
+    rfc::tools as rfc_tools, rustsec::advisory,
+};
 use devres_application::Retrieval;
 use devres_domain::{Capture, Error, Result, StoredCapture};
 use serde::{Deserialize, Serialize};
@@ -13,16 +16,16 @@ use std::{
 pub struct Research {
     retrieval: Arc<Retrieval>,
     advisory: advisory::Advisories,
-    advisory_research: Option<crate::advisory_research::AdvisoryResearch>,
+    advisory_research: Option<crate::rustsec::research::AdvisoryResearch>,
     corpus: Option<std::sync::Arc<RfcCorpus>>,
-    crate_corpus: Option<std::sync::Arc<crate::CrateCorpus>>,
-    mdn_research: Option<Arc<crate::mdn_research::MdnResearch>>,
-    whatwg_research: Option<Arc<crate::whatwg_research::WhatwgResearch>>,
-    w3c_research: Option<Arc<crate::w3c_research::W3cResearch>>,
-    chromium_research: Option<Arc<crate::chromium_research::ChromiumResearch>>,
+    crate_corpus: Option<std::sync::Arc<crate::crates_io::CrateCorpus>>,
+    mdn_research: Option<Arc<crate::mdn::research::MdnResearch>>,
+    whatwg_research: Option<Arc<crate::whatwg::research::WhatwgResearch>>,
+    w3c_research: Option<Arc<crate::w3c::research::W3cResearch>>,
+    chromium_research: Option<Arc<crate::chromium::research::ChromiumResearch>>,
     npm: crate::npm::NpmPackages,
-    npm_corpus: Option<Arc<crate::NpmCorpus>>,
-    npm_research: Option<Arc<crate::npm_research::NpmResearch>>,
+    npm_corpus: Option<Arc<crate::npm::NpmCorpus>>,
+    npm_research: Option<Arc<crate::npm::research::NpmResearch>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -127,19 +130,22 @@ impl Research {
         self.corpus = Some(corpus);
         self
     }
-    pub fn with_crate_corpus(mut self, corpus: std::sync::Arc<crate::CrateCorpus>) -> Self {
+    pub fn with_crate_corpus(
+        mut self,
+        corpus: std::sync::Arc<crate::crates_io::CrateCorpus>,
+    ) -> Self {
         self.crate_corpus = Some(corpus);
         self
     }
-    pub fn with_advisory_corpus(mut self, corpus: Arc<crate::AdvisoryCorpus>) -> Self {
-        self.advisory_research = Some(crate::advisory_research::AdvisoryResearch::new(
+    pub fn with_advisory_corpus(mut self, corpus: Arc<crate::rustsec::AdvisoryCorpus>) -> Self {
+        self.advisory_research = Some(crate::rustsec::research::AdvisoryResearch::new(
             corpus.store.clone(),
         ));
         self.advisory = self.advisory.with_corpus(corpus);
         self
     }
 
-    pub fn with_mdn_research(mut self, research: Arc<crate::mdn_research::MdnResearch>) -> Self {
+    pub fn with_mdn_research(mut self, research: Arc<crate::mdn::research::MdnResearch>) -> Self {
         self.mdn_research = Some(research);
         self
     }
@@ -148,27 +154,27 @@ impl Research {
         self.advisory.refresh().await
     }
 
-    pub fn with_whatwg_corpus(mut self, corpus: Arc<crate::WhatwgCorpus>) -> Self {
-        self.whatwg_research = Some(Arc::new(crate::whatwg_research::WhatwgResearch::new(
+    pub fn with_whatwg_corpus(mut self, corpus: Arc<crate::whatwg::WhatwgCorpus>) -> Self {
+        self.whatwg_research = Some(Arc::new(crate::whatwg::research::WhatwgResearch::new(
             corpus,
         )));
         self
     }
 
-    pub fn with_w3c_corpus(mut self, corpus: Arc<crate::W3cCorpus>) -> Self {
-        self.w3c_research = Some(Arc::new(crate::w3c_research::W3cResearch::new(corpus)));
+    pub fn with_w3c_corpus(mut self, corpus: Arc<crate::w3c::W3cCorpus>) -> Self {
+        self.w3c_research = Some(Arc::new(crate::w3c::research::W3cResearch::new(corpus)));
         self
     }
 
-    pub fn with_chromium_corpus(mut self, corpus: Arc<crate::ChromiumCorpus>) -> Self {
-        self.chromium_research = Some(Arc::new(crate::chromium_research::ChromiumResearch::new(
+    pub fn with_chromium_corpus(mut self, corpus: Arc<crate::chromium::ChromiumCorpus>) -> Self {
+        self.chromium_research = Some(Arc::new(crate::chromium::research::ChromiumResearch::new(
             corpus,
         )));
         self
     }
 
-    pub fn with_npm_corpus(mut self, corpus: Arc<crate::NpmCorpus>) -> Self {
-        self.npm_research = Some(Arc::new(crate::npm_research::NpmResearch::new(
+    pub fn with_npm_corpus(mut self, corpus: Arc<crate::npm::NpmCorpus>) -> Self {
+        self.npm_research = Some(Arc::new(crate::npm::research::NpmResearch::new(
             corpus.clone(),
         )));
         self.npm_corpus = Some(corpus);
@@ -183,7 +189,7 @@ impl Research {
             return self.npm.call(tool, input).await;
         }
         if tool == "npm_audit_lockfile" {
-            return crate::npm_audit::audit(
+            return crate::npm::audit::audit(
                 input,
                 self.npm_corpus
                     .clone()
@@ -191,7 +197,7 @@ impl Research {
             )
             .await;
         }
-        if crate::npm_research::schemas()
+        if crate::npm::research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
         {
@@ -202,7 +208,7 @@ impl Research {
                 .call(tool, input)
                 .await;
         }
-        if crate::chromium_research::schemas()
+        if crate::chromium::research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
         {
@@ -213,7 +219,7 @@ impl Research {
                 .call(tool, input)
                 .await;
         }
-        if crate::w3c_research::schemas()
+        if crate::w3c::research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
         {
@@ -224,7 +230,7 @@ impl Research {
                 .call(tool, input)
                 .await;
         }
-        if crate::whatwg_research::schemas()
+        if crate::whatwg::research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
         {
@@ -235,7 +241,7 @@ impl Research {
                 .call(tool, input)
                 .await;
         }
-        if crate::mdn_research::schemas()
+        if crate::mdn::research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
         {
@@ -246,7 +252,7 @@ impl Research {
                 .call(tool, input)
                 .await;
         }
-        if crate::advisory_research::schemas()
+        if crate::rustsec::research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
         {
@@ -257,7 +263,7 @@ impl Research {
                 .call(tool, input)
                 .await;
         }
-        if crate::crate_research::schemas()
+        if crate::crates_io::research::schemas()
             .iter()
             .any(|s| s["name"].as_str() == Some(tool))
         {
@@ -789,15 +795,15 @@ fn schemas() -> Vec<Value> {
         vec!["lockfile"],
     );
     tools.extend(rfc_tools::schemas());
-    tools.extend(crate::crate_research::schemas());
-    tools.extend(crate::advisory_research::schemas());
-    tools.extend(crate::mdn_research::schemas());
-    tools.extend(crate::whatwg_research::schemas());
-    tools.extend(crate::w3c_research::schemas());
-    tools.extend(crate::chromium_research::schemas());
+    tools.extend(crate::crates_io::research::schemas());
+    tools.extend(crate::rustsec::research::schemas());
+    tools.extend(crate::mdn::research::schemas());
+    tools.extend(crate::whatwg::research::schemas());
+    tools.extend(crate::w3c::research::schemas());
+    tools.extend(crate::chromium::research::schemas());
     tools.extend(crate::npm::schemas());
-    tools.extend(crate::npm_research::schemas());
-    tools.extend(crate::npm_audit::schemas());
+    tools.extend(crate::npm::research::schemas());
+    tools.extend(crate::npm::audit::schemas());
     tools
 }
 #[derive(Deserialize)]

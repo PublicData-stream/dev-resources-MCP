@@ -62,7 +62,7 @@ pub enum GitOperation {
 }
 #[derive(Clone, Debug)]
 pub enum BulkSource {
-    Npm(crate::npm_source::Operation),
+    Npm(crate::npm::source::Operation),
     DatabaseDump,
     CrateArchive {
         name: String,
@@ -78,18 +78,18 @@ pub enum BulkSource {
     MdnContentGit(GitOperation),
     MdnCompatGit(GitOperation),
     WhatwgGit {
-        repository: crate::whatwg_git::Repo,
+        repository: crate::whatwg::git::Repo,
         operation: GitOperation,
     },
-    WhatwgPublication(crate::whatwg_catalog::PublicationUrl),
+    WhatwgPublication(crate::whatwg::catalog::PublicationUrl),
     W3cGit {
-        repository: crate::w3c_git::Repo,
+        repository: crate::w3c::git::Repo,
         operation: GitOperation,
     },
-    W3cPublication(crate::w3c_catalog::PublicationUrl),
-    W3cApi(crate::w3c_catalog::ApiOperation),
-    W3cDiscovery(crate::w3c_discovery::DiscoveryOperation),
-    Chromium(crate::chromium_source::Operation),
+    W3cPublication(crate::w3c::catalog::PublicationUrl),
+    W3cApi(crate::w3c::catalog::ApiOperation),
+    W3cDiscovery(crate::w3c::discovery::DiscoveryOperation),
+    Chromium(crate::chromium::source::Operation),
 }
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
@@ -108,7 +108,7 @@ impl BulkSource {
             Self::W3cApi(operation) => operation.url(),
             Self::W3cDiscovery(operation) => operation.url(),
             Self::WhatwgGit { repository, operation } => {
-                crate::whatwg_git::Repo::new(&repository.as_str())?;
+                crate::whatwg::git::Repo::new(&repository.as_str())?;
                 let suffix=match operation { GitOperation::Advertisement=>"info/refs?service=git-upload-pack",GitOperation::UploadPack=>"git-upload-pack" };
                 Ok(format!("{}/{suffix}",repository.source_url()))
             }
@@ -217,8 +217,8 @@ impl BulkSource {
     }
 }
 fn package_identity(name: &str, version: &str) -> Result<()> {
-    crate::cargo::validate_name(name)?;
-    crate::cargo::validate_version(version)?;
+    crate::crates_io::packages::validate_name(name)?;
+    crate::crates_io::packages::validate_version(version)?;
     Ok(())
 }
 pub fn valid_target(target: &str) -> bool {
@@ -241,7 +241,7 @@ fn admitted_host(host: &str) -> Result<&str> {
         | "github.com"
         | "docs.rs" => Ok(host),
         "registry.npmjs.org" | "osv-vulnerabilities.storage.googleapis.com" => Ok(host),
-        host if crate::whatwg_catalog::publication_host(host) => Ok(host),
+        host if crate::whatwg::catalog::publication_host(host) => Ok(host),
         _ => Err(Error::invalid("Source host is not permitted.")),
     }
 }
@@ -323,7 +323,7 @@ impl BulkBroker {
             .map_err(|_| Error::unavailable("Bulk HTTP initialization failed."))?;
         Ok(Self {
             client,
-            w3c_client: crate::w3c_network::client()?,
+            w3c_client: crate::w3c::network::client()?,
             bulk_slots: Arc::new(Semaphore::new(config.max_transfers)),
             foreground_slots: Arc::new(Semaphore::new(2)),
             documentation_slots: Arc::new(Semaphore::new(1)),
@@ -438,7 +438,7 @@ impl BulkBroker {
         let scheduled = {
             let mut rates = self.rates.lock().await;
             let now = Instant::now();
-            let whatwg = crate::whatwg_catalog::publication_host(host);
+            let whatwg = crate::whatwg::catalog::publication_host(host);
             let clock = if whatwg { "whatwg-publications" } else { host };
             let mut scheduled = rates.get(clock).copied().unwrap_or(now).max(now);
             if w3c {
@@ -1837,7 +1837,7 @@ mod w3c_policy_tests {
 
     #[tokio::test]
     async fn w3c_uses_validated_typed_paths_and_cannot_supply_post_bodies() {
-        use crate::w3c_catalog::ApiOperation;
+        use crate::w3c::catalog::ApiOperation;
         let source = BulkSource::W3cApi(ApiOperation::Specification {
             shortname: "css-color-4".into(),
         });

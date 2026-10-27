@@ -18,21 +18,21 @@ use tokio::{
     sync::{Mutex, Semaphore},
 };
 
-#[path = "advisory_storage.rs"]
+#[path = "rustsec/storage.rs"]
 mod advisory_storage;
-#[path = "chromium_storage.rs"]
+#[path = "chromium/storage.rs"]
 mod chromium_storage;
-#[path = "corpus_storage.rs"]
+#[path = "rfc/storage.rs"]
 mod corpus_storage;
-#[path = "crate_storage.rs"]
+#[path = "crates_io/storage.rs"]
 mod crate_storage;
-#[path = "mdn_storage.rs"]
+#[path = "mdn/storage.rs"]
 mod mdn_storage;
-#[path = "npm_storage.rs"]
+#[path = "npm/storage.rs"]
 mod npm_storage;
-#[path = "w3c_storage.rs"]
+#[path = "w3c/storage.rs"]
 mod w3c_storage;
-#[path = "whatwg_storage.rs"]
+#[path = "whatwg/storage.rs"]
 mod whatwg_storage;
 
 const MAX_BLOB: usize = 128 * 1024 * 1024;

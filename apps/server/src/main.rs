@@ -58,14 +58,14 @@ async fn main() -> Result<(), ServerError> {
     );
     let fetcher = Arc::new(devres_adapters::HttpFetcher::with_broker(broker.clone())?);
     let retrieval = Arc::new(devres_application::Retrieval::new(store.clone(), fetcher));
-    let corpus = Arc::new(devres_adapters::RfcCorpus::new(
+    let corpus = Arc::new(devres_adapters::rfc::RfcCorpus::new(
         retrieval.clone(),
         store.clone(),
         &config.storage.blob_dir,
         config.rfc.clone(),
     )?);
     corpus.recover_stages().await?;
-    let crate_corpus = Arc::new(devres_adapters::CrateCorpus::new(
+    let crate_corpus = Arc::new(devres_adapters::crates_io::CrateCorpus::new(
         store.clone(),
         retrieval.clone(),
         broker.clone(),
@@ -74,14 +74,14 @@ async fn main() -> Result<(), ServerError> {
     )?);
     store.attach_artifact_budget(crate_corpus.artifact_budget())?;
     crate_corpus.recover_stages().await?;
-    let advisory_corpus = Arc::new(devres_adapters::AdvisoryCorpus::new(
+    let advisory_corpus = Arc::new(devres_adapters::rustsec::AdvisoryCorpus::new(
         retrieval.clone(),
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.rustsec.clone(),
     )?);
-    let npm_corpus = Arc::new(devres_adapters::NpmCorpus::new(
+    let npm_corpus = Arc::new(devres_adapters::npm::NpmCorpus::new(
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
@@ -101,28 +101,28 @@ async fn main() -> Result<(), ServerError> {
         println!("{}", result?);
         return Ok(());
     }
-    let mdn_corpus = Arc::new(devres_adapters::MdnCorpus::new(
+    let mdn_corpus = Arc::new(devres_adapters::mdn::MdnCorpus::new(
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.mdn.clone(),
     )?);
     mdn_corpus.initialize_status().await?;
-    let whatwg_corpus = Arc::new(devres_adapters::WhatwgCorpus::new(
+    let whatwg_corpus = Arc::new(devres_adapters::whatwg::WhatwgCorpus::new(
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.whatwg.clone(),
     )?);
     whatwg_corpus.initialize_status().await?;
-    let w3c_corpus = Arc::new(devres_adapters::W3cCorpus::new(
+    let w3c_corpus = Arc::new(devres_adapters::w3c::W3cCorpus::new(
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.w3c.clone(),
     )?);
     w3c_corpus.initialize_status().await?;
-    let chromium_corpus = Arc::new(devres_adapters::ChromiumCorpus::new(
+    let chromium_corpus = Arc::new(devres_adapters::chromium::ChromiumCorpus::new(
         store.clone(),
         broker,
         &config.storage.blob_dir,

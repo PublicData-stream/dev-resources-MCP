@@ -149,7 +149,7 @@ fn allowed_url(value: &str) -> Result<String> {
     if value.starts_with("https://registry.npmjs.org/")
         || value.starts_with("https://osv-vulnerabilities.storage.googleapis.com/")
     {
-        return crate::npm_source::validate_url(value).map(str::to_owned);
+        return crate::npm::source::validate_url(value).map(str::to_owned);
     }
     // Inspect the original spelling before URL normalization removes dot segments.
     let after_scheme = value

@@ -309,21 +309,21 @@ pub struct Config {
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
-    pub rfc: devres_adapters::RfcConfig,
+    pub rfc: devres_adapters::rfc::RfcConfig,
     #[serde(default)]
-    pub crates: devres_adapters::CrateConfig,
+    pub crates: devres_adapters::crates_io::CrateConfig,
     #[serde(default)]
-    pub rustsec: devres_adapters::RustSecConfig,
+    pub rustsec: devres_adapters::rustsec::RustSecConfig,
     #[serde(default)]
-    pub mdn: devres_adapters::MdnConfig,
+    pub mdn: devres_adapters::mdn::MdnConfig,
     #[serde(default)]
-    pub whatwg: devres_adapters::WhatwgConfig,
+    pub whatwg: devres_adapters::whatwg::WhatwgConfig,
     #[serde(default)]
-    pub w3c: devres_adapters::W3cConfig,
+    pub w3c: devres_adapters::w3c::W3cConfig,
     #[serde(default)]
-    pub chromium: devres_adapters::ChromiumConfig,
+    pub chromium: devres_adapters::chromium::ChromiumConfig,
     #[serde(default)]
-    pub npm: devres_adapters::NpmConfig,
+    pub npm: devres_adapters::npm::NpmConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
@@ -415,17 +415,18 @@ mod tests {
     }
     #[test]
     fn crate_collection_defaults_and_pause_configuration_are_explicit() {
-        let defaults: devres_adapters::CrateConfig = toml::from_str("").unwrap();
+        let defaults: devres_adapters::crates_io::CrateConfig = toml::from_str("").unwrap();
         assert!(defaults.enabled);
         assert_eq!(defaults.index_refresh_secs, 3600);
         assert_eq!(defaults.static_requests_per_second, 5);
         assert_eq!(defaults.index_requests_per_second, 1);
         defaults.validate().unwrap();
-        let paused: devres_adapters::CrateConfig = toml::from_str("enabled=false").unwrap();
+        let paused: devres_adapters::crates_io::CrateConfig =
+            toml::from_str("enabled=false").unwrap();
         assert!(!paused.enabled);
         paused.validate().unwrap();
         assert!(
-            toml::from_str::<devres_adapters::CrateConfig>(
+            toml::from_str::<devres_adapters::crates_io::CrateConfig>(
                 "arbitrary_url='https://private.invalid'"
             )
             .is_err()
@@ -437,7 +438,7 @@ mod tests {
             "min_free_bytes=1",
         ] {
             assert!(
-                toml::from_str::<devres_adapters::CrateConfig>(bad)
+                toml::from_str::<devres_adapters::crates_io::CrateConfig>(bad)
                     .unwrap()
                     .validate()
                     .is_err()
@@ -446,10 +447,10 @@ mod tests {
     }
     #[test]
     fn npm_catalog_and_advisory_configuration_remain_separate() {
-        let defaults: devres_adapters::NpmConfig = toml::from_str("").unwrap();
+        let defaults: devres_adapters::npm::NpmConfig = toml::from_str("").unwrap();
         assert!(defaults.enabled && defaults.advisories_enabled && defaults.packages.is_empty());
         defaults.validate().unwrap();
-        let configured: devres_adapters::NpmConfig =
+        let configured: devres_adapters::npm::NpmConfig =
             toml::from_str("packages=['@types/is-number']\nadvisories_enabled=false").unwrap();
         configured.validate().unwrap();
         assert!(!configured.advisories_enabled);
@@ -460,7 +461,7 @@ mod tests {
             "min_free_bytes=1",
         ] {
             assert!(
-                toml::from_str::<devres_adapters::NpmConfig>(invalid)
+                toml::from_str::<devres_adapters::npm::NpmConfig>(invalid)
                     .unwrap()
                     .validate()
                     .is_err(),
@@ -468,20 +469,23 @@ mod tests {
             );
         }
         assert!(
-            toml::from_str::<devres_adapters::NpmConfig>("registry='https://untrusted.invalid'")
-                .is_err()
+            toml::from_str::<devres_adapters::npm::NpmConfig>(
+                "registry='https://untrusted.invalid'"
+            )
+            .is_err()
         );
     }
     #[test]
     fn chromium_configuration_is_automatic_and_has_no_caller_destinations() {
-        let enabled: devres_adapters::ChromiumConfig = toml::from_str("").unwrap();
+        let enabled: devres_adapters::chromium::ChromiumConfig = toml::from_str("").unwrap();
         assert!(enabled.enabled);
         enabled.validate().unwrap();
-        let paused: devres_adapters::ChromiumConfig = toml::from_str("enabled=false").unwrap();
+        let paused: devres_adapters::chromium::ChromiumConfig =
+            toml::from_str("enabled=false").unwrap();
         assert!(!paused.enabled);
         paused.validate().unwrap();
         assert!(
-            toml::from_str::<devres_adapters::ChromiumConfig>(
+            toml::from_str::<devres_adapters::chromium::ChromiumConfig>(
                 "repository='https://private.invalid/source'"
             )
             .is_err()
@@ -492,7 +496,7 @@ mod tests {
             "min_free_bytes=1",
         ] {
             assert!(
-                toml::from_str::<devres_adapters::ChromiumConfig>(input)
+                toml::from_str::<devres_adapters::chromium::ChromiumConfig>(input)
                     .unwrap()
                     .validate()
                     .is_err()
@@ -501,14 +505,14 @@ mod tests {
     }
     #[test]
     fn w3c_configuration_can_pause_collection_but_cannot_select_destinations() {
-        let enabled: devres_adapters::W3cConfig = toml::from_str("").unwrap();
+        let enabled: devres_adapters::w3c::W3cConfig = toml::from_str("").unwrap();
         assert!(enabled.enabled);
         enabled.validate().unwrap();
-        let paused: devres_adapters::W3cConfig = toml::from_str("enabled=false").unwrap();
+        let paused: devres_adapters::w3c::W3cConfig = toml::from_str("enabled=false").unwrap();
         assert!(!paused.enabled);
         paused.validate().unwrap();
         assert!(
-            toml::from_str::<devres_adapters::W3cConfig>(
+            toml::from_str::<devres_adapters::w3c::W3cConfig>(
                 "repository='https://private.invalid/source.git'"
             )
             .is_err()
@@ -520,7 +524,7 @@ mod tests {
             "min_free_bytes=1",
         ] {
             assert!(
-                toml::from_str::<devres_adapters::W3cConfig>(input)
+                toml::from_str::<devres_adapters::w3c::W3cConfig>(input)
                     .unwrap()
                     .validate()
                     .is_err()

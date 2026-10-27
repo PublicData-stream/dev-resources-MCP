@@ -1258,7 +1258,7 @@ mod tests {
     }
     #[test]
     fn mismatched_fetch_and_streams_heading_ends_keep_body_out_of_index_title() {
-        use crate::whatwg_index::{IndexDocument, WhatwgIndex};
+        use crate::whatwg::index::{IndexDocument, WhatwgIndex};
         for (standard, markup, anchor, title) in [
             (
                 "fetch",
@@ -1335,7 +1335,7 @@ mod tests {
     }
     #[test]
     fn unicode_symbol_labels_obey_index_byte_bound_without_losing_text() {
-        use crate::whatwg_index::{IndexDocument, WhatwgIndex};
+        use crate::whatwg::index::{IndexDocument, WhatwgIndex};
         for text in [
             format!("{}\u{2019} suffix", "a".repeat(4095)),
             format!("{}\u{2019} suffix", "a".repeat(4093)),
