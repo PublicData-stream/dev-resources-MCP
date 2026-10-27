@@ -28,6 +28,8 @@ mod corpus_storage;
 mod crate_storage;
 #[path = "mdn_storage.rs"]
 mod mdn_storage;
+#[path = "npm_storage.rs"]
+mod npm_storage;
 #[path = "w3c_storage.rs"]
 mod w3c_storage;
 #[path = "whatwg_storage.rs"]
@@ -117,7 +119,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if !(2..=8).contains(&version) {
+        } else if !(2..=9).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -176,6 +178,16 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
             sqlx::query("UPDATE devres_schema SET version=8 WHERE singleton")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
+        if version <= 8 {
+            sqlx::raw_sql(npm_storage::SCHEMA_V9)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx::query("UPDATE devres_schema SET version=9 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;

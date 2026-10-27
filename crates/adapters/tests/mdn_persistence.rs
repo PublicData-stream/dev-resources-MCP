@@ -96,7 +96,7 @@ async fn mdn_owner_fenced_immutable_pair_budget_and_restart() {
             .fetch_one(&database_pool)
             .await
             .expect("schema version"),
-        8
+        9
     );
     assert_eq!(
         PgBlobStore::connect(database_url.as_str(), root.path())

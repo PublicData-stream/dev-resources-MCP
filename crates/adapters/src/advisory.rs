@@ -636,12 +636,18 @@ pub fn audit_worker_main() -> std::io::Result<()> {
     let result: Result<Value> = if bytes.len() > MAX_WORKER_INPUT {
         Err(Error::capacity("Audit worker input exceeds limit."))
     } else {
-        serde_json::from_slice::<WorkerRequest>(&bytes)
+        serde_json::from_slice::<Value>(&bytes)
             .map_err(|_| Error::invalid("Invalid audit worker request."))
             .and_then(|request| {
-                let page = request.page.checked()?;
-                let lockfile = parse_lockfile(&request.lockfile)?;
-                audit_with_snapshot(&lockfile, &request.snapshot, page)
+                if request.get("operation").and_then(Value::as_str) == Some("npm") {
+                    crate::npm_audit::worker_request(request)
+                } else {
+                    let request: WorkerRequest = serde_json::from_value(request)
+                        .map_err(|_| Error::invalid("Invalid audit worker request."))?;
+                    let page = request.page.checked()?;
+                    let lockfile = parse_lockfile(&request.lockfile)?;
+                    audit_with_snapshot(&lockfile, &request.snapshot, page)
+                }
             })
     };
     let mut output = BoundedBytes {

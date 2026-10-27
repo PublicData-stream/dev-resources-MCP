@@ -281,7 +281,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
             .fetch_one(&inspection)
             .await
             .expect("schema"),
-        8
+        9
     );
     // Exercise the actual version-six migration branch with retained older-provider evidence.
     let retained_whatwg = json!({"synthetic":true,"body":"WHATWG evidence predating W3C schema"});
@@ -327,16 +327,16 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         "schema maintenance requires no serving owner"
     );
     // Drop only new-provider tables in this task-created fixture database; earlier captures remain.
-    sqlx::raw_sql("DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; DROP TABLE devres_w3c_statistics; DROP TABLE devres_w3c_state; DROP TABLE devres_w3c_evidence; UPDATE devres_schema SET version=6 WHERE singleton").execute(&inspection).await.expect("prepare isolated schema-six fixture");
+    sqlx::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; DROP TABLE devres_w3c_statistics; DROP TABLE devres_w3c_state; DROP TABLE devres_w3c_evidence; UPDATE devres_schema SET version=6 WHERE singleton").execute(&inspection).await.expect("prepare isolated schema-six fixture");
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("migrate retained schema six to seven");
+        .expect("migrate retained schema six to current");
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
             .fetch_one(&inspection)
             .await
             .expect("upgraded schema"),
-        8
+        9
     );
     assert_eq!(
         store

@@ -66,7 +66,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     wait_owner_release(&inspection).await;
     let count:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM devres_chromium_evidence)+(SELECT count(*) FROM devres_chromium_state)+(SELECT count(*) FROM devres_chromium_statistics)").fetch_one(&inspection).await.unwrap();
     assert_eq!(count, 0, "new tables are empty before isolated downgrade");
-    sqlx::raw_sql("DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
+    sqlx::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
         .execute(&inspection).await.expect("prepare owned schema-seven fixture");
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
@@ -76,7 +76,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
             .fetch_one(&inspection)
             .await
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         store

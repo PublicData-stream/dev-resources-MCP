@@ -4,6 +4,7 @@ pub mod chromium;
 pub mod corpus;
 pub mod crate_corpus;
 pub mod mdn;
+pub mod npm;
 pub mod w3c;
 pub mod whatwg;
 use async_trait::async_trait;
