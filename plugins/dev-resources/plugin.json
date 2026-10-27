@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dev-resources",
+  "version": "0.1.0",
+  "description": "Research standards, browser behavior, Rust/npm packages, and lockfile advisories with retained public evidence from dev-resources-MCP.",
+  "author": {"name": "PublicData-stream"},
+  "repository": "https://github.com/PublicData-stream/dev-resources-MCP",
+  "license": "AGPL-3.0-only",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Developer Resources",
+        "shortDescription": "Developer evidence research",
+        "longDescription": "Research technical standards, browser support, exact Rust/npm package releases, and lockfile advisories using provenance-bearing MCP evidence.",
+        "developerName": "PublicData-stream"
+      }
+    }
+  }
+}
