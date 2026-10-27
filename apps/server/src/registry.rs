@@ -272,4 +272,36 @@ mod tests {
                 .is_valid(&json!({"query":"event","sources":["whatwg"]}))
         );
     }
+
+    #[test]
+    fn w3c_interfaces_preserve_the_local_read_boundary() {
+        let mut registry =
+            server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .unwrap();
+        }
+        assert!(registry.tools.len() <= 64);
+        assert!(
+            registry.tools["w3c_get"]
+                .validator
+                .is_valid(&json!({"specification":"css-color-4","anchor":"color"}))
+        );
+        for input in [
+            json!({"specification":"css-color-4","url":"https://untrusted.invalid"}),
+            json!({"standard":"css-color-4"}),
+            json!({"specification":"css-color-4","limit":32769}),
+        ] {
+            assert!(!registry.tools["w3c_get"].validator.is_valid(&input));
+        }
+        assert!(
+            !registry.tools["w3c_corpus_status"]
+                .validator
+                .is_valid(&json!({"enabled":true}))
+        );
+        assert!(registry.tools["search"].validator.is_valid(
+            &json!({"query":"color","sources":["rfc","cargo","rustsec","mdn","whatwg","w3c"]})
+        ));
+    }
 }

@@ -312,3 +312,94 @@ class SyntheticWhatwgTests(unittest.TestCase):
             smoke.synthetic_whatwg(SyntheticWhatwgClient(wrong_symbol=True))
         with self.assertRaisesRegex(AssertionError, "immutable resource changed"):
             smoke.synthetic_whatwg(SyntheticWhatwgClient(changed_resource=True))
+
+
+class SyntheticW3cClient:
+    def __init__(self, upstream=False, script_leak=False, wrong_symbol=False, changed_resource=False):
+        self.calls = []
+        self.upstream = upstream
+        self.script_leak = script_leak
+        self.wrong_symbol = wrong_symbol
+        self.changed_resource = changed_resource
+        self.resources = {}
+
+    def tool(self, name, arguments, revision=smoke.MODERN):
+        self.calls.append((name, revision))
+        if arguments.get("snapshot") != smoke.SYNTHETIC_W3C:
+            raise AssertionError("W3C fixture request must pin its snapshot")
+        if name == "w3c_search":
+            return {"total": 1, "results": [{"specification": "fixture"}]}
+        if name == "w3c_symbol_get":
+            representation = "symbol"
+            text = "WrongToken" if self.wrong_symbol else "FixtureToken"
+        elif name == "w3c_get":
+            representation = arguments.get("representation", "text")
+            text = ("<h1 id=fixture>Synthetic W3C storage fixture</h1><script>fixture_hidden_script()</script>"
+                    if representation == "source" else smoke.SYNTHETIC_W3C_TEXT)
+            if self.script_leak and representation == "text":
+                text += "fixture_hidden_script()"
+        else:
+            raise AssertionError("unexpected W3C fixture operation")
+        uri = f"devres://w3c/fixture/{smoke.SYNTHETIC_W3C}/{representation}/aW5kZXguaHRtbA"
+        metadata = {"copyright": "Synthetic fixture authors", "publication_status": "synthetic"}
+        self.resources[uri] = {"text": "changed" if self.changed_resource else text, "_meta": {"source_metadata": metadata}}
+        if representation == "bytes":
+            self.resources[uri + "?limit=8"] = {"blob": "changed" if self.changed_resource else "PGgxIGlkPWY=", "_meta": {"source_metadata": metadata}}
+        return {"selection": {"snapshot": smoke.SYNTHETIC_W3C,
+                "source_url": "https://www.w3.org/TR/dom/" if self.upstream else "https://fixtures.invalid/w3c",
+                "coverage": {"synthetic": True}}, "source_metadata": metadata, "derived_notice": "Synthetic derivation notice", "page": {"text": text, "base64": "PGgxIGlkPWY="}, "resource_uri": uri}
+
+    def call(self, method, params, revision=smoke.MODERN):
+        self.calls.append((method, revision))
+        if method == "resources/read":
+            return {"contents": [self.resources[params["uri"]]]}
+        if method == "tools/call" and params["name"] == "fetch":
+            return {"structuredContent": {"contents": [self.resources[params["arguments"]["id"]]]}}
+        raise AssertionError("unexpected W3C fixture RPC")
+
+
+class SyntheticW3cTests(unittest.TestCase):
+    def test_fixture_covers_both_revisions_and_all_immutable_representations(self):
+        client = SyntheticW3cClient()
+        smoke.synthetic_w3c(client)
+        self.assertEqual({revision for name, revision in client.calls if name == "w3c_get"},
+                         {smoke.MODERN, smoke.LEGACY})
+        self.assertEqual(sum(name == "resources/read" for name, _ in client.calls), 8)
+        self.assertEqual(sum(name == "tools/call" for name, _ in client.calls), 8)
+
+    def test_fixture_cannot_claim_official_upstream_provenance(self):
+        with self.assertRaisesRegex(AssertionError, "invented upstream"):
+            smoke.synthetic_w3c(SyntheticW3cClient(upstream=True))
+
+    def test_script_text_leak_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "inert text"):
+            smoke.synthetic_w3c(SyntheticW3cClient(script_leak=True))
+
+    def test_changed_symbol_or_immutable_resource_fails(self):
+        with self.assertRaisesRegex(AssertionError, "symbol changed"):
+            smoke.synthetic_w3c(SyntheticW3cClient(wrong_symbol=True))
+        with self.assertRaisesRegex(AssertionError, "immutable resource changed"):
+            smoke.synthetic_w3c(SyntheticW3cClient(changed_resource=True))
+
+
+class SyntheticW3cNoticeTests(unittest.TestCase):
+    def test_missing_copyright_and_derived_notices_fail_acceptance(self):
+        class MissingNotice(SyntheticW3cClient):
+            def tool(self, name, arguments, revision=smoke.MODERN):
+                result=super().tool(name,arguments,revision)
+                if name=="w3c_get":
+                    result.pop("source_metadata",None)
+                return result
+        with self.assertRaisesRegex(AssertionError,"copyright notice missing"):
+            smoke.synthetic_w3c(MissingNotice())
+
+    def test_missing_resource_notice_fails_acceptance(self):
+        class MissingResourceNotice(SyntheticW3cClient):
+            def call(self, method, params, revision=smoke.MODERN):
+                result=super().call(method,params,revision)
+                value=result.get("structuredContent",result)
+                if "contents" in value:
+                    value["contents"][0].pop("_meta",None)
+                return result
+        with self.assertRaisesRegex(AssertionError,"resource copyright missing"):
+            smoke.synthetic_w3c(MissingResourceNotice())

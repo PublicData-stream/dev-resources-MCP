@@ -439,6 +439,167 @@ async fn check_whatwg(
     Ok(())
 }
 
+const W3C_IDENTITY: &[u8] = b"devres:storage-probe:w3c:v1";
+const W3C_SOURCE: &str = "<h1 id=fixture>Synthetic W3C storage fixture</h1><p>Offline fixture token research.</p><dfn id=fixture-token>FixtureToken</dfn><script>fixture_hidden_script()</script>";
+async fn seed_w3c(
+    store: &PgBlobStore,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_adapters::{
+        bulk::BulkArtifactStore,
+        w3c_index::{IndexDocument, W3cIndex},
+        w3c_inventory as inventory,
+    };
+    use devres_application::w3c::{Member, PROCESSOR_VERSION, Snapshot, W3cStore};
+    use tokio_util::sync::CancellationToken;
+    let id = fixture_hash(W3C_IDENTITY);
+    if store.w3c_get("snapshots", &id).await?.is_some() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(root.join("w3c/raw-artifacts"))?;
+    let raw = BulkArtifactStore::new(root.join("w3c/raw-artifacts"), 64 * 1024 * 1024)?;
+    let artifact = raw
+        .capture_bytes(W3C_SOURCE.as_bytes().to_vec(), CancellationToken::new())
+        .await?;
+    let document = devres_adapters::w3c_processing::process_document(
+        "index.html",
+        W3C_SOURCE.as_bytes(),
+        CancellationToken::new(),
+    )?;
+    let index_id = fixture_hash(b"devres:storage-probe:w3c:index:v1");
+    let mut projection = serde_json::to_value(&document)?;
+    projection["index_ids"] = json!([index_id]);
+    let projection_id = fixture_hash(&serde_json::to_vec(&projection)?);
+    store
+        .w3c_put("projections", &projection_id, &projection)
+        .await?;
+    let empty = inventory::empty(store).await?;
+    let inventory = inventory::update(
+        store,
+        &empty,
+        "index.html",
+        Some(Member {
+            path: "index.html".into(),
+            oid: artifact.body_hash.clone(),
+            mode: "100644".into(),
+            kind: "html".into(),
+            projection: Some(projection_id),
+            raw: Some(json!({"artifact":artifact,"synthetic":true})),
+            gaps: vec![],
+        }),
+    )
+    .await?;
+    let index = W3cIndex::new(root)?
+        .publish(
+            None,
+            vec![IndexDocument {
+                id: index_id,
+                standard: "fixture".into(),
+                edition: "synthetic".into(),
+                path: "index.html".into(),
+                title: document.title,
+                text: document.text,
+                kind: "section".into(),
+                metadata: json!({"anchor":"fixture","synthetic":true}),
+            }],
+            CancellationToken::new(),
+        )
+        .await?;
+    let snapshot = Snapshot {
+        id: id.clone(),
+        standard: "fixture".into(),
+        repository: "synthetic/w3c-fixture".into(),
+        revision: fixture_hash(b"synthetic-w3c-revision")[..40].into(),
+        tree: fixture_hash(W3C_SOURCE.as_bytes()),
+        parents: vec![],
+        committed_at: 0,
+        inventory,
+        processor_version: PROCESSOR_VERSION,
+        index,
+        coverage: json!({"synthetic":true,"accounted":true,"members":1,"publication_status":"synthetic","publication_role":"synthetic","license":{"decision":"approved","copyright":"Synthetic fixture authors","notice":"First-party synthetic acceptance fixture; not W3C material.","license_url":"https://www.gnu.org/licenses/agpl-3.0.html"}}),
+        source_url: "https://fixtures.invalid/devres/storage-probe/w3c".into(),
+        representation: "html".into(),
+        validated_at: 0,
+    };
+    store
+        .w3c_put("snapshots", &id, &serde_json::to_value(snapshot)?)
+        .await?;
+    Ok(())
+}
+async fn check_w3c(
+    store: std::sync::Arc<PgBlobStore>,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_adapters::{
+        W3cCorpus,
+        bulk::{BulkBroker, BulkConfig},
+        w3c_research::W3cResearch,
+    };
+    use devres_application::w3c::W3cConfig;
+    let research = W3cResearch::new(std::sync::Arc::new(W3cCorpus::new(
+        store,
+        std::sync::Arc::new(BulkBroker::new(BulkConfig::default())?),
+        root,
+        W3cConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    )?));
+    let snapshot = fixture_hash(W3C_IDENTITY);
+    let detail = research
+        .call(
+            "w3c_get",
+            json!({"specification":"fixture","snapshot":snapshot}),
+        )
+        .await?;
+    if detail["selection"]["coverage"]["synthetic"] != true
+        || detail["selection"]["source_url"] != "https://fixtures.invalid/devres/storage-probe/w3c"
+        || !detail["page"]["text"].as_str().is_some_and(|s| {
+            s.contains("Synthetic W3C storage fixture") && !s.contains("fixture_hidden_script")
+        })
+    {
+        return Err("Synthetic W3C text/provenance mismatch".into());
+    }
+    let source = research
+        .call(
+            "w3c_get",
+            json!({"specification":"fixture","snapshot":snapshot,"representation":"source"}),
+        )
+        .await?;
+    if source["page"]["text"] != W3C_SOURCE {
+        return Err("Synthetic W3C original source mismatch".into());
+    }
+    let symbol=research.call("w3c_symbol_get",json!({"specification":"fixture","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
+    if symbol["page"]["text"] != "FixtureToken"
+        || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
+        || !symbol["derived_notice"].is_string()
+    {
+        return Err("Synthetic W3C symbol mismatch".into());
+    }
+    for selected in [&detail, &source, &symbol] {
+        let resource = research
+            .read_resource(
+                selected["resource_uri"]
+                    .as_str()
+                    .ok_or("Missing W3C fixture resource")?,
+            )
+            .await?;
+        if resource["contents"][0]["text"] != selected["page"]["text"]
+            || resource["contents"][0]["_meta"]["source_metadata"]["copyright"]
+                != "Synthetic fixture authors"
+        {
+            return Err("Synthetic W3C resource mismatch".into());
+        }
+    }
+    let found = research
+        .call("w3c_search", json!({"snapshot":snapshot,"query":"token"}))
+        .await?;
+    if found["total"] != 1 {
+        return Err("Synthetic W3C selected search mismatch".into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = std::env::var("DATABASE_URL")?;
@@ -462,6 +623,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed_whatwg(&store, std::path::Path::new(&root))
                 .await
                 .map_err(|error| format!("Synthetic WHATWG fixture seeding failed: {error}"))?;
+            seed_w3c(&store, std::path::Path::new(&root))
+                .await
+                .map_err(|error| format!("Synthetic W3C fixture seeding failed: {error}"))?;
             store
                 .publish(
                     &request,
@@ -489,6 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_advisory(&store).await?;
     check_mdn(&store, std::path::Path::new(&root)).await?;
     check_whatwg(store.clone(), std::path::Path::new(&root)).await?;
+    check_w3c(store.clone(), std::path::Path::new(&root)).await?;
     println!("{} {}", stored.capture.id, stored.capture.body_hash);
     Ok(())
 }

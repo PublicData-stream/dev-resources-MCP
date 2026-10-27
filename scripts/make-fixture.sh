@@ -28,3 +28,14 @@ chmod 644 "$scratch/fixture/cert/"*.pem
 chmod 600 "$scratch/fixture/cert/"*-key.pem
 cp "$repo/deploy/oxibelt/backend.toml" "$scratch/fixture/"
 cp "$repo/deploy/oxibelt/oxibelt.toml" "$scratch/fixture/config/"
+
+# Synthetic harnesses never admit W3C provider traffic, regardless of example defaults.
+python3 - "$scratch/fixture/backend.toml" <<'PYFIXTURE'
+import pathlib, re, sys
+p=pathlib.Path(sys.argv[1]); text=p.read_text()
+if re.search(r"(?m)^\[w3c\]\s*$",text):
+    text=re.sub(r"(?ms)(^\[w3c\]\s*\n)(.*?)(?=^\[|\Z)",lambda m: m[1]+re.sub(r"(?m)^enabled\s*=.*$","enabled = false",m[2]) if re.search(r"(?m)^enabled\s*=",m[2]) else m[1]+"enabled = false\n"+m[2],text)
+else:
+    text += "\n[w3c]\nenabled = false\n"
+p.write_text(text)
+PYFIXTURE

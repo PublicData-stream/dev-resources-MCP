@@ -102,6 +102,7 @@ async fn main() -> Result<(), ServerError> {
     let mut has_advisory_corpus = false;
     let mut has_mdn_corpus = false;
     let mut has_whatwg_corpus = false;
+    let mut has_w3c_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -155,6 +156,22 @@ async fn main() -> Result<(), ServerError> {
                     "whatwg_snapshots",
                     "whatwg_compare",
                     "whatwg_corpus_status",
+                ]
+                .iter()
+                .all(|name| tools.iter().any(|tool| tool["name"] == *name))
+            });
+            has_w3c_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
+                [
+                    "w3c_catalog_search",
+                    "w3c_search",
+                    "w3c_get",
+                    "w3c_symbol_search",
+                    "w3c_symbol_get",
+                    "w3c_references",
+                    "w3c_history",
+                    "w3c_snapshots",
+                    "w3c_compare",
+                    "w3c_corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
@@ -505,6 +522,141 @@ async fn main() -> Result<(), ServerError> {
             if resource["result"]["contents"][0]["text"] != selected["page"]["text"] {
                 return Err("Immutable WHATWG resource changed through WebTransport".into());
             }
+        }
+    }
+    if has_w3c_corpus {
+        let status = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            40,
+            "w3c_corpus_status",
+            json!({}),
+        )
+        .await?;
+        if !status["collection_enabled"].is_boolean() {
+            return Err("W3C corpus status missing through WebTransport".into());
+        }
+    }
+    if let Ok(snapshot) = std::env::var("DEVRES_PROBE_W3C_SNAPSHOT") {
+        if !has_w3c_corpus {
+            return Err("W3C discovery missing through WebTransport".into());
+        }
+        if snapshot.len() != 64
+            || !snapshot
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err("Invalid synthetic W3C snapshot".into());
+        }
+        let detail = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            41,
+            "w3c_get",
+            json!({"specification":"fixture","snapshot":snapshot}),
+        )
+        .await?;
+        if detail["selection"]["snapshot"] != snapshot
+            || detail["selection"]["coverage"]["synthetic"] != true
+            || !detail["selection"]["source_url"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("https://fixtures.invalid/"))
+            || !detail["page"]["text"].as_str().is_some_and(|s| {
+                s.contains("Synthetic W3C storage fixture") && !s.contains("fixture_hidden_script")
+            })
+        {
+            return Err("Synthetic W3C document/provenance mismatch through WebTransport".into());
+        }
+        let original = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            42,
+            "w3c_get",
+            json!({"specification":"fixture","snapshot":snapshot,"representation":"source"}),
+        )
+        .await?;
+        if !original["page"]["text"].as_str().is_some_and(|s| {
+            s.starts_with("<h1 id=fixture>") && s.contains("fixture_hidden_script()")
+        }) {
+            return Err("Original W3C source changed through WebTransport".into());
+        }
+        let found = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            43,
+            "w3c_search",
+            json!({"snapshot":snapshot,"query":"token"}),
+        )
+        .await?;
+        if found["total"] != 1 || found["results"][0]["specification"] != "fixture" {
+            return Err("W3C snapshot search mismatch through WebTransport".into());
+        }
+        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,44,"w3c_symbol_get",json!({"specification":"fixture","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
+        if symbol["page"]["text"] != "FixtureToken"
+            || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
+            || !symbol["derived_notice"].is_string()
+        {
+            return Err("W3C symbol mismatch through WebTransport".into());
+        }
+        for (id, selected) in [(45, &detail), (46, &original), (47, &symbol)] {
+            let uri = selected["resource_uri"]
+                .as_str()
+                .ok_or("Missing immutable W3C resource")?;
+            if !uri.starts_with(&format!("devres://w3c/fixture/{snapshot}/")) {
+                return Err("W3C resource lost snapshot binding".into());
+            }
+            let mut params = json!({"uri":uri});
+            if revision == "2026-07-28" {
+                params["_meta"] = metadata(revision);
+            }
+            let resource = exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":params}),
+            )
+            .await?;
+            if resource["result"]["contents"][0]["text"] != selected["page"]["text"]
+                || resource["result"]["contents"][0]["_meta"]["source_metadata"]["copyright"]
+                    != "Synthetic fixture authors"
+            {
+                return Err("Immutable W3C resource changed through WebTransport".into());
+            }
+        }
+        let binary = tool_exchange(&mut send, &mut reader, &budget, revision, 48, "w3c_get", json!({"specification":"fixture","snapshot":snapshot,"representation":"bytes","limit":8})).await?;
+        if binary["page"]["base64"] != "PGgxIGlkPWY=" {
+            return Err("W3C byte page changed through WebTransport".into());
+        }
+        let uri = format!(
+            "{}?limit=8",
+            binary["resource_uri"]
+                .as_str()
+                .ok_or("Missing W3C bytes resource")?
+        );
+        let mut params = json!({"uri":uri});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let bytes_resource = exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":49,"method":"resources/read","params":params}),
+        )
+        .await?;
+        if bytes_resource["result"]["contents"][0]["blob"] != "PGgxIGlkPWY="
+            || bytes_resource["result"]["contents"][0]["_meta"]["source_metadata"]["copyright"]
+                != "Synthetic fixture authors"
+        {
+            return Err("Immutable W3C bytes or notices changed through WebTransport".into());
         }
     }
     connection.close(0_u32.into(), b"probe complete");

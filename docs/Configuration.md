@@ -6,7 +6,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, `mdn`, and `whatwg` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, `mdn`, `whatwg`, and `w3c` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -298,3 +298,40 @@ isolated `/tmp` workflow in [Operations](operations.md).
 Corpus status labels gap totals as covering all retained snapshot generations;
 processor upgrades preserve earlier gaps. A full acceptance receipt verifies its
 named processor against the frozen source inventory separately.
+
+## W3C defaults
+
+Omitting `[w3c]` enables supervised current-first collection and resumable historical
+acquisition. `enabled=false` pauses scheduling without deleting evidence or disabling
+local research. Disposable fixture configurations disable collection explicitly.
+
+| `w3c` field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Current and history collection |
+| `catalog_refresh_secs` | `3600` | Official catalog validation target |
+| `ref_refresh_secs` | `3600` | Qualified repository ref validation target |
+| `publication_refresh_secs` | `86400` | Moving publication validation target |
+| `collection_interval_secs` | `1` | Resumable worker iteration delay |
+| `publication_interval_secs` | `300` | Historical publication batching target |
+| `max_processing_workers` | `1` | Processing admission, accepts 1..2 |
+| `max_git_bytes` | `8589934592` | Disposable Git storage per repository |
+| `min_free_bytes` | `1073741824` | Free-space admission reserve |
+| `max_archive_storage_bytes` | omitted | Optional permanent-artifact quota |
+
+Validation follows the WHATWG interval/storage ranges. W3C acquisition shares one
+attempt/second across its family and the existing destination-host clocks, including
+GitHub. Retries consume the same budgets. Quota/headroom failures pause work without
+removing history; the quota excludes PostgreSQL, indexes and disposable mirrors.
+Intervals and conservative budgets are application policy, not provider permission
+or completion guarantees.
+
+Text input caps at 64 MiB and processing at 15 seconds/100,000 items. New structural
+projections cap input at 4 MiB, nesting at 64 and individual scalars/cells at 64 KiB;
+larger supported text falls back to source-text projection with a coverage gap.
+PDF worker and paged reconstruction bounds match WHATWG. Raw intake retains its
+separate streaming byte limit; public pages remain at most 32 KiB.
+
+Schema 7 is forward-only. Back up W3C raw captures, qualified Git history,
+projections, inventories, state and search indexes together. Reprocessing and
+restoration never advance upstream validation. Unknown-license content is metadata
+only until its scope is established, including mixed historical Git packs.

@@ -241,3 +241,35 @@ content-addressed PostgreSQL chunks/objects and structurally shared Merkle seque
 a small manifest identifies each source projection. Schema 6 also maintains exact
 aggregate counters transactionally with immutable inserts. Raw publication artifacts
 have immutable 4 MiB range proofs so byte pages verify bounded local blocks.
+
+## W3C acquisition and research
+
+W3C has separate application contracts, source admission, durable state and local
+research. Schema 7 adds owner-fenced immutable evidence, processing inventories,
+statistics and atomic published views. Existing provider schemas/capture identities
+are unchanged. Acquisition I/O remains outside storage transactions; losing the
+serving ownership fence fails closed.
+
+A catalog observation records TR identities and version metadata. Qualification
+connects publications, editor drafts, repositories and report-specific source paths
+to exact official evidence. Current publication work precedes resumable history;
+ref movements, catalog removals and failed refreshes preserve earlier captures.
+Shared repositories have one mirror and revision-bound per-report inventories.
+
+The private standards-processing engine is shared through a WHATWG compatibility
+facade and an independent W3C dispatch/version. W3C adds bounded XML/XHTML and
+structured-data projections without expanding WHATWG's dispatch or changing its
+serialized output, diagnostics, hashes or processor version. Neither processor
+executes upstream content. Search reuses the immutable selected-membership engine.
+
+W3C outbound requests use typed evidence-qualified source descriptors, connection-time
+public-address DNS filtering, existing transfer admission and shared host clocks.
+License qualification precedes durable body/pack publication. Bounded temporary
+preflight cannot create public resources. Catalog metadata and blocked obligations
+remain visible when licensing or source mappings are unresolved.
+
+Public tools read published local evidence. Immutable selections and cursors bind
+catalog membership, source snapshots, validation observations and index references;
+refresh cannot retarget old citations. Rebuild/restoration preserves validation time.
+Fallback views identify catalog-latest and effective editions separately. Request-only
+audit privacy remains unchanged across resources, storage, logs and errors.

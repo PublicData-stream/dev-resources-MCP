@@ -219,3 +219,49 @@ Ordinary checks remain synthetic. Fixed-record smoke and explicitly invoked,
 retained full frozen-observation acceptance are separate evidence. Full accounting
 never substitutes for successful projection, complete rendered history, measured
 capacity, hosted native architecture checks or production deployment.
+
+## W3C technical reports
+
+The [public W3C API](https://www.w3.org/api/) supplies paginated report identities
+and version histories; the [TR index](https://www.w3.org/TR/) and publication
+navigation provide reconciliation evidence. The versioned
+[browser-specs catalog](https://github.com/w3c/browser-specs) can supplement explicit
+editor-draft/source mappings but is not exhaustive historical coverage.
+All TR statuses are retained. Separate translations, CG/BG-only reports, test suites,
+issues, administrative repositories and arbitrary site pages are not corpus seeds.
+
+Explicit official metadata can qualify external editor-draft and smart-HTTPS Git
+origins. Every admission retains its supporting observation. Publication navigation
+can identify documents/editions and advertised support formats; ordinary body links,
+examples and assets cannot expand acquisition. HTTPS, canonical identity, public DNS
+addresses, no ambient proxies and redirect refusal apply before network transfer.
+Git uses the private mediated relay, without checkout, hooks, submodule traversal,
+credential helpers or repository-selected programs. Shared repositories are mirrored
+once and mapped to individual reports using revision-bound source evidence.
+
+Catalog/ref validation targets one hour; moving publications one day. W3C attempts
+share a one-per-second family budget plus destination-host clocks and the existing
+single retry owner. The [API rate policy](https://www.w3.org/api/#rate-limits) is an
+upper bound, not permission for bulk mirroring. Conservative service defaults do
+not claim provider endorsement. Fixed-record acceptance never load-tests providers.
+
+Preserve the applicable versioned terms rather than applying one license to an
+entire organization or all history. The
+[2023 document license](https://www.w3.org/copyright/document-license-2023/) requires
+source links, original copyright and status for copies/portions and distinguishes
+code components and permitted implementation-support derivatives. Original,
+permissive, predecessor and third-party notices remain separate evidence. Public
+projections identify their source and include required derivation notices; they do
+not replace the authoritative specification.
+
+License preflight is bounded and temporary. Unresolved content is metadata only;
+no permanent raw capture, public resource, search excerpt or comparison is admitted.
+Mixed Git packs wait until their historical license scope is established. Missing
+license or mapping evidence is an explicit gap, not permission inferred from public
+availability or GitHub license detection.
+
+Published editions, source revisions and editor drafts retain distinct identities.
+Only successfully captured TRs become default membership, with explicit older-edition
+fallback where necessary. Advertised ancestry and observed publication history are
+separate coverage claims; unreachable objects and disappeared publications remain
+unobserved. Frozen full-corpus acceptance is separate from bounded live checks.

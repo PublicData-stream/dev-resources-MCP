@@ -318,6 +318,8 @@ pub struct Config {
     pub mdn: devres_adapters::MdnConfig,
     #[serde(default)]
     pub whatwg: devres_adapters::WhatwgConfig,
+    #[serde(default)]
+    pub w3c: devres_adapters::W3cConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
@@ -327,6 +329,7 @@ impl Config {
         self.rustsec.validate()?;
         self.mdn.validate()?;
         self.whatwg.validate()?;
+        self.w3c.validate()?;
         for access in [
             AccessPolicy {
                 allowed_hosts: self.http.allowed_hosts.clone(),
@@ -429,6 +432,34 @@ mod tests {
         ] {
             assert!(
                 toml::from_str::<devres_adapters::CrateConfig>(bad)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn w3c_configuration_can_pause_collection_but_cannot_select_destinations() {
+        let enabled: devres_adapters::W3cConfig = toml::from_str("").unwrap();
+        assert!(enabled.enabled);
+        enabled.validate().unwrap();
+        let paused: devres_adapters::W3cConfig = toml::from_str("enabled=false").unwrap();
+        assert!(!paused.enabled);
+        paused.validate().unwrap();
+        assert!(
+            toml::from_str::<devres_adapters::W3cConfig>(
+                "repository='https://private.invalid/source.git'"
+            )
+            .is_err()
+        );
+        for input in [
+            "catalog_refresh_secs=0",
+            "max_processing_workers=3",
+            "max_git_bytes=1",
+            "min_free_bytes=1",
+        ] {
+            assert!(
+                toml::from_str::<devres_adapters::W3cConfig>(input)
                     .unwrap()
                     .validate()
                     .is_err()

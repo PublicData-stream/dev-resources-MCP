@@ -6,7 +6,7 @@ This service is anonymous and read-only with respect to caller data and upstream
 systems. Reads may populate internal public-source caches and permanent archives.
 It supports RFC metadata/text, crates.io metadata/published sources, local package
 and API research from crates.io/docs.rs captures, MDN content/browser compatibility,
-RustSec advisories, WHATWG standards, and supplied
+RustSec advisories, WHATWG and W3C standards, and supplied
 Cargo.lock matching. No public administrative operations,
 package execution, dependency resolution, arbitrary URL fetching, or user accounts
 are exposed. Missing or unsupported coverage is explicit.
@@ -39,8 +39,8 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | Tool | Inputs and result |
 | --- | --- |
 | `server_info` | Identity, supported revisions, licensing and corresponding-source URL |
-| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
-| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, or immutable `devres://` resource URI |
+| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
+| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, `w3c:<shortname>#<anchor>`, or immutable `devres://` resource URI |
 | `rfc_search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc_get` | RFC number and byte page; published text |
 | `rfc_metadata` | RFC number, optional research snapshot; rich official metadata |
@@ -360,3 +360,55 @@ URL prefixes; moving a publication beneath a versioned URL does not itself mark 
 section as removed and added. Original Git member paths stay exact. A retained member
 with failed projection is incomplete comparison evidence, rather than proof that its
 previous sections were removed. Original-source comparison remains available.
+
+## W3C technical-report research
+
+W3C collection covers the official technical-report catalog, including drafts,
+Recommendations, Notes, registries and retired reports, discoverable historical
+editions, and officially linked editor drafts and source repositories. Separate
+translations, CG/BG-only reports and unrelated organization repositories are outside
+this corpus. Missing or withdrawn evidence is not reconstructed or silently omitted.
+
+The default selection is the latest successfully captured published TR for each
+report, never an implicit editor-draft replacement. Responses distinguish the
+catalog's latest edition from an older effective selection and explain fallback.
+Default evidence is stale after 24 hours and unavailable beyond seven days;
+explicit historical snapshots/views remain readable. Public research is local and
+does not initiate collection. Collection is current-first with resumable history.
+
+| Tool | Capability |
+| --- | --- |
+| `w3c_catalog_search` | Captured report metadata, publication status and coverage |
+| `w3c_search`, `w3c_get` | Selected-membership text search; text, anchored sections, original source and byte pages |
+| `w3c_symbol_search`, `w3c_symbol_get` | Definitions, IDL declarations and explicitly marked algorithms |
+| `w3c_references` | Captured references with qualified local resolution |
+| `w3c_snapshots`, `w3c_history` | Immutable representations, published editions, revisions and ref observations |
+| `w3c_compare` | Observed source, normalized section or symbol differences |
+| `w3c_corpus_status` | Separate discovery, license, acquisition, ancestry, processing, index and freshness evidence |
+
+W3C tools use `specification` for the report shortname. `snapshot` and `view`
+selectors are exclusive; use snapshots to select editor drafts or Git sources.
+Lists default to 20/max100, offsets cap at 10,000 and bound cursors continue beyond
+that window. History continuations preserve their frozen cutoff, including across
+empty filtered pages. Text/byte pages cap at 32 KiB; text offsets are UTF-8 byte
+boundaries. Duplicate anchors/symbols require explicit disambiguation.
+
+`w3c:<shortname>#<anchor>` is a generic fetch identifier. Immutable text, source,
+bytes, section and symbol resources use
+`devres://w3c/<shortname>/<snapshot>/<representation>/<base64url-path>`.
+Pages and copied portions include source identity, original copyright/status,
+applicable license evidence and required attribution/derivation notices.
+
+HTML/XHTML, XML/SVG, Bikeshed, Markdown, IDL, PDF and supported structured data are
+inert projections. XML has no external entities, XInclude, schema validation or
+XSLT. JSON-LD contexts are data. YAML aliases/tags and ambiguous mappings are
+rejected; CSV formulas are text. RDF text projection does not assert graph semantics.
+ReSpec, source generators, examples and repository builds are never executed.
+Unsupported encodings, formats, generated constructs and processing bounds retain
+qualified raw evidence and explicit gaps; parsing is not normative validation.
+
+Source-repository mappings are report- and revision-specific. A shared repository
+does not make every file part of each report. Unknown mappings or license scope
+remain incomplete. Unresolved-license bodies are not archived or publicly exposed;
+bounded temporary inspection may establish terms. Acquisition accounting never
+substitutes for successful projection, full history, or complete search coverage.
