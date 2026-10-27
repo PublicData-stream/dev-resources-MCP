@@ -483,7 +483,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
     store.w3c_put("catalogs",&catalog_id,&json!({"id":catalog_id,"observed_at":observed_at,"standards":[{"id":"dom","title":"DOM fixture","url":"https://www.w3.org/TR/dom/","repository":"w3c/dom","metadata":{}}],"gaps":[]})).await.expect("catalog evidence");
     let publication_id = digest(&"W3C fixture publication");
     store.w3c_put("publications",&publication_id,&json!({"id":publication_id,"standard":"dom","url":{"url":"https://www.w3.org/TR/dom/","host":"www.w3.org"},"observed_at":observed_at,"status":200,"artifact":{"body_hash":"e".repeat(64),"bytes":0,"relative_path":"synthetic-publication"},"links":[],"gaps":[],"repositories":["w3c/dom"]})).await.expect("publication observation");
-    let inventory = devres_adapters::w3c_inventory::empty(&store)
+    let inventory = devres_adapters::w3c::inventory::empty(&store)
         .await
         .expect("empty fixture inventory");
     let snapshot = Snapshot {

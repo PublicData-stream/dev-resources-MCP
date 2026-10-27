@@ -2,9 +2,10 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use devres_adapters::{
-    NpmConfig, NpmCorpus,
     bulk::{BulkBroker, BulkConfig},
-    npm_research::NpmResearch,
+    npm::NpmConfig,
+    npm::NpmCorpus,
+    npm::research::NpmResearch,
 };
 use devres_application::npm::{NpmStore, Row};
 use devres_domain::{Error, Result};

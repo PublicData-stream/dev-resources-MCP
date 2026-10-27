@@ -1,9 +1,9 @@
 //! Fixed-record evidence only; never a claim of full corpus/history completion.
 use devres_adapters::{
-    ChromiumCorpus,
     bulk::{BulkArtifact, BulkArtifactStore, BulkBroker, BulkConfig},
-    chromium_processing,
-    chromium_source::{self, ChromiumSource, Operation, SourceResponse},
+    chromium::ChromiumCorpus,
+    chromium::processing as chromium_processing,
+    chromium::source::{self as chromium_source, ChromiumSource, Operation, SourceResponse},
 };
 use devres_domain::{Error, Result};
 use serde_json::{Value, json};
@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use tokio_util::sync::CancellationToken;
-#[path = "w3c_support/root.rs"]
+#[path = "../support/root.rs"]
 mod root;
 const MARKER: &[u8] = b"devres-chromium-live-v1\n";
 fn unavailable() -> Error {

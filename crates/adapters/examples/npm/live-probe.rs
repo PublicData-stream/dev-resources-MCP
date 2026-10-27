@@ -1,8 +1,9 @@
 //! Fixed-record npm evidence. Replay never constructs a network client.
 use devres_adapters::{
     bulk::{BulkArtifact, BulkArtifactStore, BulkBroker, BulkConfig, BulkRequest, BulkSource},
-    npm_audit, npm_processing,
-    npm_source::Operation,
+    npm::audit as npm_audit,
+    npm::processing as npm_processing,
+    npm::source::Operation,
 };
 use devres_domain::{Error, Result, Validators};
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
-#[path = "w3c_support/root.rs"]
+#[path = "../support/root.rs"]
 mod root;
 
 const MARKER: &[u8] = b"devres-npm-live-v1\n";

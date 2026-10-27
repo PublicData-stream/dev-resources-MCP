@@ -1,10 +1,11 @@
 //! Explicit retained W3C acceptance; source observations are frozen before backfill.
-#[path = "w3c_support/root.rs"]
+#[path = "../support/root.rs"]
 mod root;
 use devres_adapters::{
-    PgBlobStore, W3cCorpus,
+    PgBlobStore,
     bulk::{BulkBroker, BulkConfig},
-    w3c_research::W3cResearch,
+    w3c::W3cCorpus,
+    w3c::research::W3cResearch,
 };
 use devres_application::w3c::{PROCESSOR_VERSION, W3cConfig};
 use devres_domain::{Error, Result};

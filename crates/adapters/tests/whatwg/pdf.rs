@@ -1,5 +1,5 @@
 //! First-party PDF helper boundary, using only a synthetic inert document.
-use devres_adapters::whatwg_processing::ProcessedDocument;
+use devres_adapters::whatwg::processing::ProcessedDocument;
 use devres_domain::Result;
 use lopdf::{
     Document, Object, Stream,

@@ -1,9 +1,9 @@
 //! Fixed-record provider evidence, distinct from full corpus and transport acceptance.
 use devres_adapters::{
     bulk::{BulkArtifactStore, BulkBroker, BulkConfig, BulkRequest, BulkSource, GitOperation},
-    w3c_catalog::{self, ApiOperation},
-    w3c_git::Repo,
-    w3c_processing,
+    w3c::catalog::{self as w3c_catalog, ApiOperation},
+    w3c::git::Repo,
+    w3c::processing as w3c_processing,
 };
 use devres_application::w3c::Standard;
 use devres_domain::{Error, Result, Validators};
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-#[path = "w3c_support/root.rs"]
+#[path = "../support/root.rs"]
 mod root;
 
 async fn fetch(
@@ -188,7 +188,7 @@ async fn retained_css(
             .await
             .map_err(|_| Error::unavailable("Retained live body unavailable."))?;
         if observation["bytes"].as_u64() != Some(body.len() as u64)
-            || devres_adapters::w3c_inventory::digest(&body) != hash
+            || devres_adapters::w3c::inventory::digest(&body) != hash
         {
             return Err(Error::integrity(
                 "Retained live body differs from its preflight.",
@@ -209,7 +209,7 @@ async fn retained_css(
         return Ok(Some(
             json!({"specification":"css-color-4","source_url":source,"capture_file_mtime":observed_at,"upstream_validated_at":null,"license":license,
             "artifact":{"body_hash":hash,"bytes":body.len(),"relative_path":hash},"processing":css_processing(&body,cancel)?,
-            "replay":{"kind":"licensed_capture_reprocessed","preflight_metadata":path.file_name().and_then(|name|name.to_str()),"preflight_hash":devres_adapters::w3c_inventory::digest(&bytes),"original_capture_reused":true,"upstream_validation_time_available":false,"api_response_bytes_retained":false,"latest_metadata_revalidated":false}}),
+            "replay":{"kind":"licensed_capture_reprocessed","preflight_metadata":path.file_name().and_then(|name|name.to_str()),"preflight_hash":devres_adapters::w3c::inventory::digest(&bytes),"original_capture_reused":true,"upstream_validation_time_available":false,"api_response_bytes_retained":false,"latest_metadata_revalidated":false}}),
         ));
     }
     Ok(None)
@@ -287,7 +287,7 @@ async fn run(root: &Path) -> Result<Value> {
                 let metadata = w3c_catalog::publication_metadata(&body, &cancel).ok();
                 let projection =
                     w3c_processing::process_document("index.html", &body, cancel.clone()).ok();
-                let diagnostic = json!({"source_url":publication.as_str(),"body_hash":devres_adapters::w3c_inventory::digest(&body),"bytes":body.len(),"license":license,
+                let diagnostic = json!({"source_url":publication.as_str(),"body_hash":devres_adapters::w3c::inventory::digest(&body),"bytes":body.len(),"license":license,
                     "title":projection.as_ref().map(|document|&document.title),"processing_gaps":projection.as_ref().map(|document|&document.gaps),
                     "license_links":metadata.as_ref().map(|metadata|metadata.links.iter().filter(|link|link.contains("copyright")||link.contains("license")).take(20).collect::<Vec<_>>())});
                 let mut file = std::fs::OpenOptions::new()

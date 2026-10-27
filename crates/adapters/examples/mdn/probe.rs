@@ -1,10 +1,11 @@
 //! Explicit retained MDN acceptance. Credentials enter only through the environment.
 use devres_adapters::{
-    MdnCorpus, PgBlobStore,
+    PgBlobStore,
     bulk::{BulkBroker, BulkConfig},
-    mdn_git::{CommitOrder, MdnGit, Observation, Repo},
-    mdn_index::MdnIndex,
-    mdn_inventory,
+    mdn::MdnCorpus,
+    mdn::git::{CommitOrder, MdnGit, Observation, Repo},
+    mdn::index::MdnIndex,
+    mdn::inventory as mdn_inventory,
 };
 use devres_application::mdn::{MdnConfig, MdnStore, Member, PROCESSOR_VERSION, Snapshot};
 use devres_domain::{Error, Result};
@@ -435,7 +436,8 @@ mod tests {
         let selected = canonical_history_snapshot(store.as_ref(), "content", &commit(1))
             .await
             .unwrap();
-        let research = devres_adapters::mdn_research::MdnResearch::new(store, root.path()).unwrap();
+        let research =
+            devres_adapters::mdn::research::MdnResearch::new(store, root.path()).unwrap();
         let error = research
             .call(
                 "mdn_search",
@@ -796,7 +798,7 @@ fn select_historical_member<'a>(
 
 async fn historical_samples(
     store: &dyn MdnStore,
-    research: &devres_adapters::mdn_research::MdnResearch,
+    research: &devres_adapters::mdn::research::MdnResearch,
     root: &Path,
     cancel: CancellationToken,
 ) -> Result<Value> {

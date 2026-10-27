@@ -4,7 +4,7 @@ use devres_adapters::{
         BulkArtifact, BulkArtifactStore, BulkBroker, BulkConfig, BulkRequest, BulkSource,
         DocsOperation, GitOperation,
     },
-    crate_docs::{self, ProcessingBudget},
+    crates_io::docs::{self as crate_docs, ProcessingBudget},
 };
 use devres_domain::{Error, Result, Validators};
 use serde_json::{Value, json};

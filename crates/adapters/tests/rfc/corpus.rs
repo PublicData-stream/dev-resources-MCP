@@ -1,7 +1,7 @@
 //! Synthetic RFC corpus integration: all provider access is an in-memory fixture.
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use devres_adapters::{Research, RfcConfig, RfcCorpus};
+use devres_adapters::{Research, rfc::RfcConfig, rfc::RfcCorpus};
 use devres_application::{
     Cached, Fetcher, Retrieval, Store,
     corpus::{Dataset, Document, Job, JobSpec, RfcCorpusStore, Snapshot},

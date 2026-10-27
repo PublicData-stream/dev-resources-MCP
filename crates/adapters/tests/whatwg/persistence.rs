@@ -183,7 +183,7 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
     store.whatwg_put("catalogs",&catalog_id,&json!({"id":catalog_id,"observed_at":observed_at,"standards":[{"id":"dom","title":"DOM fixture","url":"https://dom.spec.whatwg.org/","repository":"whatwg/dom","metadata":{}}],"gaps":[]})).await.expect("catalog evidence");
     let publication_id = digest(&"WHATWG fixture publication");
     store.whatwg_put("publications",&publication_id,&json!({"id":publication_id,"standard":"dom","url":{"url":"https://dom.spec.whatwg.org/","host":"dom.spec.whatwg.org"},"observed_at":observed_at,"status":200,"artifact":{"body_hash":"e".repeat(64),"bytes":0,"relative_path":"synthetic-publication"},"links":[],"gaps":[],"repositories":["whatwg/dom"]})).await.expect("publication observation");
-    let inventory = devres_adapters::whatwg_inventory::empty(&store)
+    let inventory = devres_adapters::whatwg::inventory::empty(&store)
         .await
         .expect("empty fixture inventory");
     let snapshot = Snapshot {

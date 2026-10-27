@@ -108,8 +108,8 @@ async fn seed_mdn(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
         bulk::BulkArtifactStore,
-        mdn_index::{IndexDocument, MdnIndex},
-        mdn_inventory as inventory,
+        mdn::index::{IndexDocument, MdnIndex},
+        mdn::inventory,
     };
     use devres_application::mdn::{MdnStore, Member, Snapshot};
     use tokio_util::sync::CancellationToken;
@@ -240,8 +240,8 @@ async fn check_mdn(
     root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
-        mdn_index::{MdnIndex, SearchSpec},
-        mdn_inventory,
+        mdn::index::{MdnIndex, SearchSpec},
+        mdn::inventory as mdn_inventory,
     };
     use devres_application::mdn::{MdnStore, Snapshot};
     use std::collections::BTreeSet;
@@ -288,8 +288,8 @@ async fn seed_whatwg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
         bulk::BulkArtifactStore,
-        whatwg_index::{IndexDocument, WhatwgIndex},
-        whatwg_inventory as inventory,
+        whatwg::index::{IndexDocument, WhatwgIndex},
+        whatwg::inventory,
     };
     use devres_application::whatwg::{Member, PROCESSOR_VERSION, Snapshot, WhatwgStore};
     use tokio_util::sync::CancellationToken;
@@ -302,7 +302,7 @@ async fn seed_whatwg(
     let artifact = raw
         .capture_bytes(WHATWG_SOURCE.as_bytes().to_vec(), CancellationToken::new())
         .await?;
-    let document = devres_adapters::whatwg_processing::process_document(
+    let document = devres_adapters::whatwg::processing::process_document(
         "index.html",
         WHATWG_SOURCE.as_bytes(),
         CancellationToken::new(),
@@ -372,9 +372,9 @@ async fn check_whatwg(
     root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
-        WhatwgCorpus,
         bulk::{BulkBroker, BulkConfig},
-        whatwg_research::WhatwgResearch,
+        whatwg::WhatwgCorpus,
+        whatwg::research::WhatwgResearch,
     };
     use devres_application::whatwg::WhatwgConfig;
     let research = WhatwgResearch::new(std::sync::Arc::new(WhatwgCorpus::new(
@@ -447,8 +447,8 @@ async fn seed_w3c(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
         bulk::BulkArtifactStore,
-        w3c_index::{IndexDocument, W3cIndex},
-        w3c_inventory as inventory,
+        w3c::index::{IndexDocument, W3cIndex},
+        w3c::inventory,
     };
     use devres_application::w3c::{Member, PROCESSOR_VERSION, Snapshot, W3cStore};
     use tokio_util::sync::CancellationToken;
@@ -461,7 +461,7 @@ async fn seed_w3c(
     let artifact = raw
         .capture_bytes(W3C_SOURCE.as_bytes().to_vec(), CancellationToken::new())
         .await?;
-    let document = devres_adapters::w3c_processing::process_document(
+    let document = devres_adapters::w3c::processing::process_document(
         "index.html",
         W3C_SOURCE.as_bytes(),
         CancellationToken::new(),
@@ -531,9 +531,9 @@ async fn check_w3c(
     root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
-        W3cCorpus,
         bulk::{BulkBroker, BulkConfig},
-        w3c_research::W3cResearch,
+        w3c::W3cCorpus,
+        w3c::research::W3cResearch,
     };
     use devres_application::w3c::W3cConfig;
     let research = W3cResearch::new(std::sync::Arc::new(W3cCorpus::new(
@@ -608,8 +608,8 @@ async fn seed_chromium(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
         bulk::BulkArtifactStore,
-        chromium_index::{ChromiumIndex, IndexDocument},
-        chromium_inventory as inventory,
+        chromium::index::{ChromiumIndex, IndexDocument},
+        chromium::inventory,
     };
     use devres_application::chromium::{ChromiumStore, Member, PROCESSOR_VERSION, Snapshot};
     use tokio_util::sync::CancellationToken;
@@ -625,7 +625,7 @@ async fn seed_chromium(
             CancellationToken::new(),
         )
         .await?;
-    let document = devres_adapters::chromium_processing::process_document(
+    let document = devres_adapters::chromium::processing::process_document(
         "docs/fixture.html",
         CHROMIUM_SOURCE.as_bytes(),
         CancellationToken::new(),
@@ -695,9 +695,9 @@ async fn check_chromium(
     root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use devres_adapters::{
-        ChromiumCorpus,
         bulk::{BulkBroker, BulkConfig},
-        chromium_research::ChromiumResearch,
+        chromium::ChromiumCorpus,
+        chromium::research::ChromiumResearch,
     };
     use devres_application::chromium::ChromiumConfig;
     let research = ChromiumResearch::new(std::sync::Arc::new(ChromiumCorpus::new(
@@ -809,12 +809,12 @@ fn npm_fixture_archive(
 fn npm_fixture_corpus(
     store: std::sync::Arc<PgBlobStore>,
     root: &std::path::Path,
-) -> Result<std::sync::Arc<devres_adapters::NpmCorpus>, Box<dyn std::error::Error>> {
-    Ok(std::sync::Arc::new(devres_adapters::NpmCorpus::new(
+) -> Result<std::sync::Arc<devres_adapters::npm::NpmCorpus>, Box<dyn std::error::Error>> {
+    Ok(std::sync::Arc::new(devres_adapters::npm::NpmCorpus::new(
         store,
         std::sync::Arc::new(devres_adapters::bulk::BulkBroker::new(Default::default())?),
         root,
-        devres_adapters::NpmConfig {
+        devres_adapters::npm::NpmConfig {
             enabled: false,
             advisories_enabled: false,
             packages: vec!["npm-fixture".into()],
@@ -857,7 +857,7 @@ async fn check_npm(
     root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let corpus = npm_fixture_corpus(store, root)?;
-    let research = devres_adapters::npm_research::NpmResearch::new(corpus.clone());
+    let research = devres_adapters::npm::research::NpmResearch::new(corpus.clone());
     let versions = research
         .call("npm_versions", json!({"name":"npm-fixture"}))
         .await?;
@@ -886,7 +886,7 @@ async fn check_npm(
     if matches["total"] != 1 {
         return Err("npm public advisory snapshot changed".into());
     }
-    let audit = devres_adapters::npm_audit::audit(json!({"lockfile_format":"npm","lockfile":serde_json::to_string(&json!({"lockfileVersion":3,"packages":{"node_modules/npm-fixture":{"version":"1.0.0","resolved":"https://registry.npmjs.org/npm-fixture/-/npm-fixture-1.0.0.tgz"}}}))?,"registry_context":{"default":"npmjs"}}),corpus).await?;
+    let audit = devres_adapters::npm::audit::audit(json!({"lockfile_format":"npm","lockfile":serde_json::to_string(&json!({"lockfileVersion":3,"packages":{"node_modules/npm-fixture":{"version":"1.0.0","resolved":"https://registry.npmjs.org/npm-fixture/-/npm-fixture-1.0.0.tgz"}}}))?,"registry_context":{"default":"npmjs"}}),corpus).await?;
     if audit["vulnerability_count"] != 1 {
         return Err("npm isolated audit failed after restart/restore".into());
     }

@@ -1,8 +1,9 @@
 //! Explicit retained WHATWG acceptance; source observations are frozen before backfill.
 use devres_adapters::{
-    PgBlobStore, WhatwgCorpus,
+    PgBlobStore,
     bulk::{BulkBroker, BulkConfig},
-    whatwg_research::WhatwgResearch,
+    whatwg::WhatwgCorpus,
+    whatwg::research::WhatwgResearch,
 };
 use devres_application::whatwg::{PROCESSOR_VERSION, WhatwgConfig};
 use devres_domain::{Error, Result};

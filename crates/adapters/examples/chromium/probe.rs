@@ -1,9 +1,10 @@
 //! Retained Chromium acceptance; frozen source selection never changes on resume.
-#[path = "w3c_support/root.rs"]
+#[path = "../support/root.rs"]
 mod root;
 use devres_adapters::{
-    ChromiumCorpus, PgBlobStore,
+    PgBlobStore,
     bulk::{BulkBroker, BulkConfig},
+    chromium::ChromiumCorpus,
 };
 use devres_application::chromium::{ChromiumConfig, PROCESSOR_VERSION};
 use devres_domain::{Error, Result};

@@ -1,4 +1,6 @@
 [package]
+autotests = false
+autoexamples = false
 name = "devres-adapters"
 version.workspace = true
 edition.workspace = true
@@ -45,3 +47,107 @@ yaml-rust2 = { version = "0.13", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "net"] }
+
+[[test]]
+name = "audit_worker"
+path = "tests/rustsec/audit_worker.rs"
+
+[[test]]
+name = "cargo_processing"
+path = "tests/crates_io/processing.rs"
+
+[[test]]
+name = "chromium_persistence"
+path = "tests/chromium/persistence.rs"
+
+[[test]]
+name = "mdn_persistence"
+path = "tests/mdn/persistence.rs"
+
+[[test]]
+name = "npm_audit_worker"
+path = "tests/npm/audit_worker.rs"
+
+[[test]]
+name = "npm_persistence"
+path = "tests/npm/persistence.rs"
+
+[[test]]
+name = "npm_processing"
+path = "tests/npm/processing.rs"
+
+[[test]]
+name = "persistence"
+path = "tests/shared/persistence.rs"
+
+[[test]]
+name = "research_resources"
+path = "tests/shared/research_resources.rs"
+
+[[test]]
+name = "rfc_corpus"
+path = "tests/rfc/corpus.rs"
+
+[[test]]
+name = "rfc_route"
+path = "tests/rfc/route.rs"
+
+[[test]]
+name = "rustsec_replay"
+path = "tests/rustsec/replay.rs"
+
+[[test]]
+name = "w3c_persistence"
+path = "tests/w3c/persistence.rs"
+
+[[test]]
+name = "whatwg_pdf"
+path = "tests/whatwg/pdf.rs"
+
+[[test]]
+name = "whatwg_persistence"
+path = "tests/whatwg/persistence.rs"
+
+[[test]]
+name = "module_compatibility"
+path = "tests/shared/module_compatibility.rs"
+
+[[example]]
+name = "chromium-live-probe"
+path = "examples/chromium/live-probe.rs"
+
+[[example]]
+name = "chromium-probe"
+path = "examples/chromium/probe.rs"
+
+[[example]]
+name = "crate-provider-probe"
+path = "examples/crates_io/probe.rs"
+
+[[example]]
+name = "mdn-probe"
+path = "examples/mdn/probe.rs"
+
+[[example]]
+name = "npm-live-probe"
+path = "examples/npm/live-probe.rs"
+
+[[example]]
+name = "rustsec-probe"
+path = "examples/rustsec/probe.rs"
+
+[[example]]
+name = "storage-probe"
+path = "examples/shared/storage-probe.rs"
+
+[[example]]
+name = "w3c-live-probe"
+path = "examples/w3c/live-probe.rs"
+
+[[example]]
+name = "w3c-probe"
+path = "examples/w3c/probe.rs"
+
+[[example]]
+name = "whatwg-probe"
+path = "examples/whatwg/probe.rs"

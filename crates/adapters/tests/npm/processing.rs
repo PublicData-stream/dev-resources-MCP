@@ -2,8 +2,8 @@
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devres_adapters::{
+    npm::processing::*,
     npm::{NpmPackages, archive_key, source_input_from_uri},
-    npm_processing::*,
 };
 use devres_application::{Cached, Fetcher, Retrieval, Store};
 use devres_domain::{

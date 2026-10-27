@@ -1,8 +1,9 @@
 //! Operator opt-in acceptance against disposable storage. Never accepts lockfiles.
 use devres_adapters::{
-    AdvisoryCorpus, HttpFetcher, PgBlobStore, Research,
-    advisory_git::AdvisoryHistory,
+    HttpFetcher, PgBlobStore, Research,
     bulk::{BulkBroker, BulkConfig},
+    rustsec::AdvisoryCorpus,
+    rustsec::git::AdvisoryHistory,
 };
 use devres_application::{
     Retrieval,

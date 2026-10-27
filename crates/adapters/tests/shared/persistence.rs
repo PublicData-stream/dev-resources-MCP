@@ -7,8 +7,9 @@ use devres_domain::{FetchRequest, FetchResponse, Validators};
 async fn rustsec_atomic_publication_local_research_history_and_restart() {
     use async_trait::async_trait;
     use devres_adapters::{
-        AdvisoryCorpus, Research,
+        Research,
         bulk::{BulkBroker, BulkConfig},
+        rustsec::AdvisoryCorpus,
     };
     use devres_application::{
         Fetcher, Retrieval,
@@ -38,7 +39,7 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
                 if self.bad.load(Ordering::Relaxed) {
                     b"malformed archive".to_vec()
                 } else {
-                    include_bytes!("fixtures/rustsec/git-snapshot-minimal.tar.gz").to_vec()
+                    include_bytes!("../fixtures/rustsec/git-snapshot-minimal.tar.gz").to_vec()
                 }
             } else {
                 return Err(Error::integrity("Unexpected fixture destination."));
