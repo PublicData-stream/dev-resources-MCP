@@ -6,7 +6,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, `mdn`, `whatwg`, and `w3c` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, `mdn`, `whatwg`, `w3c`, and `chromium` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -335,3 +335,36 @@ Schema 7 is forward-only. Back up W3C raw captures, qualified Git history,
 projections, inventories, state and search indexes together. Reprocessing and
 restoration never advance upstream validation. Unknown-license content is metadata
 only until its scope is established, including mixed historical Git packs.
+
+## Chromium defaults
+
+Omitting `[chromium]` enables current-first collection and resumable historical
+document discovery. `enabled=false` pauses collection while retained research stays
+available. Disposable configurations explicitly disable the collector.
+
+| `chromium` field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Supervised current/history collection |
+| `catalog_refresh_secs` | `3600` | Catalog validation scheduling target |
+| `ref_refresh_secs` | `3600` | Fixed source ref observation target |
+| `publication_refresh_secs` | `86400` | Moving website inventory/body validation target |
+| `collection_interval_secs` | `1` | Delay between bounded processing slices |
+| `publication_interval_secs` | `300` | Historical publication batching target |
+| `max_processing_workers` | `1` | Processing admission, accepts 1..2 |
+| `min_free_bytes` | `1073741824` | Free-space reserve, minimum 64 MiB |
+| `max_archive_storage_bytes` | omitted | Optional permanent raw-artifact quota |
+
+Intervals accept 1..31,622,400 seconds. A supplied archive quota must be at least the
+free-space reserve. The quota excludes PostgreSQL and derived search data. Exhausted
+quota/headroom pauses acquisition without deleting retained evidence.
+
+Documentation-only acquisition does not maintain a full Chromium Git mirror.
+Chromium requests share one family attempt/second and one transfer, including
+retries, coordinated with destination-host clocks. Text projection inputs cap at
+64 MiB and retain existing 15-second parser budgets. Public text/byte pages remain
+32 KiB. Discovery and historical queues checkpoint bounded units rather than impose
+a fixed total-history cutoff. See [Chromium](chromium.md) for coverage and provenance.
+
+Schema 8 adds isolated Chromium evidence and state. Back up raw artifacts, immutable
+inventories/projections, checkpoints, and indexes together. Rebuild/restore does not
+advance source validation times.

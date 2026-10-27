@@ -6,7 +6,7 @@ This service is anonymous and read-only with respect to caller data and upstream
 systems. Reads may populate internal public-source caches and permanent archives.
 It supports RFC metadata/text, crates.io metadata/published sources, local package
 and API research from crates.io/docs.rs captures, MDN content/browser compatibility,
-RustSec advisories, WHATWG and W3C standards, and supplied
+RustSec advisories, WHATWG and W3C standards, Chromium/Chrome documentation, and supplied
 Cargo.lock matching. No public administrative operations,
 package execution, dependency resolution, arbitrary URL fetching, or user accounts
 are exposed. Missing or unsupported coverage is explicit.
@@ -39,7 +39,7 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | Tool | Inputs and result |
 | --- | --- |
 | `server_info` | Identity, supported revisions, licensing and corresponding-source URL |
-| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
+| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
 | `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, `w3c:<shortname>#<anchor>`, or immutable `devres://` resource URI |
 | `rfc_search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc_get` | RFC number and byte page; published text |
@@ -412,3 +412,34 @@ does not make every file part of each report. Unknown mappings or license scope
 remain incomplete. Unresolved-license bodies are not archived or publicly exposed;
 bounded temporary inspection may establish terms. Acquisition accounting never
 substitutes for successful projection, full history, or complete search coverage.
+
+## Chromium documentation research
+
+[Chromium acquisition and research](chromium.md) defines the four separately
+identified components: `src`, `site`, `chrome`, and `chrome-archive`. Coverage includes
+repository-wide qualified documentation in Chromium/Blink/components, Chromium
+website sources, English Chrome developer editorial pages, and discoverable archived
+Chrome source history. External sites and separate dependency repositories are not
+acquired. Missing migrated-site history is explicit.
+
+| Tool | Capability |
+| --- | --- |
+| `chromium_catalog_search` | Captured document metadata and coverage |
+| `chromium_search`, `chromium_get` | Local selected-membership search and text/section/source/byte pages |
+| `chromium_symbol_search`, `chromium_symbol_get` | Explicit documented declarations and definitions |
+| `chromium_references` | Captured literal references and qualified local resolution |
+| `chromium_snapshots`, `chromium_history` | Immutable source/publication observations and ordered-parent changes |
+| `chromium_compare` | Observed source, normalized section, or symbol differences |
+| `chromium_corpus_status` | Discovery, license, acquisition, ancestry, projection, index, and freshness state |
+
+`component` and repository-relative `path` identify documents. Snapshot and view
+selection are exclusive. Default views expose successful current components with
+explicit missing/stale coverage; archived Chrome sources require explicit selection.
+Reads never initiate source traffic. Default evidence is stale after 24 hours and
+unavailable after seven days, while explicit historical snapshots remain readable.
+
+Generic fetch accepts `chromium:<component>/<path>#<anchor>`. Immutable resources
+use `devres://chromium/<component>/<snapshot>/<representation>/<base64url-path>`.
+Paging, strict input validation, cancellation, and technical/English query semantics
+follow the existing research limits. Citations retain source revision, representation,
+notices, and processing provenance. Comparisons make no compatibility certification.

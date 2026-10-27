@@ -273,3 +273,24 @@ catalog membership, source snapshots, validation observations and index referenc
 refresh cannot retarget old citations. Rebuild/restoration preserves validation time.
 Fallback views identify catalog-latest and effective editions separately. Request-only
 audit privacy remains unchanged across resources, storage, logs and errors.
+
+## Chromium documentation corpus
+
+Application Chromium contracts own collection policy and the immutable evidence,
+snapshot, view, and storage ports. Provider adapters implement fixed-origin Gitiles,
+archived Chrome GitHub API, and current Chrome sitemap/page readers. These feed
+owner-fenced schema-8 evidence and durable resumable processing. No whole Chromium
+source pack, checkout, dependency traversal, or source-selected executable is needed.
+
+Every retained commit binds ordered parents and a structurally shared documentation
+inventory. Tree discovery includes historical deletions; caches bind classifier/path
+context. Versioned inert projections and selected-membership search remain isolated
+from earlier providers. Chromium-specific link handling does not relax the shared
+standards parser's existing behavior. Raw acquisition, processing, indexing, and
+publication have separate failure/coverage states.
+
+Current and historical lanes share source admission and publication fencing. Partial
+views freeze each effective component snapshot and validation observation. Archived
+Chrome sources and current website observations remain distinct identities and
+licenses. Public APIs read local published evidence; maintenance replays retained
+inputs without renewing online observations. See [Chromium](chromium.md).

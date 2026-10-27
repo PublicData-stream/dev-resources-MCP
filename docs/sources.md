@@ -265,3 +265,43 @@ Only successfully captured TRs become default membership, with explicit older-ed
 fallback where necessary. Advertised ancestry and observed publication history are
 separate coverage claims; unreachable objects and disappeared publications remain
 unobserved. Frozen full-corpus acceptance is separate from bounded live checks.
+
+## Chromium and Chrome developer documentation
+
+The fixed project sources are
+[`chromium/src`](https://chromium.googlesource.com/chromium/src/) and the
+[Chromium website repository](https://chromium.googlesource.com/website/).
+[Gitiles endpoints](https://gerrit.googlesource.com/gitiles/+/refs/heads/master/Documentation/api-reference.md)
+supply ref/commit/tree observations and selected document blobs. Acquisition follows
+ordered parents from exposed branch/tag/release-head roots and preserves observed
+ref movement. Review/internal refs and unrelated dependency repositories are excluded.
+
+Current English [Chrome developer content](https://developer.chrome.com/) is
+inventoried through its same-host sitemap and qualified editorial paths. The
+[archived source repository](https://github.com/GoogleChrome/developer.chrome.com)
+is a separate historical component acquired through fixed GitHub Git API operations.
+It stopped accepting source updates after the platform migration; public evidence
+cannot reconstruct unexposed subsequent site history.
+
+Chromium family attempts share a conservative one/second budget and one transfer,
+plus destination-host clocks and the existing single retry owner. Ref/catalog
+validation targets one hour and website revalidation one day. GitHub API throttling,
+timeouts, inaccessible objects, parser bounds, and unresolved licensing remain gaps,
+not source absence or successful refresh. These defaults do not establish a bulk
+mirroring allowance or provider endorsement. Bounded live smoke admits at most 20
+attempts/provider, including retries.
+
+Preserve terms for each revision/page and nested exceptions. Chromium source has
+versioned BSD-style notices; the Chromium website identifies CC-BY-2.5 prose and BSD
+examples. The archived Chrome repository identifies CC-BY-SA-4.0 prose and Apache-2.0
+examples, whereas current pages can identify CC-BY-4.0 prose and Apache-2.0 examples.
+Those observations do not license every historical or third-party member. Store
+actual supporting notices and required attribution/derivation statements. Unknown
+scope remains metadata-only, with no permanent body or public excerpt. See the
+[archived license](https://github.com/GoogleChrome/developer.chrome.com/blob/main/LICENSE)
+and [current site policy](https://developers.google.com/terms/site-policies).
+
+Synthetic fixtures carry explicit first-party provenance. Fixed-record live evidence,
+retained frozen-corpus acceptance, local transport/cluster acceptance, native hosted
+architecture checks, and production operation are separate claims. Detailed scope,
+interfaces, and maintenance are in [Chromium](chromium.md).

@@ -4,7 +4,8 @@ Anonymous, read-only developer knowledge and Rust package research over Streamab
 HTTP and a custom WebTransport binding. It provides RFC research, crates.io
 metadata and verified sources, local package and API research from retained
 crates.io/docs.rs captures, MDN content and browser compatibility research,
-WHATWG and W3C standards and historical specification research, RustSec matching, and supplied
+WHATWG and W3C standards and historical specification research, Chromium/Chrome
+documentation research, RustSec matching, and supplied
 Cargo.lock auditing.
 
 Public upstream captures and provenance are permanent. Submitted lockfiles and audit
@@ -44,8 +45,12 @@ Health is private. Public clients use HTTPS `/mcp`; native WebTransport clients 
 [Configuration](docs/Configuration.md), [Operations](docs/operations.md), and
 [Sources](docs/sources.md). Changes follow [Contributing](CONTRIBUTING.md).
 
-Chromium documentation, npm, a graphical app, and public citation web
-pages are future work. The repository is AGPL-3.0-only; upstream source
+Chromium documentation research covers project/source documentation and English
+Chrome developer content, with separately identified public history and coverage.
+See [Chromium acquisition and research](docs/chromium.md).
+The [Chromium validation evidence](docs/chromium-acceptance-evidence.md) separates
+local gates and bounded provider observations from full-corpus acceptance.
+npm, a graphical app, and public citation web pages are future work. The repository is AGPL-3.0-only; upstream source
 materials retain their own terms. See [notices](THIRD-PARTY-NOTICES.md).
 
 [Initialization validation](docs/initialization-evidence.md) records the checks

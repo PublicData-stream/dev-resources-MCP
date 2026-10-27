@@ -582,3 +582,27 @@ Git evidence, inventories and indexes. Older binaries reject this schema. Restor
 compatible binaries and the coordinated snapshot together; do not attempt a reverse
 migration or discard permanent evidence. Index rebuild is private maintenance via
 `devres-server rebuild-w3c-index CONFIG.toml` and does not renew source validation.
+
+## Chromium operation and acceptance
+
+Chromium collection defaults on, prioritizes current documents, and resumes history
+from durable checkpoints. Disable `[chromium].enabled` in fixture configurations.
+Observe `chromium_corpus_status` for separate discovery, licensing, processing,
+indexing, history, freshness, and partial-component state. No public controls exist.
+The offline maintenance command is `devres-server rebuild-chromium-index CONFIG.toml`.
+Coordinate PostgreSQL/blob backups with all writers stopped; schema 8 is forward-only.
+
+`scripts/live-smoke.sh --live --chromium` is fixed-record opt-in acceptance with
+at most 20 attempts/provider including retries. It retains marked public evidence
+under `/tmp`. `scripts/accept-chromium.sh --live current|full` starts separate retained
+acceptance; `--resume full` continues its existing frozen source observation. It does
+not imply whole-source completion unless its final receipt establishes that scope.
+Retained public evidence survives runner failure and automatic cleanup.
+
+For shared local caches, enter `scripts/with-tmp-state.sh` first, then override
+`CARGO_HOME`/`RUSTUP_HOME` to the shared caches and set
+`CARGO_TARGET_DIR=/buildcache/rust/target` and
+`OXIBELT_TARGET_DIR=/buildcache/rust/target`. Run Cargo through the privileged channel.
+Use `scripts/with-local-docker.sh` for owned Docker state below `/tmp`; minikube tests
+create and remove their own profile rather than modify an existing operator profile.
+See [Chromium acquisition and research](chromium.md) for source and proof boundaries.
