@@ -442,7 +442,7 @@ pub fn publication_metadata(
 }
 fn repository_url(value: &str) -> Option<String> {
     let url = public_https(value).ok()?;
-    if url.fragment().is_some() {
+    if url.fragment().is_some() || repository_mapping(value).is_err() {
         return None;
     }
     // Preserve source-route path evidence until the corpus resolves clone identity and scope.
@@ -467,8 +467,22 @@ pub fn repository_mapping(value: &str) -> Result<(Repo, Value)> {
                 "W3C repository admission excludes issue and administration routes.",
             ));
         }
+        if parts.get(2) == Some(&"blob") && parts.len() < 5 {
+            return Err(Error::invalid(
+                "W3C GitHub editor source entrypoint is missing.",
+            ));
+        }
         let mapping = if matches!(parts.get(2), Some(&"tree" | &"blob")) && parts.len() >= 4 {
-            json!({"kind":"explicit_source_path","ref":parts[3],"prefix":parts.get(4..).unwrap_or_default().join("/"),"evidence_url":value})
+            let path = parts.get(4..).unwrap_or_default().join("/");
+            if parts.get(2) == Some(&"blob") {
+                let prefix = path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent)
+                    .unwrap_or("");
+                json!({"kind":"explicit_source_path","ref":parts[3],"prefix":prefix,"entrypoint":path,"evidence_url":value})
+            } else {
+                json!({"kind":"explicit_source_path","ref":parts[3],"prefix":path,"evidence_url":value})
+            }
         } else {
             json!({"kind":"repository_root","prefix":"","evidence_url":value})
         };
@@ -732,5 +746,94 @@ mod tests {
             ApiOperation::Catalog { page: 1 }.url().unwrap(),
             "https://api.w3.org/specifications?page=1&items=100"
         );
+    }
+}
+
+#[cfg(test)]
+mod publisher_editor_source_tests {
+    use super::*;
+    #[test]
+    fn bikeshed_suggest_edit_header_preserves_canonical_repository_and_file_scope() {
+        // Shape observed in the licensed CSS Color4 dated TR; metadata only.
+        let body=b"<div class=head><h1>CSS Color Module Level 4</h1><dl><dt>Suggest an Edit for this Spec:\n<dd><a href='https://github.com/w3c/csswg-drafts/blob/main/css-color-4/Overview.bs'>GitHub Editor</a><dt>Test Suite:<dd><a href='https://wpt.fyi/results/css/css-color/'>Tests</a></dl></div><h2>Body</h2>";
+        let metadata =
+            publication_metadata(body, &tokio_util::sync::CancellationToken::new()).unwrap();
+        assert_eq!(
+            metadata.repositories,
+            vec!["https://github.com/w3c/csswg-drafts/blob/main/css-color-4/Overview.bs"]
+        );
+        let (repo, mapping) = repository_mapping(&metadata.repositories[0]).unwrap();
+        assert_eq!(repo.as_str(), "https://github.com/w3c/csswg-drafts.git");
+        assert_eq!(mapping["prefix"], "css-color-4");
+        assert_eq!(mapping["entrypoint"], "css-color-4/Overview.bs");
+        assert_eq!(mapping["ref"], "main");
+    }
+    #[test]
+    fn feedback_issue_routes_body_examples_and_general_body_do_not_admit_editor_sources() {
+        let source = "<a href='https://github.com/w3c/csswg-drafts/blob/main/css-color-4/Overview.bs'>GitHub Editor</a>";
+        for body in [
+            format!("<div class=head><dl><dt>Feedback:<dd>{source}</dl></div>"),
+            "<div class=head><dl><dt>Suggest an Edit for this Spec:<dd><a href='https://github.com/w3c/csswg-drafts/issues'>GitHub Editor</a></dl></div>".to_owned(),
+            format!(
+                "<h1>Body</h1><h2>Examples</h2><dl><dt>Suggest an Edit for this Spec:<dd>{source}</dl>"
+            ),
+            format!(
+                "<div class=head><div class=example><dl><dt>Suggest an Edit for this Spec:<dd>{source}</dl></div></div>"
+            ),
+            format!(
+                "<h1>Body</h1><p>Example</p><dl><dt>Suggest an Edit for this Spec:<dd>{source}</dl>"
+            ),
+        ] {
+            let metadata =
+                publication_metadata(body.as_bytes(), &tokio_util::sync::CancellationToken::new())
+                    .unwrap();
+            assert!(metadata.repositories.is_empty(), "{body}");
+        }
+        assert!(repository_mapping("https://github.com/w3c/csswg-drafts/issues").is_err());
+    }
+    #[test]
+    fn root_editor_file_and_tree_directory_keep_distinct_scope_semantics() {
+        let (_, file) =
+            repository_mapping("https://github.com/w3c/permissions/blob/main/index.html").unwrap();
+        assert_eq!(file["prefix"], "");
+        assert_eq!(file["entrypoint"], "index.html");
+        let (_, tree) =
+            repository_mapping("https://github.com/w3c/csswg-drafts/tree/main/css-color-4")
+                .unwrap();
+        assert_eq!(tree["prefix"], "css-color-4");
+        assert!(tree.get("entrypoint").is_none());
+    }
+}
+
+#[cfg(test)]
+mod retained_editor_source_fixture {
+    use super::*;
+    #[test]
+    #[ignore = "requires explicit retained licensed CSS capture under /tmp; performs no requests"]
+    fn retained_licensed_css_editor_source_reprocesses_without_network() {
+        let path = std::env::var("DEVRES_W3C_RETAINED_HEADER_FIXTURE")
+            .expect("explicit retained licensed capture path");
+        let path = std::path::Path::new(&path).canonicalize().unwrap();
+        assert!(path.starts_with("/tmp"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1049399);
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(
+            crate::w3c_inventory::digest(&bytes),
+            "a5cef4674c085a5b568773e85affceb20a3c0d121dff371f3dd555fd51ac02f4"
+        );
+        let url =
+            PublicationUrl::new("https://www.w3.org/TR/2026/CRD-css-color-4-20261026/").unwrap();
+        assert_eq!(publication_license(&url, &bytes)["decision"], "approved");
+        let metadata =
+            publication_metadata(&bytes, &tokio_util::sync::CancellationToken::new()).unwrap();
+        let mapping = metadata
+            .repositories
+            .iter()
+            .filter_map(|source| repository_mapping(source).ok())
+            .find(|(repo, _)| repo.as_str() == "https://github.com/w3c/csswg-drafts.git")
+            .expect("publisher-qualified CSS source repository");
+        assert_eq!(mapping.1["prefix"], "css-color-4");
+        assert_eq!(mapping.1["entrypoint"], "css-color-4/Overview.bs");
+        assert_eq!(mapping.1["ref"], "main");
     }
 }

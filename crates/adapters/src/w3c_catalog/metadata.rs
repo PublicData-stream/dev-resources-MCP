@@ -32,6 +32,23 @@ fn source_label(label: &str) -> bool {
         "source" | "source code" | "source repository" | "repository"
     )
 }
+fn edit_source_label(label: &str) -> bool {
+    matches!(
+        label
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_end_matches(':'),
+        "suggest an edit for this spec" | "suggest an edit for this specification"
+    )
+}
+fn github_editor_source(value: &str) -> bool {
+    let Ok(url) = super::public_https(value) else {
+        return false;
+    };
+    let parts = url.path().trim_matches('/').split('/').collect::<Vec<_>>();
+    url.host_str() == Some("github.com") && parts.len() >= 5 && parts[2] == "blob"
+}
 fn bounded_anchor(value: Option<&str>) -> Option<&str> {
     value.filter(|value| value.len() <= MAX_ANCHOR && !value.chars().any(char::is_control))
 }
@@ -87,6 +104,7 @@ struct State {
     header_depth: usize,
     definition: Option<String>,
     source_context: bool,
+    edit_source_context: bool,
     anchor_repository: Option<String>,
     anchor_label: String,
     raw_hidden: Option<String>,
@@ -285,6 +303,7 @@ impl TokenSink for Sink<'_> {
                 && let Some(label) = state.definition.take()
             {
                 state.source_context = source_label(&label.to_ascii_lowercase());
+                state.edit_source_context = edit_source_label(&label.to_ascii_lowercase());
                 state.identity_context = matches!(
                     label.to_ascii_lowercase().trim().trim_end_matches(':'),
                     "this version" | "latest version" | "latest published version"
@@ -292,6 +311,7 @@ impl TokenSink for Sink<'_> {
             }
             if matches!(&*tag.name, "dd" | "dl") {
                 state.source_context = false;
+                state.edit_source_context = false;
                 state.identity_context = false;
                 if &*tag.name == "dl" {
                     state.definition = None;
@@ -304,6 +324,7 @@ impl TokenSink for Sink<'_> {
                     state.header_finished = true;
                     state.definition = None;
                     state.source_context = false;
+                    state.edit_source_context = false;
                     state.anchor_repository = None;
                     state.anchor_label.clear();
                 }
@@ -340,6 +361,7 @@ impl TokenSink for Sink<'_> {
             state.content_started = true;
             state.definition = None;
             state.source_context = false;
+            state.edit_source_context = false;
             state.anchor_repository = None;
             state.anchor_label.clear();
         }
@@ -368,11 +390,13 @@ impl TokenSink for Sink<'_> {
         if &*tag.name == "dt" && state.header_admission() {
             state.definition = Some(String::new());
             state.source_context = false;
+            state.edit_source_context = false;
         }
         if &*tag.name == "dd"
             && let Some(label) = state.definition.take()
         {
             state.source_context = source_label(&label.to_ascii_lowercase());
+            state.edit_source_context = edit_source_label(&label.to_ascii_lowercase());
             state.identity_context = matches!(
                 label.to_ascii_lowercase().trim().trim_end_matches(':'),
                 "this version" | "latest version" | "latest published version"
@@ -409,6 +433,10 @@ impl TokenSink for Sink<'_> {
             );
             if &*tag.name == "a" && state.header_admission() {
                 if (state.source_context
+                    || (state.header_depth > 0
+                        && state.edit_source_context
+                        && !state.containers.iter().any(|container| container.example)
+                        && github_editor_source(href))
                     || rel.split_ascii_whitespace().any(|role| {
                         role.eq_ignore_ascii_case("source")
                             || role.eq_ignore_ascii_case("repository")
