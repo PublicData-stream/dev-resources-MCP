@@ -1,6 +1,6 @@
 ---
 name: devres-package-research
-description: "Research exact Rust crate and public npm releases, verified published sources, retained documentation and APIs, dependencies, and release differences with dev-resources-MCP. Use for package evidence, not executing packages or lockfile vulnerability assessments."
+description: "Research exact Rust/npm releases, verified sources, documentation, APIs, dependencies, and release differences with dev-resources-MCP. Use for package research, not execution or lockfile audits."
 ---
 
 # Rust and npm package research

@@ -1,6 +1,6 @@
 ---
 name: devres-standards-research
-description: "Research RFCs, web standards, MDN browser compatibility, and Chromium documentation using dev-resources-MCP, including historical evidence and specification comparisons. Use for sourced technical research, not package audits or server administration."
+description: "Research RFCs, web standards, MDN browser support, and Chromium documentation with dev-resources-MCP, including historical comparisons. Use for sourced research, not package audits or administration."
 ---
 
 # Standards and browser research

@@ -1,6 +1,7 @@
 """Offline platform package and standalone skill archive contracts."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -84,6 +85,28 @@ class CustomerPluginTests(unittest.TestCase):
             self.assertEqual(first, [path.read_bytes() for path in second])
             self.assertEqual({p.name for p in self.output.iterdir()}, {target})
 
+    def test_claude_upload_description_limit_counts_decoded_characters(self):
+        source = self.sources()
+        name = next(iter(package.SKILLS))
+        skill = source / "skills" / name / "SKILL.md"
+        original = skill.read_text()
+        prefix, description = original.split("description: ", 1)
+        _, body = description.split("\n", 1)
+        for length in (200, 201, 1024, 1025):
+            # Escaped Unicode is decoded before counting; bytes and YAML source
+            # length are not the host's character limit.
+            skill.write_text(prefix + "description: " + json.dumps("\uac00" * length) + "\n" + body)
+            for target in (*package.TARGETS, "all"):
+                self.output = self.root / f"{target}-{length}"
+                with self.subTest(target=target, length=length):
+                    limit = 200 if target in ("claude-skills", "all") else 1024
+                    if length > limit:
+                        with self.assertRaises(ValueError):
+                            self.build(target, source=source)
+                        self.assertFalse(self.output.exists())
+                    else:
+                        self.assertTrue(self.build(target, source=source))
+
     def test_invalid_endpoints_publish_nothing_and_cli_does_not_echo_credentials(self):
         invalid = ("http://host/mcp", "https://user:private-value@host/mcp", "https://host/mcp?key=private-value",
                    "https://host/mcp#secret", "https://host/mcp?", "https://host/mcp#", "https://host/",
@@ -116,6 +139,50 @@ class CustomerPluginTests(unittest.TestCase):
         source = self.sources()
         with self.assertRaises(ValueError):
             package.build(self.url, source / "output", source=source)
+
+    def test_private_output_and_owned_ancestors_even_with_permissive_umask(self):
+        previous = os.umask(0)
+        try:
+            self.output = self.root / "new-parent" / "output"
+            self.build("claude-code")
+        finally:
+            os.umask(previous)
+        for path in (self.output.parent, self.output):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        unsafe = self.root / "shared-parent"
+        unsafe.mkdir(mode=0o777)
+        unsafe.chmod(0o777)
+        with self.assertRaises(ValueError):
+            package.build(self.url, unsafe / "output")
+        self.assertFalse((unsafe / "output").exists())
+
+    def test_changed_expanded_package_is_rejected_and_removed(self):
+        write = package.write_bundle
+
+        def tamper(directory, archive, files):
+            write(directory, archive, files)
+            next(directory.rglob("SKILL.md")).write_text("changed after ZIP validation")
+
+        with patch.object(package, "write_bundle", side_effect=tamper):
+            with self.assertRaises(ValueError):
+                self.build("claude-code")
+        self.assertFalse(self.output.exists())
+
+    def test_parent_symlink_inserted_during_creation_cannot_redirect_output(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        mkdir = os.mkdir
+
+        def insert_link(path, mode=0o777, *, dir_fd=None):
+            if path == "raced-parent":
+                os.symlink(str(elsewhere), path, dir_fd=dir_fd)
+                raise FileExistsError("simulated concurrent directory creation")
+            return mkdir(path, mode, dir_fd=dir_fd)
+
+        with patch.object(package.os, "mkdir", side_effect=insert_link):
+            with self.assertRaises(OSError):
+                package.reserve_output(self.root / "raced-parent" / "output")
+        self.assertFalse((elsewhere / "output").exists())
 
     def test_missing_components_symlinks_and_escaping_references_fail_before_output(self):
         source = self.sources()
@@ -165,7 +232,6 @@ class CustomerPluginTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.build()
         self.assertFalse(self.output.exists())
-        self.assertEqual(list(self.root.glob(".devres-package-*")), [])
 
 
 if __name__ == "__main__":

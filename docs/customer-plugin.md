@@ -16,7 +16,7 @@ content is AGPL-3.0-only; upstream evidence retains its own notices and terms.
 
 ## Generate packages
 
-Run from the repository root with Python 3. Supply the actual HTTPS `/mcp`
+Run from the repository root on Linux with Python 3. Supply the actual HTTPS `/mcp`
 endpoint operated for your customers; this repository does not select a production
 hostname. Replace the illustrative hostname before running:
 
@@ -30,6 +30,12 @@ The output directory must not already exist. `--target` accepts `openai`,
 `claude-code`, `claude-skills`, or `all` (the default). Generation is offline:
 it does not probe the endpoint, install anything, modify account settings, or
 publish a listing. Outputs are confined below `/tmp`.
+Nested output ancestors must belong to the invoking user and must not be writable
+by group or other users. Newly created packaging ancestors and the output root
+are private (0700); inner file and directory permissions also depend on the umask.
+Source and output paths with symlinked ancestors are rejected; packaging on
+macOS's symlinked `/tmp` layout is not supported by this Linux-qualified command.
+These packaging restrictions do not restrict the client platforms of generated ZIPs.
 
 | Output | Purpose |
 | --- | --- |
@@ -42,6 +48,11 @@ directory when changing the endpoint or package sources; do not hand-edit the
 generated platform manifests independently. Credentials are not supported in the
 endpoint or bundled files. A package pointing to a disposable fixture endpoint is
 a **test artifact**, not a production connection.
+
+The shared skill descriptions fit Claude's custom-upload limit of 200 characters.
+The packager enforces that limit for `claude-skills` and `all`; OpenAI and Claude
+Code packages retain their developer-side 1,024-character limit. See
+[Anthropic's custom-skill metadata requirements](https://support.claude.com/en/articles/12512198-how-to-create-custom-skills).
 
 ## ChatGPT and Codex
 
@@ -139,7 +150,7 @@ not change the server's supported MCP revisions or add administrative tools.
 
 ## Implementation validation: 2026-10-27
 
-The following checks passed on local Linux amd64:
+The initial implementation passed the following checks on local Linux amd64:
 
 - All three Skill Creator validations, generated JSON/YAML parsing, local Markdown
   links, eight packaging tests, and the complete 146-test Python suite.
@@ -161,6 +172,22 @@ The following checks passed on local Linux amd64:
   with disposable state under `/tmp`.
 - Independent agent review of the integrated implementation and final corrections;
   this is not a human GitHub approval.
+
+Follow-up checks on the same date passed all 12 packaging tests and the complete
+150-test Python suite after the packaging corrections. Tests cover the documented
+200-character custom-upload limit, the developer-side 1,024-character boundary,
+decoded Unicode, private output ownership/modes, a concurrent symlink-insertion
+attempt, and final expanded-package integrity. Strict Claude Code validation was
+rerun against the regenerated final package.
+
+Skill Creator validation and Claude's description-matching check ran after the
+descriptions were shortened to 199, 194 and 196 characters (standards, package and
+audit). The later output-verification changes did not change bundled skill files.
+Claude `claude-opus-5-5` selected the intended three workflows and left an unrelated
+translation request outside them. Additional read-only Claude source review of a
+frozen snapshot confirmed the prior packaging findings were addressed, with no
+blocking findings; independent agent review also found no blockers. Rust and
+container baseline gates above were not repeated for this packaging-only correction.
 
 No Kubernetes/minikube gate was needed because this change does not modify
 deployment or network behavior. Hosted CI/native arm64, native ChatGPT/Codex UI,

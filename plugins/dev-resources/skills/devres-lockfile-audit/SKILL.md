@@ -1,6 +1,6 @@
 ---
 name: devres-lockfile-audit
-description: "Assess supplied Cargo, npm, pnpm, or Yarn lockfiles and investigate RustSec or npm OSV advisories with dev-resources-MCP. Use for bounded advisory matching and its limitations, not package execution, dependency resolution, automatic fixes, or broad security certification."
+description: "Assess Cargo/npm/pnpm/Yarn lockfiles and RustSec or npm OSV advisories with dev-resources-MCP. Use for qualified advisory matching, not execution, dependency resolution, or security certification."
 ---
 
 # Lockfile and advisory assessment

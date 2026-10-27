@@ -11,9 +11,11 @@ import argparse
 import copy
 import ipaddress
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import tempfile
 from urllib.parse import unquote, urlsplit
 import zipfile
@@ -23,6 +25,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "plugins" / "dev-resources"
 SERVER = "dev-resources"
 TARGETS = ("openai", "claude-code", "claude-skills")
+# Claude's custom-skill upload surface has a tighter limit than developer tools.
+# https://support.claude.com/en/articles/12512198-how-to-create-custom-skills
+CLAUDE_UPLOAD_DESCRIPTION_LIMIT = 200
 SKILLS = {
     "devres-standards-research": ("Standards Research", "Research standards and browser evidence",
                                 "research a standards or browser behavior question"),
@@ -73,16 +78,16 @@ def json_bytes(value: object) -> bytes:
     return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def frontmatter(data: bytes, expected: str) -> None:
+def frontmatter(data: bytes, expected: str, *, description_limit: int = 1024) -> None:
     match = re.match(r'\A---\nname: ([a-z0-9-]+)\ndescription: ("[^\n]+")\n---(?:\n|\Z)', data.decode())
     if not match or match[1] != expected:
         raise ValueError("skill must have matching name and a single JSON-quoted description")
     description = json.loads(match[2])
-    if not description.strip() or len(description) > 1024:
-        raise ValueError("skill description must contain 1..1024 characters")
+    if not description.strip() or len(description) > description_limit:
+        raise ValueError(f"skill description must contain 1..{description_limit} characters")
 
 
-def skill_files(source: Path, name: str) -> dict[str, bytes]:
+def skill_files(source: Path, name: str, *, description_limit: int = 1024) -> dict[str, bytes]:
     folder = source / "skills" / name
     if not folder.is_dir() or folder.is_symlink():
         raise ValueError("missing skill directory")
@@ -98,7 +103,7 @@ def skill_files(source: Path, name: str) -> dict[str, bytes]:
         files[relative] = regular(path)
     if "SKILL.md" not in files:
         raise ValueError("missing SKILL.md")
-    frontmatter(files["SKILL.md"], name)
+    frontmatter(files["SKILL.md"], name, description_limit=description_limit)
     for relative, data in files.items():
         for target in LINK.findall(data.decode()):
             parsed = urlsplit(target)
@@ -158,7 +163,7 @@ def package_files(target: str, manifest: dict, skills: dict, license_body: bytes
 
 
 def write_bundle(directory: Path, archive: Path, files: dict[str, bytes]) -> None:
-    directory.mkdir()
+    directory.mkdir(mode=0o700)
     for relative, data in sorted(files.items()):
         path = directory / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +181,46 @@ def write_bundle(directory: Path, archive: Path, files: dict[str, bytes]) -> Non
             raise ValueError("archive component verification failed")
         if any(output.read(relative) != data for relative, data in expected.items()):
             raise ValueError("archive content verification failed")
+
+
+def reserve_output(output: Path) -> None:
+    """Create a private output through owned, non-writable parent directories.
+
+    Walk from /tmp with directory descriptors so a newly inserted symlink cannot
+    redirect directory creation. The sticky system /tmp itself is the exception
+    to the rule that writable ancestors must be owned exclusively by this user.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent = os.open("/tmp", flags)
+    try:
+        info = os.fstat(parent)
+        if (info.st_uid not in (0, os.geteuid())
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            raise ValueError("unsafe temporary root")
+        for component in output.relative_to("/tmp").parts[:-1]:
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = os.open(component, flags, dir_fd=parent)
+            info = os.fstat(child)
+            if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                os.close(child)
+                raise ValueError("output ancestors must be owned by this user and not writable by others")
+            os.close(parent)
+            parent = child
+        os.mkdir(output.name, mode=0o700, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def verify_directory(directory: Path, files: dict[str, bytes]) -> None:
+    members = list(directory.rglob("*"))
+    if any(path.is_symlink() for path in members):
+        raise ValueError("expanded package contains a symlink")
+    actual = {path.relative_to(directory).as_posix() for path in members if path.is_file()}
+    if actual != set(files) or any(regular(directory / name) != data for name, data in files.items()):
+        raise ValueError("expanded package content verification failed")
 
 
 def build(url: str, output: Path, target: str = "all", *, source: Path = SOURCE,
@@ -197,7 +242,8 @@ def build(url: str, output: Path, target: str = "all", *, source: Path = SOURCE,
             or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",
                                 manifest.get("version", ""))):
         raise ValueError("invalid canonical plugin identity")
-    skills = {name: skill_files(source, name) for name in SKILLS}
+    description_limit = CLAUDE_UPLOAD_DESCRIPTION_LIMIT if target in ("all", "claude-skills") else 1024
+    skills = {name: skill_files(source, name, description_limit=description_limit) for name in SKILLS}
     license_body = regular(license_path)
     targets = TARGETS if target == "all" else (target,)
     # Validate source and plans before publishing anything at the requested path.
@@ -207,23 +253,21 @@ def build(url: str, output: Path, target: str = "all", *, source: Path = SOURCE,
             bundles.extend((selected, name, {**files, "LICENSE": license_body}) for name, files in skills.items())
         else:
             bundles.append((selected, SERVER, package_files(selected, manifest, skills, license_body, url)))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".devres-package-", dir=output.parent))
+    reserve_output(output)
     try:
-        for selected, name, files in bundles:
-            folder = staging / selected
-            folder.mkdir(exist_ok=True)
-            write_bundle(folder / name, folder / (name + ".zip"), files)
-        # mkdir reserves the destination; never replace an existing directory or file.
-        output.mkdir()
-        try:
+        with tempfile.TemporaryDirectory(prefix=".devres-package-", dir=output) as scratch:
+            staging = Path(scratch)
+            for selected, name, files in bundles:
+                folder = staging / selected
+                folder.mkdir(mode=0o700, exist_ok=True)
+                write_bundle(folder / name, folder / (name + ".zip"), files)
             for child in staging.iterdir():
                 child.rename(output / child.name)
-        except BaseException:
-            shutil.rmtree(output)
-            raise
-    finally:
-        shutil.rmtree(staging)
+            for selected, name, files in bundles:
+                verify_directory(output / selected / name, files)
+    except BaseException:
+        shutil.rmtree(output)
+        raise
     return [output / selected / (name + ".zip") for selected, name, _ in bundles]
 
 
