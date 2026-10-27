@@ -62,6 +62,7 @@ pub enum GitOperation {
 }
 #[derive(Clone, Debug)]
 pub enum BulkSource {
+    Npm(crate::npm_source::Operation),
     DatabaseDump,
     CrateArchive {
         name: String,
@@ -93,6 +94,7 @@ pub enum BulkSource {
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
         match self {
+            Self::Npm(operation) => operation.url(),
             Self::Chromium(operation) => operation.url(),
             Self::W3cGit { repository, operation } => {
                 repository.validate()?;
@@ -146,6 +148,7 @@ impl BulkSource {
     }
     pub fn host(&self) -> &str {
         match self {
+            Self::Npm(operation) => operation.host(),
             Self::Chromium(operation) => operation.host(),
             Self::W3cGit { repository, .. } => repository.host(),
             Self::W3cPublication(source) => source.host(),
@@ -163,6 +166,7 @@ impl BulkSource {
     }
     fn media_type(&self) -> &'static str {
         match self {
+            Self::Npm(operation) => operation.media_type(),
             Self::Chromium(operation) => operation.media_type(),
             Self::W3cApi(_) => "application/hal+json",
             Self::W3cDiscovery(operation) => operation.media_type(),
@@ -236,6 +240,7 @@ fn admitted_host(host: &str) -> Result<&str> {
         | "codeload.github.com"
         | "github.com"
         | "docs.rs" => Ok(host),
+        "registry.npmjs.org" | "osv-vulnerabilities.storage.googleapis.com" => Ok(host),
         host if crate::whatwg_catalog::publication_host(host) => Ok(host),
         _ => Err(Error::invalid("Source host is not permitted.")),
     }
@@ -271,6 +276,10 @@ pub struct BulkBroker {
     foreground_slots: Arc<Semaphore>,
     documentation_slots: Arc<Semaphore>,
     chromium_slots: Arc<Semaphore>,
+    npm_slots: Arc<Semaphore>,
+    osv_slots: Arc<Semaphore>,
+    npm_registry_rate: u32,
+    npm_advisory_rate: u32,
     attempt_budget: Option<usize>,
     attempts: AtomicUsize,
     attempt_observer: Option<Arc<dyn Fn(usize) -> Result<()> + Send + Sync>>,
@@ -319,6 +328,10 @@ impl BulkBroker {
             foreground_slots: Arc::new(Semaphore::new(2)),
             documentation_slots: Arc::new(Semaphore::new(1)),
             chromium_slots: Arc::new(Semaphore::new(1)),
+            npm_slots: Arc::new(Semaphore::new(1)),
+            osv_slots: Arc::new(Semaphore::new(1)),
+            npm_registry_rate: 1,
+            npm_advisory_rate: 1,
             rates: Mutex::new(HashMap::new()),
             config,
             attempt_budget: None,
@@ -327,6 +340,16 @@ impl BulkBroker {
             #[cfg(test)]
             test_origin: None,
         })
+    }
+
+    /// Configure only npm provider clocks, preserving all existing provider policy.
+    pub fn with_npm_rates(mut self, registry: u32, advisory: u32) -> Result<Self> {
+        if !(1..=1000).contains(&registry) || !(1..=1000).contains(&advisory) {
+            return Err(Error::invalid("Invalid npm attempt rate."));
+        }
+        self.npm_registry_rate = registry;
+        self.npm_advisory_rate = advisory;
+        Ok(self)
     }
 
     /// Private acceptance harness bound; normal serving has no global attempt cap.
@@ -385,9 +408,15 @@ impl BulkBroker {
         } else {
             admitted_host(host)?
         };
-        let documentation = if host == "docs.rs" {
+        let source_slots = match host {
+            "docs.rs" => Some(&self.documentation_slots),
+            "registry.npmjs.org" => Some(&self.npm_slots),
+            "osv-vulnerabilities.storage.googleapis.com" => Some(&self.osv_slots),
+            _ => None,
+        };
+        let documentation = if let Some(source_slots) = source_slots {
             Some(
-                self.documentation_slots
+                source_slots
                     .clone()
                     .acquire_owned()
                     .await
@@ -429,6 +458,8 @@ impl BulkBroker {
             } else {
                 forced_rate.unwrap_or(match host {
                     "static.crates.io" => self.config.static_requests_per_second,
+                    "registry.npmjs.org" => self.npm_registry_rate,
+                    "osv-vulnerabilities.storage.googleapis.com" => self.npm_advisory_rate,
                     "index.crates.io" | "github.com" => self.config.index_requests_per_second,
                     _ => self.config.other_requests_per_second,
                 })
@@ -1178,6 +1209,31 @@ fn stage_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn npm_foreground_and_bulk_share_one_transfer_and_attempt_clock() {
+        let broker = Arc::new(BulkBroker::new(BulkConfig::default()).unwrap());
+        let first = broker.admit_foreground("registry.npmjs.org").await.unwrap();
+        let other = broker.clone();
+        let second = tokio::spawn(async move { other.admit("registry.npmjs.org", true).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            !second.is_finished(),
+            "bulk bypassed the shared npm transfer permit"
+        );
+        assert_eq!(broker.attempt_count(), 1);
+        drop(first);
+        let permit = second.await.unwrap().unwrap();
+        assert_eq!(broker.attempt_count(), 2);
+        drop(permit);
+        assert!(
+            BulkBroker::new(BulkConfig::default())
+                .unwrap()
+                .with_npm_rates(0, 1)
+                .is_err()
+        );
+    }
     use axum::{
         Router,
         body::Body,

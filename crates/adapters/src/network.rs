@@ -14,6 +14,7 @@ pub struct HttpFetcher {
     client: reqwest::Client,
     limits: Mutex<HashMap<String, Instant>>,
     slots: Semaphore,
+    npm_slots: Semaphore,
     broker: Option<std::sync::Arc<crate::bulk::BulkBroker>>,
 }
 impl HttpFetcher {
@@ -32,6 +33,7 @@ impl HttpFetcher {
             client,
             limits: Mutex::new(HashMap::new()),
             slots: Semaphore::new(2),
+            npm_slots: Semaphore::new(1),
             broker: None,
         })
     }
@@ -144,6 +146,11 @@ impl HttpFetcher {
 }
 
 fn allowed_url(value: &str) -> Result<String> {
+    if value.starts_with("https://registry.npmjs.org/")
+        || value.starts_with("https://osv-vulnerabilities.storage.googleapis.com/")
+    {
+        return crate::npm_source::validate_url(value).map(str::to_owned);
+    }
     // Inspect the original spelling before URL normalization removes dot segments.
     let after_scheme = value
         .split_once("://")
@@ -247,6 +254,16 @@ impl Fetcher for HttpFetcher {
         validators: Option<&Validators>,
     ) -> Result<FetchResponse> {
         let host = allowed_url(&request.url)?;
+        let _npm = if self.broker.is_none() && host == "registry.npmjs.org" {
+            Some(
+                self.npm_slots
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::capacity("npm admission closed"))?,
+            )
+        } else {
+            None
+        };
         let _slot = self
             .slots
             .acquire()
