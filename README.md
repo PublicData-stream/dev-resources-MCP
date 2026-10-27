@@ -51,7 +51,9 @@ See [Chromium acquisition and research](docs/chromium.md).
 The [Chromium validation evidence](docs/chromium-acceptance-evidence.md) separates
 local gates and bounded provider observations from full-corpus acceptance.
 [npm research and npm/pnpm/Yarn auditing](docs/npm.md) use public registry and
-OSV evidence. A graphical app and public citation web pages are future work.
+OSV evidence. [npm validation evidence](docs/npm-acceptance-evidence.md) records
+local gates and bounded live observations. A graphical app and public citation
+web pages are future work.
 The repository is AGPL-3.0-only; upstream source
 materials retain their own terms. See [notices](THIRD-PARTY-NOTICES.md).
 

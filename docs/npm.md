@@ -80,8 +80,8 @@ excessive nesting fail without reflecting private source text.
 
 Registry context contains a `default` identity and a `scopes` map with values
 `npmjs`, `other`, or `unknown`. It is a caller assertion, never credentials or an
-uploaded npm configuration. Ambiguous identities remain unassessed unless public
-evidence or an assertion establishes public npm origin. An explicit conflicting
+uploaded npm configuration. Ambiguous identities remain unassessed unless a caller
+assertion establishes public npm origin. An explicit conflicting
 custom origin remains unassessed. Aliases match the real package identity.
 Workspace, Git, file and unsupported transformed sources remain unassessed.
 Patched packages can return base-release matches while the transformed artifact
@@ -123,6 +123,8 @@ Fixture checks, PostgreSQL persistence, image/edge/minikube acceptance, bounded 
 provider observations, native architecture CI and production operations are
 separate evidence. Live smoke is opt-in and limited to fixed records and at most
 20 attempts per provider; it does not establish registry-wide coverage.
+See [npm validation evidence](npm-acceptance-evidence.md) for executed checks and
+the retained live observations.
 
 Sources: [registry metadata](https://github.com/npm/registry/blob/main/docs/responses/package-metadata.md),
 [integrity semantics](https://github.com/npm/ssri),
