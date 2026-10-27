@@ -600,6 +600,174 @@ async fn check_w3c(
     Ok(())
 }
 
+const CHROMIUM_IDENTITY: &[u8] = b"devres:storage-probe:chromium:v1";
+const CHROMIUM_SOURCE: &str = "<h1 id=fixture>Synthetic CHROMIUM storage fixture</h1><p>Offline fixture token research.</p><dfn id=fixture-token>FixtureToken</dfn><script>fixture_hidden_script()</script>";
+async fn seed_chromium(
+    store: &PgBlobStore,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_adapters::{
+        bulk::BulkArtifactStore,
+        chromium_index::{ChromiumIndex, IndexDocument},
+        chromium_inventory as inventory,
+    };
+    use devres_application::chromium::{ChromiumStore, Member, PROCESSOR_VERSION, Snapshot};
+    use tokio_util::sync::CancellationToken;
+    let id = fixture_hash(CHROMIUM_IDENTITY);
+    if store.chromium_get("snapshots", &id).await?.is_some() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(root.join("chromium/raw-artifacts"))?;
+    let raw = BulkArtifactStore::new(root.join("chromium/raw-artifacts"), 64 * 1024 * 1024)?;
+    let artifact = raw
+        .capture_bytes(
+            CHROMIUM_SOURCE.as_bytes().to_vec(),
+            CancellationToken::new(),
+        )
+        .await?;
+    let document = devres_adapters::chromium_processing::process_document(
+        "docs/fixture.html",
+        CHROMIUM_SOURCE.as_bytes(),
+        CancellationToken::new(),
+    )?;
+    let index_id = fixture_hash(b"devres:storage-probe:chromium:index:v1");
+    let mut projection = serde_json::to_value(&document)?;
+    projection["index_ids"] = json!([index_id]);
+    let projection_id = fixture_hash(&serde_json::to_vec(&projection)?);
+    store
+        .chromium_put("projections", &projection_id, &projection)
+        .await?;
+    let empty = inventory::empty(store).await?;
+    let inventory = inventory::update(
+        store,
+        &empty,
+        "docs/fixture.html",
+        Some(Member {
+            path: "docs/fixture.html".into(),
+            oid: artifact.body_hash.clone(),
+            mode: "100644".into(),
+            kind: "html".into(),
+            projection: Some(projection_id),
+            raw: Some(json!({"artifact":artifact,"synthetic":true})),
+            gaps: vec![],
+        }),
+    )
+    .await?;
+    let index = ChromiumIndex::new(root)?
+        .publish(
+            None,
+            vec![IndexDocument {
+                id: index_id,
+                component: "src".into(),
+                edition: "synthetic".into(),
+                path: "docs/fixture.html".into(),
+                title: document.title,
+                text: document.text,
+                kind: "section".into(),
+                metadata: json!({"anchor":"fixture","synthetic":true}),
+            }],
+            CancellationToken::new(),
+        )
+        .await?;
+    let snapshot = Snapshot {
+        id: id.clone(),
+        component: "src".into(),
+        repository: "synthetic/chromium-fixture".into(),
+        revision: fixture_hash(b"synthetic-chromium-revision")[..40].into(),
+        tree: fixture_hash(CHROMIUM_SOURCE.as_bytes()),
+        parents: vec![],
+        committed_at: 0,
+        inventory,
+        processor_version: PROCESSOR_VERSION,
+        index,
+        coverage: json!({"synthetic":true,"accounted":true,"members":1,"publication_status":"synthetic","publication_role":"synthetic","license":{"decision":"approved","copyright":"Synthetic fixture authors","notice":"First-party synthetic acceptance fixture; not CHROMIUM material.","license_url":"https://www.gnu.org/licenses/agpl-3.0.html"}}),
+        source_url: "https://fixtures.invalid/devres/storage-probe/chromium".into(),
+        representation: "html".into(),
+        validated_at: 0,
+    };
+    store
+        .chromium_put("snapshots", &id, &serde_json::to_value(snapshot)?)
+        .await?;
+    Ok(())
+}
+async fn check_chromium(
+    store: std::sync::Arc<PgBlobStore>,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_adapters::{
+        ChromiumCorpus,
+        bulk::{BulkBroker, BulkConfig},
+        chromium_research::ChromiumResearch,
+    };
+    use devres_application::chromium::ChromiumConfig;
+    let research = ChromiumResearch::new(std::sync::Arc::new(ChromiumCorpus::new(
+        store,
+        std::sync::Arc::new(BulkBroker::new(BulkConfig::default())?),
+        root,
+        ChromiumConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    )?));
+    let snapshot = fixture_hash(CHROMIUM_IDENTITY);
+    let detail = research
+        .call(
+            "chromium_get",
+            json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot}),
+        )
+        .await?;
+    if detail["selection"]["coverage"]["synthetic"] != true
+        || detail["selection"]["source_url"]
+            != "https://fixtures.invalid/devres/storage-probe/chromium"
+        || !detail["page"]["text"].as_str().is_some_and(|s| {
+            s.contains("Synthetic CHROMIUM storage fixture") && !s.contains("fixture_hidden_script")
+        })
+    {
+        return Err("Synthetic CHROMIUM text/provenance mismatch".into());
+    }
+    let source = research
+        .call(
+            "chromium_get",
+            json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"representation":"source"}),
+        )
+        .await?;
+    if source["page"]["text"] != CHROMIUM_SOURCE {
+        return Err("Synthetic CHROMIUM original source mismatch".into());
+    }
+    let symbol=research.call("chromium_symbol_get",json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
+    if symbol["page"]["text"] != "FixtureToken"
+        || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
+        || !symbol["derived_notice"].is_string()
+    {
+        return Err("Synthetic CHROMIUM symbol mismatch".into());
+    }
+    for selected in [&detail, &source, &symbol] {
+        let resource = research
+            .read_resource(
+                selected["resource_uri"]
+                    .as_str()
+                    .ok_or("Missing CHROMIUM fixture resource")?,
+            )
+            .await?;
+        if resource["contents"][0]["text"] != selected["page"]["text"]
+            || resource["contents"][0]["_meta"]["source_metadata"]["copyright"]
+                != "Synthetic fixture authors"
+        {
+            return Err("Synthetic CHROMIUM resource mismatch".into());
+        }
+    }
+    let found = research
+        .call(
+            "chromium_search",
+            json!({"snapshot":snapshot,"query":"token"}),
+        )
+        .await?;
+    if found["total"] != 1 {
+        return Err("Synthetic CHROMIUM selected search mismatch".into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = std::env::var("DATABASE_URL")?;
@@ -626,6 +794,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed_w3c(&store, std::path::Path::new(&root))
                 .await
                 .map_err(|error| format!("Synthetic W3C fixture seeding failed: {error}"))?;
+            seed_chromium(&store, std::path::Path::new(&root)).await?;
             store
                 .publish(
                     &request,
@@ -654,6 +823,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_mdn(&store, std::path::Path::new(&root)).await?;
     check_whatwg(store.clone(), std::path::Path::new(&root)).await?;
     check_w3c(store.clone(), std::path::Path::new(&root)).await?;
+    check_chromium(store.clone(), std::path::Path::new(&root)).await?;
     println!("{} {}", stored.capture.id, stored.capture.body_hash);
     Ok(())
 }

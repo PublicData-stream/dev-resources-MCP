@@ -103,6 +103,7 @@ async fn main() -> Result<(), ServerError> {
     let mut has_mdn_corpus = false;
     let mut has_whatwg_corpus = false;
     let mut has_w3c_corpus = false;
+    let mut has_chromium_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -172,6 +173,22 @@ async fn main() -> Result<(), ServerError> {
                     "w3c_snapshots",
                     "w3c_compare",
                     "w3c_corpus_status",
+                ]
+                .iter()
+                .all(|name| tools.iter().any(|tool| tool["name"] == *name))
+            });
+            has_chromium_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
+                [
+                    "chromium_catalog_search",
+                    "chromium_search",
+                    "chromium_get",
+                    "chromium_symbol_search",
+                    "chromium_symbol_get",
+                    "chromium_references",
+                    "chromium_history",
+                    "chromium_snapshots",
+                    "chromium_compare",
+                    "chromium_corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
@@ -657,6 +674,144 @@ async fn main() -> Result<(), ServerError> {
                 != "Synthetic fixture authors"
         {
             return Err("Immutable W3C bytes or notices changed through WebTransport".into());
+        }
+    }
+    if has_chromium_corpus {
+        let status = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            50,
+            "chromium_corpus_status",
+            json!({}),
+        )
+        .await?;
+        if !status["collection_enabled"].is_boolean() {
+            return Err("CHROMIUM corpus status missing through WebTransport".into());
+        }
+    }
+    if let Ok(snapshot) = std::env::var("DEVRES_PROBE_CHROMIUM_SNAPSHOT") {
+        if !has_chromium_corpus {
+            return Err("CHROMIUM discovery missing through WebTransport".into());
+        }
+        if snapshot.len() != 64
+            || !snapshot
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err("Invalid synthetic CHROMIUM snapshot".into());
+        }
+        let detail = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            51,
+            "chromium_get",
+            json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot}),
+        )
+        .await?;
+        if detail["selection"]["snapshot"] != snapshot
+            || detail["selection"]["coverage"]["synthetic"] != true
+            || !detail["selection"]["source_url"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("https://fixtures.invalid/"))
+            || !detail["page"]["text"].as_str().is_some_and(|s| {
+                s.contains("Synthetic CHROMIUM storage fixture")
+                    && !s.contains("fixture_hidden_script")
+            })
+        {
+            return Err(
+                "Synthetic CHROMIUM document/provenance mismatch through WebTransport".into(),
+            );
+        }
+        let original = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            52,
+            "chromium_get",
+            json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"representation":"source"}),
+        )
+        .await?;
+        if !original["page"]["text"].as_str().is_some_and(|s| {
+            s.starts_with("<h1 id=fixture>") && s.contains("fixture_hidden_script()")
+        }) {
+            return Err("Original CHROMIUM source changed through WebTransport".into());
+        }
+        let found = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            53,
+            "chromium_search",
+            json!({"snapshot":snapshot,"query":"token"}),
+        )
+        .await?;
+        if found["total"] != 1 || found["results"][0]["component"] != "src" {
+            return Err("CHROMIUM snapshot search mismatch through WebTransport".into());
+        }
+        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,54,"chromium_symbol_get",json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
+        if symbol["page"]["text"] != "FixtureToken"
+            || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
+            || !symbol["derived_notice"].is_string()
+        {
+            return Err("CHROMIUM symbol mismatch through WebTransport".into());
+        }
+        for (id, selected) in [(55, &detail), (56, &original), (57, &symbol)] {
+            let uri = selected["resource_uri"]
+                .as_str()
+                .ok_or("Missing immutable CHROMIUM resource")?;
+            if !uri.starts_with(&format!("devres://chromium/src/{snapshot}/")) {
+                return Err("CHROMIUM resource lost snapshot binding".into());
+            }
+            let mut params = json!({"uri":uri});
+            if revision == "2026-07-28" {
+                params["_meta"] = metadata(revision);
+            }
+            let resource = exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":params}),
+            )
+            .await?;
+            if resource["result"]["contents"][0]["text"] != selected["page"]["text"]
+                || resource["result"]["contents"][0]["_meta"]["source_metadata"]["copyright"]
+                    != "Synthetic fixture authors"
+            {
+                return Err("Immutable CHROMIUM resource changed through WebTransport".into());
+            }
+        }
+        let binary = tool_exchange(&mut send, &mut reader, &budget, revision, 58, "chromium_get", json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"representation":"bytes","limit":8})).await?;
+        if binary["page"]["base64"] != "PGgxIGlkPWY=" {
+            return Err("CHROMIUM byte page changed through WebTransport".into());
+        }
+        let uri = format!(
+            "{}?limit=8",
+            binary["resource_uri"]
+                .as_str()
+                .ok_or("Missing CHROMIUM bytes resource")?
+        );
+        let mut params = json!({"uri":uri});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let bytes_resource = exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":59,"method":"resources/read","params":params}),
+        )
+        .await?;
+        if bytes_resource["result"]["contents"][0]["blob"] != "PGgxIGlkPWY="
+            || bytes_resource["result"]["contents"][0]["_meta"]["source_metadata"]["copyright"]
+                != "Synthetic fixture authors"
+        {
+            return Err("Immutable CHROMIUM bytes or notices changed through WebTransport".into());
         }
     }
     connection.close(0_u32.into(), b"probe complete");

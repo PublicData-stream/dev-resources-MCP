@@ -106,6 +106,7 @@ mdn_content=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-p
 mdn_compat=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest())')
 whatwg_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest())')
 w3c_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:w3c:v1").hexdigest())')
+chromium_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:chromium:v1").hexdigest())')
 advisory_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest())')
 fixture_storage() { docker run --rm --network "$run_id" -v "$run_id-data:/data" \
   -e DATABASE_URL=postgres://devres:fixture-only@postgres/devres -e BLOB_DIR=/data/blobs \
@@ -119,9 +120,9 @@ probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/ce
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
 for revision in 2026-07-28 2025-11-25; do
   probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
-    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" DEVRES_PROBE_CHROMIUM_SNAPSHOT="$chromium_snapshot" devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
   probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
-    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
+    DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" DEVRES_PROBE_CHROMIUM_SNAPSHOT="$chromium_snapshot" devres-probe https://backend:4433/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example \
     /fixture/cert/edge-client.pem /fixture/cert/edge-client-key.pem
 done
 docker stop --time 15 "$run_id-backend" >/dev/null

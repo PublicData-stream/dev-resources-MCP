@@ -18,6 +18,8 @@ SYNTHETIC_WHATWG = hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest()
 SYNTHETIC_WHATWG_TEXT = "Synthetic WHATWG storage fixture"
 SYNTHETIC_W3C = hashlib.sha256(b"devres:storage-probe:w3c:v1").hexdigest()
 SYNTHETIC_W3C_TEXT = "Synthetic W3C storage fixture"
+SYNTHETIC_CHROMIUM = hashlib.sha256(b"devres:storage-probe:chromium:v1").hexdigest()
+SYNTHETIC_CHROMIUM_TEXT = "Synthetic CHROMIUM storage fixture"
 SYNTHETIC_MDN_TEXT = "Synthetic MDN storage fixture"
 SYNTHETIC_ADVISORY = "RUSTSEC-2024-0001"
 SYNTHETIC_SNAPSHOT = hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest()
@@ -137,6 +139,13 @@ def smoke(client, negative=True):
         assert {"w3c_catalog_search", "w3c_search", "w3c_get", "w3c_symbol_search",
                 "w3c_symbol_get", "w3c_references", "w3c_history", "w3c_snapshots",
                 "w3c_compare", "w3c_corpus_status"} <= names, names
+        assert {"chromium_catalog_search", "chromium_search", "chromium_get", "chromium_symbol_search",
+                "chromium_symbol_get", "chromium_references", "chromium_history", "chromium_snapshots",
+                "chromium_compare", "chromium_corpus_status"} <= names, names
+        chromium = client.tool("chromium_corpus_status", {}, revision)
+        assert isinstance(chromium.get("collection_enabled"), bool), "Chromium collection status missing"
+        code, rejected = client.exchange("tools/call", {"name": "chromium_get", "arguments": {"component": "src", "path": "docs/fixture.html", "url": "https://untrusted.invalid"}}, revision)
+        assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "Chromium schema admitted an arbitrary destination"
         w3c = client.tool("w3c_corpus_status", {}, revision)
         assert isinstance(w3c.get("collection_enabled"), bool), "W3C collection status missing"
         code, rejected = client.exchange("tools/call", {"name": "w3c_get", "arguments": {"specification": "fixture", "url": "https://untrusted.invalid"}}, revision)
@@ -349,6 +358,54 @@ def synthetic_w3c(client):
             assert value["contents"][0].get("_meta", {}).get("source_metadata", {}).get("copyright") == "Synthetic fixture authors", "W3C resource copyright missing"
 
 
+def synthetic_chromium(client):
+    """Exercise local synthetic CHROMIUM snapshots across both negotiated revisions."""
+    for revision in (MODERN, LEGACY):
+        selection = {"component": "src", "path": "docs/fixture.html", "snapshot": SYNTHETIC_CHROMIUM}
+        detail = client.tool("chromium_get", selection, revision)
+        provenance = detail.get("selection", {})
+        assert provenance.get("snapshot") == SYNTHETIC_CHROMIUM, "CHROMIUM snapshot changed"
+        assert provenance.get("coverage", {}).get("synthetic") is True, "CHROMIUM fixture lost synthetic provenance"
+        assert provenance.get("source_url", "").startswith("https://fixtures.invalid/"), "CHROMIUM fixture invented upstream provenance"
+        text = detail.get("page", {}).get("text", "")
+        assert SYNTHETIC_CHROMIUM_TEXT in text and "fixture_hidden_script" not in text, "CHROMIUM inert text changed"
+        original = client.tool("chromium_get", {**selection, "representation": "source"}, revision)
+        assert original.get("page", {}).get("text", "").startswith("<h1 id=fixture>"), "CHROMIUM original source changed"
+        assert "fixture_hidden_script()" in original["page"]["text"], "CHROMIUM raw source was modified"
+        found = client.tool("chromium_search", {"snapshot": SYNTHETIC_CHROMIUM, "query": "token"}, revision)
+        assert found.get("total") == 1 and found["results"][0].get("component") == "src", "CHROMIUM selected search changed"
+        symbol = client.tool("chromium_symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
+        assert symbol.get("page", {}).get("text") == "FixtureToken", "CHROMIUM symbol changed"
+        for selected in (detail, original, symbol):
+            metadata = selected.get("source_metadata", {})
+            assert metadata.get("copyright") == "Synthetic fixture authors", "CHROMIUM copyright notice missing"
+            assert metadata.get("publication_status") == "synthetic", "CHROMIUM status notice missing"
+            assert selected.get("derived_notice"), "CHROMIUM derived notice missing"
+            uri = selected.get("resource_uri", "")
+            assert uri.startswith("devres://chromium/src/" + SYNTHETIC_CHROMIUM + "/"), "CHROMIUM resource lost snapshot binding"
+            for method, params in (("resources/read", {"uri": uri}),
+                                   ("tools/call", {"name": "fetch", "arguments": {"id": uri}})):
+                value = client.call(method, params, revision)
+                if method == "tools/call":
+                    assert not value.get("isError"), "CHROMIUM immutable fetch failed"
+                    value = value.get("structuredContent", value)
+                assert value.get("contents", [{}])[0].get("text") == selected["page"]["text"], "CHROMIUM immutable resource changed"
+                assert value["contents"][0].get("_meta", {}).get("source_metadata", {}).get("copyright") == "Synthetic fixture authors", "CHROMIUM resource copyright missing"
+
+
+        binary = client.tool("chromium_get", {**selection, "representation": "bytes", "limit": 8}, revision)
+        assert binary.get("page", {}).get("base64") == "PGgxIGlkPWY=", "CHROMIUM byte page changed"
+        uri = binary.get("resource_uri", "") + "?limit=8"
+        for method, params in (("resources/read", {"uri": uri}),
+                               ("tools/call", {"name": "fetch", "arguments": {"id": uri}})):
+            value = client.call(method, params, revision)
+            if method == "tools/call":
+                assert not value.get("isError"), "CHROMIUM byte fetch failed"
+                value = value.get("structuredContent", value)
+            assert value.get("contents", [{}])[0].get("blob") == "PGgxIGlkPWY=", "CHROMIUM immutable bytes changed"
+            assert value["contents"][0].get("_meta", {}).get("source_metadata", {}).get("copyright") == "Synthetic fixture authors", "CHROMIUM resource copyright missing"
+
+
 def wait_ready(client, seconds):
     """Wait only for offline semantic routing readiness, never replay source work."""
     deadline = time.monotonic() + seconds
@@ -487,6 +544,7 @@ def main():
         synthetic_mdn(client)
         synthetic_whatwg(client)
         synthetic_w3c(client)
+        synthetic_chromium(client)
     if options.live:
         live(client, options.rfc_text_only)
     print("HTTP MCP acceptance passed" + ("; bounded live smoke passed (RFC text only)" if options.live and options.rfc_text_only else "; bounded live smoke passed" if options.live else "; no provider calls"))
