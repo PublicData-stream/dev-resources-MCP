@@ -86,6 +86,31 @@ A local gate does not establish arm64 execution or native browser/ChatGPT UI
 interoperability. Native architecture CI, image publication, production certificates,
 provider coverage, and production deployment require their own evidence.
 
+## Native end-to-end CI
+
+`scripts/ci-e2e.sh build PLATFORM DIRECTORY` builds the fixture harness once per
+native architecture and exports a Docker-save artifact through
+`scripts/e2e-artifact.py`. `test docker|minikube PLATFORM DIRECTORY` verifies its
+platform, commit, version and contents, loads it, and passes `--image` to the
+scenario harness without rebuilding. Release builds stamp their sources; consumers
+validate the version from the release tag without stamping their checkout.
+
+The `e2e-build` matrix uses Ubuntu 26.04 amd64 and ARM64 runners with 60-minute
+limits. The `e2e` matrix runs Docker and minikube on both architectures with
+45-minute limits and fail-fast disabled. The always-running `edge` aggregate
+requires both matrices to succeed, including rejecting skipped or cancelled work.
+Harness artifacts `e2e-harness-ARCH` live for one day; scenario diagnostics selected
+by `DEVRES_E2E_DIAGNOSTICS_DIR` live for seven days. Diagnostics exclude fixture
+private keys and request contents.
+
+The driver enters owned `/tmp` state through `with-tmp-state.sh`, then overrides
+Cargo and OxiBelt targets to `/buildcache/rust/target`. It installs Rust 1.99.1
+before checking native host/compiler/daemon agreement inside an isolated rootful
+`with-local-docker.sh` daemon. Minikube 1.39.0 downloads are checked against pinned
+architecture-specific SHA-256 values and use Kubernetes 1.37.0. These disposable
+fixture gates perform no publication or live-provider acceptance; hosted native
+results and production operations remain separate evidence.
+
 ## Native images and versioned releases
 
 Native CI pairs `ubuntu-26.04` with `linux/amd64` and `ubuntu-26.04-arm` with

@@ -109,22 +109,78 @@ jobs:
       - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo audit
       - run: cargo deny check
-  edge:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 90
+  e2e-build:
+    name: e2e-build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            arch: amd64
+          - runner: ubuntu-26.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Prepare release sources
-        if: env.RELEASE_TAG != ''
-        run: |
-          scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA"
-          python3 scripts/release_contract.py stamp --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
-      - run: echo "RUSTUP_HOME=$RUNNER_TEMP/devres-rustup" >> "$GITHUB_ENV"
-      - run: rustup toolchain install 1.99.1 --profile minimal
-      - name: Install edge native build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y clang cmake libclang-dev perl pkg-config
-      - run: scripts/test-oxibelt.sh
+      - name: Build native harness artifact
+        run: scripts/ci-e2e.sh build "linux/${{ matrix.arch }}" "/tmp/devres-e2e-harness"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-harness-${{ matrix.arch }}
+          path: /tmp/devres-e2e-harness/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+  e2e:
+    name: e2e (${{ matrix.scenario }}, ${{ matrix.arch }})
+    needs: e2e-build
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [docker, minikube]
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2e-harness-${{ matrix.arch }}
+          path: /tmp/devres-e2e-harness/
+      - name: Verify and exercise native harness
+        env:
+          DEVRES_E2E_DIAGNOSTICS_DIR: /tmp/devres-e2e-diagnostics
+        run: scripts/ci-e2e.sh test "${{ matrix.scenario }}" "linux/${{ matrix.arch }}" "/tmp/devres-e2e-harness"
+      - name: Retain scenario diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-diagnostics-${{ matrix.scenario }}-${{ matrix.arch }}
+          path: /tmp/devres-e2e-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
+  edge:
+    if: always()
+    needs: [e2e-build, e2e]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every native build and scenario
+        env:
+          BUILD_RESULT: ${{ needs.e2e-build.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: test "$BUILD_RESULT" = success && test "$E2E_RESULT" = success
