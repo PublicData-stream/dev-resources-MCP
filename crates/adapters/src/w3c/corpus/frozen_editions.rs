@@ -454,7 +454,7 @@ mod tests {
         let chapter_path = corpus.members(&chapter_snapshot_v1, 0, 10).await.unwrap()[0]
             .path
             .clone();
-        let original=research.call("w3c_get",json!({"specification":"example","snapshot":baseline_snapshot.id,"path":chapter_path})).await.unwrap();
+        let original=research.call("w3c.get",json!({"specification":"example","snapshot":baseline_snapshot.id,"path":chapter_path})).await.unwrap();
         let original_uri = original["resource_uri"].as_str().unwrap().to_owned();
         let (_chapter_v2,chapter_snapshot_v2)=page(&corpus,&standard,"https://www.w3.org/TR/example/chapter.html","<h2 id=future>Futurequasar replacement</h2><p>Futurequasar body outside the original freeze.</p>",now-10).await;
         store
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(
             research
                 .call(
-                    "w3c_search",
+                    "w3c.search",
                     json!({"specification":"example","view":resumed.id,"query":"futurequasar"})
                 )
                 .await

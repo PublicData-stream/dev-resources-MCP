@@ -18,6 +18,20 @@ class Response(io.BytesIO):
         return self.content_type
 
 
+class ToolInventoryTests(unittest.TestCase):
+    def test_exact_dotted_inventory(self):
+        tools = [{"name": name} for name in smoke.EXPECTED_TOOLS]
+        smoke.assert_tool_inventory(tools)
+        self.assertEqual(len(tools), 88)
+
+    def test_legacy_alias_extra_missing_and_duplicate_are_rejected(self):
+        tools = [{"name": name} for name in sorted(smoke.EXPECTED_TOOLS)]
+        for invalid in (tools + [{"name": "server_info"}], tools[:-1], tools + [tools[0]],
+                        [{"name": tool["name"].replace(".", "_", 1)} for tool in tools]):
+            with self.subTest(count=len(invalid)), self.assertRaises(AssertionError):
+                smoke.assert_tool_inventory(invalid)
+
+
 class DecodeResponseTests(unittest.TestCase):
     def test_resource_read_routes_by_uri_in_modern_mcp_name_header(self):
         uri = "devres://source/?name=example&version=1.0.0&path=src%2Flib.rs"
@@ -93,7 +107,7 @@ class DecodeResponseTests(unittest.TestCase):
         client = RecoveringClient()
         with patch.object(smoke.time, "sleep"):
             smoke.wait_ready(client, 2)
-        self.assertEqual(client.calls, [("server_info", {}), ("server_info", {})])
+        self.assertEqual(client.calls, [("server.info", {}), ("server.info", {})])
         self.assertEqual(client.timeout, 45)
 
 
@@ -112,21 +126,21 @@ class SyntheticClient:
 
     def tool(self, name, arguments, revision=smoke.MODERN):
         self.calls.append((name, revision))
-        if name != "advisory_corpus_status":
+        if name != "advisory.corpus_status":
             selected = arguments.get("snapshot", arguments.get("advisory_snapshot"))
             if selected != smoke.SYNTHETIC_SNAPSHOT:
                 raise AssertionError("synthetic request did not pin the fixture")
-        if name == "advisory_get":
+        if name == "advisory.get":
             return {"id": smoke.SYNTHETIC_ADVISORY, "snapshot": self.snapshot,
                     "source_url": "https://fixtures.invalid/devres/storage-probe/advisory",
                     "page": {"text": self.text},
                     "resource_uri": f"devres://advisory/rustsec/{smoke.SYNTHETIC_ADVISORY}/{smoke.SYNTHETIC_SNAPSHOT}"}
-        if name == "advisory_catalog_search":
+        if name == "advisory.catalog_search":
             return {"total": 1}
-        if name == "advisory_lookup":
+        if name == "advisory.lookup":
             total = int(arguments["version"] == "1.0.0")
             return {"complete": True, "total": total, "items": [{"id": smoke.SYNTHETIC_ADVISORY}] if total else []}
-        if name == "audit_lockfile":
+        if name == "audit.lockfile":
             self.private_comment_seen |= arguments["lockfile"].startswith("# " + smoke.AUDIT_PRIVACY_MARKER)
             report = {"complete": True, "snapshot": self.snapshot, "package_count": 1,
                       "assessed_count": 1, "unassessed_count": 0, "input_retention": "request_lifetime_only",
@@ -135,7 +149,7 @@ class SyntheticClient:
             if self.leak:
                 report["diagnostic"] = smoke.AUDIT_PRIVACY_MARKER
             return report
-        if name == "advisory_corpus_status":
+        if name == "advisory.corpus_status":
             return {"counts": {"snapshots": 1}}
         raise AssertionError("unexpected synthetic fixture tool")
 
@@ -148,7 +162,7 @@ class SyntheticClient:
         raise AssertionError("unexpected synthetic fixture RPC")
 
     def exchange(self, method, params, revision=smoke.MODERN):
-        if method != "tools/call" or params["name"] != "audit_lockfile":
+        if method != "tools/call" or params["name"] != "audit.lockfile":
             raise AssertionError("unexpected synthetic fixture exchange")
         self.calls.append(("invalid_audit", revision))
         message = smoke.AUDIT_PRIVACY_MARKER if self.leak_invalid else "Invalid Cargo.lock."
@@ -161,7 +175,7 @@ class SyntheticAdvisoryTests(unittest.TestCase):
         client = SyntheticClient()
         smoke.synthetic_advisory(client)
         self.assertTrue(client.private_comment_seen)
-        self.assertEqual({revision for name, revision in client.calls if name == "audit_lockfile"},
+        self.assertEqual({revision for name, revision in client.calls if name == "audit.lockfile"},
                          {smoke.MODERN, smoke.LEGACY})
         self.assertEqual(sum(name == "resources/read" for name, _revision in client.calls), 2)
         self.assertEqual({revision for name, revision in client.calls if name == "invalid_audit"},
@@ -196,13 +210,13 @@ class SyntheticMdnClient:
 
     def tool(self, name, arguments, revision=smoke.MODERN):
         self.calls.append((name, revision))
-        if name == "mdn_corpus_status":
+        if name == "mdn.corpus_status":
             return {"collection_enabled": False}
         expected = (smoke.SYNTHETIC_MDN_COMPAT if name in
-                    ("mdn_compat_get", "mdn_compat_search", "mdn_browser_get") else smoke.SYNTHETIC_MDN_CONTENT)
+                    ("mdn.compat_get", "mdn.compat_search", "mdn.browser_get") else smoke.SYNTHETIC_MDN_CONTENT)
         if arguments.get("snapshot") != expected:
             raise AssertionError("MDN fixture request did not pin its source snapshot")
-        if name == "mdn_get":
+        if name == "mdn.get":
             original = arguments.get("representation") == "source"
             text = ("---\ntitle: Synthetic MDN storage fixture\n---\nsource" if original else
                     smoke.SYNTHETIC_MDN_TEXT + "\nfixture_browser: version_added=1")
@@ -212,14 +226,14 @@ class SyntheticMdnClient:
                                                           "license": {"synthetic": True}}}
             return {"provenance": provenance, "source_url": ("https://github.com/mdn/content" if self.false_provenance else
                     "https://fixtures.invalid/mdn/content"), "page": {"text": text}, "resource_uri": uri}
-        if name == "mdn_search":
+        if name == "mdn.search":
             return {"total": 1, "results": [{"slug": "Web/Fixture"}]}
-        if name == "mdn_compat_get":
+        if name == "mdn.compat_get":
             statement = {"fixture_browser": {"version_added": "2" if self.wrong_support else "1"}}
             return {"original": statement, "resolved": statement}
-        if name == "mdn_compat_search":
+        if name == "mdn.compat_search":
             return {"total": 1}
-        if name == "mdn_browser_get":
+        if name == "mdn.browser_get":
             return {"releases": [{"version": "1"}]}
         raise AssertionError("unexpected MDN fixture operation")
 
@@ -236,7 +250,7 @@ class SyntheticMdnTests(unittest.TestCase):
     def test_seeded_mdn_exercises_both_revisions_and_original_resources(self):
         client = SyntheticMdnClient()
         smoke.synthetic_mdn(client)
-        self.assertEqual({revision for name, revision in client.calls if name == "mdn_get"},
+        self.assertEqual({revision for name, revision in client.calls if name == "mdn.get"},
                          {smoke.MODERN, smoke.LEGACY})
         self.assertEqual(sum(name == "resources/read" for name, _ in client.calls), 4)
 
@@ -262,12 +276,12 @@ class SyntheticWhatwgClient:
         self.calls.append((name, revision))
         if arguments.get("snapshot") != smoke.SYNTHETIC_WHATWG:
             raise AssertionError("WHATWG fixture request must pin its snapshot")
-        if name == "whatwg_search":
+        if name == "whatwg.search":
             return {"total": 1, "results": [{"standard": "fixture"}]}
-        if name == "whatwg_symbol_get":
+        if name == "whatwg.symbol_get":
             representation = "symbol"
             text = "WrongToken" if self.wrong_symbol else "FixtureToken"
-        elif name == "whatwg_get":
+        elif name == "whatwg.get":
             representation = arguments.get("representation", "text")
             text = ("<h1 id=fixture>Synthetic WHATWG storage fixture</h1><script>fixture_hidden_script()</script>"
                     if representation == "source" else smoke.SYNTHETIC_WHATWG_TEXT)
@@ -294,7 +308,7 @@ class SyntheticWhatwgTests(unittest.TestCase):
     def test_fixture_covers_both_revisions_and_all_immutable_representations(self):
         client = SyntheticWhatwgClient()
         smoke.synthetic_whatwg(client)
-        self.assertEqual({revision for name, revision in client.calls if name == "whatwg_get"},
+        self.assertEqual({revision for name, revision in client.calls if name == "whatwg.get"},
                          {smoke.MODERN, smoke.LEGACY})
         self.assertEqual(sum(name == "resources/read" for name, _ in client.calls), 6)
         self.assertEqual(sum(name == "tools/call" for name, _ in client.calls), 6)
@@ -327,12 +341,12 @@ class SyntheticW3cClient:
         self.calls.append((name, revision))
         if arguments.get("snapshot") != smoke.SYNTHETIC_W3C:
             raise AssertionError("W3C fixture request must pin its snapshot")
-        if name == "w3c_search":
+        if name == "w3c.search":
             return {"total": 1, "results": [{"specification": "fixture"}]}
-        if name == "w3c_symbol_get":
+        if name == "w3c.symbol_get":
             representation = "symbol"
             text = "WrongToken" if self.wrong_symbol else "FixtureToken"
-        elif name == "w3c_get":
+        elif name == "w3c.get":
             representation = arguments.get("representation", "text")
             text = ("<h1 id=fixture>Synthetic W3C storage fixture</h1><script>fixture_hidden_script()</script>"
                     if representation == "source" else smoke.SYNTHETIC_W3C_TEXT)
@@ -362,7 +376,7 @@ class SyntheticW3cTests(unittest.TestCase):
     def test_fixture_covers_both_revisions_and_all_immutable_representations(self):
         client = SyntheticW3cClient()
         smoke.synthetic_w3c(client)
-        self.assertEqual({revision for name, revision in client.calls if name == "w3c_get"},
+        self.assertEqual({revision for name, revision in client.calls if name == "w3c.get"},
                          {smoke.MODERN, smoke.LEGACY})
         self.assertEqual(sum(name == "resources/read" for name, _ in client.calls), 8)
         self.assertEqual(sum(name == "tools/call" for name, _ in client.calls), 8)
@@ -387,7 +401,7 @@ class SyntheticW3cNoticeTests(unittest.TestCase):
         class MissingNotice(SyntheticW3cClient):
             def tool(self, name, arguments, revision=smoke.MODERN):
                 result=super().tool(name,arguments,revision)
-                if name=="w3c_get":
+                if name=="w3c.get":
                     result.pop("source_metadata",None)
                 return result
         with self.assertRaisesRegex(AssertionError,"copyright notice missing"):

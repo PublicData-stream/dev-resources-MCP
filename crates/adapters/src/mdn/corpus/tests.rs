@@ -263,7 +263,7 @@ impl Fixture {
         }
         self.corpus
             .research()
-            .call("mdn_get", input)
+            .call("mdn.get", input)
             .await
             .expect("get document")
     }
@@ -291,7 +291,7 @@ async fn mdn_corpus_current_default_search_originals_and_history_are_local() {
     );
     let source = research
         .call(
-            "mdn_get",
+            "mdn.get",
             json!({"path":FETCH_PATH,"representation":"source"}),
         )
         .await
@@ -302,7 +302,7 @@ async fn mdn_corpus_current_default_search_originals_and_history_are_local() {
     );
     let search = research
         .call(
-            "mdn_search",
+            "mdn.search",
             json!({"query":"network evidence","page_type":"web-api-instance-method"}),
         )
         .await
@@ -310,7 +310,7 @@ async fn mdn_corpus_current_default_search_originals_and_history_are_local() {
     assert_eq!(search["results"].as_array().expect("results").len(), 1);
     assert_eq!(search["results"][0]["slug"], "Web/API/Fetch");
     let browser = research
-        .call("mdn_browser_get", json!({"browser":"chrome"}))
+        .call("mdn.browser_get", json!({"browser":"chrome"}))
         .await
         .expect("browser metadata");
     assert_eq!(browser["total"], 1);
@@ -330,7 +330,7 @@ async fn mdn_corpus_current_default_search_originals_and_history_are_local() {
     }
     let changes = research
         .call(
-            "mdn_history",
+            "mdn.history",
             json!({"repository":"compat","feature":"api.fetch"}),
         )
         .await
@@ -346,7 +346,7 @@ async fn mdn_corpus_current_default_search_originals_and_history_are_local() {
     fixture.server.abort();
     assert_eq!(
         research
-            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_get", json!({"feature":"api.fetch"}))
             .await
             .expect("offline compatibility")["original"]["chrome"]["version_added"],
         "42"
@@ -543,7 +543,7 @@ async fn mdn_corpus_malformed_bcd_replaces_no_historical_feature() {
         fixture
             .corpus
             .research()
-            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_get", json!({"feature":"api.fetch"}))
             .await
             .is_err(),
         "failed projection must not reuse old feature in new snapshot"
@@ -552,7 +552,7 @@ async fn mdn_corpus_malformed_bcd_replaces_no_historical_feature() {
         .corpus
         .research()
         .call(
-            "mdn_get",
+            "mdn.get",
             json!({"repository":"compat","path":"api/fetch.json","representation":"source"}),
         )
         .await
@@ -563,7 +563,7 @@ async fn mdn_corpus_malformed_bcd_replaces_no_historical_feature() {
         .corpus
         .research()
         .call(
-            "mdn_compat_get",
+            "mdn.compat_get",
             json!({"feature":"api.fetch","snapshot":historical.id}),
         )
         .await
@@ -724,7 +724,7 @@ async fn mdn_corpus_mirrors_survive_wide_repository_root_partition() {
     let support = fixture
         .corpus
         .research()
-        .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+        .call("mdn.compat_get", json!({"feature":"api.fetch"}))
         .await
         .expect("mirrored feature");
     assert_eq!(support["resolved"]["chrome_android"]["version_added"], "42");
@@ -747,7 +747,7 @@ async fn mdn_corpus_failed_include_projection_recovers_when_only_dependency_chan
             fixture
                 .corpus
                 .research()
-                .call("mdn_get", json!({"slug":"Web/API/Fetch"}))
+                .call("mdn.get", json!({"slug":"Web/API/Fetch"}))
                 .await
                 .is_err(),
             "failed included member cannot leave stale projected text"
@@ -756,7 +756,7 @@ async fn mdn_corpus_failed_include_projection_recovers_when_only_dependency_chan
             .corpus
             .research()
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"path":FETCH_PATH,"representation":"source"}),
             )
             .await
@@ -815,7 +815,7 @@ async fn mdn_corpus_malformed_bcd_identifiers_are_accounted_and_later_fixed() {
         .corpus
         .research()
         .call(
-            "mdn_get",
+            "mdn.get",
             json!({"repository":"compat","path":"api/fetch.json","representation":"source"}),
         )
         .await
@@ -841,7 +841,7 @@ async fn mdn_corpus_malformed_bcd_identifiers_are_accounted_and_later_fixed() {
         fixture
             .corpus
             .research()
-            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_get", json!({"feature":"api.fetch"}))
             .await
             .expect("fixed feature")["original"]["chrome"]["version_added"],
         "42"
@@ -887,7 +887,7 @@ async fn mdn_corpus_unindexable_article_does_not_poison_snapshot_publication() {
         .corpus
         .research()
         .call(
-            "mdn_search",
+            "mdn.search",
             json!({"query":"network","page_type":"web-api-instance-method"}),
         )
         .await
@@ -896,7 +896,7 @@ async fn mdn_corpus_unindexable_article_does_not_poison_snapshot_publication() {
     let all = fixture
         .corpus
         .research()
-        .call("mdn_search", json!({"query":"Unindexable"}))
+        .call("mdn.search", json!({"query":"Unindexable"}))
         .await
         .expect("gap does not refer to missing index projection");
     assert!(all["results"].as_array().expect("results").is_empty());
@@ -938,7 +938,7 @@ async fn mdn_corpus_identical_bcd_move_keeps_pinned_source_paths() {
             .corpus
             .research()
             .call(
-                "mdn_compat_get",
+                "mdn.compat_get",
                 json!({"feature":"api.fetch","snapshot":snapshot.id}),
             )
             .await
@@ -949,14 +949,14 @@ async fn mdn_corpus_identical_bcd_move_keeps_pinned_source_paths() {
             .corpus
             .research()
             .call(
-                "mdn_compat_search",
+                "mdn.compat_search",
                 json!({"feature":"api.fetch","snapshot":snapshot.id}),
             )
             .await
             .expect("pinned search");
         assert_eq!(search["results"].as_array().expect("results").len(), 1);
         assert_eq!(search["results"][0]["path"], path);
-        let raw=fixture.corpus.research().call("mdn_get",json!({"repository":"compat","path":path,"snapshot":snapshot.id,"representation":"source"})).await.expect("pinned original");
+        let raw=fixture.corpus.research().call("mdn.get",json!({"repository":"compat","path":path,"snapshot":snapshot.id,"representation":"source"})).await.expect("pinned original");
         assert_eq!(
             raw["page"]["text"],
             std::str::from_utf8(BCD).expect("fixture text")
@@ -1001,7 +1001,7 @@ async fn mdn_corpus_duplicate_bcd_identity_remains_ambiguous_until_one_source_is
         fixture
             .corpus
             .research()
-            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_get", json!({"feature":"api.fetch"}))
             .await
             .is_err(),
         "duplicate sources cannot choose arbitrary support"
@@ -1010,7 +1010,7 @@ async fn mdn_corpus_duplicate_bcd_identity_remains_ambiguous_until_one_source_is
         fixture
             .corpus
             .research()
-            .call("mdn_compat_search", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_search", json!({"feature":"api.fetch"}))
             .await
             .expect("ambiguity search")["results"]
             .as_array()
@@ -1023,7 +1023,7 @@ async fn mdn_corpus_duplicate_bcd_identity_remains_ambiguous_until_one_source_is
                 .corpus
                 .research()
                 .call(
-                    "mdn_get",
+                    "mdn.get",
                     json!({"repository":"compat","path":path,"representation":"source"})
                 )
                 .await
@@ -1045,7 +1045,7 @@ async fn mdn_corpus_duplicate_bcd_identity_remains_ambiguous_until_one_source_is
         fixture
             .corpus
             .research()
-            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_get", json!({"feature":"api.fetch"}))
             .await
             .expect("unique feature restored")["original"]["chrome"]["version_added"],
         "42"
@@ -1055,7 +1055,7 @@ async fn mdn_corpus_duplicate_bcd_identity_remains_ambiguous_until_one_source_is
             .corpus
             .research()
             .call(
-                "mdn_compat_get",
+                "mdn.compat_get",
                 json!({"feature":"api.fetch","snapshot":ambiguous.id})
             )
             .await
@@ -1123,7 +1123,7 @@ async fn mdn_corpus_offline_rebuild_preserves_corrupt_historical_index_and_origi
             .corpus
             .research()
             .call(
-                "mdn_search",
+                "mdn.search",
                 json!({"query":"network","snapshot":original.id})
             )
             .await
@@ -1160,7 +1160,7 @@ async fn mdn_corpus_offline_rebuild_preserves_corrupt_historical_index_and_origi
         !fixture
             .corpus
             .research()
-            .call("mdn_search", json!({"query":"network"}))
+            .call("mdn.search", json!({"query":"network"}))
             .await
             .expect("rebuilt default search")["results"]
             .as_array()
@@ -1170,7 +1170,7 @@ async fn mdn_corpus_offline_rebuild_preserves_corrupt_historical_index_and_origi
     let discovery = fixture
         .corpus
         .research()
-        .call("mdn_snapshots", json!({"repository":"content"}))
+        .call("mdn.snapshots", json!({"repository":"content"}))
         .await
         .expect("rebuilt discovery");
     assert!(
@@ -1185,7 +1185,7 @@ async fn mdn_corpus_offline_rebuild_preserves_corrupt_historical_index_and_origi
             .corpus
             .research()
             .call(
-                "mdn_search",
+                "mdn.search",
                 json!({"query":"network","snapshot":original.id})
             )
             .await
@@ -1196,7 +1196,7 @@ async fn mdn_corpus_offline_rebuild_preserves_corrupt_historical_index_and_origi
         .corpus
         .research()
         .call(
-            "mdn_get",
+            "mdn.get",
             json!({"path":FETCH_PATH,"snapshot":original.id,"representation":"source"}),
         )
         .await
@@ -1398,11 +1398,11 @@ async fn mdn_corpus_bcd_normalized_output_overflow_is_raw_retained_source_gap() 
     let ordinary = fixture
         .corpus
         .research()
-        .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+        .call("mdn.compat_get", json!({"feature":"api.fetch"}))
         .await
         .expect("valid neighbor stays available");
     assert_eq!(ordinary["original"]["chrome"]["version_added"], "42");
-    let raw=fixture.corpus.research().call("mdn_get",json!({"repository":"compat","path":"api/expanded.json","representation":"source","limit":32})).await.expect("oversized normalization raw evidence");
+    let raw=fixture.corpus.research().call("mdn.get",json!({"repository":"compat","path":"api/expanded.json","representation":"source","limit":32})).await.expect("oversized normalization raw evidence");
     assert_eq!(raw["page"]["total_bytes"], bytes.len());
     assert_eq!(
         raw["page"]["text"],
@@ -1540,7 +1540,7 @@ async fn mdn_corpus_style_only_html_edits_share_projection_but_pin_source_and_ol
         let by_path = fixture
             .corpus
             .research()
-            .call("mdn_get", json!({"path":HTML_PATH,"snapshot":snapshot.id}))
+            .call("mdn.get", json!({"path":HTML_PATH,"snapshot":snapshot.id}))
             .await
             .expect("pinned path text");
         assert_eq!(by_path["document"]["source_oid"], member.oid);
@@ -1561,7 +1561,7 @@ async fn mdn_corpus_style_only_html_edits_share_projection_but_pin_source_and_ol
             .corpus
             .research()
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"path":HTML_PATH,"snapshot":snapshot.id,"representation":"source"}),
             )
             .await
@@ -1671,7 +1671,7 @@ async fn mdn_corpus_style_only_html_edits_share_projection_but_pin_source_and_ol
             .corpus
             .research()
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"snapshot":legacy.id,"path":HTML_PATH,"representation":"source"})
             )
             .await
@@ -1683,7 +1683,7 @@ async fn mdn_corpus_style_only_html_edits_share_projection_but_pin_source_and_ol
             .corpus
             .research()
             .call(
-                "mdn_search",
+                "mdn.search",
                 json!({"snapshot":legacy.id,"query":"semantic"})
             )
             .await
@@ -1875,7 +1875,7 @@ async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renew
         fixture
             .corpus
             .research()
-            .call("mdn_search", json!({"query":"network"}))
+            .call("mdn.search", json!({"query":"network"}))
             .await
             .is_err()
     );
@@ -1979,7 +1979,7 @@ async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renew
     let search = fixture
         .corpus
         .research()
-        .call("mdn_search", json!({"query":"network"}))
+        .call("mdn.search", json!({"query":"network"}))
         .await
         .expect("repaired omitted-snapshot search");
     assert!(
@@ -1993,7 +1993,7 @@ async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renew
         fixture
             .corpus
             .research()
-            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_get", json!({"feature":"api.fetch"}))
             .await
             .expect("same compatibility source")["original"]["chrome"]["version_added"],
         "42"
@@ -2003,7 +2003,7 @@ async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renew
             .corpus
             .research()
             .call(
-                "mdn_search",
+                "mdn.search",
                 json!({"query":"network","snapshot":originals[0].id})
             )
             .await
@@ -2015,7 +2015,7 @@ async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renew
             .corpus
             .research()
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"path":FETCH_PATH,"snapshot":originals[0].id,"representation":"source"})
             )
             .await

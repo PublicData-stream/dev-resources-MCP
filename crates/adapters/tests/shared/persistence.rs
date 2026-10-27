@@ -90,7 +90,7 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
         .unwrap()
         .with_advisory_corpus(corpus.clone());
     let empty = research
-        .call("advisory_lookup", json!({"name":"odbc","version":"0.17.0"}))
+        .call("advisory.lookup", json!({"name":"odbc","version":"0.17.0"}))
         .await
         .unwrap();
     assert_eq!(empty["complete"], false);
@@ -98,7 +98,7 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
     let fresh = corpus.refresh_current().await.unwrap();
     let id = fresh["snapshot"]["id"].as_str().unwrap().to_owned();
     let lookup = research
-        .call("advisory_lookup", json!({"name":"odbc","version":"0.17.0"}))
+        .call("advisory.lookup", json!({"name":"odbc","version":"0.17.0"}))
         .await
         .unwrap();
     assert_eq!(lookup["complete"], true);
@@ -106,7 +106,7 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
     let calls = source.calls.load(Ordering::Relaxed);
     let detail = research
         .call(
-            "advisory_get",
+            "advisory.get",
             json!({"id":"RUSTSEC-2022-0039","snapshot":id}),
         )
         .await
@@ -136,7 +136,7 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
         .unwrap();
     let old = research
         .call(
-            "advisory_lookup",
+            "advisory.lookup",
             json!({"name":"odbc","version":"0.17.0","advisory_snapshot":historical.id}),
         )
         .await

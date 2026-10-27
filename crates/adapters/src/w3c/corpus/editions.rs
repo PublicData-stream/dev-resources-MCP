@@ -471,7 +471,7 @@ mod tests {
         let research = crate::w3c::research::W3cResearch::new(Arc::new(corpus));
         let found = research
             .call(
-                "w3c_search",
+                "w3c.search",
                 json!({"specification":"example","query":"quasar"}),
             )
             .await
@@ -479,7 +479,7 @@ mod tests {
         assert!(!found["results"].as_array().unwrap().is_empty());
         let text = research
             .call(
-                "w3c_get",
+                "w3c.get",
                 json!({"specification":"example","snapshot":edition.id,"path":child_member.path}),
             )
             .await

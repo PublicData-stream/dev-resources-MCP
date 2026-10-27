@@ -510,19 +510,19 @@ async fn tools_pin_both_captures_and_page_utf8_without_further_fetches() {
     let _serial = SERIAL.lock().await;
     let (packages, _, fetcher) = setup(fixture_archive());
     let args = json!({"name":"@fixture/package","version":"1.0.0","limit":2});
-    let first = packages.call("npm_source_list", args).await.unwrap();
+    let first = packages.call("npm.source_list", args).await.unwrap();
     assert_eq!(first["files"].as_array().unwrap().len(), 2);
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
     let metadata = first["metadata_capture"]["id"].as_str().unwrap();
     let archive = first["archive_capture"]["id"].as_str().unwrap();
-    let page = packages.call("npm_source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":21,"limit":4})).await.unwrap();
+    let page = packages.call("npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":21,"limit":4})).await.unwrap();
     assert_eq!(page["page"]["text"], "한");
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
     let uri = url::Url::parse(page["resource_uri"].as_str().unwrap()).unwrap();
     let parsed = source_input_from_uri(uri.as_str()).unwrap();
     assert_eq!(parsed["path"], "index.js");
-    assert!(packages.call("npm_source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata})).await.is_err());
-    assert!(packages.call("npm_source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":22})).await.is_err());
+    assert!(packages.call("npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata})).await.is_err());
+    assert!(packages.call("npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":22})).await.is_err());
     assert!(source_input_from_uri(&format!("{}&path=evil", uri)).is_err());
 }
 
@@ -533,7 +533,7 @@ async fn unsupported_archive_processing_preserves_integrity_verified_capture() {
     let (packages, store, fetcher) = setup(bytes);
     let response = packages
         .call(
-            "npm_source_list",
+            "npm.source_list",
             json!({"name":"@fixture/package","version":"1.0.0"}),
         )
         .await
@@ -562,7 +562,7 @@ async fn search_capture_paging_stays_inside_fixed_provider_page() {
     let packages = NpmPackages::new(Arc::new(Retrieval::new(store, fetcher.clone())));
     let first = packages
         .call(
-            "npm_search",
+            "npm.search",
             json!({"query":"fixture","offset":95,"limit":20}),
         )
         .await
@@ -572,7 +572,7 @@ async fn search_capture_paging_stays_inside_fixed_provider_page() {
     let capture = first["capture"]["id"].as_str().unwrap();
     let second = packages
         .call(
-            "npm_search",
+            "npm.search",
             json!({"query":"fixture","offset":96,"limit":2,"capture":capture}),
         )
         .await
@@ -581,7 +581,7 @@ async fn search_capture_paging_stays_inside_fixed_provider_page() {
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     assert!(
         packages
-            .call("npm_search", json!({"query":"other","capture":capture}))
+            .call("npm.search", json!({"query":"other","capture":capture}))
             .await
             .is_err()
     );
@@ -596,7 +596,7 @@ async fn checksum_failure_never_publishes_archive_bytes() {
     assert!(
         packages
             .call(
-                "npm_source_list",
+                "npm.source_list",
                 json!({"name":"@fixture/package","version":"1.0.0"})
             )
             .await
@@ -625,7 +625,7 @@ async fn exact_metadata_does_not_return_other_release_timestamps() {
     let packages = NpmPackages::new(Arc::new(Retrieval::new(store.clone(), fetcher)));
     let response = packages
         .call(
-            "npm_metadata",
+            "npm.metadata",
             json!({"name":"@fixture/package","version":"1.0.0"}),
         )
         .await

@@ -165,6 +165,136 @@ async fn both_revisions_validation_origin_and_private_health() {
         .unwrap();
 }
 #[tokio::test]
+async fn dotted_tools_are_discovered_and_legacy_names_rejected_in_both_http_revisions() {
+    let source = SourceOffer::new("https://source.test/revision").unwrap();
+    let mut registry = server_info_registry(source.clone()).unwrap();
+    for descriptor in devres_adapters::Research::tool_schemas() {
+        registry
+            .register(descriptor, |_, _| async { Ok(json!({"called":true})) })
+            .unwrap();
+    }
+    let mut builder = ServerBuilder::new(registry, Limits::default(), source);
+    builder
+        .register_endpoint(HttpEndpoint {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            access: AccessPolicy {
+                allowed_hosts: vec!["backend".into()],
+                allowed_origins: vec![],
+            },
+            tls: None,
+            edge_mtls: None,
+        })
+        .unwrap();
+    let server = builder.bind().await.unwrap();
+    let http = server.addresses()[0].1[0];
+    let shutdown = CancellationToken::new();
+    let signal = shutdown.clone();
+    let task = tokio::spawn(async move { server.run(signal).await });
+    let client = reqwest::Client::new();
+    let expected: Vec<String> = serde_json::from_str(include_str!("tool-names.json")).unwrap();
+    for revision in ["2026-07-28", "2025-11-25"] {
+        let request = |method: &str, mut params: Value| {
+            let modern = revision == "2026-07-28";
+            if modern {
+                params["_meta"] = meta();
+            }
+            let mut request = client
+                .post(format!("http://{http}/mcp"))
+                .header("host", "backend")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", revision);
+            if modern {
+                request = request.header("mcp-method", method);
+                if let Some(name) = params["name"].as_str() {
+                    request = request.header("mcp-name", name);
+                }
+            }
+            request.json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        };
+        if revision == "2025-11-25" {
+            let initialized = response_json(
+                request(
+                    "initialize",
+                    json!({
+                        "protocolVersion":revision,"capabilities":{},
+                        "clientInfo":{"name":"tool-name-test","version":"1"}
+                    }),
+                )
+                .send()
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(initialized["result"]["protocolVersion"], revision);
+        }
+        let listed = response_json(request("tools/list", json!({})).send().await.unwrap()).await;
+        let actual: Vec<_> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(actual, expected);
+        for name in &expected {
+            if name.contains('.') {
+                let old = name.replacen('.', "_", 1);
+                let rejected = request("tools/call", json!({"name":old,"arguments":{}}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rejected.status(),
+                    if revision == "2026-07-28" { 400 } else { 200 }
+                );
+                let value = response_json(rejected).await;
+                assert_eq!(value["error"]["code"], -32602, "{old}");
+                assert_eq!(value["error"]["message"], "unknown tool", "{old}");
+            }
+        }
+        for (name, arguments) in [
+            ("server.info", json!({})),
+            ("rfc.catalog_search", json!({})),
+            (
+                "crate.compare",
+                json!({"name":"example","from_version":"1.0.0","to_version":"2.0.0","kind":"metadata"}),
+            ),
+        ] {
+            let value = response_json(
+                request("tools/call", json!({"name":name,"arguments":arguments}))
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(value.get("error").is_none(), "{name}: {value}");
+            assert_ne!(value["result"]["isError"], true);
+        }
+        let invalid = request(
+            "tools/call",
+            json!({"name":"rfc.catalog_search","arguments":{"url":"https://untrusted.invalid"}}),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response_json(invalid).await["error"]["code"], -32602);
+    }
+    let mismatch = client.post(format!("http://{http}/mcp"))
+        .header("host", "backend").header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call").header("mcp-name", "server_info")
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"server.info","arguments":{},"_meta":meta()}}))
+        .send().await.unwrap();
+    assert_eq!(mismatch.status(), 400);
+    assert!(response_json(mismatch).await.get("error").is_some());
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn native_webtransport_probe_both_revisions_and_origin_rejection() {
     let temp = tempfile::tempdir().unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();

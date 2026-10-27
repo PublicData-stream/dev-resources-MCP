@@ -1546,6 +1546,8 @@ impl W3cCorpus {
         let mut source_license = standard.metadata["repository_license"].clone();
         if let Some(notices) = source_license["notices"].as_array_mut() {
             for notice in notices {
+                // Retain the original stored spelling under existing immutable snapshot IDs.
+                // The research response projects this selector to the current public tool name.
                 notice["source_selector"] = json!({"tool":"w3c_get","specification":standard.id,"snapshot":id,"path":notice["path"],"representation":"source"});
                 if let Some(path) = notice["path"].as_str() {
                     use base64::engine::general_purpose::URL_SAFE_NO_PAD;

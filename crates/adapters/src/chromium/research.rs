@@ -573,19 +573,19 @@ impl ChromiumResearch {
         let cancel = CancellationToken::new();
         let _guard = CancelOnDrop(cancel.clone());
         let mut output = match tool {
-            "chromium_corpus_status" => {
+            "chromium.corpus_status" => {
                 let _: EmptyInput = decode(input)?;
                 self.corpus.status().await
             }
-            "chromium_get" => self.get(decode(input)?, cancel).await,
-            "chromium_search" => self.search(decode(input)?, cancel).await,
-            "chromium_symbol_get" => self.symbol_get(decode(input)?, cancel).await,
-            "chromium_compare" => self.compare(decode(input)?, cancel).await,
-            "chromium_catalog_search"
-            | "chromium_symbol_search"
-            | "chromium_references"
-            | "chromium_snapshots"
-            | "chromium_history" => self.list(tool, decode(input)?, cancel).await,
+            "chromium.get" => self.get(decode(input)?, cancel).await,
+            "chromium.search" => self.search(decode(input)?, cancel).await,
+            "chromium.symbol_get" => self.symbol_get(decode(input)?, cancel).await,
+            "chromium.compare" => self.compare(decode(input)?, cancel).await,
+            "chromium.catalog_search"
+            | "chromium.symbol_search"
+            | "chromium.references"
+            | "chromium.snapshots"
+            | "chromium.history" => self.list(tool, decode(input)?, cancel).await,
             _ => Err(Error::not_found("Unknown Chromium research tool.")),
         }?;
         if let Some(id) = output
@@ -1204,11 +1204,11 @@ impl ChromiumResearch {
     }
     async fn list(&self, tool: &str, input: ListInput, cancel: CancellationToken) -> Result<Value> {
         let deadline = Instant::now() + Duration::from_secs(15);
-        if tool == "chromium_catalog_search" {
+        if tool == "chromium.catalog_search" {
             return self.catalog_search(input).await;
         }
         let selector = Selector {
-            component: if tool == "chromium_references"
+            component: if tool == "chromium.references"
                 && input.direction.as_deref() == Some("incoming")
                 && input.snapshot.is_none()
             {
@@ -1219,11 +1219,11 @@ impl ChromiumResearch {
             snapshot: input.snapshot.clone(),
             view: input.view.clone(),
         };
-        if matches!(tool, "chromium_snapshots" | "chromium_history") {
+        if matches!(tool, "chromium.snapshots" | "chromium.history") {
             return self.discovery(tool, input, cancel).await;
         }
         let (view, snapshots) = self.selections(&selector).await?;
-        let mut reference_targets = if tool == "chromium_references" {
+        let mut reference_targets = if tool == "chromium.references" {
             self.reference_targets(&snapshots, &cancel).await?
         } else {
             ReferenceTargets::new()
@@ -1252,7 +1252,7 @@ impl ChromiumResearch {
             input.limit,
         )?;
         let mut items = Vec::new();
-        if tool == "chromium_references"
+        if tool == "chromium.references"
             && !matches!(
                 input.direction.as_deref().unwrap_or("outgoing"),
                 "incoming" | "outgoing"
@@ -1271,7 +1271,7 @@ impl ChromiumResearch {
                 if input.path.as_ref().is_some_and(|path| path != &member.path) {
                     continue;
                 }
-                if tool == "chromium_references" {
+                if tool == "chromium.references" {
                     let mut source_anchors = BTreeMap::<String, usize>::new();
                     let mut source_anchor_bytes = 0usize;
                     for anchor in doc
@@ -1584,9 +1584,9 @@ impl ChromiumResearch {
         cancel: CancellationToken,
     ) -> Result<Value> {
         if input.history_type.as_deref() == Some("refs") {
-            if tool != "chromium_history" {
+            if tool != "chromium.history" {
                 return Err(Error::invalid(
-                    "Ref observations belong to chromium_history.",
+                    "Ref observations belong to chromium.history.",
                 ));
             }
             return self.ref_history(input, cancel).await;
@@ -1709,7 +1709,7 @@ impl ChromiumResearch {
                     skip -= 1;
                     continue;
                 }
-                if tool == "chromium_history" {
+                if tool == "chromium.history" {
                     if snapshot.parents.len() > 100 {
                         return Err(Error::capacity("Chromium history parent bound exceeded."));
                     }
@@ -2293,9 +2293,9 @@ impl ChromiumResearch {
         }
         let output = if parts[2] == "symbol" {
             input.as_object_mut().map(|m| m.remove("representation"));
-            self.call("chromium_symbol_get", input).await?
+            self.call("chromium.symbol_get", input).await?
         } else {
-            self.call("chromium_get", input).await?
+            self.call("chromium.get", input).await?
         };
         let processing_gaps = output
             .get("processing_gaps")
@@ -2330,7 +2330,7 @@ pub fn schemas() -> Vec<Value> {
     catalog_properties["path"] = path.clone();
     catalog_properties["kind"] = path.clone();
     add(
-        "chromium_catalog_search",
+        "chromium.catalog_search",
         "Search immutable Chromium document metadata and component coverage; select a snapshot or view for historical evidence. Path filters select a document prefix.",
         catalog_properties,
         vec![],
@@ -2341,20 +2341,20 @@ pub fn schemas() -> Vec<Value> {
         search[key] = path.clone();
     }
     add(
-        "chromium_search",
+        "chromium.search",
         "Search immutable Chromium sections using selected-corpus BM25. Defaults select available current source components; reuse view/snapshot and cursor.",
         search,
         vec!["query"],
     );
     let get = json!({"component":id,"snapshot":hash,"view":hash,"path":path,"anchor":path,"section_index":{"type":"integer","minimum":0,"description":"Zero-based position in this captured document's ordered sections; requires path and excludes anchor."},"representation":{"enum":["text","source","bytes"],"default":"text"},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}});
     add(
-        "chromium_get",
+        "chromium.get",
         "Read capture-fixed component text, an anchored section, original source, or base64 bytes. Text offsets count UTF-8 bytes.",
         get,
         vec!["component", "path"],
     );
     for (name, description) in [(
-        "chromium_symbol_search",
+        "chromium.symbol_search",
         "Search original definitions, Web IDL declarations and explicitly marked algorithms.",
     )] {
         let mut props = common.clone();
@@ -2366,7 +2366,7 @@ pub fn schemas() -> Vec<Value> {
     }
     let symbol_get = json!({"component":id,"snapshot":hash,"view":hash,"path":path,"symbol_index":{"type":"integer","minimum":0,"description":"Zero-based position in this captured document's ordered symbols; requires path and is local to the selected snapshot."},"name":path,"anchor":path,"kind":{"enum":["definition","idl","algorithm","api"]},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}});
     add(
-        "chromium_symbol_get",
+        "chromium.symbol_get",
         "Read one unambiguous captured symbol in bounded UTF-8 pages with original text and provenance.",
         symbol_get,
         vec!["component"],
@@ -2377,25 +2377,25 @@ pub fn schemas() -> Vec<Value> {
         refs[key] = path.clone();
     }
     add(
-        "chromium_references",
+        "chromium.references",
         "Inspect captured incoming/outgoing links. Target resolution uses selected evidence only; external references are never fetched.",
         refs,
         vec![],
     );
     for (name, description) in [
         (
-            "chromium_snapshots",
+            "chromium.snapshots",
             "Discover immutable source/publication snapshots with a frozen history cutoff.",
         ),
         (
-            "chromium_history",
+            "chromium.history",
             "Inspect retained revisions and changes against each ordered parent; missing parent projections remain explicit.",
         ),
     ] {
         let mut props = common.clone();
         props["history_snapshot"] = json!({"type":"integer","minimum":0});
         props["path"] = path.clone();
-        if name == "chromium_history" {
+        if name == "chromium.history" {
             props["history_type"] = json!({"enum":["revisions","refs"],"default":"revisions"});
             props["repository"] = json!({"type":"string","minLength":1,"maxLength":256});
             props["ref"] = json!({"type":"string","minLength":1,"maxLength":1024});
@@ -2419,13 +2419,13 @@ pub fn schemas() -> Vec<Value> {
     compare["path"] = path;
     compare["mode"] = json!({"enum":["text","symbols","source"],"default":"text"});
     add(
-        "chromium_compare",
+        "chromium.compare",
         "Compare two immutable snapshots of the same component and representation family; no compatibility verdict is inferred.",
         compare,
         vec!["component", "before", "after"],
     );
     add(
-        "chromium_corpus_status",
+        "chromium.corpus_status",
         "Inspect separate Chromium acquisition, ancestry, projection, indexing and freshness coverage. No collection controls are exposed.",
         json!({}),
         vec![],
@@ -2437,10 +2437,10 @@ pub fn schemas() -> Vec<Value> {
             tool["inputSchema"]["not"] = json!({"required":["snapshot","view"]});
         }
         match tool["name"].as_str() {
-            Some("chromium_get") => {
+            Some("chromium.get") => {
                 tool["inputSchema"]["allOf"] = json!([{"if":{"required":["section_index"]},"then":{"required":["path"],"not":{"required":["anchor"]},"properties":{"representation":{"const":"text"}}}}]);
             }
-            Some("chromium_symbol_get") => {
+            Some("chromium.symbol_get") => {
                 tool["inputSchema"]["allOf"] =
                     json!([{"if":{"required":["symbol_index"]},"then":{"required":["path"]}}]);
             }

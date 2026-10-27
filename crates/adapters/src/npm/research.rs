@@ -103,7 +103,7 @@ impl NpmResearch {
         let mut input: Input = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
         if (!matches!(
             tool,
-            "npm_document_get" | "npm_contract_get" | "npm_advisory_get" | "npm_compare"
+            "npm.document_get" | "npm.contract_get" | "npm.advisory_get" | "npm.compare"
         ) && input.offset > 10_000)
             || input
                 .query
@@ -115,7 +115,7 @@ impl NpmResearch {
         if let Some(name) = &input.name {
             crate::npm::processing::validate_name(name)?;
         }
-        if tool == "npm_corpus_status" {
+        if tool == "npm.corpus_status" {
             return self.corpus.status().await;
         }
         let mut arguments = value;
@@ -125,7 +125,7 @@ impl NpmResearch {
             }
         }
         let query = identity(&json!([tool, arguments]))?;
-        if tool == "npm_content_search" {
+        if tool == "npm.content_search" {
             if input.cursor.is_some() && input.snapshot.is_none() {
                 return Err(Error::invalid(
                     "npm content cursor requires its returned snapshot.",
@@ -151,10 +151,10 @@ impl NpmResearch {
             }
             input.snapshot = Some(cursor.snapshot.clone());
         }
-        if tool == "npm_history" || tool == "npm_snapshots" {
+        if tool == "npm.history" || tool == "npm.snapshots" {
             return self.discovery(tool, input, &query, selected_cursor).await;
         }
-        if tool.starts_with("npm_advisory_") {
+        if tool.starts_with("npm.advisory_") {
             return self.advisories(tool, input, &query, selected_cursor).await;
         }
         let snapshot = self
@@ -162,15 +162,15 @@ impl NpmResearch {
             .selection("research", input.snapshot.as_deref())
             .await?;
         match tool {
-            "npm_content_search" => self.content_search(input, snapshot).await,
-            "npm_document_get" => self.document_get(input, &snapshot).await,
-            "npm_contract_get" => self.contract_get(input, &snapshot).await,
-            "npm_compare" => self.compare(input, &snapshot).await,
-            "npm_dependencies" => {
+            "npm.content_search" => self.content_search(input, snapshot).await,
+            "npm.document_get" => self.document_get(input, &snapshot).await,
+            "npm.contract_get" => self.contract_get(input, &snapshot).await,
+            "npm.compare" => self.compare(input, &snapshot).await,
+            "npm.dependencies" => {
                 self.dependencies(input, &snapshot, &query, selected_cursor)
                     .await
             }
-            "npm_versions" | "npm_catalog_search" => {
+            "npm.versions" | "npm.catalog_search" => {
                 self.catalog(tool, input, &snapshot, &query, selected_cursor)
                     .await
             }
@@ -316,7 +316,7 @@ impl NpmResearch {
         query: &str,
         selected_cursor: Option<Cursor>,
     ) -> Result<Value> {
-        if tool == "npm_versions" && input.name.is_none() {
+        if tool == "npm.versions" && input.name.is_none() {
             return Err(invalid());
         }
         let members = self
@@ -586,19 +586,19 @@ impl NpmResearch {
         if cutoff < 0 {
             return Err(invalid());
         }
-        if tool == "npm_history" && input.name.is_none() {
+        if tool == "npm.history" && input.name.is_none() {
             return Err(invalid());
         }
         let mut output = Vec::new();
         let mut output_bytes = 0;
         let mut after = 0;
         let start = Instant::now();
-        let kind = if tool == "npm_history" {
+        let kind = if tool == "npm.history" {
             "package-snapshots"
         } else {
             "snapshots"
         };
-        let filter = if tool == "npm_history" {
+        let filter = if tool == "npm.history" {
             input.name.as_ref().map(|name| json!({"name":name}))
         } else {
             if input
@@ -624,7 +624,7 @@ impl NpmResearch {
                 after = row.sequence;
                 let mut data = snapshot_summary(&row.data);
                 data["publication_sequence"] = json!(row.sequence);
-                if tool == "npm_history" {
+                if tool == "npm.history" {
                     for key in [
                         "name",
                         "previous",
@@ -668,7 +668,7 @@ impl NpmResearch {
             .corpus
             .advisory_selection(input.snapshot.as_deref())
             .await?;
-        if tool == "npm_advisory_lookup" {
+        if tool == "npm.advisory_lookup" {
             let name = required(&input.name)?;
             let version = required(&input.version)?;
             crate::npm::processing::parse_version(version)?;
@@ -726,7 +726,7 @@ impl NpmResearch {
                     .await?
                     .ok_or_else(failure)?
                     .data;
-                if tool == "npm_advisory_get" {
+                if tool == "npm.advisory_get" {
                     if record["rights_gap"] == true {
                         return Ok(
                             json!({"advisory":advisory_summary(&record),"snapshot":snapshot_summary(&snapshot),"metadata_only":true,"gap":"unresolved_redistribution_rights","page":null,"resource_uri":null}),
@@ -807,7 +807,7 @@ impl NpmResearch {
                 }
             }
         }
-        if tool == "npm_advisory_get" {
+        if tool == "npm.advisory_get" {
             return Err(Error::not_found("npm advisory not found."));
         }
         self.page(&input, &snapshot, query, selected_cursor, output)
@@ -846,9 +846,9 @@ impl NpmResearch {
             );
         }
         let tool = match parts[1] {
-            "document" => "npm_document_get",
-            "contract" => "npm_contract_get",
-            "advisory" => "npm_advisory_get",
+            "document" => "npm.document_get",
+            "contract" => "npm.contract_get",
+            "advisory" => "npm.advisory_get",
             _ => return Err(invalid()),
         };
         let value = self.call(tool, Value::Object(input)).await?;
@@ -1032,91 +1032,91 @@ pub fn schemas() -> Vec<Value> {
     let mut tools = Vec::new();
     for (name, description, properties, required, text_page) in [
         (
-            "npm_versions",
+            "npm.versions",
             "List exact captured npm versions in semantic-version order.",
             json!({"name":text}),
             vec!["name"],
             false,
         ),
         (
-            "npm_catalog_search",
+            "npm.catalog_search",
             "Search captured public npm version metadata with conjunctive filters.",
             json!({"name":text,"version":text,"query":text,"filters":{"type":"object","properties":{"name":text,"license":text,"keyword":text,"deprecated":{"type":"boolean"},"has_types":{"type":"boolean"}},"additionalProperties":false}}),
             vec![],
             false,
         ),
         (
-            "npm_document_get",
+            "npm.document_get",
             "Read captured inert source, manifest, README, license or declaration text.",
             json!({"name":text,"version":text,"path":{"type":"string","maxLength":4096},"representation":{"enum":["text","source","metadata"]}}),
             vec!["name", "version"],
             true,
         ),
         (
-            "npm_dependencies",
+            "npm.dependencies",
             "Read declarations or reverse package-name references; no dependency resolution.",
             json!({"name":text,"version":text,"direction":{"enum":["forward","reverse"],"default":"forward"}}),
             vec!["name"],
             false,
         ),
         (
-            "npm_compare",
+            "npm.compare",
             "Compare captured release metadata, dependency declarations and ordered exports/types contracts.",
             json!({"name":text,"from_version":text,"to_version":text,"path":{"type":"string","maxLength":4096}}),
             vec!["name", "from_version", "to_version"],
             true,
         ),
         (
-            "npm_content_search",
+            "npm.content_search",
             "Search selected captured npm documents using technical or English BM25.",
             json!({"name":text,"version":text,"query":text,"mode":{"enum":["technical","english"]},"filters":{"type":"object","properties":{"name":text,"version":text,"kind":text,"path":text},"additionalProperties":false}}),
             vec!["query"],
             false,
         ),
         (
-            "npm_contract_get",
+            "npm.contract_get",
             "Read ordered published exports/imports/types declarations; no JS/TS symbol analysis.",
             json!({"name":text,"version":text}),
             vec!["name", "version"],
             true,
         ),
         (
-            "npm_history",
+            "npm.history",
             "Discover permanent package observations with a frozen history cutoff.",
             json!({"name":text,"history_snapshot":{"type":"integer","minimum":0}}),
             vec!["name"],
             false,
         ),
         (
-            "npm_snapshots",
+            "npm.snapshots",
             "Discover immutable local npm research and advisory snapshots.",
             json!({"history_snapshot":{"type":"integer","minimum":0},"lane":{"enum":["research","advisories"]}}),
             vec![],
             false,
         ),
         (
-            "npm_corpus_status",
+            "npm.corpus_status",
             "Inspect aggregate npm collection, storage and projection coverage.",
             json!({}),
             vec![],
             false,
         ),
         (
-            "npm_advisory_lookup",
+            "npm.advisory_lookup",
             "Match an exact public npm release against local captured OSV evidence.",
             json!({"name":text,"version":text}),
             vec!["name", "version"],
             false,
         ),
         (
-            "npm_advisory_get",
+            "npm.advisory_get",
             "Read original captured npm OSV advisory source and attribution.",
             json!({"id":text,"representation":{"enum":["source","metadata"]}}),
             vec!["id"],
             true,
         ),
         (
-            "npm_advisory_catalog_search",
+            "npm.advisory_catalog_search",
             "Search captured npm advisories; withdrawals and coverage remain explicit.",
             json!({"name":text,"query":text,"filters":{"type":"object","properties":{"classification":text,"id":text,"alias":text},"additionalProperties":false}}),
             vec![],
@@ -1124,7 +1124,7 @@ pub fn schemas() -> Vec<Value> {
         ),
     ] {
         let mut properties = properties.as_object().cloned().unwrap_or_default();
-        if name != "npm_corpus_status" {
+        if name != "npm.corpus_status" {
             properties.insert("snapshot".into(), hash.clone());
             properties.insert(
                 "offset".into(),

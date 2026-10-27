@@ -37,48 +37,59 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 
 ## Tools
 
+Tools use one dot between the group and operation: `rfc.catalog_search`,
+`crate.compare`, `server.info`, `audit.lockfile`, and `npm.audit_lockfile`.
+Remaining underscores belong to the operation name. Generic `search` and `fetch`
+keep their names. Both transports and supported MCP revisions expose this same set.
+
+This is a breaking rename of the former underscore names: replace only their first
+underscore with a dot. Old names are neither advertised nor callable; clients must
+refresh discovery and update saved calls. Restart pagination when upgrading because
+tool-bound cursor fingerprints change. Captures, snapshots and immutable resource
+references remain valid.
+
 | Tool | Inputs and result |
 | --- | --- |
-| `server_info` | Identity, supported revisions, licensing and corresponding-source URL |
+| `server.info` | Identity, supported revisions, licensing and corresponding-source URL |
 | `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium`/`npm` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
 | `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, `w3c:<shortname>#<anchor>`, or immutable `devres://` resource URI |
-| `rfc_search` | Query and optional status; official index metadata with capture-based paging |
-| `rfc_get` | RFC number and byte page; published text |
-| `rfc_metadata` | RFC number, optional research snapshot; rich official metadata |
-| `rfc_catalog_search` | Metadata query, conjunctive filters and snapshot-based paging |
-| `rfc_fulltext_search` | Technical AND tokens or English phrases/OR/exclusions; filters, assurance and pinned snapshot |
-| `rfc_format_get` | RFC number, txt/html/xml/pdf, optional capture; source text or base64 PDF byte page |
-| `rfc_errata` | RFC number, optional status/type and snapshot; original errata records |
-| `rfc_series_get` | STD/BCP/FYI number and snapshot; constituent RFC metadata |
-| `rfc_corpus_status` | Aggregate collection, freshness, failures and snapshot coverage; no administrative controls |
-| `crate_search` | Query and page; bounded upstream crate search |
-| `crate_metadata` | Exact crate name/version; dependency declarations, features, yanked state, checksum |
-| `crate_source_list` | Exact crate version; verified source file listing |
-| `crate_source_read` | Exact crate version and archive-relative file path; UTF-8 text page |
-| `crate_versions` | Captured exact versions for a crate in semantic-version order; snapshot paging |
-| `crate_catalog_search` | Local version metadata and conjunctive license/keyword/category/MSRV/yanked filters |
-| `crate_document_get` | Exact captured source, manifest, README, license or rustdoc text; bounded byte page |
-| `crate_dependencies` | Forward declarations or reverse package-name references; no constraint solving |
-| `crate_compare` | Metadata/dependency changes, qualified text/API release changes, or an exact public path |
-| `crate_content_search` | Local source and documentation search with snapshot-wide BM25 |
-| `crate_api_search` | Observed rustdoc API items across captured versions and targets |
-| `crate_api_get` | Exact public path, normalized signature, relationships and capture provenance |
-| `crate_corpus_status` | Aggregate acquisition, processing, storage and snapshot coverage; no public controls |
-| `advisory_lookup` | Crate/version; matched advisories, withdrawals and informational state |
-| `audit_lockfile` | Supplied Cargo.lock text; supported matches, unassessed entries, completeness/freshness |
-| `advisory_get` | Canonical advisory ID, representation and optional snapshot; structured metadata and original source byte page |
-| `advisory_catalog_search` | Local query, conjunctive metadata/platform filters, representation and snapshot/cursor paging |
-| `advisory_history` | Canonical ID, optional exact Git ref and frozen history view; parent-relative changes |
-| `advisory_snapshots` | Paginated immutable ref observations or commit snapshots; optional exact ref/representation |
-| `advisory_corpus_status` | Aggregate collection, freshness, parsing, storage and history coverage; no administrative controls |
-| `mdn_search` | Local English document search, conjunctive metadata filters, technical/English query mode and pinned cursor |
-| `mdn_get` | Exactly one slug or repository path; projected text, original source or bytes, optional immutable snapshot and explicit compatibility snapshot |
-| `mdn_compat_search` | Local compatibility feature search with browser/status filters and pinned cursor |
-| `mdn_compat_get` | Exact BCD feature, original and derived support evidence; bounded browser-statement page |
-| `mdn_browser_get` | Captured browser metadata and paged releases/engine mappings |
-| `mdn_history` | Parent-relative changes for exactly one path, slug or feature; frozen publication cutoff and cursor |
-| `mdn_snapshots` | Commit snapshots or advertised ref observations for content/compat; optional exact ref filter for observations |
-| `mdn_corpus_status` | Aggregate acquisition, history, projection, index, freshness and failure state; no administrative controls |
+| `rfc.search` | Query and optional status; official index metadata with capture-based paging |
+| `rfc.get` | RFC number and byte page; published text |
+| `rfc.metadata` | RFC number, optional research snapshot; rich official metadata |
+| `rfc.catalog_search` | Metadata query, conjunctive filters and snapshot-based paging |
+| `rfc.fulltext_search` | Technical AND tokens or English phrases/OR/exclusions; filters, assurance and pinned snapshot |
+| `rfc.format_get` | RFC number, txt/html/xml/pdf, optional capture; source text or base64 PDF byte page |
+| `rfc.errata` | RFC number, optional status/type and snapshot; original errata records |
+| `rfc.series_get` | STD/BCP/FYI number and snapshot; constituent RFC metadata |
+| `rfc.corpus_status` | Aggregate collection, freshness, failures and snapshot coverage; no administrative controls |
+| `crate.search` | Query and page; bounded upstream crate search |
+| `crate.metadata` | Exact crate name/version; dependency declarations, features, yanked state, checksum |
+| `crate.source_list` | Exact crate version; verified source file listing |
+| `crate.source_read` | Exact crate version and archive-relative file path; UTF-8 text page |
+| `crate.versions` | Captured exact versions for a crate in semantic-version order; snapshot paging |
+| `crate.catalog_search` | Local version metadata and conjunctive license/keyword/category/MSRV/yanked filters |
+| `crate.document_get` | Exact captured source, manifest, README, license or rustdoc text; bounded byte page |
+| `crate.dependencies` | Forward declarations or reverse package-name references; no constraint solving |
+| `crate.compare` | Metadata/dependency changes, qualified text/API release changes, or an exact public path |
+| `crate.content_search` | Local source and documentation search with snapshot-wide BM25 |
+| `crate.api_search` | Observed rustdoc API items across captured versions and targets |
+| `crate.api_get` | Exact public path, normalized signature, relationships and capture provenance |
+| `crate.corpus_status` | Aggregate acquisition, processing, storage and snapshot coverage; no public controls |
+| `advisory.lookup` | Crate/version; matched advisories, withdrawals and informational state |
+| `audit.lockfile` | Supplied Cargo.lock text; supported matches, unassessed entries, completeness/freshness |
+| `advisory.get` | Canonical advisory ID, representation and optional snapshot; structured metadata and original source byte page |
+| `advisory.catalog_search` | Local query, conjunctive metadata/platform filters, representation and snapshot/cursor paging |
+| `advisory.history` | Canonical ID, optional exact Git ref and frozen history view; parent-relative changes |
+| `advisory.snapshots` | Paginated immutable ref observations or commit snapshots; optional exact ref/representation |
+| `advisory.corpus_status` | Aggregate collection, freshness, parsing, storage and history coverage; no administrative controls |
+| `mdn.search` | Local English document search, conjunctive metadata filters, technical/English query mode and pinned cursor |
+| `mdn.get` | Exactly one slug or repository path; projected text, original source or bytes, optional immutable snapshot and explicit compatibility snapshot |
+| `mdn.compat_search` | Local compatibility feature search with browser/status filters and pinned cursor |
+| `mdn.compat_get` | Exact BCD feature, original and derived support evidence; bounded browser-statement page |
+| `mdn.browser_get` | Captured browser metadata and paged releases/engine mappings |
+| `mdn.history` | Parent-relative changes for exactly one path, slug or feature; frozen publication cutoff and cursor |
+| `mdn.snapshots` | Commit snapshots or advertised ref observations for content/compat; optional exact ref filter for observations |
+| `mdn.corpus_status` | Aggregate acquisition, history, projection, index, freshness and failure state; no administrative controls |
 
 Tool discovery supplies authoritative JSON input schemas. Unknown fields fail.
 Retrieval and validation timestamps are Unix seconds.
@@ -266,12 +277,12 @@ filters, and ranks with BM25 over only the selected snapshot membership. Ties us
 slug, source path and projection identity. Search-index gaps do not suppress raw
 retrieval or poison later publications. Offset paging accepts at most 10,000;
 snapshot/query-bound cursors continue beyond that window and allow a changed limit.
-`mdn_history` records changes against each ordered parent, including merges.
+`mdn.history` records changes against each ordered parent, including merges.
 Entries label processing generations; normalization upgrades retain older evidence.
 Discovery freezes `history_snapshot`; follow `next_cursor` even if a bounded scan
 returns no matching records. Lists default to 20 and cap at 100.
 
-`mdn_get` accepts `repository="content"` (default) or `"compat"`. Projected text,
+`mdn.get` accepts `repository="content"` (default) or `"compat"`. Projected text,
 original `source`, and explicit `bytes` pages cap at 32 KiB. UTF-8 text offsets must
 be character boundaries. Binary/oversized source uses base64 byte pages, verified
 against retained evidence. Resources use
@@ -298,14 +309,14 @@ Public requests perform local evidence research and never initiate collection.
 
 | Tool | Capability |
 | --- | --- |
-| `whatwg_catalog_search` | Captured standard metadata, publication state and gaps; optional immutable view |
-| `whatwg_search` | Selected-snapshot BM25 over specification sections, with technical/English queries and conjunctive standard/edition/path/kind filters |
-| `whatwg_get` | Projected text, anchored section, original UTF-8 source or base64 byte pages |
-| `whatwg_symbol_search`, `whatwg_symbol_get` | Captured definitions, IDL declarations and explicitly marked algorithms |
-| `whatwg_references` | Captured incoming/outgoing references with explicitly qualified local resolution |
-| `whatwg_snapshots`, `whatwg_history` | Immutable discovery, frozen history pagination, and ordered-parent changes |
-| `whatwg_compare` | Observed source, normalized section or symbol changes between two immutable snapshots |
-| `whatwg_corpus_status` | Separate acquisition, ancestry, projection, indexing, freshness and failure state |
+| `whatwg.catalog_search` | Captured standard metadata, publication state and gaps; optional immutable view |
+| `whatwg.search` | Selected-snapshot BM25 over specification sections, with technical/English queries and conjunctive standard/edition/path/kind filters |
+| `whatwg.get` | Projected text, anchored section, original UTF-8 source or base64 byte pages |
+| `whatwg.symbol_search`, `whatwg.symbol_get` | Captured definitions, IDL declarations and explicitly marked algorithms |
+| `whatwg.references` | Captured incoming/outgoing references with explicitly qualified local resolution |
+| `whatwg.snapshots`, `whatwg.history` | Immutable discovery, frozen history pagination, and ordered-parent changes |
+| `whatwg.compare` | Observed source, normalized section or symbol changes between two immutable snapshots |
+| `whatwg.corpus_status` | Separate acquisition, ancestry, projection, indexing, freshness and failure state |
 
 A `view` freezes catalog membership, per-standard snapshots and validation observations
 with its search reference. A document `snapshot` selects one immutable source revision
@@ -349,7 +360,7 @@ anchor/name selectors remain readable. Advertised plain text and IDL publication
 remain distinct text representations; JSON and other unsupported formats retain
 their raw bytes and explicit projection gaps.
 
-`whatwg_history` defaults to revision history. `history_type="refs"` returns paged
+`whatwg.history` defaults to revision history. `history_type="refs"` returns paged
 advertised branch/tag observations; select an exact captured `repository` and
 optionally `ref`. Its cursor freezes both the publication cutoff and position within
 an observation. Repository-qualified history avoids guessing a historical repository
@@ -379,13 +390,13 @@ does not initiate collection. Collection is current-first with resumable history
 
 | Tool | Capability |
 | --- | --- |
-| `w3c_catalog_search` | Captured report metadata, publication status and coverage |
-| `w3c_search`, `w3c_get` | Selected-membership text search; text, anchored sections, original source and byte pages |
-| `w3c_symbol_search`, `w3c_symbol_get` | Definitions, IDL declarations and explicitly marked algorithms |
-| `w3c_references` | Captured references with qualified local resolution |
-| `w3c_snapshots`, `w3c_history` | Immutable representations, published editions, revisions and ref observations |
-| `w3c_compare` | Observed source, normalized section or symbol differences |
-| `w3c_corpus_status` | Separate discovery, license, acquisition, ancestry, processing, index and freshness evidence |
+| `w3c.catalog_search` | Captured report metadata, publication status and coverage |
+| `w3c.search`, `w3c.get` | Selected-membership text search; text, anchored sections, original source and byte pages |
+| `w3c.symbol_search`, `w3c.symbol_get` | Definitions, IDL declarations and explicitly marked algorithms |
+| `w3c.references` | Captured references with qualified local resolution |
+| `w3c.snapshots`, `w3c.history` | Immutable representations, published editions, revisions and ref observations |
+| `w3c.compare` | Observed source, normalized section or symbol differences |
+| `w3c.corpus_status` | Separate discovery, license, acquisition, ancestry, processing, index and freshness evidence |
 
 W3C tools use `specification` for the report shortname. `snapshot` and `view`
 selectors are exclusive; use snapshots to select editor drafts or Git sources.
@@ -425,13 +436,13 @@ acquired. Missing migrated-site history is explicit.
 
 | Tool | Capability |
 | --- | --- |
-| `chromium_catalog_search` | Captured document metadata and coverage |
-| `chromium_search`, `chromium_get` | Local selected-membership search and text/section/source/byte pages |
-| `chromium_symbol_search`, `chromium_symbol_get` | Explicit documented declarations and definitions |
-| `chromium_references` | Captured literal references and qualified local resolution |
-| `chromium_snapshots`, `chromium_history` | Immutable source/publication observations and ordered-parent changes |
-| `chromium_compare` | Observed source, normalized section, or symbol differences |
-| `chromium_corpus_status` | Discovery, license, acquisition, ancestry, projection, index, and freshness state |
+| `chromium.catalog_search` | Captured document metadata and coverage |
+| `chromium.search`, `chromium.get` | Local selected-membership search and text/section/source/byte pages |
+| `chromium.symbol_search`, `chromium.symbol_get` | Explicit documented declarations and definitions |
+| `chromium.references` | Captured literal references and qualified local resolution |
+| `chromium.snapshots`, `chromium.history` | Immutable source/publication observations and ordered-parent changes |
+| `chromium.compare` | Observed source, normalized section, or symbol differences |
+| `chromium.corpus_status` | Discovery, license, acquisition, ancestry, projection, index, and freshness state |
 
 `component` and repository-relative `path` identify documents. Snapshot and view
 selection are exclusive. Default views expose successful current components with

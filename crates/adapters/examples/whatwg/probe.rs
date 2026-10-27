@@ -450,14 +450,14 @@ async fn verify_research(corpus: Arc<WhatwgCorpus>) -> Result<Value> {
     let view = corpus.view(None).await?;
     let research = WhatwgResearch::new(corpus);
     let catalog = research
-        .call("whatwg_catalog_search", json!({"view":view.id,"limit":100}))
+        .call("whatwg.catalog_search", json!({"view":view.id,"limit":100}))
         .await?;
     let catalog_total = catalog["total"].as_u64().ok_or_else(storage_error)?;
     if catalog_total != view.snapshots.len() as u64 || view.snapshots.is_empty() {
         return Err(Error::integrity("WHATWG acceptance view is incomplete."));
     }
     let selected = json!({"standard":"dom","view":view.id,"limit":1024});
-    let text = research.call("whatwg_get", selected.clone()).await?;
+    let text = research.call("whatwg.get", selected.clone()).await?;
     if text["page"]["text"].as_str().is_none_or(str::is_empty) {
         return Err(Error::integrity("WHATWG acceptance text is empty."));
     }
@@ -465,13 +465,13 @@ async fn verify_research(corpus: Arc<WhatwgCorpus>) -> Result<Value> {
     research.read_resource(uri).await?;
     let mut bytes_input = selected;
     bytes_input["representation"] = json!("bytes");
-    let bytes = research.call("whatwg_get", bytes_input).await?;
+    let bytes = research.call("whatwg.get", bytes_input).await?;
     if bytes["page"]["total_bytes"].as_u64().unwrap_or(0) == 0 {
         return Err(Error::integrity("WHATWG acceptance raw evidence is empty."));
     }
     let search = research
         .call(
-            "whatwg_search",
+            "whatwg.search",
             json!({"standard":"dom","view":view.id,"query":"EventTarget","limit":2}),
         )
         .await?;
@@ -483,7 +483,7 @@ async fn verify_research(corpus: Arc<WhatwgCorpus>) -> Result<Value> {
     }
     let symbols = research
         .call(
-            "whatwg_symbol_search",
+            "whatwg.symbol_search",
             json!({"standard":"dom","view":view.id,"kind":"idl","name":"EventTarget","limit":2}),
         )
         .await?;
@@ -493,7 +493,7 @@ async fn verify_research(corpus: Arc<WhatwgCorpus>) -> Result<Value> {
         .ok_or_else(|| Error::integrity("WHATWG acceptance IDL declaration is absent."))?;
     let symbol_uri = symbol["resource_uri"].as_str().ok_or_else(storage_error)?;
     research.read_resource(symbol_uri).await?;
-    history_with_items(|input| research.call("whatwg_history", input)).await?;
+    history_with_items(|input| research.call("whatwg.history", input)).await?;
     Ok(
         json!({"view":view.id,"catalog_standards":catalog_total,"default_standards":view.snapshots.len(),"text":true,"raw_bytes":true,"text_resource":true,"search":true,"idl_symbol_resource":true,"history":true,"transport":"local_adapter"}),
     )

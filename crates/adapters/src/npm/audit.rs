@@ -71,7 +71,7 @@ impl AuditInput {
 
 pub fn schemas() -> Vec<Value> {
     vec![
-        json!({"name":"npm_audit_lockfile","description":"Locally assess a supplied npm, pnpm, or Yarn lockfile against captured OSV npm evidence. Input, inventory, and report exist only for the request; no resolution, package execution, uploads, or enrollment occurs.","inputSchema":{"type":"object","additionalProperties":false,"properties":{
+        json!({"name":"npm.audit_lockfile","description":"Locally assess a supplied npm, pnpm, or Yarn lockfile against captured OSV npm evidence. Input, inventory, and report exist only for the request; no resolution, package execution, uploads, or enrollment occurs.","inputSchema":{"type":"object","additionalProperties":false,"properties":{
         "lockfile":{"type":"string","minLength":1,"maxLength":1048576},
         "lockfile_format":{"enum":["npm","pnpm","yarn_classic","yarn_berry"]},
         "advisory_snapshot":{"type":"string","pattern":"^[a-f0-9]{64}$"},

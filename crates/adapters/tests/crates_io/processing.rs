@@ -212,7 +212,7 @@ async fn search_validates_whole_provider_page_before_publication_and_pins_bounda
         .set(key, 200, serde_json::to_vec(&malformed).unwrap())
         .await;
     let error = research
-        .call("crate_search", json!({"query":"fixture","limit":1}))
+        .call("crate.search", json!({"query":"fixture","limit":1}))
         .await
         .unwrap_err();
     assert_eq!(error.code, "integrity");
@@ -221,7 +221,7 @@ async fn search_validates_whole_provider_page_before_publication_and_pins_bounda
     fetcher.set(key, 200, search_page(0, 100, 102)).await;
     let first = research
         .call(
-            "crate_search",
+            "crate.search",
             json!({"query":"fixture","offset":99,"limit":20}),
         )
         .await
@@ -232,7 +232,7 @@ async fn search_validates_whole_provider_page_before_publication_and_pins_bounda
     let calls = fetcher.calls.load(Ordering::SeqCst);
     let pinned = research
         .call(
-            "crate_search",
+            "crate.search",
             json!({"query":"fixture","capture":capture,"offset":98,"limit":2}),
         )
         .await
@@ -242,7 +242,7 @@ async fn search_validates_whole_provider_page_before_publication_and_pins_bounda
     assert_eq!(
         research
             .call(
-                "crate_search",
+                "crate.search",
                 json!({"query":"fixture","capture":capture,"offset":100})
             )
             .await
@@ -255,7 +255,7 @@ async fn search_validates_whole_provider_page_before_publication_and_pins_bounda
         .set("cargo:search:fixture:2", 200, search_page(100, 2, 102))
         .await;
     let next = research
-        .call("crate_search", json!({"query":"fixture","offset":100}))
+        .call("crate.search", json!({"query":"fixture","offset":100}))
         .await
         .unwrap();
     assert_eq!(next["items"][0]["name"], "example100");
@@ -265,7 +265,7 @@ async fn search_validates_whole_provider_page_before_publication_and_pins_bounda
     fetcher.set(key, 200, b"not json".to_vec()).await;
     assert_eq!(
         research
-            .call("crate_search", json!({"query":"fixture"}))
+            .call("crate.search", json!({"query":"fixture"}))
             .await
             .unwrap_err()
             .code,
@@ -291,7 +291,7 @@ async fn index_validates_every_version_and_preserves_modern_metadata() {
         assert_eq!(
             research
                 .call(
-                    "crate_metadata",
+                    "crate.metadata",
                     json!({"name":"example","version":"1.0.0"})
                 )
                 .await
@@ -313,7 +313,7 @@ async fn index_validates_every_version_and_preserves_modern_metadata() {
     assert_eq!(
         research
             .call(
-                "crate_metadata",
+                "crate.metadata",
                 json!({"name":"example","version":"1.0.0"})
             )
             .await
@@ -326,7 +326,7 @@ async fn index_validates_every_version_and_preserves_modern_metadata() {
         .await;
     let result = research
         .call(
-            "crate_metadata",
+            "crate.metadata",
             json!({"name":"example","version":"1.0.0"}),
         )
         .await
@@ -365,7 +365,7 @@ async fn verified_archive_resources_remain_fixed_and_invalid_archives_never_publ
     assert_eq!(
         research
             .call(
-                "crate_source_list",
+                "crate.source_list",
                 json!({"name":"example","version":"1.0.0"})
             )
             .await
@@ -378,14 +378,14 @@ async fn verified_archive_resources_remain_fixed_and_invalid_archives_never_publ
     fetcher.set(&key, 200, bytes).await;
     let listing = research
         .call(
-            "crate_source_list",
+            "crate.source_list",
             json!({"name":"example","version":"1.0.0"}),
         )
         .await
         .unwrap();
     let metadata = listing["metadata_capture"]["id"].as_str().unwrap();
     let archive_id = listing["archive_capture"]["id"].as_str().unwrap();
-    let source = research.call("crate_source_read", json!({"name":"example","version":"1.0.0","path":"src/lib.rs","metadata_capture":metadata,"archive_capture":archive_id,"offset":1,"limit":2})).await.unwrap();
+    let source = research.call("crate.source_read", json!({"name":"example","version":"1.0.0","path":"src/lib.rs","metadata_capture":metadata,"archive_capture":archive_id,"offset":1,"limit":2})).await.unwrap();
     assert_eq!(source["page"]["text"], "é");
     let uri = source["resource_uri"].as_str().unwrap();
     let before = fetcher.calls.load(Ordering::SeqCst);
@@ -414,7 +414,7 @@ async fn verified_archive_resources_remain_fixed_and_invalid_archives_never_publ
     assert_eq!(
         research
             .call(
-                "crate_source_list",
+                "crate.source_list",
                 json!({"name":"example","version":"1.0.0"})
             )
             .await
@@ -443,8 +443,8 @@ async fn warm_hits_revalidation_stale_fallback_and_coalescing_use_existing_polic
         .await;
     let input = json!({"name":"example","version":"1.0.0"});
     let (first, second) = tokio::join!(
-        research.call("crate_metadata", input.clone()),
-        research.call("crate_metadata", input.clone())
+        research.call("crate.metadata", input.clone()),
+        research.call("crate.metadata", input.clone())
     );
     let first = first.unwrap();
     assert_eq!(first["capture"]["id"], second.unwrap()["capture"]["id"]);
@@ -453,7 +453,7 @@ async fn warm_hits_revalidation_stale_fallback_and_coalescing_use_existing_polic
     fetcher.set(key, 304, Vec::new()).await;
     assert_eq!(
         research
-            .call("crate_metadata", input.clone())
+            .call("crate.metadata", input.clone())
             .await
             .unwrap()["capture"]["id"],
         first["capture"]["id"]
@@ -461,11 +461,11 @@ async fn warm_hits_revalidation_stale_fallback_and_coalescing_use_existing_polic
     assert_eq!(store.0.lock().await.revalidations, 1);
     clock.0.fetch_add(3601, Ordering::SeqCst);
     fetcher.set(key, 503, Vec::new()).await;
-    assert!(research.call("crate_metadata", input.clone()).await.is_ok());
+    assert!(research.call("crate.metadata", input.clone()).await.is_ok());
     clock.0.fetch_add(7 * 86400, Ordering::SeqCst);
     assert_eq!(
         research
-            .call("crate_metadata", input)
+            .call("crate.metadata", input)
             .await
             .unwrap_err()
             .code,
@@ -485,7 +485,7 @@ async fn malformed_caller_inputs_fail_without_provider_access() {
     ] {
         assert_eq!(
             research
-                .call("crate_source_read", input)
+                .call("crate.source_read", input)
                 .await
                 .unwrap_err()
                 .code,
@@ -512,7 +512,7 @@ async fn canceling_an_owner_releases_admission_and_allows_waiters_to_retry() {
         tokio::spawn(async move {
             research
                 .call(
-                    "crate_metadata",
+                    "crate.metadata",
                     json!({"name":"example","version":"1.0.0"}),
                 )
                 .await
@@ -524,8 +524,8 @@ async fn canceling_an_owner_releases_admission_and_allows_waiters_to_retry() {
     assert_eq!(store.0.lock().await.publications, 0);
     let input = json!({"name":"example","version":"1.0.0"});
     let (first, second) = tokio::join!(
-        research.call("crate_metadata", input.clone()),
-        research.call("crate_metadata", input)
+        research.call("crate.metadata", input.clone()),
+        research.call("crate.metadata", input)
     );
     assert!(first.is_ok());
     assert!(second.is_ok());
@@ -580,7 +580,7 @@ async fn imported_git_metadata_and_archive_pairs_support_network_free_source_res
         .unwrap();
     let metadata_result = research
         .call(
-            "crate_metadata",
+            "crate.metadata",
             json!({"name":"example","version":"1.0.0","capture":metadata.capture.id}),
         )
         .await
@@ -589,7 +589,7 @@ async fn imported_git_metadata_and_archive_pairs_support_network_free_source_res
         metadata_result["capture"]["source_url"],
         metadata.capture.source_url
     );
-    let listing=research.call("crate_source_list",json!({"name":"example","version":"1.0.0","metadata_capture":metadata.capture.id,"archive_capture":archive.capture.id})).await.unwrap();
+    let listing=research.call("crate.source_list",json!({"name":"example","version":"1.0.0","metadata_capture":metadata.capture.id,"archive_capture":archive.capture.id})).await.unwrap();
     let uri = listing["files"][0]["resource_uri"].as_str().unwrap();
     assert_eq!(
         research.read_resource(uri).await.unwrap()["contents"][0]["text"],

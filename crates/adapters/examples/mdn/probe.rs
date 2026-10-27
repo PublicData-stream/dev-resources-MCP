@@ -440,7 +440,7 @@ mod tests {
             devres_adapters::mdn::research::MdnResearch::new(store, root.path()).unwrap();
         let error = research
             .call(
-                "mdn_search",
+                "mdn.search",
                 json!({"snapshot":selected.id,"query":"fixture"}),
             )
             .await
@@ -867,7 +867,7 @@ async fn historical_samples(
             .and_then(|r| r["source_path"].as_str())
             .unwrap_or(&member.path);
         historical_phase("historical_source", &repository, &case);
-        let source=research.call("mdn_get",json!({"repository":repository,"snapshot":snapshot.id,"path":source_path,"representation":"source","limit":128})).await?;
+        let source=research.call("mdn.get",json!({"repository":repository,"snapshot":snapshot.id,"path":source_path,"representation":"source","limit":128})).await?;
         if source["provenance"]["revision"] != snapshot.revision {
             return Err(Error::integrity(
                 "Historical MDN source rebound its revision.",
@@ -881,12 +881,12 @@ async fn historical_samples(
         let mut searched = false;
         if member.kind == "article" && member.projection.is_some() {
             historical_phase("historical_document", &repository, &case);
-            research.call("mdn_get",json!({"repository":repository,"snapshot":snapshot.id,"path":member.path,"limit":128})).await?;
+            research.call("mdn.get",json!({"repository":repository,"snapshot":snapshot.id,"path":member.path,"limit":128})).await?;
             if !member.gaps.iter().any(|g| g == "search_index_gap") {
                 historical_phase("historical_search", &repository, &case);
                 let result = research
                     .call(
-                        "mdn_search",
+                        "mdn.search",
                         json!({"snapshot":snapshot.id,"path":member.path,"limit":1}),
                     )
                     .await?;
@@ -905,7 +905,7 @@ async fn historical_samples(
             historical_phase("historical_compatibility", &repository, &case);
             research
                 .call(
-                    "mdn_compat_get",
+                    "mdn.compat_get",
                     json!({"snapshot":snapshot.id,"feature":key}),
                 )
                 .await?;
@@ -913,7 +913,7 @@ async fn historical_samples(
                 historical_phase("historical_compatibility_search", &repository, &case);
                 let result = research
                     .call(
-                        "mdn_compat_search",
+                        "mdn.compat_search",
                         json!({"snapshot":snapshot.id,"feature":key,"limit":1}),
                     )
                     .await?;
@@ -1021,12 +1021,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let research=corpus.research();
         let frozen=store.mdn_state("default-view").await?.ok_or_else(||Error::unavailable("Frozen MDN view missing."))?;
         acceptance_phase("current_search");
-        let found=research.call("mdn_search",json!({"query":"fetch","limit":3,"snapshot":frozen})).await?;
+        let found=research.call("mdn.search",json!({"query":"fetch","limit":3,"snapshot":frozen})).await?;
         if found["total"].as_u64().unwrap_or(0)==0{return Err(Error::integrity("Fixed MDN search found no evidence."));}
         acceptance_phase("current_document");
-        let document=research.call("mdn_get",json!({"slug":"Web/API/Window/fetch","snapshot":frozen})).await?;
+        let document=research.call("mdn.get",json!({"slug":"Web/API/Window/fetch","snapshot":frozen})).await?;
         acceptance_phase("current_compatibility");
-        let feature=research.call("mdn_compat_get",json!({"feature":"api.fetch","snapshot":frozen})).await?;
+        let feature=research.call("mdn.compat_get",json!({"feature":"api.fetch","snapshot":frozen})).await?;
         acceptance_phase("current_resource");
         research.read_resource(document["resource_uri"].as_str().ok_or_else(||Error::integrity("MDN resource missing."))?).await?;
         let mut verification=if full{acceptance_phase("all_snapshot_verification");verify(store.as_ref(),&blob,cancel.clone()).await?}else{Value::Null};

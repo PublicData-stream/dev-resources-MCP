@@ -12,6 +12,31 @@ import urllib.parse
 MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
 MAX_RESPONSE = 8 * 1024 * 1024
+EXPECTED_TOOLS = frozenset("""
+advisory.catalog_search advisory.corpus_status advisory.get advisory.history advisory.lookup
+advisory.snapshots
+audit.lockfile
+chromium.catalog_search chromium.compare chromium.corpus_status chromium.get chromium.history
+chromium.references chromium.search chromium.snapshots chromium.symbol_get chromium.symbol_search
+crate.api_get crate.api_search crate.catalog_search crate.compare crate.content_search
+crate.corpus_status crate.dependencies crate.document_get crate.metadata crate.search
+crate.source_list crate.source_read crate.versions
+fetch
+mdn.browser_get mdn.compat_get mdn.compat_search mdn.corpus_status mdn.get mdn.history mdn.search
+mdn.snapshots
+npm.advisory_catalog_search npm.advisory_get npm.advisory_lookup npm.audit_lockfile
+npm.catalog_search npm.compare npm.content_search npm.contract_get npm.corpus_status
+npm.dependencies npm.document_get npm.history npm.metadata npm.search npm.snapshots npm.source_list
+npm.source_read npm.versions
+rfc.catalog_search rfc.corpus_status rfc.errata rfc.format_get rfc.fulltext_search rfc.get
+rfc.metadata rfc.search rfc.series_get
+search
+server.info
+w3c.catalog_search w3c.compare w3c.corpus_status w3c.get w3c.history w3c.references w3c.search
+w3c.snapshots w3c.symbol_get w3c.symbol_search
+whatwg.catalog_search whatwg.compare whatwg.corpus_status whatwg.get whatwg.history
+whatwg.references whatwg.search whatwg.snapshots whatwg.symbol_get whatwg.symbol_search
+""".split())
 SYNTHETIC_MDN_CONTENT = hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest()
 SYNTHETIC_MDN_COMPAT = hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest()
 SYNTHETIC_WHATWG = hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest()
@@ -112,6 +137,11 @@ class Client:
         return result.get("structuredContent", result)
 
 
+def assert_tool_inventory(tools):
+    names = {tool["name"] for tool in tools}
+    assert len(tools) == len(names) == 88 and names == EXPECTED_TOOLS, "unexpected public tool inventory"
+
+
 def smoke(client, negative=True):
     for revision in (MODERN, LEGACY):
         if revision == MODERN:
@@ -120,59 +150,42 @@ def smoke(client, negative=True):
             client.call("initialize", {"protocolVersion": revision, "capabilities": {},
                         "clientInfo": {"name": "devres-smoke", "version": "1"}}, revision)
         tools = client.call("tools/list", revision=revision)["tools"]
-        names = {tool["name"] for tool in tools}
-        assert {"npm_search", "npm_metadata", "npm_source_list", "npm_source_read",
-                "npm_versions", "npm_catalog_search", "npm_document_get", "npm_dependencies",
-                "npm_compare", "npm_content_search", "npm_contract_get", "npm_history",
-                "npm_snapshots", "npm_corpus_status", "npm_advisory_lookup", "npm_advisory_get",
-                "npm_advisory_catalog_search", "npm_audit_lockfile"} <= names, names
-        npm = client.tool("npm_corpus_status", {}, revision)
+        assert_tool_inventory(tools)
+        if negative:
+            for old_name in ("server_info", "rfc_catalog_search", "crate_compare", "rfc.catalog.search"):
+                code, rejected = client.exchange("tools/call", {"name": old_name, "arguments": {}}, revision)
+                assert code == (400 if revision == MODERN else 200), "unexpected unknown-tool HTTP status"
+                assert rejected.get("error", {}).get("code") == -32602, "obsolete or nested tool name was accepted"
+        npm = client.tool("npm.corpus_status", {}, revision)
         assert isinstance(npm.get("collection_enabled"), bool), "npm collection status missing"
-        code, rejected = client.exchange("tools/call", {"name": "npm_metadata", "arguments": {"name": "fixture", "version": "1.0.0", "url": "https://untrusted.invalid"}}, revision)
+        code, rejected = client.exchange("tools/call", {"name": "npm.metadata", "arguments": {"name": "fixture", "version": "1.0.0", "url": "https://untrusted.invalid"}}, revision)
         assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "npm schema admitted an arbitrary destination"
-        assert {"server_info", "search", "fetch", "audit_lockfile"} <= names, names
-        assert {"crate_versions", "crate_catalog_search", "crate_document_get", "crate_dependencies",
-                "crate_compare", "crate_content_search", "crate_api_search", "crate_api_get",
-                "crate_corpus_status"} <= names, names
-        assert {"advisory_get", "advisory_catalog_search", "advisory_history",
-                "advisory_snapshots", "advisory_corpus_status"} <= names, names
-        assert {"mdn_search", "mdn_get", "mdn_compat_search", "mdn_compat_get",
-                "mdn_browser_get", "mdn_history", "mdn_snapshots", "mdn_corpus_status"} <= names, names
-        assert {"whatwg_catalog_search", "whatwg_search", "whatwg_get", "whatwg_symbol_search",
-                "whatwg_symbol_get", "whatwg_references", "whatwg_history", "whatwg_snapshots",
-                "whatwg_compare", "whatwg_corpus_status"} <= names, names
-        whatwg = client.tool("whatwg_corpus_status", {}, revision)
+        whatwg = client.tool("whatwg.corpus_status", {}, revision)
         assert isinstance(whatwg.get("collection_enabled"), bool), "WHATWG collection status missing"
-        code, rejected = client.exchange("tools/call", {"name": "whatwg_get", "arguments": {"standard": "fixture", "url": "https://untrusted.invalid"}}, revision)
+        code, rejected = client.exchange("tools/call", {"name": "whatwg.get", "arguments": {"standard": "fixture", "url": "https://untrusted.invalid"}}, revision)
         assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "WHATWG schema admitted an arbitrary destination"
-        assert {"w3c_catalog_search", "w3c_search", "w3c_get", "w3c_symbol_search",
-                "w3c_symbol_get", "w3c_references", "w3c_history", "w3c_snapshots",
-                "w3c_compare", "w3c_corpus_status"} <= names, names
-        assert {"chromium_catalog_search", "chromium_search", "chromium_get", "chromium_symbol_search",
-                "chromium_symbol_get", "chromium_references", "chromium_history", "chromium_snapshots",
-                "chromium_compare", "chromium_corpus_status"} <= names, names
-        chromium = client.tool("chromium_corpus_status", {}, revision)
+        chromium = client.tool("chromium.corpus_status", {}, revision)
         assert isinstance(chromium.get("collection_enabled"), bool), "Chromium collection status missing"
-        code, rejected = client.exchange("tools/call", {"name": "chromium_get", "arguments": {"component": "src", "path": "docs/fixture.html", "url": "https://untrusted.invalid"}}, revision)
+        code, rejected = client.exchange("tools/call", {"name": "chromium.get", "arguments": {"component": "src", "path": "docs/fixture.html", "url": "https://untrusted.invalid"}}, revision)
         assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "Chromium schema admitted an arbitrary destination"
-        w3c = client.tool("w3c_corpus_status", {}, revision)
+        w3c = client.tool("w3c.corpus_status", {}, revision)
         assert isinstance(w3c.get("collection_enabled"), bool), "W3C collection status missing"
-        code, rejected = client.exchange("tools/call", {"name": "w3c_get", "arguments": {"specification": "fixture", "url": "https://untrusted.invalid"}}, revision)
+        code, rejected = client.exchange("tools/call", {"name": "w3c.get", "arguments": {"specification": "fixture", "url": "https://untrusted.invalid"}}, revision)
         assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "W3C schema admitted an arbitrary destination"
-        mdn = client.tool("mdn_corpus_status", {}, revision)
+        mdn = client.tool("mdn.corpus_status", {}, revision)
         assert isinstance(mdn.get("collection_enabled"), bool), "MDN collection status missing"
-        mdn_schema = next(tool["inputSchema"] for tool in tools if tool["name"] == "mdn_get")
+        mdn_schema = next(tool["inputSchema"] for tool in tools if tool["name"] == "mdn.get")
         assert mdn_schema.get("additionalProperties") is False and len(mdn_schema.get("oneOf", [])) == 2, "MDN document selector schema missing"
-        code, rejected = client.exchange("tools/call", {"name": "mdn_get", "arguments": {"slug": "Web/Fixture", "url": "https://untrusted.invalid"}}, revision)
+        code, rejected = client.exchange("tools/call", {"name": "mdn.get", "arguments": {"slug": "Web/Fixture", "url": "https://untrusted.invalid"}}, revision)
         assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "MDN schema admitted an arbitrary destination"
-        advisories = client.call("tools/call", {"name": "advisory_corpus_status", "arguments": {}}, revision)
+        advisories = client.call("tools/call", {"name": "advisory.corpus_status", "arguments": {}}, revision)
         assert not advisories.get("isError"), "advisory corpus status failed"
         assert isinstance(advisories.get("structuredContent", {}).get("counts"), dict), "missing advisory corpus counts"
-        corpus = client.call("tools/call", {"name": "crate_corpus_status", "arguments": {}}, revision)
+        corpus = client.call("tools/call", {"name": "crate.corpus_status", "arguments": {}}, revision)
         assert not corpus.get("isError"), "crate corpus status failed"
         assert isinstance(corpus.get("structuredContent", {}).get("collection_enabled"), bool)
-        info = client.call("tools/call", {"name": "server_info", "arguments": {}}, revision)
-        assert not info.get("isError"), "server_info failed"
+        info = client.call("tools/call", {"name": "server.info", "arguments": {}}, revision)
+        assert not info.get("isError"), "server.info failed"
         identity = info.get("structuredContent", {})
         assert identity.get("product") == "dev-resources-MCP", "wrong service identity"
         assert identity.get("license") == "AGPL-3.0-only", "missing source-license offer"
@@ -204,30 +217,30 @@ def synthetic_advisory(client):
                 'name = "example"\nversion = "1.0.0"\n'
                 'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
     for revision in (MODERN, LEGACY):
-        detail = client.tool("advisory_get", {"id": SYNTHETIC_ADVISORY, "snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        detail = client.tool("advisory.get", {"id": SYNTHETIC_ADVISORY, "snapshot": SYNTHETIC_SNAPSHOT}, revision)
         assert detail.get("id") == SYNTHETIC_ADVISORY, "wrong synthetic advisory identity"
         assert detail.get("snapshot", {}).get("id") == SYNTHETIC_SNAPSHOT, "synthetic advisory snapshot changed"
         assert detail["snapshot"].get("coverage", {}).get("synthetic") is True, "synthetic evidence lost its fixture label"
         assert detail.get("source_url") == "https://fixtures.invalid/devres/storage-probe/advisory", "synthetic evidence invented upstream provenance"
         text = detail.get("page", {}).get("text", "")
         assert "Synthetic storage-probe advisory" in text, "synthetic advisory body missing"
-        catalog = client.tool("advisory_catalog_search", {"snapshot": SYNTHETIC_SNAPSHOT,
+        catalog = client.tool("advisory.catalog_search", {"snapshot": SYNTHETIC_SNAPSHOT,
                               "filters": {"name": "example", "id": SYNTHETIC_ADVISORY}}, revision)
         assert catalog.get("total") == 1, "synthetic catalog membership changed"
-        lookup = client.tool("advisory_lookup", {"name": "example", "version": "1.0.0",
+        lookup = client.tool("advisory.lookup", {"name": "example", "version": "1.0.0",
                              "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
         assert lookup.get("complete") is True and lookup.get("total") == 1, "synthetic vulnerable version was not matched"
         assert lookup.get("items", [{}])[0].get("id") == SYNTHETIC_ADVISORY, "synthetic lookup matched the wrong advisory"
-        patched = client.tool("advisory_lookup", {"name": "example", "version": "1.0.1",
+        patched = client.tool("advisory.lookup", {"name": "example", "version": "1.0.1",
                               "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
         assert patched.get("complete") is True and patched.get("total") == 0, "synthetic patched version still matched"
-        report = client.tool("audit_lockfile", {"lockfile": lockfile, "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        report = client.tool("audit.lockfile", {"lockfile": lockfile, "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
         require_audit(report, detail["snapshot"]["revision"], allow_synthetic=True)
         assert report.get("snapshot", {}).get("id") == SYNTHETIC_SNAPSHOT, "audit changed its pinned synthetic snapshot"
         assert report.get("vulnerability_count") == 1 and report.get("total_findings") == 1, "audit helper did not produce the synthetic finding"
         assert report.get("findings", [{}])[0].get("advisory", {}).get("id") == SYNTHETIC_ADVISORY, "audit helper returned the wrong advisory"
         assert AUDIT_PRIVACY_MARKER not in json.dumps(report), "audit response reflected the private comment"
-        status_code, invalid = client.exchange("tools/call", {"name": "audit_lockfile", "arguments": {
+        status_code, invalid = client.exchange("tools/call", {"name": "audit.lockfile", "arguments": {
                               "lockfile": f"# {AUDIT_PRIVACY_MARKER}\nnot a Cargo.lock",
                               "advisory_snapshot": SYNTHETIC_SNAPSHOT}}, revision)
         # http_status::preserve_invalid_params_status rewrites modern errors;
@@ -246,7 +259,7 @@ def synthetic_advisory(client):
                 result = result.get("structuredContent", result)
             assert result.get("contents", [{}])[0].get("text") == text, "typed advisory content changed"
             assert AUDIT_PRIVACY_MARKER not in json.dumps(result), "advisory resource reflected audit input"
-        status = client.tool("advisory_corpus_status", {}, revision)
+        status = client.tool("advisory.corpus_status", {}, revision)
         assert AUDIT_PRIVACY_MARKER not in json.dumps(status), "advisory status reflected audit input"
 
 
@@ -255,22 +268,22 @@ def synthetic_mdn(client):
     for revision in (MODERN, LEGACY):
         arguments = {"slug": "Web/Fixture", "snapshot": SYNTHETIC_MDN_CONTENT,
                      "compatibility_snapshot": SYNTHETIC_MDN_COMPAT}
-        detail = client.tool("mdn_get", arguments, revision)
+        detail = client.tool("mdn.get", arguments, revision)
         assert detail.get("provenance", {}).get("snapshot") == SYNTHETIC_MDN_CONTENT, "MDN document snapshot changed"
         assert detail["provenance"].get("coverage", {}).get("synthetic") is True, "MDN fixture lost its synthetic label"
         assert detail.get("source_url", "").startswith("https://fixtures.invalid/"), "MDN fixture invented upstream provenance"
         assert SYNTHETIC_MDN_TEXT in detail.get("page", {}).get("text", ""), "MDN fixture text missing"
         assert "fixture_browser" in detail["page"]["text"], "pinned BCD table was not expanded"
-        found = client.tool("mdn_search", {"query": "fetch", "snapshot": SYNTHETIC_MDN_CONTENT}, revision)
+        found = client.tool("mdn.search", {"query": "fetch", "snapshot": SYNTHETIC_MDN_CONTENT}, revision)
         assert found.get("total") == 1 and found["results"][0].get("slug") == "Web/Fixture", "MDN selected-snapshot search changed"
-        compat = client.tool("mdn_compat_get", {"feature": "api.fixtureFetch", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
+        compat = client.tool("mdn.compat_get", {"feature": "api.fixtureFetch", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
         assert compat.get("original", {}).get("fixture_browser", {}).get("version_added") == "1", "synthetic BCD statement changed"
         assert compat.get("resolved") == compat.get("original"), "explicit BCD evidence was incorrectly transformed"
-        features = client.tool("mdn_compat_search", {"query": "fetch", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
+        features = client.tool("mdn.compat_search", {"query": "fetch", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
         assert features.get("total") == 1, "synthetic BCD feature did not enter its index"
-        browser = client.tool("mdn_browser_get", {"browser": "fixture_browser", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
+        browser = client.tool("mdn.browser_get", {"browser": "fixture_browser", "snapshot": SYNTHETIC_MDN_COMPAT}, revision)
         assert browser.get("releases", [{}])[0].get("version") == "1", "synthetic browser release changed"
-        original = client.tool("mdn_get", {"slug": "Web/Fixture", "snapshot": SYNTHETIC_MDN_CONTENT,
+        original = client.tool("mdn.get", {"slug": "Web/Fixture", "snapshot": SYNTHETIC_MDN_CONTENT,
                                            "representation": "source"}, revision)
         assert original.get("page", {}).get("text", "").startswith("---\ntitle: Synthetic MDN"), "original MDN Markdown was replaced by a projection"
         for selected in (detail, original):
@@ -286,26 +299,26 @@ def synthetic_mdn(client):
                 assert content.get("text") == selected["page"]["text"], "immutable MDN resource changed"
                 assert content.get("_meta", {}).get("provenance", {}).get("coverage", {}).get("synthetic") is True, "resource lost MDN fixture provenance"
                 assert content.get("_meta", {}).get("license"), "resource dropped source attribution"
-        assert AUDIT_PRIVACY_MARKER not in json.dumps(client.tool("mdn_corpus_status", {}, revision)), "MDN status reflected audit input"
+        assert AUDIT_PRIVACY_MARKER not in json.dumps(client.tool("mdn.corpus_status", {}, revision)), "MDN status reflected audit input"
 
 
 def synthetic_whatwg(client):
     """Exercise local synthetic WHATWG snapshots across both negotiated revisions."""
     for revision in (MODERN, LEGACY):
         selection = {"standard": "fixture", "snapshot": SYNTHETIC_WHATWG}
-        detail = client.tool("whatwg_get", selection, revision)
+        detail = client.tool("whatwg.get", selection, revision)
         provenance = detail.get("selection", {})
         assert provenance.get("snapshot") == SYNTHETIC_WHATWG, "WHATWG snapshot changed"
         assert provenance.get("coverage", {}).get("synthetic") is True, "WHATWG fixture lost synthetic provenance"
         assert provenance.get("source_url", "").startswith("https://fixtures.invalid/"), "WHATWG fixture invented upstream provenance"
         text = detail.get("page", {}).get("text", "")
         assert SYNTHETIC_WHATWG_TEXT in text and "fixture_hidden_script" not in text, "WHATWG inert text changed"
-        original = client.tool("whatwg_get", {**selection, "representation": "source"}, revision)
+        original = client.tool("whatwg.get", {**selection, "representation": "source"}, revision)
         assert original.get("page", {}).get("text", "").startswith("<h1 id=fixture>"), "WHATWG original source changed"
         assert "fixture_hidden_script()" in original["page"]["text"], "WHATWG raw source was modified"
-        found = client.tool("whatwg_search", {"snapshot": SYNTHETIC_WHATWG, "query": "token"}, revision)
+        found = client.tool("whatwg.search", {"snapshot": SYNTHETIC_WHATWG, "query": "token"}, revision)
         assert found.get("total") == 1 and found["results"][0].get("standard") == "fixture", "WHATWG selected search changed"
-        symbol = client.tool("whatwg_symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
+        symbol = client.tool("whatwg.symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
         assert symbol.get("page", {}).get("text") == "FixtureToken", "WHATWG symbol changed"
         for selected in (detail, original, symbol):
             uri = selected.get("resource_uri", "")
@@ -323,19 +336,19 @@ def synthetic_w3c(client):
     """Exercise local synthetic W3C snapshots across both negotiated revisions."""
     for revision in (MODERN, LEGACY):
         selection = {"specification": "fixture", "snapshot": SYNTHETIC_W3C}
-        detail = client.tool("w3c_get", selection, revision)
+        detail = client.tool("w3c.get", selection, revision)
         provenance = detail.get("selection", {})
         assert provenance.get("snapshot") == SYNTHETIC_W3C, "W3C snapshot changed"
         assert provenance.get("coverage", {}).get("synthetic") is True, "W3C fixture lost synthetic provenance"
         assert provenance.get("source_url", "").startswith("https://fixtures.invalid/"), "W3C fixture invented upstream provenance"
         text = detail.get("page", {}).get("text", "")
         assert SYNTHETIC_W3C_TEXT in text and "fixture_hidden_script" not in text, "W3C inert text changed"
-        original = client.tool("w3c_get", {**selection, "representation": "source"}, revision)
+        original = client.tool("w3c.get", {**selection, "representation": "source"}, revision)
         assert original.get("page", {}).get("text", "").startswith("<h1 id=fixture>"), "W3C original source changed"
         assert "fixture_hidden_script()" in original["page"]["text"], "W3C raw source was modified"
-        found = client.tool("w3c_search", {"snapshot": SYNTHETIC_W3C, "query": "token"}, revision)
+        found = client.tool("w3c.search", {"snapshot": SYNTHETIC_W3C, "query": "token"}, revision)
         assert found.get("total") == 1 and found["results"][0].get("specification") == "fixture", "W3C selected search changed"
-        symbol = client.tool("w3c_symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
+        symbol = client.tool("w3c.symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
         assert symbol.get("page", {}).get("text") == "FixtureToken", "W3C symbol changed"
         for selected in (detail, original, symbol):
             metadata = selected.get("source_metadata", {})
@@ -354,7 +367,7 @@ def synthetic_w3c(client):
                 assert value["contents"][0].get("_meta", {}).get("source_metadata", {}).get("copyright") == "Synthetic fixture authors", "W3C resource copyright missing"
 
 
-        binary = client.tool("w3c_get", {**selection, "representation": "bytes", "limit": 8}, revision)
+        binary = client.tool("w3c.get", {**selection, "representation": "bytes", "limit": 8}, revision)
         assert binary.get("page", {}).get("base64") == "PGgxIGlkPWY=", "W3C byte page changed"
         uri = binary.get("resource_uri", "") + "?limit=8"
         for method, params in (("resources/read", {"uri": uri}),
@@ -371,19 +384,19 @@ def synthetic_chromium(client):
     """Exercise local synthetic CHROMIUM snapshots across both negotiated revisions."""
     for revision in (MODERN, LEGACY):
         selection = {"component": "src", "path": "docs/fixture.html", "snapshot": SYNTHETIC_CHROMIUM}
-        detail = client.tool("chromium_get", selection, revision)
+        detail = client.tool("chromium.get", selection, revision)
         provenance = detail.get("selection", {})
         assert provenance.get("snapshot") == SYNTHETIC_CHROMIUM, "CHROMIUM snapshot changed"
         assert provenance.get("coverage", {}).get("synthetic") is True, "CHROMIUM fixture lost synthetic provenance"
         assert provenance.get("source_url", "").startswith("https://fixtures.invalid/"), "CHROMIUM fixture invented upstream provenance"
         text = detail.get("page", {}).get("text", "")
         assert SYNTHETIC_CHROMIUM_TEXT in text and "fixture_hidden_script" not in text, "CHROMIUM inert text changed"
-        original = client.tool("chromium_get", {**selection, "representation": "source"}, revision)
+        original = client.tool("chromium.get", {**selection, "representation": "source"}, revision)
         assert original.get("page", {}).get("text", "").startswith("<h1 id=fixture>"), "CHROMIUM original source changed"
         assert "fixture_hidden_script()" in original["page"]["text"], "CHROMIUM raw source was modified"
-        found = client.tool("chromium_search", {"snapshot": SYNTHETIC_CHROMIUM, "query": "token"}, revision)
+        found = client.tool("chromium.search", {"snapshot": SYNTHETIC_CHROMIUM, "query": "token"}, revision)
         assert found.get("total") == 1 and found["results"][0].get("component") == "src", "CHROMIUM selected search changed"
-        symbol = client.tool("chromium_symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
+        symbol = client.tool("chromium.symbol_get", {**selection, "name": "FixtureToken", "kind": "definition"}, revision)
         assert symbol.get("page", {}).get("text") == "FixtureToken", "CHROMIUM symbol changed"
         for selected in (detail, original, symbol):
             metadata = selected.get("source_metadata", {})
@@ -402,7 +415,7 @@ def synthetic_chromium(client):
                 assert value["contents"][0].get("_meta", {}).get("source_metadata", {}).get("copyright") == "Synthetic fixture authors", "CHROMIUM resource copyright missing"
 
 
-        binary = client.tool("chromium_get", {**selection, "representation": "bytes", "limit": 8}, revision)
+        binary = client.tool("chromium.get", {**selection, "representation": "bytes", "limit": 8}, revision)
         assert binary.get("page", {}).get("base64") == "PGgxIGlkPWY=", "CHROMIUM byte page changed"
         uri = binary.get("resource_uri", "") + "?limit=8"
         for method, params in (("resources/read", {"uri": uri}),
@@ -424,7 +437,7 @@ def wait_ready(client, seconds):
     try:
         while time.monotonic() < deadline:
             try:
-                info = client.tool("server_info", {})
+                info = client.tool("server.info", {})
                 if info.get("product") == "dev-resources-MCP" and info.get("license") == "AGPL-3.0-only":
                     return
             except (OSError, http.client.HTTPException, ValueError, AssertionError):
@@ -450,19 +463,19 @@ def require_audit(report, revision, allow_synthetic=False):
 def synthetic_npm(client):
     """Retained package/advisory evidence and request-only audits; no providers."""
     for revision in (MODERN, LEGACY):
-        versions = client.tool("npm_versions", {"name": "npm-fixture"}, revision)
+        versions = client.tool("npm.versions", {"name": "npm-fixture"}, revision)
         assert versions["total"] == 2 and versions["items"][0]["version"] == "2.0.0", "npm fixture inventory changed"
         snapshot = versions["snapshot"]["id"]
         selection = {"name": "npm-fixture", "version": "1.0.0", "snapshot": snapshot}
-        document = client.tool("npm_document_get", {**selection, "path": "README.md"}, revision)
+        document = client.tool("npm.document_get", {**selection, "path": "README.md"}, revision)
         assert "Synthetic npm storage fixture" in document["page"]["text"], "npm fixture document changed"
         resource = client.call("resources/read", {"uri": document["resource_uri"]}, revision)
         assert resource["contents"][0]["text"] == document["page"]["text"], "npm resource lost snapshot binding"
-        found = client.tool("npm_content_search", {"snapshot": snapshot, "query": "FixtureToken"}, revision)
+        found = client.tool("npm.content_search", {"snapshot": snapshot, "query": "FixtureToken"}, revision)
         assert found["total"] > 0, "npm captured content index missing"
-        contracts = client.tool("npm_contract_get", selection, revision)
+        contracts = client.tool("npm.contract_get", selection, revision)
         assert "index.d.ts" in json.dumps(contracts), "npm published types contract missing"
-        advisory = client.tool("npm_advisory_lookup", {"name": "npm-fixture", "version": "1.0.0"}, revision)
+        advisory = client.tool("npm.advisory_lookup", {"name": "npm-fixture", "version": "1.0.0"}, revision)
         assert advisory["total"] == 1, "npm public advisory fixture missing"
         advisory_snapshot = advisory["snapshot"]["id"]
         for format_name, text in (
@@ -471,11 +484,11 @@ def synthetic_npm(client):
             ("yarn_classic", '# yarn lockfile v1\n\nnpm-fixture@^1:\n  version "1.0.0"\n'),
             ("yarn_berry", '__metadata:\n  version: 10\n\n"npm-fixture@npm:^1":\n  version: 1.0.0\n  resolution: "npm-fixture@npm:1.0.0"\n'),
         ):
-            report = client.tool("npm_audit_lockfile", {"lockfile": text, "lockfile_format": format_name,
+            report = client.tool("npm.audit_lockfile", {"lockfile": text, "lockfile_format": format_name,
                 "advisory_snapshot": advisory_snapshot, "registry_context": {"default": "npmjs"}}, revision)
             assert report["vulnerability_count"] == 1 and report["input_retention"] == "request_lifetime_only", "npm isolated fixture assessment failed"
             assert AUDIT_PRIVACY_MARKER not in json.dumps(report), "npm audit reflected private metadata"
-        code, rejected = client.exchange("tools/call", {"name": "npm_audit_lockfile", "arguments": {
+        code, rejected = client.exchange("tools/call", {"name": "npm.audit_lockfile", "arguments": {
             "lockfile": AUDIT_PRIVACY_MARKER, "lockfile_format": "npm", "advisory_snapshot": advisory_snapshot}}, revision)
         assert code == (400 if revision == MODERN else 200), "malformed npm input changed its HTTP error mapping"
         assert isinstance(rejected, dict) and rejected.get("error", {}).get("code") == -32602, "malformed npm input did not return sanitized invalid params"
@@ -487,48 +500,48 @@ def live(client, rfc_text_only=False):
     # No user-supplied package, URL, lockfile, or bulk enumeration is accepted.
     started = time.monotonic()
     signal.alarm(300)
-    status = client.tool("rfc_corpus_status", {})
+    status = client.tool("rfc.corpus_status", {})
     assert status.get("collection_enabled") is False, "bounded live smoke requires paused automatic RFC collection"
-    assert client.tool("crate_corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused crate collection"
-    assert client.tool("mdn_corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused MDN collection"
-    assert client.tool("w3c_corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused W3C collection"
-    rfc_search = client.tool("rfc_search", {"query": "QUIC", "offset": 0, "limit": 3})
+    assert client.tool("crate.corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused crate collection"
+    assert client.tool("mdn.corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused MDN collection"
+    assert client.tool("w3c.corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused W3C collection"
+    rfc_search = client.tool("rfc.search", {"query": "QUIC", "offset": 0, "limit": 3})
     assert rfc_search.get("items") and rfc_search.get("total", 0) > 0, "RFC discovery returned no matching documents"
     assert rfc_search.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/rfc-index.xml", "RFC discovery did not use the canonical index"
-    rfc = client.tool("rfc_get", {"number": 9000, "offset": 0, "limit": 1024})
+    rfc = client.tool("rfc.get", {"number": 9000, "offset": 0, "limit": 1024})
     assert rfc.get("id") == "rfc:9000", "wrong RFC identity"
     assert rfc.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/rfc/rfc9000.txt"
     assert "9000" in rfc.get("page", {}).get("text", "") and "QUIC" in rfc["page"]["text"], "RFC response did not contain the selected document"
-    metadata_rfc = client.tool("rfc_metadata", {"number": 9000})
+    metadata_rfc = client.tool("rfc.metadata", {"number": 9000})
     assert metadata_rfc.get("metadata", {}).get("number") == 9000
     assert metadata_rfc.get("snapshot"), "RFC metadata did not pin a snapshot"
     for format_name in (("txt",) if rfc_text_only else ("txt", "html", "xml", "pdf")):
-        representation = client.tool("rfc_format_get", {"number": 9000, "format": format_name, "limit": 1024})
+        representation = client.tool("rfc.format_get", {"number": 9000, "format": format_name, "limit": 1024})
         assert representation.get("format") == format_name and representation.get("assurance") == "https"
         captured = representation.get("capture", {}).get("id")
         assert captured, "RFC format omitted its capture"
-        pinned = client.tool("rfc_format_get", {"number": 9000, "format": format_name, "capture": captured, "limit": 1024})
+        pinned = client.tool("rfc.format_get", {"number": 9000, "format": format_name, "capture": captured, "limit": 1024})
         assert pinned == representation, "capture-pinned RFC format changed"
-    errata_rfc = client.tool("rfc_errata", {"number": 9000, "limit": 1})
+    errata_rfc = client.tool("rfc.errata", {"number": 9000, "limit": 1})
     assert errata_rfc.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/api/v1/errata.json"
-    fulltext_rfc = client.tool("rfc_fulltext_search", {"query": "multiplexed", "limit": 3})
+    fulltext_rfc = client.tool("rfc.fulltext_search", {"query": "multiplexed", "limit": 3})
     assert fulltext_rfc.get("snapshot") and any(item.get("number") == 9000 for item in fulltext_rfc.get("items", [])), "fixed RFC text did not enter the partial search snapshot"
-    crate_search = client.tool("crate_search", {"query": "itoa", "offset": 0, "limit": 3})
+    crate_search = client.tool("crate.search", {"query": "itoa", "offset": 0, "limit": 3})
     assert crate_search.get("items") and crate_search.get("total", 0) > 0, "crate discovery returned no packages"
-    metadata = client.tool("crate_metadata", {"name": "itoa", "version": "1.0.15"})
+    metadata = client.tool("crate.metadata", {"name": "itoa", "version": "1.0.15"})
     assert metadata.get("id") == "crate:itoa@1.0.15"
     assert metadata.get("metadata", {}).get("name") == "itoa" and metadata["metadata"].get("vers") == "1.0.15", "wrong published package version"
     checksum = metadata["metadata"].get("cksum", "")
     assert len(checksum) == 64 and all(char in "0123456789abcdef" for char in checksum), "missing published archive checksum"
-    listing = client.tool("crate_source_list", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
+    listing = client.tool("crate.source_list", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
     assert listing.get("checksum_verified") is True and listing.get("archive_capture", {}).get("body_hash") == checksum
     assert any(item.get("path") == "src/lib.rs" for item in listing.get("files", [])), "published source listing lacks the selected member"
-    source = client.tool("crate_source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
+    source = client.tool("crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
                                                "offset": 0, "limit": 1024})
     assert source.get("path") == "src/lib.rs" and source.get("page", {}).get("text"), "source member was not retrieved"
     assert source.get("checksum_verified") is True and source.get("archive_capture", {}).get("body_hash") == checksum
     assert source.get("metadata_capture", {}).get("id") == metadata.get("capture", {}).get("id"), "source projection changed its metadata capture"
-    pinned = client.tool("crate_source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
+    pinned = client.tool("crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
                          "metadata_capture": source["metadata_capture"]["id"],
                          "archive_capture": source["archive_capture"]["id"], "offset": 0, "limit": 1024})
     assert pinned == source, "capture-fixed source changed"
@@ -539,15 +552,15 @@ def live(client, rfc_text_only=False):
             assert not value.get("isError"), "pinned source fetch failed"
             value = value.get("structuredContent", value)
         assert value.get("contents", [{}])[0].get("text") == source["page"]["text"], "source resource content changed"
-    lookup = client.tool("advisory_lookup", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
+    lookup = client.tool("advisory.lookup", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
     revision = require_snapshot(lookup)
     lockfile = ('version = 4\n[[package]]\nname = "itoa"\nversion = "1.0.15"\n'
                 'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
-    audit = client.tool("audit_lockfile", {"lockfile": lockfile, "offset": 0, "limit": 20})
+    audit = client.tool("audit.lockfile", {"lockfile": lockfile, "offset": 0, "limit": 20})
     require_audit(audit, revision)
     # A repeated fetch proves the public API still resolves the same record; request
     # counters/storage tests separately establish zero upstream calls for warm hits.
-    repeat = client.tool("rfc_get", {"number": 9000, "offset": 0, "limit": 1024})
+    repeat = client.tool("rfc.get", {"number": 9000, "offset": 0, "limit": 1024})
     assert rfc == repeat, "warm retrieval changed its captured representation"
     assert time.monotonic() - started < 300, "live smoke exceeded its five-minute budget"
     signal.alarm(0)

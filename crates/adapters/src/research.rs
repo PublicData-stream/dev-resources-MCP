@@ -188,7 +188,7 @@ impl Research {
         {
             return self.npm.call(tool, input).await;
         }
-        if tool == "npm_audit_lockfile" {
+        if tool == "npm.audit_lockfile" {
             return crate::npm::audit::audit(
                 input,
                 self.npm_corpus
@@ -271,7 +271,7 @@ impl Research {
                 .crate_corpus
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("Crate corpus storage is not configured."))?;
-            if tool == "crate_corpus_status" {
+            if tool == "crate.corpus_status" {
                 let _: EmptyInput = decode(input)?;
                 return corpus.status().await;
             }
@@ -279,13 +279,13 @@ impl Research {
         }
         if matches!(
             tool,
-            "rfc_metadata"
-                | "rfc_catalog_search"
-                | "rfc_fulltext_search"
-                | "rfc_format_get"
-                | "rfc_errata"
-                | "rfc_series_get"
-                | "rfc_corpus_status"
+            "rfc.metadata"
+                | "rfc.catalog_search"
+                | "rfc.fulltext_search"
+                | "rfc.format_get"
+                | "rfc.errata"
+                | "rfc.series_get"
+                | "rfc.corpus_status"
         ) {
             return rfc_tools::call(
                 self.corpus
@@ -297,14 +297,14 @@ impl Research {
             .await;
         }
         match tool {
-            "rfc_search" => rfc::search(&self.retrieval, decode(input)?).await,
-            "rfc_get" => rfc::get(&self.retrieval, decode(input)?).await,
-            "crate_search" => cargo::search(&self.retrieval, decode(input)?).await,
-            "crate_metadata" => cargo::metadata(&self.retrieval, decode(input)?).await,
-            "crate_source_list" => cargo::source_list(&self.retrieval, decode(input)?).await,
-            "crate_source_read" => cargo::source_read(&self.retrieval, decode(input)?).await,
-            "advisory_lookup" => self.advisory.lookup(decode(input)?).await,
-            "audit_lockfile" => self.advisory.audit(decode(input)?).await,
+            "rfc.search" => rfc::search(&self.retrieval, decode(input)?).await,
+            "rfc.get" => rfc::get(&self.retrieval, decode(input)?).await,
+            "crate.search" => cargo::search(&self.retrieval, decode(input)?).await,
+            "crate.metadata" => cargo::metadata(&self.retrieval, decode(input)?).await,
+            "crate.source_list" => cargo::source_list(&self.retrieval, decode(input)?).await,
+            "crate.source_read" => cargo::source_read(&self.retrieval, decode(input)?).await,
+            "advisory.lookup" => self.advisory.lookup(decode(input)?).await,
+            "audit.lockfile" => self.advisory.audit(decode(input)?).await,
             "search" => self.search(decode(input)?).await,
             "fetch" => self.fetch(decode(input)?).await,
             _ => Err(Error::not_found("Unknown research tool.")),
@@ -330,7 +330,7 @@ impl Research {
                 "npm" => {
                     self.npm
                         .call(
-                            "npm_search",
+                            "npm.search",
                             json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
                         )
                         .await
@@ -364,7 +364,7 @@ impl Research {
                 "chromium" => match self.chromium_research.as_ref() {
                     Some(research) => research
                         .call(
-                            "chromium_search",
+                            "chromium.search",
                             json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
                         )
                         .await,
@@ -375,7 +375,7 @@ impl Research {
                 "w3c" => match self.w3c_research.as_ref() {
                     Some(research) => research
                         .call(
-                            "w3c_search",
+                            "w3c.search",
                             json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
                         )
                         .await,
@@ -384,7 +384,7 @@ impl Research {
                 "whatwg" => match self.whatwg_research.as_ref() {
                     Some(research) => research
                         .call(
-                            "whatwg_search",
+                            "whatwg.search",
                             json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
                         )
                         .await,
@@ -395,7 +395,7 @@ impl Research {
                 "mdn" => match self.mdn_research.as_ref() {
                     Some(research) => research
                         .call(
-                            "mdn_search",
+                            "mdn.search",
                             json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
                         )
                         .await,
@@ -423,7 +423,7 @@ impl Research {
                 .ok_or_else(|| Error::invalid("npm IDs use npm:<name>@<version>."))?;
             return self
                 .npm
-                .call("npm_metadata", json!({"name":name,"version":version}))
+                .call("npm.metadata", json!({"name":name,"version":version}))
                 .await;
         }
         if let Some(id) = input.id.strip_prefix("chromium:") {
@@ -439,7 +439,7 @@ impl Research {
                 .chromium_research
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("Chromium corpus storage is not configured."))?
-                .call("chromium_get", args)
+                .call("chromium.get", args)
                 .await;
         }
         if let Some(id) = input.id.strip_prefix("w3c:") {
@@ -453,7 +453,7 @@ impl Research {
                 .w3c_research
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("W3C corpus storage is not configured."))?
-                .call("w3c_get", args)
+                .call("w3c.get", args)
                 .await;
         }
         if input.id.starts_with("devres://") {
@@ -488,7 +488,7 @@ impl Research {
                 .mdn_research
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?
-                .call("mdn_compat_get", json!({"feature":feature,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(20)}))
+                .call("mdn.compat_get", json!({"feature":feature,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(20)}))
                 .await;
         }
         if let Some(id) = input.id.strip_prefix("whatwg:") {
@@ -501,11 +501,11 @@ impl Research {
                 .whatwg_research
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("WHATWG corpus storage is not configured."))?
-                .call("whatwg_get", args)
+                .call("whatwg.get", args)
                 .await;
         }
         if let Some(slug) = input.id.strip_prefix("mdn:") {
-            return self.mdn_research.as_ref().ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?.call("mdn_get",json!({"slug":slug,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(32768)})).await;
+            return self.mdn_research.as_ref().ok_or_else(|| Error::unavailable("MDN corpus storage is not configured."))?.call("mdn.get",json!({"slug":slug,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(32768)})).await;
         }
         if let Some(number) = input.id.strip_prefix("rfc:") {
             let number = number
@@ -566,7 +566,7 @@ impl Research {
         if url.host_str() == Some("npm-source") {
             return self
                 .npm
-                .call("npm_source_read", crate::npm::source_input_from_uri(uri)?)
+                .call("npm.source_read", crate::npm::source_input_from_uri(uri)?)
                 .await;
         }
         if url.host_str() == Some("npm") {
@@ -747,49 +747,49 @@ fn schemas() -> Vec<Value> {
         vec!["id"],
     );
     add(
-        "rfc_search",
+        "rfc.search",
         "Search the official RFC index by number, title, abstract and status. Reuse capture for stable pagination.",
         json!({"query":text,"status":text,"offset":offset,"limit":limit,"capture":capture}),
         vec!["query"],
     );
     add(
-        "rfc_get",
+        "rfc.get",
         "Read a selected RFC's published text in bounded UTF-8 pages; reuse capture for stable pagination.",
         json!({"number":{"type":"integer","minimum":1,"maximum":999999},"offset":text_offset,"limit":text_limit,"capture":capture}),
         vec!["number"],
     );
     add(
-        "crate_search",
+        "crate.search",
         "Search crates.io packages. Reuse capture for the same bounded upstream result page.",
         json!({"query":text,"offset":offset,"limit":limit,"capture":capture}),
         vec!["query"],
     );
     add(
-        "crate_metadata",
+        "crate.metadata",
         "Inspect an exact crates.io version including dependency declarations, features, yanked state and archive checksum.",
         json!({"name":text,"version":text,"capture":capture}),
         vec!["name", "version"],
     );
     add(
-        "crate_source_list",
+        "crate.source_list",
         "List verified published source archive files. Capture IDs bind the index and archive for stable paging.",
         json!({"name":text,"version":text,"metadata_capture":capture,"archive_capture":capture,"offset":offset,"limit":limit}),
         vec!["name", "version"],
     );
     add(
-        "crate_source_read",
+        "crate.source_read",
         "Read a verified published source file without executing or extracting it. Offsets count UTF-8 bytes.",
         json!({"name":text,"version":text,"path":{"type":"string","minLength":1,"maxLength":4096},"metadata_capture":capture,"archive_capture":capture,"offset":text_offset,"limit":text_limit}),
         vec!["name", "version", "path"],
     );
     add(
-        "advisory_lookup",
+        "advisory.lookup",
         "Match RustSec advisories to a crates.io package/version. Reports stale, withdrawn and informational advisory state explicitly.",
         json!({"name":text,"version":text,"advisory_snapshot":capture,"format":{"enum":["rustsec","osv"],"default":"rustsec"},"offset":offset,"limit":limit}),
         vec!["name", "version"],
     );
     add(
-        "audit_lockfile",
+        "audit.lockfile",
         "Audit supplied Cargo.lock against a captured RustSec database. Input, dependency lists and results remain request-local. Resubmit input and advisory_snapshot for pagination.",
         json!({"lockfile":{"type":"string","minLength":1,"maxLength":1048576},"advisory_snapshot":capture,"format":{"enum":["rustsec","osv"],"default":"rustsec"},"offset":offset,"limit":limit}),
         vec!["lockfile"],

@@ -212,7 +212,7 @@ async fn immutable_text_source_symbol_search_and_resource_roundtrip() {
     let research = ChromiumResearch::new(corpus);
     let get = research
         .call(
-            "chromium_get",
+            "chromium.get",
             json!({"component":"src","snapshot":snapshot.id,"path":"index.html","anchor":"events"}),
         )
         .await
@@ -231,19 +231,19 @@ async fn immutable_text_source_symbol_search_and_resource_roundtrip() {
         resource["contents"][0]["_meta"]["source_metadata"]["copyright"],
         "Synthetic fixture authors"
     );
-    let raw=research.call("chromium_get",json!({"component":"src","snapshot":snapshot.id,"path":"index.html","representation":"bytes","limit":8})).await.unwrap();
+    let raw=research.call("chromium.get",json!({"component":"src","snapshot":snapshot.id,"path":"index.html","representation":"bytes","limit":8})).await.unwrap();
     assert_eq!(
         STANDARD
             .decode(raw["page"]["base64"].as_str().unwrap())
             .unwrap(),
         b"<h1 id=c"
     );
-    let symbol=research.call("chromium_symbol_get",json!({"component":"src","snapshot":snapshot.id,"path":"index.html","kind":"definition","name":"Event","limit":2})).await.unwrap();
+    let symbol=research.call("chromium.symbol_get",json!({"component":"src","snapshot":snapshot.id,"path":"index.html","kind":"definition","name":"Event","limit":2})).await.unwrap();
     assert_eq!(symbol["page"]["text"], "Ev");
     assert_eq!(symbol["page"]["next_offset"], 2);
     let result = research
         .call(
-            "chromium_search",
+            "chromium.search",
             json!({"component":"src","snapshot":snapshot.id,"query":"dispatches"}),
         )
         .await
@@ -264,7 +264,7 @@ async fn strict_selectors_and_unresolved_license_cannot_expose_content() {
         json!({"component":"src","snapshot":snapshot.id,"path":"../index.html"}),
         json!({"component":"src","snapshot":snapshot.id}),
     ] {
-        assert!(research.call("chromium_get", input).await.is_err());
+        assert!(research.call("chromium.get", input).await.is_err());
     }
     let mut blocked = snapshot.clone();
     blocked.id = digest(&"blocked-license").unwrap();
@@ -274,12 +274,12 @@ async fn strict_selectors_and_unresolved_license_cannot_expose_content() {
         .await
         .unwrap();
     for representation in ["text", "source", "bytes"] {
-        assert!(research.call("chromium_get",json!({"component":"src","snapshot":blocked.id,"path":"index.html","representation":representation})).await.is_err());
+        assert!(research.call("chromium.get",json!({"component":"src","snapshot":blocked.id,"path":"index.html","representation":representation})).await.is_err());
     }
     assert!(
         research
             .call(
-                "chromium_search",
+                "chromium.search",
                 json!({"snapshot":blocked.id,"query":"dispatches"})
             )
             .await
@@ -294,7 +294,7 @@ async fn symbol_cursor_is_query_bound_and_allows_changed_page_size() {
     let research = ChromiumResearch::new(corpus);
     let first = research
         .call(
-            "chromium_symbol_search",
+            "chromium.symbol_search",
             json!({"component":"src","snapshot":snapshot.id,"limit":1}),
         )
         .await
@@ -302,13 +302,13 @@ async fn symbol_cursor_is_query_bound_and_allows_changed_page_size() {
     let cursor = first["next_cursor"].as_str().unwrap();
     let second = research
         .call(
-            "chromium_symbol_search",
+            "chromium.symbol_search",
             json!({"component":"src","snapshot":snapshot.id,"limit":100,"cursor":cursor}),
         )
         .await
         .unwrap();
     assert!(!second["items"].as_array().unwrap().is_empty());
-    assert!(research.call("chromium_symbol_search",json!({"component":"src","snapshot":snapshot.id,"kind":"definition","cursor":cursor})).await.is_err());
+    assert!(research.call("chromium.symbol_search",json!({"component":"src","snapshot":snapshot.id,"kind":"definition","cursor":cursor})).await.is_err());
 }
 
 #[tokio::test]
@@ -330,7 +330,7 @@ async fn partial_default_skips_expired_components_but_explicit_history_is_readab
     store.chromium_publish_view(&view).await.unwrap();
     let research = ChromiumResearch::new(corpus);
     let result = research
-        .call("chromium_search", json!({"query":"dispatches"}))
+        .call("chromium.search", json!({"query":"dispatches"}))
         .await
         .unwrap();
     assert_eq!(result["selections"].as_array().unwrap().len(), 1);
@@ -338,7 +338,7 @@ async fn partial_default_skips_expired_components_but_explicit_history_is_readab
     assert!(
         research
             .call(
-                "chromium_get",
+                "chromium.get",
                 json!({"component":"site","path":"index.html"})
             )
             .await
@@ -347,7 +347,7 @@ async fn partial_default_skips_expired_components_but_explicit_history_is_readab
     assert!(
         research
             .call(
-                "chromium_get",
+                "chromium.get",
                 json!({"component":"site","snapshot":old.id,"path":"index.html"})
             )
             .await
@@ -376,7 +376,7 @@ async fn history_cutoff_and_ref_pages_preserve_filtered_continuations() {
     let research = ChromiumResearch::new(corpus);
     let first = research
         .call(
-            "chromium_history",
+            "chromium.history",
             json!({"component":"src","history_type":"refs","query":"wanted"}),
         )
         .await
@@ -384,7 +384,7 @@ async fn history_cutoff_and_ref_pages_preserve_filtered_continuations() {
     assert!(first["items"].as_array().unwrap().is_empty());
     assert!(first["next_cursor"].is_string());
     store.chromium_put("observations","late",&json!({"component":"src","repository":"chromium/src","observed_at":2,"refs":[{"name":"refs/heads/wanted-late","revision":"c".repeat(40)}]})).await.unwrap();
-    let second=research.call("chromium_history",json!({"component":"src","history_type":"refs","query":"wanted","cursor":first["next_cursor"]})).await.unwrap();
+    let second=research.call("chromium.history",json!({"component":"src","history_type":"refs","query":"wanted","cursor":first["next_cursor"]})).await.unwrap();
     assert_eq!(second["history_snapshot"], first["history_snapshot"]);
     assert_eq!(second["items"].as_array().unwrap().len(), 1);
     assert_eq!(second["items"][0]["ref"]["removed"], true);
@@ -441,7 +441,7 @@ async fn document_catalog_uses_snapshot_membership_and_query_bound_continuation(
     let research = ChromiumResearch::new(corpus);
     let first = research
         .call(
-            "chromium_catalog_search",
+            "chromium.catalog_search",
             json!({"component":"src","snapshot":snapshot.id,"query":"index.html","limit":1}),
         )
         .await
@@ -450,10 +450,10 @@ async fn document_catalog_uses_snapshot_membership_and_query_bound_continuation(
     assert_eq!(first["items"][0]["path"], "index.html");
     assert_eq!(first["items"][0]["snapshot"], snapshot.id);
     let continuation = first["next_cursor"].as_str().unwrap();
-    let next=research.call("chromium_catalog_search",json!({"component":"src","snapshot":snapshot.id,"query":"index.html","cursor":continuation,"limit":100})).await.unwrap();
+    let next=research.call("chromium.catalog_search",json!({"component":"src","snapshot":snapshot.id,"query":"index.html","cursor":continuation,"limit":100})).await.unwrap();
     assert!(next["items"].as_array().unwrap().is_empty());
     assert!(next["next_cursor"].is_null());
-    assert!(research.call("chromium_catalog_search",json!({"component":"src","snapshot":snapshot.id,"query":"changed","cursor":continuation})).await.is_err());
+    assert!(research.call("chromium.catalog_search",json!({"component":"src","snapshot":snapshot.id,"query":"changed","cursor":continuation})).await.is_err());
 }
 
 #[tokio::test]
@@ -484,16 +484,16 @@ async fn approved_path_comparison_ignores_unrelated_metadata_only_license_gap() 
         .await
         .unwrap();
     let research = ChromiumResearch::new(corpus);
-    let result=research.call("chromium_compare",json!({"component":"src","before":mixed.id,"after":mixed.id,"path":"index.html","mode":"source"})).await.unwrap();
+    let result=research.call("chromium.compare",json!({"component":"src","before":mixed.id,"after":mixed.id,"path":"index.html","mode":"source"})).await.unwrap();
     assert!(result["items"].as_array().unwrap().is_empty());
     assert!(
         research
             .call(
-                "chromium_compare",
+                "chromium.compare",
                 json!({"component":"src","before":mixed.id,"after":mixed.id,"mode":"source"})
             )
             .await
             .is_err()
     );
-    assert!(research.call("chromium_compare",json!({"component":"src","before":mixed.id,"after":mixed.id,"path":"blocked.md","mode":"source"})).await.is_err());
+    assert!(research.call("chromium.compare",json!({"component":"src","before":mixed.id,"after":mixed.id,"path":"blocked.md","mode":"source"})).await.is_err());
 }

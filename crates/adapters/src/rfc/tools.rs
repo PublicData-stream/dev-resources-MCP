@@ -258,7 +258,7 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
         .try_acquire()
         .map_err(|_| Error::capacity("RFC research capacity exhausted."))?;
     match tool {
-        "rfc_metadata" => {
+        "rfc.metadata" => {
             let input: MetadataInput = decode(input)?;
             check_number(input.number)?;
             let snapshot = corpus.selected_snapshot(input.snapshot.as_deref()).await?;
@@ -273,7 +273,7 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
             attach_snapshot(&mut value, &snapshot);
             Ok(value)
         }
-        "rfc_catalog_search" => {
+        "rfc.catalog_search" => {
             let input: CatalogueInput = decode(input)?;
             check_query(&input.query, true)?;
             input.filters.checked()?;
@@ -305,7 +305,7 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
             attach_snapshot(&mut value, &snapshot);
             Ok(value)
         }
-        "rfc_fulltext_search" => {
+        "rfc.fulltext_search" => {
             let input: FulltextInput = decode(input)?;
             check_query(&input.query, false)?;
             input.filters.checked()?;
@@ -378,8 +378,8 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
             attach_snapshot(&mut value, &snapshot);
             Ok(value)
         }
-        "rfc_format_get" => format_get(corpus, decode(input)?).await,
-        "rfc_errata" => {
+        "rfc.format_get" => format_get(corpus, decode(input)?).await,
+        "rfc.errata" => {
             let input: ErrataInput = decode(input)?;
             check_number(input.number)?;
             Page {
@@ -418,7 +418,7 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
             attach_snapshot(&mut value, &snapshot);
             Ok(value)
         }
-        "rfc_series_get" => {
+        "rfc.series_get" => {
             let input: SeriesInput = decode(input)?;
             check_number(input.number)?;
             Page {
@@ -450,7 +450,7 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
             attach_snapshot(&mut value, &snapshot);
             Ok(value)
         }
-        "rfc_corpus_status" => {
+        "rfc.corpus_status" => {
             let _: Empty = decode(input)?;
             corpus.status().await
         }
@@ -598,43 +598,43 @@ pub(crate) fn schemas() -> Vec<Value> {
     let tool = |name: &str, description: &str, properties: Value, required: Vec<&str>| json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}});
     vec![
         tool(
-            "rfc_metadata",
+            "rfc.metadata",
             "Rich RFC index metadata pinned to a research snapshot.",
             json!({"number":number,"snapshot":snapshot}),
             vec!["number"],
         ),
         tool(
-            "rfc_catalog_search",
+            "rfc.catalog_search",
             "Search rich RFC metadata; filters combine with AND. Reuse snapshot for stable pages.",
             json!({"query":{"type":"string","maxLength":256},"filters":filters,"snapshot":snapshot,"offset":offset,"limit":limit}),
             vec![],
         ),
         tool(
-            "rfc_fulltext_search",
+            "rfc.fulltext_search",
             "Search archived RFC text with technical AND tokens or explicit English phrases, OR and minus exclusions. Coverage and provenance are explicit.",
             json!({"query":text,"mode":{"enum":["technical","english"],"default":"technical"},"filters":filters,"assurance":{"enum":["https","rsync"]},"snapshot":snapshot,"offset":offset,"limit":limit}),
             vec!["query"],
         ),
         tool(
-            "rfc_format_get",
+            "rfc.format_get",
             "Read published txt/html/xml inert source or base64 pdf bytes; reuse capture for stable paging.",
             json!({"number":number,"format":{"enum":["txt","html","xml","pdf"]},"capture":snapshot,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}}),
             vec!["number", "format"],
         ),
         tool(
-            "rfc_errata",
+            "rfc.errata",
             "Read original errata records and statuses against a pinned research snapshot; never modifies RFC text.",
             json!({"number":number,"status":text,"type":text,"snapshot":snapshot,"offset":offset,"limit":limit}),
             vec!["number"],
         ),
         tool(
-            "rfc_series_get",
+            "rfc.series_get",
             "Resolve STD/BCP/FYI membership without replacing requested RFC identities.",
             json!({"series":{"enum":["STD","BCP","FYI"]},"number":number,"snapshot":snapshot,"offset":offset,"limit":limit}),
             vec!["series", "number"],
         ),
         tool(
-            "rfc_corpus_status",
+            "rfc.corpus_status",
             "Read aggregate RFC collection progress, freshness, snapshots and explicit gaps.",
             json!({}),
             vec![],

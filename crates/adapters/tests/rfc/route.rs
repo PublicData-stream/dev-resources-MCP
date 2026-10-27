@@ -98,7 +98,7 @@ async fn rfc_search_retrieves_canonical_index_and_reuses_captured_page() {
     .unwrap();
     let result = research
         .call(
-            "rfc_search",
+            "rfc.search",
             json!({"query":"multiplexed","status":"PROPOSED STANDARD"}),
         )
         .await
@@ -111,7 +111,7 @@ async fn rfc_search_retrieves_canonical_index_and_reuses_captured_page() {
     );
     let next = research
         .call(
-            "rfc_search",
+            "rfc.search",
             json!({"query":"multiplexed","capture":result["capture"]["id"],"offset":1}),
         )
         .await

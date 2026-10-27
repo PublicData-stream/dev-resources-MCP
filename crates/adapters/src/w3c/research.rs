@@ -242,7 +242,7 @@ fn public_snapshot(snapshot: &Snapshot, historical: bool) -> Value {
     json!({"snapshot":snapshot.id,"specification":snapshot.standard,"repository":snapshot.repository,
         "revision":snapshot.revision,"representation":snapshot.representation,"processor_version":snapshot.processor_version,
         "validated_at":snapshot.validated_at,"stale":devres_domain::unix_now().saturating_sub(snapshot.validated_at)>86400,
-        "historical":historical,"coverage":snapshot.coverage,"source_url":snapshot.source_url,
+        "historical":historical,"coverage":public_coverage(snapshot),"source_url":snapshot.source_url,
         "source_metadata":source_metadata(snapshot),"license":source_license(snapshot),
         "catalog_latest_publication":snapshot.coverage["latest_publication"],
         "effective_publication":snapshot.coverage["effective_publication"],
@@ -337,6 +337,39 @@ fn require_content_license(snapshot: &Snapshot) -> Result<()> {
     }
     Ok(())
 }
+// Stored snapshots retain their original selector spelling and immutable identity.
+// Only service-generated notice selectors are projected into the current public API.
+fn public_license_evidence(snapshot: &Snapshot, license: &Value) -> Value {
+    let mut evidence = license.clone();
+    if let Some(notices) = evidence.get_mut("notices").and_then(Value::as_array_mut) {
+        for notice in notices {
+            let path = notice.get("path").cloned();
+            if let Some(selector) = notice
+                .get_mut("source_selector")
+                .and_then(Value::as_object_mut)
+                && selector.len() == 5
+                && selector.get("tool").and_then(Value::as_str) == Some("w3c_get")
+                && selector.get("specification").and_then(Value::as_str)
+                    == Some(snapshot.standard.as_str())
+                && selector.get("snapshot").and_then(Value::as_str) == Some(snapshot.id.as_str())
+                && selector.get("representation").and_then(Value::as_str) == Some("source")
+                && path
+                    .as_ref()
+                    .is_some_and(|path| path.is_string() && selector.get("path") == Some(path))
+            {
+                selector.insert("tool".into(), json!("w3c.get"));
+            }
+        }
+    }
+    evidence
+}
+fn public_coverage(snapshot: &Snapshot) -> Value {
+    let mut coverage = snapshot.coverage.clone();
+    if let Some(license) = coverage.get_mut("license") {
+        *license = public_license_evidence(snapshot, license);
+    }
+    coverage
+}
 fn source_license(snapshot: &Snapshot) -> Value {
     license_metadata(
         snapshot,
@@ -345,7 +378,7 @@ fn source_license(snapshot: &Snapshot) -> Value {
     )
 }
 fn license_metadata(snapshot: &Snapshot, license: &Value, source_url: &str) -> Value {
-    json!({"attribution":"Original publication and repository contributors", "evidence":license,
+    json!({"attribution":"Original publication and repository contributors", "evidence":public_license_evidence(snapshot, license),
         "notice":"Preserve the original notices in this captured publication or repository revision; no blanket license is inferred.",
         "derived_notice":DERIVED_NOTICE,"source_url":source_url,"revision":snapshot.revision,
         "service_license_applies_to_source":false})
@@ -589,16 +622,16 @@ impl W3cResearch {
         let cancel = CancellationToken::new();
         let _guard = CancelOnDrop(cancel.clone());
         let mut output = match tool {
-            "w3c_corpus_status" => {
+            "w3c.corpus_status" => {
                 let _: EmptyInput = decode(input)?;
                 self.corpus.status().await
             }
-            "w3c_get" => self.get(decode(input)?, cancel).await,
-            "w3c_search" => self.search(decode(input)?, cancel).await,
-            "w3c_symbol_get" => self.symbol_get(decode(input)?, cancel).await,
-            "w3c_compare" => self.compare(decode(input)?, cancel).await,
-            "w3c_catalog_search" | "w3c_symbol_search" | "w3c_references" | "w3c_snapshots"
-            | "w3c_history" => self.list(tool, decode(input)?, cancel).await,
+            "w3c.get" => self.get(decode(input)?, cancel).await,
+            "w3c.search" => self.search(decode(input)?, cancel).await,
+            "w3c.symbol_get" => self.symbol_get(decode(input)?, cancel).await,
+            "w3c.compare" => self.compare(decode(input)?, cancel).await,
+            "w3c.catalog_search" | "w3c.symbol_search" | "w3c.references" | "w3c.snapshots"
+            | "w3c.history" => self.list(tool, decode(input)?, cancel).await,
             _ => Err(Error::not_found("Unknown W3C research tool.")),
         }?;
         if let Some(id) = output
@@ -1179,11 +1212,11 @@ impl W3cResearch {
     }
     async fn list(&self, tool: &str, input: ListInput, cancel: CancellationToken) -> Result<Value> {
         let deadline = Instant::now() + Duration::from_secs(15);
-        if tool == "w3c_catalog_search" {
+        if tool == "w3c.catalog_search" {
             return self.catalog_search(input).await;
         }
         let selector = Selector {
-            standard: if tool == "w3c_references"
+            standard: if tool == "w3c.references"
                 && input.direction.as_deref() == Some("incoming")
                 && input.snapshot.is_none()
             {
@@ -1194,11 +1227,11 @@ impl W3cResearch {
             snapshot: input.snapshot.clone(),
             view: input.view.clone(),
         };
-        if matches!(tool, "w3c_snapshots" | "w3c_history") {
+        if matches!(tool, "w3c.snapshots" | "w3c.history") {
             return self.discovery(tool, input, cancel).await;
         }
         let (view, snapshots) = self.selections(&selector).await?;
-        let mut reference_targets = if tool == "w3c_references" {
+        let mut reference_targets = if tool == "w3c.references" {
             self.reference_targets(&snapshots, &cancel).await?
         } else {
             ReferenceTargets::new()
@@ -1227,7 +1260,7 @@ impl W3cResearch {
             input.limit,
         )?;
         let mut items = Vec::new();
-        if tool == "w3c_references"
+        if tool == "w3c.references"
             && !matches!(
                 input.direction.as_deref().unwrap_or("outgoing"),
                 "incoming" | "outgoing"
@@ -1246,7 +1279,7 @@ impl W3cResearch {
                 if input.path.as_ref().is_some_and(|path| path != &member.path) {
                     continue;
                 }
-                if tool == "w3c_references" {
+                if tool == "w3c.references" {
                     let mut source_anchors = BTreeMap::<String, usize>::new();
                     let mut source_anchor_bytes = 0usize;
                     for anchor in doc
@@ -1421,8 +1454,8 @@ impl W3cResearch {
         cancel: CancellationToken,
     ) -> Result<Value> {
         if input.history_type.as_deref() == Some("refs") {
-            if tool != "w3c_history" {
-                return Err(Error::invalid("Ref observations belong to w3c_history."));
+            if tool != "w3c.history" {
+                return Err(Error::invalid("Ref observations belong to w3c.history."));
             }
             return self.ref_history(input, cancel).await;
         }
@@ -1544,7 +1577,7 @@ impl W3cResearch {
                     skip -= 1;
                     continue;
                 }
-                if tool == "w3c_history" {
+                if tool == "w3c.history" {
                     if snapshot.parents.len() > 100 {
                         return Err(Error::capacity("W3C history parent bound exceeded."));
                     }
@@ -2043,9 +2076,9 @@ impl W3cResearch {
         }
         let output = if parts[2] == "symbol" {
             input.as_object_mut().map(|m| m.remove("representation"));
-            self.call("w3c_symbol_get", input).await?
+            self.call("w3c.symbol_get", input).await?
         } else {
-            self.call("w3c_get", input).await?
+            self.call("w3c.get", input).await?
         };
         let processing_gaps = output
             .get("processing_gaps")
@@ -2104,7 +2137,7 @@ pub fn schemas() -> Vec<Value> {
         map.remove("snapshot");
     }
     add(
-        "w3c_catalog_search",
+        "w3c.catalog_search",
         "Search the captured W3C specifications catalog; publication and processing gaps remain explicit. Select a view for historical catalog evidence.",
         catalog_properties,
         vec![],
@@ -2115,20 +2148,20 @@ pub fn schemas() -> Vec<Value> {
         search[key] = path.clone();
     }
     add(
-        "w3c_search",
+        "w3c.search",
         "Search immutable W3C sections using selected-corpus BM25. Defaults use canonical current editions; reuse view/snapshot and cursor.",
         search,
         vec!["query"],
     );
     let get = json!({"specification":id,"snapshot":hash,"view":hash,"path":path,"anchor":path,"section_index":{"type":"integer","minimum":0,"description":"Zero-based position in this captured document's ordered sections; requires path and excludes anchor."},"representation":{"enum":["text","source","bytes"],"default":"text"},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}});
     add(
-        "w3c_get",
+        "w3c.get",
         "Read capture-fixed specification text, an anchored section, original source, or base64 bytes. Text offsets count UTF-8 bytes.",
         get,
         vec!["specification"],
     );
     for (name, description) in [(
-        "w3c_symbol_search",
+        "w3c.symbol_search",
         "Search original definitions, Web IDL declarations and explicitly marked algorithms.",
     )] {
         let mut props = common.clone();
@@ -2140,7 +2173,7 @@ pub fn schemas() -> Vec<Value> {
     }
     let symbol_get = json!({"specification":id,"snapshot":hash,"view":hash,"path":path,"symbol_index":{"type":"integer","minimum":0,"description":"Zero-based position in this captured document's ordered symbols; requires path and is local to the selected snapshot."},"name":path,"anchor":path,"kind":{"enum":["definition","idl","algorithm"]},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}});
     add(
-        "w3c_symbol_get",
+        "w3c.symbol_get",
         "Read one unambiguous captured symbol in bounded UTF-8 pages with original text and provenance.",
         symbol_get,
         vec!["specification"],
@@ -2151,25 +2184,25 @@ pub fn schemas() -> Vec<Value> {
         refs[key] = path.clone();
     }
     add(
-        "w3c_references",
+        "w3c.references",
         "Inspect captured incoming/outgoing links. Target resolution uses selected evidence only; external references are never fetched.",
         refs,
         vec![],
     );
     for (name, description) in [
         (
-            "w3c_snapshots",
+            "w3c.snapshots",
             "Discover immutable source/publication snapshots with a frozen history cutoff.",
         ),
         (
-            "w3c_history",
+            "w3c.history",
             "Inspect retained revisions and changes against each ordered parent; missing parent projections remain explicit.",
         ),
     ] {
         let mut props = common.clone();
         props["history_snapshot"] = json!({"type":"integer","minimum":0});
         props["path"] = path.clone();
-        if name == "w3c_history" {
+        if name == "w3c.history" {
             props["history_type"] = json!({"enum":["revisions","refs"],"default":"revisions"});
             props["repository"] = json!({"type":"string","minLength":1,"maxLength":256});
             props["ref"] = json!({"type":"string","minLength":1,"maxLength":1024});
@@ -2193,23 +2226,23 @@ pub fn schemas() -> Vec<Value> {
     compare["path"] = path;
     compare["mode"] = json!({"enum":["text","symbols","source"],"default":"text"});
     add(
-        "w3c_compare",
+        "w3c.compare",
         "Compare two immutable snapshots of the same specification and representation family; no normative verdict is inferred.",
         compare,
         vec!["specification", "before", "after"],
     );
     add(
-        "w3c_corpus_status",
+        "w3c.corpus_status",
         "Inspect separate W3C acquisition, ancestry, projection, indexing and freshness coverage. No collection controls are exposed.",
         json!({}),
         vec![],
     );
     for tool in &mut tools {
         match tool["name"].as_str() {
-            Some("w3c_get") => {
+            Some("w3c.get") => {
                 tool["inputSchema"]["allOf"] = json!([{"if":{"required":["section_index"]},"then":{"required":["path"],"not":{"required":["anchor"]},"properties":{"representation":{"const":"text"}}}}]);
             }
-            Some("w3c_symbol_get") => {
+            Some("w3c.symbol_get") => {
                 tool["inputSchema"]["allOf"] =
                     json!([{"if":{"required":["symbol_index"]},"then":{"required":["path"]}}]);
             }

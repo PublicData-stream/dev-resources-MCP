@@ -1,5 +1,8 @@
 # Initialization evidence
 
+Tool names recorded below describe the tested revision. Current dotted names and
+migration guidance are defined in [the specification](Specification.md#tools).
+
 Observed on Linux amd64, 2026-10-24. Runtime source is commit `0528d4c`; the following
 acceptance record changes documentation only. These are local, native-client results.
 

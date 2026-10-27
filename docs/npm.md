@@ -7,18 +7,18 @@ Cargo tools and generic search defaults are unchanged.
 
 ## Public interfaces
 
-`npm_search` queries official registry search. `npm_metadata` selects an exact
-release from full registry metadata. `npm_source_list` and `npm_source_read`
+`npm.search` queries official registry search. `npm.metadata` selects an exact
+release from full registry metadata. `npm.source_list` and `npm.source_read`
 verify distribution integrity before inspecting a published archive. Supply both
 `metadata_capture` and `archive_capture` to continue against fixed evidence.
 `fetch` accepts `npm:is-number@7.0.0` and scoped identities such as
 `npm:@types/is-number@7.0.5`. Generic `search` includes npm only when selected.
 
-Local research uses `npm_versions`, `npm_catalog_search`, `npm_document_get`,
-`npm_dependencies`, `npm_compare`, `npm_content_search`, and `npm_contract_get`.
-`npm_history`, `npm_snapshots`, and `npm_corpus_status` expose retained observations
-and coverage. `npm_advisory_lookup`, `npm_advisory_get`, and
-`npm_advisory_catalog_search` read public advisory snapshots.
+Local research uses `npm.versions`, `npm.catalog_search`, `npm.document_get`,
+`npm.dependencies`, `npm.compare`, `npm.content_search`, and `npm.contract_get`.
+`npm.history`, `npm.snapshots`, and `npm.corpus_status` expose retained observations
+and coverage. `npm.advisory_lookup`, `npm.advisory_get`, and
+`npm.advisory_catalog_search` read public advisory snapshots.
 Discovery supplies the exact schemas. Lists default to 20 and cap at 100; text
 pages count UTF-8 bytes and cap at 32 KiB. Reuse returned snapshots and cursors.
 
@@ -60,7 +60,7 @@ not establish unrestricted reuse rights.
 
 ## Local lockfile assessment
 
-`npm_audit_lockfile` requires `lockfile` and `lockfile_format` (`npm`, `pnpm`,
+`npm.audit_lockfile` requires `lockfile` and `lockfile_format` (`npm`, `pnpm`,
 `yarn_classic`, or `yarn_berry`). It accepts `advisory_snapshot`,
 `registry_context`, `offset`, and `limit`. Continue by resubmitting the same input
 and the returned advisory snapshot. Caller input, inventories and reports remain

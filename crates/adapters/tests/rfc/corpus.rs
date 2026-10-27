@@ -361,7 +361,7 @@ impl Harness {
         let search = self
             .research
             .call(
-                "rfc_search",
+                "rfc.search",
                 json!({"query":"9000","capture":index.capture.id}),
             )
             .await
@@ -435,17 +435,17 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
         .await;
     let metadata = harness
         .research
-        .call("rfc_metadata", json!({"number":9000,"snapshot":old.id}))
+        .call("rfc.metadata", json!({"number":9000,"snapshot":old.id}))
         .await
         .unwrap();
     assert_eq!(metadata["metadata"]["authors"], json!(["A. Researcher"]));
     assert_eq!(metadata["metadata"]["publication"], "2021-05");
-    let filtered=harness.research.call("rfc_catalog_search",json!({"filters":{"author":"researcher","keyword":"multiplexing","stream":"IETF","area":"Transport","working_group":"quic","published_from":"2021-05","published_through":"2021-05"},"snapshot":old.id})).await.unwrap();
+    let filtered=harness.research.call("rfc.catalog_search",json!({"filters":{"author":"researcher","keyword":"multiplexing","stream":"IETF","area":"Transport","working_group":"quic","published_from":"2021-05","published_through":"2021-05"},"snapshot":old.id})).await.unwrap();
     assert_eq!(filtered["total"], 1);
     let field_name = harness
         .research
         .call(
-            "rfc_catalog_search",
+            "rfc.catalog_search",
             json!({"query":"updated_by","snapshot":old.id}),
         )
         .await
@@ -457,7 +457,7 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
     let series = harness
         .research
         .call(
-            "rfc_series_get",
+            "rfc.series_get",
             json!({"series":"STD","number":1,"snapshot":old.id}),
         )
         .await
@@ -466,7 +466,7 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
     let exact_series = harness
         .research
         .call(
-            "rfc_catalog_search",
+            "rfc.catalog_search",
             json!({"filters":{"series":"BCP14"},"snapshot":old.id}),
         )
         .await
@@ -475,7 +475,7 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
     let different_series = harness
         .research
         .call(
-            "rfc_catalog_search",
+            "rfc.catalog_search",
             json!({"filters":{"series":"BCP1"},"snapshot":old.id}),
         )
         .await
@@ -487,7 +487,7 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
     let bcp = harness
         .research
         .call(
-            "rfc_series_get",
+            "rfc.series_get",
             json!({"series":"BCP","number":14,"snapshot":old.id}),
         )
         .await
@@ -496,7 +496,7 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
     let records = harness
         .research
         .call(
-            "rfc_errata",
+            "rfc.errata",
             json!({"number":9000,"status":"Verified","type":"Technical","snapshot":old.id}),
         )
         .await
@@ -505,7 +505,7 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
     let absent = harness
         .research
         .call(
-            "rfc_errata",
+            "rfc.errata",
             json!({"number":9000,"status":"Rejected","snapshot":old.id}),
         )
         .await
@@ -516,20 +516,20 @@ async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound()
         .await;
     let pinned = harness
         .research
-        .call("rfc_metadata", json!({"number":9000,"snapshot":old.id}))
+        .call("rfc.metadata", json!({"number":9000,"snapshot":old.id}))
         .await
         .unwrap();
     assert_eq!(pinned["metadata"]["title"], "Transport Protocol");
     let latest = harness
         .research
-        .call("rfc_metadata", json!({"number":9000}))
+        .call("rfc.metadata", json!({"number":9000}))
         .await
         .unwrap();
     assert_eq!(latest["metadata"]["title"], "Changed metadata");
     assert_eq!(latest["snapshot"], new.id);
     let status = harness
         .research
-        .call("rfc_corpus_status", json!({}))
+        .call("rfc.corpus_status", json!({}))
         .await
         .unwrap();
     assert_eq!(status["collection_enabled"], false);
@@ -546,7 +546,7 @@ async fn typed_format_and_binary_resource_pages_preserve_capture_and_utf8() {
     harness.fixture.responses.lock().await.clear();
     let legacy = harness
         .research
-        .call("rfc_get", json!({"number":9000}))
+        .call("rfc.get", json!({"number":9000}))
         .await
         .unwrap();
     assert_eq!(legacy["page"]["text"], TEXT);
@@ -564,7 +564,7 @@ async fn typed_format_and_binary_resource_pages_preserve_capture_and_utf8() {
     let page = harness
         .research
         .call(
-            "rfc_format_get",
+            "rfc.format_get",
             json!({"number":9000,"format":"txt","capture":text.capture.id,"offset":8,"limit":3}),
         )
         .await
@@ -574,7 +574,7 @@ async fn typed_format_and_binary_resource_pages_preserve_capture_and_utf8() {
     let continuation = harness
         .research
         .call(
-            "rfc_format_get",
+            "rfc.format_get",
             json!({"number":9000,"format":"txt","capture":text.capture.id,"offset":10,"limit":2}),
         )
         .await
@@ -588,7 +588,7 @@ async fn typed_format_and_binary_resource_pages_preserve_capture_and_utf8() {
     let binary = harness
         .research
         .call(
-            "rfc_format_get",
+            "rfc.format_get",
             json!({"number":9000,"format":"pdf","capture":pdf.capture.id,"offset":1,"limit":7}),
         )
         .await
@@ -624,7 +624,7 @@ async fn typed_format_and_binary_resource_pages_preserve_capture_and_utf8() {
         harness
             .research
             .call(
-                "rfc_format_get",
+                "rfc.format_get",
                 json!({"number":9001,"format":"pdf","capture":pdf.capture.id})
             )
             .await
@@ -634,7 +634,7 @@ async fn typed_format_and_binary_resource_pages_preserve_capture_and_utf8() {
         harness
             .research
             .call(
-                "rfc_format_get",
+                "rfc.format_get",
                 json!({"number":9000,"format":"txt","capture":pdf.capture.id})
             )
             .await
@@ -745,18 +745,18 @@ async fn managed_collection_resumes_pending_work_and_keeps_old_fulltext_snapshot
         .with_corpus(completed);
     let results = research
         .call(
-            "rfc_fulltext_search",
+            "rfc.fulltext_search",
             json!({"query":"multiplexed transport","snapshot":full.id}),
         )
         .await
         .unwrap();
     assert_eq!(results["total"], 1);
     assert_eq!(results["items"][0]["number"], 9000);
-    let phrase=research.call("rfc_fulltext_search",json!({"query":"\"exact research phrase\" OR missing -excluded","mode":"english","snapshot":full.id})).await.unwrap();
+    let phrase=research.call("rfc.fulltext_search",json!({"query":"\"exact research phrase\" OR missing -excluded","mode":"english","snapshot":full.id})).await.unwrap();
     assert_eq!(phrase["total"], 1);
     let old = research
         .call(
-            "rfc_fulltext_search",
+            "rfc.fulltext_search",
             json!({"query":"multiplexed transport","snapshot":bootstrap.id}),
         )
         .await
@@ -805,13 +805,13 @@ async fn managed_collection_resumes_pending_work_and_keeps_old_fulltext_snapshot
         .unwrap()
         .with_corpus(changed);
     let replacement = research
-        .call("rfc_fulltext_search", json!({"query":"replacementunique"}))
+        .call("rfc.fulltext_search", json!({"query":"replacementunique"}))
         .await
         .unwrap();
     assert_eq!(replacement["total"], 1);
     let historical = research
         .call(
-            "rfc_fulltext_search",
+            "rfc.fulltext_search",
             json!({"query":"multiplexed transport","snapshot":full.id}),
         )
         .await
@@ -819,7 +819,7 @@ async fn managed_collection_resumes_pending_work_and_keeps_old_fulltext_snapshot
     assert_eq!(historical["total"], 1);
     let historical_absence = research
         .call(
-            "rfc_fulltext_search",
+            "rfc.fulltext_search",
             json!({"query":"replacementunique","snapshot":full.id}),
         )
         .await
@@ -918,12 +918,12 @@ async fn unadvertised_text_is_retained_in_raw_and_search_membership() {
         .insert(INDEX.into(), pdf_only.into_bytes());
     harness
         .research
-        .call("rfc_format_get", json!({"number":9000,"format":"txt"}))
+        .call("rfc.format_get", json!({"number":9000,"format":"txt"}))
         .await
         .unwrap();
     let result = harness
         .research
-        .call("rfc_fulltext_search", json!({"query":"multiplexed"}))
+        .call("rfc.fulltext_search", json!({"query":"multiplexed"}))
         .await
         .unwrap();
     assert_eq!(result["total"], 1);
@@ -952,14 +952,14 @@ async fn expired_default_snapshot_requires_explicit_historical_selection() {
         .await;
     let error = harness
         .research
-        .call("rfc_metadata", json!({"number":9000}))
+        .call("rfc.metadata", json!({"number":9000}))
         .await
         .unwrap_err();
     assert_eq!(error.code, "unavailable");
     let historical = harness
         .research
         .call(
-            "rfc_metadata",
+            "rfc.metadata",
             json!({"number":9000,"snapshot":snapshot.id}),
         )
         .await
@@ -974,7 +974,7 @@ async fn concurrent_foreground_capture_is_not_erased_by_snapshot_publication() {
     let harness = Harness::new(false).await;
     harness
         .research
-        .call("rfc_format_get", json!({"number":9000,"format":"txt"}))
+        .call("rfc.format_get", json!({"number":9000,"format":"txt"}))
         .await
         .unwrap();
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -986,7 +986,7 @@ async fn concurrent_foreground_capture_is_not_erased_by_snapshot_publication() {
         .with_corpus(harness.corpus.clone());
     let pending = tokio::spawn(async move {
         research
-            .call("rfc_fulltext_search", json!({"query":"multiplexed"}))
+            .call("rfc.fulltext_search", json!({"query":"multiplexed"}))
             .await
     });
     tokio::time::timeout(Duration::from_secs(15), entered.notified())
@@ -1001,7 +1001,7 @@ async fn concurrent_foreground_capture_is_not_erased_by_snapshot_publication() {
         .insert(TXT.into(), b"RFC9000 concurrentgenerationword".to_vec());
     harness
         .research
-        .call("rfc_format_get", json!({"number":9000,"format":"txt"}))
+        .call("rfc.format_get", json!({"number":9000,"format":"txt"}))
         .await
         .unwrap();
     release.notify_one();
@@ -1009,7 +1009,7 @@ async fn concurrent_foreground_capture_is_not_erased_by_snapshot_publication() {
     let result = harness
         .research
         .call(
-            "rfc_fulltext_search",
+            "rfc.fulltext_search",
             json!({"query":"concurrentgenerationword"}),
         )
         .await
@@ -1072,7 +1072,7 @@ async fn collection_traverses_multiple_rfc_identities_and_all_advertised_formats
     assert_eq!(result["coverage"]["acquisition_complete"], true);
     let found = harness
         .research
-        .call("rfc_fulltext_search", json!({"query":"traversalfixture"}))
+        .call("rfc.fulltext_search", json!({"query":"traversalfixture"}))
         .await
         .unwrap();
     assert_eq!(found["total"], 2);

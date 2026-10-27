@@ -202,10 +202,10 @@ impl NpmPackages {
     }
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
         match tool {
-            "npm_search" => self.search(decode(input)?).await,
-            "npm_metadata" => self.metadata(decode(input)?).await,
-            "npm_source_list" => self.source_list(decode(input)?).await,
-            "npm_source_read" => self.source_read(decode(input)?).await,
+            "npm.search" => self.search(decode(input)?).await,
+            "npm.metadata" => self.metadata(decode(input)?).await,
+            "npm.source_list" => self.source_list(decode(input)?).await,
+            "npm.source_read" => self.source_read(decode(input)?).await,
             _ => Err(Error::not_found("Unknown npm package tool.")),
         }
     }
@@ -543,25 +543,25 @@ pub fn schemas() -> Vec<Value> {
         tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}))
     };
     add(
-        "npm_search",
+        "npm.search",
         "Search public npm package metadata; reuse the returned capture for the same provider page.",
         json!({"query":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0,"maximum":10000,"default":0},"limit":limit,"capture":capture}),
         vec!["query"],
     );
     add(
-        "npm_metadata",
+        "npm.metadata",
         "Read an exact public npm version and published dependency declarations without resolving or executing packages.",
         json!({"name":name,"version":version,"capture":capture}),
         vec!["name", "version"],
     );
     add(
-        "npm_source_list",
+        "npm.source_list",
         "List integrity-verified published npm archive members; processing gaps remain separate from retained raw captures.",
         json!({"name":name,"version":version,"metadata_capture":capture,"archive_capture":capture,"offset":offset,"limit":limit}),
         vec!["name", "version"],
     );
     add(
-        "npm_source_read",
+        "npm.source_read",
         "Read inert published npm source text; byte pagination is pinned to metadata and archive captures.",
         json!({"name":name,"version":version,"path":{"type":"string","minLength":1,"maxLength":4096},"metadata_capture":capture,"archive_capture":capture,"offset":{"type":"integer","minimum":0,"maximum":4194304,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}}),
         vec!["name", "version", "path"],

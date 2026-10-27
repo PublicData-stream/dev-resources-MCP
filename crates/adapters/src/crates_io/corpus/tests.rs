@@ -373,7 +373,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
         .with_crate_corpus(corpus.clone());
     assert_eq!(
         research
-            .call("crate_content_search", json!({"query":"oldtransporttoken"}))
+            .call("crate.content_search", json!({"query":"oldtransporttoken"}))
             .await
             .unwrap()["total"],
         0
@@ -448,7 +448,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
         2
     );
     let versions = research
-        .call("crate_versions", json!({"name":"example"}))
+        .call("crate.versions", json!({"name":"example"}))
         .await
         .unwrap();
     assert_eq!(versions["total"], 2);
@@ -458,7 +458,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     );
     assert_eq!(
         research
-            .call("crate_catalog_search", json!({"name":"example"}))
+            .call("crate.catalog_search", json!({"name":"example"}))
             .await
             .unwrap()["total"],
         2
@@ -466,7 +466,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     assert_eq!(
         research
             .call(
-                "crate_dependencies",
+                "crate.dependencies",
                 json!({"name":"example","version":VERSIONS[0]})
             )
             .await
@@ -476,23 +476,23 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     assert_eq!(
         research
             .call(
-                "crate_dependencies",
+                "crate.dependencies",
                 json!({"name":"itoa","direction":"reverse"})
             )
             .await
             .unwrap()["total"],
         2
     );
-    assert_eq!(research.call("crate_compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"metadata"})).await.unwrap()["changed"],true);
+    assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"metadata"})).await.unwrap()["changed"],true);
     let hits = research
-        .call("crate_content_search", json!({"query":"oldtransporttoken"}))
+        .call("crate.content_search", json!({"query":"oldtransporttoken"}))
         .await
         .unwrap();
     assert_eq!(hits["total"], 1);
     assert_eq!(
         research
             .call(
-                "crate_content_search",
+                "crate.content_search",
                 json!({"query":"oldtransporttoken","snapshot":before.id})
             )
             .await
@@ -508,14 +508,14 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
         };
         let document = research
             .call(
-                "crate_document_get",
+                "crate.document_get",
                 json!({"name":"example","version":VERSIONS[0],"kind":kind,"path":path}),
             )
             .await
             .unwrap();
         assert!(!document["page"]["text"].as_str().unwrap().is_empty());
     }
-    let old_document = research.call("crate_document_get",json!({"name":"example","version":VERSIONS[0],"kind":"rustdoc","path":"renamed_library/index.html","target":DEFAULT_TARGET})).await.unwrap();
+    let old_document = research.call("crate.document_get",json!({"name":"example","version":VERSIONS[0],"kind":"rustdoc","path":"renamed_library/index.html","target":DEFAULT_TARGET})).await.unwrap();
     assert!(
         old_document["page"]["text"]
             .as_str()
@@ -534,12 +534,12 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
         old_resource["contents"][0]["text"],
         old_document["page"]["text"]
     );
-    let api = research.call("crate_api_get",json!({"name":"example","version":VERSIONS[0],"target":OTHER_TARGET,"path":"renamed_library::alias"})).await.unwrap();
+    let api = research.call("crate.api_get",json!({"name":"example","version":VERSIONS[0],"target":OTHER_TARGET,"path":"renamed_library::alias"})).await.unwrap();
     assert_eq!(api["item"]["target"], OTHER_TARGET);
     assert!(
         research
             .call(
-                "crate_api_search",
+                "crate.api_search",
                 json!({"query":"Compute","target":OTHER_TARGET})
             )
             .await
@@ -548,7 +548,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
             .unwrap()
             >= 2
     );
-    let comparison = research.call("crate_compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"api","target":DEFAULT_TARGET})).await.unwrap();
+    let comparison = research.call("crate.compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"api","target":DEFAULT_TARGET})).await.unwrap();
     assert!(
         comparison["items"]
             .as_array()
@@ -556,7 +556,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
             .iter()
             .any(|item| item["path"] == "renamed_library::alias" && item["change"] == "changed")
     );
-    let text_comparison=research.call("crate_compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"text","path":"src/lib.rs"})).await.unwrap();
+    let text_comparison=research.call("crate.compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"text","path":"src/lib.rs"})).await.unwrap();
     assert_eq!(text_comparison["changed"], true);
     assert!(
         text_comparison["before"]["page"]["text"]
@@ -570,11 +570,11 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
             .unwrap()
             .contains("newtransporttoken")
     );
-    assert_eq!(research.call("crate_compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"text"})).await.unwrap_err().code,"unavailable","Binary source gaps prevent whole-release completeness claims.");
-    assert_eq!(research.call("crate_compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"text","path":"data.bin"})).await.unwrap_err().code,"unavailable","Skipped binary content must not be mistaken for absent text.");
+    assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"text"})).await.unwrap_err().code,"unavailable","Binary source gaps prevent whole-release completeness claims.");
+    assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":VERSIONS[0],"to_version":VERSIONS[1],"kind":"text","path":"data.bin"})).await.unwrap_err().code,"unavailable","Skipped binary content must not be mistaken for absent text.");
     assert_eq!(
         research
-            .call("crate_corpus_status", json!({}))
+            .call("crate.corpus_status", json!({}))
             .await
             .unwrap()["collection_enabled"],
         false
@@ -584,7 +584,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
         .await
         .unwrap()
         .unwrap();
-    let listing = research.call("crate_source_list",json!({"name":"example","version":VERSIONS[0],"metadata_capture":version.metadata_capture,"archive_capture":archive_ids[0]})).await.unwrap();
+    let listing = research.call("crate.source_list",json!({"name":"example","version":VERSIONS[0],"metadata_capture":version.metadata_capture,"archive_capture":archive_ids[0]})).await.unwrap();
     assert_eq!(listing["checksum_verified"], true);
     assert_eq!(listing["total"], 6);
     for capture in [&archive_ids[0], &documentation_ids[0]] {
@@ -597,7 +597,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
             "invalid_input"
         );
     }
-    let source_text = research.call("crate_source_read",json!({"name":"example","version":VERSIONS[0],"path":"src/lib.rs","metadata_capture":version.metadata_capture,"archive_capture":archive_ids[0]})).await.unwrap();
+    let source_text = research.call("crate.source_read",json!({"name":"example","version":VERSIONS[0],"path":"src/lib.rs","metadata_capture":version.metadata_capture,"archive_capture":archive_ids[0]})).await.unwrap();
     assert!(
         source_text["page"]["text"]
             .as_str()
@@ -639,14 +639,14 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
         .unwrap();
     let rebuilt = corpus.publish(CancellationToken::new()).await.unwrap();
     assert_ne!(rebuilt.id, captured.id);
-    let current = research.call("crate_document_get",json!({"name":"example","version":VERSIONS[0],"kind":"rustdoc","path":"renamed_library/index.html","target":DEFAULT_TARGET})).await.unwrap();
+    let current = research.call("crate.document_get",json!({"name":"example","version":VERSIONS[0],"kind":"rustdoc","path":"renamed_library/index.html","target":DEFAULT_TARGET})).await.unwrap();
     assert!(
         current["page"]["text"]
             .as_str()
             .unwrap()
             .contains("rebuilt hosted")
     );
-    let historical = research.call("crate_document_get",json!({"name":"example","version":VERSIONS[0],"kind":"rustdoc","path":"renamed_library/index.html","target":DEFAULT_TARGET,"snapshot":captured.id})).await.unwrap();
+    let historical = research.call("crate.document_get",json!({"name":"example","version":VERSIONS[0],"kind":"rustdoc","path":"renamed_library/index.html","target":DEFAULT_TARGET,"snapshot":captured.id})).await.unwrap();
     assert_eq!(historical["page"], old_document["page"]);
     assert_eq!(
         research.read_resource(&old_uri).await.unwrap(),
@@ -689,7 +689,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     assert_eq!(
         research
             .call(
-                "crate_content_search",
+                "crate.content_search",
                 json!({"query":"oldtransporttoken","snapshot":captured.id})
             )
             .await

@@ -246,7 +246,7 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
         .unwrap();
     let research = NpmResearch::new(corpus.clone());
     let advisory_source = research
-        .call("npm_advisory_get", json!({"id":"GHSA-2345-6789-cfgh"}))
+        .call("npm.advisory_get", json!({"id":"GHSA-2345-6789-cfgh"}))
         .await
         .unwrap();
     assert_eq!(
@@ -261,16 +261,16 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
     );
     let current_lookup = research
         .call(
-            "npm_advisory_lookup",
+            "npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         )
         .await
         .unwrap();
-    let pinned_lookup=research.call("npm_advisory_lookup",json!({"name":"npm-fixture","version":"1.0.0","snapshot":current_lookup["snapshot"]["id"]})).await.unwrap();
+    let pinned_lookup=research.call("npm.advisory_lookup",json!({"name":"npm-fixture","version":"1.0.0","snapshot":current_lookup["snapshot"]["id"]})).await.unwrap();
     assert_eq!(current_lookup["complete"], pinned_lookup["complete"]);
     let document = research
         .call(
-            "npm_document_get",
+            "npm.document_get",
             json!({"name":"npm-fixture","version":"1.0.0","path":"README.md"}),
         )
         .await
@@ -280,7 +280,7 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
         research.read_resource(uri).await.unwrap()["contents"][0]["text"],
         document["page"]["text"]
     );
-    assert!(research.call("npm_document_get",json!({"name":"npm-fixture","version":"1.0.0","path":"README.md","offset":1,"limit":0})).await.is_err());
+    assert!(research.call("npm.document_get",json!({"name":"npm-fixture","version":"1.0.0","path":"README.md","offset":1,"limit":0})).await.is_err());
     let second = package("1.0.1", "# Synthetic fixture\nsecond release needle\n");
     let (metadata, archives) = packument(&[first, second]);
     let new = corpus
@@ -290,21 +290,21 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
     assert_ne!(old["id"], new["id"]);
     let old_versions = research
         .call(
-            "npm_versions",
+            "npm.versions",
             json!({"name":"npm-fixture","snapshot":old["id"]}),
         )
         .await
         .unwrap();
     assert_eq!(old_versions["total"], 1);
     let first_page = research
-        .call("npm_versions", json!({"name":"npm-fixture","limit":1}))
+        .call("npm.versions", json!({"name":"npm-fixture","limit":1}))
         .await
         .unwrap();
     assert_eq!(first_page["items"][0]["version"], "1.0.1");
     assert!(
         research
             .call(
-                "npm_catalog_search",
+                "npm.catalog_search",
                 json!({"name":"npm-fixture","limit":2,"cursor":first_page["next_cursor"]})
             )
             .await
@@ -313,7 +313,7 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
     );
     let continuation = research
         .call(
-            "npm_versions",
+            "npm.versions",
             json!({"name":"npm-fixture","cursor":first_page["next_cursor"],"limit":2}),
         )
         .await
@@ -322,13 +322,13 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
     assert!(
         research
             .call(
-                "npm_catalog_search",
+                "npm.catalog_search",
                 json!({"query":"different","cursor":first_page["next_cursor"]})
             )
             .await
             .is_err()
     );
-    let comparison=research.call("npm_compare",json!({"name":"npm-fixture","from_version":"1.0.0","to_version":"1.0.1","path":"README.md","limit":12})).await.unwrap();
+    let comparison=research.call("npm.compare",json!({"name":"npm-fixture","from_version":"1.0.0","to_version":"1.0.1","path":"README.md","limit":12})).await.unwrap();
     assert_eq!(comparison["text_diff"]["identical"], false);
     assert!(comparison["text_diff"]["page"]["next_offset"].is_number());
     let evidence = corpus
@@ -343,7 +343,7 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
     assert_eq!(none["records"], json!([]));
     let lookup = research
         .call(
-            "npm_advisory_lookup",
+            "npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         )
         .await
@@ -361,7 +361,7 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
     );
     let old_versions = research
         .call(
-            "npm_versions",
+            "npm.versions",
             json!({"name":"npm-fixture","snapshot":old["id"]}),
         )
         .await
@@ -369,7 +369,7 @@ async fn frozen_membership_resources_cursor_audits_and_offline_rebuild() {
     assert_eq!(old_versions["total"], 1);
     let search = research
         .call(
-            "npm_content_search",
+            "npm.content_search",
             json!({"query":"needle","snapshot":old["id"]}),
         )
         .await
@@ -407,7 +407,7 @@ async fn explicit_expired_history_is_readable_without_complete_assessment() {
     let research = NpmResearch::new(corpus.clone());
     let result = research
         .call(
-            "npm_advisory_lookup",
+            "npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0","snapshot":old["id"]}),
         )
         .await
@@ -565,7 +565,7 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
     let corpus = Arc::new(NpmCorpus::new(store.clone(), broker(), root.path(), config()).unwrap());
     corpus.initialize_status().await.unwrap();
     let research = NpmResearch::new(corpus.clone());
-    let document=research.call("npm_document_get",json!({"name":"npm-fixture","version":"1.0.0","path":"README.md","snapshot":snapshot["id"]})).await.unwrap();
+    let document=research.call("npm.document_get",json!({"name":"npm-fixture","version":"1.0.0","path":"README.md","snapshot":snapshot["id"]})).await.unwrap();
     assert!(
         document["page"]["text"]
             .as_str()

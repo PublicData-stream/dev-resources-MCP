@@ -202,7 +202,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     let research = WhatwgResearch::new(corpus);
     let get = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","anchor":"events"}),
         )
         .await
@@ -222,7 +222,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
         snapshot.source_url
     );
     assert!(resource["contents"][0]["_meta"]["license"].is_object());
-    let raw=research.call("whatwg_get",json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","representation":"bytes","limit":8})).await.unwrap();
+    let raw=research.call("whatwg.get",json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","representation":"bytes","limit":8})).await.unwrap();
     assert_eq!(
         STANDARD
             .decode(raw["page"]["base64"].as_str().unwrap())
@@ -231,19 +231,19 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     );
     let symbols = research
         .call(
-            "whatwg_symbol_search",
+            "whatwg.symbol_search",
             json!({"standard":"dom","snapshot":snapshot.id,"kind":"definition"}),
         )
         .await
         .unwrap();
     assert_eq!(symbols["items"][0]["symbol"]["name"], "Event");
     assert!(symbols["items"][0]["symbol"].get("text").is_none());
-    let symbol=research.call("whatwg_symbol_get",json!({"standard":"dom","snapshot":snapshot.id,"kind":"definition","name":"Event","limit":2})).await.unwrap();
+    let symbol=research.call("whatwg.symbol_get",json!({"standard":"dom","snapshot":snapshot.id,"kind":"definition","name":"Event","limit":2})).await.unwrap();
     assert_eq!(symbol["page"]["text"], "Ev");
     assert_eq!(symbol["page"]["next_offset"], 2);
     let idl = research
         .call(
-            "whatwg_symbol_get",
+            "whatwg.symbol_get",
             json!({"standard":"dom","snapshot":snapshot.id,"kind":"idl","name":"EventTarget"}),
         )
         .await
@@ -257,7 +257,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     assert!(idl_resource["contents"][0]["_meta"]["gaps"]["processing"].is_array());
     let result = research
         .call(
-            "whatwg_search",
+            "whatwg.search",
             json!({"standard":"dom","snapshot":snapshot.id,"query":"dispatches"}),
         )
         .await
@@ -266,7 +266,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     assert!(
         research
             .call(
-                "whatwg_get",
+                "whatwg.get",
                 json!({"standard":"html","snapshot":snapshot.id,"path":"index.html"})
             )
             .await
@@ -281,7 +281,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     assert!(
         research
             .call(
-                "whatwg_corpus_status",
+                "whatwg.corpus_status",
                 json!({"url":"https://evil.invalid/"})
             )
             .await
@@ -317,7 +317,7 @@ async fn discovery_cursor_carries_frozen_cutoff_through_empty_filtered_pages() {
     }
     let research = WhatwgResearch::new(corpus);
     let first = research
-        .call("whatwg_snapshots", json!({"standard":"absent"}))
+        .call("whatwg.snapshots", json!({"standard":"absent"}))
         .await
         .unwrap();
     assert_eq!(first["items"], json!([]));
@@ -331,7 +331,7 @@ async fn discovery_cursor_carries_frozen_cutoff_through_empty_filtered_pages() {
         .unwrap();
     let second = research
         .call(
-            "whatwg_snapshots",
+            "whatwg.snapshots",
             json!({"standard":"absent","cursor":first["next_cursor"]}),
         )
         .await
@@ -357,7 +357,7 @@ async fn successful_view_validation_is_distinct_from_original_snapshot_time() {
     store.whatwg_publish_view(&view).await.unwrap();
     let research = WhatwgResearch::new(corpus.clone());
     let current = research
-        .call("whatwg_get", json!({"standard":"dom","path":"index.html"}))
+        .call("whatwg.get", json!({"standard":"dom","path":"index.html"}))
         .await
         .unwrap();
     assert_eq!(current["selection"]["stale"], false);
@@ -367,19 +367,19 @@ async fn successful_view_validation_is_distinct_from_original_snapshot_time() {
     store.whatwg_publish_view(&view).await.unwrap();
     assert!(
         research
-            .call("whatwg_get", json!({"standard":"dom","path":"index.html"}))
+            .call("whatwg.get", json!({"standard":"dom","path":"index.html"}))
             .await
             .is_err()
     );
     assert!(
         research
-            .call("whatwg_search", json!({"standard":"dom","query":"event"}))
+            .call("whatwg.search", json!({"standard":"dom","query":"event"}))
             .await
             .is_err()
     );
     let historical = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html"}),
         )
         .await
@@ -387,7 +387,7 @@ async fn successful_view_validation_is_distinct_from_original_snapshot_time() {
     assert_eq!(historical["selection"]["stale"], true);
     assert!(
         research
-            .call("whatwg_catalog_search", json!({"snapshot":snapshot.id}))
+            .call("whatwg.catalog_search", json!({"snapshot":snapshot.id}))
             .await
             .is_err()
     );
@@ -435,7 +435,7 @@ async fn ref_observations_page_inside_a_frozen_observation() {
     let research = WhatwgResearch::new(corpus);
     let first = research
         .call(
-            "whatwg_history",
+            "whatwg.history",
             json!({"history_type":"refs","repository":"whatwg/dom","limit":1}),
         )
         .await
@@ -447,11 +447,11 @@ async fn ref_observations_page_inside_a_frozen_observation() {
         .whatwg_put("observations", "later-ref-observation", &observation)
         .await
         .unwrap();
-    let second=research.call("whatwg_history",json!({"history_type":"refs","repository":"whatwg/dom","cursor":first["next_cursor"],"limit":100})).await.unwrap();
+    let second=research.call("whatwg.history",json!({"history_type":"refs","repository":"whatwg/dom","cursor":first["next_cursor"],"limit":100})).await.unwrap();
     assert_eq!(second["history_snapshot"], first["history_snapshot"]);
     assert_eq!(second["items"].as_array().unwrap().len(), 2);
     assert!(second["next_cursor"].is_null());
-    assert!(research.call("whatwg_history",json!({"history_type":"refs","repository":"whatwg/html","cursor":first["next_cursor"]})).await.is_err());
+    assert!(research.call("whatwg.history",json!({"history_type":"refs","repository":"whatwg/html","cursor":first["next_cursor"]})).await.is_err());
 }
 
 #[tokio::test]
@@ -461,21 +461,21 @@ async fn future_history_and_unapplied_ref_filters_fail_explicitly() {
     let research = WhatwgResearch::new(corpus);
     assert!(
         research
-            .call("whatwg_history", json!({"ref":"refs/heads/main"}))
+            .call("whatwg.history", json!({"ref":"refs/heads/main"}))
             .await
             .is_err()
     );
     let future = store.whatwg_cutoff().await.unwrap() + 100;
     assert!(
         research
-            .call("whatwg_history", json!({"history_snapshot":future}))
+            .call("whatwg.history", json!({"history_snapshot":future}))
             .await
             .is_err()
     );
     assert!(
         research
             .call(
-                "whatwg_history",
+                "whatwg.history",
                 json!({"history_type":"refs","history_snapshot":future})
             )
             .await
@@ -508,7 +508,7 @@ async fn failed_projection_is_not_a_removed_section_in_comparison() {
     let research = WhatwgResearch::new(corpus);
     let error = research
         .call(
-            "whatwg_compare",
+            "whatwg.compare",
             json!({"standard":"dom","before":before.id,"after":after.id}),
         )
         .await
@@ -516,7 +516,7 @@ async fn failed_projection_is_not_a_removed_section_in_comparison() {
     assert_eq!(error.code, "unavailable");
     let raw = research
         .call(
-            "whatwg_compare",
+            "whatwg.compare",
             json!({"standard":"dom","before":before.id,"after":after.id,"mode":"source"}),
         )
         .await
@@ -561,7 +561,7 @@ async fn published_revisions_compare_by_sections_across_versioned_urls() {
         .unwrap();
     let research = WhatwgResearch::new(corpus);
     for mode in ["text", "symbols", "source"] {
-        let result=research.call("whatwg_compare",json!({"standard":"dom","before":before.id,"after":after.id,"mode":mode,"path":"index.html"})).await.unwrap();
+        let result=research.call("whatwg.compare",json!({"standard":"dom","before":before.id,"after":after.id,"mode":mode,"path":"index.html"})).await.unwrap();
         assert_eq!(result["total"], 0, "{mode}");
     }
     let mut moved_member = member.clone();
@@ -584,7 +584,7 @@ async fn published_revisions_compare_by_sections_across_versioned_urls() {
         .unwrap();
     for path in [&member.path, &moved_member.path] {
         for mode in ["text", "symbols", "source"] {
-            let result=research.call("whatwg_compare",json!({"standard":"dom","before":after.id,"after":moved.id,"mode":mode,"path":path})).await.unwrap();
+            let result=research.call("whatwg.compare",json!({"standard":"dom","before":after.id,"after":moved.id,"mode":mode,"path":path})).await.unwrap();
             assert_eq!(result["total"], 0, "{path} {mode}");
         }
     }
@@ -622,7 +622,7 @@ async fn published_revisions_compare_by_sections_across_versioned_urls() {
         .await
         .unwrap();
     for path in [&member.path, &moved_member.path] {
-        let result=research.call("whatwg_compare",json!({"standard":"dom","before":after.id,"after":changed.id,"mode":"source","path":path})).await.unwrap();
+        let result=research.call("whatwg.compare",json!({"standard":"dom","before":after.id,"after":changed.id,"mode":"source","path":path})).await.unwrap();
         assert_eq!(result["total"], 1, "{path}");
     }
 }
@@ -690,7 +690,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     let research = WhatwgResearch::new(corpus);
     let section = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"dom","snapshot":snapshot.id,"path":path,"anchor":anchor}),
         )
         .await
@@ -698,7 +698,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(section["section_index"], 1);
     let direct_section = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"dom","snapshot":snapshot.id,"path":path,"section_index":1}),
         )
         .await
@@ -706,7 +706,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(direct_section["page"], section["page"]);
     let symbol = research
         .call(
-            "whatwg_symbol_get",
+            "whatwg.symbol_get",
             json!({"standard":"dom","snapshot":snapshot.id,"path":path,"name":name}),
         )
         .await
@@ -714,7 +714,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(symbol["symbol_index"], 0);
     let anchored_symbol = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"dom","snapshot":snapshot.id,"path":path,"anchor":symbol_anchor}),
         )
         .await
@@ -722,7 +722,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(anchored_symbol["page"]["text"], symbol["page"]["text"]);
     let found = research
         .call(
-            "whatwg_symbol_search",
+            "whatwg.symbol_search",
             json!({"standard":"dom","snapshot":snapshot.id,"path":path,"kind":"definition"}),
         )
         .await
@@ -772,7 +772,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
     let research = WhatwgResearch::new(corpus);
     let section = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","anchor":"events"}),
         )
         .await
@@ -787,7 +787,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
     );
     let symbol = research
         .call(
-            "whatwg_symbol_get",
+            "whatwg.symbol_get",
             json!({"standard":"dom","snapshot":snapshot.id,"name":"EventTarget","kind":"idl"}),
         )
         .await
@@ -807,7 +807,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
     );
     let found = research
         .call(
-            "whatwg_symbol_search",
+            "whatwg.symbol_search",
             json!({"standard":"dom","snapshot":snapshot.id,"name":"EventTarget","kind":"idl"}),
         )
         .await
@@ -816,29 +816,29 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
         found["items"][0]["symbol_index"], symbol["symbol_index"],
         "filtering cannot renumber symbols"
     );
-    let indexed=research.call("whatwg_symbol_get",json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":symbol["symbol_index"]})).await.unwrap();
+    let indexed=research.call("whatwg.symbol_get",json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":symbol["symbol_index"]})).await.unwrap();
     assert_eq!(indexed["page"], symbol["page"]);
     for (tool, arguments) in [
-        ("whatwg_get", json!({"section_index":0})),
+        ("whatwg.get", json!({"section_index":0})),
         (
-            "whatwg_get",
+            "whatwg.get",
             json!({"path":"index.html","section_index":0,"anchor":"events"}),
         ),
         (
-            "whatwg_get",
+            "whatwg.get",
             json!({"path":"index.html","section_index":0,"representation":"bytes"}),
         ),
         (
-            "whatwg_get",
+            "whatwg.get",
             json!({"path":"index.html","section_index":99999}),
         ),
-        ("whatwg_symbol_get", json!({"symbol_index":0})),
+        ("whatwg.symbol_get", json!({"symbol_index":0})),
         (
-            "whatwg_symbol_get",
+            "whatwg.symbol_get",
             json!({"path":"index.html","symbol_index":99999}),
         ),
         (
-            "whatwg_symbol_get",
+            "whatwg.symbol_get",
             json!({"path":"index.html","symbol_index":0,"name":"EventTarget"}),
         ),
     ] {
@@ -861,7 +861,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
         );
         assert!(research.read_resource(&uri).await.is_err());
     }
-    for name in ["whatwg_get", "whatwg_symbol_get"] {
+    for name in ["whatwg.get", "whatwg.symbol_get"] {
         let schema = schemas()
             .into_iter()
             .find(|schema| schema["name"] == name)
@@ -908,7 +908,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
             .await
             .unwrap();
         let research = WhatwgResearch::new(corpus.clone());
-        let selected=research.call("whatwg_symbol_get",json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":2})).await.unwrap();
+        let selected=research.call("whatwg.symbol_get",json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":2})).await.unwrap();
         assert_eq!(selected["name"], "EventTarget");
         let resource = research
             .read_resource(selected["resource_uri"].as_str().unwrap())
@@ -917,7 +917,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
         assert_eq!(resource["contents"][0]["text"], selected["page"]["text"]);
         let found = research
             .call(
-                "whatwg_symbol_search",
+                "whatwg.symbol_search",
                 json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html","kind":"idl"}),
             )
             .await
@@ -925,7 +925,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
         assert_eq!(found["total"], 2);
         let references = research
             .call(
-                "whatwg_references",
+                "whatwg.references",
                 json!({"standard":"dom","snapshot":snapshot.id,"path":"index.html"}),
             )
             .await
@@ -934,7 +934,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
         assert!(
             research
                 .call(
-                    "whatwg_symbol_search",
+                    "whatwg.symbol_search",
                     json!({"standard":"dom","snapshot":snapshot.id})
                 )
                 .await

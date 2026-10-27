@@ -234,14 +234,14 @@ impl MdnResearch {
             .try_acquire()
             .map_err(|_| Error::capacity("MDN research reader capacity exhausted."))?;
         match tool {
-            "mdn_search" => self.search(decode(input)?, false).await,
-            "mdn_compat_search" => self.search(decode(input)?, true).await,
-            "mdn_get" => self.get(decode(input)?).await,
-            "mdn_compat_get" => self.compat_get(decode(input)?).await,
-            "mdn_browser_get" => self.browser_get(decode(input)?).await,
-            "mdn_history" => self.discovery(decode(input)?, true).await,
-            "mdn_snapshots" => self.discovery(decode(input)?, false).await,
-            "mdn_corpus_status" => {
+            "mdn.search" => self.search(decode(input)?, false).await,
+            "mdn.compat_search" => self.search(decode(input)?, true).await,
+            "mdn.get" => self.get(decode(input)?).await,
+            "mdn.compat_get" => self.compat_get(decode(input)?).await,
+            "mdn.browser_get" => self.browser_get(decode(input)?).await,
+            "mdn.history" => self.discovery(decode(input)?, true).await,
+            "mdn.snapshots" => self.discovery(decode(input)?, false).await,
+            "mdn.corpus_status" => {
                 let _: Empty = decode(input)?;
                 let status = self
                     .store
@@ -1313,57 +1313,57 @@ pub fn schemas() -> Vec<Value> {
         tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}))
     };
     add(
-        "mdn_search",
+        "mdn.search",
         "Search immutable English MDN document snapshots locally using technical tokens or English phrases, OR and exclusions.",
         json!({"query":string,"snapshot":snapshot,"mode":{"enum":["technical","english"],"default":"technical"},"slug":path,"path":path,"page_type":string,"status":string,"compatibility_key":string,"offset":list_offset,"limit":list_limit,"cursor":cursor}),
         vec![],
     );
     add(
-        "mdn_compat_search",
+        "mdn.compat_search",
         "Search locally captured BCD features. Support evidence retains uncertainty; no browser-version compatibility verdict is inferred.",
         json!({"query":string,"snapshot":snapshot,"mode":{"enum":["technical","english"],"default":"technical"},"feature":path,"browser":string,"experimental":{"type":"boolean"},"deprecated":{"type":"boolean"},"standard_track":{"type":"boolean"},"offset":list_offset,"limit":list_limit,"cursor":cursor}),
         vec![],
     );
     add(
-        "mdn_get",
+        "mdn.get",
         "Read one MDN document by slug or repository path. Original source/bytes survive projection gaps. Historical BCD enrichment requires an explicit compatibility_snapshot.",
         json!({"slug":path,"path":path,"repository":repository,"snapshot":snapshot,"compatibility_snapshot":snapshot,"representation":{"enum":["text","source","bytes"],"default":"text"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}}),
         vec![],
     );
     add(
-        "mdn_compat_get",
+        "mdn.compat_get",
         "Read exact original BCD feature support and derived mirror mappings with source provenance. offset/limit page browser statements.",
         json!({"feature":path,"snapshot":snapshot,"browser":string,"offset":list_offset,"limit":list_limit}),
         vec!["feature"],
     );
     add(
-        "mdn_browser_get",
+        "mdn.browser_get",
         "Read a captured browser identity and engine/release mappings. Release pages preserve the selected immutable BCD snapshot.",
         json!({"browser":string,"snapshot":snapshot,"offset":list_offset,"limit":list_limit}),
         vec!["browser"],
     );
     add(
-        "mdn_history",
+        "mdn.history",
         "Discover parent-relative source changes for exactly one path, slug or feature, with a frozen publication cutoff and resumable cursor.",
         json!({"repository":repository,"path":path,"slug":path,"feature":path,"history_snapshot":{"type":"integer","minimum":0},"offset":list_offset,"limit":list_limit,"cursor":cursor}),
         vec![],
     );
     add(
-        "mdn_snapshots",
+        "mdn.snapshots",
         "Discover immutable commit snapshots or advertised ref observations. Ref filters require representation=refs. Follow next_cursor even on an empty bounded scan page.",
         json!({"repository":repository,"representation":{"enum":["commits","refs"],"default":"commits"},"ref":path,"history_snapshot":{"type":"integer","minimum":0},"offset":list_offset,"limit":list_limit,"cursor":cursor}),
         vec![],
     );
     add(
-        "mdn_corpus_status",
+        "mdn.corpus_status",
         "Inspect MDN acquisition, ancestry, processing gaps, publication and freshness without administrative controls.",
         json!({}),
         vec![],
     );
     for tool in &mut tools {
-        if tool["name"] == "mdn_get" {
+        if tool["name"] == "mdn.get" {
             tool["inputSchema"]["oneOf"] = json!([{"required":["slug"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["slug"]}}]);
-        } else if tool["name"] == "mdn_history" {
+        } else if tool["name"] == "mdn.history" {
             tool["inputSchema"]["oneOf"] = json!([{"required":["slug"],"not":{"anyOf":[{"required":["path"]},{"required":["feature"]}]}},{"required":["path"],"not":{"anyOf":[{"required":["slug"]},{"required":["feature"]}]}},{"required":["feature"],"not":{"anyOf":[{"required":["slug"]},{"required":["path"]}]}}]);
         }
     }
@@ -1582,7 +1582,7 @@ mod tests {
         let v = view(&store, &content, &compat, devres_domain::unix_now()).await;
         let research = MdnResearch::new(store.clone(), dir.path()).expect("research");
         let current = research
-            .call("mdn_get", json!({"slug":"Web/API/Fetch"}))
+            .call("mdn.get", json!({"slug":"Web/API/Fetch"}))
             .await
             .expect("current");
         assert_eq!(
@@ -1592,14 +1592,14 @@ mod tests {
         assert_eq!(current["provenance"]["view"], v.id);
         let historical = research
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"slug":"Web/API/Fetch","snapshot":content.id}),
             )
             .await
             .expect("historical");
         assert!(historical.get("compatibility").is_none());
         assert!(historical["provenance"]["compatibility_snapshot"].is_null());
-        let paired=research.call("mdn_get",json!({"slug":"Web/API/Fetch","snapshot":content.id,"compatibility_snapshot":compat.id})).await.expect("pair");
+        let paired=research.call("mdn.get",json!({"slug":"Web/API/Fetch","snapshot":content.id,"compatibility_snapshot":compat.id})).await.expect("pair");
         assert_eq!(
             paired["compatibility"][0]["metadata"]["status"]["experimental"],
             false
@@ -1621,7 +1621,7 @@ mod tests {
         let research = MdnResearch::new(store, dir.path()).expect("research");
         assert_eq!(
             research
-                .call("mdn_get", json!({"slug":"Web/API/Fetch"}))
+                .call("mdn.get", json!({"slug":"Web/API/Fetch"}))
                 .await
                 .expect_err("expired")
                 .code,
@@ -1689,13 +1689,13 @@ mod tests {
             .await
             .expect("snapshot");
         let research = MdnResearch::new(store, dir.path()).expect("research");
-        let output=research.call("mdn_get",json!({"path":"files/en-us/web/api/fetch/index.md","snapshot":historical.id,"representation":"source","offset":1,"limit":2})).await.expect("source");
+        let output=research.call("mdn.get",json!({"path":"files/en-us/web/api/fetch/index.md","snapshot":historical.id,"representation":"source","offset":1,"limit":2})).await.expect("source");
         assert_eq!(output["page"]["data"], STANDARD.encode([255, 1]));
         assert_eq!(output["page"]["next_offset"], 3);
         assert!(
             research
                 .call(
-                    "mdn_get",
+                    "mdn.get",
                     json!({"path":"files/en-us/web/api/fetch/index.md","snapshot":historical.id})
                 )
                 .await
@@ -1709,14 +1709,14 @@ mod tests {
         store.mdn_put("observations","first",&json!({"repo":"content","observed_at":1,"refs":[{"name":"refs/heads/main","oid":"a"},{"name":"refs/tags/v1","oid":"b"}]})).await.expect("first");
         let research = MdnResearch::new(store.clone(), dir.path()).expect("research");
         let first = research
-            .call("mdn_snapshots", json!({"representation":"refs","limit":1}))
+            .call("mdn.snapshots", json!({"representation":"refs","limit":1}))
             .await
             .expect("first");
         assert_eq!(first["results"][0]["ref"]["name"], "refs/heads/main");
         store.mdn_put("observations","later",&json!({"repo":"content","observed_at":2,"refs":[{"name":"refs/tags/v2","oid":"c"}]})).await.expect("later");
         let second = research
             .call(
-                "mdn_snapshots",
+                "mdn.snapshots",
                 json!({"representation":"refs","cursor":first["next_cursor"],"limit":20}),
             )
             .await
@@ -1724,7 +1724,7 @@ mod tests {
         assert_eq!(second["results"].as_array().expect("results").len(), 1);
         assert_eq!(second["results"][0]["ref"]["name"], "refs/tags/v1");
         assert!(second["next_cursor"].is_null());
-        assert!(research.call("mdn_snapshots",json!({"representation":"refs","repository":"compat","cursor":first["next_cursor"]})).await.is_err());
+        assert!(research.call("mdn.snapshots",json!({"representation":"refs","repository":"compat","cursor":first["next_cursor"]})).await.is_err());
     }
     #[tokio::test]
     async fn document_selection_and_untrusted_destinations_fail_before_lookup() {
@@ -1733,7 +1733,7 @@ mod tests {
         let research = MdnResearch::new(store, dir.path()).expect("research");
         assert_eq!(
             research
-                .call("mdn_get", json!({}))
+                .call("mdn.get", json!({}))
                 .await
                 .expect_err("missing selector")
                 .code,
@@ -1741,7 +1741,7 @@ mod tests {
         );
         assert_eq!(
             research
-                .call("mdn_get", json!({"slug":"A","path":"B"}))
+                .call("mdn.get", json!({"slug":"A","path":"B"}))
                 .await
                 .expect_err("duplicate selector")
                 .code,
@@ -1749,7 +1749,7 @@ mod tests {
         );
         assert_eq!(
             research
-                .call("mdn_get", json!({"slug":"A","url":"https://example.com"}))
+                .call("mdn.get", json!({"slug":"A","url":"https://example.com"}))
                 .await
                 .expect_err("unknown URL")
                 .code,

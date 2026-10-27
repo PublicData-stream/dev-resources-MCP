@@ -163,7 +163,7 @@ a previously verified digest through a separately authorized deployment operatio
 
 RFC collection is enabled when `[rfc]` is omitted. To pause scheduling, set
 `enabled = false` in `[rfc]` and restart; retained jobs/captures remain intact.
-The tracked edge/minikube harness explicitly pauses collection. `rfc_corpus_status`
+The tracked edge/minikube harness explicitly pauses collection. `rfc.corpus_status`
 reports missing representations, failures and the default snapshot; `latest_partial`
 identifies newer incomplete evidence for explicit queries. Coverage is observed
 evidence, not proof of whole-provider coverage.
@@ -201,7 +201,7 @@ acquisition. All live acceptance runs keep collection paused.
 
 Crate collection is also enabled when `[crates]` is omitted. Set `enabled = false`
 in `[crates]` before running disposable or bounded-live acceptance.
-`crate_corpus_status` separates inventory enumeration, metadata gaps, retained
+`crate.corpus_status` separates inventory enumeration, metadata gaps, retained
 artifacts, job failures, projections and search coverage. One successful acquisition
 or completed job does not prove whole-registry ingestion. Bootstrap and revalidation
 may take substantial storage/time; no completion estimate or whole-corpus load
@@ -294,7 +294,7 @@ public database downloads are not committed. See the
 
 Serving supervises hourly current-advisory refresh and daily full branch/tag Git
 synchronization. All public advisory tools are local reads. During bootstrap use
-`advisory_corpus_status` to distinguish a ready service from available source data,
+`advisory.corpus_status` to distinguish a ready service from available source data,
 raw graph acquisition, backfill completion, projection gaps and assessment freshness.
 History processing does not block current publication. Set `[rustsec].enabled=false`
 to pause new scheduling while retaining snapshots and source evidence.
@@ -344,8 +344,8 @@ source provenance and aggregate counts, never a supplied lockfile.
 
 Omitted `[mdn]` starts current-main acquisition and resumable complete advertised
 branch/tag ancestry processing for both repositories. Set `enabled=false` to pause
-scheduling without deleting evidence. `mdn_corpus_status` is aggregate-only;
-`mdn_snapshots` exposes frozen commit/ref discovery and `mdn_history` provides
+scheduling without deleting evidence. `mdn.corpus_status` is aggregate-only;
+`mdn.snapshots` exposes frozen commit/ref discovery and `mdn.history` provides
 parent-relative source changes. Main publication has priority over backfill.
 Unknown historical formats/macros and individual index limits remain explicit
 projection gaps; they do not imply missing raw Git evidence.
@@ -434,7 +434,7 @@ backing filesystem must also keep the stated free-space reserve.
 
 WHATWG collection starts automatically unless `[whatwg] enabled=false`. During
 bootstrap listeners can remain ready while local standards research is unavailable.
-Use `whatwg_corpus_status` to inspect acquisition/projection/index gaps separately.
+Use `whatwg.corpus_status` to inspect acquisition/projection/index gaps separately.
 Stop all serving writers before private maintenance or coordinated backup/restore.
 `devres-server rebuild-whatwg-index CONFIG.toml` rebuilds local retained evidence;
 it does not establish fresh upstream validation.
@@ -527,7 +527,7 @@ that nested Kubernetes container storage supports the underlying filesystem.
 
 W3C collection defaults to enabled with current published reports ahead of historical
 work. Set `[w3c] enabled=false` to pause new acquisition while retaining local
-research. Health/metrics remain private; `w3c_corpus_status` reports source coverage,
+research. Health/metrics remain private; `w3c.corpus_status` reports source coverage,
 license blocks, freshness and processing/index gaps separately.
 
 For this environment, build targets use `/buildcache/rust/target` and all disposable
@@ -592,7 +592,7 @@ migration or discard permanent evidence. Index rebuild is private maintenance vi
 
 Chromium collection defaults on, prioritizes current documents, and resumes history
 from durable checkpoints. Disable `[chromium].enabled` in fixture configurations.
-Observe `chromium_corpus_status` for separate discovery, licensing, processing,
+Observe `chromium.corpus_status` for separate discovery, licensing, processing,
 indexing, history, freshness, and partial-component state. No public controls exist.
 The offline maintenance command is `devres-server rebuild-chromium-index CONFIG.toml`.
 Coordinate PostgreSQL/blob backups with all writers stopped; schema 8 is forward-only.

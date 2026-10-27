@@ -303,19 +303,19 @@ impl WhatwgResearch {
         let cancel = CancellationToken::new();
         let _guard = CancelOnDrop(cancel.clone());
         match tool {
-            "whatwg_corpus_status" => {
+            "whatwg.corpus_status" => {
                 let _: EmptyInput = decode(input)?;
                 self.corpus.status().await
             }
-            "whatwg_get" => self.get(decode(input)?, cancel).await,
-            "whatwg_search" => self.search(decode(input)?, cancel).await,
-            "whatwg_symbol_get" => self.symbol_get(decode(input)?, cancel).await,
-            "whatwg_compare" => self.compare(decode(input)?, cancel).await,
-            "whatwg_catalog_search"
-            | "whatwg_symbol_search"
-            | "whatwg_references"
-            | "whatwg_snapshots"
-            | "whatwg_history" => self.list(tool, decode(input)?, cancel).await,
+            "whatwg.get" => self.get(decode(input)?, cancel).await,
+            "whatwg.search" => self.search(decode(input)?, cancel).await,
+            "whatwg.symbol_get" => self.symbol_get(decode(input)?, cancel).await,
+            "whatwg.compare" => self.compare(decode(input)?, cancel).await,
+            "whatwg.catalog_search"
+            | "whatwg.symbol_search"
+            | "whatwg.references"
+            | "whatwg.snapshots"
+            | "whatwg.history" => self.list(tool, decode(input)?, cancel).await,
             _ => Err(Error::not_found("Unknown WHATWG research tool.")),
         }
     }
@@ -681,11 +681,11 @@ impl WhatwgResearch {
     }
     async fn list(&self, tool: &str, input: ListInput, cancel: CancellationToken) -> Result<Value> {
         let deadline = Instant::now() + Duration::from_secs(15);
-        if tool == "whatwg_catalog_search" {
+        if tool == "whatwg.catalog_search" {
             return self.catalog_search(input).await;
         }
         let selector = Selector {
-            standard: if tool == "whatwg_references"
+            standard: if tool == "whatwg.references"
                 && input.direction.as_deref() == Some("incoming")
                 && input.snapshot.is_none()
             {
@@ -696,7 +696,7 @@ impl WhatwgResearch {
             snapshot: input.snapshot.clone(),
             view: input.view.clone(),
         };
-        if matches!(tool, "whatwg_snapshots" | "whatwg_history") {
+        if matches!(tool, "whatwg.snapshots" | "whatwg.history") {
             return self.discovery(tool, input, cancel).await;
         }
         let (view, snapshots) = self.selections(&selector).await?;
@@ -723,7 +723,7 @@ impl WhatwgResearch {
             input.limit,
         )?;
         let mut items = Vec::new();
-        if tool == "whatwg_references"
+        if tool == "whatwg.references"
             && !matches!(
                 input.direction.as_deref().unwrap_or("outgoing"),
                 "incoming" | "outgoing"
@@ -742,7 +742,7 @@ impl WhatwgResearch {
                 if input.path.as_ref().is_some_and(|path| path != &member.path) {
                     continue;
                 }
-                if tool == "whatwg_references" {
+                if tool == "whatwg.references" {
                     for reference in doc.references {
                         let incoming = input.direction.as_deref() == Some("incoming");
                         if input.anchor.as_ref().is_some_and(|a| {
@@ -878,8 +878,8 @@ impl WhatwgResearch {
         cancel: CancellationToken,
     ) -> Result<Value> {
         if input.history_type.as_deref() == Some("refs") {
-            if tool != "whatwg_history" {
-                return Err(Error::invalid("Ref observations belong to whatwg_history."));
+            if tool != "whatwg.history" {
+                return Err(Error::invalid("Ref observations belong to whatwg.history."));
             }
             return self.ref_history(input, cancel).await;
         }
@@ -1001,7 +1001,7 @@ impl WhatwgResearch {
                     skip -= 1;
                     continue;
                 }
-                if tool == "whatwg_history" {
+                if tool == "whatwg.history" {
                     if snapshot.parents.len() > 100 {
                         return Err(Error::capacity("WHATWG history parent bound exceeded."));
                     }
@@ -1496,9 +1496,9 @@ impl WhatwgResearch {
         }
         let output = if parts[2] == "symbol" {
             input.as_object_mut().map(|m| m.remove("representation"));
-            self.call("whatwg_symbol_get", input).await?
+            self.call("whatwg.symbol_get", input).await?
         } else {
-            self.call("whatwg_get", input).await?
+            self.call("whatwg.get", input).await?
         };
         let processing_gaps = output
             .get("processing_gaps")
@@ -1553,7 +1553,7 @@ pub fn schemas() -> Vec<Value> {
         map.remove("snapshot");
     }
     add(
-        "whatwg_catalog_search",
+        "whatwg.catalog_search",
         "Search the captured WHATWG standards catalog; publication and processing gaps remain explicit. Select a view for historical catalog evidence.",
         catalog_properties,
         vec![],
@@ -1564,20 +1564,20 @@ pub fn schemas() -> Vec<Value> {
         search[key] = path.clone();
     }
     add(
-        "whatwg_search",
+        "whatwg.search",
         "Search immutable WHATWG sections using selected-corpus BM25. Defaults use canonical current editions; reuse view/snapshot and cursor.",
         search,
         vec!["query"],
     );
     let get = json!({"standard":id,"snapshot":hash,"view":hash,"path":path,"anchor":path,"section_index":{"type":"integer","minimum":0,"description":"Zero-based position in this captured document's ordered sections; requires path and excludes anchor."},"representation":{"enum":["text","source","bytes"],"default":"text"},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}});
     add(
-        "whatwg_get",
+        "whatwg.get",
         "Read capture-fixed specification text, an anchored section, original source, or base64 bytes. Text offsets count UTF-8 bytes.",
         get,
         vec!["standard"],
     );
     for (name, description) in [(
-        "whatwg_symbol_search",
+        "whatwg.symbol_search",
         "Search original definitions, Web IDL declarations and explicitly marked algorithms.",
     )] {
         let mut props = common.clone();
@@ -1589,7 +1589,7 @@ pub fn schemas() -> Vec<Value> {
     }
     let symbol_get = json!({"standard":id,"snapshot":hash,"view":hash,"path":path,"symbol_index":{"type":"integer","minimum":0,"description":"Zero-based position in this captured document's ordered symbols; requires path and is local to the selected snapshot."},"name":path,"anchor":path,"kind":{"enum":["definition","idl","algorithm"]},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}});
     add(
-        "whatwg_symbol_get",
+        "whatwg.symbol_get",
         "Read one unambiguous captured symbol in bounded UTF-8 pages with original text and provenance.",
         symbol_get,
         vec!["standard"],
@@ -1600,25 +1600,25 @@ pub fn schemas() -> Vec<Value> {
         refs[key] = path.clone();
     }
     add(
-        "whatwg_references",
+        "whatwg.references",
         "Inspect captured incoming/outgoing links. Target resolution uses selected evidence only; external references are never fetched.",
         refs,
         vec![],
     );
     for (name, description) in [
         (
-            "whatwg_snapshots",
+            "whatwg.snapshots",
             "Discover immutable source/publication snapshots with a frozen history cutoff.",
         ),
         (
-            "whatwg_history",
+            "whatwg.history",
             "Inspect retained revisions and changes against each ordered parent; missing parent projections remain explicit.",
         ),
     ] {
         let mut props = common.clone();
         props["history_snapshot"] = json!({"type":"integer","minimum":0});
         props["path"] = path.clone();
-        if name == "whatwg_history" {
+        if name == "whatwg.history" {
             props["history_type"] = json!({"enum":["revisions","refs"],"default":"revisions"});
             props["repository"] = json!({"type":"string","minLength":1,"maxLength":256});
             props["ref"] = json!({"type":"string","minLength":1,"maxLength":1024});
@@ -1642,23 +1642,23 @@ pub fn schemas() -> Vec<Value> {
     compare["path"] = path;
     compare["mode"] = json!({"enum":["text","symbols","source"],"default":"text"});
     add(
-        "whatwg_compare",
+        "whatwg.compare",
         "Compare two immutable snapshots of the same standard and representation family; no normative verdict is inferred.",
         compare,
         vec!["standard", "before", "after"],
     );
     add(
-        "whatwg_corpus_status",
+        "whatwg.corpus_status",
         "Inspect separate WHATWG acquisition, ancestry, projection, indexing and freshness coverage. No collection controls are exposed.",
         json!({}),
         vec![],
     );
     for tool in &mut tools {
         match tool["name"].as_str() {
-            Some("whatwg_get") => {
+            Some("whatwg.get") => {
                 tool["inputSchema"]["allOf"] = json!([{"if":{"required":["section_index"]},"then":{"required":["path"],"not":{"required":["anchor"]},"properties":{"representation":{"const":"text"}}}}]);
             }
-            Some("whatwg_symbol_get") => {
+            Some("whatwg.symbol_get") => {
                 tool["inputSchema"]["allOf"] =
                     json!([{"if":{"required":["symbol_index"]},"then":{"required":["path"]}}]);
             }

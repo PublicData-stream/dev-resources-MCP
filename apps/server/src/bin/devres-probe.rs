@@ -110,7 +110,7 @@ async fn main() -> Result<(), ServerError> {
         (
             3,
             "tools/call",
-            json!({"name":"server_info","arguments":{}}),
+            json!({"name":"server.info","arguments":{}}),
         ),
     ] {
         if revision == "2026-07-28" {
@@ -124,72 +124,91 @@ async fn main() -> Result<(), ServerError> {
         )
         .await?;
         if method == "tools/list" {
+            let tools = value["result"]["tools"]
+                .as_array()
+                .ok_or("missing tool list")?;
+            for tool in tools {
+                let name = tool["name"].as_str().ok_or("missing tool name")?;
+                if !matches!(name, "search" | "fetch")
+                    && !name.split_once('.').is_some_and(|(group, operation)| {
+                        [
+                            "server", "audit", "rfc", "crate", "advisory", "mdn", "whatwg", "w3c",
+                            "chromium", "npm",
+                        ]
+                        .contains(&group)
+                            && !operation.is_empty()
+                            && !operation.contains('.')
+                    })
+                {
+                    return Err("unexpected public tool namespace".into());
+                }
+            }
             has_rfc_corpus = value["result"]["tools"]
                 .as_array()
-                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "rfc_corpus_status"));
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "rfc.corpus_status"));
             has_crate_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 tools
                     .iter()
-                    .any(|tool| tool["name"] == "crate_corpus_status")
+                    .any(|tool| tool["name"] == "crate.corpus_status")
             });
             has_mdn_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 [
-                    "mdn_search",
-                    "mdn_get",
-                    "mdn_compat_search",
-                    "mdn_compat_get",
-                    "mdn_browser_get",
-                    "mdn_history",
-                    "mdn_snapshots",
-                    "mdn_corpus_status",
+                    "mdn.search",
+                    "mdn.get",
+                    "mdn.compat_search",
+                    "mdn.compat_get",
+                    "mdn.browser_get",
+                    "mdn.history",
+                    "mdn.snapshots",
+                    "mdn.corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
             });
             has_whatwg_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 [
-                    "whatwg_catalog_search",
-                    "whatwg_search",
-                    "whatwg_get",
-                    "whatwg_symbol_search",
-                    "whatwg_symbol_get",
-                    "whatwg_references",
-                    "whatwg_history",
-                    "whatwg_snapshots",
-                    "whatwg_compare",
-                    "whatwg_corpus_status",
+                    "whatwg.catalog_search",
+                    "whatwg.search",
+                    "whatwg.get",
+                    "whatwg.symbol_search",
+                    "whatwg.symbol_get",
+                    "whatwg.references",
+                    "whatwg.history",
+                    "whatwg.snapshots",
+                    "whatwg.compare",
+                    "whatwg.corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
             });
             has_w3c_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 [
-                    "w3c_catalog_search",
-                    "w3c_search",
-                    "w3c_get",
-                    "w3c_symbol_search",
-                    "w3c_symbol_get",
-                    "w3c_references",
-                    "w3c_history",
-                    "w3c_snapshots",
-                    "w3c_compare",
-                    "w3c_corpus_status",
+                    "w3c.catalog_search",
+                    "w3c.search",
+                    "w3c.get",
+                    "w3c.symbol_search",
+                    "w3c.symbol_get",
+                    "w3c.references",
+                    "w3c.history",
+                    "w3c.snapshots",
+                    "w3c.compare",
+                    "w3c.corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
             });
             has_chromium_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 [
-                    "chromium_catalog_search",
-                    "chromium_search",
-                    "chromium_get",
-                    "chromium_symbol_search",
-                    "chromium_symbol_get",
-                    "chromium_references",
-                    "chromium_history",
-                    "chromium_snapshots",
-                    "chromium_compare",
-                    "chromium_corpus_status",
+                    "chromium.catalog_search",
+                    "chromium.search",
+                    "chromium.get",
+                    "chromium.symbol_search",
+                    "chromium.symbol_get",
+                    "chromium.references",
+                    "chromium.history",
+                    "chromium.snapshots",
+                    "chromium.compare",
+                    "chromium.corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
@@ -197,16 +216,16 @@ async fn main() -> Result<(), ServerError> {
             has_advisory_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 tools
                     .iter()
-                    .any(|tool| tool["name"] == "advisory_corpus_status")
+                    .any(|tool| tool["name"] == "advisory.corpus_status")
             });
             has_npm_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 [
-                    "npm_metadata",
-                    "npm_source_read",
-                    "npm_content_search",
-                    "npm_contract_get",
-                    "npm_audit_lockfile",
-                    "npm_corpus_status",
+                    "npm.metadata",
+                    "npm.source_read",
+                    "npm.content_search",
+                    "npm.contract_get",
+                    "npm.audit_lockfile",
+                    "npm.corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
@@ -215,9 +234,9 @@ async fn main() -> Result<(), ServerError> {
         if method == "tools/list"
             && !value["result"]["tools"]
                 .as_array()
-                .is_some_and(|v| v.iter().any(|tool| tool["name"] == "server_info"))
+                .is_some_and(|v| v.iter().any(|tool| tool["name"] == "server.info"))
         {
-            return Err("server_info missing".into());
+            return Err("server.info missing".into());
         }
         if method == "tools/call" {
             let info = &value["result"]["structuredContent"];
@@ -231,8 +250,29 @@ async fn main() -> Result<(), ServerError> {
             }
         }
     }
+    for (id, name) in [
+        (200, "server_info"),
+        (201, "rfc_catalog_search"),
+        (202, "crate_compare"),
+        (203, "rfc.catalog.search"),
+    ] {
+        let mut params = json!({"name":name,"arguments":{}});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let rejected = exchange_response(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":params}),
+        )
+        .await?;
+        if rejected["error"]["code"] != -32602 || rejected["error"]["message"] != "unknown tool" {
+            return Err("obsolete or nested tool name was accepted".into());
+        }
+    }
     if has_rfc_corpus {
-        let mut params = json!({"name":"rfc_corpus_status","arguments":{}});
+        let mut params = json!({"name":"rfc.corpus_status","arguments":{}});
         if revision == "2026-07-28" {
             params["_meta"] = metadata(revision);
         }
@@ -248,7 +288,7 @@ async fn main() -> Result<(), ServerError> {
         }
     }
     if has_crate_corpus {
-        let mut params = json!({"name":"crate_corpus_status","arguments":{}});
+        let mut params = json!({"name":"crate.corpus_status","arguments":{}});
         if revision == "2026-07-28" {
             params["_meta"] = metadata(revision);
         }
@@ -264,7 +304,7 @@ async fn main() -> Result<(), ServerError> {
         }
     }
     if has_advisory_corpus {
-        let mut params = json!({"name":"advisory_corpus_status","arguments":{}});
+        let mut params = json!({"name":"advisory.corpus_status","arguments":{}});
         if revision == "2026-07-28" {
             params["_meta"] = metadata(revision);
         }
@@ -288,7 +328,7 @@ async fn main() -> Result<(), ServerError> {
                 return Err("invalid explicit advisory fixture snapshot".into());
             }
             let lockfile = "# devres-smoke-private-comment-4d1a8e7c\nversion = 4\n[[package]]\nname = \"example\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-            let mut params = json!({"name":"audit_lockfile","arguments":{"lockfile":lockfile,"advisory_snapshot":&snapshot}});
+            let mut params = json!({"name":"audit.lockfile","arguments":{"lockfile":lockfile,"advisory_snapshot":&snapshot}});
             if revision == "2026-07-28" {
                 params["_meta"] = metadata(revision);
             }
@@ -321,7 +361,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             8,
-            "mdn_corpus_status",
+            "mdn.corpus_status",
             json!({}),
         )
         .await?;
@@ -339,7 +379,7 @@ async fn main() -> Result<(), ServerError> {
                     return Err("Invalid explicit synthetic MDN snapshot".into());
                 }
             }
-            let detail=tool_exchange(&mut send,&mut reader,&budget,revision,9,"mdn_get",json!({"slug":"Web/Fixture","snapshot":snapshot,"compatibility_snapshot":compatibility})).await?;
+            let detail=tool_exchange(&mut send,&mut reader,&budget,revision,9,"mdn.get",json!({"slug":"Web/Fixture","snapshot":snapshot,"compatibility_snapshot":compatibility})).await?;
             if detail["provenance"]["snapshot"] != snapshot
                 || detail["provenance"]["coverage"]["synthetic"] != true
                 || !detail["source_url"]
@@ -357,7 +397,7 @@ async fn main() -> Result<(), ServerError> {
                 &budget,
                 revision,
                 10,
-                "mdn_search",
+                "mdn.search",
                 json!({"query":"fetch","snapshot":snapshot}),
             )
             .await?;
@@ -370,7 +410,7 @@ async fn main() -> Result<(), ServerError> {
                 &budget,
                 revision,
                 11,
-                "mdn_compat_get",
+                "mdn.compat_get",
                 json!({"feature":"api.fixtureFetch","snapshot":compatibility}),
             )
             .await?;
@@ -385,7 +425,7 @@ async fn main() -> Result<(), ServerError> {
                 &budget,
                 revision,
                 12,
-                "mdn_browser_get",
+                "mdn.browser_get",
                 json!({"browser":"fixture_browser","snapshot":compatibility}),
             )
             .await?;
@@ -398,7 +438,7 @@ async fn main() -> Result<(), ServerError> {
                 &budget,
                 revision,
                 13,
-                "mdn_get",
+                "mdn.get",
                 json!({"slug":"Web/Fixture","snapshot":snapshot,"representation":"source"}),
             )
             .await?;
@@ -414,7 +454,7 @@ async fn main() -> Result<(), ServerError> {
                 &budget,
                 revision,
                 14,
-                "mdn_compat_search",
+                "mdn.compat_search",
                 json!({"query":"fetch","snapshot":compatibility}),
             )
             .await?;
@@ -456,7 +496,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             30,
-            "whatwg_corpus_status",
+            "whatwg.corpus_status",
             json!({}),
         )
         .await?;
@@ -481,7 +521,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             31,
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"fixture","snapshot":snapshot}),
         )
         .await?;
@@ -505,7 +545,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             32,
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"fixture","snapshot":snapshot,"representation":"source"}),
         )
         .await?;
@@ -520,14 +560,14 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             33,
-            "whatwg_search",
+            "whatwg.search",
             json!({"snapshot":snapshot,"query":"token"}),
         )
         .await?;
         if found["total"] != 1 || found["results"][0]["standard"] != "fixture" {
             return Err("WHATWG snapshot search mismatch through WebTransport".into());
         }
-        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,34,"whatwg_symbol_get",json!({"standard":"fixture","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
+        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,34,"whatwg.symbol_get",json!({"standard":"fixture","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
         if symbol["page"]["text"] != "FixtureToken" {
             return Err("WHATWG symbol mismatch through WebTransport".into());
         }
@@ -561,7 +601,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             40,
-            "w3c_corpus_status",
+            "w3c.corpus_status",
             json!({}),
         )
         .await?;
@@ -586,7 +626,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             41,
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"fixture","snapshot":snapshot}),
         )
         .await?;
@@ -607,7 +647,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             42,
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"fixture","snapshot":snapshot,"representation":"source"}),
         )
         .await?;
@@ -622,14 +662,14 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             43,
-            "w3c_search",
+            "w3c.search",
             json!({"snapshot":snapshot,"query":"token"}),
         )
         .await?;
         if found["total"] != 1 || found["results"][0]["specification"] != "fixture" {
             return Err("W3C snapshot search mismatch through WebTransport".into());
         }
-        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,44,"w3c_symbol_get",json!({"specification":"fixture","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
+        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,44,"w3c.symbol_get",json!({"specification":"fixture","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
         if symbol["page"]["text"] != "FixtureToken"
             || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
             || !symbol["derived_notice"].is_string()
@@ -661,7 +701,7 @@ async fn main() -> Result<(), ServerError> {
                 return Err("Immutable W3C resource changed through WebTransport".into());
             }
         }
-        let binary = tool_exchange(&mut send, &mut reader, &budget, revision, 48, "w3c_get", json!({"specification":"fixture","snapshot":snapshot,"representation":"bytes","limit":8})).await?;
+        let binary = tool_exchange(&mut send, &mut reader, &budget, revision, 48, "w3c.get", json!({"specification":"fixture","snapshot":snapshot,"representation":"bytes","limit":8})).await?;
         if binary["page"]["base64"] != "PGgxIGlkPWY=" {
             return Err("W3C byte page changed through WebTransport".into());
         }
@@ -696,7 +736,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             90,
-            "npm_corpus_status",
+            "npm.corpus_status",
             json!({}),
         )
         .await?;
@@ -714,7 +754,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             91,
-            "npm_versions",
+            "npm.versions",
             json!({"name":"npm-fixture"}),
         )
         .await?;
@@ -728,7 +768,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             92,
-            "npm_document_get",
+            "npm.document_get",
             json!({"name":"npm-fixture","version":"1.0.0","snapshot":snapshot,"path":"README.md"}),
         )
         .await?;
@@ -758,7 +798,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             94,
-            "npm_content_search",
+            "npm.content_search",
             json!({"snapshot":snapshot,"query":"FixtureToken"}),
         )
         .await?;
@@ -771,7 +811,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             95,
-            "npm_advisory_lookup",
+            "npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         )
         .await?;
@@ -781,7 +821,7 @@ async fn main() -> Result<(), ServerError> {
         let lockfile = serde_json::to_string(
             &json!({"lockfileVersion":3,"name":"PRIVATE_NPM_PROBE_MARKER","packages":{"node_modules/npm-fixture":{"version":"1.0.0"}}}),
         )?;
-        let audit = tool_exchange(&mut send,&mut reader,&budget,revision,96,"npm_audit_lockfile",json!({"lockfile":lockfile,"lockfile_format":"npm","advisory_snapshot":advisory["snapshot"]["id"],"registry_context":{"default":"npmjs"}})).await?;
+        let audit = tool_exchange(&mut send,&mut reader,&budget,revision,96,"npm.audit_lockfile",json!({"lockfile":lockfile,"lockfile_format":"npm","advisory_snapshot":advisory["snapshot"]["id"],"registry_context":{"default":"npmjs"}})).await?;
         if audit["vulnerability_count"] != 1
             || audit.to_string().contains("PRIVATE_NPM_PROBE_MARKER")
         {
@@ -797,7 +837,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             50,
-            "chromium_corpus_status",
+            "chromium.corpus_status",
             json!({}),
         )
         .await?;
@@ -822,7 +862,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             51,
-            "chromium_get",
+            "chromium.get",
             json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot}),
         )
         .await?;
@@ -846,7 +886,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             52,
-            "chromium_get",
+            "chromium.get",
             json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"representation":"source"}),
         )
         .await?;
@@ -861,14 +901,14 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             53,
-            "chromium_search",
+            "chromium.search",
             json!({"snapshot":snapshot,"query":"token"}),
         )
         .await?;
         if found["total"] != 1 || found["results"][0]["component"] != "src" {
             return Err("CHROMIUM snapshot search mismatch through WebTransport".into());
         }
-        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,54,"chromium_symbol_get",json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
+        let symbol=tool_exchange(&mut send,&mut reader,&budget,revision,54,"chromium.symbol_get",json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"kind":"definition","name":"FixtureToken"})).await?;
         if symbol["page"]["text"] != "FixtureToken"
             || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
             || !symbol["derived_notice"].is_string()
@@ -900,7 +940,7 @@ async fn main() -> Result<(), ServerError> {
                 return Err("Immutable CHROMIUM resource changed through WebTransport".into());
             }
         }
-        let binary = tool_exchange(&mut send, &mut reader, &budget, revision, 58, "chromium_get", json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"representation":"bytes","limit":8})).await?;
+        let binary = tool_exchange(&mut send, &mut reader, &budget, revision, 58, "chromium.get", json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"representation":"bytes","limit":8})).await?;
         if binary["page"]["base64"] != "PGgxIGlkPWY=" {
             return Err("CHROMIUM byte page changed through WebTransport".into());
         }
@@ -965,15 +1005,24 @@ async fn exchange(
     budget: &Arc<Semaphore>,
     request: Value,
 ) -> Result<Value, ServerError> {
+    let value = exchange_response(send, reader, budget, request).await?;
+    if value.get("error").is_some() || value["result"]["isError"] == true {
+        return Err("MCP operation failed".into());
+    }
+    Ok(value)
+}
+async fn exchange_response(
+    send: &mut wtransport::SendStream,
+    reader: &mut FrameReader<wtransport::RecvStream>,
+    budget: &Arc<Semaphore>,
+    request: Value,
+) -> Result<Value, ServerError> {
     let id = request["id"].clone();
     write_json(send, &request, MAX, budget, Duration::from_secs(10)).await?;
     loop {
         let frame = reader.read().await?.ok_or("response stream closed")?;
         let value: Value = serde_json::from_slice(&frame.bytes)?;
         if value["id"] == id {
-            if value.get("error").is_some() || value["result"]["isError"] == true {
-                return Err("MCP operation failed".into());
-            }
             return Ok(value);
         }
     }

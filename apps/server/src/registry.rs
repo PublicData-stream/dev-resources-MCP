@@ -146,7 +146,7 @@ pub fn server_info(source: &SourceOffer) -> Value {
 }
 pub fn server_info_registry(source: SourceOffer) -> std::result::Result<ToolRegistry, ServerError> {
     let mut registry = ToolRegistry::new();
-    registry.register(json!({"name":"server_info","description":"Read service identity, license, corresponding source, and supported protocols.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}), move |_, _| {
+    registry.register(json!({"name":"server.info","description":"Read service identity, license, corresponding source, and supported protocols.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}), move |_, _| {
         let source = source.clone(); async move { Ok(server_info(&source)) }
     })?;
     Ok(registry)
@@ -164,15 +164,15 @@ mod tests {
                 .unwrap();
         }
         for name in [
-            "crate_versions",
-            "crate_catalog_search",
-            "crate_document_get",
-            "crate_dependencies",
-            "crate_compare",
-            "crate_content_search",
-            "crate_api_search",
-            "crate_api_get",
-            "crate_corpus_status",
+            "crate.versions",
+            "crate.catalog_search",
+            "crate.document_get",
+            "crate.dependencies",
+            "crate.compare",
+            "crate.content_search",
+            "crate.api_search",
+            "crate.api_get",
+            "crate.corpus_status",
         ] {
             assert!(registry.tools.contains_key(name));
             assert!(
@@ -183,10 +183,32 @@ mod tests {
         }
     }
     #[test]
+    fn discovery_has_exact_dotted_names_without_legacy_aliases() {
+        let mut registry =
+            server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            registry
+                .register(descriptor, |_, _| async { Ok(json!({})) })
+                .unwrap();
+        }
+        let expected: Vec<String> =
+            serde_json::from_str(include_str!("../tests/tool-names.json")).unwrap();
+        assert_eq!(expected.len(), 88);
+        assert_eq!(registry.tools.keys().cloned().collect::<Vec<_>>(), expected);
+        for name in registry.tools.keys() {
+            if let Some((group, operation)) = name.split_once('.') {
+                assert!(!operation.contains('.'));
+                assert!(!registry.tools.contains_key(&format!("{group}_{operation}")));
+            } else {
+                assert!(matches!(name.as_str(), "search" | "fetch"));
+            }
+        }
+    }
+    #[test]
     fn registration_rejects_duplicates_and_external_refs() {
         let mut registry =
             server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();
-        let descriptor = serde_json::to_value(&registry.tools["server_info"].definition).unwrap();
+        let descriptor = serde_json::to_value(&registry.tools["server.info"].definition).unwrap();
         assert!(
             registry
                 .register(descriptor, |_, _| async { Ok(json!({})) })
@@ -209,12 +231,12 @@ mod tests {
                 .unwrap();
         }
         assert!(registry.tools.len() <= MAX_REGISTERED_TOOLS);
-        let get = &registry.tools["mdn_get"].validator;
+        let get = &registry.tools["mdn.get"].validator;
         assert!(get.is_valid(&json!({"slug":"Web/API/Window/fetch"})));
         assert!(!get.is_valid(&json!({})));
         assert!(!get.is_valid(&json!({"slug":"A","path":"B"})));
         assert!(!get.is_valid(&json!({"slug":"A","url":"https://example.com"})));
-        let history = &registry.tools["mdn_history"].validator;
+        let history = &registry.tools["mdn.history"].validator;
         assert!(history.is_valid(&json!({"feature":"api.fetch","repository":"compat"})));
         assert!(!history.is_valid(&json!({"slug":"A","path":"B"})));
         assert!(
@@ -239,32 +261,32 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            registry.tools["whatwg_get"]
+            registry.tools["whatwg.get"]
                 .validator
                 .is_valid(&json!({"standard":"dom","anchor":"event"}))
         );
         assert!(
-            !registry.tools["whatwg_get"]
+            !registry.tools["whatwg.get"]
                 .validator
                 .is_valid(&json!({"standard":"dom","url":"https://example.com"}))
         );
         assert!(
-            !registry.tools["whatwg_catalog_search"]
+            !registry.tools["whatwg.catalog_search"]
                 .validator
                 .is_valid(&json!({"snapshot":"a".repeat(64)}))
         );
         assert!(
-            registry.tools["whatwg_symbol_get"]
+            registry.tools["whatwg.symbol_get"]
                 .validator
                 .is_valid(&json!({"standard":"dom","name":"Event","limit":32768}))
         );
         assert!(
-            !registry.tools["whatwg_symbol_get"]
+            !registry.tools["whatwg.symbol_get"]
                 .validator
                 .is_valid(&json!({"standard":"dom","name":"Event","limit":32769}))
         );
         assert!(
-            !registry.tools["whatwg_corpus_status"]
+            !registry.tools["whatwg.corpus_status"]
                 .validator
                 .is_valid(&json!({"enabled":true}))
         );
@@ -286,7 +308,7 @@ mod tests {
         }
         assert!(registry.tools.len() <= MAX_REGISTERED_TOOLS);
         assert!(
-            registry.tools["w3c_get"]
+            registry.tools["w3c.get"]
                 .validator
                 .is_valid(&json!({"specification":"css-color-4","anchor":"color"}))
         );
@@ -295,10 +317,10 @@ mod tests {
             json!({"standard":"css-color-4"}),
             json!({"specification":"css-color-4","limit":32769}),
         ] {
-            assert!(!registry.tools["w3c_get"].validator.is_valid(&input));
+            assert!(!registry.tools["w3c.get"].validator.is_valid(&input));
         }
         assert!(
-            !registry.tools["w3c_corpus_status"]
+            !registry.tools["w3c.corpus_status"]
                 .validator
                 .is_valid(&json!({"enabled":true}))
         );
@@ -315,7 +337,7 @@ mod tests {
                 .register(descriptor, |_, _| async { Ok(json!({})) })
                 .unwrap();
         }
-        let get = &registry.tools["chromium_get"].validator;
+        let get = &registry.tools["chromium.get"].validator;
         assert!(get.is_valid(&json!({"component":"src","path":"docs/README.md"})));
         for input in [
             json!({"component":"src"}),
@@ -328,7 +350,7 @@ mod tests {
         }
         assert!(registry.tools["search"].validator.is_valid(&json!({"query":"chromium","sources":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium"]})));
         assert!(
-            !registry.tools["chromium_corpus_status"]
+            !registry.tools["chromium.corpus_status"]
                 .validator
                 .is_valid(&json!({"enabled":true}))
         );

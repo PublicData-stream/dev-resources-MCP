@@ -195,13 +195,87 @@ async fn fixture() -> (tempfile::TempDir, Arc<Memory>, Arc<W3cCorpus>, Snapshot)
     (root, store, corpus, snapshot)
 }
 #[tokio::test]
+async fn historical_notice_selectors_are_callable_without_rewriting_retained_evidence() {
+    fn assert_selectors(value: &Value, snapshot: &str) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(selector) = fields.get("source_selector")
+                    && selector["snapshot"] == snapshot
+                {
+                    assert_eq!(selector["tool"], "w3c.get");
+                }
+                for child in fields.values() {
+                    assert_selectors(child, snapshot);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    assert_selectors(child, snapshot);
+                }
+            }
+            _ => {}
+        }
+    }
+    let _gate = crate::mdn::index::TEST_GATE.lock().await;
+    let (_root, store, corpus, mut snapshot) = fixture().await;
+    let research = W3cResearch::new(corpus);
+    let original = research.call("w3c.get", json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","representation":"source"})).await.unwrap();
+    snapshot.id = digest(&"historical-notice-selector").unwrap();
+    snapshot.coverage["license"]["notices"] = json!([{
+        "path":"index.html",
+        "source_selector":{"tool":"w3c_get","specification":"dom","snapshot":snapshot.id,"path":"index.html","representation":"source"}
+    }]);
+    snapshot.coverage["license"]["original_metadata"] = json!({"tool":"w3c_get"});
+    let retained = json!(snapshot);
+    let retained_bytes = serde_json::to_vec(&retained).unwrap();
+    store
+        .w3c_put("snapshots", &snapshot.id, &retained)
+        .await
+        .unwrap();
+    let output = research.call("w3c.get", json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","representation":"source"})).await.unwrap();
+    assert_selectors(&output, &snapshot.id);
+    assert_eq!(output["page"]["text"], original["page"]["text"]);
+    assert_eq!(
+        output["selection"]["coverage"]["license"]["notices"][0]["source_selector"]["tool"],
+        "w3c.get"
+    );
+    assert_eq!(
+        output["license"]["evidence"]["original_metadata"]["tool"],
+        "w3c_get"
+    );
+    let mut selector = output["license"]["evidence"]["notices"][0]["source_selector"]
+        .as_object()
+        .unwrap()
+        .clone();
+    let tool = selector.remove("tool").unwrap();
+    let selected = research
+        .call(tool.as_str().unwrap(), Value::Object(selector))
+        .await
+        .unwrap();
+    assert_eq!(selected["page"]["text"], original["page"]["text"]);
+    assert_eq!(selected["selection"]["snapshot"], snapshot.id);
+    let resource = research
+        .read_resource(output["resource_uri"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_selectors(&resource, &snapshot.id);
+    assert_eq!(resource["contents"][0]["text"], original["page"]["text"]);
+    let stored = store
+        .w3c_get("snapshots", &snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(serde_json::to_vec(&stored.data).unwrap(), retained_bytes);
+}
+
+#[tokio::test]
 async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     let _gate = crate::mdn::index::TEST_GATE.lock().await;
     let (_root, _store, corpus, snapshot) = fixture().await;
     let research = W3cResearch::new(corpus);
     let get = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","anchor":"events"}),
         )
         .await
@@ -221,7 +295,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
         snapshot.source_url
     );
     assert!(resource["contents"][0]["_meta"]["license"].is_object());
-    let raw=research.call("w3c_get",json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","representation":"bytes","limit":8})).await.unwrap();
+    let raw=research.call("w3c.get",json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","representation":"bytes","limit":8})).await.unwrap();
     assert_eq!(
         STANDARD
             .decode(raw["page"]["base64"].as_str().unwrap())
@@ -230,19 +304,19 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     );
     let symbols = research
         .call(
-            "w3c_symbol_search",
+            "w3c.symbol_search",
             json!({"specification":"dom","snapshot":snapshot.id,"kind":"definition"}),
         )
         .await
         .unwrap();
     assert_eq!(symbols["items"][0]["symbol"]["name"], "Event");
     assert!(symbols["items"][0]["symbol"].get("text").is_none());
-    let symbol=research.call("w3c_symbol_get",json!({"specification":"dom","snapshot":snapshot.id,"kind":"definition","name":"Event","limit":2})).await.unwrap();
+    let symbol=research.call("w3c.symbol_get",json!({"specification":"dom","snapshot":snapshot.id,"kind":"definition","name":"Event","limit":2})).await.unwrap();
     assert_eq!(symbol["page"]["text"], "Ev");
     assert_eq!(symbol["page"]["next_offset"], 2);
     let idl = research
         .call(
-            "w3c_symbol_get",
+            "w3c.symbol_get",
             json!({"specification":"dom","snapshot":snapshot.id,"kind":"idl","name":"EventTarget"}),
         )
         .await
@@ -256,7 +330,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     assert!(idl_resource["contents"][0]["_meta"]["gaps"]["processing"].is_array());
     let result = research
         .call(
-            "w3c_search",
+            "w3c.search",
             json!({"specification":"dom","snapshot":snapshot.id,"query":"dispatches"}),
         )
         .await
@@ -265,7 +339,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     assert!(
         research
             .call(
-                "w3c_get",
+                "w3c.get",
                 json!({"specification":"html","snapshot":snapshot.id,"path":"index.html"})
             )
             .await
@@ -279,7 +353,7 @@ async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     );
     assert!(
         research
-            .call("w3c_corpus_status", json!({"url":"https://evil.invalid/"}))
+            .call("w3c.corpus_status", json!({"url":"https://evil.invalid/"}))
             .await
             .is_err()
     );
@@ -313,7 +387,7 @@ async fn discovery_cursor_carries_frozen_cutoff_through_empty_filtered_pages() {
     }
     let research = W3cResearch::new(corpus);
     let first = research
-        .call("w3c_snapshots", json!({"specification":"absent"}))
+        .call("w3c.snapshots", json!({"specification":"absent"}))
         .await
         .unwrap();
     assert_eq!(first["items"], json!([]));
@@ -327,7 +401,7 @@ async fn discovery_cursor_carries_frozen_cutoff_through_empty_filtered_pages() {
         .unwrap();
     let second = research
         .call(
-            "w3c_snapshots",
+            "w3c.snapshots",
             json!({"specification":"absent","cursor":first["next_cursor"]}),
         )
         .await
@@ -354,7 +428,7 @@ async fn successful_view_validation_is_distinct_from_original_snapshot_time() {
     let research = W3cResearch::new(corpus.clone());
     let current = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","path":"index.html"}),
         )
         .await
@@ -367,7 +441,7 @@ async fn successful_view_validation_is_distinct_from_original_snapshot_time() {
     assert!(
         research
             .call(
-                "w3c_get",
+                "w3c.get",
                 json!({"specification":"dom","path":"index.html"})
             )
             .await
@@ -375,13 +449,13 @@ async fn successful_view_validation_is_distinct_from_original_snapshot_time() {
     );
     assert!(
         research
-            .call("w3c_search", json!({"specification":"dom","query":"event"}))
+            .call("w3c.search", json!({"specification":"dom","query":"event"}))
             .await
             .is_err()
     );
     let historical = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html"}),
         )
         .await
@@ -389,7 +463,7 @@ async fn successful_view_validation_is_distinct_from_original_snapshot_time() {
     assert_eq!(historical["selection"]["stale"], true);
     assert!(
         research
-            .call("w3c_catalog_search", json!({"snapshot":snapshot.id}))
+            .call("w3c.catalog_search", json!({"snapshot":snapshot.id}))
             .await
             .is_err()
     );
@@ -455,7 +529,7 @@ async fn ref_observations_page_inside_a_frozen_observation() {
     let research = W3cResearch::new(corpus);
     let first = research
         .call(
-            "w3c_history",
+            "w3c.history",
             json!({"history_type":"refs","repository":"https://github.com/w3c/dom.git","limit":1}),
         )
         .await
@@ -467,11 +541,11 @@ async fn ref_observations_page_inside_a_frozen_observation() {
         .w3c_put("observations", "later-ref-observation", &observation)
         .await
         .unwrap();
-    let second=research.call("w3c_history",json!({"history_type":"refs","repository":"https://github.com/w3c/dom.git","cursor":first["next_cursor"],"limit":100})).await.unwrap();
+    let second=research.call("w3c.history",json!({"history_type":"refs","repository":"https://github.com/w3c/dom.git","cursor":first["next_cursor"],"limit":100})).await.unwrap();
     assert_eq!(second["history_snapshot"], first["history_snapshot"]);
     assert_eq!(second["items"].as_array().unwrap().len(), 2);
     assert!(second["next_cursor"].is_null());
-    assert!(research.call("w3c_history",json!({"history_type":"refs","repository":"https://github.com/w3c/html.git","cursor":first["next_cursor"]})).await.is_err());
+    assert!(research.call("w3c.history",json!({"history_type":"refs","repository":"https://github.com/w3c/html.git","cursor":first["next_cursor"]})).await.is_err());
 }
 
 #[tokio::test]
@@ -481,21 +555,21 @@ async fn future_history_and_unapplied_ref_filters_fail_explicitly() {
     let research = W3cResearch::new(corpus);
     assert!(
         research
-            .call("w3c_history", json!({"ref":"refs/heads/main"}))
+            .call("w3c.history", json!({"ref":"refs/heads/main"}))
             .await
             .is_err()
     );
     let future = store.w3c_cutoff().await.unwrap() + 100;
     assert!(
         research
-            .call("w3c_history", json!({"history_snapshot":future}))
+            .call("w3c.history", json!({"history_snapshot":future}))
             .await
             .is_err()
     );
     assert!(
         research
             .call(
-                "w3c_history",
+                "w3c.history",
                 json!({"history_type":"refs","history_snapshot":future})
             )
             .await
@@ -528,7 +602,7 @@ async fn failed_projection_is_not_a_removed_section_in_comparison() {
     let research = W3cResearch::new(corpus);
     let error = research
         .call(
-            "w3c_compare",
+            "w3c.compare",
             json!({"specification":"dom","before":before.id,"after":after.id}),
         )
         .await
@@ -536,7 +610,7 @@ async fn failed_projection_is_not_a_removed_section_in_comparison() {
     assert_eq!(error.code, "unavailable");
     let raw = research
         .call(
-            "w3c_compare",
+            "w3c.compare",
             json!({"specification":"dom","before":before.id,"after":after.id,"mode":"source"}),
         )
         .await
@@ -575,7 +649,7 @@ async fn published_revisions_compare_by_sections_across_versioned_urls() {
         .unwrap();
     let research = W3cResearch::new(corpus);
     for mode in ["text", "symbols", "source"] {
-        let result=research.call("w3c_compare",json!({"specification":"dom","before":before.id,"after":after.id,"mode":mode,"path":"index.html"})).await.unwrap();
+        let result=research.call("w3c.compare",json!({"specification":"dom","before":before.id,"after":after.id,"mode":mode,"path":"index.html"})).await.unwrap();
         assert_eq!(result["total"], 0, "{mode}");
     }
     let mut moved_member = member.clone();
@@ -598,7 +672,7 @@ async fn published_revisions_compare_by_sections_across_versioned_urls() {
         .unwrap();
     for path in [&member.path, &moved_member.path] {
         for mode in ["text", "symbols", "source"] {
-            let result=research.call("w3c_compare",json!({"specification":"dom","before":after.id,"after":moved.id,"mode":mode,"path":path})).await.unwrap();
+            let result=research.call("w3c.compare",json!({"specification":"dom","before":after.id,"after":moved.id,"mode":mode,"path":path})).await.unwrap();
             assert_eq!(result["total"], 0, "{path} {mode}");
         }
     }
@@ -636,7 +710,7 @@ async fn published_revisions_compare_by_sections_across_versioned_urls() {
         .await
         .unwrap();
     for path in [&member.path, &moved_member.path] {
-        let result=research.call("w3c_compare",json!({"specification":"dom","before":after.id,"after":changed.id,"mode":"source","path":path})).await.unwrap();
+        let result=research.call("w3c.compare",json!({"specification":"dom","before":after.id,"after":changed.id,"mode":"source","path":path})).await.unwrap();
         assert_eq!(result["total"], 1, "{path}");
     }
 }
@@ -701,7 +775,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     let research = W3cResearch::new(corpus);
     let section = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","snapshot":snapshot.id,"path":path,"anchor":anchor}),
         )
         .await
@@ -709,7 +783,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(section["section_index"], 1);
     let direct_section = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","snapshot":snapshot.id,"path":path,"section_index":1}),
         )
         .await
@@ -717,7 +791,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(direct_section["page"], section["page"]);
     let symbol = research
         .call(
-            "w3c_symbol_get",
+            "w3c.symbol_get",
             json!({"specification":"dom","snapshot":snapshot.id,"path":path,"name":name}),
         )
         .await
@@ -725,7 +799,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(symbol["symbol_index"], 0);
     let anchored_symbol = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","snapshot":snapshot.id,"path":path,"anchor":symbol_anchor}),
         )
         .await
@@ -733,7 +807,7 @@ async fn maximum_unicode_paths_anchors_and_symbol_names_have_bounded_resource_ur
     assert_eq!(anchored_symbol["page"]["text"], symbol["page"]["text"]);
     let found = research
         .call(
-            "w3c_symbol_search",
+            "w3c.symbol_search",
             json!({"specification":"dom","snapshot":snapshot.id,"path":path,"kind":"definition"}),
         )
         .await
@@ -783,7 +857,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
     let research = W3cResearch::new(corpus);
     let section = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","anchor":"events"}),
         )
         .await
@@ -798,7 +872,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
     );
     let symbol = research
         .call(
-            "w3c_symbol_get",
+            "w3c.symbol_get",
             json!({"specification":"dom","snapshot":snapshot.id,"name":"EventTarget","kind":"idl"}),
         )
         .await
@@ -818,7 +892,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
     );
     let found = research
         .call(
-            "w3c_symbol_search",
+            "w3c.symbol_search",
             json!({"specification":"dom","snapshot":snapshot.id,"name":"EventTarget","kind":"idl"}),
         )
         .await
@@ -827,29 +901,29 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
         found["items"][0]["symbol_index"], symbol["symbol_index"],
         "filtering cannot renumber symbols"
     );
-    let indexed=research.call("w3c_symbol_get",json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":symbol["symbol_index"]})).await.unwrap();
+    let indexed=research.call("w3c.symbol_get",json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":symbol["symbol_index"]})).await.unwrap();
     assert_eq!(indexed["page"], symbol["page"]);
     for (tool, arguments) in [
-        ("w3c_get", json!({"section_index":0})),
+        ("w3c.get", json!({"section_index":0})),
         (
-            "w3c_get",
+            "w3c.get",
             json!({"path":"index.html","section_index":0,"anchor":"events"}),
         ),
         (
-            "w3c_get",
+            "w3c.get",
             json!({"path":"index.html","section_index":0,"representation":"bytes"}),
         ),
         (
-            "w3c_get",
+            "w3c.get",
             json!({"path":"index.html","section_index":99999}),
         ),
-        ("w3c_symbol_get", json!({"symbol_index":0})),
+        ("w3c.symbol_get", json!({"symbol_index":0})),
         (
-            "w3c_symbol_get",
+            "w3c.symbol_get",
             json!({"path":"index.html","symbol_index":99999}),
         ),
         (
-            "w3c_symbol_get",
+            "w3c.symbol_get",
             json!({"path":"index.html","symbol_index":0,"name":"EventTarget"}),
         ),
     ] {
@@ -872,7 +946,7 @@ async fn resource_ordinals_preserve_legacy_selectors_and_validate_document_bound
         );
         assert!(research.read_resource(&uri).await.is_err());
     }
-    for name in ["w3c_get", "w3c_symbol_get"] {
+    for name in ["w3c.get", "w3c.symbol_get"] {
         let schema = schemas()
             .into_iter()
             .find(|schema| schema["name"] == name)
@@ -919,7 +993,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
             .await
             .unwrap();
         let research = W3cResearch::new(corpus.clone());
-        let selected=research.call("w3c_symbol_get",json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":2})).await.unwrap();
+        let selected=research.call("w3c.symbol_get",json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","symbol_index":2})).await.unwrap();
         assert_eq!(selected["name"], "EventTarget");
         let resource = research
             .read_resource(selected["resource_uri"].as_str().unwrap())
@@ -928,7 +1002,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
         assert_eq!(resource["contents"][0]["text"], selected["page"]["text"]);
         let found = research
             .call(
-                "w3c_symbol_search",
+                "w3c.symbol_search",
                 json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html","kind":"idl"}),
             )
             .await
@@ -936,7 +1010,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
         assert_eq!(found["total"], 2);
         let references = research
             .call(
-                "w3c_references",
+                "w3c.references",
                 json!({"specification":"dom","snapshot":snapshot.id,"path":"index.html"}),
             )
             .await
@@ -945,7 +1019,7 @@ async fn exact_document_symbol_and_reference_reads_do_not_load_unrelated_bad_pro
         assert!(
             research
                 .call(
-                    "w3c_symbol_search",
+                    "w3c.symbol_search",
                     json!({"specification":"dom","snapshot":snapshot.id})
                 )
                 .await
@@ -967,13 +1041,13 @@ async fn unresolved_license_is_metadata_only_even_for_retained_snapshot_and_raw_
         .unwrap();
     let research = W3cResearch::new(corpus);
     for (tool, mut input) in [
-        ("w3c_get", json!({"representation":"text"})),
-        ("w3c_get", json!({"representation":"source"})),
-        ("w3c_get", json!({"representation":"bytes"})),
-        ("w3c_search", json!({"query":"event"})),
-        ("w3c_symbol_get", json!({"name":"Event"})),
-        ("w3c_symbol_search", json!({"kind":"idl"})),
-        ("w3c_references", json!({})),
+        ("w3c.get", json!({"representation":"text"})),
+        ("w3c.get", json!({"representation":"source"})),
+        ("w3c.get", json!({"representation":"bytes"})),
+        ("w3c.search", json!({"query":"event"})),
+        ("w3c.symbol_get", json!({"name":"Event"})),
+        ("w3c.symbol_search", json!({"kind":"idl"})),
+        ("w3c.references", json!({})),
     ] {
         input["specification"] = json!("dom");
         input["snapshot"] = json!(snapshot.id);
@@ -982,7 +1056,7 @@ async fn unresolved_license_is_metadata_only_even_for_retained_snapshot_and_raw_
     }
     let comparison = research
         .call(
-            "w3c_compare",
+            "w3c.compare",
             json!({"specification":"dom","before":snapshot.id,"after":snapshot.id,"mode":"source"}),
         )
         .await
@@ -994,7 +1068,7 @@ async fn unresolved_license_is_metadata_only_even_for_retained_snapshot_and_raw_
         "unavailable"
     );
     let discovery = research
-        .call("w3c_snapshots", json!({"specification":"dom"}))
+        .call("w3c.snapshots", json!({"specification":"dom"}))
         .await
         .unwrap();
     assert!(
@@ -1012,14 +1086,14 @@ async fn copied_pages_search_symbols_comparisons_and_resources_preserve_required
     let (_root, _store, corpus, snapshot) = fixture().await;
     let research = W3cResearch::new(corpus);
     for (tool, mut input) in [
-        ("w3c_get", json!({"limit":8})),
+        ("w3c.get", json!({"limit":8})),
         (
-            "w3c_symbol_get",
+            "w3c.symbol_get",
             json!({"name":"Event","kind":"definition","limit":2}),
         ),
-        ("w3c_search", json!({"query":"dispatches"})),
-        ("w3c_symbol_search", json!({"kind":"definition"})),
-        ("w3c_references", json!({})),
+        ("w3c.search", json!({"query":"dispatches"})),
+        ("w3c.symbol_search", json!({"kind":"definition"})),
+        ("w3c.references", json!({})),
     ] {
         input["specification"] = json!("dom");
         input["snapshot"] = json!(snapshot.id);
@@ -1056,7 +1130,7 @@ async fn copied_pages_search_symbols_comparisons_and_resources_preserve_required
             );
         }
     }
-    let compare=research.call("w3c_compare",json!({"specification":"dom","before":snapshot.id,"after":snapshot.id,"mode":"symbols"})).await.unwrap();
+    let compare=research.call("w3c.compare",json!({"specification":"dom","before":snapshot.id,"after":snapshot.id,"mode":"symbols"})).await.unwrap();
     assert_eq!(compare["sources"].as_array().unwrap().len(), 2);
     assert_eq!(
         compare["before"]["source_metadata"]["derived_notice"],
@@ -1087,7 +1161,7 @@ async fn fallback_reports_latest_and_effective_editions_without_claiming_current
     view.snapshots.insert("dom".into(), snapshot.id.clone());
     store.w3c_publish_view(&view).await.unwrap();
     let output = W3cResearch::new(corpus)
-        .call("w3c_get", json!({"specification":"dom"}))
+        .call("w3c.get", json!({"specification":"dom"}))
         .await
         .unwrap();
     assert_ne!(
@@ -1134,7 +1208,7 @@ async fn partial_views_report_missing_catalog_members_even_on_zero_result_querie
     view.catalog = catalog.id.clone();
     store.w3c_publish_view(&view).await.unwrap();
     let output = W3cResearch::new(corpus)
-        .call("w3c_search", json!({"query":"no-such-fixture-term"}))
+        .call("w3c.search", json!({"query":"no-such-fixture-term"}))
         .await
         .unwrap();
     assert_eq!(output["total"], 0);
@@ -1164,14 +1238,14 @@ async fn old_catalog_cannot_present_fresh_default_content_as_current() {
     let research = W3cResearch::new(corpus);
     assert_eq!(
         research
-            .call("w3c_get", json!({"specification":"dom"}))
+            .call("w3c.get", json!({"specification":"dom"}))
             .await
             .unwrap_err()
             .code,
         "unavailable"
     );
     let historical = research
-        .call("w3c_get", json!({"specification":"dom","view":view.id}))
+        .call("w3c.get", json!({"specification":"dom","view":view.id}))
         .await
         .unwrap();
     assert_eq!(historical["selection_coverage"]["catalog_stale"], true);
@@ -1239,7 +1313,7 @@ async fn real_tr_edition_roots_and_multipage_paths_compare_without_fabricated_re
                 if let Some(path) = path {
                     input["path"] = json!(path);
                 }
-                let output = research.call("w3c_compare", input).await.unwrap();
+                let output = research.call("w3c.compare", input).await.unwrap();
                 assert_eq!(output["total"], 0, "{number} {mode} {path:?}");
             }
         }
@@ -1259,7 +1333,7 @@ async fn real_tr_edition_roots_and_multipage_paths_compare_without_fabricated_re
         assert_eq!(
             research
                 .call(
-                    "w3c_compare",
+                    "w3c.compare",
                     json!({"specification":"dom","before":sides[0].id,"after":broken.id})
                 )
                 .await
@@ -1378,7 +1452,7 @@ async fn aggregated_chapter_search_retrieval_symbols_comparison_and_resources_us
     let research = W3cResearch::new(corpus.clone());
     let found = research
         .call(
-            "w3c_search",
+            "w3c.search",
             json!({"query":"quasar","specification":"dom"}),
         )
         .await
@@ -1392,7 +1466,7 @@ async fn aggregated_chapter_search_retrieval_symbols_comparison_and_resources_us
     assert_eq!(hit["sources"][0]["copyright"], "Chapter authors 2026");
     assert_eq!(hit["citation"]["object_hash"], member.oid);
     for representation in ["text", "source", "bytes"] {
-        let detail=research.call("w3c_get",json!({"specification":"dom","snapshot":edition.id,"path":path,"representation":representation})).await.unwrap();
+        let detail=research.call("w3c.get",json!({"specification":"dom","snapshot":edition.id,"path":path,"representation":representation})).await.unwrap();
         assert_eq!(
             detail["source_metadata"]["copyright"],
             "Chapter authors 2026"
@@ -1428,7 +1502,7 @@ async fn aggregated_chapter_search_retrieval_symbols_comparison_and_resources_us
     }
     let symbol = research
         .call(
-            "w3c_symbol_get",
+            "w3c.symbol_get",
             json!({"specification":"dom","snapshot":edition.id,"name":"ChapterToken"}),
         )
         .await
@@ -1440,7 +1514,7 @@ async fn aggregated_chapter_search_retrieval_symbols_comparison_and_resources_us
     );
     let references = research
         .call(
-            "w3c_references",
+            "w3c.references",
             json!({"specification":"dom","snapshot":edition.id,"path":path}),
         )
         .await
@@ -1483,7 +1557,7 @@ async fn aggregated_chapter_search_retrieval_symbols_comparison_and_resources_us
         .w3c_put("snapshots", &changed.id, &json!(changed))
         .await
         .unwrap();
-    let compare=research.call("w3c_compare",json!({"specification":"dom","before":edition.id,"after":changed.id,"mode":"source","path":path})).await.unwrap();
+    let compare=research.call("w3c.compare",json!({"specification":"dom","before":edition.id,"after":changed.id,"mode":"source","path":path})).await.unwrap();
     assert_eq!(compare["total"], 1);
     assert_eq!(
         compare["items"][0]["before_source"]["copyright"],
@@ -1509,7 +1583,7 @@ async fn aggregated_chapter_search_retrieval_symbols_comparison_and_resources_us
         .w3c_put("snapshots", &blocked.id, &json!(blocked))
         .await
         .unwrap();
-    assert_eq!(research.call("w3c_get",json!({"specification":"dom","snapshot":blocked.id,"path":path,"representation":"bytes"})).await.unwrap_err().code,"unavailable");
+    assert_eq!(research.call("w3c.get",json!({"specification":"dom","snapshot":blocked.id,"path":path,"representation":"bytes"})).await.unwrap_err().code,"unavailable");
 }
 
 #[tokio::test]
@@ -1539,7 +1613,7 @@ async fn default_get_selects_canonical_full_tr_path_when_chapters_are_present() 
         .unwrap();
     let result = W3cResearch::new(corpus)
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"dom","snapshot":snapshot.id}),
         )
         .await

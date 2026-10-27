@@ -389,7 +389,7 @@ async fn check_whatwg(
     let snapshot = fixture_hash(WHATWG_IDENTITY);
     let detail = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"fixture","snapshot":snapshot}),
         )
         .await?;
@@ -404,14 +404,14 @@ async fn check_whatwg(
     }
     let source = research
         .call(
-            "whatwg_get",
+            "whatwg.get",
             json!({"standard":"fixture","snapshot":snapshot,"representation":"source"}),
         )
         .await?;
     if source["page"]["text"] != WHATWG_SOURCE {
         return Err("Synthetic WHATWG original source mismatch".into());
     }
-    let symbol=research.call("whatwg_symbol_get",json!({"standard":"fixture","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
+    let symbol=research.call("whatwg.symbol_get",json!({"standard":"fixture","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
     if symbol["page"]["text"] != "FixtureToken" {
         return Err("Synthetic WHATWG symbol mismatch".into());
     }
@@ -429,7 +429,7 @@ async fn check_whatwg(
     }
     let found = research
         .call(
-            "whatwg_search",
+            "whatwg.search",
             json!({"snapshot":snapshot,"query":"token"}),
         )
         .await?;
@@ -548,7 +548,7 @@ async fn check_w3c(
     let snapshot = fixture_hash(W3C_IDENTITY);
     let detail = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"fixture","snapshot":snapshot}),
         )
         .await?;
@@ -562,14 +562,14 @@ async fn check_w3c(
     }
     let source = research
         .call(
-            "w3c_get",
+            "w3c.get",
             json!({"specification":"fixture","snapshot":snapshot,"representation":"source"}),
         )
         .await?;
     if source["page"]["text"] != W3C_SOURCE {
         return Err("Synthetic W3C original source mismatch".into());
     }
-    let symbol=research.call("w3c_symbol_get",json!({"specification":"fixture","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
+    let symbol=research.call("w3c.symbol_get",json!({"specification":"fixture","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
     if symbol["page"]["text"] != "FixtureToken"
         || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
         || !symbol["derived_notice"].is_string()
@@ -592,7 +592,7 @@ async fn check_w3c(
         }
     }
     let found = research
-        .call("w3c_search", json!({"snapshot":snapshot,"query":"token"}))
+        .call("w3c.search", json!({"snapshot":snapshot,"query":"token"}))
         .await?;
     if found["total"] != 1 {
         return Err("Synthetic W3C selected search mismatch".into());
@@ -712,7 +712,7 @@ async fn check_chromium(
     let snapshot = fixture_hash(CHROMIUM_IDENTITY);
     let detail = research
         .call(
-            "chromium_get",
+            "chromium.get",
             json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot}),
         )
         .await?;
@@ -727,14 +727,14 @@ async fn check_chromium(
     }
     let source = research
         .call(
-            "chromium_get",
+            "chromium.get",
             json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"representation":"source"}),
         )
         .await?;
     if source["page"]["text"] != CHROMIUM_SOURCE {
         return Err("Synthetic CHROMIUM original source mismatch".into());
     }
-    let symbol=research.call("chromium_symbol_get",json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
+    let symbol=research.call("chromium.symbol_get",json!({"component":"src","path":"docs/fixture.html","snapshot":snapshot,"name":"FixtureToken","kind":"definition"})).await?;
     if symbol["page"]["text"] != "FixtureToken"
         || symbol["source_metadata"]["copyright"] != "Synthetic fixture authors"
         || !symbol["derived_notice"].is_string()
@@ -758,7 +758,7 @@ async fn check_chromium(
     }
     let found = research
         .call(
-            "chromium_search",
+            "chromium.search",
             json!({"snapshot":snapshot,"query":"token"}),
         )
         .await?;
@@ -859,7 +859,7 @@ async fn check_npm(
     let corpus = npm_fixture_corpus(store, root)?;
     let research = devres_adapters::npm::research::NpmResearch::new(corpus.clone());
     let versions = research
-        .call("npm_versions", json!({"name":"npm-fixture"}))
+        .call("npm.versions", json!({"name":"npm-fixture"}))
         .await?;
     if versions["total"] != 2 || versions["items"][0]["version"] != "2.0.0" {
         return Err("npm inventory changed after restart/restore".into());
@@ -867,7 +867,7 @@ async fn check_npm(
     let snapshot = versions["snapshot"]["id"].clone();
     let document = research
         .call(
-            "npm_document_get",
+            "npm.document_get",
             json!({"name":"npm-fixture","version":"1.0.0","path":"README.md","snapshot":snapshot}),
         )
         .await?;
@@ -879,7 +879,7 @@ async fn check_npm(
     }
     let matches = research
         .call(
-            "npm_advisory_lookup",
+            "npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         )
         .await?;

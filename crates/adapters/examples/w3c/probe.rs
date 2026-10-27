@@ -452,14 +452,14 @@ async fn verify_research(corpus: Arc<W3cCorpus>) -> Result<Value> {
     let view = corpus.view(None).await?;
     let research = W3cResearch::new(corpus);
     let catalog = research
-        .call("w3c_catalog_search", json!({"view":view.id,"limit":100}))
+        .call("w3c.catalog_search", json!({"view":view.id,"limit":100}))
         .await?;
     let catalog_total = catalog["total"].as_u64().ok_or_else(storage_error)?;
     if catalog_total != view.snapshots.len() as u64 || view.snapshots.is_empty() {
         return Err(Error::integrity("W3C acceptance view is incomplete."));
     }
     let selected = json!({"specification":"css-color-4","view":view.id,"limit":1024});
-    let text = research.call("w3c_get", selected.clone()).await?;
+    let text = research.call("w3c.get", selected.clone()).await?;
     if text["page"]["text"].as_str().is_none_or(str::is_empty) {
         return Err(Error::integrity("W3C acceptance text is empty."));
     }
@@ -467,13 +467,13 @@ async fn verify_research(corpus: Arc<W3cCorpus>) -> Result<Value> {
     research.read_resource(uri).await?;
     let mut bytes_input = selected;
     bytes_input["representation"] = json!("bytes");
-    let bytes = research.call("w3c_get", bytes_input).await?;
+    let bytes = research.call("w3c.get", bytes_input).await?;
     if bytes["page"]["total_bytes"].as_u64().unwrap_or(0) == 0 {
         return Err(Error::integrity("W3C acceptance raw evidence is empty."));
     }
     let search = research
         .call(
-            "w3c_search",
+            "w3c.search",
             json!({"specification":"css-color-4","view":view.id,"query":"color","limit":2}),
         )
         .await?;
@@ -485,7 +485,7 @@ async fn verify_research(corpus: Arc<W3cCorpus>) -> Result<Value> {
     }
     let symbols = research
         .call(
-            "w3c_symbol_search",
+            "w3c.symbol_search",
             json!({"specification":"css-color-4","view":view.id,"kind":"definition","limit":2}),
         )
         .await?;
@@ -495,7 +495,7 @@ async fn verify_research(corpus: Arc<W3cCorpus>) -> Result<Value> {
         .ok_or_else(|| Error::integrity("W3C acceptance definition is absent."))?;
     let symbol_uri = symbol["resource_uri"].as_str().ok_or_else(storage_error)?;
     research.read_resource(symbol_uri).await?;
-    history_with_items(|input| research.call("w3c_history", input)).await?;
+    history_with_items(|input| research.call("w3c.history", input)).await?;
     Ok(
         json!({"view":view.id,"catalog_standards":catalog_total,"default_standards":view.snapshots.len(),"text":true,"raw_bytes":true,"text_resource":true,"search":true,"definition_resource":true,"history":true,"transport":"local_adapter"}),
     )

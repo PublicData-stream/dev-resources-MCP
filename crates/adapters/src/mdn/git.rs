@@ -1961,7 +1961,7 @@ pub(crate) mod tests {
         }
         let research = corpus.research();
         let current = research
-            .call("mdn_get", json!({"slug":"Web/API/Window/fetch"}))
+            .call("mdn.get", json!({"slug":"Web/API/Window/fetch"}))
             .await
             .unwrap();
         assert!(
@@ -1971,7 +1971,7 @@ pub(crate) mod tests {
                 .contains("updatedliteral")
         );
         let snapshots = research
-            .call("mdn_snapshots", json!({"repository":"content","limit":100}))
+            .call("mdn.snapshots", json!({"repository":"content","limit":100}))
             .await
             .unwrap();
         let old = snapshots["results"]
@@ -1985,7 +1985,7 @@ pub(crate) mod tests {
             .to_owned();
         let oldest = research
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"slug":"Web/API/Window/fetch","snapshot":old,"representation":"source"}),
             )
             .await
@@ -2006,24 +2006,24 @@ pub(crate) mod tests {
         );
         let search = research
             .call(
-                "mdn_search",
+                "mdn.search",
                 json!({"query":"originalliteral","snapshot":old}),
             )
             .await
             .unwrap();
         assert_eq!(search["results"].as_array().unwrap().len(), 1);
         let present = research
-            .call("mdn_search", json!({"query":"originalliteral"}))
+            .call("mdn.search", json!({"query":"originalliteral"}))
             .await
             .unwrap();
         assert!(present["results"].as_array().unwrap().is_empty());
         let feature = research
-            .call("mdn_compat_get", json!({"feature":"api.fetch"}))
+            .call("mdn.compat_get", json!({"feature":"api.fetch"}))
             .await
             .unwrap();
         assert_eq!(feature["original"]["chrome"]["version_added"], "2");
         let history = research
-            .call("mdn_history", json!({"path":article,"limit":100}))
+            .call("mdn.history", json!({"path":article,"limit":100}))
             .await
             .unwrap();
         assert!(
@@ -2076,7 +2076,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             research
-                .call("mdn_get", json!({"slug":"Web/API/Window/fetch"}))
+                .call("mdn.get", json!({"slug":"Web/API/Window/fetch"}))
                 .await
                 .unwrap_err()
                 .code,
@@ -2084,7 +2084,7 @@ pub(crate) mod tests {
         );
         let frozen = research
             .call(
-                "mdn_history",
+                "mdn.history",
                 json!({"path":article,"history_snapshot":cutoff,"limit":100}),
             )
             .await
@@ -2097,7 +2097,7 @@ pub(crate) mod tests {
                 .any(|change| change["revision"] == deleted)
         );
         let latest = research
-            .call("mdn_history", json!({"path":article,"limit":100}))
+            .call("mdn.history", json!({"path":article,"limit":100}))
             .await
             .unwrap();
         assert!(
@@ -2109,7 +2109,7 @@ pub(crate) mod tests {
         );
         let old_body = research
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"path":article,"snapshot":old,"representation":"source"}),
             )
             .await
@@ -2132,7 +2132,7 @@ pub(crate) mod tests {
         let raw = restored
             .research()
             .call(
-                "mdn_get",
+                "mdn.get",
                 json!({"path":binary_path,"representation":"bytes"}),
             )
             .await
