@@ -27,7 +27,8 @@ async fn main() -> Result<(), ServerError> {
     let w3c_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-w3c-index");
     let chromium_rebuild =
         matches!(args.as_slice(),[command,_] if command=="rebuild-chromium-index");
-    let args = if mdn_rebuild || whatwg_rebuild || w3c_rebuild || chromium_rebuild {
+    let npm_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-npm-index");
+    let args = if mdn_rebuild || whatwg_rebuild || w3c_rebuild || chromium_rebuild || npm_rebuild {
         vec![args[1].clone()]
     } else {
         args
@@ -39,7 +40,7 @@ async fn main() -> Result<(), ServerError> {
         [command,path] if command=="rebuild-crate-index" => (false,false,None,Some(("rebuild",None)),path),
         [command,path,flag,hash] if command=="import-crate-corpus" && flag=="--manifest" => (false,false,None,Some(("import",Some(hash.as_str()))),path),
         [command, path, flag, budget] if command == "import-rfcs" && flag == "--max-bytes" => (false, false, Some(budget.parse::<u64>().map_err(|_| "invalid RFC import byte budget")?), None, path),
-        _ => return Err("usage: devres-server CONFIG.toml | refresh-advisories CONFIG.toml | rebuild-rfc-index CONFIG.toml | rebuild-crate-index CONFIG.toml | rebuild-mdn-index CONFIG.toml | rebuild-whatwg-index CONFIG.toml | rebuild-w3c-index CONFIG.toml | rebuild-chromium-index CONFIG.toml | import-crate-corpus CONFIG.toml --manifest SHA256 | import-rfcs CONFIG.toml --max-bytes N".into()),
+        _ => return Err("usage: devres-server CONFIG.toml | refresh-advisories CONFIG.toml | rebuild-rfc-index CONFIG.toml | rebuild-crate-index CONFIG.toml | rebuild-mdn-index CONFIG.toml | rebuild-whatwg-index CONFIG.toml | rebuild-w3c-index CONFIG.toml | rebuild-chromium-index CONFIG.toml | rebuild-npm-index CONFIG.toml | import-crate-corpus CONFIG.toml --manifest SHA256 | import-rfcs CONFIG.toml --max-bytes N".into()),
     };
     let config = Config::load(Path::new(config_path)).await?;
     let store = Arc::new(
@@ -49,9 +50,12 @@ async fn main() -> Result<(), ServerError> {
         )
         .await?,
     );
-    let broker = Arc::new(devres_adapters::bulk::BulkBroker::new(
-        config.crates.bulk_config(),
-    )?);
+    let broker = Arc::new(
+        devres_adapters::bulk::BulkBroker::new(config.crates.bulk_config())?.with_npm_rates(
+            config.npm.registry_requests_per_second,
+            config.npm.advisory_requests_per_second,
+        )?,
+    );
     let fetcher = Arc::new(devres_adapters::HttpFetcher::with_broker(broker.clone())?);
     let retrieval = Arc::new(devres_application::Retrieval::new(store.clone(), fetcher));
     let corpus = Arc::new(devres_adapters::RfcCorpus::new(
@@ -77,6 +81,26 @@ async fn main() -> Result<(), ServerError> {
         &config.storage.blob_dir,
         config.rustsec.clone(),
     )?);
+    let npm_corpus = Arc::new(devres_adapters::NpmCorpus::new(
+        store.clone(),
+        broker.clone(),
+        &config.storage.blob_dir,
+        config.npm.clone(),
+    )?);
+    npm_corpus.initialize_status().await?;
+    if npm_rebuild {
+        let shutdown = CancellationToken::new();
+        let signal = shutdown.clone();
+        let task = tokio::spawn(async move {
+            shutdown_signal().await;
+            signal.cancel();
+        });
+        let result = npm_corpus.rebuild_index(shutdown).await;
+        task.abort();
+        let _ = task.await;
+        println!("{}", result?);
+        return Ok(());
+    }
     let mdn_corpus = Arc::new(devres_adapters::MdnCorpus::new(
         store.clone(),
         broker.clone(),
@@ -166,7 +190,8 @@ async fn main() -> Result<(), ServerError> {
             .with_mdn_research(mdn_corpus.research())
             .with_whatwg_corpus(whatwg_corpus.clone())
             .with_w3c_corpus(w3c_corpus.clone())
-            .with_chromium_corpus(chromium_corpus.clone()),
+            .with_chromium_corpus(chromium_corpus.clone())
+            .with_npm_corpus(npm_corpus.clone()),
     );
     if let Some((command, manifest)) = crate_command {
         let shutdown = CancellationToken::new();
@@ -217,6 +242,9 @@ async fn main() -> Result<(), ServerError> {
     })?;
     server.register_worker("crate-collector", move |shutdown| async move {
         crate_corpus.run(shutdown).await.map_err(Into::into)
+    })?;
+    server.register_worker("npm-collector", move |shutdown| async move {
+        npm_corpus.run(shutdown).await.map_err(Into::into)
     })?;
     let current = advisory_corpus.clone();
     server.register_worker("rustsec-current", move |shutdown| async move {

@@ -322,6 +322,8 @@ pub struct Config {
     pub w3c: devres_adapters::W3cConfig,
     #[serde(default)]
     pub chromium: devres_adapters::ChromiumConfig,
+    #[serde(default)]
+    pub npm: devres_adapters::NpmConfig,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
@@ -333,6 +335,7 @@ impl Config {
         self.whatwg.validate()?;
         self.w3c.validate()?;
         self.chromium.validate()?;
+        self.npm.validate()?;
         for access in [
             AccessPolicy {
                 allowed_hosts: self.http.allowed_hosts.clone(),
@@ -440,6 +443,34 @@ mod tests {
                     .is_err()
             );
         }
+    }
+    #[test]
+    fn npm_catalog_and_advisory_configuration_remain_separate() {
+        let defaults: devres_adapters::NpmConfig = toml::from_str("").unwrap();
+        assert!(defaults.enabled && defaults.advisories_enabled && defaults.packages.is_empty());
+        defaults.validate().unwrap();
+        let configured: devres_adapters::NpmConfig =
+            toml::from_str("packages=['@types/is-number']\nadvisories_enabled=false").unwrap();
+        configured.validate().unwrap();
+        assert!(!configured.advisories_enabled);
+        for invalid in [
+            "registry_requests_per_second=0",
+            "packages=['same','same']",
+            "packages=['https://example.test']",
+            "min_free_bytes=1",
+        ] {
+            assert!(
+                toml::from_str::<devres_adapters::NpmConfig>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            toml::from_str::<devres_adapters::NpmConfig>("registry='https://untrusted.invalid'")
+                .is_err()
+        );
     }
     #[test]
     fn chromium_configuration_is_automatic_and_has_no_caller_destinations() {

@@ -1,5 +1,10 @@
 # Sources and upstream policy
 
+The additive [npm provider profile](npm.md) defines public registry metadata and
+verified tarball access, an explicit package catalog, independent OSV npm export
+collection, original licensing, conservative shared clocks and local lockfile
+matching. npm audit/security endpoints and linked documentation sites are not sources.
+
 All provider URLs are constructed by trusted adapters. The HTTP adapter rejects
 arbitrary schemes, hosts, credentials, ports, fragments, escaped paths, and redirects.
 Requests identify the application and repository. One adapter owns retries: at most

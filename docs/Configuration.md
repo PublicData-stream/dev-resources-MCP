@@ -368,3 +368,33 @@ a fixed total-history cutoff. See [Chromium](chromium.md) for coverage and prove
 Schema 8 adds isolated Chromium evidence and state. Back up raw artifacts, immutable
 inventories/projections, checkpoints, and indexes together. Rebuild/restore does not
 advance source validation times.
+
+## npm defaults
+
+Omitting `[npm]` enables collection with an empty public package catalog and an
+independent OSV npm advisory lane. `enabled=false` pauses both lanes while retained
+research remains readable. `advisories_enabled=false` pauses only advisory refresh.
+Disposable harnesses explicitly disable npm collection. Retrieval and audits never
+add packages to the operator catalog.
+
+| `npm` field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Supervised collection |
+| `packages` | `[]` | Exact public scoped/unscoped package names |
+| `advisories_enabled` | `true` | Independent OSV npm export collection |
+| `metadata_refresh_secs` | `3600` | Catalog metadata validation target |
+| `advisory_refresh_secs` | `3600` | Advisory export validation target |
+| `collection_interval_secs` | `1` | Delay between resumable iterations |
+| `publication_interval_secs` | `300` | Research publication batching target |
+| `max_processing_workers` | `1` | Processing admission ceiling, 1..2 |
+| `registry_requests_per_second` | `1` | Shared foreground/background registry clock |
+| `advisory_requests_per_second` | `1` | OSV host clock |
+| `min_free_bytes` | `1073741824` | Free-space reserve |
+| `max_archive_storage_bytes` | omitted | Optional permanent npm artifact quota |
+
+Intervals accept 1..31,622,400 seconds and rates 1..1,000 attempts/second.
+Operators must respect provider policy before changing defaults. The reserve is at
+least 64 MiB and a supplied quota must be at least the reserve. Limits pause new
+work without removing retained evidence. The artifact quota excludes PostgreSQL
+and derived indexes. Schema 9 and processing/privacy limits are described in
+[npm](npm.md).

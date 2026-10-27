@@ -20,6 +20,9 @@ pub struct Research {
     whatwg_research: Option<Arc<crate::whatwg_research::WhatwgResearch>>,
     w3c_research: Option<Arc<crate::w3c_research::W3cResearch>>,
     chromium_research: Option<Arc<crate::chromium_research::ChromiumResearch>>,
+    npm: crate::npm::NpmPackages,
+    npm_corpus: Option<Arc<crate::NpmCorpus>>,
+    npm_research: Option<Arc<crate::npm_research::NpmResearch>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -105,6 +108,9 @@ pub(crate) fn text_page(text: &str, offset: usize, limit: usize) -> Result<Value
 impl Research {
     pub async fn new(retrieval: Arc<Retrieval>) -> Result<Self> {
         Ok(Self {
+            npm: crate::npm::NpmPackages::new(retrieval.clone()),
+            npm_corpus: None,
+            npm_research: None,
             advisory: advisory::Advisories::new(retrieval.clone()),
             advisory_research: None,
             retrieval,
@@ -161,7 +167,41 @@ impl Research {
         self
     }
 
+    pub fn with_npm_corpus(mut self, corpus: Arc<crate::NpmCorpus>) -> Self {
+        self.npm_research = Some(Arc::new(crate::npm_research::NpmResearch::new(
+            corpus.clone(),
+        )));
+        self.npm_corpus = Some(corpus);
+        self
+    }
+
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        if crate::npm::schemas()
+            .iter()
+            .any(|schema| schema["name"] == tool)
+        {
+            return self.npm.call(tool, input).await;
+        }
+        if tool == "npm_audit_lockfile" {
+            return crate::npm_audit::audit(
+                input,
+                self.npm_corpus
+                    .clone()
+                    .ok_or_else(|| Error::unavailable("npm advisory storage is not configured."))?,
+            )
+            .await;
+        }
+        if crate::npm_research::schemas()
+            .iter()
+            .any(|schema| schema["name"] == tool)
+        {
+            return self
+                .npm_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("npm corpus storage is not configured."))?
+                .call(tool, input)
+                .await;
+        }
         if crate::chromium_research::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
@@ -271,8 +311,8 @@ impl Research {
             limit: input.limit,
         }
         .checked()?;
-        if input.sources.is_empty() || input.sources.len() > 7 {
-            return Err(Error::invalid("Select one to seven sources."));
+        if input.sources.is_empty() || input.sources.len() > 8 {
+            return Err(Error::invalid("Select one to eight sources."));
         }
         let mut results = Vec::new();
         let mut unique = std::collections::HashSet::new();
@@ -281,6 +321,14 @@ impl Research {
                 return Err(Error::invalid("Duplicate search source."));
             }
             let output = match source.as_str() {
+                "npm" => {
+                    self.npm
+                        .call(
+                            "npm_search",
+                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                        )
+                        .await
+                }
                 "rfc" => {
                     rfc::search(
                         &self.retrieval,
@@ -349,7 +397,7 @@ impl Research {
                 },
                 _ => {
                     return Err(Error::invalid(
-                        "Search sources are rfc, cargo, rustsec, mdn, whatwg, w3c, and chromium.",
+                        "Search sources are rfc, cargo, rustsec, mdn, whatwg, w3c, chromium, and npm.",
                     ));
                 }
             };
@@ -362,6 +410,16 @@ impl Research {
     }
 
     async fn fetch(&self, input: FetchInput) -> Result<Value> {
+        if let Some(id) = input.id.strip_prefix("npm:") {
+            let (name, version) = id
+                .rsplit_once('@')
+                .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+                .ok_or_else(|| Error::invalid("npm IDs use npm:<name>@<version>."))?;
+            return self
+                .npm
+                .call("npm_metadata", json!({"name":name,"version":version}))
+                .await;
+        }
         if let Some(id) = input.id.strip_prefix("chromium:") {
             let (document, anchor) = id.split_once('#').map_or((id, None), |(s, a)| (s, Some(a)));
             let (component, path) = document.split_once('/').ok_or_else(|| {
@@ -496,6 +554,20 @@ impl Research {
                 .chromium_research
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("Chromium corpus storage is not configured."))?
+                .read_resource(uri)
+                .await;
+        }
+        if url.host_str() == Some("npm-source") {
+            return self
+                .npm
+                .call("npm_source_read", crate::npm::source_input_from_uri(uri)?)
+                .await;
+        }
+        if url.host_str() == Some("npm") {
+            return self
+                .npm_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("npm corpus storage is not configured."))?
                 .read_resource(uri)
                 .await;
         }
@@ -659,12 +731,12 @@ fn schemas() -> Vec<Value> {
     add(
         "search",
         "Search RFC metadata, crates.io packages, RustSec advisories, local MDN documents, WHATWG or W3C standards. Sources are independent; errors and freshness are explicit.",
-        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium"]},"minItems":1,"maxItems":7,"uniqueItems":true},"offset":offset,"limit":limit}),
+        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium","npm"]},"minItems":1,"maxItems":8,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(
         "fetch",
-        "Retrieve rfc:<number>, crate:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, w3c:<shortname>#<anchor>, chromium:<component>/<path>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
+        "Retrieve rfc:<number>, crate:<name>@<version>, npm:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, w3c:<shortname>#<anchor>, chromium:<component>/<path>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
         json!({"id":{"type":"string","minLength":1,"maxLength":16384},"offset":text_offset,"limit":text_limit}),
         vec!["id"],
     );
@@ -723,6 +795,9 @@ fn schemas() -> Vec<Value> {
     tools.extend(crate::whatwg_research::schemas());
     tools.extend(crate::w3c_research::schemas());
     tools.extend(crate::chromium_research::schemas());
+    tools.extend(crate::npm::schemas());
+    tools.extend(crate::npm_research::schemas());
+    tools.extend(crate::npm_audit::schemas());
     tools
 }
 #[derive(Deserialize)]

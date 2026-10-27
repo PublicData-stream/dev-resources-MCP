@@ -1,5 +1,10 @@
 # Operations and acceptance
 
+The [npm module](npm.md) adds schema 9, public catalog/advisory acquisition and
+local npm/pnpm/Yarn assessment. Include npm evidence and search data in coordinated
+backups. Private maintenance uses `devres-server rebuild-npm-index CONFIG.toml`
+with serving stopped and the same ownership fence as other rebuild commands.
+
 ## Local gates
 
 From the repository root, use the pinned toolchain and a working Docker daemon.

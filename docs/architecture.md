@@ -1,5 +1,11 @@
 # Architecture
 
+The [npm module](npm.md) follows the same dependency direction and ownership fence.
+Application ports admit public evidence and operator scheduling state; request-only
+npm/pnpm/Yarn input stays in a bounded sibling audit process. Package and advisory
+snapshots publish independently through schema 9. Public resources never identify
+caller inventories or reports.
+
 The domain crate owns source/capture/request/error representations. Application owns
 retrieval policy and Store, Fetcher, Clock ports. Adapters implement fixed-source
 HTTPS, PostgreSQL/blob persistence, pure source parsers, archive inspection, and

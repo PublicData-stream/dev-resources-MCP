@@ -7,7 +7,8 @@ systems. Reads may populate internal public-source caches and permanent archives
 It supports RFC metadata/text, crates.io metadata/published sources, local package
 and API research from crates.io/docs.rs captures, MDN content/browser compatibility,
 RustSec advisories, WHATWG and W3C standards, Chromium/Chrome documentation, and supplied
-Cargo.lock matching. No public administrative operations,
+Cargo.lock matching. Public npm package research and request-only npm/pnpm/Yarn
+lockfile matching are described in [npm](npm.md). No public administrative operations,
 package execution, dependency resolution, arbitrary URL fetching, or user accounts
 are exposed. Missing or unsupported coverage is explicit.
 
@@ -39,7 +40,7 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 | Tool | Inputs and result |
 | --- | --- |
 | `server_info` | Identity, supported revisions, licensing and corresponding-source URL |
-| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
+| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium`/`npm` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
 | `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, `w3c:<shortname>#<anchor>`, or immutable `devres://` resource URI |
 | `rfc_search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc_get` | RFC number and byte page; published text |
