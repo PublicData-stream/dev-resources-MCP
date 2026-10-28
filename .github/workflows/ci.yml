@@ -15,6 +15,9 @@ permissions:
   contents: read
 env:
   RELEASE_TAG: ${{ inputs.release-tag || '' }}
+  TMPDIR: /tmp
+  PYTHONDONTWRITEBYTECODE: '1'
+  CARGO_TARGET_DIR: /buildcache/rust/target
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -43,7 +46,9 @@ jobs:
           scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA"
           python3 scripts/release_contract.py stamp --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
       - name: Isolate pinned toolchain
-        run: echo "RUSTUP_HOME=$RUNNER_TEMP/devres-rustup" >> "$GITHUB_ENV"
+        run: |
+          echo "RUSTUP_HOME=/tmp/devres-rustup" >> "$GITHUB_ENV"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /buildcache/rust/target
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       - name: Verify native architecture
         env:
@@ -62,6 +67,8 @@ jobs:
         run: scripts/test-image.sh --platform "$PLATFORM"
       - name: Install OCI artifact tools
         run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Exercise anonymous registry acceptance with local fixtures
+        run: python3 scripts/test-release-registry.py
       - name: Build and smoke separate native images
         env:
           PLATFORM: linux/${{ matrix.arch }}
@@ -73,11 +80,11 @@ jobs:
           for target in server probe audit-worker; do
             scripts/test-image.sh --platform "$PLATFORM" --target "$target" \
               --revision "$GITHUB_SHA" --version "$version" \
-              --oci-output "$RUNNER_TEMP/oci-images/$target"
+              --oci-output "/tmp/devres-ci-oci-images/$target"
             if [[ -n $RELEASE_TAG ]]; then
-              python3 scripts/release_images.py verify --directory "$RUNNER_TEMP/oci-images/$target" \
+              python3 scripts/release_images.py verify --directory "/tmp/devres-ci-oci-images/$target" \
                 --target "$target" --arch "${PLATFORM#linux/}" --tag "$RELEASE_TAG" \
-                --commit "$GITHUB_SHA" --output "$RUNNER_TEMP/verified-$target.json"
+                --commit "$GITHUB_SHA" --output "/tmp/devres-ci-verified-$target.json"
             fi
           done
       - name: Retain tested release images
@@ -85,7 +92,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: oci-images-${{ matrix.arch }}
-          path: ${{ runner.temp }}/oci-images/
+          path: /tmp/devres-ci-oci-images/
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -103,7 +110,10 @@ jobs:
         run: |
           scripts/verify-release-tag.sh "$RELEASE_TAG" "$GITHUB_SHA"
           python3 scripts/release_contract.py stamp --tag "$RELEASE_TAG" --commit "$GITHUB_SHA"
-      - run: echo "RUSTUP_HOME=$RUNNER_TEMP/devres-rustup" >> "$GITHUB_ENV"
+      - name: Isolate pinned toolchain
+        run: |
+          echo "RUSTUP_HOME=/tmp/devres-rustup" >> "$GITHUB_ENV"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /buildcache/rust/target
       - run: rustup toolchain install 1.99.1 --profile minimal
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo install cargo-deny --version 0.20.2 --locked

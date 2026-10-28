@@ -48,14 +48,99 @@ jobs:
           path: ${{ env.RELEASE_SCRATCH }}/source/
           if-no-files-found: error
           retention-days: 7
-  ci:
+  discover-ci:
+    name: Find recent complete CI for release revision
     needs: contract
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.lookup.outputs.reuse }}
+      run_id: ${{ steps.lookup.outputs.run_id }}
+      attempt: ${{ steps.lookup.outputs.attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.contract.outputs.revision }}
+      - name: Verify complete main-push CI attempt
+        id: lookup
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
+        run: python3 scripts/select_release_ci.py
+  ci:
+    name: Fresh complete release CI
+    needs: [contract, discover-ci]
+    if: needs.discover-ci.outputs.reuse == 'false'
     uses: ./.github/workflows/ci.yml
     with:
       release-tag: ${{ needs.contract.outputs.tag }}
+  release-images:
+    name: Test stamped release images (${{ matrix.arch }})
+    needs: [contract, discover-ci]
+    if: needs.discover-ci.outputs.reuse == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.contract.outputs.revision }}
+          fetch-depth: 0
+      - name: Isolate pinned toolchain
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          echo "RUSTUP_HOME=$RELEASE_SCRATCH/rustup" >> "$GITHUB_ENV"
+      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.37.1
+      - name: Build and smoke exact native release artifacts
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+          RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
+        run: scripts/build-release-images.sh "$PLATFORM" "$RELEASE_SCRATCH/oci-images" "$RELEASE_TAG" "$RELEASE_REVISION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oci-images-${{ matrix.arch }}
+          path: ${{ env.RELEASE_SCRATCH }}/oci-images/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+  ci-gate:
+    name: Require complete CI and stamped artifacts
+    needs: [contract, discover-ci, ci, release-images]
+    if: ${{ !cancelled() && needs.contract.result == 'success' && needs.discover-ci.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.contract.outputs.revision }}
+      - name: Require exactly one successful production path
+        env:
+          REUSE_CI: ${{ needs.discover-ci.outputs.reuse }}
+          REUSED_RUN: ${{ needs.discover-ci.outputs.run_id }}
+          REUSED_ATTEMPT: ${{ needs.discover-ci.outputs.attempt }}
+          FRESH_CI_RESULT: ${{ needs.ci.result }}
+          RELEASE_IMAGES_RESULT: ${{ needs.release-images.result }}
+        run: python3 scripts/release_ci_gate.py
   platforms:
-    needs: [contract, ci]
-    if: github.repository == 'PublicData-stream/dev-resources-MCP'
+    needs: [contract, ci-gate]
+    if: ${{ !cancelled() && github.repository == 'PublicData-stream/dev-resources-MCP' && needs.contract.result == 'success' && needs.ci-gate.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -121,7 +206,7 @@ jobs:
           retention-days: 7
   indexes:
     needs: [contract, platforms]
-    if: github.repository == 'PublicData-stream/dev-resources-MCP'
+    if: ${{ !cancelled() && github.repository == 'PublicData-stream/dev-resources-MCP' && needs.contract.result == 'success' && needs.platforms.result == 'success' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
@@ -178,9 +263,43 @@ jobs:
           path: ${{ env.RELEASE_SCRATCH }}/digests/
           if-no-files-found: error
           retention-days: 30
-  source-release:
+  acceptance:
+    name: Verify provenance and complete anonymous pulls
     needs: [contract, indexes]
-    if: github.repository == 'PublicData-stream/dev-resources-MCP'
+    if: ${{ !cancelled() && github.repository == 'PublicData-stream/dev-resources-MCP' && needs.contract.result == 'success' && needs.indexes.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.contract.outputs.revision }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: ${{ env.RELEASE_SCRATCH }}/digests
+          merge-multiple: true
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Accept all index and platform digests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REVISION: ${{ needs.contract.outputs.revision }}
+        run: |
+          python3 scripts/verify-release-images.py --digests "$RELEASE_SCRATCH/digests" \
+            --tag "$RELEASE_TAG" --commit "$RELEASE_REVISION" \
+            --output "$RELEASE_SCRATCH/ghcr-release-digests.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ghcr-release-digests
+          path: ${{ env.RELEASE_SCRATCH }}/ghcr-release-digests.json
+          if-no-files-found: error
+          retention-days: 30
+  source-release:
+    needs: [contract, acceptance]
+    if: ${{ !cancelled() && github.repository == 'PublicData-stream/dev-resources-MCP' && needs.contract.result == 'success' && needs.acceptance.result == 'success' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:

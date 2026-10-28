@@ -21,6 +21,15 @@ The upstream contributors retain their rights. Adaptation removes legal-data,
 widget, and product composition and connects developer-resource operations.
 The complete AGPL license is in [LICENSE](LICENSE).
 
+## OpenLegal release workflow adaptation
+
+The release CI selector and publication flow were adapted from
+[OpenLegal at 90dc7fcf](https://github.com/PublicData-stream/openlegal4everyoneMCP/tree/90dc7fcf91db6a1361ab8362466be763921fb826),
+revision `90dc7fcf91db6a1361ab8362466be763921fb826`, AGPL-3.0-only.
+The adaptation retains this repository's native OCI artifact promotion and
+corresponding-source distribution, with developer-resource image families and CI
+job completeness checks. Upstream contributors retain their rights.
+
 ## OxiBelt reference
 
 Contributor orientation and delegation principles refer to

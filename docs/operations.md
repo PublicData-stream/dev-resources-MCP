@@ -199,9 +199,15 @@ publication. Existing `v`-prefixed tags are not accepted by the new release tool
 
 Main retains Cargo version `0.0.0`. Each release CI checkout stamps the version
 into first-party manifests, path dependencies, lock entries and exact
-license exceptions. Third-party resolutions are unchanged. Fresh full CI and all
-six separate image gates must succeed before registry-writing jobs start. The
-tested OCI artifacts are promoted without rebuilding. Immutable platform tags
+license exceptions. Third-party resolutions are unchanged. Publication reuses only
+the newest complete successful main-push CI attempt for the exact commit within
+24 hours. All ten expanded jobs, including both architectures and both edge
+scenarios, must have succeeded in that same attempt. Stale, incomplete, failed,
+ambiguous or unavailable evidence requires fresh full stamped release CI.
+When ordinary CI is reused, separate native jobs build and smoke the six stamped
+release images; fresh release CI already produces those artifacts. An explicit
+gate requires exactly one successful path before any registry-writing job starts.
+The tested OCI artifacts are promoted without rebuilding. Immutable platform tags
 `VERSION-amd64` and `VERSION-arm64` support an index at `VERSION`, where `VERSION`
 is the complete unprefixed Git tag. Matching artifact retries are idempotent;
 conflicting tags/assets fail rather than overwrite. A partial publication is not a
@@ -223,11 +229,17 @@ accessible offer for this exact corresponding source before independent deployme
 
 Before the first independently authorized publication, verify organization package
 permissions and set all three GHCR packages public (new packages default private).
-After publication, verify native job completion, provenance, source assets, index
-and platform digests, and anonymous pulls of both platforms. An authenticated pull
-alone does not prove public availability. CI retains tested image/source artifacts
-for seven days and index-digest artifacts for thirty days; published GitHub Release
-assets remain the durable corresponding-source distribution. Never delete retained
+After platform/index publication, workflow acceptance verifies all three version
+indexes and all six platform provenance statements, binding the source commit,
+tag and publishing workflow. Explicit anonymous Skopeo copies download every
+platform image into fresh isolated storage and check manifest/config/layer content
+and source labels without executing the images. Only complete acceptance produces
+the combined `ghcr-release-digests` artifact and allows corresponding-source
+completion. Failures leave partial publication; stable/beta GitHub Releases already
+exist at that point. Authenticated pulls or manifest inspection alone do not prove
+complete public downloads. CI retains tested image/source artifacts for seven days
+and index/accepted-digest artifacts for thirty days; published GitHub Release assets
+remain the durable corresponding-source distribution. Never delete retained
 public captures as part of image/test cleanup. Roll back a deployment by selecting
 a previously verified digest through a separately authorized deployment operation.
 
