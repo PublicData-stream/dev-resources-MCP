@@ -252,8 +252,13 @@ workflow appends missing assets after image acceptance, preserves matching asset
 and human-written release metadata, and rejects conflicts without replacing them.
 All existing required assets are checked before uploading any missing asset.
 Immutable stable/beta Releases are rejected before registry publication. Build
-candidates retain draft creation, asset upload, and prerelease publication. The source archive includes the exact stamped
-manifests used for building; the ordinary Git tag archive retains placeholders.
+candidates retain draft creation, asset upload, and prerelease publication. Since
+the by-tag REST lookup only returns published Releases, build publication also
+searches the authenticated, fully paginated Release inventory before creating a
+draft. Retries resume a matching draft, and subsequent checks use its captured
+numeric ID. Failed or ambiguous discovery rejects publication. The source archive
+includes the exact stamped manifests used for building; the ordinary Git tag
+archive retains placeholders.
 Build the extracted archive with `docker build --target server .`; when using
 `scripts/test-image.sh` to build it, supply `--revision` and `--version` from
 `release.json` because the archive has no Git history.

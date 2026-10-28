@@ -1,5 +1,6 @@
 """Offline corresponding-source and append-only GitHub Release contracts."""
 import copy
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
@@ -17,6 +18,8 @@ with patch.object(sys, "path", [str(scripts), *sys.path]):
     spec.loader.exec_module(release)
 
 GET_RELEASE = release.get_release
+COMMAND = release.command
+FETCH_RELEASE = release.fetch_release
 
 
 class SourceReleaseTests(unittest.TestCase):
@@ -40,9 +43,11 @@ class SourceReleaseTests(unittest.TestCase):
         self.remote = self.fixture_release(complete=False)
         self.calls = []
         self.fences = []
+        self.api_reads = []
         self.addCleanup(patch.stopall)
         patch.object(release, "get_release", side_effect=lambda tag: copy.deepcopy(self.remote)).start()
         patch.object(release, "check", side_effect=self.fence).start()
+        patch.object(release, "fetch_release", side_effect=lambda identity: copy.deepcopy(self.remote)).start()
         patch.object(release, "command", side_effect=self.command).start()
 
     def write_metadata(self):
@@ -83,6 +88,7 @@ class SourceReleaseTests(unittest.TestCase):
             path = Path(arguments[3])
             self.remote["assets"].append({"name": path.name, "digest": "sha256:" + release.checksum(path)})
         elif arguments[:2] == ("release", "edit"):
+            self.assertEqual(len(self.remote["assets"]), 6)
             self.remote["draft"] = False
         elif arguments[:2] == ("release", "download"):
             path = arguments[arguments.index("--pattern") + 1]
@@ -188,6 +194,18 @@ class SourceReleaseTests(unittest.TestCase):
                         self.publish()
                 self.assertFalse(self.calls)
 
+    def test_build_id_rechecks_reject_identity_changes_before_upload(self):
+        self.build()
+        self.remote = self.fixture_release(draft=True, complete=False)
+        for field, value in (("id", 43), ("id", True), ("tag_name", "different"),
+                             ("draft", False), ("prerelease", False), ("immutable", True)):
+            with self.subTest(field=field, value=value), patch.object(release, "fetch_release", return_value={
+                    **self.remote, field: value}) as fetch:
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    self.publish()
+                fetch.assert_called_once_with("42")
+                self.assertFalse(self.calls)
+
     def test_immutable_build_missing_assets_is_rejected(self):
         self.build()
         self.remote = self.fixture_release(complete=False)
@@ -209,11 +227,126 @@ class SourceReleaseTests(unittest.TestCase):
         self.publish()
         self.assertEqual([call[:2] for call in self.calls], [("release", "download")] * 2)
 
-    def test_http_403_is_not_absence(self):
-        forbidden = subprocess.CompletedProcess([], 1, b"", b"gh: Forbidden (HTTP 403)")
-        with patch.object(release.subprocess, "run", return_value=forbidden):
-            with self.assertRaisesRegex(ValueError, "existing GitHub Release state"):
+    def github_transport(self, fail_after_upload=False):
+        def by_tag(arguments, **kwargs):
+            self.assertEqual(arguments, ["gh", "api", f"repos/{release.REPOSITORY}/releases/tags/{self.tag}"])
+            if self.remote is None or self.remote["draft"]:
+                return subprocess.CompletedProcess(arguments, 1, b"", b"gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(self.remote).encode(), b"")
+
+        def execute(arguments):
+            if arguments[1] == "api":
+                self.api_reads.append(tuple(arguments[2:]))
+                endpoint = arguments[2]
+                if endpoint.endswith("/releases?per_page=100"):
+                    self.assertIn("--paginate", arguments)
+                    self.assertIn("--slurp", arguments)
+                    return json.dumps([[{"id": 1, "tag_name": "older"}],
+                                       [self.remote] if self.remote else []]).encode()
+                self.assertEqual(endpoint, f"repos/{release.REPOSITORY}/releases/42")
+                if fail_after_upload and self.calls and self.calls[-1][:2] == ("release", "upload"):
+                    raise subprocess.CalledProcessError(1, arguments, stderr=b"HTTP 404")
+                return json.dumps(self.remote).encode()
+            return self.command(*arguments[1:])
+
+        stack = ExitStack()
+        stack.enter_context(patch.object(release, "get_release", GET_RELEASE))
+        stack.enter_context(patch.object(release, "command", COMMAND))
+        stack.enter_context(patch.object(release, "fetch_release", FETCH_RELEASE))
+        stack.enter_context(patch.object(release.subprocess, "run", side_effect=by_tag))
+        stack.enter_context(patch.object(release.subprocess, "check_output", side_effect=execute))
+        return stack
+
+    def test_draft_lookup_supports_fresh_and_resumed_build_publication(self):
+        self.build()
+        for fresh in (True, False):
+            with self.subTest(fresh=fresh):
+                self.calls.clear()
+                self.api_reads.clear()
+                self.remote = None if fresh else self.fixture_release(draft=True, complete=False)
+                with self.github_transport():
+                    self.publish()
+                mutations = [call[:2] for call in self.calls]
+                self.assertEqual(mutations, ([("release", "create")] if fresh else [])
+                                 + [("release", "upload")] * 6 + [("release", "edit")])
+                self.assertFalse(self.remote["draft"])
+                self.assertEqual(sum("--paginate" in read for read in self.api_reads), 2 if fresh else 1)
+                self.assertTrue(any(read[0].endswith("/releases/42") for read in self.api_reads))
+
+    def test_disappearing_draft_stops_without_recreation_or_publication(self):
+        self.build()
+        self.remote = self.fixture_release(draft=True, complete=False)
+        with self.github_transport(fail_after_upload=True):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.publish()
+        self.assertEqual([call[:2] for call in self.calls], [("release", "upload")])
+        self.assertTrue(self.remote["draft"])
+
+
+class ReleaseLookupTests(unittest.TestCase):
+    tag = "1.2.3-build.abcdef12"
+
+    def setUp(self):
+        self.remote = {"id": 42, "tag_name": self.tag, "draft": True,
+                       "prerelease": True, "immutable": False, "assets": []}
+        self.not_found = subprocess.CompletedProcess([], 1, b"", b"gh: Not Found (HTTP 404)")
+
+    def lookup(self, pages, detail=None):
+        responses = [json.dumps(pages).encode(), json.dumps(self.remote if detail is None else detail).encode()]
+        with patch.object(release.subprocess, "run", return_value=self.not_found), \
+             patch.object(release.subprocess, "check_output", side_effect=responses):
+            return GET_RELEASE(self.tag)
+
+    def test_published_release_uses_by_tag_without_listing(self):
+        response = subprocess.CompletedProcess([], 0, json.dumps(self.remote).encode(), b"")
+        with patch.object(release.subprocess, "run", return_value=response), \
+             patch.object(release.subprocess, "check_output") as fallback:
+            self.assertEqual(GET_RELEASE(self.tag), self.remote)
+        fallback.assert_not_called()
+
+    def test_draft_on_later_page_is_fetched_by_numeric_id(self):
+        with patch.object(release.subprocess, "run", return_value=self.not_found), \
+             patch.object(release.subprocess, "check_output", side_effect=[
+                 json.dumps([[{"id": 1, "tag_name": "older"}], [self.remote]]).encode(),
+                 json.dumps(self.remote).encode()]) as api:
+            self.assertEqual(GET_RELEASE(self.tag), self.remote)
+        self.assertEqual(api.call_args_list[0].args[0], ["gh", "api",
+                         f"repos/{release.REPOSITORY}/releases?per_page=100", "--paginate", "--slurp"])
+        self.assertEqual(api.call_args_list[1].args[0], ["gh", "api",
+                         f"repos/{release.REPOSITORY}/releases/42"])
+
+    def test_absence_requires_successful_exhaustive_listing(self):
+        for pages in ([[]], [[{"id": 1, "tag_name": "older"}], []]):
+            with self.subTest(pages=pages):
+                self.assertIsNone(self.lookup(pages))
+
+    def test_lookup_errors_are_not_absence(self):
+        for status in (403, 500):
+            response = subprocess.CompletedProcess([], 1, b"", f"gh: Failed (HTTP {status})".encode())
+            with self.subTest(status=status), patch.object(release.subprocess, "run", return_value=response), \
+                 patch.object(release.subprocess, "check_output") as fallback:
+                with self.assertRaises(ValueError):
+                    GET_RELEASE(self.tag)
+                fallback.assert_not_called()
+        with patch.object(release.subprocess, "run", return_value=self.not_found), \
+             patch.object(release.subprocess, "check_output", side_effect=subprocess.CalledProcessError(1, "gh")):
+            with self.assertRaises(subprocess.CalledProcessError):
                 GET_RELEASE(self.tag)
-        absent = subprocess.CompletedProcess([], 1, b"", b"gh: Not Found (HTTP 404)")
-        with patch.object(release.subprocess, "run", return_value=absent):
-            self.assertIsNone(GET_RELEASE(self.tag))
+
+    def test_malformed_and_duplicate_listing_is_rejected(self):
+        for pages in ({}, [], [None], [[None]], [[{}]], [[{"tag_name": 42}]],
+                      [[self.remote], [self.remote]]):
+            with self.subTest(pages=pages), self.assertRaises(ValueError):
+                self.lookup(pages)
+        with patch.object(release.subprocess, "run", return_value=self.not_found), \
+             patch.object(release.subprocess, "check_output", return_value=b"not JSON"):
+            with self.assertRaises(ValueError):
+                GET_RELEASE(self.tag)
+
+    def test_invalid_discovered_ids_and_changed_details_are_rejected(self):
+        for identity in (None, True, 0, -1, "42"):
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                self.lookup([[{**self.remote, "id": identity}]])
+        for field, value in (("id", 43), ("id", True), ("tag_name", "different")):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self.lookup([[self.remote]], {**self.remote, field: value})

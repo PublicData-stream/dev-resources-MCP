@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 from release_contract import validate
-from release_event import check, kind_for
+from release_event import check, fetch_release, kind_for
 from release_images import ARCHES, DIGEST, FAMILIES, REGISTRY
 
 REPOSITORY = "PublicData-stream/dev-resources-MCP"
@@ -25,9 +25,34 @@ def get_release(tag: str) -> dict | None:
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if response.returncode == 0:
         return json.loads(response.stdout)
-    if b"HTTP 404" in response.stderr:
+    if b"HTTP 404" not in response.stderr:
+        raise ValueError("Cannot establish existing GitHub Release state")
+    # The by-tag REST endpoint only returns published releases. Discover drafts
+    # through the authenticated inventory before deciding that creation is safe.
+    pages = json.loads(command("api", f"repos/{REPOSITORY}/releases?per_page=100",
+                               "--paginate", "--slurp"))
+    if (not isinstance(pages, list) or not pages
+            or any(not isinstance(page, list) for page in pages)):
+        raise ValueError("Invalid GitHub Release inventory")
+    matches = []
+    for page in pages:
+        for item in page:
+            if not isinstance(item, dict) or not isinstance(item.get("tag_name"), str):
+                raise ValueError("Invalid GitHub Release inventory")
+            if item["tag_name"] == tag:
+                matches.append(item)
+    if not matches:
         return None
-    raise ValueError("Cannot establish existing GitHub Release state")
+    if len(matches) != 1:
+        raise ValueError("Ambiguous GitHub Release identity")
+    release_id = matches[0].get("id")
+    if type(release_id) is not int or release_id <= 0:
+        raise ValueError("Invalid GitHub Release identity")
+    release = fetch_release(str(release_id))
+    if (not isinstance(release, dict) or type(release.get("id")) is not int
+            or release["id"] != release_id or release.get("tag_name") != tag):
+        raise ValueError("GitHub Release identity changed during discovery")
+    return release
 
 
 def checksum(path: Path) -> str:
@@ -95,8 +120,9 @@ def publish(source: Path, digests: Path, tag: str, commit: str,
     def current() -> dict:
         observed = check(tag, commit, tag_object, kind, release_id)
         if not published:
-            observed = get_release(tag)
-        if (not isinstance(observed, dict) or observed.get("id") != captured_id
+            observed = fetch_release(str(captured_id))
+        if (not isinstance(observed, dict) or type(observed.get("id")) is not int
+                or observed["id"] != captured_id
                 or observed.get("tag_name") != tag or observed.get("draft") is not captured_draft
                 or observed.get("prerelease") is not (kind != "stable")
                 or observed.get("immutable") is not release["immutable"]):
