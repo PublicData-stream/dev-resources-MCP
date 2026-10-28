@@ -213,22 +213,31 @@ is the complete unprefixed Git tag. Matching artifact retries are idempotent;
 conflicting tags/assets fail rather than overwrite. A partial publication is not a
 successful release, even when some platform images are already available.
 
-Hosted platform and index publishing jobs keep registry credentials in private
-`/tmp` scratch directories. The pinned attestation action reads
-`$HOME/.docker/config.json` instead of `DOCKER_CONFIG`, so the jobs temporarily
-bridge that default path to the isolated Docker config without changing `HOME`.
-Preparation rejects unsafe paths and requires the home config and scratch backup
-to share a filesystem before changing the home path. An existing regular config
-is preserved by rename and restored during unconditional cleanup. Cleanup never
-overwrites an unrelated replacement; on interference, it fails and retains the
-protected original and recovery journal. Abrupt runner loss can prevent cleanup;
-this bridge is restricted to disposable GitHub-hosted publishing runners.
-Restoration uses an exclusive hard link to preserve the original inode without
-replacing a newly appeared config. An interruption can leave the default path
-temporarily absent or linked alongside the backup; repeating cleanup recovers
-either state. An interruption before a newly created Docker directory is
-journaled can leave that empty directory in place.
-Credentials and backups are never included in uploaded artifacts or diagnostics.
+Hosted platform and index publishing jobs keep registry credentials in a private
+`/tmp` authentication directory. Docker writes to `auth/home/.docker/config.json`
+and Skopeo writes to `auth/registry-auth.json` below the release scratch directory.
+The pinned attestation action reads `$HOME/.docker/config.json` instead of
+`DOCKER_CONFIG`, so only its step receives the isolated `auth/home` as `HOME`.
+Its `RUNNER_TEMP` points to `auth/attest`. Other steps retain the runner home;
+authentication neither inspects nor changes the runner's existing Docker config
+and does not require it to share a filesystem with scratch.
+
+Preparation rejects unsafe paths and preexisting authentication state. A private
+ownership marker records the authentication directory's identity before any
+credentials are written. Docker's initial config contains an empty GHCR entry
+so it cannot automatically select a native credential store. Preflight validates
+the isolated directories and matching inline GHCR credentials before publication.
+Unconditional cleanup validates ownership and identity, removes credentials and
+generated bundles without following replacement symlinks, then removes the marker
+last. Unsafe or
+replaced state is retained and cleanup fails. Repeated cleanup can recover an
+interruption while the marker remains; interruption after its removal can leave
+an empty unmarked directory, which cleanup retains and rejects. Tested OCI
+artifacts and release digest records remain outside the authentication directory.
+Abrupt runner loss can prevent cleanup, so preparation remains restricted to
+disposable GitHub-hosted publishing runners. Failures report fixed diagnostic
+codes; credentials, configuration contents, and client output are never included
+in diagnostics or uploaded artifacts.
 
 A historical workflow rerun uses its original workflow definition; committing an
 authentication fix on main does not repair an older run. Preserve failed version

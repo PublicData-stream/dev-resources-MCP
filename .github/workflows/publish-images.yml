@@ -14,7 +14,7 @@ env:
   RELEASE_SCRATCH: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}
   TMPDIR: /tmp
   PYTHONDONTWRITEBYTECODE: '1'
-  DOCKER_CONFIG: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}/auth/docker
+  DOCKER_CONFIG: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}/auth/home/.docker
   REGISTRY_AUTH_FILE: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}/auth/registry-auth.json
 jobs:
   contract:
@@ -195,7 +195,8 @@ jobs:
       - name: Attest platform image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         env:
-          RUNNER_TEMP: ${{ env.RELEASE_SCRATCH }}/attest
+          HOME: ${{ env.RELEASE_SCRATCH }}/auth/home
+          RUNNER_TEMP: ${{ env.RELEASE_SCRATCH }}/auth/attest
         with:
           subject-name: ghcr.io/publicdata-stream/dev-resources-${{ matrix.target }}
           subject-digest: ${{ steps.promote.outputs.digest }}
@@ -260,7 +261,8 @@ jobs:
             --tag-object "$TAG_OBJECT" --output "$RELEASE_SCRATCH/digests/$TARGET.json"
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         env:
-          RUNNER_TEMP: ${{ env.RELEASE_SCRATCH }}/attest
+          HOME: ${{ env.RELEASE_SCRATCH }}/auth/home
+          RUNNER_TEMP: ${{ env.RELEASE_SCRATCH }}/auth/attest
         with:
           subject-name: ghcr.io/publicdata-stream/dev-resources-${{ matrix.target }}
           subject-digest: ${{ steps.index.outputs.digest }}

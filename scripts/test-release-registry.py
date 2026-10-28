@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Exercise anonymous release downloads with a disposable loopback OCI registry.
 
-Only attestation verification is mocked: local fixtures cannot mint GitHub OIDC
-provenance. Real Skopeo requests fetch every platform manifest, config and layer.
+Local fixtures cannot mint GitHub OIDC provenance, so attestation verification
+is mocked. Real Docker verifies isolated inline credential storage; real Skopeo
+requests fetch every platform manifest, config and layer.
 No container daemon, public registry, image execution or package code is involved.
 """
 from __future__ import annotations
 
 from collections import Counter
+import base64
 import gzip
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from threading import Thread
 from unittest.mock import patch
@@ -21,6 +26,9 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("verify_release_images", Path(__file__).with_name("verify-release-images.py"))
 acceptance = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acceptance)
+auth_spec = importlib.util.spec_from_file_location("release_registry_auth", Path(__file__).with_name("release_registry_auth.py"))
+registry_auth = importlib.util.module_from_spec(auth_spec)
+auth_spec.loader.exec_module(registry_auth)
 
 
 def encoded(value):
@@ -29,6 +37,60 @@ def encoded(value):
 
 def descriptor(raw, media_type):
     return {"digest": acceptance.content_digest(raw), "size": len(raw), "mediaType": media_type}
+
+
+def check_docker_inline_store(root: Path, port: int) -> None:
+    """Real Docker must use inline credentials even when native helpers exist."""
+    class Initialized(BaseException):
+        pass
+
+    actor, token = "fixture-actor", "fixture-only-registry-secret"
+    manager = registry_auth.RegistryAuth(root / "release-auth")
+    # Stop at the login boundary: exercise production configuration creation
+    # without sending any request to the helper's fixed production registry.
+    try:
+        with patch.object(manager, "_login", side_effect=Initialized):
+            manager.prepare(token, actor)
+    except Initialized:
+        pass
+    else:
+        raise ValueError("Authentication fixture did not stop before production login")
+    try:
+        helper_directory = root / "credential-helpers"
+        helper_directory.mkdir(mode=0o700)
+        calls = root / "credential-helper-calls"
+        for name in ("pass", "docker-credential-pass", "docker-credential-secretservice"):
+            helper = helper_directory / name
+            helper.write_text(f'''#!{sys.executable}
+import os, sys
+sys.stdin.read()
+with open(os.environ["FIXTURE_HELPER_CALLS"], "a") as output:
+    output.write((sys.argv[1] if len(sys.argv) > 1 else "invoked") + "\\n")
+''')
+            helper.chmod(0o700)
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in {"REGISTRY_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "DOCKER_AUTH_CONFIG",
+                                      "DOCKER_CONTEXT", "DOCKER_HOST"}}
+        environment.update({"PATH": str(helper_directory) + os.pathsep + os.environ["PATH"],
+                            "HOME": str(manager.home), "DOCKER_CONFIG": str(manager.docker.parent),
+                            "FIXTURE_HELPER_CALLS": str(calls), "TMPDIR": str(root)})
+        address = f"localhost:{port}"
+        # Docker automatically permits plain HTTP on loopback. Production
+        # commands continue to use the fixed HTTPS GHCR destination.
+        result = subprocess.run(["docker", "login", "--username", actor, "--password-stdin", address],
+                                input=token.encode(), env=environment, capture_output=True,
+                                timeout=30, check=False)
+        if result.returncode:
+            raise ValueError("Loopback Docker authentication failed")
+        config = json.loads(manager.docker.read_text())
+        expected = base64.b64encode(f"{actor}:{token}".encode()).decode()
+        entry = config.get("auths", {}).get(address, {})
+        if (calls.exists() or config.get("credsStore") or config.get("credHelpers")
+                or entry.get("auth") != expected):
+            raise ValueError("Docker did not retain isolated inline credentials")
+        print("Loopback Docker login accepted: inline credentials; no native credential helper invoked")
+    finally:
+        manager.cleanup()
 
 
 def main():
@@ -73,6 +135,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="devres-registry-fixture-", dir="/tmp") as temporary:
             root = Path(temporary)
+            check_docker_inline_store(root, server.server_port)
             digests = root / "digests"
             digests.mkdir()
             for target in acceptance.FAMILIES:
