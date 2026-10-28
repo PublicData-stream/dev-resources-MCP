@@ -137,6 +137,37 @@ print("1.2.3")
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(calls, [["sudo", "-n", "apt-get", "update"]])
 
+    def test_consumer_storage_failures_preserve_verification_and_scenario_status(self):
+        # Exercise the real child-shell driver without host installs or daemon setup.
+        for name in ("sudo", "rustup"):
+            self.executable(self.bin / name, "#!/bin/sh\nexit 0\n")
+        self.executable(self.scripts / "with-local-docker.sh", '#!/bin/sh\nexec "$@"\n')
+        self.executable(self.scripts / "check-native-platform.sh", '#!/bin/sh\necho native >> "$TEST_LOG"\n')
+        self.executable(self.scripts / "e2e-storage.sh", '#!/bin/sh\necho "storage $1" >> "$TEST_LOG"\nexit 97\n')
+        self.executable(self.scripts / "test-oxibelt.sh", '#!/bin/sh\necho "scenario $*" >> "$TEST_LOG"\nexit 44\n')
+        (self.scripts / "e2e-artifact.py").write_text('''import os, sys
+with open(os.environ["TEST_LOG"], "a") as stream:
+    stream.write("verify\\n")
+if os.environ.get("VERIFY_FAIL"):
+    sys.exit(42)
+print("fixture:test")
+''')
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                self.log.unlink(missing_ok=True)
+                env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+                           GITHUB_SHA=COMMIT, RELEASE_TAG="", TEST_LOG=str(self.log),
+                           DEVRES_TMP_ROOT=str(self.state), VERIFY_FAIL="1" if failure else "")
+                result = subprocess.run(["bash", str(self.scripts / "ci-e2e.sh"), "--inside-state",
+                                         "test", "docker", "linux/amd64", "artifact"],
+                                        env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 42 if failure else 44, result.stderr)
+                self.assertEqual(self.log.read_text().splitlines(), [
+                    "native", "storage before-artifact-load", "verify",
+                    *(["storage artifact-load-failed"] if failure else
+                      ["storage after-artifact-load", "scenario --image fixture:test"]),
+                ])
+
 
 if __name__ == "__main__":
     unittest.main()

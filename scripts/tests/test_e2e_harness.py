@@ -70,7 +70,15 @@ k() { minikube "$@"; }
                 self.run_cleanup(kind, 0)
 
     def test_supplied_and_default_build_paths_and_kubernetes_pin(self):
-        for kind in ('oxibelt', 'minikube'):
+        self.run_startup_paths()
+
+    def test_minikube_startup_and_import_failures_preserve_status_and_cleanup(self):
+        for phase in ('start', 'image'):
+            with self.subTest(phase=phase):
+                self.run_startup_paths(kinds=('minikube',), failure=phase)
+
+    def run_startup_paths(self, kinds=('oxibelt', 'minikube'), failure=''):
+        for kind in kinds:
             for supplied in (False, True):
                 with self.subTest(kind=kind, supplied=supplied), tempfile.TemporaryDirectory() as temp:
                     root = Path(temp)
@@ -85,18 +93,23 @@ k() { minikube "$@"; }
                         file = root / 'scripts' / name
                         file.write_text('#!/bin/bash\nprintf "%s\\n" "' + name + ' $*" >> "$CALLS"\n')
                         file.chmod(0o755)
+                    diagnostic = root / 'scripts' / 'e2e-storage.sh'
+                    diagnostic.write_text('#!/bin/bash\nprintf "storage %s\\n" "$1" >> "$CALLS"\nexit 97\n')
+                    diagnostic.chmod(0o755)
                     for name in ('docker', 'minikube'):
                         file = root / 'bin' / name
-                        file.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\nif [[ $1 == profile ]]; then echo \'{"valid":[]}\'; fi\n')
+                        file.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\nif [[ $1 == profile ]]; then echo \'{"valid":[]}\'; fi\n'
+                                        'if [[ ${3:-} == "${FAIL_PHASE:-unused}" ]]; then exit 43; fi\n')
                         file.chmod(0o755)
                     env = dict(os.environ, CALLS=str(root / 'calls'), PATH=str(root / 'bin') + ':' + os.environ['PATH'])
                     env.pop('DEVRES_KUBERNETES_VERSION', None)
                     env.pop('DEVRES_E2E_DIAGNOSTICS_DIR', None)
+                    env['FAIL_PHASE'] = failure or 'unused'
                     args = ['--image', 'supplied:test'] if supplied else []
                     if kind == 'minikube':
                         args += ['--rfc-text-only', '--live']
                     result = subprocess.run(['bash', str(harness), *args], env=env, capture_output=True, timeout=15)
-                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    self.assertEqual(result.returncode, 43 if failure else 0, result.stderr.decode())
                     calls = (root / 'calls').read_text()
                     self.assertEqual('build-harness.sh' in calls, not supplied)
                     if supplied:
@@ -104,7 +117,15 @@ k() { minikube "$@"; }
                         self.assertNotIn('image rm supplied:test', calls)
                     if kind == 'minikube':
                         self.assertIn('--kubernetes-version=v1.37.0', calls)
-                        if supplied:
+                        self.assertIn('storage before-minikube-start', calls)
+                        if failure:
+                            expected = 'minikube-start-failed' if failure == 'start' else 'minikube-import-failed'
+                            self.assertIn('storage ' + expected, calls)
+                            self.assertIn(' delete', calls)
+                            self.assertNotIn('storage after-minikube-import', calls)
+                        else:
+                            self.assertIn('storage after-minikube-import', calls)
+                        if supplied and failure != 'start':
                             self.assertIn('image load supplied:test', calls)
 
     def test_invalid_arguments(self):

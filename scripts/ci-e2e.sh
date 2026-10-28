@@ -65,7 +65,13 @@ exec scripts/with-local-docker.sh bash -euo pipefail -c '
     scripts/build-harness.sh "$scratch" "$image"
     python3 scripts/e2e-artifact.py export "$3" "$image" "$1" "$5" "$4"
   else
-    image=$(python3 scripts/e2e-artifact.py verify "$3" "$1" "$5" "$4")
+    scripts/e2e-storage.sh before-artifact-load "" "$3" || true
+    image=$(python3 scripts/e2e-artifact.py verify "$3" "$1" "$5" "$4") || {
+      status=$?
+      scripts/e2e-storage.sh artifact-load-failed "" "$3" || true
+      exit "$status"
+    }
+    scripts/e2e-storage.sh after-artifact-load "$image" "$3" || true
     case "$7" in
       docker) scripts/test-oxibelt.sh --image "$image" ;;
       minikube) scripts/test-minikube.sh --image "$image" ;;

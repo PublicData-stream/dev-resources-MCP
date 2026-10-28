@@ -78,10 +78,21 @@ else
 fi
 # Set the cleanup fence before startup so partially created task-owned profiles go away.
 created=1
+scripts/e2e-storage.sh before-minikube-start "$image" "$scratch" || true
 minikube -p "$profile" start --driver=docker --container-runtime=containerd --cni=calico \
   --kubernetes-version="${DEVRES_KUBERNETES_VERSION:-v1.37.0}" \
-  --cpus=4 --memory=6144 --subnet=10.223.254.0/24 --keep-context
-minikube -p "$profile" image load "$image"
+  --cpus=4 --memory=6144 --subnet=10.223.254.0/24 --keep-context || {
+    status=$?
+    scripts/e2e-storage.sh minikube-start-failed "$image" "$scratch" || true
+    exit "$status"
+  }
+scripts/e2e-storage.sh after-minikube-start "$image" "$scratch" || true
+minikube -p "$profile" image load "$image" || {
+  status=$?
+  scripts/e2e-storage.sh minikube-import-failed "$image" "$scratch" || true
+  exit "$status"
+}
+scripts/e2e-storage.sh after-minikube-import "$image" "$scratch" || true
 k create namespace "$namespace" --dry-run=client -o yaml | k apply -f -
 k create secret generic devres-config --from-file=backend.toml="$scratch/fixture/backend.toml" \
   --from-literal=postgres-password=fixture-only

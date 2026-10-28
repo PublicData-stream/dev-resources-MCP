@@ -95,6 +95,11 @@ platform, commit, version and contents, loads it, and passes `--image` to the
 scenario harness without rebuilding. Release builds stamp their sources; consumers
 validate the version from the release tag without stamping their checkout.
 
+Harness construction requires native `strip`. It removes debug sections only from
+the six staged executable copies before building the image, preserving symbol tables
+and shared build outputs. This reduces the archive, Docker and minikube image copies
+without changing compiler profiles or acceptance coverage.
+
 The `e2e-build` matrix uses Ubuntu 26.04 amd64 and ARM64 runners with 60-minute
 limits. The `e2e` matrix runs Docker and minikube on both architectures with
 45-minute limits and fail-fast disabled. The always-running `edge` aggregate
@@ -102,6 +107,13 @@ requires both matrices to succeed, including rejecting skipped or cancelled work
 Harness artifacts `e2e-harness-ARCH` live for one day; scenario diagnostics selected
 by `DEVRES_E2E_DIAGNOSTICS_DIR` live for seven days. Diagnostics exclude fixture
 private keys and request contents.
+
+Storage diagnostics run before and after artifact loading and cluster startup,
+then after node image import, including failed stages. They report filesystem
+space/inodes, harness image bytes and task-owned directory totals to the console and the diagnostics
+artifact's `storage/` directory. Each capture is limited to 64 KiB and 15 seconds;
+nonzero console status marks unavailable or partial counters. Artifact write failures
+never replace the scenario's exit status. No host software or shared caches are pruned.
 
 The driver enters owned `/tmp` state through `with-tmp-state.sh`, then overrides
 Cargo and OxiBelt targets to `/buildcache/rust/target`. It installs Rust 1.99.1
