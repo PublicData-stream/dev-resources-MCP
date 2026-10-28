@@ -89,23 +89,23 @@ print("1.2.3")
         for args in (("build", "linux/386", "artifact"),
                      ("test", "docker", "darwin/arm64", "artifact")):
             with self.subTest(args=args):
-                result, calls = self.run_driver(*args, RELEASE_TAG="v1.2.3")
+                result, calls = self.run_driver(*args, RELEASE_TAG="1.2.3")
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("Unsupported native platform", result.stderr)
                 self.assertEqual(calls, [])
 
     def test_invalid_scenario_fails_before_release_or_install(self):
-        result, calls = self.run_driver("test", "unknown", "linux/amd64", "artifact", RELEASE_TAG="v1.2.3")
+        result, calls = self.run_driver("test", "unknown", "linux/amd64", "artifact", RELEASE_TAG="1.2.3")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("Unsupported CI scenario", result.stderr)
         self.assertEqual(calls, [])
 
     def test_release_build_verifies_tag_then_stamps_before_install(self):
-        result, calls = self.run_driver("build", "linux/amd64", "artifact", RELEASE_TAG="v1.2.3")
+        result, calls = self.run_driver("build", "linux/amd64", "artifact", RELEASE_TAG="1.2.3")
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(calls, [
-            ["tag", "v1.2.3", COMMIT],
-            ["release", "stamp", "--tag", "v1.2.3", "--commit", COMMIT],
+            ["tag", "1.2.3", COMMIT],
+            ["release", "stamp", "--tag", "1.2.3", "--commit", COMMIT],
             ["sudo", "-n", "apt-get", "update"],
         ])
 
@@ -113,10 +113,10 @@ print("1.2.3")
         for scenario, platform in (("docker", "linux/amd64"), ("minikube", "linux/arm64")):
             with self.subTest(scenario=scenario):
                 self.log.unlink(missing_ok=True)
-                result, calls = self.run_driver("test", scenario, platform, "artifact", RELEASE_TAG="v1.2.3")
+                result, calls = self.run_driver("test", scenario, platform, "artifact", RELEASE_TAG="1.2.3")
                 self.assertEqual(result.returncode, 73, result.stderr)
                 self.assertEqual(calls, [
-                    ["release", "validate", "--tag", "v1.2.3", "--commit", COMMIT],
+                    ["release", "validate", "--tag", "1.2.3", "--commit", COMMIT],
                     ["sudo", "-n", "apt-get", "update"],
                 ])
 
@@ -128,7 +128,7 @@ print("1.2.3")
         ):
             with self.subTest(args=args, settings=settings):
                 self.log.unlink(missing_ok=True)
-                result, calls = self.run_driver(*args, RELEASE_TAG="v1.2.3", **settings)
+                result, calls = self.run_driver(*args, RELEASE_TAG="1.2.3", **settings)
                 self.assertEqual(result.returncode, int(next(iter(settings.values()))), result.stderr)
                 self.assertEqual([call[0] for call in calls], expected)
 

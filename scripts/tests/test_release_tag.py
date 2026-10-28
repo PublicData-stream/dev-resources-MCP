@@ -30,7 +30,7 @@ class ReleaseTagTests(unittest.TestCase):
         self.git("init", "--quiet", "--bare", str(self.origin))
         self.git("remote", "add", "origin", str(self.origin))
         self.git("push", "--quiet", "--set-upstream", "origin", "main")
-        self.tag = "v1.2.3"
+        self.tag = "1.2.3"
 
     def git(self, *arguments):
         return subprocess.check_output(["git", "-C", str(self.root), *arguments], stderr=subprocess.PIPE).decode().strip()

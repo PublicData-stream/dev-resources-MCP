@@ -187,24 +187,33 @@ The default Dockerfile target remains the combined compatibility image. Explicit
 `--target server`, `--target probe`, and `--target audit-worker` select the separate
 images. No Kubernetes manifest or runtime configuration automatically selects them.
 
-Publication is triggered only by an annotated version-tag push whose commit is in
-main history: `vX.Y.Z`, `vX.Y.Z-beta.N`, or `vX.Y.Z-build.<8-lowercase-hex-commit>`.
-Numeric SemVer identifiers cannot have leading zeros; a build tag must match the
-commit prefix. There are no `latest`, branch, major or minor image aliases.
-Maintainers must protect these version tags against movement and deletion.
+Publication uses annotated, unprefixed version tags whose commits are in main
+history: `X.Y.Z`, `X.Y.Z-beta.N`, or `X.Y.Z-build.<8-lowercase-hex-commit>`.
+Stable and beta images require a published GitHub Release; stable releases must
+not be prereleases and beta releases must be prereleases. Build candidates start
+from tag pushes. Numeric SemVer identifiers cannot have leading zeros; a build tag
+must match the commit prefix. There are no `latest`, branch, major or minor image
+aliases. Maintainers must protect these version tags against movement and deletion.
+The workflow rechecks annotated tag identity and mutable Release identity before
+publication. Existing `v`-prefixed tags are not accepted by the new release tooling.
 
 Main retains Cargo version `0.0.0`. Each release CI checkout stamps the version
-without `v` into first-party manifests, path dependencies, lock entries and exact
+into first-party manifests, path dependencies, lock entries and exact
 license exceptions. Third-party resolutions are unchanged. Fresh full CI and all
 six separate image gates must succeed before registry-writing jobs start. The
 tested OCI artifacts are promoted without rebuilding. Immutable platform tags
 `VERSION-amd64` and `VERSION-arm64` support an index at `VERSION`, where `VERSION`
-is the complete Git tag including `v`. Matching artifact retries are idempotent;
+is the complete unprefixed Git tag. Matching artifact retries are idempotent;
 conflicting tags/assets fail rather than overwrite. A partial publication is not a
 successful release, even when some platform images are already available.
 
 The GitHub Release contains `source.tar.gz`, its SHA-256 file, release identity,
-and three JSON image-digest records. The source archive includes the exact stamped
+and three JSON image-digest records. Stable/beta Releases must be mutable: the
+workflow appends missing assets after image acceptance, preserves matching assets
+and human-written release metadata, and rejects conflicts without replacing them.
+All existing required assets are checked before uploading any missing asset.
+Immutable stable/beta Releases are rejected before registry publication. Build
+candidates retain draft creation, asset upload, and prerelease publication. The source archive includes the exact stamped
 manifests used for building; the ordinary Git tag archive retains placeholders.
 Build the extracted archive with `docker build --target server .`; when using
 `scripts/test-image.sh` to build it, supply `--revision` and `--version` from

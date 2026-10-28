@@ -31,7 +31,7 @@ class ImageReleaseTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.tag, self.commit = "v1.2.3", "abcdef12" + "0" * 32
+        self.tag, self.commit = "1.2.3", "abcdef12" + "0" * 32
         self.config = {
             "os": "linux", "architecture": "arm64",
             "config": {"Labels": {
@@ -181,7 +181,7 @@ class ImageReleaseTests(unittest.TestCase):
             self.assertEqual(args[:3], ("skopeo", "copy", "--preserve-digests"))
             self.assertEqual(args[3], "oci-archive:" + str(self.archive.resolve()))
             self.assertEqual(args[4], "docker://" + result["platform_reference"])
-            self.assertTrue(result["platform_reference"].endswith(":v1.2.3-arm64"))
+            self.assertTrue(result["platform_reference"].endswith(":1.2.3-arm64"))
 
     def test_identical_existing_platform_is_idempotent_without_copy(self):
         record = self.verified_record()
@@ -204,9 +204,9 @@ class ImageReleaseTests(unittest.TestCase):
             result = subprocess.CompletedProcess([], 1, b"", error)
             with self.subTest(error=error), patch.object(images.subprocess, "run", return_value=result):
                 with self.assertRaisesRegex(ValueError, "registry tag state"):
-                    images.existing_digest("ghcr.io/example/image:v1.2.3")
+                    images.existing_digest("ghcr.io/example/image:1.2.3")
         with patch.object(images.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"manifest unknown")):
-            self.assertIsNone(images.existing_digest("ghcr.io/example/image:v1.2.3"))
+            self.assertIsNone(images.existing_digest("ghcr.io/example/image:1.2.3"))
 
     def test_merge_requires_exactly_two_platforms_with_one_release_identity(self):
         records, _ = self.platform_records()

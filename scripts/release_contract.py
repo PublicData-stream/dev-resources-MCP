@@ -21,7 +21,7 @@ import tomllib
 
 
 NUMBER = r"(?:0|[1-9][0-9]*)"
-TAG = re.compile(rf"v({NUMBER}\.{NUMBER}\.{NUMBER}(?:-beta\.{NUMBER}|-build\.[0-9a-f]{{8}})?)\Z")
+TAG = re.compile(rf"({NUMBER}\.{NUMBER}\.{NUMBER}(?:-beta\.{NUMBER}|-build\.[0-9a-f]{{8}})?)\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 BASE_VERSION = "0.0.0"
 EXCLUDED = {".git", ".agents", ".codex", ".aws", "target", ".cache", "__pycache__"}

@@ -17,24 +17,24 @@ spec.loader.exec_module(release)
 class TagTests(unittest.TestCase):
     def test_stable_beta_and_build_versions(self):
         sha = "ab123456" + "0" * 32
-        for tag in ("v1.2.3", "v1.2.3-beta.0", "v1.2.3-build.ab123456"):
-            self.assertEqual(release.validate(tag, sha), tag[1:])
+        for tag in ("1.2.3", "1.2.3-beta.0", "1.2.3-build.ab123456"):
+            self.assertEqual(release.validate(tag, sha), tag)
 
     def test_disallowed_or_mismatched_tags(self):
         sha = "ab123456" + "0" * 32
-        for tag in ("1.2.3", "v01.2.3", "v1.2.3-beta.01", "v1.2.3-rc.1", "v1.2.3+meta",
-                    "v1.2.3-build.AB123456", "v1.2.3-build.ab1234567", "v1.2.3\n",
-                    "v1.2.3-build.deadbeef", "v1.2.3; touch /tmp/injection"):
+        for tag in ("v1.2.3", "01.2.3", "1.2.3-beta.01", "1.2.3-rc.1", "1.2.3+meta",
+                    "1.2.3-build.AB123456", "1.2.3-build.ab1234567", "1.2.3\n",
+                    "1.2.3-build.deadbeef", "1.2.3; touch /tmp/injection"):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 release.validate(tag, sha)
         for sha in ("ab123456", "a" * 39, "A" * 40, "g" * 40):
             with self.subTest(sha=sha), self.assertRaises(ValueError):
-                release.validate("v1.2.3", sha)
+                release.validate("1.2.3", sha)
 
     def test_numeric_build_suffix_obeys_semver(self):
         with self.assertRaisesRegex(ValueError, "leading zeros"):
-            release.validate("v1.2.3-build.01234567", "01234567" + "a" * 32)
-        self.assertEqual(release.validate("v1.2.3-build.12345678", "12345678" + "a" * 32), "1.2.3-build.12345678")
+            release.validate("1.2.3-build.01234567", "01234567" + "a" * 32)
+        self.assertEqual(release.validate("1.2.3-build.12345678", "12345678" + "a" * 32), "1.2.3-build.12345678")
 
 
 class SourceTests(unittest.TestCase):
@@ -51,7 +51,7 @@ class SourceTests(unittest.TestCase):
         self.write("README.md", "Released source\n")
         self.git("init", "-q")
         self.commit()
-        self.tag = "v1.2.3-beta.1"
+        self.tag = "1.2.3-beta.1"
 
     def git(self, *args):
         return subprocess.check_output(["git", "-C", str(self.root), *args], stderr=subprocess.PIPE).decode().strip()
@@ -71,7 +71,7 @@ class SourceTests(unittest.TestCase):
 
     def test_stamp_changes_all_first_party_surfaces_only(self):
         release.stamp(self.root, self.tag, self.sha)
-        self.assertEqual(release.verify_stamped(self.root, self.tag, self.sha), self.tag[1:])
+        self.assertEqual(release.verify_stamped(self.root, self.tag, self.sha), self.tag)
         packages = tomllib.loads(self.text("Cargo.lock"))["package"]
         self.assertEqual([p["version"] for p in packages], ["1.2.3-beta.1", "1.2.3-beta.1", "0.0.0"])
         self.assertEqual(packages[1]["dependencies"], ["devres-domain 1.2.3-beta.1", "third-party 0.0.0"])
