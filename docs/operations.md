@@ -125,6 +125,32 @@ results and production operations remain separate evidence.
 
 ## Native images and versioned releases
 
+### CPU defaults and overrides
+
+The repository Cargo configuration defaults all x86_64 Rust builds to
+`-C target-cpu=x86-64-v3`, including local development, tests, examples,
+documentation tests, native CI, application images, and the pinned OxiBelt
+acceptance harness built from this repository. Build and runtime hosts must expose
+the x86-64-v3 instruction set. ARM64 retains its existing target defaults.
+OCI platform names remain `linux/amd64` and `linux/arm64`. Native dependencies,
+system packages, and the prebuilt Rust standard library retain their existing
+compilation policies.
+
+Official builds use the repository default. For a local build on an older x86_64
+CPU, standard Cargo flag overrides can select the baseline CPU:
+
+```sh
+env -u CARGO_ENCODED_RUSTFLAGS -u CARGO_ENCODED_RUSTDOCFLAGS \
+  RUSTFLAGS='-C target-cpu=x86-64' RUSTDOCFLAGS='-C target-cpu=x86-64' \
+  cargo build --workspace --bins --locked
+```
+
+These variables replace the configured flags; include any other required flags in
+the override. Host environment overrides are not automatically forwarded into
+Docker builds. See [Cargo flag precedence](https://doc.rust-lang.org/stable/cargo/reference/config.html#buildrustflags).
+
+### Native platform acceptance
+
 Native CI pairs `ubuntu-26.04` with `linux/amd64` and `ubuntu-26.04-arm` with
 `linux/arm64`. It checks the host, Rust compiler and Docker daemon architecture
 before building. Local amd64 checks do not establish ARM64 execution.

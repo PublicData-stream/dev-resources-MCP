@@ -21,7 +21,9 @@ Claude Connectors, with deployment-specific MCP connection packages.
 ## Development
 
 Install Rust 1.99.1, Docker, Python 3, OpenSSL, and Git; the cluster gate also
-uses minikube. From this directory:
+uses minikube. Default x86_64 Rust builds require an x86-64-v3 CPU; ARM64 keeps
+its existing target defaults. See [CPU defaults and overrides](docs/operations.md#cpu-defaults-and-overrides).
+From this directory:
 
 ```sh
 cargo test --workspace --locked
