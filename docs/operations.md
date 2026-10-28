@@ -256,7 +256,14 @@ candidates retain draft creation, asset upload, and prerelease publication. Sinc
 the by-tag REST lookup only returns published Releases, build publication also
 searches the authenticated, fully paginated Release inventory before creating a
 draft. Retries resume a matching draft, and subsequent checks use its captured
-numeric ID. Failed or ambiguous discovery rejects publication. The source archive
+numeric ID. Failed or ambiguous discovery rejects publication. The source
+publisher accepts GitHub's optional `immutable` field being absent only when
+`draft` is explicitly `true`: immutability protections begin at publication.
+Absent and explicit-false draft mutability may alternate between reads; null,
+malformed values, and immutable drafts are rejected. Published Releases still
+require explicit boolean mutability, and stable/beta Releases require `false`.
+Publisher identity rejections identify the validation stage, field, and fixed
+failure category without printing API values or release notes. The source archive
 includes the exact stamped manifests used for building; the ordinary Git tag
 archive retains placeholders.
 Build the extracted archive with `docker build --target server .`; when using

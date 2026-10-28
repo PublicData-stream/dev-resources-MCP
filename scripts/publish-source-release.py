@@ -20,6 +20,49 @@ def command(*arguments: str) -> bytes:
     return subprocess.check_output(["gh", *arguments])
 
 
+def publication_identity(release: object, tag: str, kind: str, stage: str,
+                         captured: tuple[int, bool, bool] | None = None) -> tuple[int, bool, bool]:
+    """Validate identity without including untrusted response values in errors."""
+    def reject(field: str, reason: str) -> None:
+        raise ValueError(f"GitHub Release identity rejected: stage={stage} field={field} reason={reason}")
+
+    if not isinstance(release, dict):
+        reject("release", "wrong-type")
+    for field, expected_type in (("id", int), ("tag_name", str), ("draft", bool), ("prerelease", bool)):
+        if field not in release:
+            reject(field, "missing")
+        if type(release[field]) is not expected_type:
+            reject(field, "wrong-type")
+    if release["id"] <= 0:
+        reject("id", "invalid")
+    if release["tag_name"] != tag:
+        reject("tag_name", "mismatch")
+    if release["prerelease"] is not (kind != "stable"):
+        reject("prerelease", "mismatch")
+    if kind != "build" and release["draft"]:
+        reject("draft", "mismatch")
+    if captured is not None:
+        for field, expected in zip(("id", "draft"), captured[:2]):
+            if release[field] != expected:
+                reject(field, "changed")
+    # GitHub's optional immutable field is unnecessary to establish draft
+    # mutability: its protections begin at publication. Null is not omission.
+    if "immutable" not in release:
+        if not release["draft"]:
+            reject("immutable", "missing")
+        immutable = False
+    else:
+        immutable = release["immutable"]
+        if type(immutable) is not bool:
+            reject("immutable", "wrong-type")
+    if immutable and (release["draft"] or kind != "build"):
+        reject("immutable", "mismatch")
+    identity = (release["id"], release["draft"], immutable)
+    if captured is not None and immutable is not captured[2]:
+        reject("immutable", "changed")
+    return identity
+
+
 def get_release(tag: str) -> dict | None:
     response = subprocess.run(["gh", "api", f"repos/{REPOSITORY}/releases/tags/{tag}"],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -110,23 +153,14 @@ def publish(source: Path, digests: Path, tag: str, commit: str,
             command("release", "create", tag, "--repo", REPOSITORY, "--verify-tag", "--target", commit,
                     "--draft", "--title", tag, "--notes-file", str(notes), "--prerelease")
         release = get_release(tag)
-    if (not isinstance(release, dict) or type(release.get("id")) is not int or release["id"] <= 0
-            or release.get("tag_name") != tag or release.get("prerelease") is not (kind != "stable")
-            or type(release.get("draft")) is not bool or type(release.get("immutable")) is not bool):
-        raise ValueError("Existing GitHub Release identity differs")
-    captured_id = release["id"]
-    captured_draft = release["draft"]
+    captured = publication_identity(release, tag, kind, "initial")
+    captured_id, captured_draft, captured_immutable = captured
 
     def current() -> dict:
         observed = check(tag, commit, tag_object, kind, release_id)
         if not published:
             observed = fetch_release(str(captured_id))
-        if (not isinstance(observed, dict) or type(observed.get("id")) is not int
-                or observed["id"] != captured_id
-                or observed.get("tag_name") != tag or observed.get("draft") is not captured_draft
-                or observed.get("prerelease") is not (kind != "stable")
-                or observed.get("immutable") is not release["immutable"]):
-            raise ValueError("GitHub Release identity changed during publication")
+        publication_identity(observed, tag, kind, "publication", captured)
         return observed
 
     def missing_assets(observed: dict) -> list[Path]:
@@ -151,7 +185,7 @@ def publish(source: Path, digests: Path, tag: str, commit: str,
                     asset_digest = "sha256:" + checksum(Path(temporary) / path.name)
             if asset_digest != "sha256:" + checksum(path):
                 raise ValueError("Refusing to replace conflicting GitHub Release asset")
-        if missing and observed["immutable"]:
+        if missing and captured_immutable:
             raise ValueError("Immutable Release is missing required assets")
         return missing
 

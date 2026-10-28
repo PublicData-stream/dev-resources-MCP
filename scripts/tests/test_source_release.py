@@ -190,7 +190,7 @@ class SourceReleaseTests(unittest.TestCase):
             with self.subTest(field=field):
                 changed = {**original, field: value}
                 with patch.object(release, "check", side_effect=[original, changed]):
-                    with self.assertRaisesRegex(ValueError, "changed"):
+                    with self.assertRaisesRegex(ValueError, f"stage=publication field={field} reason="):
                         self.publish()
                 self.assertFalse(self.calls)
 
@@ -201,7 +201,7 @@ class SourceReleaseTests(unittest.TestCase):
                              ("draft", False), ("prerelease", False), ("immutable", True)):
             with self.subTest(field=field, value=value), patch.object(release, "fetch_release", return_value={
                     **self.remote, field: value}) as fetch:
-                with self.assertRaisesRegex(ValueError, "changed"):
+                with self.assertRaisesRegex(ValueError, f"stage=publication field={field} reason="):
                     self.publish()
                 fetch.assert_called_once_with("42")
                 self.assertFalse(self.calls)
@@ -213,6 +213,118 @@ class SourceReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Immutable"):
             self.publish()
         self.assertFalse(self.calls)
+
+    def test_complete_immutable_published_build_is_idempotent(self):
+        self.build()
+        self.remote = self.fixture_release()
+        self.remote["immutable"] = True
+        with self.github_transport():
+            self.publish()
+        self.assertFalse(self.calls)
+
+    def test_published_build_requires_explicit_boolean_mutability(self):
+        self.build()
+        for value in ("missing", None, 0, "false"):
+            with self.subTest(value=value):
+                self.remote = self.fixture_release()
+                if value == "missing":
+                    self.remote.pop("immutable")
+                else:
+                    self.remote["immutable"] = value
+                with self.github_transport(), self.assertRaisesRegex(
+                        ValueError, "stage=initial field=immutable reason="):
+                    self.publish()
+                self.assertFalse(self.calls)
+
+    def test_stable_and_beta_still_require_explicit_false_mutability(self):
+        for kind, tag in (("stable", "1.2.3"), ("beta", "1.2.3-beta.1")):
+            self.kind, self.tag = kind, tag
+            self.write_metadata()
+            for value in ("missing", None, True):
+                with self.subTest(kind=kind, value=value):
+                    self.remote = self.fixture_release()
+                    if value == "missing":
+                        self.remote.pop("immutable")
+                    else:
+                        self.remote["immutable"] = value
+                    with self.assertRaisesRegex(ValueError, "stage=initial field=immutable reason="):
+                        self.publish()
+                    self.assertFalse(self.calls)
+
+    def test_invalid_draft_identity_diagnostics_are_fixed_and_stop_uploads(self):
+        self.build()
+        private = "private-response-sentinel\nInjected diagnostic"
+        for field, value, reason in (("id", True, "wrong-type"), ("id", 0, "invalid"),
+                                     ("tag_name", private, "mismatch"),
+                                     ("draft", private, "wrong-type"),
+                                     ("prerelease", False, "mismatch"),
+                                     ("immutable", None, "wrong-type"),
+                                     ("immutable", 0, "wrong-type"),
+                                     ("immutable", private, "wrong-type"),
+                                     ("immutable", True, "mismatch")):
+            with self.subTest(field=field, value=value):
+                self.remote = self.fixture_release(draft=True, complete=False)
+                self.remote.update({field: value, "body": private, "unexpected": private})
+                with self.assertRaises(ValueError) as error:
+                    self.publish()
+                self.assertEqual(str(error.exception),
+                                 f"GitHub Release identity rejected: stage=initial field={field} reason={reason}")
+                self.assertFalse(self.calls)
+        for field in ("id", "tag_name", "draft", "prerelease"):
+            with self.subTest(missing=field):
+                self.remote = self.fixture_release(draft=True, complete=False)
+                self.remote.pop(field)
+                with self.assertRaisesRegex(ValueError, f"stage=initial field={field} reason=missing"):
+                    self.publish()
+                self.assertFalse(self.calls)
+
+    def test_draft_mutability_omission_and_false_can_alternate_during_upload(self):
+        self.build()
+        for initially_omitted in (True, False):
+            with self.subTest(initially_omitted=initially_omitted):
+                self.calls.clear()
+                self.remote = self.fixture_release(draft=True, complete=False)
+                if initially_omitted:
+                    self.remote.pop("immutable")
+                reads = 0
+
+                def observe(identity):
+                    nonlocal reads
+                    self.assertEqual(identity, "42")
+                    reads += 1
+                    result = copy.deepcopy(self.remote)
+                    if (reads % 2 == 0) == initially_omitted:
+                        result.pop("immutable", None)
+                    else:
+                        result["immutable"] = False
+                    return result
+
+                with patch.object(release, "fetch_release", side_effect=observe):
+                    self.publish()
+                self.assertEqual(reads, 7)
+                self.assertEqual([call[:2] for call in self.calls],
+                                 [("release", "upload")] * 6 + [("release", "edit")])
+
+    def test_invalid_recheck_stops_remaining_uploads_and_publication(self):
+        self.build()
+        for field, value in (("id", 43), ("tag_name", "different"), ("draft", False),
+                             ("prerelease", False), ("immutable", True), ("immutable", None)):
+            with self.subTest(field=field, value=value):
+                self.calls.clear()
+                self.remote = self.fixture_release(draft=True, complete=False)
+                self.remote.pop("immutable")
+
+                def observe(identity):
+                    result = copy.deepcopy(self.remote)
+                    if self.calls:
+                        result[field] = value
+                    return result
+
+                with patch.object(release, "fetch_release", side_effect=observe), \
+                     self.assertRaisesRegex(ValueError, f"stage=publication field={field} reason="):
+                    self.publish()
+                self.assertEqual([call[:2] for call in self.calls], [("release", "upload")])
+                self.assertTrue(self.remote["draft"])
 
     def test_duplicate_assets_are_rejected(self):
         self.remote = self.fixture_release()
@@ -227,12 +339,18 @@ class SourceReleaseTests(unittest.TestCase):
         self.publish()
         self.assertEqual([call[:2] for call in self.calls], [("release", "download")] * 2)
 
-    def github_transport(self, fail_after_upload=False):
+    def github_transport(self, fail_after_upload=False, omit_draft_immutable=False):
+        def encode(observed):
+            observed = copy.deepcopy(observed)
+            if omit_draft_immutable and observed is not None and observed["draft"]:
+                observed.pop("immutable", None)
+            return json.dumps(observed).encode()
+
         def by_tag(arguments, **kwargs):
             self.assertEqual(arguments, ["gh", "api", f"repos/{release.REPOSITORY}/releases/tags/{self.tag}"])
             if self.remote is None or self.remote["draft"]:
                 return subprocess.CompletedProcess(arguments, 1, b"", b"gh: Not Found (HTTP 404)")
-            return subprocess.CompletedProcess(arguments, 0, json.dumps(self.remote).encode(), b"")
+            return subprocess.CompletedProcess(arguments, 0, encode(self.remote), b"")
 
         def execute(arguments):
             if arguments[1] == "api":
@@ -241,12 +359,13 @@ class SourceReleaseTests(unittest.TestCase):
                 if endpoint.endswith("/releases?per_page=100"):
                     self.assertIn("--paginate", arguments)
                     self.assertIn("--slurp", arguments)
+                    observed = json.loads(encode(self.remote))
                     return json.dumps([[{"id": 1, "tag_name": "older"}],
-                                       [self.remote] if self.remote else []]).encode()
+                                       [observed] if observed else []]).encode()
                 self.assertEqual(endpoint, f"repos/{release.REPOSITORY}/releases/42")
                 if fail_after_upload and self.calls and self.calls[-1][:2] == ("release", "upload"):
                     raise subprocess.CalledProcessError(1, arguments, stderr=b"HTTP 404")
-                return json.dumps(self.remote).encode()
+                return encode(self.remote)
             return self.command(*arguments[1:])
 
         stack = ExitStack()
@@ -260,18 +379,19 @@ class SourceReleaseTests(unittest.TestCase):
     def test_draft_lookup_supports_fresh_and_resumed_build_publication(self):
         self.build()
         for fresh in (True, False):
-            with self.subTest(fresh=fresh):
-                self.calls.clear()
-                self.api_reads.clear()
-                self.remote = None if fresh else self.fixture_release(draft=True, complete=False)
-                with self.github_transport():
-                    self.publish()
-                mutations = [call[:2] for call in self.calls]
-                self.assertEqual(mutations, ([("release", "create")] if fresh else [])
-                                 + [("release", "upload")] * 6 + [("release", "edit")])
-                self.assertFalse(self.remote["draft"])
-                self.assertEqual(sum("--paginate" in read for read in self.api_reads), 2 if fresh else 1)
-                self.assertTrue(any(read[0].endswith("/releases/42") for read in self.api_reads))
+            for omitted in (True, False):
+                with self.subTest(fresh=fresh, immutable_omitted=omitted):
+                    self.calls.clear()
+                    self.api_reads.clear()
+                    self.remote = None if fresh else self.fixture_release(draft=True, complete=False)
+                    with self.github_transport(omit_draft_immutable=omitted):
+                        self.publish()
+                    mutations = [call[:2] for call in self.calls]
+                    self.assertEqual(mutations, ([("release", "create")] if fresh else [])
+                                     + [("release", "upload")] * 6 + [("release", "edit")])
+                    self.assertFalse(self.remote["draft"])
+                    self.assertEqual(sum("--paginate" in read for read in self.api_reads), 2 if fresh else 1)
+                    self.assertTrue(any(read[0].endswith("/releases/42") for read in self.api_reads))
 
     def test_disappearing_draft_stops_without_recreation_or_publication(self):
         self.build()
