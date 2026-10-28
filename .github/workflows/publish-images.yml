@@ -14,8 +14,8 @@ env:
   RELEASE_SCRATCH: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}
   TMPDIR: /tmp
   PYTHONDONTWRITEBYTECODE: '1'
-  DOCKER_CONFIG: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}/docker
-  REGISTRY_AUTH_FILE: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}/registry-auth.json
+  DOCKER_CONFIG: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}/auth/docker
+  REGISTRY_AUTH_FILE: /tmp/devres-release-${{ github.run_id }}-${{ github.run_attempt }}/auth/registry-auth.json
 jobs:
   contract:
     if: github.repository == 'PublicData-stream/dev-resources-MCP'
@@ -164,6 +164,8 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
           fetch-depth: 0
+      - name: Prepare private publication scratch
+        run: install -d -m 700 "$RELEASE_SCRATCH"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: oci-images-${{ matrix.arch }}
@@ -172,10 +174,9 @@ jobs:
       - name: Authenticate registry
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p "$DOCKER_CONFIG"
-          printf '%s' "$REGISTRY_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
-          printf '%s' "$REGISTRY_TOKEN" | docker login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+        run: python3 scripts/release_registry_auth.py prepare
+      - name: Check attestation credentials before promotion
+        run: python3 scripts/release_registry_auth.py check
       - name: Promote exact tested artifact
         id: promote
         env:
@@ -193,6 +194,8 @@ jobs:
             --tag-object "$TAG_OBJECT" --output "$RELEASE_SCRATCH/promoted/$TARGET-$ARCH.json"
       - name: Attest platform image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        env:
+          RUNNER_TEMP: ${{ env.RELEASE_SCRATCH }}/attest
         with:
           subject-name: ghcr.io/publicdata-stream/dev-resources-${{ matrix.target }}
           subject-digest: ${{ steps.promote.outputs.digest }}
@@ -204,6 +207,9 @@ jobs:
           path: ${{ env.RELEASE_SCRATCH }}/promoted/
           if-no-files-found: error
           retention-days: 7
+      - name: Restore registry credential state
+        if: always()
+        run: python3 scripts/release_registry_auth.py cleanup
   indexes:
     needs: [contract, platforms]
     if: ${{ !cancelled() && github.repository == 'PublicData-stream/dev-resources-MCP' && needs.contract.result == 'success' && needs.platforms.result == 'success' }}
@@ -224,6 +230,8 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
           fetch-depth: 0
+      - name: Prepare private publication scratch
+        run: install -d -m 700 "$RELEASE_SCRATCH"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: promoted-${{ matrix.target }}-*
@@ -233,10 +241,9 @@ jobs:
       - name: Authenticate registry
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p "$DOCKER_CONFIG"
-          printf '%s' "$REGISTRY_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
-          printf '%s' "$REGISTRY_TOKEN" | docker login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+        run: python3 scripts/release_registry_auth.py prepare
+      - name: Check attestation credentials before index publication
+        run: python3 scripts/release_registry_auth.py check
       - name: Publish verified platform index
         id: index
         env:
@@ -252,6 +259,8 @@ jobs:
             --target "$TARGET" --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" \
             --tag-object "$TAG_OBJECT" --output "$RELEASE_SCRATCH/digests/$TARGET.json"
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        env:
+          RUNNER_TEMP: ${{ env.RELEASE_SCRATCH }}/attest
         with:
           subject-name: ghcr.io/publicdata-stream/dev-resources-${{ matrix.target }}
           subject-digest: ${{ steps.index.outputs.digest }}
@@ -263,6 +272,9 @@ jobs:
           path: ${{ env.RELEASE_SCRATCH }}/digests/
           if-no-files-found: error
           retention-days: 30
+      - name: Restore registry credential state
+        if: always()
+        run: python3 scripts/release_registry_auth.py cleanup
   acceptance:
     name: Verify provenance and complete anonymous pulls
     needs: [contract, indexes]

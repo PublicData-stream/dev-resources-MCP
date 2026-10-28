@@ -213,6 +213,30 @@ is the complete unprefixed Git tag. Matching artifact retries are idempotent;
 conflicting tags/assets fail rather than overwrite. A partial publication is not a
 successful release, even when some platform images are already available.
 
+Hosted platform and index publishing jobs keep registry credentials in private
+`/tmp` scratch directories. The pinned attestation action reads
+`$HOME/.docker/config.json` instead of `DOCKER_CONFIG`, so the jobs temporarily
+bridge that default path to the isolated Docker config without changing `HOME`.
+Preparation rejects unsafe paths and requires the home config and scratch backup
+to share a filesystem before changing the home path. An existing regular config
+is preserved by rename and restored during unconditional cleanup. Cleanup never
+overwrites an unrelated replacement; on interference, it fails and retains the
+protected original and recovery journal. Abrupt runner loss can prevent cleanup;
+this bridge is restricted to disposable GitHub-hosted publishing runners.
+Restoration uses an exclusive hard link to preserve the original inode without
+replacing a newly appeared config. An interruption can leave the default path
+temporarily absent or linked alongside the backup; repeating cleanup recovers
+either state. An interruption before a newly created Docker directory is
+journaled can leave that empty directory in place.
+Credentials and backups are never included in uploaded artifacts or diagnostics.
+
+A historical workflow rerun uses its original workflow definition; committing an
+authentication fix on main does not repair an older run. Preserve failed version
+tags and their partial images. Prefer a separately authorized new build candidate
+from the fixed commit. Recovery of the old version requires its retained tested
+artifacts and all existing identity, conflict, provenance, and acceptance gates;
+never move its tag or rebuild over a conflicting digest.
+
 The GitHub Release contains `source.tar.gz`, its SHA-256 file, release identity,
 and three JSON image-digest records. Stable/beta Releases must be mutable: the
 workflow appends missing assets after image acceptance, preserves matching assets
