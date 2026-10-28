@@ -5,6 +5,7 @@ scratch=$1
 image=$2
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
+command -v strip >/dev/null || { echo 'strip is required to stage harness binaries' >&2; exit 1; }
 if [[ -z ${SERVER_BINARY:-} || -z ${PROBE_BINARY:-} ]]; then cargo build --workspace --bins --locked; fi
 cargo build --locked -p devres-adapters --example storage-probe --bin devres-audit-worker --bin devres-pdf-worker
 target_dir=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
@@ -25,6 +26,10 @@ cp "$target_dir/debug/examples/storage-probe" "$scratch/build/bin/storage-probe"
 cp "$target_dir/debug/devres-audit-worker" "$scratch/build/bin/devres-audit-worker"
 cp "$target_dir/debug/devres-pdf-worker" "$scratch/build/bin/devres-pdf-worker"
 cp "$edge_binary" "$scratch/build/bin/oxibelt"
+# Remove debug information only from disposable copies, preserving shared builds.
+for binary in devres-server devres-probe storage-probe devres-audit-worker devres-pdf-worker oxibelt; do
+  strip --strip-debug "$scratch/build/bin/$binary"
+done
 cp scripts/mcp_smoke.py "$scratch/build/scripts/"
 cp deploy/oxibelt/Dockerfile.harness "$scratch/build/Dockerfile"
 docker build --label "devres.test-owner=$image" -t "$image" "$scratch/build"
