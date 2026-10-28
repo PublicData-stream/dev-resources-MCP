@@ -255,9 +255,12 @@ Immutable stable/beta Releases are rejected before registry publication. Build
 candidates retain draft creation, asset upload, and prerelease publication. Since
 the by-tag REST lookup only returns published Releases, build publication also
 searches the authenticated, fully paginated Release inventory before creating a
-draft. Retries resume a matching draft, and subsequent checks use its captured
-numeric ID. Failed or ambiguous discovery rejects publication. The source
-publisher accepts GitHub's optional `immutable` field being absent only when
+draft. New drafts capture the numeric ID directly from the REST creation response;
+publication does not depend on immediate inventory visibility. The existing tag
+is checked immediately before creation, and uncertain creation requests are not
+retried automatically. Retries resume a matching draft, and subsequent checks use
+its captured numeric ID. Failed or ambiguous discovery rejects publication. The
+source publisher accepts GitHub's optional `immutable` field being absent only when
 `draft` is explicitly `true`: immutability protections begin at publication.
 Absent and explicit-false draft mutability may alternate between reads; null,
 malformed values, and immutable drafts are rejected. Published Releases still

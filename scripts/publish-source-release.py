@@ -143,16 +143,27 @@ def publish(source: Path, digests: Path, tag: str, commit: str,
         release = get_release(tag)
     if release is None:
         with tempfile.TemporaryDirectory(prefix="devres-release-", dir="/tmp") as temporary:
-            notes = Path(temporary) / "notes.txt"
-            notes.write_text(
+            notes = (
                 f"Native amd64 and ARM64 images for `{commit}`.\n\n"
                 "Download source.tar.gz for the exact version-stamped corresponding source. "
                 "The JSON assets record the accepted image index and platform digests.\n\n"
                 "Assisted-by: Codex <codex@openai.com>\n")
+            request = Path(temporary) / "request.json"
+            request.write_text(json.dumps({"tag_name": tag, "target_commitish": commit,
+                                          "name": tag, "body": notes, "draft": True,
+                                          "prerelease": True}))
             check(tag, commit, tag_object, kind, release_id)
-            command("release", "create", tag, "--repo", REPOSITORY, "--verify-tag", "--target", commit,
-                    "--draft", "--title", tag, "--notes-file", str(notes), "--prerelease")
-        release = get_release(tag)
+            response = command("api", f"repos/{REPOSITORY}/releases", "--method", "POST",
+                               "--input", str(request))
+        # Bind publication to the creation response instead of requiring a new
+        # draft to appear immediately in the Release inventory. Never retry POST.
+        try:
+            release = json.loads(response)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ValueError("Invalid GitHub Release creation response") from None
+        publication_identity(release, tag, kind, "creation")
+        if release["draft"] is not True:
+            raise ValueError("GitHub Release identity rejected: stage=creation field=draft reason=mismatch")
     captured = publication_identity(release, tag, kind, "initial")
     captured_id, captured_draft, captured_immutable = captured
 

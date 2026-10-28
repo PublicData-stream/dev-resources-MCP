@@ -20,6 +20,7 @@ with patch.object(sys, "path", [str(scripts), *sys.path]):
 GET_RELEASE = release.get_release
 COMMAND = release.command
 FETCH_RELEASE = release.fetch_release
+CREATE = ("api", f"repos/{release.REPOSITORY}/releases")
 
 
 class SourceReleaseTests(unittest.TestCase):
@@ -77,13 +78,21 @@ class SourceReleaseTests(unittest.TestCase):
 
     def command(self, *arguments):
         self.calls.append(arguments)
-        if arguments[:2] == ("release", "create"):
-            self.assertIn("--draft", arguments)
-            self.assertIn("--verify-tag", arguments)
-            self.assertIn("--prerelease", arguments)
-            notes = Path(arguments[arguments.index("--notes-file") + 1]).read_text()
-            self.assertIn("Assisted-by: Codex <codex@openai.com>", notes)
+        if arguments[:2] == CREATE:
+            self.assertEqual(arguments[arguments.index("--method") + 1], "POST")
+            request = Path(arguments[arguments.index("--input") + 1])
+            self.assertTrue(request.is_relative_to("/tmp"))
+            payload = json.loads(request.read_text())
+            self.assertEqual(set(payload), {"tag_name", "target_commitish", "name", "body",
+                                           "draft", "prerelease"})
+            self.assertEqual(payload["tag_name"], self.tag)
+            self.assertEqual(payload["target_commitish"], self.commit)
+            self.assertEqual(payload["name"], self.tag)
+            self.assertIs(payload["draft"], True)
+            self.assertIs(payload["prerelease"], True)
+            self.assertIn("Assisted-by: Codex <codex@openai.com>", payload["body"])
             self.remote = self.fixture_release(draft=True, complete=False)
+            return json.dumps(self.remote).encode()
         elif arguments[:2] == ("release", "upload"):
             path = Path(arguments[3])
             self.remote["assets"].append({"name": path.name, "digest": "sha256:" + release.checksum(path)})
@@ -156,10 +165,68 @@ class SourceReleaseTests(unittest.TestCase):
         self.build()
         self.remote = None
         self.publish()
-        self.assertEqual(self.calls[0][:2], ("release", "create"))
+        self.assertEqual(self.calls[0][:2], CREATE)
         self.assertEqual(self.calls[-1][:2], ("release", "edit"))
         self.assertEqual(len(self.remote["assets"]), 6)
         self.assertFalse(self.remote["draft"])
+
+    def test_failed_immediate_tag_fence_prevents_creation(self):
+        self.build()
+        self.remote = None
+        with patch.object(release, "check", side_effect=[None, ValueError("Tag identity changed")]), \
+             patch.object(release, "command") as command:
+            with self.assertRaisesRegex(ValueError, "Tag identity changed"):
+                self.publish()
+        command.assert_not_called()
+
+    def test_uncertain_creation_is_not_retried_or_published(self):
+        self.build()
+        self.remote = None
+
+        def create_then_fail(*arguments):
+            self.command(*arguments)
+            raise subprocess.CalledProcessError(1, "gh")
+
+        with patch.object(release, "command", side_effect=create_then_fail), \
+             patch.object(release, "fetch_release") as fetch:
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.publish()
+        self.assertEqual([call[:2] for call in self.calls], [CREATE])
+        self.assertTrue(self.remote["draft"])
+        fetch.assert_not_called()
+
+    def test_invalid_creation_response_stops_without_retry_or_upload(self):
+        self.build()
+        draft = self.fixture_release(draft=True, complete=False)
+        invalid = [b"not JSON private-response-sentinel", b"\xff", b"null", b"[]"]
+        for field, value in (("id", True), ("id", 0), ("tag_name", "different"),
+                             ("prerelease", False), ("draft", False),
+                             ("immutable", True), ("immutable", None)):
+            invalid.append(json.dumps({**draft, field: value}).encode())
+        for field in ("id", "tag_name", "prerelease", "draft"):
+            invalid.append(json.dumps({key: value for key, value in draft.items()
+                                       if key != field}).encode())
+        for response in invalid:
+            with self.subTest(response=response):
+                self.remote = None
+                with patch.object(release, "command", return_value=response) as command, \
+                     patch.object(release, "fetch_release") as fetch:
+                    with self.assertRaises(ValueError) as error:
+                        self.publish()
+                self.assertNotIn("private-response-sentinel", str(error.exception))
+                command.assert_called_once()
+                self.assertEqual(command.call_args.args[:2], CREATE)
+                fetch.assert_not_called()
+
+    def test_created_draft_disappearing_by_id_stops_before_upload(self):
+        self.build()
+        self.remote = None
+        with patch.object(release, "fetch_release", side_effect=subprocess.CalledProcessError(1, "gh")) as fetch:
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.publish()
+        self.assertEqual([call[:2] for call in self.calls], [CREATE])
+        fetch.assert_called_once_with("42")
+        self.assertTrue(self.remote["draft"])
 
     def test_failed_asset_upload_never_publishes_build_draft(self):
         self.build()
@@ -339,7 +406,8 @@ class SourceReleaseTests(unittest.TestCase):
         self.publish()
         self.assertEqual([call[:2] for call in self.calls], [("release", "download")] * 2)
 
-    def github_transport(self, fail_after_upload=False, omit_draft_immutable=False):
+    def github_transport(self, fail_after_upload=False, omit_draft_immutable=False,
+                         hide_created_draft=False):
         def encode(observed):
             observed = copy.deepcopy(observed)
             if omit_draft_immutable and observed is not None and observed["draft"]:
@@ -354,12 +422,17 @@ class SourceReleaseTests(unittest.TestCase):
 
         def execute(arguments):
             if arguments[1] == "api":
+                if "--method" in arguments:
+                    response = self.command(*arguments[1:])
+                    return encode(json.loads(response))
                 self.api_reads.append(tuple(arguments[2:]))
                 endpoint = arguments[2]
                 if endpoint.endswith("/releases?per_page=100"):
                     self.assertIn("--paginate", arguments)
                     self.assertIn("--slurp", arguments)
                     observed = json.loads(encode(self.remote))
+                    if hide_created_draft and any(call[:2] == CREATE for call in self.calls):
+                        observed = None
                     return json.dumps([[{"id": 1, "tag_name": "older"}],
                                        [observed] if observed else []]).encode()
                 self.assertEqual(endpoint, f"repos/{release.REPOSITORY}/releases/42")
@@ -387,11 +460,21 @@ class SourceReleaseTests(unittest.TestCase):
                     with self.github_transport(omit_draft_immutable=omitted):
                         self.publish()
                     mutations = [call[:2] for call in self.calls]
-                    self.assertEqual(mutations, ([("release", "create")] if fresh else [])
+                    self.assertEqual(mutations, ([CREATE] if fresh else [])
                                      + [("release", "upload")] * 6 + [("release", "edit")])
                     self.assertFalse(self.remote["draft"])
-                    self.assertEqual(sum("--paginate" in read for read in self.api_reads), 2 if fresh else 1)
+                    self.assertEqual(sum("--paginate" in read for read in self.api_reads), 1)
                     self.assertTrue(any(read[0].endswith("/releases/42") for read in self.api_reads))
+
+    def test_created_draft_need_not_appear_in_inventory(self):
+        self.build()
+        self.remote = None
+        with self.github_transport(hide_created_draft=True):
+            self.publish()
+        self.assertEqual(sum("--paginate" in read for read in self.api_reads), 1)
+        self.assertEqual([call[:2] for call in self.calls],
+                         [CREATE] + [("release", "upload")] * 6 + [("release", "edit")])
+        self.assertFalse(self.remote["draft"])
 
     def test_disappearing_draft_stops_without_recreation_or_publication(self):
         self.build()
