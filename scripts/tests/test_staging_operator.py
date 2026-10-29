@@ -6,12 +6,19 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location('staging_operator', ROOT / 'deploy/staging/operator.py')
+spec = importlib.util.spec_from_file_location('staging_operator', ROOT / 'deploy/staging/staging.py')
 op = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(op)
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_cli_imports_without_shadowing_python_standard_modules(self):
+        import subprocess
+        import sys
+        result = subprocess.run([sys.executable, str(ROOT / 'deploy/staging/staging.py'), '--help'], cwd=ROOT / 'deploy/staging', capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('edge-activate', result.stdout)
+
     def test_additive_array_preserves_other_policy(self):
         source = '[tls]\nserver_names = ["existing.example"]\nmin_version = "tls1.3"\n'
         result = op.append_array(source, 'tls', 'server_names', 'new.example')

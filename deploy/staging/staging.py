@@ -260,7 +260,7 @@ def prepare():
 
 
 def install_services():
-    executable = str(HERE / 'operator.py')
+    executable = str(HERE / 'staging.py')
     maintenance = str(HERE / 'maintenance.py')
     services = {
         'devres-staging-firewall.service': f'[Unit]\nDescription=Devres staging NodePort isolation\nAfter=docker.service network-online.target\nRequires=docker.service\nBefore=k3s.service\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 {executable} firewall-bootstrap\n',

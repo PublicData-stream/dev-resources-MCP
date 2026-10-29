@@ -108,13 +108,13 @@ as root; the operator owns only the new namespace, datasets, firewall table,
 certificates, systemd units and two additive edge snippets.
 
 ```sh
-python3 operator.py prepare
-python3 operator.py start
-python3 operator.py edge-prepare
-python3 operator.py edge-activate
+python3 staging.py prepare
+python3 staging.py start
+python3 staging.py edge-prepare
+python3 staging.py edge-activate
 # Complete offline, fixed-live, private-isolation and shared-edge acceptance.
-python3 operator.py backup
-python3 operator.py collectors-on
+python3 staging.py backup
+python3 staging.py collectors-on
 systemctl enable --now devres-staging-backup.timer
 ```
 
