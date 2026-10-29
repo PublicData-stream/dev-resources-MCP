@@ -172,3 +172,13 @@ capability drops and namespace policy remain enabled. Existing runtime profiles
 are not modified; no cluster-wide policy reload is needed. The standard AppArmor
 boot service loads the two files before k3s. Attribution and the complete Apache
 license accompany the template.
+
+A bounded `pg_isready` init container gates the backend process on private database
+reachability. This avoids a fresh Pod exiting before CNI endpoint policy convergence;
+it does not retry provider calls or weaken ownership fencing. For first-time live
+RustSec qualification while collectors are paused, perform the documented
+[current-only advisory refresh](../../docs/operations.md#rustsec-collection-and-history)
+with serving stopped before running advisory/audit assertions. Use a one-shot Pod
+with the backend's security, volume and network settings, the same database wait,
+`restartPolicy: Never`, and an active deadline; verify its completion and termination
+before starting serving again.

@@ -178,6 +178,23 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         runAsNonRoot: true
         seccompProfile: {type: RuntimeDefault}
+      # A new Pod can start before CNI policy endpoint sets converge. Wait for
+      # database reachability before the application takes exclusive ownership.
+      initContainers:
+        - name: wait-postgres
+          image: postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a
+          command:
+            - sh
+            - -c
+            - 'for attempt in $(seq 1 30); do pg_isready -h postgres -p 5432 -U devres -d devres -t 2 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 128Mi}
+          securityContext:
+            appArmorProfile: {type: Localhost, localhostProfile: devres-staging-backend}
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
       containers:
         - name: backend
           image: ghcr.io/publicdata-stream/dev-resources-server@sha256:02977361122a11d7f0a9eedea97437b15f2fccc17f82d2331f859d388359179e
