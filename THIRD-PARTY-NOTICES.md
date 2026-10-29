@@ -74,3 +74,17 @@ observed in the official
 It is a notice template, not a blanket authorization for every W3C artifact or
 historical revision. Document-license prose and clearly marked code components
 retain their distinct governing notices; unresolved terms remain metadata only.
+
+## Staging AppArmor profiles
+
+The workload profile template in `deploy/staging/apparmor.profile` is adapted
+from containerd v2.3.4, revision `db8809540e1a7a9da5d518876894933ff55692ab`,
+[`contrib/apparmor/template.go`](https://github.com/containerd/containerd/blob/db8809540e1a7a9da5d518876894933ff55692ab/contrib/apparmor/template.go).
+The source file SHA-256 is `f5bef9dd4d785a27aa00b421862c68de973f19bb5b36dd39f4a5d2dd35ac2683`.
+Copyright The docker Authors, The Moby Authors, and The containerd Authors.
+It remains Apache-2.0; the complete license accompanies the template in
+[Apache-2.0.txt](deploy/staging/Apache-2.0.txt).
+The adaptation renders two workload-specific names and adds exact same-workload
+stacked-label signal permission for the deployment host's AppArmor behavior.
+It retains the upstream proc/sys/mount restrictions and confines the change to
+these new workloads; existing cluster profiles are not modified.

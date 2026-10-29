@@ -198,6 +198,19 @@ def firewall(strict=True):
         raise OperatorError('edge_topology_changed_ports_fenced')
 
 
+def install_profiles():
+    template = (HERE / 'apparmor.profile').read_text()
+    for role in ('postgres', 'backend'):
+        name = 'devres-staging-' + role
+        profile = template.replace('DEVRES_PROFILE', name)
+        run(['apparmor_parser', '-Q', '-K'], profile)
+        target = Path('/etc/apparmor.d') / name
+        if target.exists() and target.read_text() != profile:
+            raise OperatorError('workload_apparmor_profile_conflict')
+        write(target, profile, 0o644)
+        run(['apparmor_parser', '-r', '-K', target])
+
+
 def prepare():
     private_dirs()
     # Inventory failures and terminating Pods must not permit a Secret rewrite.
@@ -235,6 +248,7 @@ def prepare():
         write(PRIVATE / 'backend.toml', text)
     for image in (PG, SERVER, PROBE):
         run(['docker', 'pull', image], timeout=600)
+    install_profiles()
     firewall()
     # Namespace creation precedes secret and namespaced object admission.
     k('create', 'namespace', NS, '--dry-run=client', '-o', 'json')  # availability check

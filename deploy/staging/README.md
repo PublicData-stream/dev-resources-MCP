@@ -159,3 +159,16 @@ or pool loss. They preserve permanent history and the latest verified restore
 point rather than guaranteeing seven restore points under every workload.
 Disposable restore clones and credentials use owned `/tmp` directories, an internal
 Docker network and no published ports; they never import synthetic fixture data.
+
+## Host AppArmor compatibility
+
+Ubuntu on this host stacks an `unconfined` label onto subprocesses. The containerd
+v2.3.4 default profile does not admit signals to that exact stacked peer, which
+blocks PostgreSQL authentication, recovery and clean shutdown. `prepare` compiles
+and loads two dedicated Localhost profiles before admitting the new Pods. They
+retain the pinned upstream containerd default restrictions and add signals only
+to the same workload's exact stacked peer. RuntimeDefault seccomp, nonroot users,
+capability drops and namespace policy remain enabled. Existing runtime profiles
+are not modified; no cluster-wide policy reload is needed. The standard AppArmor
+boot service loads the two files before k3s. Attribution and the complete Apache
+license accompany the template.
