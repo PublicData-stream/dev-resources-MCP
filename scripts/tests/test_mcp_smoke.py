@@ -32,6 +32,17 @@ class ToolInventoryTests(unittest.TestCase):
                 smoke.assert_tool_inventory(invalid)
 
 
+class StoredIdentityTests(unittest.TestCase):
+    def test_fresh_storage_identity_requires_tagged_lowercase_blake3(self):
+        value = "blake3:" + "a" * 64
+        self.assertEqual(smoke.require_blake3(value), value)
+        for invalid in ("a" * 64, "sha256:" + "a" * 64, "blake3:" + "A" * 64,
+                        "blake3:" + "a" * 63, "blake3:" + "a" * 65,
+                        value + "\n", " " + value, None, 123):
+            with self.subTest(value=invalid), self.assertRaisesRegex(AssertionError, "tagged BLAKE3"):
+                smoke.require_blake3(invalid)
+
+
 class DecodeResponseTests(unittest.TestCase):
     def test_resource_read_routes_by_uri_in_modern_mcp_name_header(self):
         uri = "devres://source/?name=example&version=1.0.0&path=src%2Flib.rs"

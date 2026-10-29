@@ -111,6 +111,13 @@ pub struct WhatwgIndex {
     inner: MdnIndex,
 }
 impl WhatwgIndex {
+    /// Bind the provider's existing search layout without filesystem changes.
+    pub(crate) fn for_verification(root: &Path) -> Result<Self> {
+        Ok(Self {
+            inner: MdnIndex::for_verification(&root.join("whatwg-search"))
+                .map_err(provider_error)?,
+        })
+    }
     pub fn new(root: &Path) -> Result<Self> {
         let owned = root.join("whatwg-search");
         if owned.exists() {
@@ -132,6 +139,19 @@ impl WhatwgIndex {
     }
     pub fn recover_stages(&self) -> Result<()> {
         self.inner.recover_stages().map_err(provider_error)
+    }
+    /// Bounded exact-posting export for offline migration of a frozen generation.
+    pub async fn document_ids(
+        &self,
+        index: &Value,
+        after: usize,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> Result<(Vec<String>, Option<usize>)> {
+        self.inner
+            .document_ids(&reference(index, false)?, after, limit, cancel)
+            .await
+            .map_err(provider_error)
     }
     pub async fn publish(
         &self,

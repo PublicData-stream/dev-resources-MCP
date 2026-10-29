@@ -7,16 +7,13 @@ use devres_application::{
 };
 use devres_domain::{FetchRequest, FetchResponse, Validators};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 fn digest(value: &impl serde::Serialize) -> String {
-    hex::encode(Sha256::digest(
-        serde_json::to_vec(value).expect("fixture identity"),
-    ))
+    devres_adapters::integrity::hash(&serde_json::to_vec(value).expect("fixture identity"))
 }
 fn view(catalog: &str, snapshot: &Snapshot, validated_at: i64) -> View {
     let snapshots = BTreeMap::from([(snapshot.standard.clone(), snapshot.id.clone())]);
@@ -269,10 +266,10 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .expect("owned fixture database");
     let mut url = url::Url::parse(&base).expect("fixture URL");
     url.set_path(&format!("/{database}"));
-    let root = tempfile::tempdir().expect("owned fixture blobs");
+    let root = tempfile::tempdir_in("/tmp").expect("owned fixture blobs");
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("schema seven migration");
+        .expect("fresh schema ten");
     let inspection = sqlx::PgPool::connect(url.as_str())
         .await
         .expect("fixture inspection");
@@ -281,12 +278,13 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
             .fetch_one(&inspection)
             .await
             .expect("schema"),
-        9
+        10
     );
+    // Recognized opaque acceptance evidence can migrate without invented provider graph variants.
     // Exercise the actual version-six migration branch with retained older-provider evidence.
     let retained_whatwg = json!({"synthetic":true,"body":"WHATWG evidence predating W3C schema"});
     store
-        .whatwg_put("migration-fixtures", "before-w3c", &retained_whatwg)
+        .whatwg_put("acceptance", "before-w3c", &retained_whatwg)
         .await
         .expect("retain schema-six WHATWG evidence");
     let request = FetchRequest {
@@ -326,21 +324,54 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         owner_released,
         "schema maintenance requires no serving owner"
     );
+    remove_integrity_schema(&inspection).await;
     // Drop only new-provider tables in this task-created fixture database; earlier captures remain.
     sqlx::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; DROP TABLE devres_w3c_statistics; DROP TABLE devres_w3c_state; DROP TABLE devres_w3c_evidence; UPDATE devres_schema SET version=6 WHERE singleton").execute(&inspection).await.expect("prepare isolated schema-six fixture");
+    assert!(
+        PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .is_err(),
+        "schema-six serving requires explicit offline migration"
+    );
+    wait_owner_release(&inspection).await;
+    let migrating = std::sync::Arc::new(
+        PgBlobStore::connect_for_migration(url.as_str(), root.path())
+            .await
+            .expect("upgrade schema six in maintenance mode"),
+    );
+    assert!(
+        migrating
+            .activate_storage(tokio_util::sync::CancellationToken::new())
+            .await
+            .is_err(),
+        "unqualified storage cannot activate"
+    );
+    devres_adapters::migrate_storage_graphs(
+        &devres_adapters::MigrationSettings::default(),
+        migrating.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("qualify every retained storage graph offline");
+    migrating
+        .activate_storage(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("activate fully qualified storage");
+    drop(migrating);
+    wait_owner_release(&inspection).await;
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("migrate retained schema six to current");
+        .expect("serve fully migrated schema ten");
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
             .fetch_one(&inspection)
             .await
             .expect("upgraded schema"),
-        9
+        10
     );
     assert_eq!(
         store
-            .whatwg_get("migration-fixtures", "before-w3c")
+            .whatwg_get("acceptance", "before-w3c")
             .await
             .expect("old-provider retained row")
             .expect("old-provider identity")
@@ -800,4 +831,46 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
     .await
     .expect("remove owned fixture DB");
     admin.close().await;
+}
+
+async fn wait_owner_release(pool: &sqlx::PgPool) {
+    for _ in 0..50 {
+        let count:i64=sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(pool).await.expect("fixture ownership inspection");
+        if count == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("owned PostgreSQL session did not release its fence");
+}
+
+// Remove only schema-ten metadata in this task-owned fixture database. Retained
+// captures, source rows, and permanent filesystem evidence remain untouched.
+async fn remove_integrity_schema(pool: &sqlx::PgPool) {
+    sqlx::raw_sql(
+        r#"
+DO $fixture$
+DECLARE retained_column record;
+BEGIN
+    FOR retained_column IN
+        SELECT table_schema,table_name,column_name FROM information_schema.columns
+        WHERE table_schema='public' AND left(table_name,7)='devres_'
+          AND right(column_name,10)='_integrity'
+    LOOP
+        EXECUTE format('ALTER TABLE %I.%I DROP COLUMN %I',
+            retained_column.table_schema,retained_column.table_name,retained_column.column_name);
+    END LOOP;
+END;
+$fixture$;
+DROP TABLE devres_integrity_staged_state;
+DROP TABLE devres_integrity_provider_cutoffs;
+DROP TABLE devres_integrity_graph_progress;
+DROP TABLE devres_integrity_files;
+DROP TABLE devres_content_aliases;
+DROP TABLE devres_integrity_control;
+"#,
+    )
+    .execute(pool)
+    .await
+    .expect("remove schema-ten-only fixture metadata");
 }

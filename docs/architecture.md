@@ -45,11 +45,15 @@ manifests. Version 3 adds crate inventories, durable acquisition/processing jobs
 artifact provenance, metadata enrichment, content generations and research snapshots.
 Version 4 adds owner-fenced advisory observations, deduplicated representations,
 ordered snapshot membership, fixed legacy aliases and resumable Git-history state.
-Migrations preserve earlier capture identities; older binaries reject newer schemas.
+Versions 1–9 preserve earlier capture identities. Schema 10 adds explicit BLAKE3
+identities and permanent legacy compatibility mappings; older binaries reject it.
 
-Blobs use SHA-256 filenames in an operator-owned directory. Publication writes a
-unique staging file, fsyncs it, hard-links the immutable object without replacing an
-existing object, fsyncs the directory, then commits capture/head/observation records.
+New blobs use `blake3/<64 lowercase hex>` paths in an operator-owned directory;
+public hash identifiers use `blake3:<64 lowercase hex>`. Legacy SHA-256 paths remain
+retained compatibility evidence. Publication writes a unique staging file, fsyncs
+it, hard-links the immutable object without replacing an existing object, fsyncs
+the destination and new parent entries, then records BLAKE3 evidence before
+committing capture/head/observation records.
 Failures can leave unreferenced public blobs or staging files; these are recoverable
 artifacts, not missing published history. Cancellation guards remove owned staging files, and exclusive startup removes only
 recognized abandoned regular stage files. No automatic history deletion or immutable
@@ -66,6 +70,57 @@ the latest retained validation observation while preserving original retrieval t
 Existing resource content
 never follows a moving head. Source browsing additionally pins the index capture and
 archive capture; checksum verification precedes archive parsing.
+
+## BLAKE3 enforcement and schema 10
+
+Fresh stores initialize with enforced schema 10. Older stores require explicit
+private offline migration; serving rejects an older schema or pending migration.
+The maintenance path acquires the same exclusive owner fence before any provider
+workers or listeners start. It makes no upstream requests and never executes
+inspected package code.
+
+BLAKE3 covers capture bodies, bulk artifacts, retained SQL evidence/projections,
+content-bearing state, inventories, and index data/manifests. Rust computes and
+verifies versioned SQL envelopes binding the record namespace, identity and
+payload. The canonical JSON checksum encoding preserves arrays and normalizes
+numbers as exact decimal coefficient/exponent pairs, without an `f64` conversion;
+SQL constraints require integrity metadata. No PostgreSQL hashing extension is
+installed. Request-only lockfiles, dependency graphs and audit reports remain
+outside these storage paths.
+
+Private file descriptors under `blob_dir/.devres-integrity` bind exact relative
+paths, lengths and BLAKE3 digests. Writers publish them atomically after data fsync
+and before database pointers. Nested stores reuse the existing outer integrity
+root. These descriptors are permanent backup metadata, not index members or a
+public resource. Legacy reads require independently qualified BLAKE3 evidence in
+addition to their original checksum. BLAKE3 is verified before retained payloads
+are served or processed; missing metadata fails closed rather than qualifying
+content implicitly on a public read.
+
+Migration verifies legacy evidence, then reconstructs canonical graphs and indexes
+from frozen retained generations. Hash-radix inventories rebuild their routing as
+well as their node IDs. Frozen index replay preserves the actual admitted postings,
+text, processor/tokenizer version and recorded gaps. Migration occurrence IDs bind
+a versioned namespace, original ID and typed frozen evidence, preserving distinct
+historical generations that share content. Byte objects may deduplicate without
+merging observations, source timestamps or history positions.
+
+Original files, records, indexes and selectors remain retained. Namespaced mappings
+separate body, capture and provider/entity roles; identical old hash text in two
+roles need not identify the same canonical object. Legacy selectors and unversioned
+cursors read their frozen compatibility generation and original ordering. New
+discovery emits tagged BLAKE3 identities and versioned cursors. Activation promotes
+staged canonical selections only after complete verification; interruption resumes
+from verified checkpoints. Corruption, missing evidence or an unsupported retained
+variant blocks activation. Rollback restores the coordinated pre-upgrade database
+and blob backup.
+
+Registry archive checksums, npm SRI, Git OIDs, OCI/release checksums and source bytes
+retain their original meaning. SHA-based names for mutable scheduling/cache lookup
+keys can remain stable; they are not content addresses or integrity substitutes.
+The integrity envelopes detect mismatched retained content, not an administrator
+rewriting both content and its digest. Existing freshness, provider budgets,
+licensing, request limits and network boundaries remain unchanged.
 
 ## RFC corpus
 

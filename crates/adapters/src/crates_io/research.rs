@@ -84,12 +84,11 @@ impl Input {
         {
             crate::crates_io::packages::validate_version(version)?;
         }
-        if self.snapshot.as_ref().is_some_and(|s| {
-            s.len() != 64
-                || !s
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        }) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| !crate::integrity::valid_hash(s))
+        {
             return Err(Error::invalid("Invalid crate research snapshot."));
         }
         for value in [
@@ -796,7 +795,7 @@ impl CrateResearch {
     }
 }
 fn snapshot_json(snapshot: &Snapshot) -> Value {
-    json!({"id":snapshot.id,"inventory":snapshot.inventory.id,"revision":snapshot.inventory.revision,"enrichment_capture":snapshot.enrichment,"created_at":snapshot.created_at,"inventory_created_at":snapshot.inventory.created_at,"validated_at":snapshot.inventory.validated_at,"stale":devres_domain::unix_now().saturating_sub(snapshot.inventory.validated_at)>3600,"coverage":snapshot.coverage,"search_coverage":{"available":snapshot.index_manifest["sha256"].is_string(),"complete":snapshot.index_manifest["complete_search_coverage"],"skipped_documents":snapshot.index_manifest["skipped_documents"],"gap_samples":snapshot.index_manifest["gap_samples"]}})
+    json!({"id":snapshot.id,"inventory":snapshot.inventory.id,"revision":snapshot.inventory.revision,"enrichment_capture":snapshot.enrichment,"created_at":snapshot.created_at,"inventory_created_at":snapshot.inventory.created_at,"validated_at":snapshot.inventory.validated_at,"stale":devres_domain::unix_now().saturating_sub(snapshot.inventory.validated_at)>3600,"coverage":snapshot.coverage,"search_coverage":{"available":(snapshot.index_manifest["digest"].is_string() || snapshot.index_manifest["sha256"].is_string()),"complete":snapshot.index_manifest["complete_search_coverage"],"skipped_documents":snapshot.index_manifest["skipped_documents"],"gap_samples":snapshot.index_manifest["gap_samples"]}})
 }
 
 pub fn schemas() -> Vec<Value> {

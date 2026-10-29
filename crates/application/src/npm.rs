@@ -102,6 +102,30 @@ pub struct Row {
 /// Only public upstream evidence and private operator scheduling state are admitted.
 #[async_trait]
 pub trait NpmStore: Send + Sync {
+    /// Complete retained rows for private integrity verification, including aliases.
+    async fn npm_migration_rows(
+        &self,
+        _kind: &str,
+        _after: i64,
+        _limit: usize,
+    ) -> Result<Vec<Row>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration verification unavailable.",
+        ))
+    }
+
+    /// Private offline migration inventory; never exposed through MCP.
+    async fn npm_migration_kinds(&self) -> Result<Vec<String>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration enumeration unavailable.",
+        ))
+    }
+    async fn npm_migration_state_keys(&self, _after: &str, _limit: usize) -> Result<Vec<String>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration enumeration unavailable.",
+        ))
+    }
+
     async fn npm_get(&self, kind: &str, key: &str) -> Result<Option<Row>>;
     async fn npm_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64>;
     async fn npm_cutoff(&self) -> Result<i64>;

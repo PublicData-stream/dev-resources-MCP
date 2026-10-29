@@ -489,6 +489,86 @@ async fn build_streams_version_content_and_enrichment_into_indexed_filters() {
     );
 }
 
+#[tokio::test]
+async fn frozen_rebuild_keeps_text_filters_and_rewrites_only_record_references() {
+    let _serial = super::TEST_BUILD.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let store = fixture();
+    let mut snapshot = store.snapshot.lock().unwrap().clone();
+    let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
+    let original = build(
+        store.clone(),
+        retrieval,
+        root.path().to_owned(),
+        snapshot.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    snapshot.id = crate::integrity::hash(b"canonical frozen crate snapshot");
+    snapshot.inventory.id = crate::integrity::hash(b"canonical frozen crate inventory");
+    let rewrite: PayloadRewrite = Arc::new(|value| {
+        if value["class"] == "content" {
+            for key in ["id", "capture", "metadata_capture", "archive_capture"] {
+                if let Some(old) = value["record"][key].as_str() {
+                    value["record"][key] = json!(crate::integrity::hash(old.as_bytes()));
+                }
+            }
+        }
+        Ok(())
+    });
+    let rebuilt = rebuild_frozen(
+        store,
+        root.path().to_owned(),
+        original.clone(),
+        snapshot,
+        rewrite,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let spec = SearchSpec {
+        class: Some("version".into()),
+        license: Some("MIT".into()),
+        keyword: Some("network".into()),
+        category: Some("development-tools".into()),
+        msrv: Some("1.70".into()),
+        dependency: Some("dependency".into()),
+        limit: 20,
+        ..Default::default()
+    };
+    let before = search_sync(
+        root.path(),
+        &original,
+        spec.clone(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let after = search_sync(root.path(), &rebuilt, spec, CancellationToken::new()).unwrap();
+    assert_eq!(before, after);
+    let content = search_sync(
+        root.path(),
+        &rebuilt,
+        SearchSpec {
+            class: Some("content".into()),
+            limit: 100,
+            ..Default::default()
+        },
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(content["total"].as_u64().unwrap() > 0);
+    for item in content["items"].as_array().unwrap() {
+        assert!(
+            item["document"]["record"]["capture"]
+                .as_str()
+                .unwrap()
+                .starts_with("blake3:")
+        );
+    }
+    assert_eq!(rebuilt["skipped_documents"], original["skipped_documents"]);
+}
+
 #[test]
 fn one_unindexable_token_is_a_durable_gap_and_keeps_other_documents_searchable() {
     let root = tempfile::tempdir().unwrap();
@@ -603,7 +683,7 @@ fn cursors_cross_shards_and_bind_query_snapshot_with_changeable_page_sizes() {
         "invalid_input"
     );
     let mut other = manifest.clone();
-    other["sha256"] = json!("f".repeat(64));
+    other["digest"] = json!(crate::integrity::hash(b"different index manifest"));
     assert_eq!(
         search_sync(
             root.path(),

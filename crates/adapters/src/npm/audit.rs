@@ -47,12 +47,10 @@ impl AuditInput {
         ) || self.limit == 0
             || self.limit > 100
             || self.offset > MAX_FINDINGS
-            || self.advisory_snapshot.as_ref().is_some_and(|id| {
-                id.len() != 64
-                    || !id
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
+            || self
+                .advisory_snapshot
+                .as_ref()
+                .is_some_and(|id| !crate::integrity::valid_hash(id))
         {
             return Err(Error::invalid(
                 "Invalid npm audit format, snapshot, or page.",

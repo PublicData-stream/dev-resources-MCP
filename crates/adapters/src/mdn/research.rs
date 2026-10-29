@@ -40,9 +40,7 @@ fn integrity() -> Error {
     Error::integrity("Invalid retained MDN evidence.")
 }
 fn valid_hash(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::integrity::valid_hash(s)
 }
 fn from_value<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|_| integrity())
@@ -197,6 +195,8 @@ struct DiscoveryInput {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
+    #[serde(default)]
+    version: u8,
     fingerprint: String,
     cutoff: i64,
     after: i64,
@@ -206,6 +206,26 @@ struct Cursor {
 }
 
 impl MdnResearch {
+    pub(crate) fn for_verification(store: Arc<dyn MdnStore>, root: &Path) -> Result<Self> {
+        Ok(Self {
+            store,
+            root: root.into(),
+            index: MdnIndex::for_verification(root)?,
+            content_git: MdnGit::for_verification(
+                root,
+                Repo::Content,
+                8 * 1024 * 1024 * 1024,
+                64 * 1024 * 1024,
+            )?,
+            compat_git: MdnGit::for_verification(
+                root,
+                Repo::Compat,
+                8 * 1024 * 1024 * 1024,
+                64 * 1024 * 1024,
+            )?,
+            admission: Arc::new(Semaphore::new(2)),
+        })
+    }
     pub fn new(store: Arc<dyn MdnStore>, root: &Path) -> Result<Self> {
         Ok(Self {
             store,
@@ -666,10 +686,26 @@ impl MdnResearch {
             .filter(|s| valid_hash(s))
             .ok_or_else(integrity)?;
         let relative = raw["relative_path"].as_str().ok_or_else(integrity)?;
-        if relative != format!("mdn/raw-artifacts/{expected}") {
+        if relative
+            != format!(
+                "mdn/raw-artifacts/{}",
+                crate::integrity::relative_path(expected)?.display()
+            )
+        {
             return Err(integrity());
         }
         let path = self.root.join(relative);
+        if !expected.starts_with("blake3:") {
+            let legacy_path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::integrity::verify_legacy_file(
+                    &legacy_path,
+                    std::time::Instant::now() + Duration::from_secs(15),
+                )
+            })
+            .await
+            .map_err(|_| failure())??;
+        }
         let meta = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|_| failure())?;
@@ -689,6 +725,7 @@ impl MdnResearch {
         let operation = async {
             let mut file = tokio::fs::File::open(path).await.map_err(|_| failure())?;
             let mut hash = Sha256::new();
+            let mut blake3_hash = blake3::Hasher::new();
             let mut buffer = vec![0u8; 65536];
             let mut position = 0u64;
             let mut selected = Vec::new();
@@ -699,6 +736,7 @@ impl MdnResearch {
                     break;
                 }
                 hash.update(&buffer[..n]);
+                blake3_hash.update(&buffer[..n]);
                 if textual {
                     text.extend_from_slice(&buffer[..n]);
                 } else {
@@ -716,7 +754,12 @@ impl MdnResearch {
                     return Err(integrity());
                 }
             }
-            if position != total || hex::encode(hash.finalize()) != expected {
+            let observed = if expected.starts_with("blake3:") {
+                format!("blake3:{}", blake3_hash.finalize().to_hex())
+            } else {
+                hex::encode(hash.finalize())
+            };
+            if position != total || observed != expected {
                 return Err(integrity());
             }
             if textual && let Ok(text) = std::str::from_utf8(&text) {
@@ -940,9 +983,21 @@ impl MdnResearch {
         normalized.offset = 0;
         normalized.limit = 0;
         normalized.history_snapshot = None;
-        let fingerprint = crate::mdn::index::hash(
-            &serde_json::to_vec(&(history, &normalized)).map_err(|_| integrity())?,
-        );
+        let identity = serde_json::to_vec(&(history, &normalized)).map_err(|_| integrity())?;
+        let version = match input.cursor.as_deref() {
+            Some(encoded) if encoded.len() <= 16_384 => {
+                serde_json::from_str::<Cursor>(encoded)
+                    .map_err(|_| Error::invalid("Malformed MDN discovery cursor."))?
+                    .version
+            }
+            Some(_) => return Err(Error::invalid("MDN cursor exceeds its bound.")),
+            None => 2,
+        };
+        let fingerprint = match version {
+            0 => crate::integrity::legacy_hash(&identity),
+            2 => crate::integrity::hash(&identity),
+            _ => return Err(Error::invalid("Unsupported MDN cursor version.")),
+        };
         let (cutoff, mut after, mut position, offset_to_skip) = if let Some(cursor) = &input.cursor
         {
             if cursor.len() > 16384 || input.offset != 0 {
@@ -1039,6 +1094,7 @@ impl MdnResearch {
         let next_cursor = if more {
             Some(
                 serde_json::to_string(&Cursor {
+                    version,
                     fingerprint,
                     cutoff,
                     after,
@@ -1478,15 +1534,16 @@ mod tests {
     async fn article(store: &Memory, root: &Path, text: &str, revision: &str) -> Snapshot {
         let source = format!("---\ntitle: Fetch\nslug: Web/API/Fetch\n---\n{text}");
         let body_hash = crate::mdn::index::hash(source.as_bytes());
-        std::fs::create_dir_all(root.join("mdn/raw-artifacts")).expect("raw directory");
+        std::fs::create_dir_all(root.join("mdn/raw-artifacts/blake3")).expect("raw directory");
         std::fs::write(
-            root.join("mdn/raw-artifacts").join(&body_hash),
+            root.join("mdn/raw-artifacts")
+                .join(crate::integrity::relative_path(&body_hash).expect("digest path")),
             source.as_bytes(),
         )
         .expect("raw");
         let projection=put_projection(store,json!({"title":"Fetch","slug":"Web/API/Fetch","text":text,"compatibility_keys":["api.fetch"],"gaps":[],"status":[],"page_type":"web-api-method"})).await;
         let empty = crate::mdn::inventory::empty(store).await.expect("empty");
-        let inventory=crate::mdn::inventory::update(store,&empty,"files/en-us/web/api/fetch/index.md",Some(Member{path:"files/en-us/web/api/fetch/index.md".into(),oid:"a".repeat(40),mode:"100644".into(),kind:"article".into(),projection:Some(projection),raw:Some(json!({"body_hash":body_hash,"relative_path":format!("mdn/raw-artifacts/{body_hash}"),"bytes":source.len(),"source_path":"files/en-us/web/api/fetch/index.md"})),gaps:Vec::new()})).await.expect("inventory");
+        let inventory=crate::mdn::inventory::update(store,&empty,"files/en-us/web/api/fetch/index.md",Some(Member{path:"files/en-us/web/api/fetch/index.md".into(),oid:"a".repeat(40),mode:"100644".into(),kind:"article".into(),projection:Some(projection),raw:Some(json!({"body_hash":body_hash,"relative_path":format!("mdn/raw-artifacts/{}",crate::integrity::relative_path(&body_hash).expect("digest path").display()),"bytes":source.len(),"source_path":"files/en-us/web/api/fetch/index.md"})),gaps:Vec::new()})).await.expect("inventory");
         let id = crate::mdn::index::hash(format!("content:{revision}:{inventory}").as_bytes());
         let snapshot = Snapshot {
             id,
@@ -1666,9 +1723,15 @@ mod tests {
         member.gaps = vec!["unsupported_format".into()];
         let bytes = [0, 255, 1, 2];
         let hash = crate::mdn::index::hash(&bytes);
-        std::fs::write(dir.path().join("mdn/raw-artifacts").join(&hash), bytes).expect("raw");
+        std::fs::write(
+            dir.path()
+                .join("mdn/raw-artifacts")
+                .join(crate::integrity::relative_path(&hash).expect("digest path")),
+            bytes,
+        )
+        .expect("raw");
         member.raw = Some(
-            json!({"body_hash":hash,"relative_path":format!("mdn/raw-artifacts/{hash}"),"bytes":bytes.len(),"source_path":member.path}),
+            json!({"body_hash":hash,"relative_path":format!("mdn/raw-artifacts/{}",crate::integrity::relative_path(&hash).expect("digest path").display()),"bytes":bytes.len(),"source_path":member.path}),
         );
         let mut historical = content.clone();
         historical.inventory = crate::mdn::inventory::update(

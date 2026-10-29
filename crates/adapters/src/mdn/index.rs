@@ -35,7 +35,7 @@ use tantivy::{
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const MAX_SHARDS: usize = 4096;
 const MAX_DOCS: usize = 50_000;
 const MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -54,6 +54,28 @@ fn integrity() -> Error {
 fn capacity() -> Error {
     Error::capacity("MDN search processing bound exceeded.")
 }
+fn reference_digest(reference: &Value) -> Result<&str> {
+    match (reference.get("digest"), reference.get("sha256")) {
+        (Some(digest), None) => digest
+            .as_str()
+            .filter(|s| s.starts_with("blake3:") && valid_hash(s))
+            .ok_or_else(integrity),
+        (None, Some(digest)) => digest
+            .as_str()
+            .filter(|s| !s.starts_with("blake3:") && valid_hash(s))
+            .ok_or_else(integrity),
+        _ => Err(integrity()),
+    }
+}
+
+fn index_suffix(id: &str) -> Result<String> {
+    Ok(crate::integrity::relative_path(id)?
+        .to_string_lossy()
+        .into_owned())
+}
+fn manifest_relative(id: &str) -> Result<String> {
+    Ok(format!("mdn-indexes/manifests/{}.json", index_suffix(id)?))
+}
 fn check(cancel: &CancellationToken, deadline: Instant) -> Result<()> {
     if cancel.is_cancelled() {
         return Err(Error::new("cancelled", "MDN search canceled."));
@@ -64,12 +86,10 @@ fn check(cancel: &CancellationToken, deadline: Instant) -> Result<()> {
     Ok(())
 }
 pub(crate) fn hash(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
 }
 fn valid_hash(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::integrity::valid_hash(s)
 }
 fn field(schema: &Schema, name: &str) -> Result<Field> {
     schema.get_field(name).map_err(|_| integrity())
@@ -138,7 +158,8 @@ fn twenty() -> usize {
 #[serde(deny_unknown_fields)]
 struct FileDigest {
     bytes: u64,
-    sha256: String,
+    #[serde(alias = "sha256")]
+    digest: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,6 +180,7 @@ struct Manifest {
 #[derive(Clone)]
 pub struct MdnIndex {
     root: PathBuf,
+    verification_only: bool,
 }
 
 fn schema() -> Schema {
@@ -215,12 +237,21 @@ fn register(index: &Index) -> Result<()> {
     Ok(())
 }
 fn digest(path: &Path, cancel: &CancellationToken, deadline: Instant) -> Result<FileDigest> {
+    digest_with_algorithm(path, cancel, deadline, false)
+}
+fn digest_with_algorithm(
+    path: &Path,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    legacy: bool,
+) -> Result<FileDigest> {
     let m = fs::symlink_metadata(path).map_err(|_| failure())?;
     if !m.is_file() || m.file_type().is_symlink() || m.len() > MAX_BYTES {
         return Err(integrity());
     }
     let mut f = File::open(path).map_err(|_| failure())?;
     let mut h = Sha256::new();
+    let mut blake3 = blake3::Hasher::new();
     let mut buf = [0u8; 65536];
     let mut bytes = 0u64;
     loop {
@@ -234,13 +265,18 @@ fn digest(path: &Path, cancel: &CancellationToken, deadline: Instant) -> Result<
             return Err(integrity());
         }
         h.update(&buf[..n]);
+        blake3.update(&buf[..n]);
     }
     if bytes != m.len() {
         return Err(integrity());
     }
     Ok(FileDigest {
         bytes,
-        sha256: hex::encode(h.finalize()),
+        digest: if legacy {
+            hex::encode(h.finalize())
+        } else {
+            format!("blake3:{}", blake3.finalize().to_hex())
+        },
     })
 }
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -305,19 +341,44 @@ impl MdnIndex {
     pub fn validate_document(input: &IndexDocument, cancel: &CancellationToken) -> Result<()> {
         document_counts(input, cancel).map(|_| ())
     }
+    /// Bind the expected index location without creating or recovering directories.
+    pub(crate) fn for_verification(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: root.into(),
+            verification_only: true,
+        })
+    }
     pub fn new(root: &Path) -> Result<Self> {
         let root = fs::canonicalize(root).map_err(|_| failure())?;
         real_directory(&root)?;
         let base = root.join("mdn-indexes");
-        fs::create_dir_all(base.join("manifests")).map_err(|_| failure())?;
-        fs::create_dir_all(base.join("shards")).map_err(|_| failure())?;
-        for p in [&base, &base.join("manifests"), &base.join("shards")] {
+        crate::integrity::ensure_directory_durable(&base.join("manifests/blake3"))?;
+        crate::integrity::ensure_directory_durable(&base.join("shards/blake3"))?;
+        for p in [
+            &base,
+            &base.join("manifests"),
+            &base.join("shards"),
+            &base.join("manifests/blake3"),
+            &base.join("shards/blake3"),
+        ] {
             real_directory(p)?;
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            verification_only: false,
+        })
+    }
+    fn require_writable(&self) -> Result<()> {
+        if self.verification_only {
+            return Err(Error::integrity(
+                "Verification index handles are read-only.",
+            ));
+        }
+        Ok(())
     }
     /// Called only during fenced startup. Published manifests and shards are never removed.
     pub fn recover_stages(&self) -> Result<()> {
+        self.require_writable()?;
         let base = self.root.join("mdn-indexes");
         real_directory(&base)?;
         for entry in fs::read_dir(&base).map_err(|_| failure())? {
@@ -353,6 +414,82 @@ impl MdnIndex {
             .and_then(|f| f.sync_all())
             .map_err(|_| failure())
     }
+    /// Export exact retained posting identities for private frozen-generation migration.
+    /// Full document text remains in verified `index-documents` evidence rows.
+    pub async fn document_ids(
+        &self,
+        reference: &Value,
+        after: usize,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> Result<(Vec<String>, Option<usize>)> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::invalid("Invalid index export page."));
+        }
+        let permit = READERS
+            .get_or_init(|| Arc::new(Semaphore::new(2)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| capacity())?;
+        let this = self.clone();
+        let reference = reference.clone();
+        let stop = cancel.child_token();
+        let _cancel_guard = CancelOnDrop(stop.clone());
+        let mut task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let opened = this.open(&reference, &stop, deadline)?;
+            let payload_field = field(&schema(), "payload")?;
+            let mut position = 0usize;
+            let mut bytes = 0usize;
+            let mut ids = Vec::new();
+            for shard in &opened.shards {
+                for (segment_id, segment) in shard.searcher.segment_readers().iter().enumerate() {
+                    for document in segment.doc_ids_alive() {
+                        check(&stop, deadline)?;
+                        if position < after {
+                            position = position.checked_add(1).ok_or_else(capacity)?;
+                            continue;
+                        }
+                        if ids.len() == limit {
+                            return Ok((ids, Some(position)));
+                        }
+                        let stored: TantivyDocument = shard
+                            .searcher
+                            .doc(tantivy::DocAddress::new(segment_id as u32, document))
+                            .map_err(|_| integrity())?;
+                        let payload = stored
+                            .get_first(payload_field)
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(integrity)?;
+                        if payload.len() > 128 * 1024 {
+                            return Err(capacity());
+                        }
+                        let value: Value =
+                            serde_json::from_str(payload).map_err(|_| integrity())?;
+                        let id = value["id"]
+                            .as_str()
+                            .filter(|id| valid_hash(id))
+                            .ok_or_else(integrity)?;
+                        bytes = bytes.checked_add(id.len()).ok_or_else(capacity)?;
+                        if bytes > 16 * 1024 * 1024 {
+                            return Err(capacity());
+                        }
+                        ids.push(id.to_owned());
+                        position = position.checked_add(1).ok_or_else(capacity)?;
+                    }
+                }
+            }
+            if after > position {
+                return Err(Error::invalid(
+                    "Index export cursor exceeds retained membership.",
+                ));
+            }
+            Ok((ids, None))
+        });
+        tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "MDN index export canceled.")) }, result = &mut task => result.map_err(|_| failure())? }
+    }
+
     pub async fn publish(
         &self,
         previous: Option<&Value>,
@@ -370,6 +507,7 @@ impl MdnIndex {
         cancel: CancellationToken,
         generation: &str,
     ) -> Result<Value> {
+        self.require_writable()?;
         if generation.len() > 128 || generation.chars().any(char::is_control) {
             return Err(Error::invalid("Invalid MDN index processing generation."));
         }
@@ -419,9 +557,9 @@ impl MdnIndex {
             if unique.len() != documents.len() {
                 return Err(Error::integrity("Duplicate MDN index projection."));
             }
-            let mut input_hash = Sha256::new();
-            input_hash.update(FORMAT_VERSION.to_be_bytes());
-            input_hash.update((generation.len() as u64).to_be_bytes());
+            let mut input_hash = blake3::Hasher::new();
+            input_hash.update(&FORMAT_VERSION.to_be_bytes());
+            input_hash.update(&(generation.len() as u64).to_be_bytes());
             input_hash.update(generation.as_bytes());
             let mut input_bytes = 0usize;
             for document in &documents {
@@ -430,11 +568,11 @@ impl MdnIndex {
                     return Err(capacity());
                 }
                 let encoded = serde_json::to_vec(document).map_err(|_| integrity())?;
-                input_hash.update((encoded.len() as u64).to_be_bytes());
-                input_hash.update(encoded);
+                input_hash.update(&(encoded.len() as u64).to_be_bytes());
+                input_hash.update(&encoded);
             }
-            let id = hex::encode(input_hash.finalize());
-            let final_path = base.join("shards").join(&id);
+            let id = format!("blake3:{}", input_hash.finalize().to_hex());
+            let final_path = base.join("shards").join(index_suffix(&id)?);
             if final_path.exists() {
                 let descriptor = final_path.join("descriptor.json");
                 let metadata = fs::symlink_metadata(&descriptor).map_err(|_| failure())?;
@@ -554,11 +692,26 @@ impl MdnIndex {
                     .and_then(|f| f.sync_all())
                     .map_err(|_| failure())?;
                 fs::rename(&stage, &final_path).map_err(|_| failure())?;
-                File::open(base.join("shards"))
+                File::open(final_path.parent().ok_or_else(integrity)?)
                     .and_then(|f| f.sync_all())
                     .map_err(|_| failure())?;
                 shard = Some(descriptor);
             }
+        }
+        if let Some(shard) = &shard {
+            let path = base.join("shards").join(index_suffix(&shard.id)?);
+            for (name, digest) in &shard.files {
+                crate::integrity::record_file(
+                    &self.root,
+                    &path.join(name),
+                    &digest.digest,
+                    digest.bytes,
+                )?;
+            }
+            let path = path.join("descriptor.json");
+            let (digest, bytes) =
+                crate::integrity::file_digest(&path, MAX_MANIFEST as u64, deadline)?;
+            crate::integrity::record_file(&self.root, &path, &digest, bytes)?;
         }
         let manifest = Manifest {
             version: FORMAT_VERSION,
@@ -571,7 +724,7 @@ impl MdnIndex {
             return Err(capacity());
         }
         let id = hash(&bytes);
-        let final_path = base.join("manifests").join(format!("{id}.json"));
+        let final_path = self.root.join(manifest_relative(&id)?);
         if final_path.exists() {
             if fs::read(&final_path).map_err(|_| failure())? != bytes {
                 return Err(integrity());
@@ -585,11 +738,12 @@ impl MdnIndex {
             write_new(&temporary, &bytes)?;
             fs::hard_link(&temporary, &final_path).map_err(|_| failure())?;
             fs::remove_file(temporary).map_err(|_| failure())?;
-            File::open(base.join("manifests"))
+            File::open(final_path.parent().ok_or_else(integrity)?)
                 .and_then(|f| f.sync_all())
                 .map_err(|_| failure())?;
         }
-        let reference = json!({"path":format!("mdn-indexes/manifests/{id}.json"),"sha256":id});
+        crate::integrity::record_file(&self.root, &final_path, &id, bytes.len() as u64)?;
+        let reference = json!({"version":3,"path":manifest_relative(&id)?,"digest":id});
         self.open(&reference, cancel, deadline)?;
         Ok(reference)
     }
@@ -602,15 +756,26 @@ impl MdnIndex {
         if !valid_hash(&shard.id) || shard.documents > MAX_DOCS || shard.files.len() > 10_000 {
             return Err(integrity());
         }
-        let path = self.root.join("mdn-indexes/shards").join(&shard.id);
+        let path = self
+            .root
+            .join("mdn-indexes/shards")
+            .join(index_suffix(&shard.id)?);
         real_directory(&path)?;
         let mut total = 0u64;
         for (name, expected) in &shard.files {
-            if !safe_file(name) || !valid_hash(&expected.sha256) {
+            if !safe_file(name) || !valid_hash(&expected.digest) {
                 return Err(integrity());
             }
-            let found = digest(&path.join(name), cancel, deadline)?;
-            if found.bytes != expected.bytes || found.sha256 != expected.sha256 {
+            if !expected.digest.starts_with("blake3:") {
+                crate::integrity::verify_legacy_file(&path.join(name), deadline)?;
+            }
+            let found = digest_with_algorithm(
+                &path.join(name),
+                cancel,
+                deadline,
+                !expected.digest.starts_with("blake3:"),
+            )?;
+            if found.bytes != expected.bytes || found.digest != expected.digest {
                 return Err(integrity());
             }
             total = total.saturating_add(found.bytes);
@@ -626,16 +791,18 @@ impl MdnIndex {
         cancel: &CancellationToken,
         deadline: Instant,
     ) -> Result<Arc<Opened>> {
-        let expected = reference["sha256"]
-            .as_str()
-            .filter(|s| valid_hash(s))
-            .ok_or_else(integrity)?;
-        if reference["path"] != format!("mdn-indexes/manifests/{expected}.json") {
+        let expected = reference_digest(reference)?;
+        if reference["path"] != manifest_relative(expected)? {
             return Err(integrity());
+        }
+        if self.verification_only {
+            real_directory(&self.root)?;
         }
         let key = format!("{}:{expected}", self.root.display());
         let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(found) = cache.lock().map_err(|_| failure())?.get(&key).cloned() {
+        if !self.verification_only
+            && let Some(found) = cache.lock().map_err(|_| failure())?.get(&key).cloned()
+        {
             return Ok(found);
         }
         let mut current = Some(reference.clone());
@@ -644,52 +811,60 @@ impl MdnIndex {
         let mut shards = Vec::new();
         while let Some(reference) = current {
             check(cancel, deadline)?;
-            let id = reference["sha256"]
-                .as_str()
-                .filter(|s| valid_hash(s))
-                .ok_or_else(integrity)?;
-            if reference["path"] != format!("mdn-indexes/manifests/{id}.json")
+            let id = reference_digest(&reference)?;
+            if reference["path"] != manifest_relative(id)?
                 || !manifests.insert(id.to_owned())
                 || manifests.len() > MAX_SHARDS + 1
             {
                 return Err(integrity());
             }
-            let path = self
-                .root
-                .join("mdn-indexes/manifests")
-                .join(format!("{id}.json"));
+            let path = self.root.join(manifest_relative(id)?);
             let meta = fs::symlink_metadata(&path).map_err(|_| failure())?;
             if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_MANIFEST as u64
             {
                 return Err(integrity());
             }
-            let bytes = fs::read(path).map_err(|_| failure())?;
-            if hash(&bytes) != id {
-                return Err(integrity());
+            if !id.starts_with("blake3:") {
+                crate::integrity::verify_legacy_file(&path, deadline)?;
             }
+            let bytes = fs::read(path).map_err(|_| failure())?;
+            crate::integrity::verify(id, &bytes)?;
             let m: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
-            if m.version != FORMAT_VERSION
+            if !matches!(m.version, 2 | FORMAT_VERSION)
                 || m.generation.len() > 128
                 || m.generation.chars().any(char::is_control)
             {
                 return Err(integrity());
             }
             if let Some(shard) = m.shard {
+                if m.version == FORMAT_VERSION
+                    && (!shard.id.starts_with("blake3:")
+                        || shard
+                            .files
+                            .values()
+                            .any(|f| !f.digest.starts_with("blake3:")))
+                {
+                    return Err(integrity());
+                }
                 if !shard_ids.insert(shard.id.clone()) {
                     return Err(integrity());
                 }
                 let shard_key = format!("{}:{}", self.root.display(), shard.id);
                 let shard_cache = SHARD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-                let retained = shard_cache
-                    .lock()
-                    .map_err(|_| failure())?
-                    .get(&shard_key)
-                    .and_then(Weak::upgrade);
+                let retained = if self.verification_only {
+                    None
+                } else {
+                    shard_cache
+                        .lock()
+                        .map_err(|_| failure())?
+                        .get(&shard_key)
+                        .and_then(Weak::upgrade)
+                };
                 let opened = if let Some(opened) = retained {
                     opened
                 } else {
                     let path = self.verify_shard(&shard, cancel, deadline)?;
-                    let index = Index::open_in_dir(&path).map_err(|_| integrity())?;
+                    let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
                     if index.schema() != schema() {
                         return Err(integrity());
                     }
@@ -707,11 +882,13 @@ impl MdnIndex {
                         _reader: reader,
                         searcher,
                     });
-                    let mut cache = shard_cache.lock().map_err(|_| failure())?;
-                    if cache.len() > MAX_SHARDS * 2 {
-                        cache.retain(|_, v| v.strong_count() > 0);
+                    if !self.verification_only {
+                        let mut cache = shard_cache.lock().map_err(|_| failure())?;
+                        if cache.len() > MAX_SHARDS * 2 {
+                            cache.retain(|_, v| v.strong_count() > 0);
+                        }
+                        cache.insert(shard_key, Arc::downgrade(&opened));
                     }
-                    cache.insert(shard_key, Arc::downgrade(&opened));
                     opened
                 };
                 shards.push(opened);
@@ -719,6 +896,9 @@ impl MdnIndex {
             current = m.parent;
         }
         let opened = Arc::new(Opened { shards });
+        if self.verification_only {
+            return Ok(opened);
+        }
         let mut guard = cache.lock().map_err(|_| failure())?;
         if guard.len() >= 4 {
             guard.clear();
@@ -877,17 +1057,21 @@ impl MdnIndex {
             )
         };
         check(cancel, deadline)?;
-        let fingerprint = hash(
-            &serde_json::to_vec(&(
-                reference,
-                &members,
-                &spec.snapshot,
-                &spec.query,
-                &spec.mode,
-                &spec.filters,
-            ))
-            .map_err(|_| integrity())?,
-        );
+        let fingerprint_bytes = serde_json::to_vec(&(
+            reference,
+            &members,
+            &spec.snapshot,
+            &spec.query,
+            &spec.mode,
+            &spec.filters,
+        ))
+        .map_err(|_| integrity())?;
+        let canonical = reference_digest(reference)?.starts_with("blake3:");
+        let fingerprint = if canonical {
+            hash(&fingerprint_bytes)
+        } else {
+            crate::integrity::legacy_hash(&fingerprint_bytes)
+        };
         let after = if let Some(cursor) = &spec.cursor {
             if cursor.len() > 16384 || spec.offset != 0 {
                 return Err(Error::invalid("Invalid MDN search cursor."));
@@ -895,6 +1079,7 @@ impl MdnIndex {
             let continuation: Continuation = serde_json::from_str(cursor)
                 .map_err(|_| Error::invalid("Malformed MDN search cursor."))?;
             if continuation.fingerprint != fingerprint
+                || continuation.version != if canonical { 2 } else { 0 }
                 || !continuation.rank.score.is_finite()
                 || continuation.rank.tie.len() > 16384
             {
@@ -965,6 +1150,7 @@ impl MdnIndex {
                 .get(spec.offset + spec.limit - 1)
                 .map(|(rank, _, _)| {
                     serde_json::to_string(&Continuation {
+                        version: if canonical { 2 } else { 0 },
                         fingerprint: fingerprint.clone(),
                         rank: rank.clone(),
                     })
@@ -1222,6 +1408,8 @@ impl PartialOrd for Rank {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Continuation {
+    #[serde(default)]
+    version: u32,
     fingerprint: String,
     rank: Rank,
 }
@@ -1377,6 +1565,58 @@ mod tests {
             metadata: json!({"status":["experimental"]}),
         }
     }
+    #[tokio::test]
+    async fn frozen_posting_export_pages_exact_original_membership() {
+        let _gate = TEST_GATE.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let index = MdnIndex::new(root.path()).unwrap();
+        let documents = vec![
+            doc("one", "One", "first source"),
+            doc("two", "Two", "second source"),
+        ];
+        let ids: BTreeSet<_> = documents.iter().map(|doc| doc.id.clone()).collect();
+        let reference = index
+            .publish(None, documents, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(reference["digest"].as_str().unwrap().starts_with("blake3:"));
+        assert!(reference.get("sha256").is_none());
+        let mut after = 0;
+        let mut exported = BTreeSet::new();
+        loop {
+            let (page, next) = index
+                .document_ids(&reference, after, 1, CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(page.len() <= 1);
+            for id in page {
+                assert!(exported.insert(id));
+            }
+            match next {
+                Some(next) => {
+                    assert!(next > after);
+                    after = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(exported, ids);
+        assert!(
+            index
+                .document_ids(&reference, 3, 1, CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let mut ambiguous = reference;
+        ambiguous["sha256"] = json!("a".repeat(64));
+        assert!(
+            index
+                .document_ids(&ambiguous, 0, 1, CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn prepared_membership_and_exact_filters_keep_cross_shard_counts_and_cursor_order() {
         struct NoScoringStatistics;
@@ -1877,7 +2117,7 @@ mod tests {
         let damaged = dir
             .path()
             .join("mdn-indexes/shards")
-            .join(shard.id)
+            .join(index_suffix(&shard.id).expect("shard suffix"))
             .join("meta.json");
         fs::write(&damaged, b"corrupt historical index").expect("damage");
         CACHE

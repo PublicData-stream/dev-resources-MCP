@@ -3,7 +3,6 @@ use devres_application::advisory::AdvisoryRecord;
 use devres_domain::{Error, Result};
 use semver::Version;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{cmp::Ordering, collections::BTreeSet};
 
 const MAX_RECORD: usize = 1024 * 1024;
@@ -170,7 +169,7 @@ pub(crate) fn normalize(path: &str, body: &str) -> Result<AdvisoryRecord> {
         format: "osv".into(),
         path: path.into(),
         body: body.into(),
-        body_hash: hex::encode(Sha256::digest(body.as_bytes())),
+        body_hash: crate::integrity::hash(body.as_bytes()),
         metadata,
     })
 }

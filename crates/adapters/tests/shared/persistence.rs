@@ -2,6 +2,10 @@ use devres_adapters::PgBlobStore;
 use devres_application::Store;
 use devres_domain::{FetchRequest, FetchResponse, Validators};
 
+fn fixture_id(seed: &str) -> String {
+    format!("blake3:{}", blake3::hash(seed.as_bytes()).to_hex())
+}
+
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn rustsec_atomic_publication_local_research_history_and_restart() {
@@ -127,7 +131,7 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
         .await
         .unwrap()
         .unwrap();
-    historical.id = "d".repeat(64);
+    historical.id = fixture_id("d");
     historical.historical = true;
     historical.validated_at = None;
     store
@@ -208,13 +212,13 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
     assert_eq!(projection_state.complete, historical.complete);
     assert!(
         store
-            .advisory_projection_state(&"9".repeat(64), "rustsec")
+            .advisory_projection_state(&fixture_id("9"), "rustsec")
             .await
             .unwrap()
             .is_none()
     );
     let mut reprocessed = historical.clone();
-    reprocessed.id = "f".repeat(64);
+    reprocessed.id = fixture_id("f");
     reprocessed.coverage["processor_version"] = json!(2);
     store
         .publish_advisory_snapshot(&reprocessed, false)
@@ -287,7 +291,7 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
         .await
         .unwrap()
         .unwrap();
-    synthetic.id = "e".repeat(64);
+    synthetic.id = fixture_id("e");
     synthetic.coverage["synthetic"] = json!(true);
     assert_eq!(
         store
@@ -507,7 +511,7 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
         .await
         .unwrap();
     let page = |id: char, path: &str, capture: &str| ContentRecord {
-        id: id.to_string().repeat(64),
+        id: fixture_id(&id.to_string()),
         name: "example".into(),
         version: "1.0.0".into(),
         target: "x86_64-unknown-linux-gnu".into(),
@@ -518,7 +522,7 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
         archive_capture: manifest.id.clone(),
         attributes: json!({}),
     };
-    let gen1 = "c".repeat(64);
+    let gen1 = fixture_id("c");
     store
         .stage_content(
             &gen1,
@@ -578,14 +582,14 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
         .unwrap();
     store
         .stage_content(
-            &"f".repeat(64),
+            &fixture_id("f"),
             &[page('0', "example/index.html", &new_text.id)],
         )
         .await
         .unwrap();
     store
         .commit_content(
-            &"f".repeat(64),
+            &fixture_id("f"),
             json!({"job_key":"html:example:1.0.0","documents":1}),
         )
         .await
@@ -620,15 +624,15 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
     api.kind = "api".into();
     api.attributes = json!({"format_version":61,"signature":{"kind":"function","sig":"fn run()"}});
     let mut next_api = api.clone();
-    next_api.id = "2".repeat(64);
+    next_api.id = fixture_id("2");
     next_api.version = "2.0.0".into();
     next_api.attributes["signature"] = json!({"kind":"function","sig":"fn run() -> bool"});
     store
-        .stage_content(&"3".repeat(64), &[api, next_api])
+        .stage_content(&fixture_id("3"), &[api, next_api])
         .await
         .unwrap();
     store
-        .commit_content(&"3".repeat(64), json!({"job_key":"api-fixture"}))
+        .commit_content(&fixture_id("3"), json!({"job_key":"api-fixture"}))
         .await
         .unwrap();
     let comparison = store
@@ -670,13 +674,13 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
     );
     store
         .stage_content(
-            &"4".repeat(64),
+            &fixture_id("4"),
             &[page('8', "example/late.html", &new_text.id)],
         )
         .await
         .unwrap();
     store
-        .commit_content(&"4".repeat(64), json!({"job_key":"late:independent"}))
+        .commit_content(&fixture_id("4"), json!({"job_key":"late:independent"}))
         .await
         .unwrap();
     let frozen = store.commit_snapshot(prepared.clone()).await.unwrap();
@@ -907,20 +911,43 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     // The disposable database begins with the original v1 schema and a retained body.
     sqlx::raw_sql("CREATE TABLE devres_schema(singleton boolean PRIMARY KEY CHECK(singleton),version integer NOT NULL); INSERT INTO devres_schema VALUES(true,1); CREATE TABLE devres_captures(id text PRIMARY KEY,source_key text NOT NULL,source_url text NOT NULL,body_hash text NOT NULL,media_type text NOT NULL,retrieved_at bigint NOT NULL); CREATE TABLE devres_heads(source_key text PRIMARY KEY,capture_id text NOT NULL REFERENCES devres_captures(id),validated_at bigint NOT NULL,etag text,last_modified text); CREATE TABLE devres_observations(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,capture_id text NOT NULL REFERENCES devres_captures(id),validated_at bigint NOT NULL,status smallint NOT NULL CHECK(status IN (200,304))); ")
         .execute(&fixture_pool).await.unwrap();
-    let original_id = "a".repeat(64);
     let original_hash = hex::encode(Sha256::digest(b"v1 retained capture"));
+    let original_id = hex::encode(Sha256::digest(
+        format!("fixture:v1\0https://fixture.invalid/v1\0text/plain\0{original_hash}").as_bytes(),
+    ));
     tokio::fs::write(root.path().join(&original_hash), b"v1 retained capture")
         .await
         .unwrap();
     sqlx::query("INSERT INTO devres_captures VALUES($1,'fixture:v1','https://fixture.invalid/v1',$2,'text/plain',1)")
         .bind(&original_id).bind(&original_hash).execute(&fixture_pool).await.unwrap();
+    assert!(
+        PgBlobStore::connect(&url, root.path()).await.is_err(),
+        "Legacy serving must require explicit offline migration"
+    );
+    let migrating = std::sync::Arc::new(
+        PgBlobStore::connect_for_migration(&url, root.path())
+            .await
+            .unwrap(),
+    );
+    devres_adapters::migrate_storage_graphs(
+        &devres_adapters::MigrationSettings::default(),
+        migrating.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    migrating
+        .activate_storage(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    drop(migrating);
     let store = PgBlobStore::connect(&url, root.path()).await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema")
             .fetch_one(&fixture_pool)
             .await
             .unwrap(),
-        9
+        10
     );
     assert_eq!(
         store.capture(&original_id).await.unwrap().body,
@@ -990,7 +1017,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         dataset.records
     );
     let mut absent = dataset.clone();
-    absent.capture.id = "c".repeat(64);
+    absent.capture.id = fixture_id("c");
     assert!(store.save_dataset("catalogue", &absent).await.is_err());
     let newer_catalogue = store
         .publish(
@@ -1089,7 +1116,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     assert_eq!(store.status().await.unwrap()["pending_documents"], 0);
     assert_eq!(store.status().await.unwrap()["outstanding_jobs"], 1);
     let mut snapshot = Snapshot {
-        id: "d".repeat(64),
+        id: fixture_id("d"),
         catalogue_capture: catalogue.capture.id.clone(),
         errata_capture: None,
         documents: vec![Document {
@@ -1109,7 +1136,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     store.save_snapshot(&snapshot).await.unwrap();
     store.save_snapshot(&snapshot).await.unwrap();
     let mut duplicate_source = snapshot.clone();
-    duplicate_source.id = "f".repeat(64);
+    duplicate_source.id = fixture_id("f");
     duplicate_source
         .search_documents
         .push(snapshot.documents[0].clone());
@@ -1122,8 +1149,8 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         "invalid_input"
     );
     let mut absent_source = snapshot.clone();
-    absent_source.id = "f".repeat(64);
-    absent_source.search_documents[0].capture.id = "0".repeat(64);
+    absent_source.id = fixture_id("f");
+    absent_source.search_documents[0].capture.id = fixture_id("0");
     assert_eq!(
         store.save_snapshot(&absent_source).await.unwrap_err().code,
         "invalid_input"
@@ -1153,7 +1180,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         "rediscovery must not reset the due time"
     );
     let mut partial = snapshot.clone();
-    partial.id = "e".repeat(64);
+    partial.id = fixture_id("e");
     partial.created_at = 60;
     partial.complete = false;
     partial.documents[0].capture = second.capture.clone();
@@ -1165,7 +1192,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         "new partial must not displace complete snapshot"
     );
     let mut newer_partial = partial.clone();
-    newer_partial.id = "b".repeat(64);
+    newer_partial.id = fixture_id("b");
     store.save_snapshot(&newer_partial).await.unwrap();
     assert_eq!(
         store.status().await.unwrap()["latest_partial"]["id"],
@@ -1173,7 +1200,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         "same-second partial selection follows durable publication order"
     );
     let mut newer_complete = snapshot.clone();
-    newer_complete.id = "a".repeat(64);
+    newer_complete.id = fixture_id("a");
     store.save_snapshot(&newer_complete).await.unwrap();
     assert_eq!(
         store.snapshot(None).await.unwrap().unwrap().id,
@@ -1396,14 +1423,22 @@ async fn permanent_history_revalidation_and_integrity() {
     let store = PgBlobStore::connect(&url, root.path()).await.unwrap();
     assert!(!root.path().join(".stage-123-0").exists());
     assert!(root.path().join("operator-note").exists());
-    assert!(root.path().join(&a.capture.body_hash).exists());
+    assert!(
+        root.path()
+            .join(devres_adapters::integrity::relative_path(&a.capture.body_hash).unwrap())
+            .exists()
+    );
     assert_eq!(
         store.latest(&req.key).await.unwrap().unwrap().stored.body,
         b"second"
     );
-    tokio::fs::write(root.path().join(&a.capture.body_hash), b"corrupt")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        root.path()
+            .join(devres_adapters::integrity::relative_path(&a.capture.body_hash).unwrap()),
+        b"corrupt",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         store.capture(&a.capture.id).await.unwrap_err().code,
         "integrity"

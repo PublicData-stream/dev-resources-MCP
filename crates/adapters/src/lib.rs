@@ -1,10 +1,15 @@
 //! Network, durable storage, and source-specific research adapters.
 mod archive;
 pub mod bulk;
+pub(crate) mod immutable_index;
+pub mod integrity;
+pub(crate) mod migration_map;
 mod network;
 mod research;
 mod standards_processing;
 mod storage;
+mod storage_migration_runner;
+pub use storage_migration_runner::{MigrationSettings, migrate_storage_graphs};
 
 pub mod chromium;
 pub mod crates_io;

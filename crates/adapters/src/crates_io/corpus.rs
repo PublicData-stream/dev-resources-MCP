@@ -21,7 +21,6 @@ use devres_application::{
 use devres_domain::{Capture, Error, Result, Validators, unix_now};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -276,7 +275,9 @@ impl CrateCorpus {
                     )
                     .await?;
                 crate::crates_io::dump::import_dump(
-                    self.root.join(&captured.capture.body_hash),
+                    self.root.join(crate::integrity::relative_path(
+                        &captured.capture.body_hash,
+                    )?),
                     captured.capture.id.clone(),
                     self.store.clone(),
                     stop.child_token(),
@@ -306,7 +307,9 @@ impl CrateCorpus {
                 .await?
                 .ok_or_else(|| Error::integrity("Pending registry evidence is absent."))?;
             let manifest = BulkArtifact {
-                relative_path: saved.capture.body_hash.clone(),
+                relative_path: crate::integrity::relative_path(&saved.capture.body_hash)?
+                    .to_string_lossy()
+                    .into_owned(),
                 body_hash: saved.capture.body_hash,
                 bytes: saved.bytes,
             };
@@ -566,8 +569,10 @@ impl CrateCorpus {
                         "Documentation platform metadata exceeds 1 MiB.",
                     ));
                 }
-                let file = std::fs::File::open(self.root.join(&captured.capture.body_hash))
-                    .map_err(|_| Error::unavailable("Platform capture unavailable."))?;
+                let file = std::fs::File::open(self.root.join(crate::integrity::relative_path(
+                    &captured.capture.body_hash,
+                )?))
+                .map_err(|_| Error::unavailable("Platform capture unavailable."))?;
                 let targets =
                     crate_docs::parse_platforms(file, &ProcessingBudget::new(stop.child_token()))?;
                 let mut jobs = Vec::new();
@@ -719,7 +724,9 @@ impl CrateCorpus {
             .await
             .map_err(|_| Error::capacity("Crate processing stopped."))?;
         let (send, mut receive) = mpsc::channel::<ProjectionText>(2);
-        let path = self.root.join(&artifact.capture.body_hash);
+        let path = self.root.join(crate::integrity::relative_path(
+            &artifact.capture.body_hash,
+        )?);
         let processing_job = job.clone();
         let captured = artifact.clone();
         let token = stop.child_token();
@@ -745,8 +752,10 @@ impl CrateCorpus {
                 .await?;
             platform_capture = Some(platforms.capture.id.clone());
             let targets = crate_docs::parse_platforms(
-                std::fs::File::open(self.root.join(platforms.capture.body_hash))
-                    .map_err(|_| Error::unavailable("Platform capture unavailable."))?,
+                std::fs::File::open(self.root.join(crate::integrity::relative_path(
+                    &platforms.capture.body_hash,
+                )?))
+                .map_err(|_| Error::unavailable("Platform capture unavailable."))?,
                 &ProcessingBudget::new(token.child_token()),
             )?;
             targets
@@ -875,7 +884,7 @@ impl Drop for Stage {
     }
 }
 fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
 }
 fn artifact_key(job: &CollectionJob) -> String {
     match job.kind.as_str() {

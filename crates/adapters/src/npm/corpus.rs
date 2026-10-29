@@ -8,7 +8,7 @@ use crate::{
 use devres_application::npm::{NpmConfig, NpmStore, PROCESSOR_VERSION};
 use devres_domain::{Error, Result, Validators};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -35,7 +35,7 @@ pub struct NpmCorpus {
     processing: Mutex<()>,
 }
 pub(crate) fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
 }
 pub(crate) fn identity(value: &Value) -> Result<String> {
     Ok(digest(&serde_json::to_vec(value).map_err(|_| failure())?))
@@ -51,7 +51,11 @@ fn canceled(cancel: &CancellationToken) -> Result<()> {
     }
 }
 fn state_key(prefix: &str, name: &str) -> String {
-    format!("{prefix}:{}", digest(name.as_bytes()))
+    // Operational source/job lookup names stay stable across the content-ID migration.
+    format!(
+        "{prefix}:{}",
+        crate::integrity::legacy_hash(name.as_bytes())
+    )
 }
 impl NpmCorpus {
     pub fn new(

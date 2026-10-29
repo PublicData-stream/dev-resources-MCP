@@ -72,10 +72,22 @@ fn check_deadline(deadline: Instant) -> Result<()> {
 }
 
 fn valid_id(id: &str) -> bool {
-    id.len() == 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::integrity::valid_hash(id)
+}
+
+fn index_suffix(id: &str) -> Result<String> {
+    Ok(crate::integrity::relative_path(id)?
+        .to_string_lossy()
+        .into_owned())
+}
+fn path_id(path: &str) -> Result<String> {
+    let id = path
+        .strip_prefix("blake3/")
+        .map_or_else(|| path.to_owned(), |hex| format!("blake3:{hex}"));
+    if !valid_id(&id) || index_suffix(&id)? != path {
+        return Err(integrity());
+    }
+    Ok(id)
 }
 
 fn valid_file(name: &str) -> bool {
@@ -115,7 +127,7 @@ fn directory(root: &Path) -> Result<PathBuf> {
 fn selected_directory(root: &Path, relative: &str) -> Result<PathBuf> {
     let id = relative
         .strip_prefix("rfc-indexes/")
-        .filter(|id| valid_id(id))
+        .filter(|id| path_id(id).is_ok())
         .ok_or_else(|| Error::invalid("Invalid RFC search snapshot path."))?;
     let base = fs::canonicalize(root)
         .map_err(|_| unavailable())?
@@ -173,7 +185,8 @@ fn schema() -> Schema {
 #[serde(deny_unknown_fields)]
 struct FileDigest {
     bytes: u64,
-    sha256: String,
+    #[serde(alias = "sha256")]
+    digest: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -184,6 +197,9 @@ struct Manifest {
 }
 
 fn digest(path: &Path, deadline: Instant) -> Result<FileDigest> {
+    digest_with_algorithm(path, deadline, false)
+}
+fn digest_with_algorithm(path: &Path, deadline: Instant, legacy: bool) -> Result<FileDigest> {
     let metadata = fs::symlink_metadata(path).map_err(|_| unavailable())?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_INDEX_BYTES
     {
@@ -191,6 +207,7 @@ fn digest(path: &Path, deadline: Instant) -> Result<FileDigest> {
     }
     let mut file = File::open(path).map_err(|_| unavailable())?;
     let mut hasher = Sha256::new();
+    let mut blake3 = blake3::Hasher::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -204,13 +221,18 @@ fn digest(path: &Path, deadline: Instant) -> Result<FileDigest> {
             return Err(integrity());
         }
         hasher.update(&buffer[..read]);
+        blake3.update(&buffer[..read]);
     }
     if bytes != metadata.len() {
         return Err(integrity());
     }
     Ok(FileDigest {
         bytes,
-        sha256: hex::encode(hasher.finalize()),
+        digest: if legacy {
+            hex::encode(hasher.finalize())
+        } else {
+            format!("blake3:{}", blake3.finalize().to_hex())
+        },
     })
 }
 
@@ -245,7 +267,10 @@ fn verify(path: &Path, deadline: Instant) -> Result<()> {
     }
     let bytes = fs::read(&manifest_path).map_err(|_| unavailable())?;
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
-    if manifest.version != 1
+    if manifest.version == 1 {
+        crate::integrity::verify_legacy_file(&manifest_path, deadline)?;
+    }
+    if !matches!(manifest.version, 1 | 2)
         || manifest.files.len() > MAX_FILES
         || !manifest.files.contains_key("meta.json")
     {
@@ -258,15 +283,24 @@ fn verify(path: &Path, deadline: Instant) -> Result<()> {
     let mut total = 0_u64;
     for name in files {
         let expected = manifest.files.get(&name).ok_or_else(integrity)?;
-        if !valid_id(&expected.sha256) {
+        if !valid_id(&expected.digest)
+            || manifest.version == 2 && !expected.digest.starts_with("blake3:")
+        {
             return Err(integrity());
         }
-        let actual = digest(&path.join(name), deadline)?;
+        if !expected.digest.starts_with("blake3:") {
+            crate::integrity::verify_legacy_file(&path.join(&name), deadline)?;
+        }
+        let actual = digest_with_algorithm(
+            &path.join(name),
+            deadline,
+            !expected.digest.starts_with("blake3:"),
+        )?;
         total = total.saturating_add(actual.bytes);
         if total > MAX_INDEX_BYTES {
             return Err(Error::capacity("RFC index size limit exceeded."));
         }
-        if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
+        if actual.bytes != expected.bytes || actual.digest != expected.digest {
             return Err(integrity());
         }
     }
@@ -275,6 +309,7 @@ fn verify(path: &Path, deadline: Instant) -> Result<()> {
 
 /// One writer holds at most one source at the call boundary; callers can load captures sequentially.
 pub(crate) struct IndexBuilder {
+    storage_root: PathBuf,
     writer: Option<IndexWriter<TantivyDocument>>,
     index: Index,
     stage: PathBuf,
@@ -300,7 +335,11 @@ impl IndexBuilder {
             .try_acquire()
             .map_err(|_| Error::capacity("RFC index writer is busy."))?;
         let directory = directory(root)?;
-        let final_path = directory.join(id);
+        let suffix = index_suffix(id)?;
+        let final_path = directory.join(&suffix);
+        let parent = final_path.parent().ok_or_else(integrity)?;
+        crate::integrity::ensure_directory_durable(parent)?;
+        real_directory(parent)?;
         if fs::symlink_metadata(&final_path).is_ok() {
             return Err(Error::integrity("RFC search snapshot already exists."));
         }
@@ -371,11 +410,12 @@ impl IndexBuilder {
         })();
         match prepared {
             Ok((index, writer, numbers)) => Ok(Self {
+                storage_root: fs::canonicalize(root).map_err(|_| unavailable())?,
                 writer: Some(writer),
                 index,
                 stage,
                 final_path,
-                relative: format!("rfc-indexes/{id}"),
+                relative: format!("rfc-indexes/{suffix}"),
                 numbers,
                 queued_bytes: 0,
                 published: false,
@@ -479,8 +519,8 @@ impl IndexBuilder {
             }
             files.insert(name, file_digest);
         }
-        let manifest =
-            serde_json::to_vec(&Manifest { version: 1, files }).map_err(|_| integrity())?;
+        let descriptor = Manifest { version: 2, files };
+        let manifest = serde_json::to_vec(&descriptor).map_err(|_| integrity())?;
         if manifest.len() as u64 > MAX_MANIFEST {
             return Err(Error::capacity("RFC index manifest exceeds limit."));
         }
@@ -505,6 +545,20 @@ impl IndexBuilder {
         File::open(parent)
             .and_then(|file| file.sync_all())
             .map_err(|_| unavailable())?;
+        for (name, digest) in &descriptor.files {
+            crate::integrity::record_file(
+                &self.storage_root,
+                &self.final_path.join(name),
+                &digest.digest,
+                digest.bytes,
+            )?;
+        }
+        crate::integrity::record_file(
+            &self.storage_root,
+            &self.final_path.join(MANIFEST),
+            &crate::integrity::hash(&manifest),
+            manifest.len() as u64,
+        )?;
         Ok(self.relative.clone())
     }
 }
@@ -698,6 +752,155 @@ fn query(field: Field, input: &str, mode: &str) -> Result<Box<dyn Query>> {
     )))
 }
 
+/// Rebuild exactly one frozen index generation using its original admitted text.
+pub(crate) async fn rebuild_frozen(
+    root: PathBuf,
+    relative: String,
+    id: String,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    struct CancelOnDrop(tokio_util::sync::CancellationToken);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let stop = cancel.child_token();
+    let _guard = CancelOnDrop(stop.clone());
+    let mut task = tokio::task::spawn_blocking(move || {
+        if stop.is_cancelled() {
+            return Err(Error::new("cancelled", "RFC migration canceled."));
+        }
+        let target = format!("rfc-indexes/{}", index_suffix(&id)?);
+        if root.join(&target).exists() {
+            let mut original = BTreeMap::new();
+            let mut retained = BTreeMap::new();
+            for (path, output) in [(&relative, &mut original), (&target, &mut retained)] {
+                let mut after = 0;
+                loop {
+                    if stop.is_cancelled() {
+                        return Err(Error::new("cancelled", "RFC migration canceled."));
+                    }
+                    let (documents, next) = export_documents(&root, path, after, 1000)?;
+                    for document in documents {
+                        if output
+                            .insert(
+                                document.number,
+                                crate::integrity::hash(document.text.as_bytes()),
+                            )
+                            .is_some()
+                        {
+                            return Err(integrity());
+                        }
+                    }
+                    match next {
+                        Some(next) => after = next,
+                        None => break,
+                    }
+                }
+            }
+            if original != retained {
+                return Err(integrity());
+            }
+            return Ok(target);
+        }
+        let mut builder = IndexBuilder::begin_from(&root, &id, None)?;
+        let mut after = 0;
+        loop {
+            if stop.is_cancelled() {
+                return Err(Error::new("cancelled", "RFC migration canceled."));
+            }
+            let (documents, next) = export_documents(&root, &relative, after, 1000)?;
+            for document in documents {
+                if stop.is_cancelled() {
+                    return Err(Error::new("cancelled", "RFC migration canceled."));
+                }
+                builder.add_document(document)?;
+            }
+            match next {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        builder.finish()
+    });
+    tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "RFC migration canceled.")) }, result = &mut task => result.map_err(|_| unavailable())? }
+}
+
+/// Export exact retained text without selecting a moving corpus head.
+/// The caller owns the maintenance fence and executes this on a blocking worker.
+pub(crate) fn export_documents(
+    root: &Path,
+    relative: &str,
+    after: usize,
+    limit: usize,
+) -> Result<(Vec<IndexDocument>, Option<usize>)> {
+    if !(1..=1000).contains(&limit) {
+        return Err(Error::invalid("Invalid RFC index export page."));
+    }
+    let _permit = READERS
+        .try_acquire()
+        .map_err(|_| Error::capacity("RFC index reader capacity exhausted."))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let path = selected_directory(root, relative)?;
+    verify(&path, deadline)?;
+    let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
+    if index.schema() != schema() {
+        return Err(integrity());
+    }
+    let reader = index.reader().map_err(|_| unavailable())?;
+    let searcher = reader.searcher();
+    let index_schema = index.schema();
+    let text_field = index_schema.get_field(TECHNICAL).map_err(|_| integrity())?;
+    let number_field = index_schema.get_field(NUMBER).map_err(|_| integrity())?;
+    let mut position = 0usize;
+    let mut bytes = 0usize;
+    let mut output = Vec::new();
+    for (segment_id, segment) in searcher.segment_readers().iter().enumerate() {
+        for document in segment.doc_ids_alive() {
+            check_deadline(deadline)?;
+            if position < after {
+                position += 1;
+                continue;
+            }
+            if output.len() == limit {
+                return Ok((output, Some(position)));
+            }
+            let stored: TantivyDocument = searcher
+                .doc(tantivy::DocAddress::new(segment_id as u32, document))
+                .map_err(|_| integrity())?;
+            let text = stored
+                .get_first(text_field)
+                .and_then(|v| v.as_str())
+                .ok_or_else(integrity)?;
+            let number = stored
+                .get_first(number_field)
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| (1..=999999).contains(v))
+                .ok_or_else(integrity)?;
+            if text.len() > MAX_TEXT {
+                return Err(Error::capacity("RFC index export text exceeds bound."));
+            }
+            if !output.is_empty() && bytes.saturating_add(text.len()) > 32 * 1024 * 1024 {
+                return Ok((output, Some(position)));
+            }
+            bytes += text.len();
+            output.push(IndexDocument {
+                number,
+                text: text.to_owned(),
+            });
+            position += 1;
+        }
+    }
+    if after > position {
+        return Err(Error::invalid(
+            "RFC export cursor exceeds retained membership.",
+        ));
+    }
+    Ok((output, None))
+}
+
 /// Called on an admitted blocking worker. Each reader opens only the selected immutable directory.
 pub(crate) fn search(
     root: &Path,
@@ -724,7 +927,7 @@ pub(crate) fn search(
     let deadline = Instant::now() + Duration::from_secs(15);
     let path = selected_directory(root, relative)?;
     verify(&path, deadline)?;
-    let index = Index::open_in_dir(&path).map_err(|_| integrity())?;
+    let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
     if index.schema() != schema() {
         return Err(integrity());
     }
@@ -800,6 +1003,110 @@ mod tests {
                 text: (*text).into(),
             })
             .collect()
+    }
+
+    fn qualify_legacy_file(root: &Path, path: &Path) {
+        let (digest, bytes) = crate::integrity::file_digest(
+            path,
+            MAX_INDEX_BYTES,
+            Instant::now() + Duration::from_secs(15),
+        )
+        .unwrap();
+        let evidence = crate::integrity::FileEvidence {
+            version: 1,
+            path: path.strip_prefix(root).unwrap().to_str().unwrap().into(),
+            bytes,
+            digest,
+        };
+        let descriptor = crate::integrity::evidence_path(root, path).unwrap();
+        fs::create_dir_all(descriptor.parent().unwrap()).unwrap();
+        fs::write(descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn canonical_index_addresses_and_legacy_qualification_are_enforced() {
+        let _test = TEST_SERIAL.blocking_lock();
+        let root = tempfile::tempdir().unwrap();
+        let id = crate::integrity::hash(b"canonical RFC snapshot");
+        let relative = build(root.path(), &id, documents(&[(1, "persistent transport")])).unwrap();
+        assert!(relative.starts_with("rfc-indexes/blake3/"));
+        let directory = root.path().join(&relative);
+        let manifest_path = directory.join(MANIFEST);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["version"], 2);
+        for descriptor in manifest["files"].as_object().unwrap().values() {
+            assert!(
+                descriptor["digest"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("blake3:")
+            );
+            assert!(descriptor.get("sha256").is_none());
+        }
+        assert_eq!(
+            search(root.path(), &relative, "transport", TECHNICAL, 0, 20, None).unwrap()["total"],
+            1
+        );
+        // A version-1 manifest remains usable only with separately migrated BLAKE3 evidence.
+        manifest["version"] = json!(1);
+        for (name, descriptor) in manifest["files"].as_object_mut().unwrap() {
+            let path = directory.join(name);
+            descriptor.as_object_mut().unwrap().remove("digest");
+            descriptor["sha256"] = json!(crate::integrity::legacy_hash(&fs::read(&path).unwrap()));
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(search(root.path(), &relative, "transport", TECHNICAL, 0, 20, None).is_err());
+        qualify_legacy_file(root.path(), &manifest_path);
+        for name in manifest["files"].as_object().unwrap().keys() {
+            qualify_legacy_file(root.path(), &directory.join(name));
+        }
+        assert_eq!(
+            search(root.path(), &relative, "transport", TECHNICAL, 0, 20, None).unwrap()["total"],
+            1
+        );
+        let descriptor =
+            crate::integrity::evidence_path(root.path(), &directory.join("meta.json")).unwrap();
+        let mut evidence: Value = serde_json::from_slice(&fs::read(&descriptor).unwrap()).unwrap();
+        evidence["digest"] = json!(crate::integrity::hash(b"wrong retained bytes"));
+        fs::write(descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        assert!(search(root.path(), &relative, "transport", TECHNICAL, 0, 20, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn frozen_rebuild_preserves_original_admitted_text_and_resumes() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let original = build(
+            root.path(),
+            &crate::integrity::hash(b"original RFC frozen index"),
+            documents(&[(12, "original transport"), (13, "original protocol")]),
+        )
+        .unwrap();
+        let canonical = crate::integrity::hash(b"canonical RFC frozen index");
+        let rebuilt = rebuild_frozen(
+            root.path().to_owned(),
+            original.clone(),
+            canonical.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(original, rebuilt);
+        let left = search(root.path(), &original, "original", TECHNICAL, 0, 20, None).unwrap();
+        let right = search(root.path(), &rebuilt, "original", TECHNICAL, 0, 20, None).unwrap();
+        assert_eq!(left, right);
+        assert_eq!(
+            rebuild_frozen(
+                root.path().to_owned(),
+                original,
+                canonical,
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+            rebuilt
+        );
     }
 
     #[test]

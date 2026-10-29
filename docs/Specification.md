@@ -12,6 +12,28 @@ lockfile matching are described in [npm](npm.md). No public administrative opera
 package execution, dependency resolution, arbitrary URL fetching, or user accounts
 are exposed. Missing or unsupported coverage is explicit.
 
+## Stored identities and integrity
+
+New service-generated hash identities use `blake3:<64 lowercase hexadecimal
+characters>`, including capture/snapshot selectors and body digests. Existing
+64-character SHA-256 selectors and immutable resource URLs remain valid for their
+original frozen evidence. Natural upstream names, Git object IDs and
+provider-defined checksums keep their existing formats and meaning. New digest
+references declare BLAKE3 explicitly; legacy fields named `sha256` continue to mean
+SHA-256.
+
+Retained public bytes, projections and search evidence require BLAKE3 verification.
+Missing or mismatched integrity evidence fails explicitly. Storage migration does
+not refresh source validation, change frozen snapshot membership, or authorize
+provider traffic. Existing cursors remain usable with their original selectors and
+ordering; new cursors identify their format/generation. This compatibility is
+separate from the earlier tool-name migration described below.
+
+Storage upgrade, verification and activation are private operator commands, never
+MCP tools. They require stopped serving/collection writers and preserve retained
+history and request-only audit privacy. Existing retrieval, freshness, licensing,
+paging, result-size and transport behavior continues to apply.
+
 ## MCP and transport
 
 Streamable HTTP uses `/mcp`. WebTransport `/mcp-wt/v1` is a custom binding: one

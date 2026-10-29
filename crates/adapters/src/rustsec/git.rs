@@ -13,7 +13,6 @@ use devres_application::advisory::{
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -110,7 +109,7 @@ fn failure() -> Error {
     Error::unavailable("RustSec Git operation failed.")
 }
 fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
 }
 fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|_| Error::integrity("RustSec evidence encoding failed."))
@@ -748,19 +747,29 @@ impl AdvisoryHistory {
             }
             let target = root.join(&pack.name);
             match tokio::fs::hard_link(
-                self.artifacts.root().join(&pack.artifact.body_hash),
+                self.artifacts.root().join(&pack.artifact.relative_path),
                 &target,
             )
             .await
             {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if self
+                    let actual = self
                         .artifacts
                         .ingest_file(&target, bulk::MAX_ARTIFACT_BYTES, shutdown.clone())
-                        .await?
-                        != pack.artifact
-                    {
+                        .await?;
+                    let matches = if pack.artifact.body_hash.starts_with("blake3:") {
+                        actual == pack.artifact
+                    } else {
+                        actual.bytes == pack.artifact.bytes
+                            && crate::integrity::verify_legacy_digest(
+                                &self.artifacts.root().join(&pack.artifact.relative_path),
+                                &actual.body_hash,
+                                actual.bytes,
+                            )
+                            .is_ok()
+                    };
+                    if !matches {
                         return Err(Error::integrity(
                             "RustSec working pack differs from evidence.",
                         ));
@@ -1547,6 +1556,111 @@ fn recover_locks(repository: &Path) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => return Err(Error::integrity("Invalid RustSec working lock.")),
         }
+    }
+    Ok(())
+}
+
+impl AdvisoryHistory {
+    /// Derive a new service-owned manifest without changing retained upstream
+    /// Git objects, refs, observation time or the exact original manifest bytes.
+    pub async fn migrate_blake3_manifest(
+        &self,
+        original: &BulkArtifact,
+        mappings: &mut std::collections::BTreeMap<String, String>,
+        cancel: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        let mut manifest = self.read_manifest(original, cancel.clone()).await?;
+        let rewrite = |artifact: &mut BulkArtifact| -> Result<()> {
+            if artifact.body_hash.starts_with("blake3:") {
+                return Ok(());
+            }
+            artifact.body_hash =
+                crate::integrity::migration_lookup(mappings, "body", &artifact.body_hash)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::integrity("Retained Git manifest body is not qualified.")
+                    })?;
+            artifact.relative_path = crate::integrity::relative_path(&artifact.body_hash)?
+                .to_string_lossy()
+                .into_owned();
+            Ok(())
+        };
+        rewrite(&mut manifest.commits)?;
+        for pack in &mut manifest.packs {
+            rewrite(&mut pack.artifact)?;
+        }
+        for reference in &mut manifest.refs {
+            for id in reference.snapshots.values_mut() {
+                if !id.starts_with("blake3:") {
+                    *id = crate::integrity::migration_lookup(mappings, "advisory:snapshots", id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::integrity("Retained Git advisory snapshot is not migrated.")
+                        })?;
+                }
+            }
+        }
+        let bytes = serde_json::to_vec(&manifest)
+            .map_err(|_| Error::integrity("Invalid canonical Git manifest."))?;
+        if bytes.len() > MAX_MANIFEST {
+            return Err(Error::capacity(
+                "Canonical Git manifest exceeds its byte bound.",
+            ));
+        }
+        let canonical = self.artifacts.capture_bytes(bytes, cancel).await?;
+        let role = "advisory:manifest";
+        if crate::integrity::migration_lookup(mappings, role, &original.body_hash)
+            .is_some_and(|existing| existing != &canonical.body_hash)
+        {
+            return Err(Error::integrity(
+                "Conflicting canonical Git manifest mapping.",
+            ));
+        }
+        crate::migration_map::insert(
+            mappings,
+            format!("{role}:{}", original.body_hash),
+            canonical.body_hash.clone(),
+        )?;
+        crate::migration_map::insert(
+            mappings,
+            format!("advisory:manifest-descriptor:{}", original.body_hash),
+            serde_json::to_string(&canonical)
+                .map_err(|_| Error::integrity("Invalid canonical manifest descriptor."))?,
+        )?;
+        Ok(canonical)
+    }
+}
+
+/// Validate the retained service-owned manifest without changing its serializer.
+pub(crate) fn validate_migration_manifest(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_MANIFEST {
+        return Err(Error::capacity("RustSec manifest exceeds its byte bound."));
+    }
+    let value: Manifest = serde_json::from_slice(bytes)
+        .map_err(|_| Error::integrity("Invalid RustSec Git manifest."))?;
+    if value.version != 1
+        || value.source_url != SOURCE
+        || value.observed_at < 0
+        || value.observed_at > devres_domain::unix_now()
+        || value.refs.len() > MAX_REFS
+        || value.roots.len() > MAX_REFS * 10
+        || value.packs.len() > 10_000
+        || value.total_commits > MAX_COMMITS
+        || value.roots.iter().any(|oid| !valid_oid(oid))
+        || value.refs.iter().any(|reference| {
+            !valid_ref(&reference.name)
+                || !valid_oid(&reference.oid)
+                || reference
+                    .peeled_commit
+                    .as_ref()
+                    .is_some_and(|oid| !valid_oid(oid))
+        })
+        || value.packs.iter().any(|pack| {
+            !valid_pack_name(&pack.name) || !crate::integrity::valid_hash(&pack.artifact.body_hash)
+        })
+        || !crate::integrity::valid_hash(&value.commits.body_hash)
+    {
+        return Err(Error::integrity("Invalid RustSec Git manifest identity."));
     }
     Ok(())
 }

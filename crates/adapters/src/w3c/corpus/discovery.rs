@@ -274,7 +274,8 @@ mod tests {
         for row in rows {
             assert_eq!(row.data["assurance"], "https");
             let hash = row.data["body_hash"].as_str().unwrap();
-            assert_eq!(hash.len(), 64);
+            assert!(hash.starts_with("blake3:"));
+            assert_eq!(hash.len(), 71);
             let mut file = corpus
                 .raw
                 .open(hash, 16 * 1024 * 1024, CancellationToken::new())
@@ -344,7 +345,7 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .len(),
-            64
+            71
         );
         let cancel = CancellationToken::new();
         cancel.cancel();

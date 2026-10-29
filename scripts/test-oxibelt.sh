@@ -130,12 +130,14 @@ expect_failure probe devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/wron
 expect_failure probe devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem 2026-07-28 https://untrusted.invalid
 expect_failure probe devres-probe https://edge:8443/wrong /fixture/cert/ca.pem 2026-07-28 https://client.example
 # Seed only task-owned public synthetic evidence while the serving fence is released.
-mdn_content=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest())')
-mdn_compat=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest())')
-whatwg_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest())')
-w3c_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:w3c:v1").hexdigest())')
-chromium_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:chromium:v1").hexdigest())')
-advisory_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest())')
+# Share the inspectable BLAKE3 golden fixture identities with the HTTP smoke.
+read -r mdn_content mdn_compat whatwg_snapshot w3c_snapshot chromium_snapshot advisory_snapshot < <(
+  python3 - <<'PYIDS'
+import runpy
+fixture = runpy.run_path("scripts/mcp_smoke.py")
+print(*(fixture[name] for name in ("SYNTHETIC_MDN_CONTENT", "SYNTHETIC_MDN_COMPAT", "SYNTHETIC_WHATWG", "SYNTHETIC_W3C", "SYNTHETIC_CHROMIUM", "SYNTHETIC_SNAPSHOT")))
+PYIDS
+)
 fixture_storage() { docker run --rm --network "$run_id" -v "$run_id-data:/data" \
   -e DATABASE_URL=postgres://devres:fixture-only@postgres/devres -e BLOB_DIR=/data/blobs \
   --entrypoint storage-probe "$image" "$1"; }

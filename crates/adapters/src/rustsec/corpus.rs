@@ -8,7 +8,6 @@ use devres_application::{
 };
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     sync::Arc,
@@ -26,7 +25,7 @@ pub struct AdvisoryCorpus {
     history: AdvisoryHistory,
 }
 pub(crate) fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
 }
 pub(crate) fn revision(bytes: &[u8]) -> Result<String> {
     let value: Value = serde_json::from_slice(bytes)

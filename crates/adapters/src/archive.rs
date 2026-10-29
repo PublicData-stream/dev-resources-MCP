@@ -119,10 +119,14 @@ fn inspect_until(
     if bytes.len() > MAX_COMPRESSED {
         return Err(Error::capacity("Compressed archive exceeds 32 MiB."));
     }
-    if checksum.len() != 64
-        || !checksum.bytes().all(|v| v.is_ascii_hexdigit())
-        || sha256(bytes) != checksum.to_ascii_lowercase()
-    {
+    let matches = if checksum.starts_with("blake3:") {
+        crate::integrity::verify(checksum, bytes).is_ok()
+    } else {
+        checksum.len() == 64
+            && checksum.bytes().all(|v| v.is_ascii_hexdigit())
+            && sha256(bytes) == checksum.to_ascii_lowercase()
+    };
+    if !matches {
         return Err(Error::integrity(
             "Archive checksum does not match its source capture.",
         ));

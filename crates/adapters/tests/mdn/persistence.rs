@@ -2,11 +2,10 @@
 use devres_adapters::PgBlobStore;
 use devres_application::mdn::{MdnStore, MdnWrite, Snapshot, View};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    devres_adapters::integrity::hash(bytes)
 }
 fn snapshot(repository: &str, revision: &str, index: Value) -> Snapshot {
     Snapshot {
@@ -96,7 +95,7 @@ async fn mdn_owner_fenced_immutable_pair_budget_and_restart() {
             .fetch_one(&database_pool)
             .await
             .expect("schema version"),
-        9
+        10
     );
     assert_eq!(
         PgBlobStore::connect(database_url.as_str(), root.path())

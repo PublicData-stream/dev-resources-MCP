@@ -4,13 +4,12 @@ use devres_application::{Cached, Store};
 use devres_domain::{
     Body, Capture, Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators,
 };
-use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::{
@@ -18,6 +17,9 @@ use tokio::{
     sync::{Mutex, Semaphore},
 };
 
+#[cfg(test)]
+#[path = "storage_acceptance.rs"]
+mod acceptance;
 #[path = "rustsec/storage.rs"]
 mod advisory_storage;
 #[path = "chromium/storage.rs"]
@@ -26,10 +28,24 @@ mod chromium_storage;
 mod corpus_storage;
 #[path = "crates_io/storage.rs"]
 mod crate_storage;
+#[path = "storage_events.rs"]
+mod events;
+#[path = "storage_graph_verify.rs"]
+mod graph_verify;
 #[path = "mdn/storage.rs"]
 mod mdn_storage;
+#[path = "storage_migration.rs"]
+mod migration;
+#[path = "storage_migration_npm.rs"]
+mod migration_npm;
 #[path = "npm/storage.rs"]
 mod npm_storage;
+#[path = "storage_integrity.rs"]
+mod payload_integrity;
+#[path = "storage_sequence.rs"]
+mod sequence_integrity;
+#[path = "storage_visibility.rs"]
+mod visibility;
 #[path = "w3c/storage.rs"]
 mod w3c_storage;
 #[path = "whatwg/storage.rs"]
@@ -56,6 +72,8 @@ fn stage_name(name: &str) -> bool {
 
 pub struct PgBlobStore {
     pool: PgPool,
+    active: AtomicBool,
+    visibility: tokio::sync::OnceCell<visibility::VisibilityRegistry>,
     root: PathBuf,
     read_budget: Arc<Semaphore>,
     // A dedicated non-reconnecting connection holds the single-server fence.
@@ -68,17 +86,57 @@ fn storage_error() -> Error {
     Error::unavailable("Durable storage unavailable")
 }
 fn hash(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
 }
 fn valid_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+    crate::integrity::valid_hash(value)
+}
+
+fn capture_metadata_digest(capture: &Capture) -> Result<String> {
+    crate::integrity::canonical_hash(&serde_json::json!({
+        "version":1,"namespace":"capture-metadata",
+        "id":capture.id,"key":capture.key,"source_url":capture.source_url,
+        "body_hash":capture.body_hash,"media_type":capture.media_type,
+        "retrieved_at":capture.retrieved_at
+    }))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Serve,
+    Migrate,
+    Inspect,
+    Activate,
 }
 
 impl PgBlobStore {
     pub async fn connect(database_url: &str, root: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Serve).await
+    }
+    /// Private operator maintenance; never starts collectors or listeners.
+    pub async fn connect_for_migration(database_url: &str, root: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Migrate).await
+    }
+    pub async fn connect_for_verification(
+        database_url: &str,
+        root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Inspect).await
+    }
+    pub async fn connect_for_activation(
+        database_url: &str,
+        root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Activate).await
+    }
+    async fn connect_inner(
+        database_url: &str,
+        root: impl AsRef<Path>,
+        mode: OpenMode,
+    ) -> Result<Self> {
+        let maintenance = mode != OpenMode::Serve;
+        let allow_migration = mode == OpenMode::Migrate;
+        let read_only = mode == OpenMode::Inspect;
         let mut owner = PgConnection::connect(database_url)
             .await
             .map_err(|_| storage_error())?;
@@ -95,17 +153,56 @@ impl PgBlobStore {
             .fetch_one(&mut owner).await.map_err(|_|storage_error())?;
         let owner_pid = identity.try_get("pid").map_err(|_| storage_error())?;
         let owner_started = identity.try_get("started").map_err(|_| storage_error())?;
+        if read_only {
+            sqlx::query("SET default_transaction_read_only=on")
+                .execute(&mut owner)
+                .await
+                .map_err(|_| storage_error())?;
+        }
         let pool = PgPoolOptions::new()
+            .after_connect(move |connection, _metadata| {
+                Box::pin(async move {
+                    if read_only {
+                        sqlx::query("SET default_transaction_read_only=on")
+                            .execute(connection)
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
             .max_connections(8)
             .acquire_timeout(std::time::Duration::from_secs(5))
             .connect(database_url)
             .await
             .map_err(|_| storage_error())?;
-        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx::raw_sql(SCHEMA)
-            .execute(&mut *tx)
+        let existed: bool = sqlx::query_scalar("SELECT to_regclass('devres_schema') IS NOT NULL")
+            .fetch_one(&mut owner)
             .await
             .map_err(|_| storage_error())?;
+        if !existed && matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
+            return Err(Error::unavailable(
+                "No initialized storage schema to inspect.",
+            ));
+        }
+        if existed && !allow_migration {
+            let existing: i32 =
+                sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
+                    .fetch_one(&mut owner)
+                    .await
+                    .map_err(|_| storage_error())?;
+            if existing < 10 {
+                return Err(Error::unavailable(
+                    "Offline BLAKE3 storage migration required.",
+                ));
+            }
+        }
+        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
+            sqlx::raw_sql(SCHEMA)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
         let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
             .fetch_one(&mut *tx)
             .await
@@ -119,7 +216,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if !(2..=9).contains(&version) {
+        } else if !(2..=10).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -192,27 +289,61 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
         }
-        sqlx::query("UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'")
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| storage_error())?;
-        sqlx::query("UPDATE devres_crate_jobs SET state='pending' WHERE state='running'")
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| storage_error())?;
+        if version <= 9 {
+            migration::prepare(&mut tx, !existed).await?;
+        }
+        let active: bool =
+            sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        if !maintenance && !active {
+            return Err(Error::unavailable(
+                "BLAKE3 storage migration is pending activation.",
+            ));
+        }
+        if !maintenance {
+            sqlx::query("UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx::query("UPDATE devres_crate_jobs SET state='pending' WHERE state='running'")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
         tx.commit().await.map_err(|_| storage_error())?;
-        tokio::fs::create_dir_all(root.as_ref())
-            .await
-            .map_err(|_| storage_error())?;
+        if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
+            tokio::fs::create_dir_all(root.as_ref())
+                .await
+                .map_err(|_| storage_error())?;
+        }
         let root = tokio::fs::canonicalize(root.as_ref())
             .await
             .map_err(|_| storage_error())?;
+        if matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
+            for path in [
+                root.join(".devres-integrity"),
+                root.join(".devres-integrity/files"),
+            ] {
+                if !tokio::fs::symlink_metadata(path)
+                    .await
+                    .map_err(|_| Error::integrity("Integrity metadata directory missing."))?
+                    .is_dir()
+                {
+                    return Err(Error::integrity("Invalid integrity metadata directory."));
+                }
+            }
+        } else {
+            crate::integrity::ensure_directory(&root.join(".devres-integrity/files")).await?;
+        }
         // The exclusive database owner fence is held; no serving writer can own these stages.
         let mut entries = tokio::fs::read_dir(&root)
             .await
             .map_err(|_| storage_error())?;
         while let Some(entry) = entries.next_entry().await.map_err(|_| storage_error())? {
-            if stage_name(&entry.file_name().to_string_lossy())
+            if !maintenance
+                && stage_name(&entry.file_name().to_string_lossy())
                 && entry
                     .file_type()
                     .await
@@ -229,7 +360,9 @@ impl PgBlobStore {
             .await
             .map_err(|_| storage_error())?
             .map_err(|_| storage_error())?;
-        Ok(Self {
+        let store = Self {
+            active: AtomicBool::new(active),
+            visibility: tokio::sync::OnceCell::new(),
             pool,
             root,
             read_budget: Arc::new(Semaphore::new(128)),
@@ -237,7 +370,14 @@ impl PgBlobStore {
             owner_pid,
             owner_started,
             artifact_budget: std::sync::OnceLock::new(),
-        })
+        };
+        if active {
+            store.verify_visibility_registry().await?;
+        }
+        Ok(store)
+    }
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
     }
     pub fn attach_artifact_budget(
         &self,
@@ -269,7 +409,9 @@ impl PgBlobStore {
         if !valid_hash(content_hash) {
             return Err(Error::integrity("Invalid content hash"));
         }
-        let path = self.root.join(content_hash);
+        let path = self
+            .root
+            .join(crate::integrity::relative_path(content_hash)?);
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|_| storage_error())?;
@@ -298,22 +440,51 @@ impl PgBlobStore {
             .map_err(|_| storage_error())?;
         let mut extra = [0_u8; 1];
         if file.read(&mut extra).await.map_err(|_| storage_error())? != 0
-            || hash(&body) != content_hash
+            || crate::integrity::verify(content_hash, &body).is_err()
         {
             return Err(Error::integrity("Stored blob checksum or length mismatch"));
+        }
+        if !content_hash.starts_with(crate::integrity::BLAKE3_PREFIX) {
+            crate::integrity::verify_legacy_digest(
+                &self.root.join(content_hash),
+                &hash(&body),
+                body.len() as u64,
+            )?;
         }
         Ok(Body::with_lease(body, lease))
     }
     async fn write_blob(&self, content_hash: &str, body: &[u8]) -> Result<()> {
+        if !content_hash.starts_with(crate::integrity::BLAKE3_PREFIX) {
+            return Err(Error::integrity("New immutable objects require BLAKE3."));
+        }
         if body.len() > MAX_BLOB {
             return Err(Error::capacity("Blob size exceeds storage limit"));
         }
-        let final_path = self.root.join(content_hash);
+        crate::integrity::verify(content_hash, body)?;
+        let final_path = self
+            .root
+            .join(crate::integrity::relative_path(content_hash)?);
+        let parent = final_path.parent().ok_or_else(storage_error)?;
+        crate::integrity::ensure_directory(parent).await?;
+        let directory = self.root.clone();
+        tokio::task::spawn_blocking(move || std::fs::File::open(directory)?.sync_all())
+            .await
+            .map_err(|_| storage_error())?
+            .map_err(|_| storage_error())?;
         if tokio::fs::try_exists(&final_path)
             .await
             .map_err(|_| storage_error())?
         {
             self.blob(content_hash).await?;
+            let root = self.root.clone();
+            let path = final_path.clone();
+            let digest = content_hash.to_owned();
+            let bytes = body.len() as u64;
+            tokio::task::spawn_blocking(move || {
+                crate::integrity::record_file(&root, &path, &digest, bytes)
+            })
+            .await
+            .map_err(|_| storage_error())??;
             return Ok(());
         }
         let free = fs2::available_space(&self.root).map_err(|_| storage_error())?;
@@ -352,7 +523,7 @@ impl PgBlobStore {
                 match std::fs::hard_link(&stage_guard.0, &target) {
                     Ok(()) => {
                         if let Some(reservation) = reservation {
-                            reservation.retain();
+                            reservation.retain_at(&target)?;
                         }
                         Ok(true)
                     }
@@ -365,11 +536,20 @@ impl PgBlobStore {
             if !published {
                 self.blob(content_hash).await?;
             }
-            let dir = self.root.clone();
+            let dir = final_path.parent().ok_or_else(storage_error)?.to_path_buf();
             tokio::task::spawn_blocking(move || std::fs::File::open(dir)?.sync_all())
                 .await
                 .map_err(|_| storage_error())?
                 .map_err(|_| storage_error())?;
+            let root = self.root.clone();
+            let path = final_path.clone();
+            let digest = content_hash.to_owned();
+            let bytes = body.len() as u64;
+            tokio::task::spawn_blocking(move || {
+                crate::integrity::record_file(&root, &path, &digest, bytes)
+            })
+            .await
+            .map_err(|_| storage_error())??;
             Ok(())
         }
         .await;
@@ -392,6 +572,30 @@ impl PgBlobStore {
                 })
                 .map_err(|_| storage_error())?,
         };
+        let expected: String = row
+            .try_get("metadata_integrity")
+            .map_err(|_| Error::integrity("Capture integrity evidence missing."))?;
+        if capture_metadata_digest(&capture)? != expected {
+            return Err(Error::integrity("Capture metadata integrity failed."));
+        }
+        crate::integrity::verify(
+            &capture.id,
+            format!(
+                "{}\0{}\0{}\0{}",
+                capture.key, capture.source_url, capture.media_type, capture.body_hash
+            )
+            .as_bytes(),
+        )?;
+        if head {
+            let proof: String = row
+                .try_get("head_integrity")
+                .map_err(|_| Error::integrity("Source head integrity missing."))?;
+            let payload = serde_json::json!({"source_key":capture.key,"capture_id":capture.id,"validated_at":capture.validated_at,"etag":row.try_get::<Option<String>,_>("etag").map_err(|_|storage_error())?,"last_modified":row.try_get::<Option<String>,_>("last_modified").map_err(|_|storage_error())?});
+            if events::event_digest("devres_heads", &capture.key, &payload)? != proof {
+                return Err(Error::integrity("Source head integrity failed."));
+            }
+        }
+        self.verify_effective_validation(&capture.id).await?;
         let body = self.blob(&capture.body_hash).await?;
         Ok(StoredCapture { capture, body })
     }
@@ -400,7 +604,7 @@ impl PgBlobStore {
 impl Store for PgBlobStore {
     async fn latest(&self, key: &str) -> Result<Option<Cached>> {
         self.fence().await?;
-        let row = sqlx::query("SELECT c.*, h.validated_at AS head_validated_at, h.etag, h.last_modified FROM devres_heads h JOIN devres_captures c ON c.id=h.capture_id WHERE h.source_key=$1")
+        let row = sqlx::query("SELECT c.*, h.validated_at AS head_validated_at, h.etag, h.last_modified,h.head_integrity FROM devres_heads h JOIN devres_captures c ON c.id=h.capture_id WHERE h.source_key=$1")
             .bind(key).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
         match row {
             None => Ok(None),
@@ -421,7 +625,7 @@ impl Store for PgBlobStore {
         if !valid_hash(id) {
             return Err(Error::invalid("Invalid capture identifier"));
         }
-        let row = sqlx::query("SELECT c.*, GREATEST(COALESCE((SELECT MAX(o.validated_at) FROM devres_observations o WHERE o.capture_id=c.id),c.retrieved_at),COALESCE((SELECT MAX(o.observed_at) FROM devres_rfc_import_observations o WHERE o.capture_id=c.id),c.retrieved_at)) AS capture_validated_at FROM devres_captures c WHERE c.id=$1")
+        let row = sqlx::query("SELECT c.*, GREATEST(COALESCE((SELECT MAX(o.validated_at) FROM devres_observations o WHERE o.capture_id=c.id OR o.capture_id IN (SELECT legacy FROM devres_content_aliases WHERE namespace='capture' AND canonical=c.id)),c.retrieved_at),COALESCE((SELECT MAX(o.observed_at) FROM devres_rfc_import_observations o WHERE o.capture_id=c.id OR o.capture_id IN (SELECT legacy FROM devres_content_aliases WHERE namespace='capture' AND canonical=c.id)),c.retrieved_at)) AS capture_validated_at FROM devres_captures c WHERE c.id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -450,21 +654,30 @@ impl Store for PgBlobStore {
             )
             .as_bytes(),
         );
+        let metadata_digest = capture_metadata_digest(&Capture {
+            id: id.clone(),
+            key: request.key.clone(),
+            source_url: request.url.clone(),
+            body_hash: body_hash.clone(),
+            media_type: request.media_type.clone(),
+            retrieved_at: now,
+            validated_at: now,
+        })?;
         self.write_blob(&body_hash, &response.body).await?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         // Publication uses the same connection that owns the serving fence.
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_captures (id,source_key,source_url,body_hash,media_type,retrieved_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING")
-            .bind(&id).bind(&request.key).bind(&request.url).bind(&body_hash).bind(&request.media_type).bind(now).execute(&mut *tx).await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_heads (source_key,capture_id,validated_at,etag,last_modified) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(source_key) DO UPDATE SET capture_id=EXCLUDED.capture_id,validated_at=EXCLUDED.validated_at,etag=EXCLUDED.etag,last_modified=EXCLUDED.last_modified")
-            .bind(&request.key).bind(&id).bind(now).bind(&response.validators.etag).bind(&response.validators.last_modified).execute(&mut *tx).await.map_err(|_| storage_error())?;
+        sqlx::query("INSERT INTO devres_captures (id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING")
+            .bind(&id).bind(&request.key).bind(&request.url).bind(&body_hash).bind(&request.media_type).bind(now).bind(&metadata_digest).execute(&mut *tx).await.map_err(|_| storage_error())?;
+        let head_payload = serde_json::json!({"source_key":request.key,"capture_id":id,"validated_at":now,"etag":response.validators.etag,"last_modified":response.validators.last_modified});
+        let head_integrity = events::event_digest("devres_heads", &request.key, &head_payload)?;
+        sqlx::query("INSERT INTO devres_heads (source_key,capture_id,validated_at,etag,last_modified,head_integrity) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(source_key) DO UPDATE SET capture_id=EXCLUDED.capture_id,validated_at=EXCLUDED.validated_at,etag=EXCLUDED.etag,last_modified=EXCLUDED.last_modified,head_integrity=EXCLUDED.head_integrity")
+            .bind(&request.key).bind(&id).bind(now).bind(&response.validators.etag).bind(&response.validators.last_modified).bind(head_integrity).execute(&mut *tx).await.map_err(|_| storage_error())?;
         if imported {
-            sqlx::query("INSERT INTO devres_rfc_import_observations(capture_id,observed_at,source_url) VALUES($1,$2,$3)")
-                .bind(&id).bind(now).bind(&request.url).execute(&mut *tx).await.map_err(|_| storage_error())?;
+            events::append_import(&mut tx, &id, now, &request.url).await?;
         } else {
-            sqlx::query("INSERT INTO devres_observations (capture_id,validated_at,status) VALUES ($1,$2,200)")
-                .bind(&id).bind(now).execute(&mut *tx).await.map_err(|_| storage_error())?;
+            events::append_http(&mut tx, &id, now, 200).await?;
         }
         tx.commit().await.map_err(|_| storage_error())?;
         drop(owner);
@@ -490,19 +703,26 @@ impl Store for PgBlobStore {
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let updated = sqlx::query("UPDATE devres_heads SET validated_at=$3,etag=COALESCE($4,etag),last_modified=COALESCE($5,last_modified) WHERE source_key=$1 AND capture_id=$2")
-            .bind(key).bind(id).bind(now).bind(validators.etag).bind(validators.last_modified).execute(&mut *tx).await.map_err(|_| storage_error())?;
-        if updated.rows_affected() != 1 {
-            return Err(Error::integrity("Source head changed during revalidation"));
+        let prior=sqlx::query("SELECT source_key,capture_id,validated_at,etag,last_modified,head_integrity FROM devres_heads WHERE source_key=$1 AND capture_id=$2 FOR UPDATE")
+            .bind(key).bind(id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?.ok_or_else(||Error::integrity("Source head changed during revalidation"))?;
+        let prior_payload = serde_json::json!({"source_key":key,"capture_id":id,"validated_at":prior.try_get::<i64,_>("validated_at").map_err(|_|storage_error())?,"etag":prior.try_get::<Option<String>,_>("etag").map_err(|_|storage_error())?,"last_modified":prior.try_get::<Option<String>,_>("last_modified").map_err(|_|storage_error())?});
+        let proof: String = prior
+            .try_get("head_integrity")
+            .map_err(|_| storage_error())?;
+        if events::event_digest("devres_heads", key, &prior_payload)? != proof {
+            return Err(Error::integrity("Source head integrity failed."));
         }
-        sqlx::query(
-            "INSERT INTO devres_observations (capture_id,validated_at,status) VALUES ($1,$2,304)",
-        )
-        .bind(id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?;
+        let etag = validators
+            .etag
+            .or(prior.try_get("etag").map_err(|_| storage_error())?);
+        let modified = validators.last_modified.or(prior
+            .try_get("last_modified")
+            .map_err(|_| storage_error())?);
+        let payload = serde_json::json!({"source_key":key,"capture_id":id,"validated_at":now,"etag":etag,"last_modified":modified});
+        let proof = events::event_digest("devres_heads", key, &payload)?;
+        sqlx::query("UPDATE devres_heads SET validated_at=$3,etag=$4,last_modified=$5,head_integrity=$6 WHERE source_key=$1 AND capture_id=$2")
+            .bind(key).bind(id).bind(now).bind(etag).bind(modified).bind(proof).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        events::append_http(&mut tx, id, now, 304).await?;
         tx.commit().await.map_err(|_| storage_error())?;
         drop(owner);
         let mut stored = self.capture(id).await?;

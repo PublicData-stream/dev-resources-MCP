@@ -1,5 +1,5 @@
 //! Owner-fenced, append-only W3C evidence and atomic default publication.
-use super::{PgBlobStore, hash, storage_error, valid_hash};
+use super::{PgBlobStore, hash, payload_integrity, sequence_integrity, storage_error, valid_hash};
 use async_trait::async_trait;
 use devres_application::w3c::{Row, Snapshot, View, W3cStore, Write, validate_w3c_writes};
 use devres_domain::{Error, Result};
@@ -29,10 +29,7 @@ fn row(row: sqlx::postgres::PgRow) -> Result<Row> {
     Ok(Row {
         sequence: row.try_get("sequence").map_err(|_| storage_error())?,
         key: row.try_get("key").map_err(|_| storage_error())?,
-        data: row
-            .try_get::<Json<Value>, _>("data")
-            .map_err(|_| storage_error())?
-            .0,
+        data: payload_integrity::row("devres_w3c_evidence", &row)?,
     })
 }
 #[async_trait]
@@ -48,16 +45,12 @@ impl W3cStore for PgBlobStore {
         for key in keys {
             checked(kind, key)?;
         }
-        self.fence().await?;
-        let keys: Vec<String> = sqlx::query_scalar(
-            "SELECT key FROM devres_w3c_evidence WHERE kind=$1 AND key=ANY($2::text[])",
-        )
-        .bind(kind)
-        .bind(keys)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| storage_error())?;
-        Ok(keys.into_iter().collect())
+        Ok(self
+            .w3c_get_many(kind, keys)
+            .await?
+            .into_iter()
+            .map(|row| row.key)
+            .collect())
     }
     async fn w3c_statistics(&self) -> Result<Value> {
         self.fence().await?;
@@ -66,6 +59,9 @@ impl W3cStore for PgBlobStore {
     }
     async fn w3c_cutoff(&self) -> Result<i64> {
         self.fence().await?;
+        if let Some(cutoff) = self.migration_cutoff("w3c").await? {
+            return Ok(cutoff);
+        }
         sqlx::query_scalar("SELECT COALESCE(max(sequence),0) FROM devres_w3c_evidence")
             .fetch_one(&self.pool)
             .await
@@ -79,43 +75,103 @@ impl W3cStore for PgBlobStore {
             checked(kind, key)?;
         }
         self.fence().await?;
-        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(octet_length(data::text)),0)::bigint FROM devres_w3c_evidence WHERE kind=$1 AND key=ANY($2::text[])").bind(kind).bind(keys).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let original_keys = keys;
+        let mut resolved = Vec::with_capacity(keys.len());
+        for key in keys {
+            resolved.push(payload_integrity::natural_key(&self.pool, "w3c", kind, key).await?);
+        }
+        let keys = &resolved;
+
+        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(octet_length(data::text)),0)::bigint FROM devres_w3c_evidence JOIN UNNEST($2::text[]) AS requested(key) ON requested.key=devres_w3c_evidence.key WHERE kind=$1").bind(kind).bind(keys).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if bytes > 64 * 1024 * 1024 {
             return Err(Error::capacity("W3C batch read memory bound exceeded."));
         }
-        sqlx::query("SELECT sequence,key,data FROM devres_w3c_evidence WHERE kind=$1 AND key=ANY($2::text[])").bind(kind).bind(keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
+        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_w3c_evidence WHERE kind=$1 AND key=ANY($2::text[])").bind(kind).bind(keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(|found|{let found=row(found)?;let matches=resolved.iter().enumerate().filter(|(_,key)|**key==found.key).map(|(position,_)|original_keys[position].clone()).collect::<std::collections::BTreeSet<_>>();Ok(matches.into_iter().map(|key|{let mut value=found.clone();value.key=key;value}).collect::<Vec<_>>())}).collect::<Result<Vec<Vec<_>>>>().map(|rows|rows.into_iter().flatten().collect())
+    }
+    async fn w3c_migration_rows(&self, kind: &str, after: i64, limit: usize) -> Result<Vec<Row>> {
+        checked(kind, "migration-page")?;
+        if after < 0 || !(1..=1000).contains(&limit) {
+            return Err(Error::invalid(
+                "Invalid retained evidence verification page.",
+            ));
+        }
+        self.fence().await?;
+        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM(SELECT octet_length(data::text) AS n FROM devres_w3c_evidence WHERE kind=$1 AND sequence>$2 ORDER BY sequence LIMIT $3) page").bind(kind).bind(after).bind(limit as i64).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        if bytes > 64 * 1024 * 1024 {
+            return Err(Error::capacity(
+                "Retained evidence verification page exceeds memory budget.",
+            ));
+        }
+        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_w3c_evidence WHERE kind=$1 AND sequence>$2 ORDER BY sequence LIMIT $3").bind(kind).bind(after).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
+    }
+    async fn w3c_migration_kinds(&self) -> Result<Vec<String>> {
+        self.fence().await?;
+        let kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT kind FROM devres_w3c_evidence ORDER BY kind LIMIT 257",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
+        if kinds.len() > 256 {
+            return Err(Error::capacity(
+                "Provider evidence kind inventory exceeds bound.",
+            ));
+        }
+        Ok(kinds)
+    }
+    async fn w3c_migration_state_keys(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::invalid("Invalid migration state page."));
+        }
+        self.fence().await?;
+        sqlx::query_scalar("SELECT key FROM devres_w3c_state WHERE key>$1 ORDER BY key LIMIT $2")
+            .bind(after)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| storage_error())
     }
     async fn w3c_get(&self, kind: &str, key: &str) -> Result<Option<Row>> {
         checked(kind, key)?;
         self.fence().await?;
-        sqlx::query("SELECT sequence,key,data FROM devres_w3c_evidence WHERE kind=$1 AND key=$2")
+        let resolved = payload_integrity::natural_key(&self.pool, "w3c", kind, key).await?;
+        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_w3c_evidence WHERE kind=$1 AND key=$2")
             .bind(kind)
-            .bind(key)
+            .bind(&resolved)
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| storage_error())?
-            .map(row)
+            .map(|found|{let mut found=row(found)?;if resolved!=key {found.key=key.to_owned();}Ok(found)})
             .transpose()
     }
     async fn w3c_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
         checked(kind, key)?;
         bounded(data)?;
+        let resolved = payload_integrity::natural_key(&self.pool, "w3c", kind, key).await?;
+        let key = resolved.as_str();
         let mut owner = self.owner.lock().await;
         // This non-reconnecting connection itself holds the ownership lock. One
         // atomic statement suffices for a new immutable row; cancellation can
         // leave only a replayable, unreferenced public object.
-        let inserted:Option<i64>=sqlx::query_scalar("WITH inserted AS(INSERT INTO devres_w3c_evidence(kind,key,data) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING sequence,kind,data),counted AS(INSERT INTO devres_w3c_statistics(kind,rows,projection_gaps,index_gaps) SELECT kind,1,CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,projection_gaps}')::bigint,0) ELSE 0 END,CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,index_gaps}')::bigint,0) ELSE 0 END FROM inserted ON CONFLICT(kind) DO UPDATE SET rows=devres_w3c_statistics.rows+EXCLUDED.rows,projection_gaps=devres_w3c_statistics.projection_gaps+EXCLUDED.projection_gaps,index_gaps=devres_w3c_statistics.index_gaps+EXCLUDED.index_gaps RETURNING kind) SELECT sequence FROM inserted").bind(kind).bind(key).bind(Json(data)).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
+        if let Some(sequence) =
+            sequence_integrity::admit(&mut owner, "devres_w3c_evidence", kind, key, data).await?
+        {
+            return Ok(sequence);
+        }
+        let allocated = sequence_integrity::reserve_one(&mut owner, "devres_w3c_evidence").await?;
+        let inserted:Option<i64>=sqlx::query_scalar("WITH inserted AS(INSERT INTO devres_w3c_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING RETURNING sequence,kind,data),counted AS(INSERT INTO devres_w3c_statistics(kind,rows,projection_gaps,index_gaps) SELECT kind,1,CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,projection_gaps}')::bigint,0) ELSE 0 END,CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,index_gaps}')::bigint,0) ELSE 0 END FROM inserted ON CONFLICT(kind) DO UPDATE SET rows=devres_w3c_statistics.rows+EXCLUDED.rows,projection_gaps=devres_w3c_statistics.projection_gaps+EXCLUDED.projection_gaps,index_gaps=devres_w3c_statistics.index_gaps+EXCLUDED.index_gaps RETURNING kind) SELECT sequence FROM inserted").bind(kind).bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_w3c_evidence",kind,key,data)?).bind(allocated).bind(sequence_integrity::digest("devres_w3c_evidence",kind,key,allocated)?).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
         if let Some(sequence) = inserted {
             return Ok(sequence);
         }
         let retained =
-            sqlx::query("SELECT sequence,data=$3::jsonb AS identical FROM devres_w3c_evidence WHERE kind=$1 AND key=$2")
+            sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity,data=$3::jsonb AS identical FROM devres_w3c_evidence WHERE kind=$1 AND key=$2")
                 .bind(kind)
                 .bind(key)
                 .bind(Json(data))
                 .fetch_one(&mut *owner)
                 .await
                 .map_err(|_| storage_error())?;
+        payload_integrity::row("devres_w3c_evidence", &retained)?;
         if !retained
             .try_get::<bool, _>("identical")
             .map_err(|_| storage_error())?
@@ -128,6 +184,12 @@ impl W3cStore for PgBlobStore {
         Ok(sequence)
     }
     async fn w3c_put_many(&self, rows: &[Write]) -> Result<()> {
+        let mut resolved_rows = rows.to_vec();
+        for row in &mut resolved_rows {
+            row.key =
+                payload_integrity::natural_key(&self.pool, "w3c", &row.kind, &row.key).await?;
+        }
+        let rows = resolved_rows.as_slice();
         validate_w3c_writes(rows)?;
         for row in rows {
             checked(&row.kind, &row.key)?;
@@ -138,19 +200,45 @@ impl W3cStore for PgBlobStore {
         let kinds: Vec<_> = rows.iter().map(|r| r.kind.clone()).collect();
         let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
         let values: Vec<_> = rows.iter().map(|r| Json(r.data.clone())).collect();
+        let digests = rows
+            .iter()
+            .map(|row| {
+                payload_integrity::digest("devres_w3c_evidence", &row.kind, &row.key, &row.data)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut owner = self.owner.lock().await;
         // This connection itself owns the non-reconnecting session fence. All
         // rows and collision checks commit together, without changing durability.
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx::query("WITH inserted AS(INSERT INTO devres_w3c_evidence(kind,key,data) SELECT * FROM UNNEST($1::text[],$2::text[],$3::jsonb[]) ON CONFLICT DO NOTHING RETURNING kind,data) INSERT INTO devres_w3c_statistics(kind,rows,projection_gaps,index_gaps) SELECT kind,count(*)::bigint,COALESCE(sum(CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,projection_gaps}')::bigint,0) ELSE 0 END),0)::bigint,COALESCE(sum(CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,index_gaps}')::bigint,0) ELSE 0 END),0)::bigint FROM inserted GROUP BY kind ON CONFLICT(kind) DO UPDATE SET rows=devres_w3c_statistics.rows+EXCLUDED.rows,projection_gaps=devres_w3c_statistics.projection_gaps+EXCLUDED.projection_gaps,index_gaps=devres_w3c_statistics.index_gaps+EXCLUDED.index_gaps")
-            .bind(&kinds).bind(&keys).bind(&values).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        let matched:i64=sqlx::query_scalar("SELECT count(*)::bigint FROM UNNEST($1::text[],$2::text[],$3::jsonb[]) AS expected(kind,key,data) JOIN devres_w3c_evidence AS retained ON retained.kind=expected.kind AND retained.key=expected.key AND retained.data=expected.data")
-            .bind(&kinds).bind(&keys).bind(&values).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
+        for row in rows {
+            sequence_integrity::admit(
+                &mut tx,
+                "devres_w3c_evidence",
+                &row.kind,
+                &row.key,
+                &row.data,
+            )
+            .await?;
+        }
+        let sequences =
+            sequence_integrity::reserve(&mut tx, "devres_w3c_evidence", rows.len()).await?;
+        let sequence_digests = rows
+            .iter()
+            .zip(&sequences)
+            .map(|(row, sequence)| {
+                sequence_integrity::digest("devres_w3c_evidence", &row.kind, &row.key, *sequence)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sqlx::query("WITH inserted AS(INSERT INTO devres_w3c_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) SELECT * FROM UNNEST($1::text[],$2::text[],$3::jsonb[],$4::text[],$5::bigint[],$6::text[]) ON CONFLICT DO NOTHING RETURNING kind,data) INSERT INTO devres_w3c_statistics(kind,rows,projection_gaps,index_gaps) SELECT kind,count(*)::bigint,COALESCE(sum(CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,projection_gaps}')::bigint,0) ELSE 0 END),0)::bigint,COALESCE(sum(CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{coverage,index_gaps}')::bigint,0) ELSE 0 END),0)::bigint FROM inserted GROUP BY kind ON CONFLICT(kind) DO UPDATE SET rows=devres_w3c_statistics.rows+EXCLUDED.rows,projection_gaps=devres_w3c_statistics.projection_gaps+EXCLUDED.projection_gaps,index_gaps=devres_w3c_statistics.index_gaps+EXCLUDED.index_gaps")
+            .bind(&kinds).bind(&keys).bind(&values).bind(&digests).bind(&sequences).bind(&sequence_digests).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        let matched:i64=sqlx::query_scalar("SELECT count(*)::bigint FROM UNNEST($1::text[],$2::text[],$3::jsonb[],$4::text[]) AS expected(kind,key,data,data_integrity) JOIN devres_w3c_evidence AS retained ON retained.kind=expected.kind AND retained.key=expected.key AND retained.data=expected.data AND retained.data_integrity=expected.data_integrity")
+            .bind(&kinds).bind(&keys).bind(&values).bind(&digests).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         if matched != rows.len() as i64 {
             return Err(Error::integrity(
                 "W3C immutable evidence identity collision.",
             ));
         }
+        sequence_integrity::verify_keys(&mut tx, "devres_w3c_evidence", &kinds, &keys).await?;
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn w3c_rows(
@@ -165,23 +253,21 @@ impl W3cStore for PgBlobStore {
             return Err(Error::invalid("Invalid W3C evidence page."));
         }
         self.fence().await?;
-        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM (SELECT octet_length(data::text) AS n FROM devres_w3c_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) ORDER BY sequence LIMIT $4) page").bind(kind).bind(after).bind(cutoff).bind(limit as i64).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let excluded = self.visibility_aliases("w3c", kind, cutoff).await?;
+        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM (SELECT octet_length(data::text) AS n FROM devres_w3c_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4) page").bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(excluded.as_ref()).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if bytes > 64 * 1024 * 1024 {
             return Err(Error::capacity("W3C evidence page memory bound exceeded."));
         }
-        sqlx::query("SELECT sequence,key,data FROM devres_w3c_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) ORDER BY sequence LIMIT $4")
-            .bind(kind).bind(after).bind(cutoff).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
+        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_w3c_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4")
+            .bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(excluded.as_ref()).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
     }
     async fn w3c_state(&self, key: &str) -> Result<Option<Value>> {
         checked("state", key)?;
         self.fence().await?;
         Ok(
-            sqlx::query_scalar::<_, Json<Value>>("SELECT data FROM devres_w3c_state WHERE key=$1")
-                .bind(key)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|_| storage_error())?
-                .map(|j| j.0),
+            payload_integrity::load(&self.pool, "devres_w3c_state", "", key)
+                .await?
+                .map(|value| value.0),
         )
     }
     async fn w3c_set_state(&self, key: &str, data: &Value) -> Result<()> {
@@ -189,7 +275,7 @@ impl W3cStore for PgBlobStore {
         bounded(data)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_w3c_state(key,data) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data").bind(key).bind(Json(data)).execute(&mut *owner).await.map_err(|_|storage_error())?;
+        sqlx::query("INSERT INTO devres_w3c_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_w3c_state","",key,data)?).execute(&mut *owner).await.map_err(|_|storage_error())?;
         Ok(())
     }
     async fn w3c_publish_view(&self, view: &View) -> Result<()> {
@@ -212,13 +298,9 @@ impl W3cStore for PgBlobStore {
         }
         let mut owner = self.owner.lock().await;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let catalog: Option<Json<Value>> = sqlx::query_scalar(
-            "SELECT data FROM devres_w3c_evidence WHERE kind='catalogs' AND key=$1",
-        )
-        .bind(&view.catalog)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?;
+        let catalog: Option<Json<Value>> =
+            payload_integrity::load(&mut *tx, "devres_w3c_evidence", "catalogs", &view.catalog)
+                .await?;
         let catalog: devres_application::w3c::Catalog = serde_json::from_value(
             catalog
                 .ok_or_else(|| Error::integrity("W3C view catalog missing."))?
@@ -247,14 +329,10 @@ impl W3cStore for PgBlobStore {
                     "W3C view standard is outside its catalog.",
                 ));
             }
-            let data: Json<Value> = sqlx::query_scalar(
-                "SELECT data FROM devres_w3c_evidence WHERE kind='snapshots' AND key=$1",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| storage_error())?
-            .ok_or_else(|| Error::integrity("W3C view snapshot missing."))?;
+            let data: Json<Value> =
+                payload_integrity::load(&mut *tx, "devres_w3c_evidence", "snapshots", id)
+                    .await?
+                    .ok_or_else(|| Error::integrity("W3C view snapshot missing."))?;
             let snapshot: Snapshot = serde_json::from_value(data.0)
                 .map_err(|_| Error::integrity("Invalid W3C snapshot."))?;
             if snapshot.standard != *standard
@@ -273,13 +351,13 @@ impl W3cStore for PgBlobStore {
                 let publication = snapshot.coverage["publication"]
                     .as_str()
                     .ok_or_else(|| Error::integrity("W3C publication evidence missing."))?;
-                let evidence: Json<Value> = sqlx::query_scalar(
-                    "SELECT data FROM devres_w3c_evidence WHERE kind='publications' AND key=$1",
+                let evidence: Json<Value> = payload_integrity::load(
+                    &mut *tx,
+                    "devres_w3c_evidence",
+                    "publications",
+                    publication,
                 )
-                .bind(publication)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?
+                .await?
                 .ok_or_else(|| Error::integrity("W3C publication evidence missing."))?;
                 let publication_validation = if let Some(manifest) =
                     snapshot.coverage["edition_manifest"].as_str()
@@ -301,7 +379,7 @@ impl W3cStore for PgBlobStore {
                     ));
                 }
             } else {
-                let evidence:Option<Json<Value>>=sqlx::query_scalar("SELECT data FROM devres_w3c_evidence WHERE kind='observations' AND data->'repo'->>'url'=$1 AND data->>'main_revision'=$2 AND (data->>'observed_at')::bigint >= $3 ORDER BY sequence DESC LIMIT 1").bind(&snapshot.repository).bind(&snapshot.revision).bind(validated_at).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+                let evidence = sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_w3c_evidence WHERE kind='observations' AND data->'repo'->>'url'=$1 AND data->>'main_revision'=$2 AND (data->>'observed_at')::bigint >= $3 ORDER BY sequence DESC LIMIT 1").bind(&snapshot.repository).bind(&snapshot.revision).bind(validated_at).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?.map(|row|payload_integrity::row("devres_w3c_evidence",&row)).transpose()?;
                 if evidence.is_none() {
                     return Err(Error::integrity(
                         "W3C default requires matching current Git evidence.",
@@ -311,7 +389,16 @@ impl W3cStore for PgBlobStore {
         }
         let data = serde_json::to_value(view).map_err(|_| Error::integrity("Invalid W3C view."))?;
         bounded(&data)?;
-        sqlx::query("INSERT INTO devres_w3c_evidence(kind,key,data) VALUES('views',$1,$2) ON CONFLICT DO NOTHING").bind(&view.id).bind(Json(&data)).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sequence_integrity::admit(&mut tx, "devres_w3c_evidence", "views", &view.id, &data).await?;
+        let allocated = sequence_integrity::reserve_one(&mut tx, "devres_w3c_evidence").await?;
+        sqlx::query("INSERT INTO devres_w3c_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) VALUES('views',$1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(&view.id).bind(Json(&data)).bind(payload_integrity::digest("devres_w3c_evidence","views",&view.id,&data)?).bind(allocated).bind(sequence_integrity::digest("devres_w3c_evidence","views",&view.id,allocated)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sequence_integrity::verify_keys(
+            &mut tx,
+            "devres_w3c_evidence",
+            &["views".to_owned()],
+            std::slice::from_ref(&view.id),
+        )
+        .await?;
         let identical: bool = sqlx::query_scalar(
             "SELECT data=$2::jsonb FROM devres_w3c_evidence WHERE kind='views' AND key=$1",
         )
@@ -320,10 +407,13 @@ impl W3cStore for PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
+        payload_integrity::load(&mut *tx, "devres_w3c_evidence", "views", &view.id)
+            .await?
+            .ok_or_else(|| Error::integrity("Retained view missing."))?;
         if !identical {
             return Err(Error::integrity("W3C view identity collision."));
         }
-        sqlx::query("INSERT INTO devres_w3c_state(key,data) VALUES('default',$1) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data").bind(Json(&data)).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx::query("INSERT INTO devres_w3c_state(key,data,data_integrity) VALUES('default',$1,$2) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(Json(&data)).bind(payload_integrity::digest("devres_w3c_state","","default",&data)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
         tx.commit().await.map_err(|_| storage_error())
     }
 }
@@ -353,11 +443,8 @@ async fn validate_edition(
         return Err(invalid());
     }
     let manifest: Json<Value> =
-        sqlx::query_scalar("SELECT data FROM devres_w3c_evidence WHERE kind='editions' AND key=$1")
-            .bind(key)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|_| storage_error())?
+        payload_integrity::load(&mut **tx, "devres_w3c_evidence", "editions", key)
+            .await?
             .ok_or_else(invalid)?;
     let encoded = serde_json::to_vec(&manifest.0).map_err(|_| invalid())?;
     if encoded.len() > 16 * 1024 * 1024
@@ -375,14 +462,10 @@ async fn validate_edition(
     if snapshot.coverage["edition_root_snapshot"].as_str() != Some(root_id) {
         return Err(invalid());
     }
-    let root: Json<Value> = sqlx::query_scalar(
-        "SELECT data FROM devres_w3c_evidence WHERE kind='snapshots' AND key=$1",
-    )
-    .bind(root_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|_| storage_error())?
-    .ok_or_else(invalid)?;
+    let root: Json<Value> =
+        payload_integrity::load(&mut **tx, "devres_w3c_evidence", "snapshots", root_id)
+            .await?
+            .ok_or_else(invalid)?;
     let root: Snapshot = serde_json::from_value(root.0).map_err(|_| invalid())?;
     if root.id != root_id
         || root.standard != standard
@@ -451,14 +534,10 @@ async fn validate_edition(
             .as_str()
             .filter(|id| valid_hash(id))
             .ok_or_else(invalid)?;
-        let publication: Json<Value> = sqlx::query_scalar(
-            "SELECT data FROM devres_w3c_evidence WHERE kind='publications' AND key=$1",
-        )
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| storage_error())?
-        .ok_or_else(invalid)?;
+        let publication: Json<Value> =
+            payload_integrity::load(&mut **tx, "devres_w3c_evidence", "publications", id)
+                .await?
+                .ok_or_else(invalid)?;
         let data = publication.0;
         let observed = data["observed_at"]
             .as_i64()

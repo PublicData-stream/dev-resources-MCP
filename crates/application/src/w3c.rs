@@ -171,6 +171,30 @@ pub struct View {
 
 #[async_trait]
 pub trait W3cStore: Send + Sync {
+    /// Complete retained rows for private integrity verification, including aliases.
+    async fn w3c_migration_rows(
+        &self,
+        _kind: &str,
+        _after: i64,
+        _limit: usize,
+    ) -> Result<Vec<Row>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration verification unavailable.",
+        ))
+    }
+
+    /// Private offline migration inventory; never exposed through MCP.
+    async fn w3c_migration_kinds(&self) -> Result<Vec<String>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration enumeration unavailable.",
+        ))
+    }
+    async fn w3c_migration_state_keys(&self, _after: &str, _limit: usize) -> Result<Vec<String>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration enumeration unavailable.",
+        ))
+    }
+
     async fn w3c_existing(
         &self,
         kind: &str,

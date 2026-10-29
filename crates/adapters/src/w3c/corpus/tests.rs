@@ -10,6 +10,33 @@ pub(super) struct Memory {
 }
 #[async_trait]
 impl W3cStore for Memory {
+    async fn w3c_migration_rows(&self, kind: &str, after: i64, limit: usize) -> Result<Vec<Row>> {
+        self.w3c_rows(kind, after, limit, None).await
+    }
+
+    async fn w3c_migration_kinds(&self) -> Result<Vec<String>> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(kind, _)| kind.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+    async fn w3c_migration_state_keys(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| key.as_str() > after)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     async fn w3c_cutoff(&self) -> Result<i64> {
         Ok(self
             .rows
@@ -864,4 +891,218 @@ async fn moving_editor_revalidates_without_changing_old_capture_and_obeys_due_ti
             > devres_domain::unix_now()
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn blake3_migration_rebuilds_shared_objects_and_catalogue_companions() {
+    let broker = Arc::new(BulkBroker::new(Default::default()).unwrap());
+    let (_root, store, corpus) = corpus_fixture(broker).await;
+    async fn put_hash(store: &Memory, kind: &str, data: Value) -> String {
+        let id = crate::integrity::legacy_hash(&serde_json::to_vec(&data).unwrap());
+        store.w3c_put(kind, &id, &data).await.unwrap();
+        id
+    }
+    let chunk = put_hash(&store, "projection-chunks", json!("exact retained text")).await;
+    let text = put_hash(
+        &store,
+        "projection-sequences",
+        json!({"values":[chunk.clone(),chunk]}),
+    )
+    .await;
+    let section = put_hash(
+        &store,
+        "projection-sections",
+        json!({"anchor":"a","title":"A","text":text}),
+    )
+    .await;
+    let sections = put_hash(&store, "projection-sequences", json!({"values":[section]})).await;
+    let empty = put_hash(&store, "projection-sequences", json!({"values":[]})).await;
+    let projection = crate::integrity::legacy_hash(b"frozen projection context");
+    store.w3c_put("projections",&projection,&json!({"manifest":{"format":"html","title":"A","text":text,"sections":sections,"symbols":empty,"references":empty,"gaps":[]},"index_membership":empty,"index_count":0,"gaps":[]})).await.unwrap();
+    let member = Member {
+        path: "doc.html".into(),
+        oid: "a".repeat(40),
+        mode: "100644".into(),
+        kind: "article".into(),
+        projection: Some(projection.clone()),
+        raw: None,
+        gaps: Vec::new(),
+    };
+    let leaf = devres_application::w3c::InventoryNode {
+        member: Some(member),
+        members: 1,
+        kinds: BTreeMap::from([("article".into(), 1)]),
+        ..Default::default()
+    };
+    let leaf_id = crate::integrity::legacy_hash(&serde_json::to_vec(&leaf).unwrap());
+    store
+        .w3c_put("nodes", &leaf_id, &encode(&leaf).unwrap())
+        .await
+        .unwrap();
+    let node = devres_application::w3c::InventoryNode {
+        children: BTreeMap::from([("doc.html".into(), leaf_id)]),
+        members: 1,
+        kinds: BTreeMap::from([("article".into(), 1)]),
+        ..Default::default()
+    };
+    let inventory = crate::integrity::legacy_hash(&serde_json::to_vec(&node).unwrap());
+    store
+        .w3c_put("nodes", &inventory, &encode(&node).unwrap())
+        .await
+        .unwrap();
+    let old = crate::integrity::legacy_hash(b"snapshot occurrence");
+    let snapshot = Snapshot {
+        id: old.clone(),
+        standard: "fixture".into(),
+        repository: String::new(),
+        revision: "c".repeat(40),
+        tree: "d".repeat(40),
+        parents: Vec::new(),
+        committed_at: 42,
+        inventory,
+        processor_version: 1,
+        index: Value::Null,
+        coverage: json!({"accounted":true}),
+        source_url: "https://www.w3.org/TR/fixture/".into(),
+        representation: "publication".into(),
+        validated_at: 41,
+    };
+    store
+        .w3c_put("snapshots", &old, &encode(&snapshot).unwrap())
+        .await
+        .unwrap();
+    let selector = crate::integrity::legacy_hash(
+        &serde_json::to_vec(&(
+            &snapshot.standard,
+            &snapshot.repository,
+            &snapshot.revision,
+            &snapshot.representation,
+            snapshot.processor_version,
+        ))
+        .unwrap(),
+    );
+    store
+        .w3c_put("snapshot-keys", &selector, &json!(old))
+        .await
+        .unwrap();
+    let catalog_id = crate::integrity::legacy_hash(b"catalogue occurrence");
+    let catalog = Catalog {
+        id: catalog_id.clone(),
+        observed_at: 41,
+        standards: Vec::new(),
+        gaps: Vec::new(),
+    };
+    store
+        .w3c_put("catalogs", &catalog_id, &encode(&catalog).unwrap())
+        .await
+        .unwrap();
+    let companion = json!({"repository":"official/source","revision":"e".repeat(40),"path":"catalog.json","metadata":{"literal":old}});
+    store
+        .w3c_put("catalog-captures", &catalog_id, &companion)
+        .await
+        .unwrap();
+    let pending = devres_application::w3c::InventoryNode::default();
+    let pending_root = crate::integrity::legacy_hash(&serde_json::to_vec(&pending).unwrap());
+    store
+        .w3c_put("nodes", &pending_root, &encode(&pending).unwrap())
+        .await
+        .unwrap();
+    store
+        .w3c_set_state(
+            "work:fixture",
+            &json!({"root":pending_root,"previous":null,"offset":17}),
+        )
+        .await
+        .unwrap();
+    let mut map = BTreeMap::new();
+    corpus
+        .migrate_blake3_graph(&mut map, CancellationToken::new())
+        .await
+        .unwrap();
+    let migrated = store
+        .w3c_get("snapshots", &map[&format!("w3c:snapshots:{old}")])
+        .await
+        .unwrap()
+        .unwrap();
+    let migrated: Snapshot = decode(migrated.data).unwrap();
+    let member = inventory::get(store.as_ref(), &migrated.inventory, "doc.html")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        member.projection.as_deref(),
+        Some(map[&format!("w3c:projections:{projection}")].as_str())
+    );
+    assert_eq!(migrated.committed_at, 42);
+    assert_eq!(migrated.validated_at, 41);
+    let canonical_catalog = &map[&format!("w3c:catalogs:{catalog_id}")];
+    assert_eq!(
+        store
+            .w3c_get("catalog-captures", canonical_catalog)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        companion,
+        "opaque metadata remains exact"
+    );
+    let canonical_selector = &map[&format!("w3c:snapshot-keys:{selector}")];
+    assert_eq!(
+        store
+            .w3c_get("snapshot-keys", canonical_selector)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        migrated.id
+    );
+    assert!(store.w3c_get("snapshots", &old).await.unwrap().is_some());
+    let work = store
+        .w3c_state("storage-migration:work:fixture")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(work["root"].as_str().unwrap().starts_with("blake3:"));
+    assert_eq!(work["offset"], 17);
+    corpus
+        .migrate_blake3_graph(&mut map, CancellationToken::new())
+        .await
+        .unwrap();
+    corpus
+        .verify_blake3_graph(CancellationToken::new())
+        .await
+        .unwrap();
+    let canonical_projection = map[&format!("w3c:projections:{projection}")].clone();
+    let removed = store
+        .rows
+        .lock()
+        .unwrap()
+        .remove(&("projections".into(), canonical_projection.clone()))
+        .unwrap();
+    assert_eq!(
+        corpus
+            .verify_blake3_graph(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code,
+        "integrity",
+        "valid remaining row hashes cannot hide a deleted descendant"
+    );
+    store
+        .rows
+        .lock()
+        .unwrap()
+        .insert(("projections".into(), canonical_projection), removed);
+    store
+        .w3c_put("unknown-format", "new-kind", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        corpus
+            .migrate_blake3_graph(&mut map, CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
 }

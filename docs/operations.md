@@ -5,11 +5,78 @@ local npm/pnpm/Yarn assessment. Include npm evidence and search data in coordina
 backups. Private maintenance uses `devres-server rebuild-npm-index CONFIG.toml`
 with serving stopped and the same ownership fence as other rebuild commands.
 
+## BLAKE3 storage upgrade (schema 10)
+
+Fresh empty stores initialize with BLAKE3 enforcement. Stores from schemas 1–9 need
+an explicit offline upgrade. Normal serving rejects an old schema or schema-10
+migration still pending activation; configuring collectors as disabled does not
+bypass that gate. PostgreSQL needs no BLAKE3 extension or replacement database
+image. Existing configuration fields and limits retain their meaning.
+
+1. Stop every serving, collection and maintenance writer. Take a coordinated
+   database/blob backup and record the schema and software identity. Preserve all
+   provider archives, projections, inventory/index generations and private
+   `.devres-integrity` descriptors together. Verify that the backup can be restored
+   into isolated storage before committing to the outage.
+2. Preflight free bytes and inodes for originals **plus** canonical SQL/index copies,
+   integrity metadata, database/WAL growth and configured reserves. Identical raw
+   files can use same-filesystem hard links, counted once by physical file identity;
+   rebuilt indexes and metadata still consume additional storage. Quotas/headroom
+   never authorize deleting history. These commands do not provide a full-corpus
+   capacity estimate.
+3. Run migration with the new binary and the same private configuration. It holds
+   the exclusive storage-owner fence, verifies existing evidence, and rebuilds every
+   retained generation without network acquisition or new source validation:
+
+   ```sh
+   devres-server migrate-storage /etc/devres/server.toml --to blake3
+   devres-server verify-storage /etc/devres/server.toml
+   ```
+
+   SIGINT/SIGTERM or a failed stage leaves serving unavailable. Keep all writers
+   stopped and rerun `migrate-storage` with the same database/blob pair to resume;
+   committed checkpoints are verified rather than trusted solely because they
+   exist. Missing/corrupt evidence, unknown retained variants, conflicting mappings
+   or exhausted space block progress. The migration identity working set is limited
+   to 64 MiB and one million entries; exceeding it fails with a capacity error
+   while preserving history and pending activation. Recover the evidence or add
+   reviewed format support before retrying; migration does not silently refetch
+   or discard it.
+4. Activate only after migration and verification succeed:
+
+   ```sh
+   devres-server activate-storage /etc/devres/server.toml
+   ```
+
+   Activation verifies content and graph completion, promotes staged canonical
+   heads/views under the ownership fence, and marks enforcement active. Restart
+   serving, then check new tagged IDs and representative old URLs, cursors, resource
+   reads and searches. The commands expose no public administration endpoint.
+5. Retain the pre-upgrade backup and all original evidence. An earlier binary
+   rejects schema 10; rollback restores the matching pre-upgrade database **and**
+   blob tree with all writers stopped. Retained SHA files alone are not a schema
+   downgrade. Later coordinated backups must include canonical/legacy generations,
+   mappings and `.devres-integrity` as permanent metadata.
+
+`verify-storage CONFIG.toml` also checks an active store after subsequent ingestion;
+it verifies retained file evidence and SQL envelopes without fetching sources,
+creating missing storage layouts, or updating database records. It requires an
+existing schema-10 store; missing integrity evidence is a failure.
+Passing local migration fixtures or a disposable cluster restore does not establish
+production migration, whole-provider coverage, native ARM64 execution, or hosted CI.
+See [architecture](architecture.md#blake3-enforcement-and-schema-10) for identity,
+legacy cursor, exact-number and upstream-checksum boundaries.
+
 ## Local gates
 
 From the repository root, use the pinned toolchain and a working Docker daemon.
 Cargo commands using shared caches require the privileged command channel in the
 Codex environment. Docker rootful and rootless operation are both permitted.
+For local work, keep generated state below `/tmp` with `scripts/with-tmp-state.sh`
+and use `CARGO_TARGET_DIR=/tmp/rust/target` plus
+`OXIBELT_TARGET_DIR=/tmp/rust/target` after entering that wrapper. Shared Cargo/rustup
+cache overrides follow the [isolated example](#w3c-validation-and-retained-acceptance).
+These local overrides do not change hosted CI's configured build-cache location.
 
 ```sh
 cargo fmt --all -- --check
@@ -350,15 +417,16 @@ Stop serving before either private crate maintenance command:
 
 ```sh
 devres-server rebuild-crate-index /etc/devres/server.toml
-devres-server import-crate-corpus /etc/devres/server.toml --manifest SHA256
+devres-server import-crate-corpus /etc/devres/server.toml --manifest CONTENT_DIGEST
 ```
 
 The rebuild uses retained database/capture evidence and publishes a new immutable
 index/snapshot. Large retained search indexes are validated by a cancellable
 background prewarm before activation and after restart; transient bootstrap search
 unavailability is separate from listener readiness and legacy tool availability.
-The import accepts the **body SHA-256 of an already retained Git
-evidence manifest**, not a caller URL, package executable or SQL script. It restores
+The import accepts the **body digest of an already retained Git evidence
+manifest**, either tagged BLAKE3 or a qualified legacy SHA-256 selector, not a caller
+URL, package executable or SQL script. It restores
 and verifies owned index evidence before publishing inventory; unknown/missing
 artifacts fail explicitly. Both commands use the single storage-owner fence and
 support SIGINT/SIGTERM cancellation. They do not authorize publication/deployment
@@ -458,9 +526,9 @@ An additional opt-in probe operates against **disposable dedicated storage** sup
 through `DATABASE_URL` and `BLOB_DIR`; never run it alongside a serving storage owner:
 
 ```sh
-CARGO_TARGET_DIR=/buildcache/rust/target cargo build --locked -p devres-adapters --example rustsec-probe
-/buildcache/rust/target/debug/examples/rustsec-probe --live current
-/buildcache/rust/target/debug/examples/rustsec-probe --live history
+CARGO_TARGET_DIR=/tmp/rust/target cargo build --locked -p devres-adapters --example rustsec-probe
+/tmp/rust/target/debug/examples/rustsec-probe --live current
+/tmp/rust/target/debug/examples/rustsec-probe --live history
 ```
 
 Each invocation enforces a shared maximum of 20 HTTP attempts, including retries,
@@ -505,11 +573,11 @@ collectors are disabled. They never establish upstream/full-source acceptance.
 Explicit source acceptance uses separate retained storage:
 
 ```sh
-CARGO_TARGET_DIR=/buildcache/rust/target scripts/accept-mdn.sh --live current
-CARGO_TARGET_DIR=/buildcache/rust/target scripts/accept-mdn.sh --live full
+CARGO_TARGET_DIR=/tmp/rust/target scripts/accept-mdn.sh --live current
+CARGO_TARGET_DIR=/tmp/rust/target scripts/accept-mdn.sh --live full
 # Reuse the printed task-owned directory; perform no new source acquisition:
 DEVRES_MDN_ACCEPTANCE_ROOT=/tmp/devres-mdn-retained.EXAMPLE \
-  CARGO_TARGET_DIR=/buildcache/rust/target scripts/accept-mdn.sh --resume full
+  CARGO_TARGET_DIR=/tmp/rust/target scripts/accept-mdn.sh --resume full
 ```
 
 Each initial invocation creates its own PostgreSQL directory and blobs under `/tmp`
@@ -662,7 +730,7 @@ work. Set `[w3c] enabled=false` to pause new acquisition while retaining local
 research. Health/metrics remain private; `w3c.corpus_status` reports source coverage,
 license blocks, freshness and processing/index gaps separately.
 
-For this environment, build targets use `/buildcache/rust/target` and all disposable
+For this environment, build targets use `/tmp/rust/target` and all disposable
 state uses `/tmp`. The existing temporary-state wrapper remains unchanged; apply
 shared-cache/build overrides after entering it:
 
@@ -672,7 +740,7 @@ shared_rustup_cache=${RUSTUP_HOME:-"$HOME/.rustup"}
 export DEVRES_TMP_ROOT=/tmp/devres-w3c
 scripts/with-tmp-state.sh env \
   CARGO_HOME="$shared_cargo_cache" RUSTUP_HOME="$shared_rustup_cache" \
-  CARGO_TARGET_DIR=/buildcache/rust/target OXIBELT_TARGET_DIR=/buildcache/rust/target \
+  CARGO_TARGET_DIR=/tmp/rust/target OXIBELT_TARGET_DIR=/tmp/rust/target \
   CARGO_BUILD_JOBS=2 scripts/with-local-docker.sh scripts/test-minikube.sh
 ```
 
@@ -738,8 +806,8 @@ Retained public evidence survives runner failure and automatic cleanup.
 
 For shared local caches, enter `scripts/with-tmp-state.sh` first, then override
 `CARGO_HOME`/`RUSTUP_HOME` to the shared caches and set
-`CARGO_TARGET_DIR=/buildcache/rust/target` and
-`OXIBELT_TARGET_DIR=/buildcache/rust/target`. Run Cargo through the privileged channel.
+`CARGO_TARGET_DIR=/tmp/rust/target` and
+`OXIBELT_TARGET_DIR=/tmp/rust/target`. Run Cargo through the privileged channel.
 Use `scripts/with-local-docker.sh` for owned Docker state below `/tmp`; minikube tests
 create and remove their own profile rather than modify an existing operator profile.
 See [Chromium acquisition and research](chromium.md) for source and proof boundaries.

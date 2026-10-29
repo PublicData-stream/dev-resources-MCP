@@ -9,8 +9,7 @@ use crate::{
 };
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha1::{Digest, Sha1};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -245,6 +244,35 @@ impl WhatwgGit {
         }
         Ok(paths.into_iter().collect())
     }
+    /// Bind retained evidence paths without creating a Git repository or artifacts.
+    pub(crate) fn for_verification(
+        root: &Path,
+        repo: Repo,
+        max_git_bytes: u64,
+        min_free_bytes: u64,
+    ) -> Result<Self> {
+        if !(1024 * 1024..=128 * 1024 * 1024 * 1024).contains(&max_git_bytes) {
+            return Err(Error::invalid("Invalid WHATWG Git storage budget."));
+        }
+        Repo::new(&repo.as_str())?;
+        let root = root
+            .join("whatwg")
+            .join("git")
+            .join(&repo.owner)
+            .join(&repo.name);
+        let artifacts = Arc::new(BulkArtifactStore::for_verification(
+            root.join("artifacts"),
+            min_free_bytes,
+        )?);
+        Ok(Self {
+            root,
+            repo,
+            artifacts,
+            max_git_bytes,
+            min_free_bytes,
+            gate: Arc::new(Mutex::new(())),
+        })
+    }
     pub fn new(
         root: &Path,
         repo: Repo,
@@ -280,6 +308,7 @@ impl WhatwgGit {
     /// Attach the WHATWG raw-object store's combined quota during fenced startup,
     /// before this Git adapter or its artifact store has been cloned or used.
     pub fn with_shared_budget(mut self, budget: &BulkArtifactStore) -> Result<Self> {
+        self.artifacts.require_writable()?;
         if Arc::strong_count(&self.artifacts) != 1 {
             return Err(Error::integrity(
                 "WHATWG shared budget must attach before cloning the artifact store.",
@@ -313,6 +342,7 @@ impl WhatwgGit {
         run_command(command, max, cancel, deadline).await
     }
     async fn initialize(&self, cancel: &CancellationToken, deadline: Instant) -> Result<()> {
+        self.artifacts.require_writable()?;
         let marker = self.root.join("owner-v1");
         let expected = format!("devres-whatwg-{}-v1\n", self.repo.as_str());
         let exists = tokio::fs::try_exists(self.repository())
@@ -920,19 +950,29 @@ impl WhatwgGit {
             }
             let target = root.join(&pack.name);
             match tokio::fs::hard_link(
-                self.artifacts.root().join(&pack.artifact.body_hash),
+                self.artifacts.root().join(&pack.artifact.relative_path),
                 &target,
             )
             .await
             {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if self
+                    let actual = self
                         .artifacts
                         .ingest_file(&target, bulk::MAX_ARTIFACT_BYTES, cancel.clone())
-                        .await?
-                        != pack.artifact
-                    {
+                        .await?;
+                    let matches = if pack.artifact.body_hash.starts_with("blake3:") {
+                        actual == pack.artifact
+                    } else {
+                        actual.bytes == pack.artifact.bytes
+                            && crate::integrity::verify_legacy_digest(
+                                &self.artifacts.root().join(&pack.artifact.relative_path),
+                                &actual.body_hash,
+                                actual.bytes,
+                            )
+                            .is_ok()
+                    };
+                    if !matches {
                         return Err(Error::integrity(
                             "WHATWG working pack differs from retained evidence.",
                         ));
@@ -1270,7 +1310,7 @@ impl WhatwgGit {
         let mut child = ManagedChild::spawn(command)?;
         let result = async {
             let mut reader = child.child.stdout.take().ok_or_else(failure)?;
-            let mut digest = Sha256::new();
+            let mut digest = blake3::Hasher::new();
             let mut git_hash = Sha1::new();
             git_hash.update(format!("blob {total}\0").as_bytes());
             let mut position = 0u64;
@@ -1313,7 +1353,7 @@ impl WhatwgGit {
             Ok(BlobPage {
                 bytes,
                 total_bytes: total,
-                body_hash: hex::encode(digest.finalize()),
+                body_hash: format!("blake3:{}", digest.finalize().to_hex()),
             })
         }
         .await;
@@ -1382,7 +1422,7 @@ fn encoded_path(bytes: &[u8]) -> (String, Option<String>) {
         return (path.into(), None);
     }
     (
-        format!("@unsupported-path/{}", hex::encode(Sha256::digest(bytes))),
+        format!("@unsupported-path/{}", crate::integrity::hash(bytes)),
         Some(hex::encode(bytes)),
     )
 }
@@ -1487,6 +1527,105 @@ fn recover_locks(repository: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+impl WhatwgGit {
+    /// Derive a new service-owned manifest without changing retained upstream
+    /// Git objects, refs, observation time or the exact original manifest bytes.
+    pub async fn migrate_blake3_manifest(
+        &self,
+        original: &BulkArtifact,
+        mappings: &mut std::collections::BTreeMap<String, String>,
+        cancel: CancellationToken,
+    ) -> Result<BulkArtifact> {
+        let mut manifest = self.read_manifest(original, cancel.clone()).await?;
+        let rewrite = |artifact: &mut BulkArtifact| -> Result<()> {
+            if artifact.body_hash.starts_with("blake3:") {
+                return Ok(());
+            }
+            artifact.body_hash =
+                crate::integrity::migration_lookup(mappings, "body", &artifact.body_hash)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::integrity("Retained Git manifest body is not qualified.")
+                    })?;
+            artifact.relative_path = crate::integrity::relative_path(&artifact.body_hash)?
+                .to_string_lossy()
+                .into_owned();
+            Ok(())
+        };
+        rewrite(&mut manifest.commits)?;
+        for pack in &mut manifest.packs {
+            rewrite(&mut pack.artifact)?;
+        }
+
+        let bytes = serde_json::to_vec(&manifest)
+            .map_err(|_| Error::integrity("Invalid canonical Git manifest."))?;
+        if bytes.len() > MAX_MANIFEST {
+            return Err(Error::capacity(
+                "Canonical Git manifest exceeds its byte bound.",
+            ));
+        }
+        let canonical = self.artifacts.capture_bytes(bytes, cancel.clone()).await?;
+        self.verify_retained_manifest(&canonical, cancel).await?;
+        let role = "whatwg:manifest";
+        if crate::integrity::migration_lookup(mappings, role, &original.body_hash)
+            .is_some_and(|existing| existing != &canonical.body_hash)
+        {
+            return Err(Error::integrity(
+                "Conflicting canonical Git manifest mapping.",
+            ));
+        }
+        crate::migration_map::insert(
+            mappings,
+            format!("{role}:{}", original.body_hash),
+            canonical.body_hash.clone(),
+        )?;
+        crate::migration_map::insert(
+            mappings,
+            format!("whatwg:manifest-descriptor:{}", original.body_hash),
+            serde_json::to_string(&canonical)
+                .map_err(|_| Error::integrity("Invalid canonical manifest descriptor."))?,
+        )?;
+        Ok(canonical)
+    }
+}
+
+impl WhatwgGit {
+    pub async fn verify_retained_manifest(
+        &self,
+        artifact: &BulkArtifact,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let manifest = self.read_manifest(artifact, cancel.clone()).await?;
+        let actual = self
+            .artifacts
+            .verify(&manifest.commits.body_hash, MAX_ORDER, cancel.clone())
+            .await?;
+        if actual != manifest.commits {
+            return Err(Error::integrity(
+                "Retained Git commit-order metadata mismatch.",
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for pack in manifest.packs {
+            if !valid_pack_name(&pack.name) || !names.insert(pack.name) {
+                return Err(Error::integrity("Invalid retained Git pack name."));
+            }
+            let actual = self
+                .artifacts
+                .verify(
+                    &pack.artifact.body_hash,
+                    bulk::MAX_ARTIFACT_BYTES,
+                    cancel.clone(),
+                )
+                .await?;
+            if actual != pack.artifact {
+                return Err(Error::integrity("Retained Git pack metadata mismatch."));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1819,7 +1958,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(page.bytes, b"eco");
         assert_eq!(page.total_bytes, 7);
-        assert_eq!(page.body_hash, hex::encode(Sha256::digest(b"second\n")));
+        assert_eq!(page.body_hash, crate::integrity::hash(b"second\n"));
         source
             .run(
                 &["update-ref", "-d", "refs/heads/side"],

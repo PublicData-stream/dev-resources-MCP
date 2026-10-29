@@ -58,6 +58,8 @@ pub struct MdnCorpus {
 
 #[path = "corpus/buffer.rs"]
 mod buffer;
+#[path = "corpus/migration.rs"]
+pub(crate) mod migration;
 
 #[cfg(test)]
 #[path = "corpus/tests.rs"]
@@ -102,7 +104,7 @@ fn work_key(repo: Repo, rev: &str) -> String {
     format!("work:{}:{rev}:{PROCESSOR_VERSION}", repo.as_str())
 }
 fn observation_key(o: &Observation) -> String {
-    format!("{}:{}", o.repo.as_str(), o.manifest.body_hash)
+    inventory::digest(format!("{}:{}", o.repo.as_str(), o.manifest.body_hash).as_bytes())
 }
 async fn admitted_index(
     mut document: IndexDocument,
@@ -130,6 +132,45 @@ async fn admitted_index(
     }
 }
 impl MdnCorpus {
+    /// Construct frozen-graph verification handles without initializing storage.
+    pub(crate) fn for_verification(
+        store: Arc<dyn MdnStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: MdnConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let raw = Arc::new(BulkArtifactStore::for_verification(
+            root.join("mdn/raw-artifacts"),
+            config.min_free_bytes,
+        )?);
+        let content = Arc::new(MdnGit::for_verification(
+            root,
+            Repo::Content,
+            config.max_git_bytes,
+            config.min_free_bytes,
+        )?);
+        let compat = Arc::new(MdnGit::for_verification(
+            root,
+            Repo::Compat,
+            config.max_git_bytes,
+            config.min_free_bytes,
+        )?);
+        let research = Arc::new(MdnResearch::for_verification(store.clone(), root)?);
+        let processors = Arc::new(Semaphore::new(config.max_processing_workers));
+        Ok(Self {
+            store,
+            broker,
+            config,
+            content,
+            compat,
+            raw,
+            index: MdnIndex::for_verification(root)?,
+            research,
+            processing: Mutex::new(()),
+            processors,
+        })
+    }
     pub fn new(
         store: Arc<dyn MdnStore>,
         broker: Arc<BulkBroker>,
@@ -295,7 +336,10 @@ impl MdnCorpus {
             .await
     }
     async fn register_dependent(&self, dependency: &str, path: &str) -> Result<()> {
-        let key = format!("dependents:{}", inventory::digest(dependency.as_bytes()));
+        let key = format!(
+            "dependents:{}",
+            crate::integrity::legacy_hash(dependency.as_bytes())
+        );
         let mut paths: BTreeSet<String> = self
             .store
             .mdn_state(&key)
@@ -803,7 +847,8 @@ impl MdnCorpus {
                     .await?;
                 let artifact = self.raw.capture_bytes(body.clone(), cancel.clone()).await?;
                 raw = encoded(&artifact)?;
-                raw["relative_path"] = json!(format!("mdn/raw-artifacts/{}", artifact.body_hash));
+                raw["relative_path"] =
+                    json!(format!("mdn/raw-artifacts/{}", artifact.relative_path));
                 raw["source_path"] = json!(entry.path);
                 member.raw = Some(raw.clone());
                 if article {

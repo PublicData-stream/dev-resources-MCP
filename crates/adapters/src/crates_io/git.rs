@@ -445,7 +445,7 @@ impl GitRegistry {
             if verified != entry.artifact {
                 return Err(Error::integrity("Registry Git artifact metadata mismatch."));
             }
-            let source = artifacts.root().join(&entry.artifact.body_hash);
+            let source = artifacts.root().join(&entry.artifact.relative_path);
             let destination = pack_root.join(&entry.name);
             match tokio::fs::hard_link(source, &destination).await {
                 Ok(()) => {}

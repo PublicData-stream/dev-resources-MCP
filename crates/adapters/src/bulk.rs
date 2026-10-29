@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -780,17 +781,22 @@ pub struct BulkArtifact {
 }
 pub struct BulkArtifactStore {
     root: PathBuf,
+    verification_only: bool,
     min_free_bytes: u64,
     quota: Option<Quota>,
 }
+type PhysicalObjects = std::collections::BTreeSet<(u64, u64)>;
+type PhysicalRegistry = Arc<std::sync::Mutex<PhysicalObjects>>;
 #[derive(Clone)]
 struct Quota {
     used: Arc<AtomicU64>,
     limit: u64,
     roots: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
+    objects: PhysicalRegistry,
 }
 pub struct ArtifactReservation {
     used: Option<Arc<AtomicU64>>,
+    objects: Option<PhysicalRegistry>,
     bytes: u64,
     retained: bool,
 }
@@ -810,6 +816,22 @@ impl ArtifactReservation {
     pub fn retain(mut self) {
         self.retained = true;
     }
+    /// Register the newly published physical object for cross-root hard-link accounting.
+    pub fn retain_at(mut self, path: &Path) -> Result<()> {
+        // A failed bookkeeping check must not release bytes already published on disk.
+        self.retained = true;
+        if let Some(objects) = &self.objects {
+            let metadata = std::fs::symlink_metadata(path).map_err(|_| storage_error())?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(Error::integrity("Invalid retained artifact."));
+            }
+            objects
+                .lock()
+                .map_err(|_| storage_error())?
+                .insert((metadata.dev(), metadata.ino()));
+        }
+        Ok(())
+    }
 }
 impl Drop for ArtifactReservation {
     fn drop(&mut self) {
@@ -827,11 +849,9 @@ impl Drop for Stage {
     }
 }
 pub(crate) fn valid_hash(hash: &str) -> bool {
-    hash.len() == 64
-        && hash
-            .bytes()
-            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+    crate::integrity::valid_hash(hash)
 }
+
 impl BulkArtifactStore {
     /// The caller must already hold the database's exclusive storage fence.
     pub fn new(root: impl AsRef<Path>, min_free_bytes: u64) -> Result<Self> {
@@ -844,9 +864,31 @@ impl BulkArtifactStore {
         }
         Ok(Self {
             root: std::fs::canonicalize(root).map_err(|_| storage_error())?,
+            verification_only: false,
             min_free_bytes,
             quota: None,
         })
+    }
+    /// Bind an expected archive path without initializing, recovering, or scanning it.
+    /// Verification validates referenced objects when they are read.
+    pub(crate) fn for_verification(root: impl AsRef<Path>, min_free_bytes: u64) -> Result<Self> {
+        if min_free_bytes < 64 * 1024 * 1024 {
+            return Err(Error::invalid("Invalid bulk storage headroom."));
+        }
+        Ok(Self {
+            root: root.as_ref().to_owned(),
+            verification_only: true,
+            min_free_bytes,
+            quota: None,
+        })
+    }
+    pub(crate) fn require_writable(&self) -> Result<()> {
+        if self.verification_only {
+            return Err(Error::integrity(
+                "Verification archive handles are read-only.",
+            ));
+        }
+        Ok(())
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -854,6 +896,7 @@ impl BulkArtifactStore {
     /// Counts existing hash-named immutable objects; concurrent bulk stages reserve
     /// quota before writes. Ordinary publishers must share this store's accounting.
     pub fn with_quota(mut self, max_bytes: Option<u64>) -> Result<Self> {
+        self.require_writable()?;
         let Some(limit) = max_bytes else {
             self.quota = None;
             return Ok(self);
@@ -861,10 +904,11 @@ impl BulkArtifactStore {
         if limit == 0 {
             return Err(Error::invalid("Artifact quota must be positive."));
         }
-        let used = retained_bytes(&self.root)?;
+        let (used, objects) = retained_bytes(&self.root, &std::collections::BTreeSet::new())?;
         self.quota = Some(Quota {
             used: Arc::new(AtomicU64::new(used)),
             limit,
+            objects: Arc::new(std::sync::Mutex::new(objects)),
             roots: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::from([
                 self.root.clone(),
             ]))),
@@ -876,6 +920,7 @@ impl BulkArtifactStore {
     /// including when another handle is reconstructed for an already attached root.
     /// All publishers into those directories must use this shared budget.
     pub fn with_shared_budget(mut self, other: &Self) -> Result<Self> {
+        self.require_writable()?;
         let Some(quota) = &other.quota else {
             self.quota = None;
             return Ok(self);
@@ -883,13 +928,15 @@ impl BulkArtifactStore {
         {
             let mut roots = quota.roots.lock().map_err(|_| storage_error())?;
             if !roots.contains(&self.root) {
-                let bytes = retained_bytes(&self.root)?;
+                let mut objects = quota.objects.lock().map_err(|_| storage_error())?;
+                let (bytes, additions) = retained_bytes(&self.root, &objects)?;
                 quota
                     .used
                     .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                         used.checked_add(bytes)
                     })
                     .map_err(|_| Error::capacity("Artifact quota accounting overflow."))?;
+                objects.extend(additions);
                 roots.insert(self.root.clone());
             }
         }
@@ -907,8 +954,10 @@ impl BulkArtifactStore {
     /// The ordinary small-blob publisher can share the same accounting. Dropping
     /// an unretained reservation rolls back staging/duplicate charges.
     pub fn reserve_bytes(&self, bytes: u64) -> Result<ArtifactReservation> {
+        self.require_writable()?;
         let mut reservation = ArtifactReservation {
             used: self.quota.as_ref().map(|quota| quota.used.clone()),
+            objects: self.quota.as_ref().map(|quota| quota.objects.clone()),
             bytes: 0,
             retained: false,
         };
@@ -920,6 +969,7 @@ impl BulkArtifactStore {
     }
     /// Only recognized abandoned regular staging files are disposable.
     pub async fn recover_stages(&self) -> Result<()> {
+        self.require_writable()?;
         let mut entries = tokio::fs::read_dir(&self.root)
             .await
             .map_err(|_| storage_error())?;
@@ -1024,7 +1074,8 @@ impl BulkArtifactStore {
         max_bytes: u64,
         shutdown: CancellationToken,
     ) -> Result<BulkArtifact> {
-        if expected_hash.is_some_and(|hash| !valid_hash(hash)) {
+        self.require_writable()?;
+        if expected_hash.is_some_and(|hash| !valid_hash(hash) || hash.starts_with("blake3:")) {
             return Err(Error::invalid("Invalid expected artifact checksum."));
         }
         let path = self.root.join(format!(
@@ -1039,7 +1090,8 @@ impl BulkArtifactStore {
             .open(&path)
             .await
             .map_err(|_| storage_error())?;
-        let mut hash = Sha256::new();
+        let mut upstream_hash = Sha256::new();
+        let mut hash = blake3::Hasher::new();
         let mut bytes = 0_u64;
         let mut reservation = self.reserve_bytes(0)?;
         loop {
@@ -1067,10 +1119,12 @@ impl BulkArtifactStore {
                 self.quota.as_ref().map_or(u64::MAX, |quota| quota.limit),
             )?;
             tokio::select! { biased; _ = shutdown.cancelled() => return Err(Error::unavailable("Bulk artifact publication canceled.")), result = file.write_all(&chunk) => result.map_err(|_| storage_error())? }
+            upstream_hash.update(&chunk);
             hash.update(&chunk);
         }
-        let body_hash = hex::encode(hash.finalize());
-        if expected_hash.is_some_and(|expected| expected != body_hash) {
+        let body_hash = format!("blake3:{}", hash.finalize().to_hex());
+        let upstream_hash = hex::encode(upstream_hash.finalize());
+        if expected_hash.is_some_and(|expected| expected != upstream_hash) {
             return Err(Error::integrity("Bulk artifact checksum mismatch."));
         }
         file.sync_all().await.map_err(|_| storage_error())?;
@@ -1078,7 +1132,10 @@ impl BulkArtifactStore {
         if shutdown.is_cancelled() {
             return Err(Error::unavailable("Bulk artifact publication canceled."));
         }
-        let destination = self.root.join(&body_hash);
+        let relative_path = crate::integrity::relative_path(&body_hash)?;
+        let destination = self.root.join(&relative_path);
+        let destination_directory = destination.parent().ok_or_else(storage_error)?.to_owned();
+        crate::integrity::ensure_directory(&destination_directory).await?;
         // The filesystem operation and quota ownership transition must have one
         // owner even if its async waiter is canceled after link creation.
         let stage_path = stage.0.clone();
@@ -1092,9 +1149,17 @@ impl BulkArtifactStore {
                 return Err(Error::integrity("Immutable artifact length mismatch."));
             }
         }
-        sync_directory(&self.root).await?;
+        sync_directory(&destination_directory).await?;
+        let root = self.root.clone();
+        let published_path = self.root.join(&relative_path);
+        let published_digest = body_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::integrity::record_file(&root, &published_path, &published_digest, bytes)
+        })
+        .await
+        .map_err(|_| storage_error())??;
         Ok(BulkArtifact {
-            relative_path: body_hash.clone(),
+            relative_path: relative_path.to_string_lossy().into_owned(),
             body_hash,
             bytes,
         })
@@ -1108,7 +1173,15 @@ impl BulkArtifactStore {
         if !valid_hash(hash) {
             return Err(Error::invalid("Invalid artifact hash."));
         }
-        let path = self.root.join(hash);
+        if self.verification_only {
+            let metadata = tokio::fs::symlink_metadata(&self.root)
+                .await
+                .map_err(|_| storage_error())?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(Error::integrity("Invalid bulk archive directory."));
+            }
+        }
+        let path = self.root.join(crate::integrity::relative_path(hash)?);
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|_| storage_error())?;
@@ -1118,7 +1191,8 @@ impl BulkArtifactStore {
         let mut file = tokio::fs::File::open(path)
             .await
             .map_err(|_| storage_error())?;
-        let mut digest = Sha256::new();
+        let mut legacy_digest = Sha256::new();
+        let mut digest = blake3::Hasher::new();
         let mut length = 0_u64;
         let mut chunk = vec![0; CHUNK_BYTES];
         loop {
@@ -1130,14 +1204,26 @@ impl BulkArtifactStore {
                 .checked_add(count as u64)
                 .filter(|bytes| *bytes <= max_bytes)
                 .ok_or_else(|| Error::integrity("Retained artifact grew beyond its budget."))?;
+            legacy_digest.update(&chunk[..count]);
             digest.update(&chunk[..count]);
         }
-        if length != metadata.len() || hex::encode(digest.finalize()) != hash {
+        let computed_b3 = format!("blake3:{}", digest.finalize().to_hex());
+        let actual = if hash.starts_with("blake3:") {
+            computed_b3.clone()
+        } else {
+            hex::encode(legacy_digest.finalize())
+        };
+        if length != metadata.len() || actual != hash {
             return Err(Error::integrity("Retained artifact checksum mismatch."));
+        }
+        if !hash.starts_with("blake3:") {
+            crate::integrity::verify_legacy_digest(&self.root.join(hash), &computed_b3, length)?;
         }
         Ok(BulkArtifact {
             body_hash: hash.into(),
-            relative_path: hash.into(),
+            relative_path: crate::integrity::relative_path(hash)?
+                .to_string_lossy()
+                .into_owned(),
             bytes: length,
         })
     }
@@ -1148,29 +1234,56 @@ impl BulkArtifactStore {
         shutdown: CancellationToken,
     ) -> Result<tokio::fs::File> {
         self.verify(hash, max_bytes, shutdown).await?;
-        tokio::fs::File::open(self.root.join(hash))
+        tokio::fs::File::open(self.root.join(crate::integrity::relative_path(hash)?))
             .await
             .map_err(|_| storage_error())
     }
 }
-fn retained_bytes(root: &Path) -> Result<u64> {
-    let mut used = 0_u64;
-    for entry in std::fs::read_dir(root).map_err(|_| storage_error())? {
-        let entry = entry.map_err(|_| storage_error())?;
-        if !valid_hash(&entry.file_name().to_string_lossy()) {
-            continue;
+fn retained_bytes(root: &Path, known: &PhysicalObjects) -> Result<(u64, PhysicalObjects)> {
+    fn scan(
+        root: &Path,
+        canonical: bool,
+        known: &PhysicalObjects,
+        additions: &mut PhysicalObjects,
+    ) -> Result<u64> {
+        let mut used = 0_u64;
+        for entry in std::fs::read_dir(root).map_err(|_| storage_error())? {
+            let entry = entry.map_err(|_| storage_error())?;
+            if entry.file_name() == "blake3" {
+                let kind = entry.file_type().map_err(|_| storage_error())?;
+                if canonical || !kind.is_dir() || kind.is_symlink() {
+                    return Err(Error::integrity("Invalid BLAKE3 artifact directory."));
+                }
+                used = used
+                    .checked_add(scan(&entry.path(), true, known, additions)?)
+                    .ok_or_else(|| Error::capacity("Artifact quota accounting overflow."))?;
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !valid_hash(&name) || name.starts_with("blake3:") {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| storage_error())?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(Error::integrity(
+                    "Invalid immutable artifact filesystem member.",
+                ));
+            }
+            let identity = (metadata.dev(), metadata.ino());
+            if !known.contains(&identity) && additions.insert(identity) {
+                used = used
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| Error::capacity("Artifact quota accounting overflow."))?;
+            }
         }
-        if !entry.file_type().map_err(|_| storage_error())?.is_file() {
-            return Err(Error::integrity(
-                "Invalid immutable artifact filesystem member.",
-            ));
-        }
-        used = used
-            .checked_add(entry.metadata().map_err(|_| storage_error())?.len())
-            .ok_or_else(|| Error::capacity("Artifact quota accounting overflow."))?;
+        Ok(used)
     }
-    Ok(used)
+    let mut additions = PhysicalObjects::new();
+    let bytes = scan(root, false, known, &mut additions)?;
+    Ok((bytes, additions))
 }
+
 fn storage_error() -> Error {
     Error::unavailable("Bulk artifact storage unavailable.")
 }
@@ -1179,9 +1292,9 @@ fn retain_link(
     destination: PathBuf,
     reservation: ArtifactReservation,
 ) -> Result<bool> {
-    match std::fs::hard_link(stage, destination) {
+    match std::fs::hard_link(stage, &destination) {
         Ok(()) => {
-            reservation.retain();
+            reservation.retain_at(&destination)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -1352,8 +1465,13 @@ mod tests {
                 .is_err()
         );
         let files: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
-        assert_eq!(files.len(), 1);
-        tokio::fs::write(root.path().join(&artifact.body_hash), b"corrupt")
+        assert_eq!(files.len(), 2);
+        crate::integrity::verify_legacy_file(
+            &root.path().join(&artifact.relative_path),
+            std::time::Instant::now() + Duration::from_secs(15),
+        )
+        .unwrap();
+        tokio::fs::write(root.path().join(&artifact.relative_path), b"corrupt")
             .await
             .unwrap();
         assert!(
@@ -1363,6 +1481,126 @@ mod tests {
                 .is_err()
         );
     }
+    #[tokio::test]
+    async fn migrated_hard_links_are_charged_once_across_roots_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let first_root = root.path().join("first");
+        let second_root = root.path().join("second");
+        let third_root = root.path().join("third");
+        for directory in [&first_root, &second_root, &third_root] {
+            crate::integrity::ensure_directory(directory).await.unwrap();
+        }
+        let body = vec![17; 64];
+        let first = BulkArtifactStore::new(&first_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(128))
+            .unwrap();
+        let artifact = first
+            .capture_bytes(body.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let canonical = first_root.join(&artifact.relative_path);
+        let legacy = first_root.join(crate::integrity::legacy_hash(&body));
+        std::fs::hard_link(&canonical, &legacy).unwrap();
+        let second_path = second_root.join(&artifact.relative_path);
+        crate::integrity::ensure_directory(second_path.parent().unwrap())
+            .await
+            .unwrap();
+        std::fs::hard_link(&canonical, &second_path).unwrap();
+        let second = BulkArtifactStore::new(&second_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&first)
+            .unwrap();
+        assert_eq!(second.accounted_bytes(), Some(64));
+        let restarted = BulkArtifactStore::new(&first_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(128))
+            .unwrap();
+        let second = BulkArtifactStore::new(&second_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&restarted)
+            .unwrap();
+        assert_eq!(second.accounted_bytes(), Some(64));
+        // Equal bytes in a separate inode still consume storage and quota.
+        std::fs::write(third_root.join(crate::integrity::legacy_hash(&body)), &body).unwrap();
+        let third = BulkArtifactStore::new(&third_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&restarted)
+            .unwrap();
+        assert_eq!(third.accounted_bytes(), Some(128));
+        assert!(
+            third
+                .capture_bytes(vec![18; 1], CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(legacy.exists() && canonical.exists() && second_path.exists());
+    }
+
+    #[tokio::test]
+    async fn streaming_blake3_storage_keeps_registry_sha256_and_legacy_verification_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BulkArtifactStore::new(root.path(), 64 * 1024 * 1024).unwrap();
+        let body = vec![29; 3 * CHUNK_BYTES + 19];
+        let sha = crate::integrity::legacy_hash(&body);
+        let chunks: Vec<_> = body
+            .chunks(CHUNK_BYTES)
+            .map(|chunk| Ok(chunk.to_vec()))
+            .collect();
+        let response = BulkResponse {
+            status: 200,
+            validators: Validators::default(),
+            content_length: Some(body.len() as u64),
+            next_page: None,
+            retry_at: None,
+            stream: Box::pin(futures::stream::iter(chunks)),
+        };
+        let artifact = store
+            .capture(response, Some(&sha), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(artifact.body_hash, crate::integrity::hash(&body));
+        assert!(artifact.relative_path.starts_with("blake3/"));
+        let legacy = root.path().join(&sha);
+        std::fs::hard_link(root.path().join(&artifact.relative_path), &legacy).unwrap();
+        assert!(
+            store
+                .verify(&sha, body.len() as u64, CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let evidence = crate::integrity::FileEvidence {
+            version: 1,
+            path: sha.clone(),
+            bytes: body.len() as u64,
+            digest: artifact.body_hash.clone(),
+        };
+        let descriptor = crate::integrity::evidence_path(root.path(), &legacy).unwrap();
+        crate::integrity::ensure_directory(descriptor.parent().unwrap())
+            .await
+            .unwrap();
+        std::fs::write(&descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        assert_eq!(
+            store
+                .verify(&sha, body.len() as u64, CancellationToken::new())
+                .await
+                .unwrap()
+                .bytes,
+            body.len() as u64
+        );
+        let wrong = crate::integrity::FileEvidence {
+            digest: crate::integrity::hash(b"different"),
+            ..evidence
+        };
+        std::fs::write(&descriptor, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(
+            store
+                .verify(&sha, body.len() as u64, CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn foreground_and_background_share_one_provider_clock() {
         let broker = BulkBroker::new(BulkConfig::default()).unwrap();
@@ -1558,7 +1796,7 @@ mod tests {
         assert_eq!(store.accounted_bytes(), Some(164));
         drop(reservation);
         assert_eq!(store.accounted_bytes(), Some(64));
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
     }
     #[tokio::test]
     async fn shared_quota_counts_three_roots_once_and_recovers_after_restart() {
@@ -1872,3 +2110,7 @@ mod w3c_policy_tests {
         assert_eq!(broker.attempt_count(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "bulk_verification_tests.rs"]
+mod verification_tests;

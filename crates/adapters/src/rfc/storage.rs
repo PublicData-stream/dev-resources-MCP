@@ -1,5 +1,5 @@
 //! Owner-fenced durable RFC jobs, immutable projections, and snapshot manifests.
-use super::{PgBlobStore, storage_error, valid_hash};
+use super::{PgBlobStore, payload_integrity, storage_error, valid_hash};
 use async_trait::async_trait;
 use devres_application::corpus::{Dataset, Document, Job, JobSpec, RfcCorpusStore, Snapshot};
 use devres_domain::{Capture, Error, Result};
@@ -135,12 +135,14 @@ impl RfcCorpusStore for PgBlobStore {
         owner.ping().await.map_err(|_| storage_error())?;
         check_capture(&mut owner, &dataset.capture).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let saved: Option<String> = sqlx::query_scalar("INSERT INTO devres_rfc_datasets(kind,capture_id,data) VALUES($1,$2,$3) ON CONFLICT(kind,capture_id) DO UPDATE SET capture_id=EXCLUDED.capture_id WHERE devres_rfc_datasets.data->'records'=EXCLUDED.data->'records' RETURNING capture_id")
-            .bind(kind).bind(&dataset.capture.id).bind(Json(&value))
+        let saved: Option<String> = sqlx::query_scalar("INSERT INTO devres_rfc_datasets(kind,capture_id,data,data_integrity) VALUES($1,$2,$3,$4) ON CONFLICT(kind,capture_id) DO UPDATE SET capture_id=EXCLUDED.capture_id WHERE devres_rfc_datasets.data->'records'=EXCLUDED.data->'records' RETURNING capture_id")
+            .bind(kind).bind(&dataset.capture.id).bind(Json(&value)).bind(payload_integrity::digest("devres_rfc_datasets",kind,&dataset.capture.id,&value)?)
             .fetch_optional(&mut *tx).await.map_err(|_| storage_error())?;
         if saved.is_none() {
             return Err(Error::integrity("Immutable RFC dataset cannot be replaced"));
         }
+        let retained=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(&dataset.capture.id).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
+        payload_integrity::row("devres_rfc_datasets", &retained)?;
         sqlx::query("INSERT INTO devres_rfc_dataset_heads(kind,capture_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM devres_heads WHERE source_key=$3 AND capture_id=$2) ON CONFLICT(kind) DO UPDATE SET capture_id=EXCLUDED.capture_id")
             .bind(kind).bind(&dataset.capture.id).bind(expected_key).execute(&mut *tx).await.map_err(|_| storage_error())?;
         tx.commit().await.map_err(|_| storage_error())
@@ -152,10 +154,10 @@ impl RfcCorpusStore for PgBlobStore {
             return Err(Error::invalid("Invalid RFC dataset capture"));
         }
         self.fence().await?;
-        let row = sqlx::query("SELECT d.data,COALESCE((SELECT MAX(validated_at) FROM devres_observations WHERE capture_id=d.capture_id),c.retrieved_at) AS validated_at FROM devres_rfc_datasets d JOIN devres_captures c ON c.id=d.capture_id WHERE d.kind=$1 AND d.capture_id=COALESCE($2,(SELECT capture_id FROM devres_rfc_dataset_heads WHERE kind=$1))")
+        let row = sqlx::query("SELECT d.kind,d.capture_id AS key,d.data,d.data_integrity,COALESCE((SELECT MAX(validated_at) FROM devres_observations WHERE capture_id=d.capture_id),c.retrieved_at) AS validated_at FROM devres_rfc_datasets d JOIN devres_captures c ON c.id=d.capture_id WHERE d.kind=$1 AND d.capture_id=COALESCE($2,(SELECT capture_id FROM devres_rfc_dataset_heads WHERE kind=$1))")
             .bind(kind).bind(capture).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
         row.map(|row| {
-            let Json(value): Json<Value> = row.try_get("data").map_err(|_| storage_error())?;
+            let value = payload_integrity::row("devres_rfc_datasets", &row)?;
             let mut dataset: Dataset = decode(value)?;
             dataset.capture.validated_at =
                 row.try_get("validated_at").map_err(|_| storage_error())?;
@@ -239,9 +241,15 @@ impl RfcCorpusStore for PgBlobStore {
                 ));
             }
         }
-        let result = sqlx::query("UPDATE devres_rfc_jobs SET status=CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'captured' END,capture_id=COALESCE($2,capture_id),capture_metadata=COALESCE($3,capture_metadata),last_error=$4,due_at=$5 WHERE source_key=$1 AND ($2::text IS NULL OR source_url=$6)")
+        let integrity = value
+            .as_ref()
+            .map(|value| {
+                payload_integrity::digest("devres_rfc_jobs", "capture_metadata", key, value)
+            })
+            .transpose()?;
+        let result = sqlx::query("UPDATE devres_rfc_jobs SET status=CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'captured' END,capture_id=COALESCE($2,capture_id),capture_metadata=COALESCE($3,capture_metadata),capture_metadata_integrity=COALESCE($7,capture_metadata_integrity),last_error=$4,due_at=$5 WHERE source_key=$1 AND ($2::text IS NULL OR source_url=$6)")
             .bind(key).bind(capture.map(|capture| capture.id.as_str())).bind(value.map(Json))
-            .bind(error).bind(next_due).bind(capture.map(|capture| capture.source_url.as_str()))
+            .bind(error).bind(next_due).bind(capture.map(|capture| capture.source_url.as_str())).bind(integrity)
             .execute(&mut *owner).await.map_err(|_| storage_error())?;
         if result.rows_affected() != 1 {
             return Err(Error::integrity(
@@ -253,7 +261,7 @@ impl RfcCorpusStore for PgBlobStore {
 
     async fn documents(&self) -> Result<Vec<Document>> {
         self.fence().await?;
-        let rows = sqlx::query("SELECT number,format,assurance,capture_metadata FROM devres_rfc_jobs WHERE capture_id IS NOT NULL ORDER BY number,format,assurance")
+        let rows = sqlx::query("SELECT source_key,number,format,assurance,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE capture_id IS NOT NULL ORDER BY number,format,assurance")
             .fetch_all(&self.pool).await.map_err(|_| storage_error())?;
         rows.into_iter()
             .map(|row| {
@@ -266,13 +274,34 @@ impl RfcCorpusStore for PgBlobStore {
                         .map_err(|_| Error::integrity("Invalid stored RFC number"))?,
                     format: row.try_get("format").map_err(|_| storage_error())?,
                     assurance: row.try_get("assurance").map_err(|_| storage_error())?,
-                    capture: decode(value)?,
+                    capture: decode(payload_integrity::checked(
+                        "devres_rfc_jobs",
+                        "capture_metadata",
+                        &row.try_get::<String, _>("source_key")
+                            .map_err(|_| storage_error())?,
+                        value,
+                        &row.try_get::<String, _>("capture_metadata_integrity")
+                            .map_err(|_| storage_error())?,
+                    )?)?,
                 })
             })
             .collect()
     }
 
     async fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        if !snapshot.id.starts_with("blake3:") {
+            let retained = RfcCorpusStore::snapshot(self, Some(&snapshot.id))
+                .await?
+                .ok_or_else(|| {
+                    Error::integrity("New RFC snapshots require tagged BLAKE3 identities.")
+                })?;
+            if encoded(&retained)? != encoded(snapshot)? {
+                return Err(Error::integrity(
+                    "Legacy RFC snapshot replay differs from retained evidence.",
+                ));
+            }
+            return Ok(());
+        }
         if !valid_hash(&snapshot.id)
             || !valid_hash(&snapshot.catalogue_capture)
             || snapshot
@@ -355,15 +384,45 @@ impl RfcCorpusStore for PgBlobStore {
                 "RFC snapshot references an absent dataset",
             ));
         }
-        let result: Option<String> = sqlx::query_scalar("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,created_at,complete,data) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id WHERE devres_rfc_snapshots.data=EXCLUDED.data RETURNING id")
+        for (kind, id) in [
+            ("catalogue", Some(&snapshot.catalogue_capture)),
+            ("errata", snapshot.errata_capture.as_ref()),
+        ] {
+            if let Some(id) = id {
+                let row=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(id).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
+                payload_integrity::row("devres_rfc_datasets", &row)?;
+            }
+        }
+        let order: i64 = sqlx::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('devres_rfc_snapshots','published_order'))",
+        )
+        .fetch_one(&mut *owner)
+        .await
+        .map_err(|_| storage_error())?;
+        let integrity = payload_integrity::digest(
+            "devres_rfc_snapshots",
+            "",
+            &snapshot.id,
+            &payload_integrity::rfc_snapshot_payload(
+                order,
+                snapshot.catalogue_capture.clone(),
+                snapshot.errata_capture.clone(),
+                snapshot.created_at,
+                snapshot.complete,
+                &value,
+            )?,
+        )?;
+        let result: Option<String> = sqlx::query_scalar("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,created_at,complete,data,data_integrity,published_order) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id WHERE devres_rfc_snapshots.data=EXCLUDED.data RETURNING id")
             .bind(&snapshot.id).bind(&snapshot.catalogue_capture).bind(&snapshot.errata_capture)
-            .bind(snapshot.created_at).bind(snapshot.complete).bind(Json(&value))
+            .bind(snapshot.created_at).bind(snapshot.complete).bind(Json(&value)).bind(integrity).bind(order)
             .fetch_optional(&mut *owner).await.map_err(|_| storage_error())?;
         if result.is_none() {
             return Err(Error::integrity(
                 "Immutable RFC snapshot cannot be replaced",
             ));
         }
+        let retained=sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id=$1").bind(&snapshot.id).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
+        payload_integrity::row("devres_rfc_snapshots", &retained)?;
         Ok(())
     }
 
@@ -372,9 +431,10 @@ impl RfcCorpusStore for PgBlobStore {
             return Err(Error::invalid("Invalid RFC snapshot identifier"));
         }
         self.fence().await?;
-        let row: Option<Json<Value>> = sqlx::query_scalar("SELECT data FROM devres_rfc_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY complete DESC,published_order DESC LIMIT 1")
+        let row = sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY complete DESC,published_order DESC LIMIT 1")
             .bind(id).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
-        row.map(|Json(value)| decode(value)).transpose()
+        row.map(|row| decode(payload_integrity::row("devres_rfc_snapshots", &row)?))
+            .transpose()
     }
 
     async fn status(&self) -> Result<Value> {
@@ -403,7 +463,7 @@ impl RfcCorpusStore for PgBlobStore {
             Ok(json!({"key":row.try_get::<String,_>("source_key").map_err(|_| storage_error())?,"error":row.try_get::<String,_>("last_error").map_err(|_| storage_error())?,"next_due":row.try_get::<i64,_>("due_at").map_err(|_| storage_error())?}))
         }).collect::<Result<Vec<_>>>()?;
         let latest = self.snapshot(None).await?;
-        let partial = sqlx::query("SELECT id,created_at,data->'coverage' AS coverage FROM devres_rfc_snapshots WHERE NOT complete ORDER BY published_order DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?.map(|row|Ok::<_,Error>(json!({"id":row.try_get::<String,_>("id").map_err(|_|storage_error())?,"created_at":row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?,"coverage":row.try_get::<Json<Value>,_>("coverage").map_err(|_|storage_error())?.0}))).transpose()?;
+        let partial = sqlx::query("SELECT published_order,catalogue_capture,errata_capture,complete,id,id AS key,''::text AS kind,created_at,data,data_integrity FROM devres_rfc_snapshots WHERE NOT complete ORDER BY published_order DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?.map(|row|Ok::<_,Error>(json!({"id":row.try_get::<String,_>("id").map_err(|_|storage_error())?,"created_at":row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?,"coverage":payload_integrity::row("devres_rfc_snapshots",&row)?["coverage"]}))).transpose()?;
         Ok(
             json!({"jobs":counts,"total_jobs":total_jobs,"captured_documents":captured_documents,"pending_documents":total_jobs-captured_documents,"outstanding_jobs":outstanding_jobs,"errors":errors,"latest_partial":partial,"snapshot":latest.map(|snapshot| json!({"id":snapshot.id,"complete":snapshot.complete,"created_at":snapshot.created_at,"coverage":snapshot.coverage}))}),
         )
@@ -487,5 +547,217 @@ mod tests {
         ] {
             assert!(imported_source(key, url).is_err());
         }
+    }
+}
+
+impl PgBlobStore {
+    /// Build canonical RFC generations from exact retained source/index evidence.
+    /// Publication pointers are staged; original rows and ordering remain untouched.
+    pub async fn migrate_rfc_graph(
+        &self,
+        mappings: &mut std::collections::BTreeMap<String, String>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<(String, String, String)>> {
+        self.fence().await?;
+        let mut aliases = Vec::new();
+        let mut after = (String::new(), String::new());
+        loop {
+            migration_cancel(&cancel)?;
+            let rows=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE capture_id NOT LIKE 'blake3:%' AND (kind,capture_id)>($1,$2) ORDER BY kind,capture_id LIMIT 1")
+                .bind(&after.0).bind(&after.1).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let kind: String = row.try_get("kind").map_err(|_| storage_error())?;
+                let old: String = row.try_get("key").map_err(|_| storage_error())?;
+                let mut dataset: Dataset =
+                    decode(payload_integrity::row("devres_rfc_datasets", &row)?)?;
+                migrate_rfc_capture(&mut dataset.capture, mappings)?;
+                self.save_dataset(&kind, &dataset).await?;
+                {
+                    let alias = (
+                        format!("dataset-{kind}"),
+                        old.clone(),
+                        dataset.capture.id.clone(),
+                    );
+                    crate::migration_map::reserve_alias(mappings, &alias)?;
+                    aliases.push(alias);
+                }
+                after = (kind, old);
+            }
+        }
+        let mut after = 0_i64;
+        loop {
+            migration_cancel(&cancel)?;
+            let found=sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%' AND published_order>$1 ORDER BY published_order LIMIT 1")
+                .bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some(found) = found else {
+                break;
+            };
+            let old: String = found.try_get("key").map_err(|_| storage_error())?;
+            let mut snapshot: Snapshot =
+                decode(payload_integrity::row("devres_rfc_snapshots", &found)?)?;
+            snapshot.catalogue_capture =
+                migration_reference(&snapshot.catalogue_capture, mappings)?;
+            snapshot.errata_capture = snapshot
+                .errata_capture
+                .as_deref()
+                .map(|id| migration_reference(id, mappings))
+                .transpose()?;
+            for document in snapshot
+                .documents
+                .iter_mut()
+                .chain(snapshot.search_documents.iter_mut())
+            {
+                migrate_rfc_capture(&mut document.capture, mappings)?;
+            }
+            let original_index = snapshot.index_path.take();
+            snapshot.id = String::new();
+            let identity =
+                serde_json::to_value(("devres:storage-migration:snapshot:v1", &old, &snapshot))
+                    .map_err(|_| storage_error())?;
+            let id = crate::integrity::canonical_hash(&identity)?;
+            snapshot.id = id.clone();
+            if let Some(path) = original_index {
+                snapshot.index_path = Some(
+                    crate::rfc::index::rebuild_frozen(
+                        self.root.clone(),
+                        path,
+                        id.clone(),
+                        cancel.child_token(),
+                    )
+                    .await?,
+                );
+            }
+            self.save_snapshot(&snapshot).await?;
+            if mappings
+                .get(&format!("rfc:snapshots:{old}"))
+                .is_some_and(|prior| prior != &id)
+            {
+                return Err(Error::integrity("Ambiguous RFC migration identity."));
+            }
+            crate::migration_map::insert(mappings, format!("rfc:snapshots:{old}"), id.clone())?;
+            {
+                let alias = ("snapshots".into(), old.clone(), id);
+                crate::migration_map::reserve_alias(mappings, &alias)?;
+                aliases.push(alias);
+            }
+            after = found
+                .try_get("published_order")
+                .map_err(|_| storage_error())?;
+        }
+        let heads: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind,capture_id FROM devres_rfc_dataset_heads ORDER BY kind")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| storage_error())?;
+        for (kind, capture) in heads {
+            let canonical = migration_reference(&capture, mappings)?;
+            payload_integrity::stage(
+                self,
+                "rfc",
+                &format!("dataset-head:{kind}"),
+                &json!({"kind":kind,"capture_id":canonical}),
+            )
+            .await?;
+        }
+        let mut after = String::new();
+        loop {
+            migration_cancel(&cancel)?;
+            let found=sqlx::query("SELECT source_key,capture_id,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE capture_metadata IS NOT NULL AND source_key>$1 ORDER BY source_key LIMIT 1")
+                .bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some(found) = found else {
+                break;
+            };
+            let key: String = found.try_get("source_key").map_err(|_| storage_error())?;
+            let data: Json<Value> = found
+                .try_get("capture_metadata")
+                .map_err(|_| storage_error())?;
+            let data = payload_integrity::checked(
+                "devres_rfc_jobs",
+                "capture_metadata",
+                &key,
+                data.0,
+                &found
+                    .try_get::<String, _>("capture_metadata_integrity")
+                    .map_err(|_| storage_error())?,
+            )?;
+            let mut capture: Capture = decode(data)?;
+            migrate_rfc_capture(&mut capture, mappings)?;
+            payload_integrity::stage(
+                self,
+                "rfc",
+                &format!("job:{key}"),
+                &json!({"source_key":key,"capture_id":capture.id,"capture_metadata":capture}),
+            )
+            .await?;
+            after = key;
+        }
+        Ok(aliases)
+    }
+}
+
+fn migration_cancel(cancel: &tokio_util::sync::CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::new("cancelled", "RFC graph migration canceled."));
+    }
+    Ok(())
+}
+fn migration_reference(
+    value: &str,
+    mappings: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    if value.starts_with("blake3:") && valid_hash(value) {
+        return Ok(value.to_owned());
+    }
+    mappings
+        .get(&format!("capture:{value}"))
+        .cloned()
+        .ok_or_else(|| Error::integrity("Unresolved RFC migration reference."))
+}
+fn migrate_rfc_capture(
+    capture: &mut Capture,
+    mappings: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    capture.id = migration_reference(&capture.id, mappings)?;
+    if !capture.body_hash.starts_with("blake3:") {
+        capture.body_hash = mappings
+            .get(&format!("body:{}", capture.body_hash))
+            .cloned()
+            .ok_or_else(|| Error::integrity("Unresolved RFC body reference."))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    #[test]
+    fn capture_migration_keeps_body_and_capture_namespaces_distinct() {
+        let old = "a".repeat(64);
+        let capture_id = crate::integrity::hash(b"capture identity");
+        let body = crate::integrity::hash(b"source body");
+        let maps = std::collections::BTreeMap::from([
+            (format!("capture:{old}"), capture_id.clone()),
+            (format!("body:{old}"), body.clone()),
+        ]);
+        let mut capture = Capture {
+            id: old.clone(),
+            body_hash: old.clone(),
+            key: "rfc:text:1".into(),
+            source_url: format!("https://fixtures.invalid/{old}"),
+            media_type: "text/plain".into(),
+            retrieved_at: 1,
+            validated_at: 2,
+        };
+        migrate_rfc_capture(&mut capture, &maps).unwrap();
+        assert_eq!(capture.id, capture_id);
+        assert_eq!(capture.body_hash, body);
+        assert_eq!(
+            capture.source_url,
+            format!("https://fixtures.invalid/{old}")
+        );
+        assert_eq!((capture.retrieved_at, capture.validated_at), (1, 2));
     }
 }

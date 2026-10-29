@@ -16,13 +16,14 @@ async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 futures = "0.3"
 sha2 = "0.11"
+blake3 = { version = "=1.8.7", default-features = false, features = ["std", "pure"] }
 sha1 = "0.11"
 hex = "0.4"
 fs2 = "0.4"
 httpdate = "1"
 tokio = { version = "1", features = ["process", "fs", "time", "sync", "io-util", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "json"] }
 quick-xml = { version = "0.42", features = ["serialize"] }
 base64 = "0.22"

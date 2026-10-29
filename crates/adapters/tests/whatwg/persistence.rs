@@ -2,16 +2,13 @@
 use devres_adapters::PgBlobStore;
 use devres_application::whatwg::{Snapshot, View, WhatwgStore, Write};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 fn digest(value: &impl serde::Serialize) -> String {
-    hex::encode(Sha256::digest(
-        serde_json::to_vec(value).expect("fixture identity"),
-    ))
+    devres_adapters::integrity::hash(&serde_json::to_vec(value).expect("fixture identity"))
 }
 fn view(catalog: &str, snapshot: &Snapshot, validated_at: i64) -> View {
     let snapshots = BTreeMap::from([(snapshot.standard.clone(), snapshot.id.clone())]);
@@ -62,7 +59,7 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
             .fetch_one(&inspection)
             .await
             .expect("schema"),
-        9
+        10
     );
     assert_eq!(
         PgBlobStore::connect(url.as_str(), root.path())

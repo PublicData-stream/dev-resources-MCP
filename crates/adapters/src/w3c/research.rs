@@ -12,7 +12,6 @@ use devres_application::w3c::{Catalog, Member, Snapshot, View};
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -35,18 +34,40 @@ fn text_representation() -> String {
     "text".into()
 }
 fn digest(value: &impl Serialize) -> Result<String> {
-    Ok(hex::encode(Sha256::digest(
-        serde_json::to_vec(value).map_err(|_| Error::integrity("Invalid W3C evidence."))?,
-    )))
+    Ok(crate::integrity::hash(
+        &serde_json::to_vec(value).map_err(|_| Error::integrity("Invalid W3C evidence."))?,
+    ))
+}
+fn fingerprint(value: &impl Serialize, cursor: Option<&str>) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| Error::integrity("Invalid query identity."))?;
+    let version = if let Some(cursor) = cursor {
+        if cursor.len() > 16_384 {
+            return Err(Error::invalid("Cursor exceeds its bound."));
+        }
+        let data = URL_SAFE_NO_PAD
+            .decode(cursor)
+            .map_err(|_| Error::invalid("Invalid query cursor."))?;
+        let value: Value =
+            serde_json::from_slice(&data).map_err(|_| Error::invalid("Invalid query cursor."))?;
+        value
+            .get("version")
+            .map_or(Some(0), Value::as_u64)
+            .ok_or_else(|| Error::invalid("Invalid cursor version."))?
+    } else {
+        2
+    };
+    match version {
+        0 => Ok(crate::integrity::legacy_hash(&bytes)),
+        2 => Ok(crate::integrity::hash(&bytes)),
+        _ => Err(Error::invalid("Unsupported cursor version.")),
+    }
 }
 fn retained<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|_| Error::integrity("Invalid retained W3C evidence."))
 }
 fn valid_hash(id: &str) -> bool {
-    id.len() == 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::integrity::valid_hash(id)
 }
 fn check(deadline: Instant, cancel: &CancellationToken) -> Result<()> {
     if cancel.is_cancelled() {
@@ -173,12 +194,16 @@ struct EmptyInput {}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
+    #[serde(default)]
+    version: u8,
     fingerprint: String,
     position: usize,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoryCursor {
+    #[serde(default)]
+    version: u8,
     fingerprint: String,
     after: i64,
     cutoff: i64,
@@ -187,6 +212,8 @@ struct HistoryCursor {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RefHistoryCursor {
+    #[serde(default)]
+    version: u8,
     fingerprint: String,
     after: i64,
     entry: usize,
@@ -227,6 +254,11 @@ fn page(items: Vec<Value>, fingerprint: String, start: usize, limit: usize) -> R
         Some(
             URL_SAFE_NO_PAD.encode(
                 serde_json::to_vec(&Cursor {
+                    version: if fingerprint.starts_with("blake3:") {
+                        2
+                    } else {
+                        0
+                    },
                     fingerprint,
                     position: end,
                 })
@@ -1241,18 +1273,21 @@ impl W3cResearch {
             .as_ref()
             .map(|v| &v.id)
             .or_else(|| snapshots.first().map(|s| &s.id));
-        let fingerprint = digest(&(
-            tool,
-            identity,
-            &input.standard,
-            &input.query,
-            &input.kind,
-            &input.name,
-            &input.anchor,
-            &input.path,
-            &input.direction,
-            &input.target,
-        ))?;
+        let fingerprint = fingerprint(
+            &(
+                tool,
+                identity,
+                &input.standard,
+                &input.query,
+                &input.kind,
+                &input.name,
+                &input.anchor,
+                &input.path,
+                &input.direction,
+                &input.target,
+            ),
+            input.cursor.as_deref(),
+        )?;
         let start = position(
             &fingerprint,
             input.offset,
@@ -1424,7 +1459,10 @@ impl W3cResearch {
                 "W3C default catalog is older than seven days.",
             ));
         }
-        let fingerprint = digest(&("catalog", &catalog.id, &input.standard, &input.query))?;
+        let fingerprint = fingerprint(
+            &("catalog", &catalog.id, &input.standard, &input.query),
+            input.cursor.as_deref(),
+        )?;
         let start = position(
             &fingerprint,
             input.offset,
@@ -1504,14 +1542,17 @@ impl W3cResearch {
         if cutoff < 0 || cutoff > self.corpus.store().w3c_cutoff().await? {
             return Err(Error::invalid("Invalid W3C history cutoff."));
         }
-        let fingerprint = digest(&(
-            tool,
-            cutoff,
-            &input.standard,
-            &input.repository,
-            &input.query,
-            &input.path,
-        ))?;
+        let fingerprint = fingerprint(
+            &(
+                tool,
+                cutoff,
+                &input.standard,
+                &input.repository,
+                &input.query,
+                &input.path,
+            ),
+            input.cursor.as_deref(),
+        )?;
         let mut after = if let Some(c) = &cursor {
             if c.skip > 10_000
                 || c.fingerprint != fingerprint
@@ -1585,13 +1626,7 @@ impl W3cResearch {
                     for parent in &snapshot.parents {
                         check(deadline, &cancel)?;
                         let previous = self
-                            .corpus
-                            .snapshot_for_revision(
-                                &snapshot.standard,
-                                &snapshot.repository,
-                                parent,
-                                &snapshot.representation,
-                            )
+                            .parent_snapshot(&snapshot, parent, cutoff, &cancel)
                             .await?;
                         let change = if let Some(previous) = previous {
                             self.member_changes(
@@ -1624,6 +1659,11 @@ impl W3cResearch {
             Some(
                 URL_SAFE_NO_PAD.encode(
                     serde_json::to_vec(&HistoryCursor {
+                        version: if fingerprint.starts_with("blake3:") {
+                            2
+                        } else {
+                            0
+                        },
                         fingerprint,
                         after,
                         cutoff,
@@ -1677,13 +1717,16 @@ impl W3cResearch {
         if cutoff < 0 || cutoff > self.corpus.store().w3c_cutoff().await? {
             return Err(Error::invalid("Invalid W3C history cutoff."));
         }
-        let fingerprint = digest(&(
-            "refs",
-            cutoff,
-            &input.repository,
-            &input.reference,
-            &input.query,
-        ))?;
+        let fingerprint = fingerprint(
+            &(
+                "refs",
+                cutoff,
+                &input.repository,
+                &input.reference,
+                &input.query,
+            ),
+            input.cursor.as_deref(),
+        )?;
         if let Some(c) = &cursor
             && (c.fingerprint != fingerprint
                 || c.after < 0
@@ -1771,6 +1814,11 @@ impl W3cResearch {
             Some(
                 URL_SAFE_NO_PAD.encode(
                     serde_json::to_vec(&RefHistoryCursor {
+                        version: if fingerprint.starts_with("blake3:") {
+                            2
+                        } else {
+                            0
+                        },
                         fingerprint,
                         after,
                         entry,
@@ -1786,6 +1834,42 @@ impl W3cResearch {
         Ok(
             json!({"history_type":"refs","history_snapshot":cutoff,"items":items,"next_cursor":next,"scanned":scanned,"coverage":"Observed advertised refs only; earlier observations retain deleted refs."}),
         )
+    }
+    async fn parent_snapshot(
+        &self,
+        selected: &Snapshot,
+        revision: &str,
+        cutoff: i64,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Snapshot>> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut after = 0;
+        let mut found = None;
+        loop {
+            check(deadline, cancel)?;
+            let rows = self
+                .corpus
+                .store()
+                .w3c_rows("snapshots", after, 100, Some(cutoff))
+                .await?;
+            if rows.is_empty() {
+                return Ok(found);
+            }
+            for row in rows {
+                check(deadline, cancel)?;
+                after = row.sequence;
+                let candidate: Snapshot = retained(row.data)?;
+                if candidate.standard == selected.standard
+                    && candidate.repository == selected.repository
+                    && candidate.revision == revision
+                    && candidate.representation == selected.representation
+                    && candidate.processor_version == selected.processor_version
+                    && candidate.id.starts_with("blake3:") == selected.id.starts_with("blake3:")
+                {
+                    found = Some(candidate);
+                }
+            }
+        }
     }
     async fn member_changes(
         &self,
@@ -1881,13 +1965,16 @@ impl W3cResearch {
             self.compare_coverage(&before, &after, input.path.as_deref(), &cancel)
                 .await?;
         }
-        let fingerprint = digest(&(
-            &before.id,
-            &after.id,
-            &input.mode,
-            &input.anchor,
-            &input.path,
-        ))?;
+        let fingerprint = fingerprint(
+            &(
+                &before.id,
+                &after.id,
+                &input.mode,
+                &input.anchor,
+                &input.path,
+            ),
+            input.cursor.as_deref(),
+        )?;
         let start = position(
             &fingerprint,
             input.offset,
@@ -2255,3 +2342,37 @@ pub fn schemas() -> Vec<Value> {
 #[cfg(test)]
 #[path = "research/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod cursor_digest_tests {
+    use super::*;
+    #[test]
+    fn cursor_versions_bind_the_original_query_algorithm() {
+        let selected = ("history", "frozen-snapshot", "path");
+        let bytes = serde_json::to_vec(&selected).expect("query");
+        let canonical = fingerprint(&selected, None).expect("new identity");
+        assert_eq!(canonical, crate::integrity::hash(&bytes));
+        let old = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "fingerprint":crate::integrity::legacy_hash(&bytes), "position":10
+            }))
+            .expect("old cursor"),
+        );
+        assert_eq!(
+            fingerprint(&selected, Some(&old)).expect("legacy identity"),
+            crate::integrity::legacy_hash(&bytes)
+        );
+        let new = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "version":2, "fingerprint":canonical, "position":10
+            }))
+            .expect("new cursor"),
+        );
+        assert_eq!(
+            fingerprint(&selected, Some(&new)).expect("new continuation"),
+            canonical
+        );
+        let unknown = URL_SAFE_NO_PAD.encode(br#"{"version":99}"#);
+        assert!(fingerprint(&selected, Some(&unknown)).is_err());
+    }
+}

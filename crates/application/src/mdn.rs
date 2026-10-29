@@ -156,6 +156,30 @@ pub struct View {
 /// Public source evidence only. Immutable rows reject replacement; state is private.
 #[async_trait]
 pub trait MdnStore: Send + Sync {
+    /// Complete retained rows for private integrity verification, including aliases.
+    async fn mdn_migration_rows(
+        &self,
+        _kind: &str,
+        _after: i64,
+        _limit: usize,
+    ) -> Result<Vec<MdnRow>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration verification unavailable.",
+        ))
+    }
+
+    /// Private offline migration inventory; never exposed through MCP.
+    async fn mdn_migration_kinds(&self) -> Result<Vec<String>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration enumeration unavailable.",
+        ))
+    }
+    async fn mdn_migration_state_keys(&self, _after: &str, _limit: usize) -> Result<Vec<String>> {
+        Err(devres_domain::Error::unavailable(
+            "Migration enumeration unavailable.",
+        ))
+    }
+
     async fn mdn_cutoff(&self) -> Result<i64>;
     async fn mdn_get(&self, kind: &str, key: &str) -> Result<Option<MdnRow>>;
     async fn mdn_get_many(&self, kind: &str, keys: &[String]) -> Result<Vec<MdnRow>> {

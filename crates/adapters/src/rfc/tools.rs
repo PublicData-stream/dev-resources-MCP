@@ -585,7 +585,7 @@ pub(crate) fn format_from_uri(url: &url::Url) -> Result<FormatInput> {
 
 pub(crate) fn schemas() -> Vec<Value> {
     let text = json!({"type":"string","minLength":1,"maxLength":256});
-    let snapshot = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    let snapshot = json!({"type":"string","pattern":"^(blake3:)?[0-9a-f]{64}$"});
     let number = json!({"type":"integer","minimum":1,"maximum":999999});
     let offset = json!({"type":"integer","minimum":0,"maximum":1000000});
     let limit = json!({"type":"integer","minimum":1,"maximum":100,"default":20});

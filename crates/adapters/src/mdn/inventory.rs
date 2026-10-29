@@ -3,10 +3,17 @@ use devres_application::mdn::{
     InventoryNode, MDN_WRITE_BATCH_BYTES, MDN_WRITE_BATCH_ROWS, MdnStore, MdnWrite, Member,
 };
 use devres_domain::{Error, Result};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 pub fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
+}
+/// Radix digits are always the hexadecimal digest, without the algorithm tag.
+fn routing_hash(bytes: &[u8], legacy: bool) -> String {
+    if legacy {
+        crate::integrity::legacy_hash(bytes)
+    } else {
+        digest(bytes).trim_start_matches("blake3:").to_owned()
+    }
 }
 pub fn value<T: serde::Serialize>(item: &T) -> Result<serde_json::Value> {
     serde_json::to_value(item).map_err(|_| Error::integrity("Invalid MDN evidence encoding."))
@@ -93,7 +100,7 @@ pub(crate) async fn node_cached(
     let node: InventoryNode = decode(row.data)?;
     let bytes =
         serde_json::to_vec(&node).map_err(|_| Error::integrity("Invalid MDN inventory."))?;
-    if digest(&bytes) != id {
+    if crate::integrity::verify(id, &bytes).is_err() {
         return Err(Error::integrity("MDN inventory hash mismatch."));
     }
     if cache.enabled && durable {
@@ -160,7 +167,7 @@ impl<'a> Staged<'a> {
             }
             return Ok(id);
         }
-        // The envelope is at most 128 bytes for kind=nodes and a SHA-256 key.
+        // The envelope is at most 128 bytes for kind=nodes and a tagged BLAKE3 key.
         self.bytes = self
             .bytes
             .checked_add(encoded.bytes + 128)
@@ -208,8 +215,9 @@ async fn child(
     mut n: InventoryNode,
     part: &str,
     cache: &mut NodeCache,
+    legacy: bool,
 ) -> Result<Option<InventoryNode>> {
-    let hash = digest(part.as_bytes());
+    let hash = routing_hash(part.as_bytes(), legacy);
     let mut depth = 0;
     while !n.buckets.is_empty() {
         let nibble = hash
@@ -240,7 +248,7 @@ pub(crate) async fn get_cached(
     }
     let mut n = node_cached(store, root, cache).await?;
     for part in path.split('/') {
-        let Some(next) = child(store, n, part, cache).await? else {
+        let Some(next) = child(store, n, part, cache, !root.starts_with("blake3:")).await? else {
             return Ok(None);
         };
         n = next;
@@ -255,7 +263,7 @@ pub async fn subtree(store: &dyn MdnStore, root: &str, path: &str) -> Result<Opt
     let mut id = root.to_owned();
     for part in path.split('/') {
         let mut n = node(store, &id).await?;
-        let hash = digest(part.as_bytes());
+        let hash = routing_hash(part.as_bytes(), !root.starts_with("blake3:"));
         let mut depth = 0;
         while !n.buckets.is_empty() {
             let key = hash
@@ -322,7 +330,7 @@ async fn partition(staged: &mut Staged<'_>, n: &mut InventoryNode, depth: usize)
     }
     let mut groups: BTreeMap<String, InventoryNode> = BTreeMap::new();
     for (name, id) in std::mem::take(&mut n.children) {
-        let hash = digest(name.as_bytes());
+        let hash = routing_hash(name.as_bytes(), false);
         let key = hash[depth..depth + 1].to_owned();
         let c = staged.node(&id).await?;
         let group = groups.entry(key).or_default();
@@ -355,13 +363,18 @@ pub(crate) async fn update_cached(
     member: Option<Member>,
     cache: &mut NodeCache,
 ) -> Result<String> {
+    if !root.starts_with("blake3:") {
+        return Err(Error::integrity(
+            "Legacy inventory must be migrated before updating.",
+        ));
+    }
     if !valid_path(path) {
         return Err(Error::invalid("Invalid MDN member path."));
     }
     let mut stack = Vec::new();
     let mut current = node_cached(store, root, cache).await?;
     for part in path.split('/') {
-        let hash = digest(part.as_bytes());
+        let hash = routing_hash(part.as_bytes(), false);
         let mut depth = 0;
         while !current.buckets.is_empty() {
             let key = hash
@@ -453,8 +466,11 @@ pub async fn members(store: &dyn MdnStore, root: &str, max: usize) -> Result<Vec
                 return Err(Error::capacity("MDN inventory traversal bound exceeded."));
             }
             let n: InventoryNode = decode(row.data)?;
-            if digest(&serde_json::to_vec(&n).map_err(|_| Error::integrity("Invalid MDN node."))?)
-                != row.key
+            if crate::integrity::verify(
+                &row.key,
+                &serde_json::to_vec(&n).map_err(|_| Error::integrity("Invalid MDN node."))?,
+            )
+            .is_err()
             {
                 return Err(Error::integrity("MDN inventory hash mismatch."));
             }
@@ -474,6 +490,25 @@ pub async fn members(store: &dyn MdnStore, root: &str, max: usize) -> Result<Vec
         }
     }
     Ok(out)
+}
+
+/// Rebuild a frozen logical inventory with canonical BLAKE3 routing.
+/// The caller rewrites typed references in each member; source data stays unchanged.
+pub async fn rebuild_inventory(
+    store: &dyn MdnStore,
+    root: &str,
+    mut rewrite: impl FnMut(Member) -> Result<Member>,
+) -> Result<String> {
+    let mut retained = members(store, root, 1_000_000).await?;
+    retained.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut canonical = empty(store).await?;
+    let mut cache = NodeCache::new();
+    for member in retained {
+        let member = rewrite(member)?;
+        let path = member.path.clone();
+        canonical = update_cached(store, &canonical, &path, Some(member), &mut cache).await?;
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -582,7 +617,7 @@ mod tests {
             .expect("cached update");
         assert_eq!(
             root,
-            "59cc157dfa306cdebe2c26b81c8f786ce50dc412dbf66dff817e6f799c2fff27"
+            "blake3:5d39ea6f61f890c38ed97937d95d5ae980531cc0df3c186a31b863a75cbbcd5d"
         );
         let reads = store.reads.load(Ordering::Relaxed);
         assert_eq!(
@@ -629,6 +664,87 @@ mod tests {
                 .is_none()
         );
     }
+    #[tokio::test]
+    async fn legacy_radix_rebuild_preserves_members_and_reads() {
+        let store = Memory::default();
+        async fn legacy_put(store: &Memory, node: &InventoryNode) -> String {
+            let bytes = serde_json::to_vec(node).expect("legacy encoding");
+            let id = crate::integrity::legacy_hash(&bytes);
+            store
+                .mdn_put("nodes", &id, &value(node).expect("legacy value"))
+                .await
+                .expect("legacy row");
+            id
+        }
+        let mut buckets = BTreeMap::<String, InventoryNode>::new();
+        for n in 0..80 {
+            let path = format!("member-{n:03}");
+            let leaf = InventoryNode {
+                member: Some(member(&path)),
+                members: 1,
+                searchable: 1,
+                kinds: BTreeMap::from([("article".into(), 1)]),
+                ..InventoryNode::default()
+            };
+            let id = legacy_put(&store, &leaf).await;
+            let nibble = crate::integrity::legacy_hash(path.as_bytes())[..1].to_owned();
+            let bucket = buckets.entry(nibble).or_default();
+            bucket.children.insert(path, id);
+            bucket.members += 1;
+            bucket.searchable += 1;
+            *bucket.kinds.entry("article".into()).or_default() += 1;
+        }
+        let mut root = InventoryNode {
+            members: 80,
+            searchable: 80,
+            kinds: BTreeMap::from([("article".into(), 80)]),
+            ..InventoryNode::default()
+        };
+        for (nibble, node) in buckets {
+            root.buckets.insert(nibble, legacy_put(&store, &node).await);
+        }
+        let legacy = legacy_put(&store, &root).await;
+        let canonical = rebuild_inventory(&store, &legacy, Ok)
+            .await
+            .expect("rebuild");
+        assert!(canonical.starts_with("blake3:"));
+        assert_ne!(canonical, legacy);
+        for n in 0..80 {
+            let path = format!("member-{n:03}");
+            assert_eq!(
+                get(&store, &legacy, &path).await.expect("legacy lookup"),
+                Some(member(&path))
+            );
+            assert_eq!(
+                get(&store, &canonical, &path)
+                    .await
+                    .expect("canonical lookup"),
+                Some(member(&path))
+            );
+        }
+        assert_eq!(
+            members(&store, &legacy, 100)
+                .await
+                .expect("legacy members")
+                .len(),
+            80
+        );
+        assert_eq!(
+            members(&store, &canonical, 100)
+                .await
+                .expect("canonical members")
+                .len(),
+            80
+        );
+        assert_eq!(
+            update(&store, &legacy, "new", Some(member("new")))
+                .await
+                .expect_err("cannot mix radix generations")
+                .code,
+            "integrity"
+        );
+    }
+
     #[test]
     fn node_cache_fifo_enforces_both_capacity_limits() {
         let mut cache = NodeCache::new();
@@ -732,8 +848,8 @@ mod tests {
             .await
             .expect("batched path");
         assert_eq!(
-            root, "59cc157dfa306cdebe2c26b81c8f786ce50dc412dbf66dff817e6f799c2fff27",
-            "pre-batch inventory encoding identity"
+            root, "blake3:5d39ea6f61f890c38ed97937d95d5ae980531cc0df3c186a31b863a75cbbcd5d",
+            "canonical BLAKE3 inventory encoding identity"
         );
         assert_eq!(
             store.singles.load(Ordering::Relaxed),

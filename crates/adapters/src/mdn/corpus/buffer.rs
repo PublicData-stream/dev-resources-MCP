@@ -467,7 +467,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root,
-            "59cc157dfa306cdebe2c26b81c8f786ce50dc412dbf66dff817e6f799c2fff27"
+            "blake3:5d39ea6f61f890c38ed97937d95d5ae980531cc0df3c186a31b863a75cbbcd5d"
         );
         assert_eq!(
             inventory::get_cached(&buffer, &root, "a/b/c", &mut cache)

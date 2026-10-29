@@ -7,7 +7,6 @@ use devres_application::{
 use devres_domain::{Error, FetchRequest, Result, unix_now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -457,18 +456,18 @@ impl RfcCorpus {
         // A prior completed index may be orphaned after a crash before DB commit.
         // A unique derived-artifact name allows safe replay without replacing it.
         static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let mut build_hash = Sha256::new();
+        let mut build_hash = blake3::Hasher::new();
         build_hash.update(&preidentity);
-        build_hash.update(std::process::id().to_le_bytes());
-        build_hash.update(BUILDS.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        build_hash.update(&std::process::id().to_le_bytes());
+        build_hash.update(&BUILDS.fetch_add(1, Ordering::Relaxed).to_le_bytes());
         build_hash.update(
-            std::time::SystemTime::now()
+            &std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
                 .to_le_bytes(),
         );
-        let build_id = hex::encode(build_hash.finalize());
+        let build_id = format!("blake3:{}", build_hash.finalize().to_hex());
         let mut builder = None;
         let mut selected = BTreeMap::new();
         let mut extraction_errors = BTreeMap::new();
@@ -579,7 +578,7 @@ impl RfcCorpus {
             &index_path,
         ))
         .map_err(|_| Error::integrity("RFC snapshot identity failed."))?;
-        let id = hex::encode(Sha256::digest(&identity));
+        let id = crate::integrity::hash(&identity);
         if let Some(existing) = self.store.snapshot(Some(&id)).await? {
             self.dirty.fetch_sub(generation, Ordering::Relaxed);
             self.last_snapshot.store(unix_now(), Ordering::Relaxed);
@@ -753,11 +752,7 @@ pub(crate) fn media_type(format: &str) -> Result<&'static str> {
     }
 }
 pub(crate) fn valid_snapshot_id(id: &str) -> Result<()> {
-    if id.len() != 64
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !crate::integrity::valid_hash(id) {
         return Err(Error::invalid("Invalid RFC snapshot identifier."));
     }
     Ok(())

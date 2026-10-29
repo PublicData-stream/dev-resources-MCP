@@ -19,6 +19,38 @@ struct Memory {
 }
 #[async_trait]
 impl MdnStore for Memory {
+    async fn mdn_migration_rows(
+        &self,
+        kind: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<MdnRow>> {
+        self.mdn_rows(kind, after, limit, None).await
+    }
+
+    async fn mdn_migration_kinds(&self) -> Result<Vec<String>> {
+        Ok(self
+            .rows
+            .lock()
+            .expect("rows")
+            .keys()
+            .map(|(kind, _)| kind.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+    async fn mdn_migration_state_keys(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        Ok(self
+            .states
+            .lock()
+            .expect("states")
+            .keys()
+            .filter(|key| key.as_str() > after)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     async fn mdn_cutoff(&self) -> Result<i64> {
         Ok(self.sequence.load(Ordering::Relaxed))
     }
@@ -1096,7 +1128,7 @@ async fn mdn_corpus_offline_rebuild_preserves_corrupt_historical_index_and_origi
     let shard = manifest["shard"]["id"].as_str().expect("retained shard");
     let damaged = target
         .join("mdn-indexes/shards")
-        .join(shard)
+        .join(crate::integrity::relative_path(shard).expect("shard digest path"))
         .join("meta.json");
     std::fs::write(&damaged, b"corrupt synthetic historical index")
         .expect("damage disposable fixture index");
@@ -1848,7 +1880,10 @@ async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renew
     .unwrap();
     let damaged = target
         .join("mdn-indexes/shards")
-        .join(manifest["shard"]["id"].as_str().unwrap())
+        .join(
+            crate::integrity::relative_path(manifest["shard"]["id"].as_str().unwrap())
+                .expect("shard digest path"),
+        )
         .join("meta.json");
     std::fs::write(&damaged, b"corrupt legacy default fixture index").unwrap();
     for index in 0..5 {
@@ -2122,4 +2157,105 @@ async fn mdn_corpus_offline_rebuild_repairs_generation_two_default_without_renew
         .await
         .unwrap();
     assert_eq!(fixture.corpus.broker.attempt_count(), attempts);
+}
+
+#[tokio::test]
+async fn blake3_migration_preserves_distinct_frozen_snapshot_occurrences() {
+    let directory = tempfile::tempdir().expect("migration directory");
+    let store = Arc::new(Memory::default());
+    let broker = Arc::new(BulkBroker::new(Default::default()).expect("broker"));
+    let corpus = MdnCorpus::new(
+        store.clone(),
+        broker,
+        directory.path(),
+        MdnConfig {
+            enabled: false,
+            min_free_bytes: 64 * 1024 * 1024,
+            max_git_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        },
+    )
+    .expect("corpus");
+    let node = devres_application::mdn::InventoryNode::default();
+    let legacy_root = crate::integrity::legacy_hash(&serde_json::to_vec(&node).expect("node"));
+    store
+        .mdn_put("nodes", &legacy_root, &encoded(&node).expect("node value"))
+        .await
+        .expect("legacy node");
+    let mut old = Vec::new();
+    for occurrence in ["original", "rebuilt"] {
+        let id = crate::integrity::legacy_hash(occurrence.as_bytes());
+        let snapshot = Snapshot {
+            id: id.clone(),
+            repository: "content".into(),
+            revision: "a".repeat(40),
+            tree: "b".repeat(40),
+            parents: Vec::new(),
+            committed_at: 42,
+            inventory: legacy_root.clone(),
+            processor_version: 1,
+            index: Value::Null,
+            coverage: json!({"accounted":true}),
+        };
+        let data = encoded(&snapshot).expect("snapshot");
+        let sequence = store
+            .mdn_put("snapshots", &id, &data)
+            .await
+            .expect("legacy snapshot");
+        old.push((id, data, sequence));
+    }
+    let mut mappings = BTreeMap::new();
+    let aliases = corpus
+        .migrate_blake3_graph(&mut mappings, CancellationToken::new())
+        .await
+        .expect("migration");
+    assert_ne!(
+        mappings[&format!("mdn:snapshots:{}", old[0].0)],
+        mappings[&format!("mdn:snapshots:{}", old[1].0)],
+        "historical occurrences cannot collapse"
+    );
+    assert_eq!(
+        aliases
+            .iter()
+            .filter(|(kind, _, _)| kind == "snapshots")
+            .count(),
+        2
+    );
+    for (id, data, sequence) in &old {
+        let retained = store
+            .mdn_get("snapshots", id)
+            .await
+            .expect("read")
+            .expect("retained");
+        assert_eq!(retained.sequence, *sequence);
+        assert_eq!(retained.data, *data);
+        let canonical = store
+            .mdn_get("snapshots", &mappings[&format!("mdn:snapshots:{id}")])
+            .await
+            .expect("read")
+            .expect("canonical");
+        assert!(canonical.key.starts_with("blake3:"));
+        assert!(
+            canonical.data["inventory"]
+                .as_str()
+                .expect("root")
+                .starts_with("blake3:")
+        );
+        assert_eq!(canonical.data["committed_at"], 42);
+        assert_eq!(canonical.data["processor_version"], 1);
+    }
+    corpus
+        .migrate_blake3_graph(&mut mappings, CancellationToken::new())
+        .await
+        .expect("resume");
+    let stop = CancellationToken::new();
+    stop.cancel();
+    assert_eq!(
+        corpus
+            .migrate_blake3_graph(&mut mappings, stop)
+            .await
+            .expect_err("cancellation")
+            .code,
+        "cancelled"
+    );
 }

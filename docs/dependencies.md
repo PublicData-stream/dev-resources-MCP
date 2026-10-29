@@ -12,7 +12,7 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | serde/json, jsonschema, TOML, URL | Typed schemas, strict configuration, source decoding, and canonical URL construction. Remote schema resolution is disabled. These parsers handle untrusted data under application limits. |
 | reqwest | Bounded fixed-source HTTPS with no redirects, gzip auto-expansion, or arbitrary caller URLs. A separate retry owner avoids amplification. rustls+stream only, no default features. |
 | sqlx | PostgreSQL transactions and explicit bound queries; no runtime SQL from callers, no compile-time database access or macros. Memory-only storage would not meet retention requirements. |
-| SHA-256, hex, fs2 | Content-addressed immutable blobs, exact archive checksum verification, and free-space admission. fs2 provides safe filesystem-space calls rather than adding unsafe local FFI. |
+| BLAKE3, SHA-2/SHA-1, hex, fs2 | BLAKE3 addresses and verifies service-owned durable content. SHA-2/SHA-1 retain upstream registry/Git checksums, legacy evidence verification, and stable operational lookup names. fs2 provides safe filesystem-space calls rather than adding unsafe local FFI. |
 | quick-xml, tar, flate2 | Streaming official RFC metadata and bounded crate/advisory archives. Neither tar extraction nor link following is used. XML general entities and mixed text need parser tests. |
 | html5ever | Streaming HTML tokenization without a DOM, scripting, network or rendering. Direct tokenization avoids CSS dependencies and checks budgets between feeds. Raw captures remain unchanged; fixtures cover entities and active content. |
 | tantivy 0.27 | Embedded positional search over whole RFCs and immutable crate/version/document shards, avoiding PostgreSQL position limits and a separate daemon. Defaults disabled; enable mmap, stemmer, stopwords and LZ4 only. Trusted index paths/schemas, restricted query syntax and verified immutable manifests contain the boundary. Its indexing, compression, tokenizer and proc-macro graph receives current advisory/license/source checks. |
@@ -53,6 +53,31 @@ the pinned toolchain standard-library copyright inventory and license texts are
 included as well. Operating-system packages retain their image-provided copyright
 information.
 
+## BLAKE3 storage integrity
+
+`blake3 1.8.7` is pinned with default features disabled and only `std` and `pure`
+enabled. The [official implementation](https://github.com/BLAKE3-team/BLAKE3/tree/1.8.7)
+provides incremental hashing and published test vectors; maintaining a separate
+cryptographic implementation would add review and compatibility work. Keeping
+SHA-256 as the canonical storage algorithm would not meet the selected BLAKE3
+migration. Upstream-defined checksums keep their original algorithms.
+
+`pure` selects Rust hashing implementations rather than the C/assembly hashing
+backends. The packaged `build.rs` still runs and can probe C compiler flags on x86;
+`cc` remains in the locked build graph. Neither the build script nor its compiler
+probes execute inspected source/package contents. `rayon`, `mmap`, optional Serde,
+and digest-trait integrations are disabled; hashing uses the existing bounded I/O,
+worker, memory and cancellation admission. No PostgreSQL extension or database
+image change is needed.
+
+The maintained upstream package is licensed under `CC0-1.0 OR Apache-2.0 OR
+Apache-2.0 WITH LLVM-exception`; preserve its packaged license texts and the notices
+for its resolved support libraries in the build inventory. The adapter computes
+BLAKE3 for immutable files and canonical SQL envelopes; domain contracts remain
+independent of concrete storage. Current advisory/license/source admission still
+requires `cargo audit` and `cargo deny check` on the resolved graph. This dependency
+choice and passing hash fixtures do not establish current admission results.
+
 ## Crate corpus dependency boundary
 
 ZIP is pinned to 9.0.0; earlier 8.x candidates failed current advisory admission and
@@ -91,7 +116,7 @@ source only; neither performs network or filesystem access in the projection pat
 The locked additions include arraydeque 0.5.1, hashlink 0.12.2 and unicase 2.10.0;
 original permissive notices remain in the generated notice inventory. Direct
 `sha1 0.11.0` was already resolved in the graph and verifies Git's native object
-identity on every raw read; SHA-256 remains the archive/projection addressing hash.
+identity on every raw read; service-owned archive/projection addressing uses BLAKE3.
 No Git dependencies, upstream build tools or source-selected executables are added.
 Current cargo-audit and cargo-deny admission remains mandatory and separate from
 compilation and provider acceptance.

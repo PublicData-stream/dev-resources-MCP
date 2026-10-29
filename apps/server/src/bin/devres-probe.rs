@@ -320,11 +320,7 @@ async fn main() -> Result<(), ServerError> {
             return Err("Advisory corpus status was not available through WebTransport".into());
         }
         if let Ok(snapshot) = std::env::var("DEVRES_PROBE_ADVISORY_SNAPSHOT") {
-            if snapshot.len() != 64
-                || !snapshot
-                    .bytes()
-                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-            {
+            if !devres_domain::valid_content_id(&snapshot) {
                 return Err("invalid explicit advisory fixture snapshot".into());
             }
             let lockfile = "# devres-smoke-private-comment-4d1a8e7c\nversion = 4\n[[package]]\nname = \"example\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
@@ -371,11 +367,7 @@ async fn main() -> Result<(), ServerError> {
         if let Ok(snapshot) = std::env::var("DEVRES_PROBE_MDN_SNAPSHOT") {
             let compatibility = std::env::var("DEVRES_PROBE_MDN_COMPAT_SNAPSHOT")?;
             for id in [&snapshot, &compatibility] {
-                if id.len() != 64
-                    || !id
-                        .bytes()
-                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-                {
+                if !devres_domain::valid_content_id(id) {
                     return Err("Invalid explicit synthetic MDN snapshot".into());
                 }
             }
@@ -508,11 +500,7 @@ async fn main() -> Result<(), ServerError> {
         if !has_whatwg_corpus {
             return Err("WHATWG discovery missing through WebTransport".into());
         }
-        if snapshot.len() != 64
-            || !snapshot
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        {
+        if !devres_domain::valid_content_id(&snapshot) {
             return Err("Invalid synthetic WHATWG snapshot".into());
         }
         let detail = tool_exchange(
@@ -613,11 +601,7 @@ async fn main() -> Result<(), ServerError> {
         if !has_w3c_corpus {
             return Err("W3C discovery missing through WebTransport".into());
         }
-        if snapshot.len() != 64
-            || !snapshot
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        {
+        if !devres_domain::valid_content_id(&snapshot) {
             return Err("Invalid synthetic W3C snapshot".into());
         }
         let detail = tool_exchange(
@@ -849,11 +833,7 @@ async fn main() -> Result<(), ServerError> {
         if !has_chromium_corpus {
             return Err("CHROMIUM discovery missing through WebTransport".into());
         }
-        if snapshot.len() != 64
-            || !snapshot
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        {
+        if !devres_domain::valid_content_id(&snapshot) {
             return Err("Invalid synthetic CHROMIUM snapshot".into());
         }
         let detail = tool_exchange(

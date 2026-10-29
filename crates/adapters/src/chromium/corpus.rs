@@ -28,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 
 mod collection;
 mod licensing;
+#[path = "corpus/migration.rs"]
+mod migration;
 #[cfg(test)]
 mod tests;
 
@@ -63,7 +65,8 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     inventory::decode(value)
 }
 fn state_key(kind: &str, id: &str) -> String {
-    format!("{kind}:{}", inventory::digest(id.as_bytes()))
+    // Preserve mutable scheduling lookup names; payloads use BLAKE3 integrity.
+    format!("{kind}:{}", crate::integrity::legacy_hash(id.as_bytes()))
 }
 fn alias(
     component: &str,
@@ -128,6 +131,28 @@ fn component(id: &str) -> Result<Component> {
     })
 }
 impl ChromiumCorpus {
+    /// Construct frozen-graph verification handles without initializing storage.
+    pub(crate) fn for_verification(
+        store: Arc<dyn ChromiumStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: ChromiumConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let raw = Arc::new(BulkArtifactStore::for_verification(
+            root.join("chromium/raw-artifacts"),
+            config.min_free_bytes,
+        )?);
+        Ok(Self {
+            store,
+            source: ChromiumSource::new(broker)?,
+            index: ChromiumIndex::for_verification(root)?,
+            processors: Arc::new(Semaphore::new(config.max_processing_workers)),
+            config,
+            raw,
+            processing: Mutex::new(()),
+        })
+    }
     pub fn new(
         store: Arc<dyn ChromiumStore>,
         broker: Arc<BulkBroker>,
@@ -189,6 +214,7 @@ impl ChromiumCorpus {
             )
             .await?;
         let mut whole = Sha256::new();
+        let mut whole_blake3 = blake3::Hasher::new();
         let mut chunks = Vec::new();
         let mut remaining = artifact.bytes;
         while remaining > 0 {
@@ -197,10 +223,16 @@ impl ChromiumCorpus {
             let mut bytes = vec![0; size];
             file.read_exact(&mut bytes).await.map_err(|_| failure())?;
             whole.update(&bytes);
+            whole_blake3.update(&bytes);
             chunks.push(inventory::digest(&bytes));
             remaining -= size as u64;
         }
-        if hex::encode(whole.finalize()) != artifact.body_hash {
+        let observed = if artifact.body_hash.starts_with("blake3:") {
+            format!("blake3:{}", whole_blake3.finalize().to_hex())
+        } else {
+            hex::encode(whole.finalize())
+        };
+        if observed != artifact.body_hash {
             return Err(Error::integrity(
                 "Chromium raw range proof differs from retained artifact.",
             ));
@@ -216,13 +248,26 @@ impl ChromiumCorpus {
     ) -> Result<Vec<u8>> {
         const BLOCK: u64 = 4 * 1024 * 1024;
         if artifact.bytes > bulk::MAX_ARTIFACT_BYTES
-            || artifact.body_hash.len() != 64
-            || !artifact.body_hash.bytes().all(|b| b.is_ascii_hexdigit())
+            || !crate::integrity::valid_hash(&artifact.body_hash)
             || chunks.len() as u64 != artifact.bytes.div_ceil(BLOCK)
         {
             return Err(Error::integrity("Invalid Chromium raw range proof."));
         }
-        let path = self.raw.root().join(&artifact.body_hash);
+        let path = self
+            .raw
+            .root()
+            .join(crate::integrity::relative_path(&artifact.body_hash)?);
+        if !artifact.body_hash.starts_with("blake3:") {
+            let legacy_path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::integrity::verify_legacy_file(
+                    &legacy_path,
+                    std::time::Instant::now() + Duration::from_secs(15),
+                )
+            })
+            .await
+            .map_err(|_| failure())??;
+        }
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|_| failure())?;
@@ -245,7 +290,10 @@ impl ChromiumCorpus {
                 .await
                 .map_err(|_| failure())?;
             file.read_exact(&mut bytes).await.map_err(|_| failure())?;
-            if chunks.get(block as usize) != Some(&inventory::digest(&bytes)) {
+            if chunks
+                .get(block as usize)
+                .is_none_or(|expected| crate::integrity::verify(expected, &bytes).is_err())
+            {
                 return Err(Error::integrity("Chromium raw range checksum mismatch."));
             }
             let from = (position - start) as usize;
@@ -297,7 +345,7 @@ impl ChromiumCorpus {
                         "Chromium projection reconstruction exceeds its bound.",
                     ));
                 }
-                if inventory::digest(&encoded) != row.key {
+                if crate::integrity::verify(&row.key, &encoded).is_err() {
                     return Err(Error::integrity(
                         "Chromium shared projection object hash mismatch.",
                     ));

@@ -1,5 +1,7 @@
 //! Schema-v3 crate inventories, immutable projections and resumable acquisition.
-use super::{PgBlobStore, hash, storage_error, valid_hash};
+#[path = "storage_migration.rs"]
+mod graph_migration;
+use super::{PgBlobStore, hash, payload_integrity, storage_error, valid_hash};
 use async_trait::async_trait;
 use devres_application::crate_corpus::{
     Artifact, CollectionJob, ContentDeltaQuery, ContentFilter, ContentRecord, CrateCorpusStore,
@@ -30,6 +32,9 @@ fn checked_id(value: &str) -> Result<()> {
     Ok(())
 }
 fn inventory(row: sqlx::postgres::PgRow) -> Result<Inventory> {
+    let id: String = row.try_get("id").map_err(|_| storage_error())?;
+    let revision: String = row.try_get("revision").map_err(|_| storage_error())?;
+    crate::integrity::verify(&id, format!("crate-inventory:1:{revision}").as_bytes())?;
     Ok(Inventory {
         id: row.try_get("id").map_err(|_| storage_error())?,
         sequence: row.try_get("sequence").map_err(|_| storage_error())?,
@@ -105,10 +110,13 @@ impl CrateCorpusStore for PgBlobStore {
     }
     async fn pending_inventory(&self) -> Result<Option<Inventory>> {
         self.fence().await?;
+        let hidden = self
+            .visibility_aliases("crate", "inventories", None)
+            .await?;
         sqlx::query(
-            "SELECT * FROM devres_crate_inventories WHERE NOT published ORDER BY sequence LIMIT 1",
+            "SELECT * FROM devres_crate_inventories i WHERE NOT published AND NOT(i.id=ANY($1::text[])) ORDER BY sequence LIMIT 1",
         )
-        .fetch_optional(&self.pool)
+        .bind(hidden.as_ref()).fetch_optional(&self.pool)
         .await
         .map_err(|_| storage_error())?
         .map(inventory)
@@ -116,10 +124,13 @@ impl CrateCorpusStore for PgBlobStore {
     }
     async fn latest_inventory(&self) -> Result<Option<Inventory>> {
         self.fence().await?;
+        let hidden = self
+            .visibility_aliases("crate", "inventories", None)
+            .await?;
         sqlx::query(
-            "SELECT * FROM devres_crate_inventories WHERE published ORDER BY sequence DESC LIMIT 1",
+            "SELECT * FROM devres_crate_inventories i WHERE published AND NOT(i.id=ANY($1::text[])) ORDER BY sequence DESC LIMIT 1",
         )
-        .fetch_optional(&self.pool)
+        .bind(hidden.as_ref()).fetch_optional(&self.pool)
         .await
         .map_err(|_| storage_error())?
         .map(inventory)
@@ -142,7 +153,26 @@ impl CrateCorpusStore for PgBlobStore {
         {
             return Err(Error::invalid("Invalid staged registry records."));
         }
-        let rows = json_limit(&versions, 16 * 1024 * 1024)?;
+        let mut rows = json_limit(&versions, 16 * 1024 * 1024)?;
+        for row in rows
+            .as_array_mut()
+            .ok_or_else(|| Error::integrity("Invalid staged metadata batch."))?
+        {
+            let key = format!(
+                "{}@{}",
+                row["name"].as_str().ok_or_else(storage_error)?,
+                row["version"].as_str().ok_or_else(storage_error)?
+            );
+            row["record_integrity"] = json!(payload_integrity::digest(
+                "devres_crate_staging",
+                epoch,
+                &key,
+                &payload_integrity::crate_staging_payload(
+                    row["metadata_capture"].as_str().ok_or_else(storage_error)?,
+                    &row["record"]
+                )
+            )?);
+        }
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
@@ -179,7 +209,7 @@ impl CrateCorpusStore for PgBlobStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record) SELECT $1,r.name,r.version,r.metadata_capture,r.record FROM jsonb_to_recordset($2::jsonb) AS r(name text,version text,metadata_capture text,record jsonb)").bind(epoch).bind(Json(rows)).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) SELECT $1,r.name,r.version,r.metadata_capture,r.record,r.record_integrity FROM jsonb_to_recordset($2::jsonb) AS r(name text,version text,metadata_capture text,record jsonb,record_integrity text)").bind(epoch).bind(Json(rows)).execute(&mut *tx).await.map_err(|_|storage_error())?;
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn commit_inventory(&self, epoch: &str, manifest: &str) -> Result<Inventory> {
@@ -211,8 +241,43 @@ impl CrateCorpusStore for PgBlobStore {
                 "An older import cannot replace the current inventory.",
             ));
         }
-        sqlx::query("UPDATE devres_crate_versions v SET valid_to=$2 FROM devres_crate_changes c WHERE c.inventory=$1 AND c.name=v.name AND v.valid_to IS NULL").bind(epoch).bind(inv.sequence).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_versions(name,version,valid_from,metadata_capture,record) SELECT name,version,$2,metadata_capture,record FROM devres_crate_staging WHERE inventory=$1").bind(epoch).bind(inv.sequence).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        close_crate_versions(&mut tx, epoch, inv.sequence).await?;
+        let mut after = String::new();
+        loop {
+            let rows=sqlx::query("SELECT name,version,metadata_capture,record,record_integrity FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>$2 ORDER BY name||'@'||version LIMIT 1000").bind(epoch).bind(&after).fetch_all(&mut *tx).await.map_err(|_|storage_error())?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let name: String = row.try_get("name").map_err(|_| storage_error())?;
+                let version: String = row.try_get("version").map_err(|_| storage_error())?;
+                let key = format!("{name}@{version}");
+                let data: Json<Value> = row.try_get("record").map_err(|_| storage_error())?;
+                let expected: String = row
+                    .try_get("record_integrity")
+                    .map_err(|_| storage_error())?;
+                let metadata: String = row
+                    .try_get("metadata_capture")
+                    .map_err(|_| storage_error())?;
+                let data = payload_integrity::checked(
+                    "devres_crate_staging",
+                    epoch,
+                    &key,
+                    payload_integrity::crate_staging_payload(&metadata, &data.0),
+                    &expected,
+                )?["record"]
+                    .clone();
+                let digest = payload_integrity::digest(
+                    "devres_crate_versions",
+                    &inv.sequence.to_string(),
+                    &key,
+                    &payload_integrity::crate_record_payload(&metadata, None, &data),
+                )?;
+                sqlx::query("INSERT INTO devres_crate_versions(name,version,valid_from,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6)")
+                    .bind(name).bind(version).bind(inv.sequence).bind(row.try_get::<String,_>("metadata_capture").map_err(|_|storage_error())?).bind(Json(data)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+                after = key;
+            }
+        }
         // Index completeness and archive/documentation acquisition are deliberately independent.
         sqlx::query("INSERT INTO devres_crate_jobs(source_key,kind,name,version,target,checksum,metadata_capture,due_at) SELECT 'archive:'||name||':'||version||':'||(record->>'cksum'),'archive',name,version,'',record->>'cksum',metadata_capture,$2 FROM devres_crate_staging WHERE inventory=$1 ON CONFLICT(source_key) DO NOTHING").bind(epoch).bind(inv.created_at).execute(&mut *tx).await.map_err(|_|storage_error())?;
         sqlx::query("INSERT INTO devres_crate_jobs(source_key,kind,name,version,target,checksum,metadata_capture,due_at) SELECT 'platforms:'||name||':'||version,'platforms',name,version,'',record->>'cksum',metadata_capture,$2 FROM devres_crate_staging WHERE inventory=$1 ON CONFLICT(source_key) DO NOTHING").bind(epoch).bind(inv.created_at).execute(&mut *tx).await.map_err(|_|storage_error())?;
@@ -271,7 +336,7 @@ impl CrateCorpusStore for PgBlobStore {
         checked_id(epoch)?;
         page(limit, after)?;
         self.fence().await?;
-        let rows=sqlx::query("SELECT v.name,v.version,v.metadata_capture,v.record,g.error AS metadata_error FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.id=$1 AND i.published LEFT JOIN devres_crate_inventory_gaps g ON g.inventory=i.id AND g.name=v.name WHERE v.valid_from<=i.sequence AND (v.valid_to IS NULL OR v.valid_to>i.sequence) AND ($2::text IS NULL OR v.name=$2) AND ($3::text IS NULL OR v.name||'@'||v.version>$3) ORDER BY v.name||'@'||v.version LIMIT $4").bind(epoch).bind(name).bind(after).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let rows=sqlx::query("SELECT v.name,v.version,v.valid_from,v.valid_to,v.metadata_capture,v.record,v.record_integrity,g.error AS metadata_error FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.id=$1 AND i.published LEFT JOIN devres_crate_inventory_gaps g ON g.inventory=i.id AND g.name=v.name WHERE v.valid_from<=i.sequence AND (v.valid_to IS NULL OR v.valid_to>i.sequence) AND ((i.id LIKE 'blake3:%')=(SELECT id LIKE 'blake3:%' FROM devres_crate_inventories WHERE sequence=v.valid_from)) AND ($2::text IS NULL OR v.name=$2) AND ($3::text IS NULL OR v.name||'@'||v.version>$3) ORDER BY v.name||'@'||v.version LIMIT $4").bind(epoch).bind(name).bind(after).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         rows.into_iter()
             .map(|r| {
                 Ok(VersionRecord {
@@ -282,10 +347,7 @@ impl CrateCorpusStore for PgBlobStore {
                         .try_get::<Option<String>, _>("metadata_error")
                         .map_err(|_| storage_error())?
                         .map(|e| format!("stale_due_to_invalid_update:{e}")),
-                    record: r
-                        .try_get::<Json<Value>, _>("record")
-                        .map_err(|_| storage_error())?
-                        .0,
+                    record: checked_version(&r)?,
                 })
             })
             .collect()
@@ -294,6 +356,27 @@ impl CrateCorpusStore for PgBlobStore {
         let c = &artifact.capture;
         checked_id(&c.id)?;
         checked_id(&c.body_hash)?;
+        if !c.id.starts_with("blake3:") || !c.body_hash.starts_with("blake3:") {
+            let retained = CrateCorpusStore::artifact(self, &c.id)
+                .await?
+                .ok_or_else(|| {
+                    Error::integrity("New artifact captures require tagged BLAKE3 identities.")
+                })?;
+            if retained.capture.id != c.id
+                || retained.capture.key != c.key
+                || retained.capture.source_url != c.source_url
+                || retained.capture.body_hash != c.body_hash
+                || retained.capture.media_type != c.media_type
+                || retained.capture.retrieved_at != c.retrieved_at
+                || retained.bytes != artifact.bytes
+                || retained.provenance != artifact.provenance
+            {
+                return Err(Error::integrity(
+                    "Legacy artifact replay differs from retained evidence.",
+                ));
+            }
+            return Ok(());
+        }
         if artifact.bytes > 32 * 1024 * 1024 * 1024_u64
             || c.key.len() > 8192
             || c.source_url.len() > 8192
@@ -302,19 +385,58 @@ impl CrateCorpusStore for PgBlobStore {
             return Err(Error::capacity("Invalid bulk capture metadata."));
         }
         let provenance = json_limit(&artifact.provenance, 1024 * 1024)?;
-        // Verify the immutable object exists and has the exact committed length. Streaming writers verify its hash.
-        let meta = tokio::fs::symlink_metadata(self.root.join(&c.body_hash))
-            .await
-            .map_err(|_| storage_error())?;
-        if !meta.is_file() || meta.len() != artifact.bytes {
-            return Err(Error::integrity("Bulk artifact is missing or has changed."));
+        let archive = crate::bulk::BulkArtifactStore::new(&self.root, 64 * 1024 * 1024)?;
+        let verified = archive
+            .verify(
+                &c.body_hash,
+                crate::bulk::MAX_ARTIFACT_BYTES,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        if verified.bytes != artifact.bytes {
+            return Err(Error::integrity("Bulk artifact length mismatch."));
         }
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(&c.id).bind(&c.key).bind(&c.source_url).bind(&c.body_hash).bind(&c.media_type).bind(c.retrieved_at).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance) VALUES($1,$2,$3) ON CONFLICT DO NOTHING").bind(&c.id).bind(artifact.bytes as i64).bind(Json(provenance)).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_observations(capture_id,observed_at,transport,provenance) VALUES($1,$2,$3,$4)").bind(&c.id).bind(c.validated_at).bind(if http{"https"}else{"derived_or_git"}).bind(Json(&artifact.provenance)).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING").bind(&c.id).bind(&c.key).bind(&c.source_url).bind(&c.body_hash).bind(&c.media_type).bind(c.retrieved_at).bind(super::capture_metadata_digest(c)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING").bind(&c.id).bind(artifact.bytes as i64).bind(Json(&provenance)).bind(payload_integrity::digest("devres_crate_artifacts","",&c.id,&payload_integrity::crate_artifact_payload(artifact.bytes,&provenance))?).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        append_crate_observation(
+            &mut tx,
+            &c.id,
+            c.validated_at,
+            if http { "https" } else { "derived_or_git" },
+            &artifact.provenance,
+        )
+        .await?;
+        let retained=sqlx::query("SELECT provenance,provenance_integrity,bytes FROM devres_crate_artifacts WHERE capture_id=$1").bind(&c.id).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
+        let retained_data: Json<Value> = retained
+            .try_get("provenance")
+            .map_err(|_| storage_error())?;
+        payload_integrity::checked(
+            "devres_crate_artifacts",
+            "",
+            &c.id,
+            payload_integrity::crate_artifact_payload(
+                u64::try_from(
+                    retained
+                        .try_get::<i64, _>("bytes")
+                        .map_err(|_| storage_error())?,
+                )
+                .map_err(|_| Error::integrity("Invalid artifact length."))?,
+                &retained_data.0,
+            ),
+            &retained
+                .try_get::<String, _>("provenance_integrity")
+                .map_err(|_| storage_error())?,
+        )?;
+        if retained
+            .try_get::<i64, _>("bytes")
+            .map_err(|_| storage_error())?
+            != artifact.bytes as i64
+        {
+            return Err(Error::integrity("Artifact provenance identity collision."));
+        }
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn version(
@@ -325,7 +447,7 @@ impl CrateCorpusStore for PgBlobStore {
     ) -> Result<Option<VersionRecord>> {
         checked_id(epoch)?;
         self.fence().await?;
-        let row=sqlx::query("SELECT v.*,g.error AS metadata_error FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.id=$1 AND i.published LEFT JOIN devres_crate_inventory_gaps g ON g.inventory=i.id AND g.name=v.name WHERE v.name=$2 AND v.version=$3 AND v.valid_from<=i.sequence AND (v.valid_to IS NULL OR v.valid_to>i.sequence)").bind(epoch).bind(name).bind(version).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+        let row=sqlx::query("SELECT v.*,g.error AS metadata_error FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.id=$1 AND i.published LEFT JOIN devres_crate_inventory_gaps g ON g.inventory=i.id AND g.name=v.name WHERE v.name=$2 AND v.version=$3 AND v.valid_from<=i.sequence AND (v.valid_to IS NULL OR v.valid_to>i.sequence) AND ((i.id LIKE 'blake3:%')=(SELECT id LIKE 'blake3:%' FROM devres_crate_inventories WHERE sequence=v.valid_from))").bind(epoch).bind(name).bind(version).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
         row.map(|r| {
             Ok(VersionRecord {
                 name: r.try_get("name").map_err(|_| storage_error())?,
@@ -335,10 +457,7 @@ impl CrateCorpusStore for PgBlobStore {
                     .try_get::<Option<String>, _>("metadata_error")
                     .map_err(|_| storage_error())?
                     .map(|e| format!("stale_due_to_invalid_update:{e}")),
-                record: r
-                    .try_get::<Json<Value>, _>("record")
-                    .map_err(|_| storage_error())?
-                    .0,
+                record: checked_version(&r)?,
             })
         })
         .transpose()
@@ -346,12 +465,12 @@ impl CrateCorpusStore for PgBlobStore {
     async fn artifact(&self, id: &str) -> Result<Option<Artifact>> {
         checked_id(id)?;
         self.fence().await?;
-        let row=sqlx::query("SELECT c.*,a.bytes,a.provenance,(SELECT max(observed_at) FROM devres_crate_observations WHERE capture_id=c.id) AS validated_at FROM devres_captures c JOIN devres_crate_artifacts a ON a.capture_id=c.id WHERE c.id=$1").bind(id).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+        let row=sqlx::query("SELECT c.*,a.bytes,a.provenance,a.provenance_integrity,o.observed_at AS validated_at,o.sequence AS observed_sequence,o.transport AS observed_transport,o.provenance AS observed_provenance,o.provenance_integrity AS observed_integrity FROM devres_captures c JOIN devres_crate_artifacts a ON a.capture_id=c.id LEFT JOIN LATERAL(SELECT * FROM devres_crate_observations WHERE capture_id=c.id ORDER BY observed_at DESC LIMIT 1) o ON true WHERE c.id=$1").bind(id).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
         row.map(read_artifact).transpose()
     }
     async fn latest_artifact(&self, key: &str) -> Result<Option<Artifact>> {
         self.fence().await?;
-        let row=sqlx::query("SELECT c.*,a.bytes,a.provenance,o.observed_at AS validated_at FROM devres_crate_observations o JOIN devres_captures c ON c.id=o.capture_id JOIN devres_crate_artifacts a ON a.capture_id=c.id WHERE c.source_key=$1 ORDER BY o.sequence DESC LIMIT 1").bind(key).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+        let row=sqlx::query("SELECT c.*,a.bytes,a.provenance,a.provenance_integrity,o.observed_at AS validated_at,o.sequence AS observed_sequence,o.transport AS observed_transport,o.provenance AS observed_provenance,o.provenance_integrity AS observed_integrity FROM devres_crate_observations o JOIN devres_captures c ON c.id=o.capture_id JOIN devres_crate_artifacts a ON a.capture_id=c.id WHERE c.source_key=$1 ORDER BY o.sequence DESC LIMIT 1").bind(key).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
         row.map(read_artifact).transpose()
     }
     async fn import_metadata(
@@ -465,6 +584,45 @@ impl CrateCorpusStore for PgBlobStore {
     }
     async fn stage_content(&self, generation: &str, records: &[ContentRecord]) -> Result<()> {
         checked_id(generation)?;
+        self.fence().await?;
+        if !generation.starts_with("blake3:") {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM devres_crate_generations WHERE id=$1)",
+            )
+            .bind(generation)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| storage_error())?;
+            if !exists {
+                return Err(Error::integrity(
+                    "New content generations require tagged BLAKE3 identities.",
+                ));
+            }
+        }
+        for record in records {
+            if !record.id.starts_with("blake3:") {
+                let retained =
+                    sqlx::query("SELECT * FROM devres_crate_content WHERE generation=$1 AND id=$2")
+                        .bind(generation)
+                        .bind(&record.id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|_| storage_error())?
+                        .ok_or_else(|| {
+                            Error::integrity(
+                                "New content records require tagged BLAKE3 identities.",
+                            )
+                        })?;
+                checked_attributes(&retained)?;
+                if payload_integrity::crate_content_row(&retained)?
+                    != serde_json::to_value(record).map_err(|_| storage_error())?
+                {
+                    return Err(Error::integrity(
+                        "Legacy content replay differs from retained evidence.",
+                    ));
+                }
+            }
+        }
         if records.len() > 100 {
             return Err(Error::capacity("Content batch exceeds 100 records."));
         }
@@ -486,27 +644,52 @@ impl CrateCorpusStore for PgBlobStore {
             }
             json_limit(&r.attributes, 1024 * 1024)?;
         }
-        let value = json_limit(&records, 16 * 1024 * 1024)?;
+        let mut value = json_limit(&records, 16 * 1024 * 1024)?;
+        for row in value
+            .as_array_mut()
+            .ok_or_else(|| Error::integrity("Invalid content batch."))?
+        {
+            row["attributes_integrity"] = json!(payload_integrity::digest(
+                "devres_crate_content",
+                generation,
+                row["id"].as_str().ok_or_else(storage_error)?,
+                &*row
+            )?);
+        }
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_generations(id) VALUES($1) ON CONFLICT DO NOTHING")
-            .bind(generation)
+        sqlx::query("INSERT INTO devres_crate_generations(id,summary_integrity) VALUES($1,$2) ON CONFLICT DO NOTHING")
+            .bind(generation).bind(payload_integrity::digest("devres_crate_generations","",generation,&payload_integrity::crate_generation_payload(None,&json!({}))?)?)
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        let committed: bool = sqlx::query_scalar(
-            "SELECT published_sequence IS NOT NULL FROM devres_crate_generations WHERE id=$1 FOR UPDATE",
-        )
-        .bind(generation)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?;
+        let generation_row = sqlx::query("SELECT published_sequence,summary,summary_integrity FROM devres_crate_generations WHERE id=$1 FOR UPDATE")
+            .bind(generation).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
+        let published: Option<i64> = generation_row
+            .try_get("published_sequence")
+            .map_err(|_| storage_error())?;
+        payload_integrity::checked(
+            "devres_crate_generations",
+            "",
+            generation,
+            payload_integrity::crate_generation_payload(
+                published,
+                &generation_row
+                    .try_get::<Json<Value>, _>("summary")
+                    .map_err(|_| storage_error())?
+                    .0,
+            )?,
+            &generation_row
+                .try_get::<String, _>("summary_integrity")
+                .map_err(|_| storage_error())?,
+        )?;
+        let committed = published.is_some();
         if !committed {
-            sqlx::query("INSERT INTO devres_crate_content(generation,id,name,version,target,path,kind,capture,metadata_capture,archive_capture,attributes) SELECT $1,r.id,r.name,r.version,r.target,r.path,r.kind,r.capture,r.metadata_capture,r.archive_capture,r.attributes FROM jsonb_to_recordset($2::jsonb) AS r(id text,name text,version text,target text,path text,kind text,capture text,metadata_capture text,archive_capture text,attributes jsonb) ON CONFLICT(generation,id) DO NOTHING").bind(generation).bind(Json(value)).execute(&mut *tx).await.map_err(|_|storage_error())?;
+            sqlx::query("INSERT INTO devres_crate_content(generation,id,name,version,target,path,kind,capture,metadata_capture,archive_capture,attributes,attributes_integrity) SELECT $1,r.id,r.name,r.version,r.target,r.path,r.kind,r.capture,r.metadata_capture,r.archive_capture,r.attributes,r.attributes_integrity FROM jsonb_to_recordset($2::jsonb) AS r(id text,name text,version text,target text,path text,kind text,capture text,metadata_capture text,archive_capture text,attributes jsonb,attributes_integrity text) ON CONFLICT(generation,id) DO NOTHING").bind(generation).bind(Json(value)).execute(&mut *tx).await.map_err(|_|storage_error())?;
         } else {
             for record in records {
-                let existing:Option<Json<Value>>=sqlx::query_scalar("SELECT to_jsonb(c)-'generation' FROM devres_crate_content c WHERE generation=$1 AND id=$2").bind(generation).bind(&record.id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+                let existing:Option<Json<Value>>=sqlx::query_scalar("SELECT to_jsonb(c)-'generation'-'attributes_integrity' FROM devres_crate_content c WHERE generation=$1 AND id=$2").bind(generation).bind(&record.id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
                 if existing.as_ref().map(|j| &j.0)
                     != Some(
                         &serde_json::to_value(record)
@@ -519,15 +702,74 @@ impl CrateCorpusStore for PgBlobStore {
                 }
             }
         }
+        for record in records {
+            let retained =
+                sqlx::query("SELECT * FROM devres_crate_content WHERE generation=$1 AND id=$2")
+                    .bind(generation)
+                    .bind(&record.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| storage_error())?;
+            let attributes = checked_attributes(&retained)?;
+            if attributes != record.attributes {
+                return Err(Error::integrity("Immutable content attributes collision."));
+            }
+        }
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn commit_content(&self, generation: &str, summary: Value) -> Result<()> {
         checked_id(generation)?;
+        self.fence().await?;
         let summary = json_limit(&summary, 1024 * 1024)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_generations(id,published_sequence,summary) VALUES($1,nextval('devres_crate_content_sequence'),$2) ON CONFLICT(id) DO UPDATE SET published_sequence=COALESCE(devres_crate_generations.published_sequence,EXCLUDED.published_sequence),summary=CASE WHEN devres_crate_generations.published_sequence IS NULL THEN EXCLUDED.summary ELSE devres_crate_generations.summary END").bind(generation).bind(Json(summary)).execute(&mut *owner).await.map_err(|_|storage_error())?;
-        Ok(())
+        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let retained = sqlx::query("SELECT published_sequence,summary,summary_integrity FROM devres_crate_generations WHERE id=$1 FOR UPDATE")
+            .bind(generation).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+        if let Some(row) = retained {
+            let published: Option<i64> = row
+                .try_get("published_sequence")
+                .map_err(|_| storage_error())?;
+            let stored: Json<Value> = row.try_get("summary").map_err(|_| storage_error())?;
+            payload_integrity::checked(
+                "devres_crate_generations",
+                "",
+                generation,
+                payload_integrity::crate_generation_payload(published, &stored.0)?,
+                &row.try_get::<String, _>("summary_integrity")
+                    .map_err(|_| storage_error())?,
+            )?;
+            if published.is_some() {
+                if !generation.starts_with("blake3:") && stored.0 != summary {
+                    return Err(Error::integrity(
+                        "Legacy generation replay differs from retained publication.",
+                    ));
+                }
+                return tx.commit().await.map_err(|_| storage_error());
+            }
+            if !generation.starts_with("blake3:") {
+                return Err(Error::integrity(
+                    "New content generations require tagged BLAKE3 identities.",
+                ));
+            }
+        } else if !generation.starts_with("blake3:") {
+            return Err(Error::integrity(
+                "New content generations require tagged BLAKE3 identities.",
+            ));
+        }
+        let sequence: i64 = sqlx::query_scalar("SELECT nextval('devres_crate_content_sequence')")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| storage_error())?;
+        let digest = payload_integrity::digest(
+            "devres_crate_generations",
+            "",
+            generation,
+            &payload_integrity::crate_generation_payload(Some(sequence), &summary)?,
+        )?;
+        sqlx::query("INSERT INTO devres_crate_generations(id,published_sequence,summary,summary_integrity) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET published_sequence=EXCLUDED.published_sequence,summary=EXCLUDED.summary,summary_integrity=EXCLUDED.summary_integrity")
+            .bind(generation).bind(sequence).bind(Json(&summary)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        tx.commit().await.map_err(|_| storage_error())
     }
     async fn contents(
         &self,
@@ -538,9 +780,27 @@ impl CrateCorpusStore for PgBlobStore {
     ) -> Result<Vec<ContentRecord>> {
         page(limit, after)?;
         self.fence().await?;
-        let rows=sqlx::query("SELECT * FROM (SELECT DISTINCT ON(c.name,c.version,c.target,c.path,c.kind) c.* FROM devres_crate_content c JOIN devres_crate_generations g ON g.id=c.generation WHERE g.published_sequence<=$1 AND g.published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 GROUP BY COALESCE(summary->>'job_key',id)) AND ($2::text IS NULL OR c.name=$2) AND ($3::text IS NULL OR c.version=$3) AND ($4::text IS NULL OR c.target=$4) AND ($5::text IS NULL OR c.path=$5) AND ($6::text IS NULL OR c.kind=$6) ORDER BY c.name,c.version,c.target,c.path,c.kind,g.published_sequence DESC) q WHERE ($7::text IS NULL OR id>$7) ORDER BY id LIMIT $8").bind(cutoff).bind(&filter.name).bind(&filter.version).bind(&filter.target).bind(&filter.path).bind(&filter.kind).bind(after).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let hidden = self
+            .visibility_aliases("crate", "generations", Some(cutoff))
+            .await?;
+        let rows=sqlx::query("SELECT * FROM (SELECT DISTINCT ON(c.name,c.version,c.target,c.path,c.kind) c.*,g.summary AS generation_summary,g.published_sequence AS generation_sequence,g.summary_integrity AS generation_integrity FROM devres_crate_content c JOIN devres_crate_generations g ON g.id=c.generation WHERE g.published_sequence<=$1 AND NOT(g.id=ANY($9::text[])) AND g.published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 GROUP BY COALESCE(summary->>'job_key',id)) AND ($2::text IS NULL OR c.name=$2) AND ($3::text IS NULL OR c.version=$3) AND ($4::text IS NULL OR c.target=$4) AND ($5::text IS NULL OR c.path=$5) AND ($6::text IS NULL OR c.kind=$6) ORDER BY c.name,c.version,c.target,c.path,c.kind,g.published_sequence DESC) q WHERE ($7::text IS NULL OR id>$7) ORDER BY id LIMIT $8").bind(cutoff).bind(&filter.name).bind(&filter.version).bind(&filter.target).bind(&filter.path).bind(&filter.kind).bind(after).bind(limit as i64).bind(hidden.as_ref()).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         rows.into_iter()
             .map(|r| {
+                payload_integrity::checked(
+                    "devres_crate_generations",
+                    "",
+                    &r.try_get::<String, _>("generation")
+                        .map_err(|_| storage_error())?,
+                    payload_integrity::crate_generation_payload(
+                        r.try_get("generation_sequence")
+                            .map_err(|_| storage_error())?,
+                        &r.try_get::<Json<Value>, _>("generation_summary")
+                            .map_err(|_| storage_error())?
+                            .0,
+                    )?,
+                    &r.try_get::<String, _>("generation_integrity")
+                        .map_err(|_| storage_error())?,
+                )?;
                 Ok(ContentRecord {
                     id: r.try_get("id").map_err(|_| storage_error())?,
                     name: r.try_get("name").map_err(|_| storage_error())?,
@@ -551,10 +811,7 @@ impl CrateCorpusStore for PgBlobStore {
                     capture: r.try_get("capture").map_err(|_| storage_error())?,
                     metadata_capture: r.try_get("metadata_capture").map_err(|_| storage_error())?,
                     archive_capture: r.try_get("archive_capture").map_err(|_| storage_error())?,
-                    attributes: r
-                        .try_get::<Json<Value>, _>("attributes")
-                        .map_err(|_| storage_error())?
-                        .0,
+                    attributes: checked_attributes(&r)?,
                 })
             })
             .collect()
@@ -583,13 +840,37 @@ impl CrateCorpusStore for PgBlobStore {
         }
         let values: Vec<_> = rows
             .iter()
-            .map(|(id, value)| json!({"id":id,"value":value}))
+            .map(|(id,value)|Ok(json!({"id":id,"value":value,"integrity":payload_integrity::digest("devres_crate_enrichment",&format!("{artifact}:{kind}"),id,value)?})))
+            .collect::<Result<Vec<_>>>()?.into_iter()
             .collect();
         let value = json_limit(&values, 8 * 1024 * 1024)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_enrichment(artifact,kind,external_id,data) SELECT $1,$2,r.id,r.value FROM jsonb_to_recordset($3::jsonb) AS r(id text,value jsonb) ON CONFLICT DO NOTHING").bind(artifact).bind(kind).bind(Json(value)).execute(&mut *owner).await.map_err(|_|storage_error())?;
-        Ok(())
+        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        sqlx::query("INSERT INTO devres_crate_enrichment(artifact,kind,external_id,data,data_integrity) SELECT $1,$2,r.id,r.value,r.integrity FROM jsonb_to_recordset($3::jsonb) AS r(id text,value jsonb,integrity text) ON CONFLICT DO NOTHING").bind(artifact).bind(kind).bind(Json(value)).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        let ids = rows.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let retained=sqlx::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind=$2 AND external_id=ANY($3::text[])").bind(artifact).bind(kind).bind(&ids).fetch_all(&mut *tx).await.map_err(|_|storage_error())?;
+        for row in retained {
+            let key: String = row.try_get("external_id").map_err(|_| storage_error())?;
+            let data = payload_integrity::checked(
+                "devres_crate_enrichment",
+                &format!("{artifact}:{kind}"),
+                &key,
+                row.try_get::<Json<Value>, _>("data")
+                    .map_err(|_| storage_error())?
+                    .0,
+                &row.try_get::<String, _>("data_integrity")
+                    .map_err(|_| storage_error())?,
+            )?;
+            if rows
+                .iter()
+                .find(|(id, _)| *id == key)
+                .is_none_or(|(_, expected)| *expected != data)
+            {
+                return Err(Error::integrity("Immutable enrichment identity collision."));
+            }
+        }
+        tx.commit().await.map_err(|_| storage_error())
     }
     async fn content_deltas(&self, query: &ContentDeltaQuery) -> Result<Vec<Value>> {
         let ContentDeltaQuery {
@@ -611,11 +892,65 @@ impl CrateCorpusStore for PgBlobStore {
         );
         page(limit, after)?;
         self.fence().await?;
+        let hidden = self
+            .visibility_aliases("crate", "generations", Some(cutoff))
+            .await?;
         if !matches!(kind, "api" | "text") {
             return Err(Error::invalid("Comparison kind must be api or text."));
         }
-        let rows:Vec<Json<Value>>=sqlx::query_scalar("WITH latest AS (SELECT DISTINCT ON(c.version,c.target,c.path,c.kind) c.*,b.body_hash FROM devres_crate_content c JOIN devres_crate_generations g ON g.id=c.generation JOIN devres_captures b ON b.id=c.capture WHERE c.name=$2 AND c.version IN($3,$4) AND g.published_sequence<=$1 AND g.published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 GROUP BY COALESCE(summary->>'job_key',id)) AND ($5::text IS NULL OR c.target=$5) AND (($6='api' AND c.kind='api') OR ($6='text' AND c.kind IN('source','manifest','readme','license'))) ORDER BY c.version,c.target,c.path,c.kind,g.published_sequence DESC), a AS(SELECT * FROM latest WHERE version=$3), b AS(SELECT * FROM latest WHERE version=$4), changes AS(SELECT COALESCE(a.target,b.target)||chr(31)||COALESCE(a.path,b.path) AS cursor,COALESCE(a.path,b.path) AS path,COALESCE(a.target,b.target) AS target,CASE WHEN a.id IS NULL THEN 'added' WHEN b.id IS NULL THEN 'removed' WHEN $6='api' AND a.attributes->'format_version' IS DISTINCT FROM b.attributes->'format_version' THEN 'uncomparable' WHEN $6='api' AND a.attributes->'signature' IS NOT DISTINCT FROM b.attributes->'signature' THEN 'unchanged' WHEN $6='text' AND a.body_hash=b.body_hash THEN 'unchanged' ELSE 'changed' END AS change,to_jsonb(a)-'generation'-'body_hash' AS old,to_jsonb(b)-'generation'-'body_hash' AS new FROM a FULL JOIN b ON a.target=b.target AND a.path=b.path) SELECT jsonb_build_object('cursor',cursor,'path',path,'target',target,'change',change,'from',old,'to',new) FROM changes WHERE change<>'unchanged' AND ($7::text IS NULL OR cursor>$7) ORDER BY cursor LIMIT $8").bind(cutoff).bind(name).bind(from).bind(to).bind(target).bind(kind).bind(after).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
-        Ok(rows.into_iter().map(|j| j.0).collect())
+        let rows:Vec<Json<Value>>=sqlx::query_scalar("WITH latest AS (SELECT DISTINCT ON(c.version,c.target,c.path,c.kind) c.*,b.body_hash,g.published_sequence AS generation_sequence,g.summary AS generation_summary,g.summary_integrity AS generation_integrity FROM devres_crate_content c JOIN devres_crate_generations g ON g.id=c.generation JOIN devres_captures b ON b.id=c.capture WHERE c.name=$2 AND c.version IN($3,$4) AND g.published_sequence<=$1 AND NOT(g.id=ANY($9::text[])) AND g.published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 GROUP BY COALESCE(summary->>'job_key',id)) AND ($5::text IS NULL OR c.target=$5) AND (($6='api' AND c.kind='api') OR ($6='text' AND c.kind IN('source','manifest','readme','license'))) ORDER BY c.version,c.target,c.path,c.kind,g.published_sequence DESC), a AS(SELECT * FROM latest WHERE version=$3), b AS(SELECT * FROM latest WHERE version=$4), changes AS(SELECT COALESCE(a.target,b.target)||chr(31)||COALESCE(a.path,b.path) AS cursor,COALESCE(a.path,b.path) AS path,COALESCE(a.target,b.target) AS target,CASE WHEN a.id IS NULL THEN 'added' WHEN b.id IS NULL THEN 'removed' WHEN $6='api' AND a.attributes->'format_version' IS DISTINCT FROM b.attributes->'format_version' THEN 'uncomparable' WHEN $6='api' AND a.attributes->'signature' IS NOT DISTINCT FROM b.attributes->'signature' THEN 'unchanged' WHEN $6='text' AND a.body_hash=b.body_hash THEN 'unchanged' ELSE 'changed' END AS change,to_jsonb(a)-'body_hash' AS old,to_jsonb(b)-'body_hash' AS new FROM a FULL JOIN b ON a.target=b.target AND a.path=b.path) SELECT jsonb_build_object('cursor',cursor,'path',path,'target',target,'change',change,'from',old,'to',new) FROM changes WHERE change<>'unchanged' AND ($7::text IS NULL OR cursor>$7) ORDER BY cursor LIMIT $8").bind(cutoff).bind(name).bind(from).bind(to).bind(target).bind(kind).bind(after).bind(limit as i64).bind(hidden.as_ref()).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        rows.into_iter()
+            .map(|Json(mut value)| {
+                for side in ["from", "to"] {
+                    if value[side].is_null() {
+                        continue;
+                    }
+                    let item = &value[side];
+                    payload_integrity::checked(
+                        "devres_crate_generations",
+                        "",
+                        item["generation"].as_str().ok_or_else(storage_error)?,
+                        payload_integrity::crate_generation_payload(
+                            Some(
+                                item["generation_sequence"]
+                                    .as_i64()
+                                    .ok_or_else(storage_error)?,
+                            ),
+                            &item["generation_summary"],
+                        )?,
+                        item["generation_integrity"]
+                            .as_str()
+                            .ok_or_else(storage_error)?,
+                    )?;
+                    payload_integrity::checked(
+                        "devres_crate_content",
+                        item["generation"].as_str().ok_or_else(storage_error)?,
+                        item["id"].as_str().ok_or_else(storage_error)?,
+                        {
+                            let mut payload = item.clone();
+                            let object = payload.as_object_mut().ok_or_else(storage_error)?;
+                            object.remove("generation");
+                            object.remove("attributes_integrity");
+                            object.remove("generation_sequence");
+                            object.remove("generation_summary");
+                            object.remove("generation_integrity");
+                            payload
+                        },
+                        item["attributes_integrity"]
+                            .as_str()
+                            .ok_or_else(storage_error)?,
+                    )?;
+                    if let Some(object) = value[side].as_object_mut() {
+                        object.remove("generation");
+                        object.remove("attributes_integrity");
+                        object.remove("generation_sequence");
+                        object.remove("generation_summary");
+                        object.remove("generation_integrity");
+                    }
+                }
+                Ok(value)
+            })
+            .collect()
     }
     async fn projection_status(
         &self,
@@ -626,8 +961,13 @@ impl CrateCorpusStore for PgBlobStore {
         target: Option<&str>,
     ) -> Result<Vec<Value>> {
         self.fence().await?;
-        let rows:Vec<Json<Value>>=sqlx::query_scalar("SELECT summary FROM devres_crate_generations WHERE published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 AND summary->>'name'=$2 AND summary->>'version'=$3 AND summary->>'kind'=$4 AND ($5::text IS NULL OR summary->>'target'=$5) GROUP BY COALESCE(summary->>'job_key',id)) ORDER BY summary->>'target' LIMIT 1001").bind(cutoff).bind(name).bind(version).bind(kind).bind(target).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
-        Ok(rows.into_iter().map(|j| j.0).collect())
+        let hidden = self
+            .visibility_aliases("crate", "generations", Some(cutoff))
+            .await?;
+        let rows=sqlx::query("SELECT published_sequence,''::text AS kind,id AS key,summary AS data,summary_integrity AS data_integrity FROM devres_crate_generations WHERE published_sequence IN(SELECT max(published_sequence) FROM devres_crate_generations WHERE published_sequence<=$1 AND NOT(id=ANY($6::text[])) AND summary->>'name'=$2 AND summary->>'version'=$3 AND summary->>'kind'=$4 AND ($5::text IS NULL OR summary->>'target'=$5) GROUP BY COALESCE(summary->>'job_key',id)) ORDER BY summary->>'target' LIMIT 1001").bind(cutoff).bind(name).bind(version).bind(kind).bind(target).bind(hidden.as_ref()).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        rows.into_iter()
+            .map(|row| payload_integrity::row("devres_crate_generations", &row))
+            .collect()
     }
     async fn commit_enrichment(&self, artifact: &str) -> Result<()> {
         checked_id(artifact)?;
@@ -647,18 +987,59 @@ impl CrateCorpusStore for PgBlobStore {
         let Some(artifact) = artifact else {
             return Ok(json!({}));
         };
-        let row:Option<Json<Value>>=sqlx::query_scalar("SELECT jsonb_build_object('crate',c.data,'version',v.data,'artifact',$1,'keywords',COALESCE((SELECT CASE WHEN count(*)<=1024 THEN jsonb_agg(k.data->>'keyword' ORDER BY k.data->>'keyword') ELSE jsonb_build_object('capacity_exceeded',true) END FROM devres_crate_enrichment ck JOIN devres_crate_enrichment k ON k.artifact=ck.artifact AND k.kind='keywords' AND k.external_id=ck.data->>'keyword_id' WHERE ck.artifact=c.artifact AND ck.kind='crates_keywords' AND ck.data->>'crate_id'=c.external_id),'[]'::jsonb),'categories',COALESCE((SELECT CASE WHEN count(*)<=1024 THEN jsonb_agg(k.data->>'slug' ORDER BY k.data->>'slug') ELSE jsonb_build_object('capacity_exceeded',true) END FROM devres_crate_enrichment ck JOIN devres_crate_enrichment k ON k.artifact=ck.artifact AND k.kind='categories' AND k.external_id=ck.data->>'category_id' WHERE ck.artifact=c.artifact AND ck.kind='crates_categories' AND ck.data->>'crate_id'=c.external_id),'[]'::jsonb)) FROM devres_crate_enrichment c LEFT JOIN devres_crate_enrichment v ON v.artifact=c.artifact AND v.kind='versions' AND v.data->>'crate_id'=c.external_id AND v.data->>'num'=$3 WHERE c.artifact=$1 AND c.kind='crates' AND lower(c.data->>'name')=lower($2) LIMIT 1").bind(artifact).bind(name).bind(version).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-        let value = row.map_or_else(|| json!({}), |j| j.0);
-        if ["keywords", "categories"]
-            .iter()
-            .any(|k| value.get(k).is_some_and(|v| !v.is_array()))
-        {
-            return Err(Error::capacity(
-                "Metadata enrichment relation bound exceeded.",
-            ));
+        let Some(found)=sqlx::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind='crates' AND lower(data->>'name')=lower($2) LIMIT 1")
+            .bind(artifact).bind(name).fetch_optional(&self.pool).await.map_err(|_|storage_error())? else{return Ok(json!({}));};
+        let crate_id: String = found.try_get("external_id").map_err(|_| storage_error())?;
+        let crate_data = checked_enrichment(artifact, "crates", &found)?;
+        let version_data=sqlx::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind='versions' AND data->>'crate_id'=$2 AND data->>'num'=$3 LIMIT 1")
+            .bind(artifact).bind(&crate_id).bind(version).fetch_optional(&self.pool).await.map_err(|_|storage_error())?
+            .map(|row|checked_enrichment(artifact,"versions",&row)).transpose()?.unwrap_or(Value::Null);
+        let mut result = json!({"crate":crate_data,"version":version_data,"artifact":artifact});
+        for (relation, target, reference, field, output) in [
+            (
+                "crates_keywords",
+                "keywords",
+                "keyword_id",
+                "keyword",
+                "keywords",
+            ),
+            (
+                "crates_categories",
+                "categories",
+                "category_id",
+                "slug",
+                "categories",
+            ),
+        ] {
+            let rows=sqlx::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind=$2 AND data->>'crate_id'=$3 LIMIT 1025")
+                .bind(artifact).bind(relation).bind(&crate_id).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            if rows.len() > 1024 {
+                return Err(Error::capacity(
+                    "Metadata enrichment relation bound exceeded.",
+                ));
+            }
+            let mut values = Vec::new();
+            for row in rows {
+                let relation_data = checked_enrichment(artifact, relation, &row)?;
+                let Some(key) = json_text(&relation_data[reference]) else {
+                    continue;
+                };
+                if let Some(found)=sqlx::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind=$2 AND external_id=$3")
+                    .bind(artifact).bind(target).bind(key).fetch_optional(&self.pool).await.map_err(|_|storage_error())? {
+                    let data=checked_enrichment(artifact,target,&found)?;
+                    values.push(json_text(&data[field]));
+                }
+            }
+            values.sort_by(|a, b| match (a, b) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, _) => std::cmp::Ordering::Greater,
+                (_, None) => std::cmp::Ordering::Less,
+                (Some(a), Some(b)) => a.cmp(b),
+            });
+            result[output] = serde_json::to_value(values).map_err(|_| storage_error())?;
         }
-        json_limit(&value, 2 * 1024 * 1024)?;
-        Ok(value)
+        json_limit(&result, 2 * 1024 * 1024)?;
+        Ok(result)
     }
     async fn prepare_snapshot(&self, epoch: &str, now: i64) -> Result<Snapshot> {
         checked_id(epoch)?;
@@ -687,7 +1068,7 @@ impl CrateCorpusStore for PgBlobStore {
         .await
         .map_err(|_| storage_error())?;
         let counts:Json<Value>=sqlx::query_scalar("SELECT COALESCE(jsonb_object_agg(kind,stats),'{}'::jsonb) FROM (SELECT kind,jsonb_build_object('total',count(*),'captured',count(artifact),'failed',count(*) FILTER(WHERE last_error IS NOT NULL)) stats FROM devres_crate_jobs GROUP BY kind) q").fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
-        let versions:i64=sqlx::query_scalar("SELECT count(*) FROM devres_crate_versions WHERE valid_from<=$1 AND (valid_to IS NULL OR valid_to>$1)").bind(inv.sequence).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
+        let versions:i64=sqlx::query_scalar("SELECT count(*) FROM devres_crate_versions v WHERE valid_from<=$1 AND (valid_to IS NULL OR valid_to>$1) AND ($2=(SELECT id LIKE 'blake3:%' FROM devres_crate_inventories WHERE sequence=v.valid_from))").bind(inv.sequence).bind(inv.id.starts_with("blake3:")).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         let gaps: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM devres_crate_inventory_gaps WHERE inventory=$1",
         )
@@ -695,7 +1076,17 @@ impl CrateCorpusStore for PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        let processing:Json<Value>=sqlx::query_scalar("SELECT jsonb_build_object('published_generations',count(*),'skipped_binary',COALESCE(sum((summary->>'skipped_binary')::bigint),0),'skipped_oversized',COALESCE(sum((summary->>'skipped_oversized')::bigint),0),'unresolved_references',COALESCE(sum((summary->>'unresolved_references')::bigint),0)) FROM devres_crate_generations WHERE published_sequence<=$1").bind(cutoff).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
+        let hidden = self
+            .visibility_aliases("crate", "generations", Some(cutoff))
+            .await?;
+        {
+            use futures::TryStreamExt;
+            let mut stream=sqlx::query("SELECT published_sequence,''::text AS kind,id AS key,summary AS data,summary_integrity AS data_integrity FROM devres_crate_generations g WHERE published_sequence<=$1 AND NOT(g.id=ANY($2::text[]))").bind(cutoff).bind(hidden.as_ref()).fetch(&mut *tx);
+            while let Some(row) = stream.try_next().await.map_err(|_| storage_error())? {
+                payload_integrity::row("devres_crate_generations", &row)?;
+            }
+        }
+        let processing:Json<Value>=sqlx::query_scalar("SELECT jsonb_build_object('published_generations',count(*),'skipped_binary',COALESCE(sum((summary->>'skipped_binary')::bigint),0),'skipped_oversized',COALESCE(sum((summary->>'skipped_oversized')::bigint),0),'unresolved_references',COALESCE(sum((summary->>'unresolved_references')::bigint),0)) FROM devres_crate_generations g WHERE published_sequence<=$1 AND NOT(g.id=ANY($2::text[]))").bind(cutoff).bind(hidden.as_ref()).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         let coverage = json!({"inventory_complete":gaps==0,"inventory_enumeration_complete":true,"metadata_gaps":gaps,"processing_cumulative":processing.0,"versions":versions,"jobs":counts.0,"content_sequence":cutoff,"processor_version":1});
         let id=hash(serde_json::to_vec(&json!({"inventory":inv.id,"inventory_validated_at":inv.validated_at,"content_sequence":cutoff,"enrichment":enrichment,"index":index_manifest,"coverage":coverage})).map_err(|_|Error::integrity("Snapshot identity failed."))?.as_slice());
         let snapshot = Snapshot {
@@ -729,13 +1120,17 @@ impl CrateCorpusStore for PgBlobStore {
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_crate_snapshots(id,inventory,content_sequence,data) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING").bind(&snapshot.id).bind(&snapshot.inventory.id).bind(snapshot.content_sequence).bind(Json(encoded)).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('devres_crate_snapshots','sequence'))",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?;
+        sqlx::query("INSERT INTO devres_crate_snapshots(id,inventory,content_sequence,data,data_integrity,sequence) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(&snapshot.id).bind(&snapshot.inventory.id).bind(snapshot.content_sequence).bind(Json(&encoded)).bind(payload_integrity::digest("devres_crate_snapshots","",&snapshot.id,&payload_integrity::crate_snapshot_payload(sequence,&snapshot.inventory.id,snapshot.content_sequence,&encoded)?)?).bind(sequence).execute(&mut *tx).await.map_err(|_|storage_error())?;
         let retained: Json<Value> =
-            sqlx::query_scalar("SELECT data FROM devres_crate_snapshots WHERE id=$1")
-                .bind(&snapshot.id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
+            payload_integrity::load(&mut *tx, "devres_crate_snapshots", "", &snapshot.id)
+                .await?
+                .ok_or_else(|| Error::integrity("Crate snapshot missing."))?;
         tx.commit().await.map_err(|_| storage_error())?;
         serde_json::from_value(retained.0).map_err(|_| Error::integrity("Invalid stored snapshot."))
     }
@@ -754,10 +1149,10 @@ impl CrateCorpusStore for PgBlobStore {
             checked_id(id)?;
         }
         self.fence().await?;
-        let value:Option<Json<Value>>=sqlx::query_scalar("SELECT data FROM devres_crate_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY sequence DESC LIMIT 1").bind(id).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+        let value=sqlx::query("SELECT sequence,inventory,content_sequence,''::text AS kind,id AS key,data,data_integrity FROM devres_crate_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY sequence DESC LIMIT 1").bind(id).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
         value
             .map(|v| {
-                serde_json::from_value(v.0)
+                serde_json::from_value(payload_integrity::row("devres_crate_snapshots", &v)?)
                     .map_err(|_| Error::integrity("Invalid stored crate snapshot."))
             })
             .transpose()
@@ -771,24 +1166,186 @@ impl CrateCorpusStore for PgBlobStore {
         )
     }
 }
-fn read_artifact(r: sqlx::postgres::PgRow) -> Result<Artifact> {
-    Ok(Artifact {
-        capture: Capture {
-            id: r.try_get("id").map_err(|_| storage_error())?,
-            key: r.try_get("source_key").map_err(|_| storage_error())?,
-            source_url: r.try_get("source_url").map_err(|_| storage_error())?,
-            body_hash: r.try_get("body_hash").map_err(|_| storage_error())?,
-            media_type: r.try_get("media_type").map_err(|_| storage_error())?,
-            retrieved_at: r.try_get("retrieved_at").map_err(|_| storage_error())?,
-            validated_at: r.try_get("validated_at").map_err(|_| storage_error())?,
-        },
-        bytes: u64::try_from(r.try_get::<i64, _>("bytes").map_err(|_| storage_error())?)
-            .map_err(|_| Error::integrity("Invalid artifact size."))?,
-        provenance: r
-            .try_get::<Json<Value>, _>("provenance")
+fn json_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        value => Some(value.to_string()),
+    }
+}
+fn checked_enrichment(artifact: &str, kind: &str, row: &sqlx::postgres::PgRow) -> Result<Value> {
+    payload_integrity::checked(
+        "devres_crate_enrichment",
+        &format!("{artifact}:{kind}"),
+        &row.try_get::<String, _>("external_id")
+            .map_err(|_| storage_error())?,
+        row.try_get::<Json<Value>, _>("data")
             .map_err(|_| storage_error())?
             .0,
+        &row.try_get::<String, _>("data_integrity")
+            .map_err(|_| storage_error())?,
+    )
+}
+fn checked_version(row: &sqlx::postgres::PgRow) -> Result<Value> {
+    let key = format!(
+        "{}@{}",
+        row.try_get::<String, _>("name")
+            .map_err(|_| storage_error())?,
+        row.try_get::<String, _>("version")
+            .map_err(|_| storage_error())?
+    );
+    let record: Json<Value> = row.try_get("record").map_err(|_| storage_error())?;
+    let payload = payload_integrity::crate_record_payload(
+        &row.try_get::<String, _>("metadata_capture")
+            .map_err(|_| storage_error())?,
+        row.try_get::<Option<i64>, _>("valid_to")
+            .map_err(|_| storage_error())?,
+        &record.0,
+    );
+    payload_integrity::checked(
+        "devres_crate_versions",
+        &row.try_get::<i64, _>("valid_from")
+            .map_err(|_| storage_error())?
+            .to_string(),
+        &key,
+        payload,
+        &row.try_get::<String, _>("record_integrity")
+            .map_err(|_| storage_error())?,
+    )?;
+    Ok(record.0)
+}
+fn checked_attributes(row: &sqlx::postgres::PgRow) -> Result<Value> {
+    let payload = payload_integrity::crate_content_row(row)?;
+    let attributes = payload["attributes"].clone();
+    payload_integrity::checked(
+        "devres_crate_content",
+        &row.try_get::<String, _>("generation")
+            .map_err(|_| storage_error())?,
+        &row.try_get::<String, _>("id")
+            .map_err(|_| storage_error())?,
+        payload,
+        &row.try_get::<String, _>("attributes_integrity")
+            .map_err(|_| storage_error())?,
+    )?;
+    Ok(attributes)
+}
+fn read_artifact(row: sqlx::postgres::PgRow) -> Result<Artifact> {
+    let capture = Capture {
+        id: row.try_get("id").map_err(|_| storage_error())?,
+        key: row.try_get("source_key").map_err(|_| storage_error())?,
+        source_url: row.try_get("source_url").map_err(|_| storage_error())?,
+        body_hash: row.try_get("body_hash").map_err(|_| storage_error())?,
+        media_type: row.try_get("media_type").map_err(|_| storage_error())?,
+        retrieved_at: row.try_get("retrieved_at").map_err(|_| storage_error())?,
+        validated_at: row.try_get("validated_at").map_err(|_| storage_error())?,
+    };
+    if super::capture_metadata_digest(&capture)?
+        != row
+            .try_get::<String, _>("metadata_integrity")
+            .map_err(|_| storage_error())?
+    {
+        return Err(Error::integrity("Capture metadata integrity failed."));
+    }
+    let bytes = u64::try_from(
+        row.try_get::<i64, _>("bytes")
+            .map_err(|_| storage_error())?,
+    )
+    .map_err(|_| Error::integrity("Invalid artifact size."))?;
+    let observation: Json<Value> = row
+        .try_get("observed_provenance")
+        .map_err(|_| storage_error())?;
+    let transport: String = row
+        .try_get("observed_transport")
+        .map_err(|_| storage_error())?;
+    let sequence: i64 = row
+        .try_get("observed_sequence")
+        .map_err(|_| storage_error())?;
+    payload_integrity::checked(
+        "devres_crate_observations",
+        &capture.id,
+        &sequence.to_string(),
+        payload_integrity::crate_observation_payload(
+            &capture.id,
+            capture.validated_at,
+            &transport,
+            &observation.0,
+        ),
+        &row.try_get::<String, _>("observed_integrity")
+            .map_err(|_| storage_error())?,
+    )?;
+    let provenance: Json<Value> = row.try_get("provenance").map_err(|_| storage_error())?;
+    payload_integrity::checked(
+        "devres_crate_artifacts",
+        "",
+        &capture.id,
+        payload_integrity::crate_artifact_payload(bytes, &provenance.0),
+        &row.try_get::<String, _>("provenance_integrity")
+            .map_err(|_| storage_error())?,
+    )?;
+    Ok(Artifact {
+        capture,
+        bytes,
+        provenance: provenance.0,
     })
+}
+async fn append_crate_observation(
+    tx: &mut sqlx::PgConnection,
+    capture: &str,
+    time: i64,
+    transport: &str,
+    provenance: &Value,
+) -> Result<i64> {
+    let sequence: i64 = sqlx::query_scalar(
+        "SELECT nextval(pg_get_serial_sequence('devres_crate_observations','sequence'))",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| storage_error())?;
+    let payload =
+        payload_integrity::crate_observation_payload(capture, time, transport, provenance);
+    let digest = payload_integrity::digest(
+        "devres_crate_observations",
+        capture,
+        &sequence.to_string(),
+        &payload,
+    )?;
+    sqlx::query("INSERT INTO devres_crate_observations(sequence,capture_id,observed_at,transport,provenance,provenance_integrity) VALUES($1,$2,$3,$4,$5,$6)").bind(sequence).bind(capture).bind(time).bind(transport).bind(Json(provenance)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+    Ok(sequence)
+}
+async fn close_crate_versions(
+    tx: &mut sqlx::PgConnection,
+    epoch: &str,
+    sequence: i64,
+) -> Result<()> {
+    let mut after = (String::new(), String::new(), 0_i64);
+    loop {
+        let row=sqlx::query("SELECT v.* FROM devres_crate_versions v WHERE v.valid_to IS NULL AND (v.name,v.version,v.valid_from)>($2,$3,$4) AND EXISTS(SELECT 1 FROM devres_crate_changes c WHERE c.inventory=$1 AND c.name=v.name) AND ((SELECT id LIKE 'blake3:%' FROM devres_crate_inventories WHERE id=$1)=(SELECT id LIKE 'blake3:%' FROM devres_crate_inventories WHERE sequence=v.valid_from)) ORDER BY v.name,v.version,v.valid_from LIMIT 1 FOR UPDATE OF v")
+            .bind(epoch).bind(&after.0).bind(&after.1).bind(after.2).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+        let Some(row) = row else {
+            break;
+        };
+        let record = checked_version(&row)?;
+        let name: String = row.try_get("name").map_err(|_| storage_error())?;
+        let version: String = row.try_get("version").map_err(|_| storage_error())?;
+        let from: i64 = row.try_get("valid_from").map_err(|_| storage_error())?;
+        let metadata: String = row
+            .try_get("metadata_capture")
+            .map_err(|_| storage_error())?;
+        let digest = payload_integrity::digest(
+            "devres_crate_versions",
+            &from.to_string(),
+            &format!("{name}@{version}"),
+            &payload_integrity::crate_record_payload(&metadata, Some(sequence), &record),
+        )?;
+        let changed=sqlx::query("UPDATE devres_crate_versions SET valid_to=$4,record_integrity=$5 WHERE name=$1 AND version=$2 AND valid_from=$3 AND valid_to IS NULL").bind(&name).bind(&version).bind(from).bind(sequence).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        if changed.rows_affected() != 1 {
+            return Err(Error::integrity(
+                "Crate version interval changed during publication.",
+            ));
+        }
+        after = (name, version, from);
+    }
+    Ok(())
 }
 
 pub(super) const SCHEMA_V3: &str = r#"

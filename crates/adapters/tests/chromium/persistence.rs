@@ -36,10 +36,11 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         .expect("inspection");
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("schema eight");
+        .expect("fresh schema ten");
+    // Acceptance is a recognized opaque evidence role; production rejects unknown roles.
     let old = json!({"synthetic":true,"body":"Prior W3C evidence remains immutable"});
     store
-        .w3c_put("fixtures", "before-chromium", &old)
+        .w3c_put("acceptance", "before-chromium", &old)
         .await
         .unwrap();
     let request = FetchRequest {
@@ -66,21 +67,54 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     wait_owner_release(&inspection).await;
     let count:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM devres_chromium_evidence)+(SELECT count(*) FROM devres_chromium_state)+(SELECT count(*) FROM devres_chromium_statistics)").fetch_one(&inspection).await.unwrap();
     assert_eq!(count, 0, "new tables are empty before isolated downgrade");
+    remove_integrity_schema(&inspection).await;
     sqlx::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
         .execute(&inspection).await.expect("prepare owned schema-seven fixture");
+    assert!(
+        PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .is_err(),
+        "schema-seven serving requires explicit offline migration"
+    );
+    wait_owner_release(&inspection).await;
+    let migrating = std::sync::Arc::new(
+        PgBlobStore::connect_for_migration(url.as_str(), root.path())
+            .await
+            .expect("upgrade schema seven in maintenance mode"),
+    );
+    assert!(
+        migrating
+            .activate_storage(tokio_util::sync::CancellationToken::new())
+            .await
+            .is_err(),
+        "unqualified storage cannot activate"
+    );
+    devres_adapters::migrate_storage_graphs(
+        &devres_adapters::MigrationSettings::default(),
+        migrating.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("qualify every retained storage graph offline");
+    migrating
+        .activate_storage(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("activate fully qualified storage");
+    drop(migrating);
+    wait_owner_release(&inspection).await;
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("actual seven to eight upgrade");
+        .expect("serve fully migrated schema ten");
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
             .fetch_one(&inspection)
             .await
             .unwrap(),
-        9
+        10
     );
     assert_eq!(
         store
-            .w3c_get("fixtures", "before-chromium")
+            .w3c_get("acceptance", "before-chromium")
             .await
             .unwrap()
             .unwrap()
@@ -208,7 +242,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     );
     assert_eq!(
         restarted
-            .w3c_get("fixtures", "before-chromium")
+            .w3c_get("acceptance", "before-chromium")
             .await
             .unwrap()
             .unwrap()
@@ -235,4 +269,35 @@ async fn wait_owner_release(pool: &sqlx::PgPool) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("owned PostgreSQL session did not release its fence");
+}
+
+// Remove only schema-ten metadata in this task-owned fixture database. Retained
+// captures, source rows, and permanent filesystem evidence remain untouched.
+async fn remove_integrity_schema(pool: &sqlx::PgPool) {
+    sqlx::raw_sql(
+        r#"
+DO $fixture$
+DECLARE retained_column record;
+BEGIN
+    FOR retained_column IN
+        SELECT table_schema,table_name,column_name FROM information_schema.columns
+        WHERE table_schema='public' AND left(table_name,7)='devres_'
+          AND right(column_name,10)='_integrity'
+    LOOP
+        EXECUTE format('ALTER TABLE %I.%I DROP COLUMN %I',
+            retained_column.table_schema,retained_column.table_name,retained_column.column_name);
+    END LOOP;
+END;
+$fixture$;
+DROP TABLE devres_integrity_staged_state;
+DROP TABLE devres_integrity_provider_cutoffs;
+DROP TABLE devres_integrity_graph_progress;
+DROP TABLE devres_integrity_files;
+DROP TABLE devres_content_aliases;
+DROP TABLE devres_integrity_control;
+"#,
+    )
+    .execute(pool)
+    .await
+    .expect("remove schema-ten-only fixture metadata");
 }

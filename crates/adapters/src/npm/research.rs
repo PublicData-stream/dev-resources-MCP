@@ -41,6 +41,8 @@ struct Input {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
+    #[serde(default)]
+    version: u8,
     snapshot: String,
     query: String,
     position: usize,
@@ -124,7 +126,20 @@ impl NpmResearch {
                 arguments.remove(key);
             }
         }
-        let query = identity(&json!([tool, arguments]))?;
+        let query_value = json!([tool, arguments]);
+        let version = input
+            .cursor
+            .as_deref()
+            .map(cursor)
+            .transpose()?
+            .map_or(2, |c| c.version);
+        let query = match version {
+            0 => crate::integrity::legacy_hash(
+                &serde_json::to_vec(&query_value).map_err(|_| failure())?,
+            ),
+            2 => identity(&query_value)?,
+            _ => return Err(Error::invalid("Unsupported npm cursor version.")),
+        };
         if tool == "npm.content_search" {
             if input.cursor.is_some() && input.snapshot.is_none() {
                 return Err(Error::invalid(
@@ -292,6 +307,7 @@ impl NpmResearch {
             Some(
                 URL_SAFE_NO_PAD.encode(
                     serde_json::to_vec(&Cursor {
+                        version: if query.starts_with("blake3:") { 2 } else { 0 },
                         snapshot: snapshot["id"].as_str().ok_or_else(failure)?.into(),
                         query: query.into(),
                         position: end,

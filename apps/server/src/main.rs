@@ -22,6 +22,56 @@ async fn main() -> Result<(), ServerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::new("devres_server=info"))
         .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
+    // Offline storage commands branch before constructing any provider/collector.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("migrate-storage" | "verify-storage" | "activate-storage")
+    ) {
+        let (command, path) = match args.as_slice() {
+            [command, path, flag, algorithm] if command == "migrate-storage" && flag == "--to" && algorithm == "blake3" => (command.as_str(), path),
+            [command, path] if command == "verify-storage" || command == "activate-storage" => (command.as_str(), path),
+            _ => return Err("usage: devres-server migrate-storage CONFIG.toml --to blake3 | verify-storage CONFIG.toml | activate-storage CONFIG.toml".into()),
+        };
+        let config = Config::load(Path::new(path)).await?;
+        let store = Arc::new(match command {
+            "migrate-storage" => {
+                devres_adapters::PgBlobStore::connect_for_migration(
+                    &config.storage.database_url,
+                    &config.storage.blob_dir,
+                )
+                .await?
+            }
+            "verify-storage" => {
+                devres_adapters::PgBlobStore::connect_for_verification(
+                    &config.storage.database_url,
+                    &config.storage.blob_dir,
+                )
+                .await?
+            }
+            _ => {
+                devres_adapters::PgBlobStore::connect_for_activation(
+                    &config.storage.database_url,
+                    &config.storage.blob_dir,
+                )
+                .await?
+            }
+        });
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let task = tokio::spawn(async move {
+            shutdown_signal().await;
+            signal.cancel();
+        });
+        let result = match command {
+            "migrate-storage" => migrate_storage_graphs(&config, store.clone(), cancel).await,
+            "verify-storage" => store.verify_storage(cancel).await,
+            _ => store.activate_storage(cancel).await,
+        };
+        task.abort();
+        let _ = task.await;
+        println!("{}", result?);
+        return Ok(());
+    }
     let mdn_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-mdn-index");
     let whatwg_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-whatwg-index");
     let w3c_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-w3c-index");
@@ -352,6 +402,23 @@ async fn main() -> Result<(), ServerError> {
     signal_task.abort();
     let _ = signal_task.await;
     result
+}
+
+async fn migrate_storage_graphs(
+    config: &Config,
+    store: Arc<devres_adapters::PgBlobStore>,
+    cancel: CancellationToken,
+) -> devres_domain::Result<serde_json::Value> {
+    let settings = devres_adapters::MigrationSettings {
+        crates: config.crates.clone(),
+        rustsec: config.rustsec.clone(),
+        mdn: config.mdn.clone(),
+        whatwg: config.whatwg.clone(),
+        w3c: config.w3c.clone(),
+        chromium: config.chromium.clone(),
+        npm: config.npm.clone(),
+    };
+    devres_adapters::migrate_storage_graphs(&settings, store, cancel).await
 }
 
 async fn shutdown_signal() {

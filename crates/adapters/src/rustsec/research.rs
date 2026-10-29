@@ -5,7 +5,6 @@ use devres_application::advisory::{AdvisoryRecord, AdvisoryRow, AdvisorySnapshot
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -170,7 +169,7 @@ impl Input {
             "filters":self.filters,"ref":self.reference,"kind":self.kind.as_deref().unwrap_or("commits")});
         let bytes = serde_json::to_vec(&value)
             .map_err(|_| Error::integrity("Advisory query identity failed."))?;
-        Ok(hex::encode(Sha256::digest(bytes)))
+        Ok(crate::integrity::hash(&bytes))
     }
     fn cursor(&self, tool: &str) -> Result<Option<Cursor>> {
         let Some(encoded) = &self.cursor else {
@@ -181,8 +180,24 @@ impl Input {
             .map_err(|_| Error::invalid("Invalid advisory cursor."))?;
         let cursor: Cursor = serde_json::from_slice(&bytes)
             .map_err(|_| Error::invalid("Invalid advisory cursor."))?;
-        if cursor.version != 1
-            || cursor.fingerprint != self.fingerprint(tool)?
+        let expected = match cursor.version {
+            1 => {
+                let format = if tool == "advisory.snapshots" {
+                    json!(self.format)
+                } else {
+                    json!(self.format()?)
+                };
+                let value = json!({"tool":tool,"id":self.id,"format":format,"query":self.query,
+                    "filters":self.filters,"ref":self.reference,"kind":self.kind.as_deref().unwrap_or("commits")});
+                crate::integrity::legacy_hash(
+                    &serde_json::to_vec(&value)
+                        .map_err(|_| Error::integrity("Advisory query identity failed."))?,
+                )
+            }
+            2 => self.fingerprint(tool)?,
+            _ => return Err(Error::invalid("Unsupported advisory cursor version.")),
+        };
+        if cursor.fingerprint != expected
             || cursor.after < 0
             || cursor.within > 100
             || cursor.cutoff.is_some_and(|v| v < 0)
@@ -320,7 +335,7 @@ impl AdvisoryResearch {
         let offset=offset.min(matches.len());
         let next = offset.saturating_add(limit).min(matches.len());
         let next_cursor = if next < matches.len() {
-            Some(encode_cursor(Cursor { version:1, fingerprint:input.fingerprint("advisory.catalog_search")?,
+            Some(encode_cursor(Cursor { version:2, fingerprint:input.fingerprint("advisory.catalog_search")?,
                 snapshot:Some(snapshot.id.clone()), cutoff:None, after:next as i64, within:0 })?)
         } else { None };
         let items = matches[offset..next].iter().map(|record| record_summary(&snapshot,record)).collect::<Vec<_>>();
@@ -443,7 +458,7 @@ impl AdvisoryResearch {
         }
         let next_cursor = if more {
             Some(encode_cursor(Cursor {
-                version: 1,
+                version: 2,
                 fingerprint: input.fingerprint("advisory.snapshots")?,
                 snapshot: None,
                 cutoff: Some(cutoff),
@@ -528,7 +543,7 @@ impl AdvisoryResearch {
         }
         let next_cursor = if more {
             Some(encode_cursor(Cursor {
-                version: 1,
+                version: 2,
                 fingerprint: input.fingerprint("advisory.history")?,
                 snapshot: None,
                 cutoff: Some(cutoff),
@@ -712,10 +727,7 @@ pub(crate) fn snapshot_metadata(snapshot: &AdvisorySnapshot) -> Value {
 }
 
 fn valid_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+    crate::integrity::valid_hash(value)
 }
 fn valid_ref(value: &str) -> bool {
     (value.starts_with("refs/heads/") || value.starts_with("refs/tags/"))
@@ -925,7 +937,7 @@ fn history_event(
 
 pub(crate) fn schemas() -> Vec<Value> {
     let text = json!({"type":"string","minLength":1,"maxLength":256});
-    let snapshot = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    let snapshot = json!({"type":"string","pattern":"^(blake3:)?[0-9a-f]{64}$"});
     let format = json!({"enum":["rustsec","osv"],"default":"rustsec"});
     let offset = json!({"type":"integer","minimum":0,"maximum":10000,"default":0});
     let limit = json!({"type":"integer","minimum":1,"maximum":100,"default":20});
@@ -1135,7 +1147,7 @@ mod tests {
             format: "rustsec".into(),
             path: format!("crates/example/{id}.md"),
             body: body.into(),
-            body_hash: hex::encode(Sha256::digest(body.as_bytes())),
+            body_hash: crate::integrity::hash(body.as_bytes()),
             metadata: json!({"id":id,"package":"example","title":"Synthetic advisory","classification":"vulnerability","date":"2024-02-29",
                 "aliases":["CVE-2024-1234","GHSA-abcd-abcd-abcd"],"categories":["memory-corruption"],"informational":null,"affected":{"os":[],"arch":[]},"original":{"fixture":true}}),
         }

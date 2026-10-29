@@ -4,6 +4,16 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Service content IDs are algorithm-tagged; untagged SHA-256 IDs are accepted
+/// exclusively for retained compatibility generations.
+pub fn valid_content_id(value: &str) -> bool {
+    let digest = value.strip_prefix("blake3:").unwrap_or(value);
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Deliberately sanitized error; private diagnostics must never carry input bodies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Error {

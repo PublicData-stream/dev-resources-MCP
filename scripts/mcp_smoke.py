@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded native MCP HTTP acceptance. No provider calls unless --live is set."""
 import argparse
-import hashlib
+import re
 import http.client
 import json
 import ssl
@@ -37,17 +37,18 @@ w3c.snapshots w3c.symbol_get w3c.symbol_search
 whatwg.catalog_search whatwg.compare whatwg.corpus_status whatwg.get whatwg.history
 whatwg.references whatwg.search whatwg.snapshots whatwg.symbol_get whatwg.symbol_search
 """.split())
-SYNTHETIC_MDN_CONTENT = hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest()
-SYNTHETIC_MDN_COMPAT = hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest()
-SYNTHETIC_WHATWG = hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest()
+# Fixed BLAKE3 vectors for storage-probe fixture-ids; no Python hashing dependency.
+SYNTHETIC_MDN_CONTENT = "blake3:ea99837f59ecf2413ea4baaa21a57b8e734546e5510ce47fdabf194d36809918"
+SYNTHETIC_MDN_COMPAT = "blake3:5b4a512528e5d7209e36233d9287b7a2f9487f30f6ed721c8d6b677717613f2a"
+SYNTHETIC_WHATWG = "blake3:3e8f4b64669f53f79fb44137214fb818ba3921539777d24343575de379c96888"
 SYNTHETIC_WHATWG_TEXT = "Synthetic WHATWG storage fixture"
-SYNTHETIC_W3C = hashlib.sha256(b"devres:storage-probe:w3c:v1").hexdigest()
+SYNTHETIC_W3C = "blake3:d0010c2164196909b62ef99e9ef0e149ee452bddb92e925d18aa16aa748c7f44"
 SYNTHETIC_W3C_TEXT = "Synthetic W3C storage fixture"
-SYNTHETIC_CHROMIUM = hashlib.sha256(b"devres:storage-probe:chromium:v1").hexdigest()
+SYNTHETIC_CHROMIUM = "blake3:1edf390e9156718f6022c74bc2b6604548987582948e2b19db5f58b619183b6c"
 SYNTHETIC_CHROMIUM_TEXT = "Synthetic CHROMIUM storage fixture"
 SYNTHETIC_MDN_TEXT = "Synthetic MDN storage fixture"
 SYNTHETIC_ADVISORY = "RUSTSEC-2024-0001"
-SYNTHETIC_SNAPSHOT = hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest()
+SYNTHETIC_SNAPSHOT = "blake3:253b2fc6721b10bef9b167777528c2b72e7b85dce92a3483d095df93167a5763"
 AUDIT_PRIVACY_MARKER = "devres-smoke-private-comment-4d1a8e7c"
 
 
@@ -195,6 +196,11 @@ def smoke(client, negative=True):
                           {"path": "/live"}, {"path": "/ready"}, {"path": "/metrics"}):
             status, value = client.exchange("tools/list", **overrides)
             assert status >= 400 or (value and "error" in value), "boundary accepted invalid request"
+
+
+def require_blake3(value, label="stored identity"):
+    assert isinstance(value, str) and re.fullmatch(r"blake3:[0-9a-f]{64}", value), f"{label} is not tagged BLAKE3"
+    return value
 
 
 def require_snapshot(report, allow_synthetic=False):
@@ -534,12 +540,16 @@ def live(client, rfc_text_only=False):
     checksum = metadata["metadata"].get("cksum", "")
     assert len(checksum) == 64 and all(char in "0123456789abcdef" for char in checksum), "missing published archive checksum"
     listing = client.tool("crate.source_list", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
-    assert listing.get("checksum_verified") is True and listing.get("archive_capture", {}).get("body_hash") == checksum
+    assert listing.get("checksum_verified") is True, "published SHA256 archive checksum was not verified"
+    archive = listing.get("archive_capture", {})
+    require_blake3(archive.get("id"), "archive capture")
+    require_blake3(archive.get("body_hash"), "archive body digest")
     assert any(item.get("path") == "src/lib.rs" for item in listing.get("files", [])), "published source listing lacks the selected member"
     source = client.tool("crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
                                                "offset": 0, "limit": 1024})
     assert source.get("path") == "src/lib.rs" and source.get("page", {}).get("text"), "source member was not retrieved"
-    assert source.get("checksum_verified") is True and source.get("archive_capture", {}).get("body_hash") == checksum
+    assert source.get("checksum_verified") is True, "published SHA256 archive checksum was not verified"
+    assert source.get("archive_capture") == archive, "source listing and selected member changed archive evidence"
     assert source.get("metadata_capture", {}).get("id") == metadata.get("capture", {}).get("id"), "source projection changed its metadata capture"
     pinned = client.tool("crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
                          "metadata_capture": source["metadata_capture"]["id"],
@@ -595,6 +605,7 @@ def main():
         return
     smoke(client, not options.no_negative)
     if options.capture:
+        require_blake3(options.capture, "fresh synthetic capture")
         value = client.tool("fetch", {"id": "devres://capture/" + options.capture})
         assert "Synthetic dev-resources persistence acceptance fixture" in json.dumps(value)
         synthetic_advisory(client)

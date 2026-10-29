@@ -10,7 +10,6 @@ use devres_application::{ResponseValidator, Retrieval};
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -181,7 +180,7 @@ pub fn archive_key(name: &str, version: &str, manifest: &Value) -> Result<String
         .map_err(|_| Error::integrity("Invalid npm distribution metadata."))?;
     Ok(format!(
         "npm:archive:{name}:{version}:{}",
-        hex::encode(Sha256::digest(bytes))
+        crate::integrity::legacy_hash(&bytes)
     ))
 }
 fn selected(document: &Value, version: &str) -> Result<Value> {
@@ -535,7 +534,7 @@ pub fn source_input_from_uri(value: &str) -> Result<Value> {
 pub fn schemas() -> Vec<Value> {
     let name = json!({"type":"string","minLength":1,"maxLength":214});
     let version = json!({"type":"string","minLength":1,"maxLength":256});
-    let capture = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    let capture = json!({"type":"string","pattern":"^(blake3:)?[0-9a-f]{64}$"});
     let offset = json!({"type":"integer","minimum":0,"maximum":1000000,"default":0});
     let limit = json!({"type":"integer","minimum":1,"maximum":100,"default":20});
     let mut tools = Vec::new();

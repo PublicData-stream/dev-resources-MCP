@@ -103,11 +103,7 @@ impl Retrieval {
         }
     }
     pub async fn read_capture(&self, id: &str) -> Result<StoredCapture> {
-        if id.len() != 64
-            || !id
-                .bytes()
-                .all(|v| v.is_ascii_hexdigit() && !v.is_ascii_uppercase())
-        {
+        if !devres_domain::valid_content_id(id) {
             return Err(Error::invalid("Invalid capture identifier"));
         }
         let _permit = self

@@ -3,10 +3,17 @@ use devres_application::whatwg::{
     InventoryNode, Member, WHATWG_WRITE_BATCH_BYTES, WHATWG_WRITE_BATCH_ROWS, WhatwgStore, Write,
 };
 use devres_domain::{Error, Result};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
+}
+/// Radix digits are always the hexadecimal digest, without the algorithm tag.
+fn routing_hash(bytes: &[u8], legacy: bool) -> String {
+    if legacy {
+        crate::integrity::legacy_hash(bytes)
+    } else {
+        digest(bytes).trim_start_matches("blake3:").to_owned()
+    }
 }
 pub fn value<T: serde::Serialize>(item: &T) -> Result<serde_json::Value> {
     serde_json::to_value(item).map_err(|_| Error::integrity("Invalid WHATWG evidence encoding."))
@@ -90,7 +97,7 @@ pub(crate) async fn node_cached(
     let node: InventoryNode = decode(row.data)?;
     let bytes =
         serde_json::to_vec(&node).map_err(|_| Error::integrity("Invalid WHATWG inventory."))?;
-    if digest(&bytes) != id {
+    if crate::integrity::verify(id, &bytes).is_err() {
         return Err(Error::integrity("WHATWG inventory hash mismatch."));
     }
     if cache.enabled && durable {
@@ -160,7 +167,7 @@ impl<'a> Staged<'a> {
             }
             return Ok(id);
         }
-        // The envelope is at most 128 bytes for kind=nodes and a SHA-256 key.
+        // The envelope is at most 128 bytes for kind=nodes and a tagged BLAKE3 key.
         self.bytes = self
             .bytes
             .checked_add(encoded.bytes + 128)
@@ -208,8 +215,9 @@ async fn child(
     mut n: InventoryNode,
     part: &str,
     cache: &mut NodeCache,
+    legacy: bool,
 ) -> Result<Option<InventoryNode>> {
-    let hash = digest(part.as_bytes());
+    let hash = routing_hash(part.as_bytes(), legacy);
     let mut depth = 0;
     while !n.buckets.is_empty() {
         let nibble = hash
@@ -240,7 +248,7 @@ pub(crate) async fn get_cached(
     }
     let mut n = node_cached(store, root, cache).await?;
     for part in path.split('/') {
-        let Some(next) = child(store, n, part, cache).await? else {
+        let Some(next) = child(store, n, part, cache, !root.starts_with("blake3:")).await? else {
             return Ok(None);
         };
         n = next;
@@ -255,7 +263,7 @@ pub async fn subtree(store: &dyn WhatwgStore, root: &str, path: &str) -> Result<
     let mut id = root.to_owned();
     for part in path.split('/') {
         let mut n = node(store, &id).await?;
-        let hash = digest(part.as_bytes());
+        let hash = routing_hash(part.as_bytes(), !root.starts_with("blake3:"));
         let mut depth = 0;
         while !n.buckets.is_empty() {
             let key = hash
@@ -322,7 +330,7 @@ async fn partition(staged: &mut Staged<'_>, n: &mut InventoryNode, depth: usize)
     }
     let mut groups: BTreeMap<String, InventoryNode> = BTreeMap::new();
     for (name, id) in std::mem::take(&mut n.children) {
-        let hash = digest(name.as_bytes());
+        let hash = routing_hash(name.as_bytes(), false);
         let key = hash[depth..depth + 1].to_owned();
         let c = staged.node(&id).await?;
         let group = groups.entry(key).or_default();
@@ -355,13 +363,18 @@ pub(crate) async fn update_cached(
     member: Option<Member>,
     cache: &mut NodeCache,
 ) -> Result<String> {
+    if !root.starts_with("blake3:") {
+        return Err(Error::integrity(
+            "Legacy inventory must be migrated before updating.",
+        ));
+    }
     if !valid_path(path) {
         return Err(Error::invalid("Invalid WHATWG member path."));
     }
     let mut stack = Vec::new();
     let mut current = node_cached(store, root, cache).await?;
     for part in path.split('/') {
-        let hash = digest(part.as_bytes());
+        let hash = routing_hash(part.as_bytes(), false);
         let mut depth = 0;
         while !current.buckets.is_empty() {
             let key = hash
@@ -455,9 +468,11 @@ pub async fn members(store: &dyn WhatwgStore, root: &str, max: usize) -> Result<
                 ));
             }
             let n: InventoryNode = decode(row.data)?;
-            if digest(
+            if crate::integrity::verify(
+                &row.key,
                 &serde_json::to_vec(&n).map_err(|_| Error::integrity("Invalid WHATWG node."))?,
-            ) != row.key
+            )
+            .is_err()
             {
                 return Err(Error::integrity("WHATWG inventory hash mismatch."));
             }
@@ -665,7 +680,7 @@ pub(crate) async fn sequences(
                     "WHATWG projection sequence traversal exceeds its bound.",
                 ));
             }
-            if digest(&encoded) != row.key {
+            if crate::integrity::verify(&row.key, &encoded).is_err() {
                 return Err(Error::integrity(
                     "WHATWG projection sequence hash mismatch.",
                 ));
@@ -735,6 +750,25 @@ pub(crate) async fn sequences(
         result.insert(root.clone(), values);
     }
     Ok(result)
+}
+
+/// Rebuild a frozen logical inventory with canonical BLAKE3 routing.
+/// The caller rewrites typed references in each member; source data stays unchanged.
+pub async fn rebuild_inventory(
+    store: &dyn WhatwgStore,
+    root: &str,
+    mut rewrite: impl FnMut(Member) -> Result<Member>,
+) -> Result<String> {
+    let mut retained = members(store, root, 1_000_000).await?;
+    retained.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut canonical = empty(store).await?;
+    let mut cache = NodeCache::new();
+    for member in retained {
+        let member = rewrite(member)?;
+        let path = member.path.clone();
+        canonical = update_cached(store, &canonical, &path, Some(member), &mut cache).await?;
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -1111,7 +1145,7 @@ mod tests {
             .expect("cached update");
         assert_eq!(
             root,
-            "59cc157dfa306cdebe2c26b81c8f786ce50dc412dbf66dff817e6f799c2fff27"
+            "blake3:5d39ea6f61f890c38ed97937d95d5ae980531cc0df3c186a31b863a75cbbcd5d"
         );
         let reads = store.reads.load(Ordering::Relaxed);
         assert_eq!(
@@ -1261,8 +1295,8 @@ mod tests {
             .await
             .expect("batched path");
         assert_eq!(
-            root, "59cc157dfa306cdebe2c26b81c8f786ce50dc412dbf66dff817e6f799c2fff27",
-            "pre-batch inventory encoding identity"
+            root, "blake3:5d39ea6f61f890c38ed97937d95d5ae980531cc0df3c186a31b863a75cbbcd5d",
+            "canonical BLAKE3 inventory encoding identity"
         );
         assert_eq!(
             store.singles.load(Ordering::Relaxed),

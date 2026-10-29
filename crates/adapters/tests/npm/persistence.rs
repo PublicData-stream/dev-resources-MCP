@@ -398,7 +398,7 @@ async fn explicit_expired_history_is_readable_without_complete_assessment() {
         .unwrap()
         .unwrap()
         .data;
-    old["id"] = json!("b".repeat(64));
+    old["id"] = json!(devres_adapters::integrity::hash(b"npm historical fixture"));
     old["validated_at"] = json!(now - 8 * 86400);
     store
         .npm_put("snapshots", old["id"].as_str().unwrap(), &old)
@@ -421,7 +421,7 @@ async fn explicit_expired_history_is_readable_without_complete_assessment() {
         .unwrap();
     assert!(corpus.advisory_selection(None).await.is_err());
     let mut future = old;
-    future["id"] = json!("c".repeat(64));
+    future["id"] = json!(devres_adapters::integrity::hash(b"npm future fixture"));
     future["validated_at"] = json!(now + 86400);
     store
         .npm_put("snapshots", future["id"].as_str().unwrap(), &future)
@@ -463,7 +463,7 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
             .fetch_one(&inspection)
             .await
             .unwrap(),
-        9
+        10
     );
     assert!(
         devres_adapters::PgBlobStore::connect(url.as_str(), root.path())
@@ -482,19 +482,44 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
         )
         .await
         .unwrap();
+    assert!(
+        !store
+            .npm_rows(
+                "members",
+                0,
+                100,
+                None,
+                Some(&json!({"kind":"indexed-document"}))
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .verify_storage(CancellationToken::new())
+        .await
+        .unwrap();
     let old_index = store.npm_state("index").await.unwrap().unwrap();
     let documents = store.npm_rows("documents", 0, 2, None, None).await.unwrap();
     let ids: Vec<String> = documents.iter().map(|r| r.key.clone()).collect();
     assert_eq!(ids.len(), 2);
     assert!(
         ids.iter()
-            .all(|id| id.len() == 64 && id.bytes().all(|v| v.is_ascii_hexdigit()))
+            .all(|id| id.starts_with("blake3:") && devres_domain::valid_content_id(id))
     );
     sqlx::query("DELETE FROM devres_npm_evidence WHERE kind='indexed' AND key=ANY($1::text[])")
         .bind(&ids)
         .execute(&inspection)
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .verify_storage(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
     let ddl = format!(
         "CREATE FUNCTION npm_fixture_interrupt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind='indexed' AND NEW.key='{}' THEN RAISE EXCEPTION 'fixture interrupt'; END IF; RETURN NEW; END $$; CREATE TRIGGER npm_fixture_interrupt BEFORE INSERT ON devres_npm_evidence FOR EACH ROW EXECUTE FUNCTION npm_fixture_interrupt();",
         ids[1]
@@ -521,6 +546,10 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
     for id in &ids {
         assert!(store.npm_get("indexed", id).await.unwrap().is_some());
     }
+    store
+        .verify_storage(CancellationToken::new())
+        .await
+        .unwrap();
     let cutoff = store.npm_cutoff().await.unwrap();
     store
         .npm_put("fixtures", "later", &json!({"public":true}))

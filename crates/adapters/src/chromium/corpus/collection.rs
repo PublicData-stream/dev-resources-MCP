@@ -41,7 +41,7 @@ fn work_key(component: &str, revision: &str) -> String {
     )
 }
 fn job_key(component: &str, revision: &str) -> String {
-    inventory::digest(format!("{component}:{revision}:{PROCESSOR_VERSION}").as_bytes())
+    crate::integrity::legacy_hash(format!("{component}:{revision}:{PROCESSOR_VERSION}").as_bytes())
 }
 fn derived_key(component: &str, tree: &str, path: &str, license: &Value) -> Result<String> {
     Ok(inventory::digest(
@@ -387,7 +387,9 @@ impl ChromiumCorpus {
             .chromium_get("tree-pages", id)
             .await?
             .ok_or_else(failure)?;
-        if inventory::digest(&serde_json::to_vec(&row.data).map_err(|_| failure())?) != *id {
+        if crate::integrity::verify(id, &serde_json::to_vec(&row.data).map_err(|_| failure())?)
+            .is_err()
+        {
             return Err(Error::integrity("Chromium tree page hash mismatch."));
         }
         let entries: Vec<Entry> = decode(row.data)?;
@@ -1937,7 +1939,8 @@ impl ChromiumCorpus {
             .await?
             .ok_or_else(failure)?;
         if row.data != frozen["evidence"]
-            || inventory::digest(&serde_json::to_vec(&row.data).map_err(|_| failure())?) != id
+            || crate::integrity::verify(id, &serde_json::to_vec(&row.data).map_err(|_| failure())?)
+                .is_err()
             || row.data["processor_version"] != PROCESSOR_VERSION
         {
             return Err(Error::integrity("Chromium frozen observation mismatch."));

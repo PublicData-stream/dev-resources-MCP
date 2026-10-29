@@ -544,7 +544,6 @@ impl W3cCorpus {
         cancel: CancellationToken,
         publish_head: bool,
     ) -> Result<Publication> {
-        use sha2::{Digest, Sha256};
         use tokio::io::AsyncWriteExt;
         url.validate()?;
         let deadline = Instant::now() + Duration::from_secs(3600);
@@ -570,7 +569,7 @@ impl W3cCorpus {
             .map_err(|_| failure())?;
         let mut bytes = Vec::new();
         let mut total = 0u64;
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         let mut gaps = Vec::new();
         let mut metadata = catalog::PublicationMetadata::default();
         if status == 200 {
@@ -610,7 +609,7 @@ impl W3cCorpus {
             gaps.push(format!("publication_http_{status}"));
         }
         drop(file);
-        let body_hash = hex::encode(hasher.finalize());
+        let body_hash = format!("blake3:{}", hasher.finalize().to_hex());
         let mut license = if status == 200 {
             let source = url.clone();
             let stop = cancel.clone();
@@ -1309,7 +1308,11 @@ impl W3cCorpus {
                 .w3c_get("edition-nodes", &id)
                 .await?
                 .ok_or_else(|| Error::integrity("W3C version inventory node missing."))?;
-            if inventory::digest(&serde_json::to_vec(&node.data).map_err(|_| failure())?) != id
+            if crate::integrity::verify(
+                &id,
+                &serde_json::to_vec(&node.data).map_err(|_| failure())?,
+            )
+            .is_err()
                 || node.data["specification"].as_str() != Some(&standard.id)
             {
                 return Err(Error::integrity("W3C version inventory identity mismatch."));

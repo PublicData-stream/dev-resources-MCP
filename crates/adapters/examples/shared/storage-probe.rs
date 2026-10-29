@@ -11,7 +11,7 @@ const FIXTURE_SOURCE: &str = "https://fixtures.invalid/devres/storage-probe/advi
 const ADVISORY: &str = "```toml\n[advisory]\nid = \"RUSTSEC-2024-0001\"\npackage = \"example\"\ndate = \"2024-01-01\"\nurl = \"https://fixtures.invalid/devres/storage-probe/advisory\"\nlicense = \"CC0-1.0\"\n[versions]\npatched = [\">= 1.0.1\"]\n```\n\n# Synthetic storage-probe advisory\n\nOffline acceptance fixture only. This is not an upstream RustSec advisory.\n";
 
 async fn seed_advisory(store: &PgBlobStore) -> Result<(), Box<dyn std::error::Error>> {
-    let id = hex::encode(Sha256::digest(FIXTURE_IDENTITY));
+    let id = fixture_hash(FIXTURE_IDENTITY);
     if store
         .advisory_snapshot(Some(&id), "rustsec")
         .await?
@@ -45,17 +45,14 @@ async fn seed_advisory(store: &PgBlobStore) -> Result<(), Box<dyn std::error::Er
         format: "rustsec".into(),
         path: "crates/example/RUSTSEC-2024-0001.md".into(),
         body: ADVISORY.into(),
-        body_hash: hex::encode(Sha256::digest(ADVISORY.as_bytes())),
+        body_hash: fixture_hash(ADVISORY.as_bytes()),
         metadata: json!({"id":"RUSTSEC-2024-0001","package":"example","title":parsed.title(),
             "classification":"vulnerability","date":parsed.metadata.date,"withdrawn":null,"informational":null,
             "aliases":[],"categories":[],"keywords":[],"patched":parsed.versions.patched(),"unaffected":parsed.versions.unaffected(),
             "affected":parsed.affected,"applicability_known":true,"matching_complete":true,"format":"rustsec",
             "url":FIXTURE_SOURCE,"attribution_url":FIXTURE_SOURCE,"license":"CC0-1.0","original":parsed}),
     };
-    let revision = hex::encode(Sha256::digest(
-        b"devres:synthetic:storage-probe:revision:v1",
-    ))[..40]
-        .to_owned();
+    let revision = fixture_git_oid(b"devres:synthetic:storage-probe:revision:v1");
     store.publish_advisory_snapshot(&AdvisorySnapshot {
         id,revision,format:"rustsec".into(),created_at:now,validated_at:Some(now),historical:false,complete:true,
         records:vec![record],captures:vec![capture.capture],parents:vec![],committed_at:0,
@@ -66,7 +63,7 @@ async fn seed_advisory(store: &PgBlobStore) -> Result<(), Box<dyn std::error::Er
 }
 
 async fn check_advisory(store: &PgBlobStore) -> Result<(), Box<dyn std::error::Error>> {
-    let id = hex::encode(Sha256::digest(FIXTURE_IDENTITY));
+    let id = fixture_hash(FIXTURE_IDENTITY);
     let snapshot = store
         .advisory_snapshot(Some(&id), "rustsec")
         .await?
@@ -86,7 +83,19 @@ const MDN_TEXT: &str =
     "Synthetic MDN storage fixture\n\nOffline acceptance text about fetch network.\n";
 const MDN_SOURCE: &str = "---\ntitle: Synthetic MDN storage fixture\nslug: Web/Fixture\npage-type: guide\nbrowser-compat: api.fixtureFetch\n---\n\nSynthetic MDN storage fixture\n\nOffline acceptance text about fetch network.\n";
 fn fixture_hash(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+// These are synthetic upstream Git markers, never service content identities.
+fn legacy_hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+fn fixture_git_oid(bytes: &[u8]) -> String {
+    legacy_hash(bytes)[..40].to_owned()
+}
+fn fixture_ids() -> serde_json::Value {
+    json!({"mdn_content":fixture_hash(MDN_CONTENT_IDENTITY),"mdn_compat":fixture_hash(MDN_COMPAT_IDENTITY),
+        "whatwg":fixture_hash(WHATWG_IDENTITY),"w3c":fixture_hash(W3C_IDENTITY),
+        "chromium":fixture_hash(CHROMIUM_IDENTITY),"rustsec":fixture_hash(FIXTURE_IDENTITY)})
 }
 async fn fixture_projection(
     store: &PgBlobStore,
@@ -129,7 +138,7 @@ async fn seed_mdn(
     let source = raw
         .capture_bytes(MDN_SOURCE.as_bytes().to_vec(), CancellationToken::new())
         .await?;
-    let descriptor = json!({"body_hash":source.body_hash,"relative_path":format!("mdn/raw-artifacts/{}",source.body_hash),"bytes":source.bytes,"source_path":MDN_PATH});
+    let descriptor = json!({"body_hash":source.body_hash,"relative_path":format!("mdn/raw-artifacts/{}",source.relative_path),"bytes":source.bytes,"source_path":MDN_PATH});
     let projection = json!({"slug":"Web/Fixture","title":"Synthetic MDN storage fixture","page_type":"guide","status":[],"compatibility_keys":["api.fixtureFetch"],"headings":[],"links":[],"spec_urls":[],"text":MDN_TEXT,"metadata":{"synthetic":true},"macros":[],"gaps":[],"dependencies":[]});
     let article = fixture_projection(store, projection).await?;
     roots[0] = inventory::update(
@@ -138,7 +147,7 @@ async fn seed_mdn(
         MDN_PATH,
         Some(Member {
             path: MDN_PATH.into(),
-            oid: fixture_hash(MDN_SOURCE.as_bytes())[..40].into(),
+            oid: fixture_git_oid(MDN_SOURCE.as_bytes()),
             mode: "100644".into(),
             kind: "article".into(),
             projection: Some(article.clone()),
@@ -170,7 +179,7 @@ async fn seed_mdn(
         let artifact = raw
             .capture_bytes(bytes.clone(), CancellationToken::new())
             .await?;
-        let descriptor = json!({"body_hash":artifact.body_hash,"relative_path":format!("mdn/raw-artifacts/{}",artifact.body_hash),"bytes":artifact.bytes,"source_path":path});
+        let descriptor = json!({"body_hash":artifact.body_hash,"relative_path":format!("mdn/raw-artifacts/{}",artifact.relative_path),"bytes":artifact.bytes,"source_path":path});
         let projection = fixture_projection(
             store,
             json!({"key":key,"data":if kind=="feature"{&feature_data}else{&browser_data}}),
@@ -185,7 +194,7 @@ async fn seed_mdn(
             path,
             Some(Member {
                 path: path.into(),
-                oid: fixture_hash(&bytes)[..40].into(),
+                oid: fixture_git_oid(&bytes),
                 mode: "100644".into(),
                 kind: "bcd".into(),
                 projection: None,
@@ -201,7 +210,7 @@ async fn seed_mdn(
             &synthetic_path,
             Some(Member {
                 path: synthetic_path.clone(),
-                oid: fixture_hash(&bytes)[..40].into(),
+                oid: fixture_git_oid(&bytes),
                 mode: "100644".into(),
                 kind: kind.into(),
                 projection: Some(projection),
@@ -220,8 +229,8 @@ async fn seed_mdn(
         let snapshot = Snapshot {
             id: id.clone(),
             repository: repository.into(),
-            revision: fixture_hash(format!("synthetic-mdn-{repository}").as_bytes())[..40].into(),
-            tree: fixture_hash(format!("synthetic-mdn-tree-{repository}").as_bytes())[..40].into(),
+            revision: fixture_git_oid(format!("synthetic-mdn-{repository}").as_bytes()),
+            tree: fixture_git_oid(format!("synthetic-mdn-tree-{repository}").as_bytes()),
             parents: vec![],
             committed_at: 0,
             inventory,
@@ -321,7 +330,7 @@ async fn seed_whatwg(
         "index.html",
         Some(Member {
             path: "index.html".into(),
-            oid: artifact.body_hash.clone(),
+            oid: fixture_git_oid(WHATWG_SOURCE.as_bytes()),
             mode: "100644".into(),
             kind: "html".into(),
             projection: Some(projection_id),
@@ -350,8 +359,8 @@ async fn seed_whatwg(
         id: id.clone(),
         standard: "fixture".into(),
         repository: "synthetic/whatwg-fixture".into(),
-        revision: fixture_hash(b"synthetic-whatwg-revision")[..40].into(),
-        tree: fixture_hash(WHATWG_SOURCE.as_bytes()),
+        revision: fixture_git_oid(b"synthetic-whatwg-revision"),
+        tree: fixture_git_oid(WHATWG_SOURCE.as_bytes()),
         parents: vec![],
         committed_at: 0,
         inventory,
@@ -480,7 +489,7 @@ async fn seed_w3c(
         "index.html",
         Some(Member {
             path: "index.html".into(),
-            oid: artifact.body_hash.clone(),
+            oid: fixture_git_oid(W3C_SOURCE.as_bytes()),
             mode: "100644".into(),
             kind: "html".into(),
             projection: Some(projection_id),
@@ -509,8 +518,8 @@ async fn seed_w3c(
         id: id.clone(),
         standard: "fixture".into(),
         repository: "synthetic/w3c-fixture".into(),
-        revision: fixture_hash(b"synthetic-w3c-revision")[..40].into(),
-        tree: fixture_hash(W3C_SOURCE.as_bytes()),
+        revision: fixture_git_oid(b"synthetic-w3c-revision"),
+        tree: fixture_git_oid(W3C_SOURCE.as_bytes()),
         parents: vec![],
         committed_at: 0,
         inventory,
@@ -644,7 +653,7 @@ async fn seed_chromium(
         "docs/fixture.html",
         Some(Member {
             path: "docs/fixture.html".into(),
-            oid: artifact.body_hash.clone(),
+            oid: fixture_git_oid(CHROMIUM_SOURCE.as_bytes()),
             mode: "100644".into(),
             kind: "html".into(),
             projection: Some(projection_id),
@@ -673,8 +682,8 @@ async fn seed_chromium(
         id: id.clone(),
         component: "src".into(),
         repository: "synthetic/chromium-fixture".into(),
-        revision: fixture_hash(b"synthetic-chromium-revision")[..40].into(),
-        tree: fixture_hash(CHROMIUM_SOURCE.as_bytes()),
+        revision: fixture_git_oid(b"synthetic-chromium-revision"),
+        tree: fixture_git_oid(CHROMIUM_SOURCE.as_bytes()),
         parents: vec![],
         committed_at: 0,
         inventory,
@@ -895,6 +904,10 @@ async fn check_npm(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("fixture-ids") {
+        println!("{}", fixture_ids());
+        return Ok(());
+    }
     let database = std::env::var("DATABASE_URL")?;
     let root = std::env::var("BLOB_DIR")?;
     let store = std::sync::Arc::new(PgBlobStore::connect(&database, &root).await?);
@@ -940,7 +953,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("Fixture not captured")?
                 .stored
         }
-        _ => return Err("Expected write or read".into()),
+        _ => return Err("Expected write, read, or fixture-ids".into()),
     };
     if stored.body != b"Synthetic dev-resources persistence acceptance fixture\n" {
         return Err("Fixture mismatch".into());

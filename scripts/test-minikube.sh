@@ -172,12 +172,14 @@ start_backend() {
   k rollout status deployment/backend --timeout=120s
   wait_edge
 }
-mdn_content=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-content:v1").hexdigest())')
-mdn_compat=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:mdn-compat:v1").hexdigest())')
-whatwg_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:whatwg:v1").hexdigest())')
-w3c_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:w3c:v1").hexdigest())')
-chromium_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:chromium:v1").hexdigest())')
-advisory_snapshot=$(python3 -c 'import hashlib;print(hashlib.sha256(b"devres:storage-probe:rustsec:v1").hexdigest())')
+# Share the inspectable BLAKE3 golden fixture identities with the HTTP smoke.
+read -r mdn_content mdn_compat whatwg_snapshot w3c_snapshot chromium_snapshot advisory_snapshot < <(
+  python3 - <<'PYIDS'
+import runpy
+fixture = runpy.run_path("scripts/mcp_smoke.py")
+print(*(fixture[name] for name in ("SYNTHETIC_MDN_CONTENT", "SYNTHETIC_MDN_COMPAT", "SYNTHETIC_WHATWG", "SYNTHETIC_W3C", "SYNTHETIC_CHROMIUM", "SYNTHETIC_SNAPSHOT")))
+PYIDS
+)
 seeded_webtransport() {
   for revision in 2026-07-28 2025-11-25; do
     external env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \

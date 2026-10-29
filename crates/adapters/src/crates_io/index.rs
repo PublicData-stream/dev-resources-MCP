@@ -11,7 +11,7 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -60,12 +60,38 @@ fn capacity() -> Error {
     Error::capacity("Crate search processing bounds exceeded.")
 }
 fn hash(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::integrity::hash(bytes)
 }
 fn valid_hash(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::integrity::valid_hash(s)
+}
+fn reference_digest(reference: &Value) -> Result<&str> {
+    match (reference.get("digest"), reference.get("sha256")) {
+        (Some(digest), None) => digest
+            .as_str()
+            .filter(|s| s.starts_with("blake3:") && valid_hash(s))
+            .ok_or_else(integrity),
+        (None, Some(digest)) => digest
+            .as_str()
+            .filter(|s| !s.starts_with("blake3:") && valid_hash(s))
+            .ok_or_else(integrity),
+        _ => Err(integrity()),
+    }
+}
+
+fn index_suffix(id: &str) -> Result<String> {
+    Ok(crate::integrity::relative_path(id)?
+        .to_string_lossy()
+        .into_owned())
+}
+fn path_id(path: &str) -> Result<String> {
+    let id = path
+        .strip_prefix("blake3/")
+        .map_or_else(|| path.to_owned(), |hex| format!("blake3:{hex}"));
+    if !valid_hash(&id) || index_suffix(&id)? != path {
+        return Err(integrity());
+    }
+    Ok(id)
 }
 fn check(cancel: &CancellationToken, deadline: Instant) -> Result<()> {
     if cancel.is_cancelled() {
@@ -195,7 +221,8 @@ impl PartialOrd for Rank {
 #[serde(deny_unknown_fields)]
 struct Digest {
     bytes: u64,
-    sha256: String,
+    #[serde(alias = "sha256")]
+    digest: String,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -232,12 +259,21 @@ fn file_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 fn digest(path: &Path, cancel: &CancellationToken, deadline: Instant) -> Result<Digest> {
+    digest_with_algorithm(path, cancel, deadline, false)
+}
+fn digest_with_algorithm(
+    path: &Path,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    legacy: bool,
+) -> Result<Digest> {
     let m = fs::symlink_metadata(path).map_err(|_| unavailable())?;
     if !m.is_file() || m.file_type().is_symlink() || m.len() > MAX_SHARD {
         return Err(integrity());
     }
     let mut input = File::open(path).map_err(|_| unavailable())?;
     let mut hash = Sha256::new();
+    let mut blake3 = blake3::Hasher::new();
     let mut buffer = [0u8; 65536];
     let mut bytes = 0;
     loop {
@@ -251,13 +287,18 @@ fn digest(path: &Path, cancel: &CancellationToken, deadline: Instant) -> Result<
             return Err(integrity());
         }
         hash.update(&buffer[..n]);
+        blake3.update(&buffer[..n]);
     }
     if bytes != m.len() {
         return Err(integrity());
     }
     Ok(Digest {
         bytes,
-        sha256: hex::encode(hash.finalize()),
+        digest: if legacy {
+            hex::encode(hash.finalize())
+        } else {
+            format!("blake3:{}", blake3.finalize().to_hex())
+        },
     })
 }
 fn files(path: &Path) -> Result<Vec<String>> {
@@ -280,6 +321,7 @@ fn files(path: &Path) -> Result<Vec<String>> {
 }
 
 struct Builder {
+    storage_root: PathBuf,
     writer: Option<IndexWriter<TantivyDocument>>,
     index: Option<Index>,
     stage: PathBuf,
@@ -335,14 +377,18 @@ impl Builder {
             )
             .as_bytes(),
         );
-        let stage = base.join(format!(".stage-{id}"));
+        let suffix = index_suffix(&id)?;
+        crate::integrity::ensure_directory_durable(&base.join("blake3"))?;
+        real_directory(&base.join("blake3"))?;
+        let stage = base.join(format!(".stage-{}", crate::integrity::digest_hex(&id)?));
         fs::create_dir(&stage).map_err(|_| unavailable())?;
         Ok(Self {
+            storage_root: canonical,
             writer: None,
             index: None,
             stage,
-            destination: base.join(&id),
-            relative: format!("crate-indexes/{id}"),
+            destination: base.join(&suffix),
+            relative: format!("crate-indexes/{suffix}"),
             shards: Vec::new(),
             documents: 0,
             document_limit: MAX_DOCS,
@@ -512,7 +558,7 @@ impl Builder {
     fn finish(mut self, snapshot: &Snapshot) -> Result<Value> {
         self.finish_shard()?;
         let manifest = Manifest {
-            version: 1,
+            version: 2,
             inventory: snapshot.inventory.id.clone(),
             content_sequence: snapshot.content_sequence,
             enrichment: snapshot.enrichment.clone(),
@@ -551,9 +597,33 @@ impl Builder {
             .and_then(|f| f.sync_all())
             .map_err(|_| unavailable())?;
         self.published = true;
+        for shard in &manifest.shards {
+            for (name, digest) in &shard.files {
+                crate::integrity::record_file(
+                    &self.storage_root,
+                    &self.destination.join(&shard.name).join(name),
+                    &digest.digest,
+                    digest.bytes,
+                )?;
+            }
+        }
+        if let Some(digest) = &manifest.gap_artifact {
+            crate::integrity::record_file(
+                &self.storage_root,
+                &self.destination.join("gaps.ndjson"),
+                &digest.digest,
+                digest.bytes,
+            )?;
+        }
+        crate::integrity::record_file(
+            &self.storage_root,
+            &self.destination.join("manifest.json"),
+            &hash(&bytes),
+            bytes.len() as u64,
+        )?;
         let _ = &self.owner;
         Ok(
-            json!({"version":1,"path":self.relative,"sha256":hash(&bytes),"inventory":snapshot.inventory.id,"content_sequence":snapshot.content_sequence,"enrichment":snapshot.enrichment,"documents":manifest.shards.iter().map(|s|s.documents as u64).sum::<u64>(),"shards":manifest.shards.len(),"ranking":"snapshot_global_bm25","skipped_documents":manifest.gaps,"gap_samples":manifest.gap_samples,"complete_search_coverage":manifest.gaps==0}),
+            json!({"version":2,"path":self.relative,"digest":hash(&bytes),"inventory":snapshot.inventory.id,"content_sequence":snapshot.content_sequence,"enrichment":snapshot.enrichment,"documents":manifest.shards.iter().map(|s|s.documents as u64).sum::<u64>(),"shards":manifest.shards.len(),"ranking":"snapshot_global_bm25","skipped_documents":manifest.gaps,"gap_samples":manifest.gap_samples,"complete_search_coverage":manifest.gaps==0}),
         )
     }
 }
@@ -773,12 +843,9 @@ fn cache_key(root: &Path, reference: &Value) -> Result<String> {
     let path = reference["path"]
         .as_str()
         .and_then(|s| s.strip_prefix("crate-indexes/"))
-        .filter(|s| valid_hash(s))
+        .filter(|s| path_id(s).is_ok())
         .ok_or_else(integrity)?;
-    let expected = reference["sha256"]
-        .as_str()
-        .filter(|s| valid_hash(s))
-        .ok_or_else(integrity)?;
+    let expected = reference_digest(reference)?;
     Ok(format!(
         "{}:{expected}",
         fs::canonicalize(root)
@@ -821,13 +888,10 @@ fn open(
 ) -> Result<Arc<Opened>> {
     check(cancel, deadline)?;
     let path = reference["path"].as_str().ok_or_else(unavailable)?;
-    let expected = reference["sha256"]
-        .as_str()
-        .filter(|s| valid_hash(s))
-        .ok_or_else(integrity)?;
+    let expected = reference_digest(reference)?;
     let id = path
         .strip_prefix("crate-indexes/")
-        .filter(|s| valid_hash(s))
+        .filter(|s| path_id(s).is_ok())
         .ok_or_else(integrity)?;
     let base = fs::canonicalize(root)
         .map_err(|_| unavailable())?
@@ -846,11 +910,12 @@ fn open(
         return Err(integrity());
     }
     let bytes = fs::read(&path).map_err(|_| unavailable())?;
-    if hash(&bytes) != expected {
-        return Err(integrity());
+    if !expected.starts_with("blake3:") {
+        crate::integrity::verify_legacy_file(&path, deadline)?;
     }
+    crate::integrity::verify(expected, &bytes)?;
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
-    if manifest.version != 1
+    if !matches!(manifest.version, 1 | 2)
         || manifest.shards.len() > MAX_SHARDS
         || reference["inventory"].as_str() != Some(&manifest.inventory)
         || reference["content_sequence"].as_i64() != Some(manifest.content_sequence)
@@ -874,19 +939,30 @@ fn open(
         }
         let mut size = 0;
         for (name, expected) in &shard.files {
-            if !file_name(name) || !valid_hash(&expected.sha256) {
+            if !file_name(name)
+                || !valid_hash(&expected.digest)
+                || manifest.version == 2 && !expected.digest.starts_with("blake3:")
+            {
                 return Err(integrity());
             }
-            let actual = digest(&path.join(name), cancel, deadline)?;
+            if !expected.digest.starts_with("blake3:") {
+                crate::integrity::verify_legacy_file(&path.join(name), deadline)?;
+            }
+            let actual = digest_with_algorithm(
+                &path.join(name),
+                cancel,
+                deadline,
+                !expected.digest.starts_with("blake3:"),
+            )?;
             size += actual.bytes;
             if size > MAX_SHARD
                 || actual.bytes != expected.bytes
-                || actual.sha256 != expected.sha256
+                || actual.digest != expected.digest
             {
                 return Err(integrity());
             }
         }
-        let index = Index::open_in_dir(&path).map_err(|_| integrity())?;
+        let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
         if index.schema() != schema() {
             return Err(integrity());
         }
@@ -900,8 +976,19 @@ fn open(
         searchers.push(searcher);
     }
     if let Some(expected) = &manifest.gap_artifact {
-        let actual = digest(&directory.join("gaps.ndjson"), cancel, deadline)?;
-        if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
+        if manifest.version == 2 && !expected.digest.starts_with("blake3:") {
+            return Err(integrity());
+        }
+        if !expected.digest.starts_with("blake3:") {
+            crate::integrity::verify_legacy_file(&directory.join("gaps.ndjson"), deadline)?;
+        }
+        let actual = digest_with_algorithm(
+            &directory.join("gaps.ndjson"),
+            cancel,
+            deadline,
+            !expected.digest.starts_with("blake3:"),
+        )?;
+        if actual.bytes != expected.bytes || actual.digest != expected.digest {
             return Err(integrity());
         }
     } else if manifest.gaps != 0 {
@@ -915,6 +1002,246 @@ fn open(
     let mut cache = cache.lock().map_err(|_| unavailable())?;
     cache.retain_history(key, opened.clone());
     Ok(opened)
+}
+
+pub(crate) type PayloadRewrite = Arc<dyn Fn(&mut Value) -> Result<()> + Send + Sync>;
+type FrozenDocumentPage = (Vec<(Value, String)>, Option<usize>);
+
+fn from_frozen_payload(payload: Value, text: String) -> Result<IndexDocument> {
+    let class = payload["class"].as_str().ok_or_else(integrity)?;
+    let record = &payload["record"];
+    let name = record["name"].as_str().ok_or_else(integrity)?.to_owned();
+    let version = record["version"].as_str().ok_or_else(integrity)?.to_owned();
+    let mut identity = Identity {
+        name: name.clone(),
+        version: version.clone(),
+        target: String::new(),
+        path: String::new(),
+        id: format!("{name}@{version}"),
+    };
+    let mut keys = vec![
+        ("class".into(), class.into()),
+        ("name".into(), name),
+        ("version".into(), version),
+    ];
+    let mut yanked = None;
+    let mut rust_version = None;
+    match class {
+        "version" => {
+            keys.push(("kind".into(), "metadata".into()));
+            let metadata = &record["record"];
+            if let Some(deps) = metadata["deps"].as_array() {
+                for dep in deps {
+                    if let Some(name) = dep["package"].as_str().or_else(|| dep["name"].as_str()) {
+                        keys.push(("dependency".into(), name.into()));
+                    }
+                }
+            }
+            let enrichment = &payload["enrichment"];
+            if let Some(license) = enrichment["version"]["license"].as_str() {
+                keys.push(("license".into(), license.into()));
+            }
+            for (source, key) in [("keywords", "keyword"), ("categories", "category")] {
+                if let Some(values) = enrichment[source].as_array() {
+                    for value in values {
+                        if let Some(value) = value.as_str() {
+                            keys.push((key.into(), value.into()));
+                        }
+                    }
+                }
+            }
+            yanked = metadata["yanked"].as_bool();
+            rust_version = metadata["rust_version"].as_str().map(msrv).transpose()?;
+        }
+        "content" => {
+            identity.target = record["target"].as_str().ok_or_else(integrity)?.into();
+            identity.path = record["path"].as_str().ok_or_else(integrity)?.into();
+            identity.id = record["id"].as_str().ok_or_else(integrity)?.into();
+            keys.extend([
+                ("target".into(), identity.target.clone()),
+                ("path".into(), identity.path.clone()),
+                (
+                    "kind".into(),
+                    record["kind"].as_str().ok_or_else(integrity)?.into(),
+                ),
+            ]);
+        }
+        _ => return Err(integrity()),
+    }
+    Ok(IndexDocument {
+        identity,
+        text,
+        payload,
+        keywords: keys,
+        yanked,
+        msrv: rust_version,
+    })
+}
+
+/// Rebuild only the exact postings and gaps from one immutable retained generation.
+/// The callback rewrites typed service references in payloads, never indexed text.
+pub(crate) async fn rebuild_frozen(
+    owner: Arc<dyn CrateCorpusStore>,
+    root: PathBuf,
+    reference: Value,
+    snapshot: Snapshot,
+    rewrite: PayloadRewrite,
+    cancel: CancellationToken,
+) -> Result<Value> {
+    struct CancelOnDrop(CancellationToken);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let stop = cancel.child_token();
+    let _guard = CancelOnDrop(stop.clone());
+    let permit = WRITER
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| capacity())?;
+    let mut task = tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        open(&root, &reference, &stop, deadline)?;
+        let source = root.join(reference["path"].as_str().ok_or_else(integrity)?);
+        let bytes = fs::read(source.join("manifest.json")).map_err(|_| unavailable())?;
+        if bytes.len() > MAX_MANIFEST {
+            return Err(capacity());
+        }
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
+        let mut builder = Builder::begin(&root, owner, stop.clone(), permit)?;
+        let mut after = 0;
+        loop {
+            check(&stop, Instant::now() + Duration::from_secs(15))?;
+            let (documents, next) = export_documents(&root, &reference, after, 1000, &stop)?;
+            for (mut payload, text) in documents {
+                rewrite(&mut payload)?;
+                if !builder.add(from_frozen_payload(payload, text)?)? {
+                    return Err(Error::integrity(
+                        "Frozen crate migration changed indexed membership.",
+                    ));
+                }
+            }
+            match next {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        builder.gap_samples = manifest.gap_samples;
+        for gap in &mut builder.gap_samples {
+            rewrite(gap)?;
+        }
+        if manifest.gaps > 0 {
+            let mut input = std::io::BufReader::new(
+                File::open(source.join("gaps.ndjson")).map_err(|_| unavailable())?,
+            );
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(builder.stage.join("gaps.ndjson"))
+                .map_err(|_| unavailable())?;
+            loop {
+                check(&stop, Instant::now() + Duration::from_secs(15))?;
+                let mut line = Vec::new();
+                let count = (&mut input)
+                    .take(16 * 1024 + 1)
+                    .read_until(b'\n', &mut line)
+                    .map_err(|_| unavailable())?;
+                if count == 0 {
+                    break;
+                }
+                if line.len() > 16 * 1024 || !line.ends_with(b"\n") {
+                    return Err(integrity());
+                }
+                let mut gap: Value = serde_json::from_slice(&line).map_err(|_| integrity())?;
+                rewrite(&mut gap)?;
+                let mut encoded = serde_json::to_vec(&gap).map_err(|_| integrity())?;
+                encoded.push(b'\n');
+                builder.gap_bytes = builder
+                    .gap_bytes
+                    .checked_add(encoded.len() as u64)
+                    .filter(|n| *n <= MAX_SHARD)
+                    .ok_or_else(capacity)?;
+                output.write_all(&encoded).map_err(|_| unavailable())?;
+                builder.gaps = builder.gaps.checked_add(1).ok_or_else(capacity)?;
+            }
+            output.sync_all().map_err(|_| unavailable())?;
+            if builder.gaps != manifest.gaps {
+                return Err(integrity());
+            }
+        }
+        builder.finish(&snapshot)
+    });
+    tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "Crate migration canceled.")) }, result = &mut task => result.map_err(|_| unavailable())? }
+}
+
+/// Export exact retained payload and indexed text for an offline frozen rebuild.
+/// The caller owns the maintenance fence and executes this on a blocking worker.
+pub(crate) fn export_documents(
+    root: &Path,
+    reference: &Value,
+    after: usize,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> Result<FrozenDocumentPage> {
+    if !(1..=1000).contains(&limit) {
+        return Err(Error::invalid("Invalid crate index export page."));
+    }
+    let _permit = READERS
+        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .try_acquire()
+        .map_err(|_| capacity())?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let opened = open(root, reference, cancel, deadline)?;
+    let s = schema();
+    let payload_field = field(&s, "payload")?;
+    let text_field = field(&s, "technical")?;
+    let mut position = 0usize;
+    let mut bytes = 0usize;
+    let mut output = Vec::new();
+    for searcher in &opened.searchers {
+        for (segment_id, segment) in searcher.segment_readers().iter().enumerate() {
+            for document in segment.doc_ids_alive() {
+                check(cancel, deadline)?;
+                if position < after {
+                    position = position.checked_add(1).ok_or_else(capacity)?;
+                    continue;
+                }
+                if output.len() == limit {
+                    return Ok((output, Some(position)));
+                }
+                let stored: TantivyDocument = searcher
+                    .doc(tantivy::DocAddress::new(segment_id as u32, document))
+                    .map_err(|_| integrity())?;
+                let payload = stored
+                    .get_first(payload_field)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(integrity)?;
+                let text = stored
+                    .get_first(text_field)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(integrity)?;
+                let size = payload.len().checked_add(text.len()).ok_or_else(capacity)?;
+                if size > 16 * 1024 * 1024 {
+                    return Err(capacity());
+                }
+                if !output.is_empty() && bytes.saturating_add(size) > 16 * 1024 * 1024 {
+                    return Ok((output, Some(position)));
+                }
+                let value: Value = serde_json::from_str(payload).map_err(|_| integrity())?;
+                output.push((value, text.to_owned()));
+                bytes += size;
+                position = position.checked_add(1).ok_or_else(capacity)?;
+            }
+        }
+    }
+    if after > position {
+        return Err(Error::invalid(
+            "Crate export cursor exceeds retained membership.",
+        ));
+    }
+    Ok((output, None))
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1108,6 +1435,8 @@ fn query(field: Field, input: &str, mode: &str) -> Result<Box<dyn Query>> {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Continuation {
+    #[serde(default)]
+    version: u32,
     fingerprint: String,
     rank: Rank,
 }
@@ -1119,13 +1448,14 @@ fn continuation(spec: &SearchSpec, reference: &Value) -> Result<(String, Option<
     if normalized.mode.is_empty() {
         normalized.mode = "technical".into();
     }
-    let fingerprint = hash(
-        &serde_json::to_vec(&(
-            reference["sha256"].as_str().ok_or_else(unavailable)?,
-            normalized,
-        ))
-        .map_err(|_| integrity())?,
-    );
+    let fingerprint_bytes =
+        serde_json::to_vec(&(reference_digest(reference)?, normalized)).map_err(|_| integrity())?;
+    let canonical = reference_digest(reference)?.starts_with("blake3:");
+    let fingerprint = if canonical {
+        hash(&fingerprint_bytes)
+    } else {
+        crate::integrity::legacy_hash(&fingerprint_bytes)
+    };
     let rank = if let Some(cursor) = &spec.cursor {
         if cursor.len() > 16384 || spec.offset != 0 {
             return Err(Error::invalid(
@@ -1135,6 +1465,7 @@ fn continuation(spec: &SearchSpec, reference: &Value) -> Result<(String, Option<
         let cursor: Continuation =
             serde_json::from_str(cursor).map_err(|_| Error::invalid("Malformed search cursor."))?;
         if cursor.fingerprint != fingerprint
+            || cursor.version != if canonical { 2 } else { 0 }
             || !cursor.rank.score.is_finite()
             || cursor.rank.key.name.len() > 64
             || cursor.rank.key.version.len() > 128
@@ -1320,7 +1651,16 @@ fn search_sync(
     };
     let next_cursor = next_rank
         .map(|rank| {
-            serde_json::to_string(&Continuation { fingerprint, rank }).map_err(|_| integrity())
+            serde_json::to_string(&Continuation {
+                version: if reference_digest(reference)?.starts_with("blake3:") {
+                    2
+                } else {
+                    0
+                },
+                fingerprint,
+                rank,
+            })
+            .map_err(|_| integrity())
         })
         .transpose()?;
     if next_cursor
