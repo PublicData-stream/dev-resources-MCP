@@ -126,6 +126,21 @@ class RestoreTests(unittest.TestCase):
         self.assertLess(backend_rm, first_destroy)
         self.assertTrue(all('@' not in c[-1] for c in commands if c[:2] == ['zfs', 'destroy']))
 
+    def test_private_operator_umask_keeps_only_runtime_group_access(self):
+        import os
+        tool = self.drill()
+        previous = os.umask(0o077)
+        try:
+            with patch.object(restore.os, 'chown'):
+                tool.prepare()
+            for folder in ('config', 'tls'):
+                self.assertEqual((self.root / folder).stat().st_mode & 0o777, 0o750)
+            self.assertEqual((self.root / 'config/backend.toml').stat().st_mode & 0o777, 0o640)
+            self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
+        finally:
+            os.umask(previous)
+            tool.cleanup()
+
     def test_corrupt_blob_never_boots_backend_and_cleans_clones(self):
         self.host.corrupt = True
         with self.assertRaisesRegex(restore.RestoreError, 'hash_mismatch'):

@@ -205,6 +205,7 @@ class Drill:
         for folder in ('config', 'tls'):
             path = self.root / folder
             path.mkdir(mode=0o750)
+            os.chmod(path, 0o750)
             os.chown(path, 0, 65532)
         config = paused_config((self.private / 'backend.toml').read_text())
         # Keep PostgreSQL alias/credentials and all transport identity unchanged.

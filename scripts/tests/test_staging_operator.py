@@ -19,6 +19,12 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('edge-activate', result.stdout)
 
+    def test_fixed_restore_codes_are_visible_but_arbitrary_errors_are_not(self):
+        error_type = type('RestoreError', (RuntimeError,), {})
+        self.assertEqual(op.diagnostic_code(error_type('restored_rpc_http_failure')), 'restored_rpc_http_failure')
+        self.assertEqual(op.diagnostic_code(error_type('secret test content')), 'RestoreError')
+        self.assertEqual(op.diagnostic_code(ValueError('secret_test_content')), 'ValueError')
+
     def test_additive_array_preserves_other_policy(self):
         source = '[tls]\nserver_names = ["existing.example"]\nmin_version = "tls1.3"\n'
         result = op.append_array(source, 'tls', 'server_names', 'new.example')

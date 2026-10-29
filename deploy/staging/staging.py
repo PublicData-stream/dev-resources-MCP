@@ -465,6 +465,15 @@ def backup():
     print('coordinated snapshot and isolated restore verified: ' + name)
 
 
+def diagnostic_code(error):
+    if isinstance(error, OperatorError):
+        return str(error)
+    if (type(error).__name__ in {'RestoreError', 'MaintenanceError'}
+            and re.fullmatch(r'[a-z][a-z0-9_]{0,100}', str(error))):
+        return str(error)
+    return type(error).__name__
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'firewall', 'firewall-bootstrap', 'start', 'edge-prepare',
@@ -485,5 +494,5 @@ if __name__ == '__main__':
         main()
     except Exception as error:
         # Fixed code only. The exception chain may hold secret external output.
-        print('devres-staging operator failed: ' + (str(error) if isinstance(error, OperatorError) else type(error).__name__), file=sys.stderr)
+        print('devres-staging operator failed: ' + diagnostic_code(error), file=sys.stderr)
         sys.exit(1)
