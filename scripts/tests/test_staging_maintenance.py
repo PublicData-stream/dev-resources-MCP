@@ -295,5 +295,16 @@ class PrivateStateTests(unittest.TestCase):
                         self.fail("concurrent maintenance accepted")
 
 
+class TimerContractTests(unittest.TestCase):
+    def test_busy_is_temporary_but_real_failures_remain_failures(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        for code, expected in (("maintenance_busy", 75), ("unsafe_state_file", 1)):
+            with patch.object(maintenance.sys, 'argv', ['maintenance.py', 'guard']), patch.object(maintenance.os, 'geteuid', return_value=0), patch.object(maintenance, 'State') as state, contextlib.redirect_stderr(io.StringIO()):
+                state.return_value.locked.return_value.__enter__.side_effect = maintenance.MaintenanceError(code)
+                self.assertEqual(maintenance.main(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

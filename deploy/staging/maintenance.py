@@ -415,7 +415,7 @@ def main():
     except (MaintenanceError, OSError, ValueError) as error:
         code = str(error) if isinstance(error, MaintenanceError) else "maintenance_failed"
         print(code, file=sys.stderr)
-        return 1
+        return 75 if code == "maintenance_busy" else 1
     return 0
 
 
