@@ -743,3 +743,12 @@ For shared local caches, enter `scripts/with-tmp-state.sh` first, then override
 Use `scripts/with-local-docker.sh` for owned Docker state below `/tmp`; minikube tests
 create and remove their own profile rather than modify an existing operator profile.
 See [Chromium acquisition and research](chromium.md) for source and proof boundaries.
+
+## Public staging deployment
+
+The host-specific [staging runbook](../deploy/staging/README.md) describes the
+accepted immutable server release, dedicated k3s namespace, shared OxiBelt routes,
+private mTLS and health boundaries, and coordinated ZFS snapshot/clone recovery.
+Its permanent public corpus is separate from the disposable foundation and tests.
+Staging acceptance covers deployment and supervised collection bootstrap; full
+provider coverage, full-corpus capacity and native ChatGPT UI remain separate gates.
