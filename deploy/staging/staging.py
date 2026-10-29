@@ -192,7 +192,7 @@ def firewall(strict=True):
         if expected:
             rules += f'ip daddr 10.0.0.1 ip saddr 10.0.0.3 iifname "openlegal-edge0" {proto} dport {port} accept\n'
         rules += f'fib daddr type local {proto} dport {port} drop\n'
-    rules += '} }\n'
+    rules += '}\n}\n'
     run(['nft', '-f', '-'], rules)
     if not expected and strict:
         raise OperatorError('edge_topology_changed_ports_fenced')
