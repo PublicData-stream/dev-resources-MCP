@@ -307,6 +307,7 @@ def edge_prepare():
     if candidate.exists():
         raise OperatorError('candidate_already_exists')
     candidate.mkdir(mode=0o755)
+    os.chmod(candidate, 0o755)  # private process umask must not hide the mounted config from edge UID
     conf = candidate / 'oxibelt-conf'
     shutil.copytree(EDGE / 'oxibelt-conf', conf)
     shutil.copyfile(EDGE / 'oxibelt.toml', candidate / 'oxibelt.toml')
@@ -320,6 +321,7 @@ def edge_prepare():
         if (conf / name).exists():
             raise OperatorError('shared_snippet_conflict')
         shutil.copyfile(HERE / name, conf / name)
+        os.chmod(conf / name, 0o644)
     compose = (EDGE / 'docker-compose.yml').read_text()
     write(candidate / 'docker-compose.yml', add_host(compose), 0o600)
     before = json.loads(run(['docker', 'compose', '-f', EDGE / 'docker-compose.yml', 'config', '--format', 'json']))
