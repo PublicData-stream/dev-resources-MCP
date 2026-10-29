@@ -1,0 +1,38 @@
+# Additive shared-edge configuration for OxiBelt revision 4f3154d8.
+# The parent proxy trust list must include devres-backend-ca.pem.
+[[upstreams]]
+name = "devres-staging-http"
+origin = "https://devres-k8s:30081"
+max_http_version = "h1"
+preserve_host = false
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+first_byte_timeout_ms = 40000
+read_timeout_ms = 40000
+send_timeout_ms = 40000
+idle_timeout_ms = 65000
+pool_max_idle_per_host = 0
+[upstreams.tls.client_identity]
+cert_chain = "devres-client.pem"
+private_key = "devres-client-key.pem"
+[upstreams.tls.ech]
+mode = "disabled"
+
+[[upstreams]]
+name = "devres-staging-wt"
+origin = "https://devres-k8s:30434"
+max_http_version = "h3"
+preserve_host = false
+webtransport = true
+webtransport_http3_draft = "draft02"
+connect_timeout_ms = 3000
+request_timeout_ms = 40000
+first_byte_timeout_ms = 40000
+read_timeout_ms = 40000
+send_timeout_ms = 40000
+idle_timeout_ms = 65000
+[upstreams.tls.client_identity]
+cert_chain = "devres-client.pem"
+private_key = "devres-client-key.pem"
+[upstreams.tls.ech]
+mode = "disabled"

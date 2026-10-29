@@ -1,0 +1,48 @@
+# This template is not usable until the private database placeholder is replaced.
+# Keep populated configuration in the root-owned runtime Secret, never in Git.
+[source]
+url = "https://github.com/PublicData-stream/dev-resources-MCP/releases/download/0.1.0-build.27d35cd6/source.tar.gz"
+
+# First qualify transport, live fixed records, and coordinated restore with all
+# collectors paused. Activation changes only these eight booleans to true.
+[rfc]
+enabled = false
+[crates]
+enabled = false
+[rustsec]
+enabled = false
+[mdn]
+enabled = false
+[whatwg]
+enabled = false
+[w3c]
+enabled = false
+[chromium]
+enabled = false
+[npm]
+enabled = false
+packages = []
+
+[http]
+bind = "0.0.0.0:8080"
+allowed_hosts = ["devres-k8s:30081"]
+allowed_origins = ["https://chatgpt.com", "https://dev-resources.staged.mcp.publicdata.stream"]
+[http.tls]
+certificate = "/etc/devres/tls/backend.pem"
+private_key = "/etc/devres/tls/backend-key.pem"
+
+[webtransport]
+bind = "0.0.0.0:4433"
+certificate = "/etc/devres/tls/backend.pem"
+private_key = "/etc/devres/tls/backend-key.pem"
+allowed_hosts = ["devres-k8s:30434"]
+allowed_origins = ["https://chatgpt.com", "https://dev-resources.staged.mcp.publicdata.stream"]
+
+[health]
+bind = "0.0.0.0:9090"
+[storage]
+database_url = "REPLACE_WITH_PRIVATE_POSTGRES_URL"
+blob_dir = "/data/blobs"
+[edge_mtls]
+client_ca_file = "/etc/devres/tls/client-ca.pem"
+required_client_dns_san = "devres-edge.internal"

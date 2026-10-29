@@ -1,0 +1,311 @@
+# Host-specific staging deployment. Create ZFS datasets, Secrets and host firewall
+# before applying; this is independent of the disposable acceptance foundation.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devres-staging
+  labels:
+    app.kubernetes.io/part-of: devres-staging
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.36
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: devres-staging-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: devres-staging-postgres
+  labels: {app.kubernetes.io/part-of: devres-staging}
+spec:
+  capacity: {storage: 256Gi}
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: devres-staging-local
+  claimRef: {namespace: devres-staging, name: devres-staging-postgres}
+  local: {path: /mnt/devres-staging/postgres}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: kubernetes.io/hostname, operator: In, values: [piqua-serve]}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: devres-staging-evidence
+  labels: {app.kubernetes.io/part-of: devres-staging}
+spec:
+  capacity: {storage: 768Gi}
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: devres-staging-local
+  claimRef: {namespace: devres-staging, name: devres-staging-evidence}
+  local: {path: /mnt/devres-staging/evidence}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: kubernetes.io/hostname, operator: In, values: [piqua-serve]}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: devres-staging
+  name: devres-staging-postgres
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: devres-staging-local
+  volumeName: devres-staging-postgres
+  resources: {requests: {storage: 256Gi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: devres-staging
+  name: devres-staging-evidence
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: devres-staging-local
+  volumeName: devres-staging-evidence
+  resources: {requests: {storage: 768Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: devres-staging
+  name: postgres
+  labels: {app.kubernetes.io/part-of: devres-staging}
+spec:
+  # Admission stays closed until Secrets, firewall and policy are verified.
+  replicas: 0
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata:
+      labels: {app: postgres, app.kubernetes.io/part-of: devres-staging}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: POSTGRES_USER, value: devres_admin}
+            - {name: POSTGRES_DB, value: devres}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: devres-config, key: postgres-password}}
+          ports: [{name: postgres, containerPort: 5432}]
+          startupProbe:
+            exec: {command: [pg_isready, -U, devres_admin, -d, devres]}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec: {command: [pg_isready, -U, devres_admin, -d, devres]}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: '1', memory: 4Gi}
+            limits: {cpu: '4', memory: 16Gi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: devres-staging-postgres}
+        - name: init
+          secret:
+            secretName: devres-config
+            defaultMode: 0440
+            items: [{key: init.sql, path: 10-devres.sql}]
+        - name: run
+          emptyDir: {medium: Memory, sizeLimit: 16Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 1Gi}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {namespace: devres-staging, name: postgres}
+spec:
+  selector: {app: postgres}
+  ports: [{name: postgres, port: 5432, targetPort: postgres, protocol: TCP}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: devres-staging
+  name: backend
+  labels: {app.kubernetes.io/part-of: devres-staging}
+spec:
+  # Explicit operator activation preserves the single-owner admission fence.
+  replicas: 0
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: backend}}
+  template:
+    metadata:
+      labels: {app: backend, app.kubernetes.io/part-of: devres-staging}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: backend
+          image: ghcr.io/publicdata-stream/dev-resources-server@sha256:02977361122a11d7f0a9eedea97437b15f2fccc17f82d2331f859d388359179e
+          imagePullPolicy: IfNotPresent
+          args: [/etc/devres/config/backend.toml]
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - {name: wt, containerPort: 4433, protocol: UDP}
+            - {name: health, containerPort: 9090, protocol: TCP}
+          startupProbe:
+            httpGet: {path: /ready, port: health}
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: {path: /ready, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /live, port: health}
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests: {cpu: '4', memory: 16Gi}
+            limits: {cpu: '12', memory: 64Gi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/devres/config, readOnly: true}
+            - {name: tls, mountPath: /etc/devres/tls, readOnly: true}
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          secret:
+            secretName: devres-config
+            defaultMode: 0440
+            items: [{key: backend.toml, path: backend.toml}]
+        - name: tls
+          secret:
+            secretName: devres-tls
+            defaultMode: 0440
+            items:
+              - {key: backend.pem, path: backend.pem}
+              - {key: backend-key.pem, path: backend-key.pem}
+              - {key: client-ca.pem, path: client-ca.pem}
+        - name: data
+          persistentVolumeClaim: {claimName: devres-staging-evidence}
+        - name: tmp
+          emptyDir: {sizeLimit: 8Gi}
+---
+apiVersion: v1
+kind: Service
+metadata: {namespace: devres-staging, name: backend}
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector: {app: backend}
+  ports:
+    - {name: http, port: 8080, targetPort: http, nodePort: 30081, protocol: TCP}
+    - {name: wt, port: 4433, targetPort: wt, nodePort: 30434, protocol: UDP}
+# Health has no Service port; the shared edge routes only the two MCP paths.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {namespace: devres-staging, name: default-deny}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {namespace: devres-staging, name: backend-edge-only}
+spec:
+  podSelector: {matchLabels: {app: backend}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ipBlock: {cidr: 10.0.0.3/32}}]
+      ports:
+        - {port: 8080, protocol: TCP}
+        - {port: 4433, protocol: UDP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {namespace: devres-staging, name: postgres-backend-only}
+spec:
+  podSelector: {matchLabels: {app: postgres}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: backend}}}]
+      ports: [{port: 5432, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {namespace: devres-staging, name: backend-egress}
+spec:
+  podSelector: {matchLabels: {app: backend}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+    - to: [{podSelector: {matchLabels: {app: postgres}}}]
+      ports: [{port: 5432, protocol: TCP}]
+    # CNI restricts addresses/ports; the application separately restricts provider
+    # hostnames, redirects and connection-time destinations. This is not an FQDN ACL.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.0.2.0/24
+              - 192.88.99.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 198.51.100.0/24
+              - 203.0.113.0/24
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+              - 144.91.103.67/32
+      ports: [{port: 443, protocol: TCP}]
+# Public IPv6 egress is intentionally absent on this IPv4 Pod cluster. AAAA public
+# ingress terminates at the shared edge; it is independent of backend egress.
