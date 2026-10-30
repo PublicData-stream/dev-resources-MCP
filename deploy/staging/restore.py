@@ -26,12 +26,16 @@ HERE = Path(__file__).resolve().parent
 PRIVATE = Path('/etc/devres-staging')
 DATASET = 'cachepool/devres-staging'
 PG = 'postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:02977361122a11d7f0a9eedea97437b15f2fccc17f82d2331f859d388359179e'
+OLD_SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:02977361122a11d7f0a9eedea97437b15f2fccc17f82d2331f859d388359179e'
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:8abbfb5a15ac4a660f8853a2668e19b660cd67d2c898e72a3e2e8383477fac34'
+PROFILES = {9: (OLD_SERVER, '0.1.0-build.27d35cd6'), 10: (SERVER, '0.1.0-build.fc7d9856')}
+SOURCE_PREFIX = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
 COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
 OWNER_KEY = 'org.publicdata:restore-owner'
 LABEL_KEY = 'devres.restore-owner'
 TOKEN_RE = re.compile(r'[0-9a-f]{24}\Z')
 HASH_RE = re.compile(r'[0-9a-f]{64}\Z')
+CONTENT_RE = re.compile(r'(?:blake3:)?[0-9a-f]{64}\Z')
 MAX_RESPONSE = 1024 * 1024
 MAX_FIXED_BODY = 16 * 1024 * 1024
 RECORD_SQL = "SELECT id, body_hash FROM devres_captures WHERE source_url='https://www.rfc-editor.org/rfc/rfc9000.txt' AND media_type='text/plain' ORDER BY retrieved_at DESC,id LIMIT 1"
@@ -85,12 +89,25 @@ def paused_config(text):
     return changed
 
 
-def hash_blob(root, value):
-    if not HASH_RE.fullmatch(value):
+def blob_path(root, value):
+    if not CONTENT_RE.fullmatch(value):
         raise RestoreError('invalid_capture_hash')
-    path = Path(root) / value
+    root = Path(root)
+    path = root / 'blake3' / value[7:] if value.startswith('blake3:') else root / value
+    for parent in (root, path.parent):
+        try:
+            info = parent.lstat()
+        except OSError as error:
+            raise RestoreError('capture_blob_unavailable') from error
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise RestoreError('capture_blob_unavailable')
+    return path
+
+
+def open_blob(root, value):
+    path = blob_path(root, value)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
         raise RestoreError('capture_blob_unavailable') from error
     try:
@@ -99,13 +116,28 @@ def hash_blob(root, value):
             raise RestoreError('capture_blob_not_regular')
         if not 0 < info.st_size <= MAX_FIXED_BODY:
             raise RestoreError('fixed_capture_size_exceeds_bound')
+        return fd, info.st_size
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def hash_blob(root, value, *, integrity_verified=False):
+    # Tagged BLAKE3 and legacy independent descriptors are verified by the exact
+    # schema-ten binary, avoiding a second cryptography implementation here.
+    if value.startswith('blake3:') and not integrity_verified:
+        raise RestoreError('independent_integrity_verification_required')
+    fd, size = open_blob(root, value)
+    try:
+        if value.startswith('blake3:'):
+            return size
         digest = hashlib.sha256()
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             while part := stream.read(1024 * 1024):
                 digest.update(part)
         if digest.hexdigest() != value:
             raise RestoreError('capture_blob_hash_mismatch')
-        return info.st_size
+        return size
     finally:
         os.close(fd)
 
@@ -165,14 +197,28 @@ def rpc(ip, method, params, private=PRIVATE):
 
 class Drill:
     def __init__(self, snapshot, run=execute, root=None, private=PRIVATE,
-                 token=None, sleep=time.sleep, call=rpc):
+                 token=None, sleep=time.sleep, call=rpc, server=None, schema=None,
+                 config_text=None, source_dataset=None):
         self.snapshot = validate_snapshot(snapshot)
+        if schema is not None and (type(schema) is not int or schema not in PROFILES):
+            raise RestoreError('restored_schema_mismatch')
+        if server is not None and server not in (OLD_SERVER, SERVER):
+            raise RestoreError('unreviewed_restore_image')
+        if server is not None and schema is not None and server != PROFILES[schema][0]:
+            raise RestoreError('restore_profile_mismatch')
+        self.server, self.schema, self.config_text = server, schema, config_text
         self.run, self.private, self.sleep, self.call = run, Path(private), sleep, call
         self.token = token or secrets.token_hex(12)
         if not TOKEN_RE.fullmatch(self.token):
             raise RestoreError('invalid_restore_token')
         self.name = 'devres-staging-restore-' + self.token
         self.dataset = 'cachepool/' + self.name
+        self.source_dataset = DATASET if source_dataset is None else source_dataset
+        if (self.source_dataset != DATASET
+                and not re.fullmatch(r'cachepool/devres-staging-restore-[0-9a-f]{24}', self.source_dataset)):
+            raise RestoreError('unsafe_restore_source_dataset')
+        if self.source_dataset == self.dataset:
+            raise RestoreError('restore_source_matches_destination')
         self.root = Path(root) if root is not None else Path('/tmp') / self.name
         if not self.root.is_absolute() or self.root == Path('/tmp') or Path('/tmp') not in self.root.parents:
             raise RestoreError('restore_path_must_be_below_tmp')
@@ -180,6 +226,9 @@ class Drill:
         self.containers = []
         self.network = False
         self.runtime_owned = False
+        self.postgres_started = False
+        self.offline_sequence = 0
+        self.backend_started = False
 
     def owned(self, dataset):
         if dataset not in (self.dataset, self.dataset + '/postgres', self.dataset + '/evidence'):
@@ -188,6 +237,12 @@ class Drill:
             raise RestoreError('restore_dataset_ownership_changed')
 
     def prepare(self):
+        if self.source_dataset != DATASET:
+            source_owner = self.source_dataset.rsplit('-', 1)[1]
+            for child in ('', '/postgres', '/evidence'):
+                if self.run(['zfs', 'get', '-H', '-o', 'value', OWNER_KEY,
+                             self.source_dataset + child]).strip() != source_owner:
+                    raise RestoreError('restore_source_ownership_changed')
         self.root.mkdir(mode=0o700, parents=False, exist_ok=False)
         (self.root / 'owner').write_text(self.token)
         self.runtime_owned = True
@@ -199,7 +254,7 @@ class Drill:
             self.datasets.append(self.dataset + '/' + child)
             self.run(['zfs', 'clone', '-o', OWNER_KEY + '=' + self.token,
                       '-o', 'mountpoint=' + str(self.root / child), '-o', 'canmount=on',
-                      DATASET + '/' + child + '@' + self.snapshot, self.dataset + '/' + child])
+                      self.source_dataset + '/' + child + '@' + self.snapshot, self.dataset + '/' + child])
         self.network = True
         self.run(['docker', 'network', 'create', '--internal', '--label', LABEL_KEY + '=' + self.token, self.name])
         for folder in ('config', 'tls'):
@@ -207,7 +262,8 @@ class Drill:
             path.mkdir(mode=0o750)
             os.chmod(path, 0o750)
             os.chown(path, 0, 65532)
-        config = paused_config((self.private / 'backend.toml').read_text())
+        config = paused_config(self.config_text if self.config_text is not None
+                               else (self.private / 'backend.toml').read_text())
         # Keep PostgreSQL alias/credentials and all transport identity unchanged.
         parsed = tomllib.loads(config)
         if not re.fullmatch(r'postgres://devres:[0-9a-f]+@postgres:5432/devres', parsed['storage']['database_url']):
@@ -234,8 +290,9 @@ class Drill:
         return self.run(['docker', 'exec', self.name + '-postgres', 'psql', '-X', '-A', '-t',
                          '-F', '\t', '-h', '/tmp', '-U', 'devres_admin', '-d', 'devres', '-v', 'ON_ERROR_STOP=1', '-c', query])
 
-    def check(self):
-        self.prepare()
+    def start_postgres(self):
+        if not self.runtime_owned or self.postgres_started:
+            raise RestoreError('restore_postgres_state_invalid')
         pg = self.name + '-postgres'
         self.containers.append(pg)
         self.run(['docker', 'run', '-d', '--name', pg, '--label', LABEL_KEY + '=' + self.token,
@@ -253,30 +310,106 @@ class Drill:
                 if attempt == 59:
                     raise RestoreError('restored_postgres_not_ready')
                 self.sleep(1)
-        if self.psql('SELECT version FROM devres_schema WHERE singleton') != '9':
+        self.postgres_started = True
+
+    def backend_args(self, memory='16g'):
+        return ['--user', '65532:65532', '--memory=' + memory,
+                '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=1g,uid=65532,gid=65532',
+                '-v', str(self.root / 'evidence') + ':/data',
+                '-v', str(self.root / 'config') + ':/etc/devres/config:ro',
+                '-v', str(self.root / 'tls') + ':/etc/devres/tls:ro']
+
+    def offline(self, command, target=SERVER, timeout=86400):
+        """Run one reviewed offline command; stop/remove its writer on every exit."""
+        if command not in ('migrate-storage', 'verify-storage', 'activate-storage') or target != SERVER:
+            raise RestoreError('invalid_offline_command_or_image')
+        if type(timeout) not in (int, float) or not 0 < timeout <= 86400:
+            raise RestoreError('invalid_offline_timeout')
+        if (not self.postgres_started or self.backend_started
+                or any(name.startswith(self.name + '-offline-') for name in self.containers)):
+            raise RestoreError('offline_writer_exclusion_required')
+        self.offline_sequence += 1
+        name = self.name + '-offline-' + str(self.offline_sequence)
+        self.containers.append(name)
+        args = [command, '/etc/devres/config/backend.toml']
+        if command == 'migrate-storage':
+            args.extend(['--to', 'blake3'])
+        try:
+            self.run(['docker', 'run', '-d', '--name', name, '--label', LABEL_KEY + '=' + self.token,
+                      '--network', self.name, '--read-only', '--cap-drop=ALL',
+                      '--security-opt=no-new-privileges', '--pids-limit=128',
+                      *self.backend_args(), '--entrypoint', '/usr/local/bin/devres-server', target, *args])
+            # Count bounded polling intervals too, so injectable test clocks do
+            # not turn a stalled command into an unbounded loop.
+            started = time.monotonic()
+            for attempt in range(int(timeout) + 1):
+                state = json.loads(self.run(['docker', 'inspect', '--format', '{{json .State}}', name]))
+                if not state.get('Running'):
+                    if state.get('ExitCode') != 0:
+                        raise RestoreError('offline_command_failed')
+                    return {'command': command, 'completed': True}
+                if time.monotonic() - started >= timeout or attempt >= timeout:
+                    raise RestoreError('offline_command_timed_out')
+                self.sleep(min(1, timeout))
+            raise RestoreError('offline_command_timed_out')
+        finally:
+            # Docker removal waits for container termination before dropping the
+            # writer; failed cleanup deliberately prevents the next command.
+            self.run(['docker', 'rm', '-f', name])
+            self.containers.remove(name)
+
+    def select_profile(self, schema):
+        server, version = PROFILES[schema]
+        if self.server is not None and self.server != server:
+            raise RestoreError('restore_profile_mismatch')
+        source = SOURCE_PREFIX + version + '/source.tar.gz'
+        path = self.root / 'config/backend.toml'
+        text = path.read_text()
+        before = tomllib.loads(text)
+        pattern = r'(?ms)(^\[source\][ \t]*\n)((?:(?!^\[).)*?)(^url[ \t]*=[ \t]*)[^\n]*$'
+        changed, count = re.subn(pattern, lambda m: m[1] + m[2] + m[3] + json.dumps(source), text)
+        after = tomllib.loads(changed)
+        before.setdefault('source', {})['url'] = source
+        if count != 1 or before != after:
+            raise RestoreError('restore_source_configuration_invalid')
+        path.write_text(changed)
+        return server, version, source
+
+    def check(self, prepared=False, timeout=86400):
+        if not prepared:
+            self.prepare()
+            self.start_postgres()
+        elif not self.postgres_started:
+            raise RestoreError('restore_postgres_state_invalid')
+        actual = self.psql('SELECT version FROM devres_schema WHERE singleton')
+        if actual not in ('9', '10') or (self.schema is not None and str(self.schema) != actual):
             raise RestoreError('restored_schema_mismatch')
+        schema = int(actual)
+        server, version, source = self.select_profile(schema)
+        if schema == 10:
+            if self.psql('SELECT active FROM devres_integrity_control WHERE singleton') != 't':
+                raise RestoreError('restored_integrity_not_active')
+            self.offline('verify-storage', timeout=timeout)
         count = self.psql('SELECT count(*) FROM devres_captures')
         if not count.isdigit() or int(count) < 1:
             raise RestoreError('real_capture_required')
         row = self.psql(RECORD_SQL).split('\t')
-        if len(row) != 2 or not all(HASH_RE.fullmatch(v) for v in row):
+        identity_pattern = HASH_RE if schema == 9 else CONTENT_RE
+        if len(row) != 2 or not all(identity_pattern.fullmatch(v) for v in row):
             raise RestoreError('retained_fixed_rfc_required')
         capture, body_hash = row
         blob_root = self.root / 'evidence/blobs'
-        size = hash_blob(blob_root, body_hash)
-        backend = self.docker_run('backend', SERVER, [
-            '--user', '65532:65532', '--memory=4g',
-            '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=1g,uid=65532,gid=65532',
-            '-v', str(self.root / 'evidence') + ':/data',
-            '-v', str(self.root / 'config') + ':/etc/devres/config:ro',
-            '-v', str(self.root / 'tls') + ':/etc/devres/tls:ro'])
+        size = hash_blob(blob_root, body_hash, integrity_verified=schema == 10)
+        backend = self.docker_run('backend', server, self.backend_args('4g'))
+        self.backend_started = True
         info = json.loads(self.run(['docker', 'inspect', backend]))[0]
         ip = info['NetworkSettings']['Networks'][self.name]['IPAddress']
         for attempt in range(60):
             try:
                 result = self.call(ip, 'tools/call', {'name': 'server.info', 'arguments': {}}, self.private)
                 identity = result.get('structuredContent', {})
-                if result.get('isError') or identity.get('product') != 'dev-resources-MCP':
+                if (result.get('isError') or identity.get('product') != 'dev-resources-MCP'
+                        or identity.get('version') != version or identity.get('sourceUrl') != source):
                     raise RestoreError('restored_identity_mismatch')
                 break
             except RestoreError:
@@ -290,10 +423,13 @@ class Drill:
         page = contents[0]['text'].encode('utf-8')
         if len(page) > 32768:
             raise RestoreError('restored_capture_page_exceeds_bound')
-        with (blob_root / body_hash).open('rb') as stream:
+        fd, _ = open_blob(blob_root, body_hash)
+        with os.fdopen(fd, 'rb') as stream:
             if stream.read(len(page)) != page:
                 raise RestoreError('restored_capture_page_mismatch')
-        return {'snapshot': self.snapshot, 'schema': 9, 'captures': int(count),
+        return {'snapshot': self.snapshot, 'schema': schema, 'server': server,
+                'version': version, 'source_url': source, 'captures': int(count),
+                'verified_capture_id': capture,
                 'verified_body_hash': body_hash, 'verified_body_bytes': size,
                 'verified_resource_bytes': len(page)}
 
@@ -334,10 +470,10 @@ class Drill:
             shutil.rmtree(self.root)
 
 
-def verify(snapshot, **kwargs):
+def verify(snapshot, *, timeout=86400, **kwargs):
     """Return bounded metadata only after real capture recovery and cleanup pass."""
     drill = Drill(snapshot, **kwargs)
     try:
-        return drill.check()
+        return drill.check(timeout=timeout)
     finally:
         drill.cleanup()
