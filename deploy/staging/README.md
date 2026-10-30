@@ -1,7 +1,7 @@
 # Staging deployment
 
 These host-specific assets deploy the existing accepted
-`0.1.0-build.27d35cd6` server image into `devres-staging` on `piqua-serve`.
+`0.1.0-build.fc7d9856` server image into `devres-staging` on `piqua-serve`.
 The disposable [foundation](../kubernetes/foundation.yaml) remains separate.
 No package code is executed and no administrative HTTP route is added.
 
@@ -101,6 +101,64 @@ collectors alone does not stop foreground retrieval writes. See the maintenance
 tool and the [operations guide](../../docs/operations.md) for backup/restore gates.
 
 ## Host commands and recovery
+
+### Existing schema-nine deployment
+
+The build above requires schema 10. Do not rerun `prepare` against an existing
+deployment or start the new image on schema nine. Install the reviewed operator,
+upgrade and restore modules together, retaining the previous bundle privately.
+The upgrade changes only release identity and temporarily pauses collectors;
+the original eight scheduling settings, npm package list and budgets are restored.
+
+```sh
+python3 staging.py upgrade-rehearse
+python3 staging.py upgrade
+# Complete independent retained-data, isolation, public HTTP/WebTransport and
+# shared-service acceptance; save the private acceptance receipt described below.
+python3 staging.py upgrade-finish
+# On a failed cutover, preserve its data and restore the matching previous pair:
+python3 staging.py upgrade-rollback
+```
+
+Rehearsal uses a protected coordinated snapshot and isolated `/tmp` clones with
+no provider egress. It first proves schema-nine recovery, then runs the exact new
+binary's `migrate-storage`, `verify-storage` and `activate-storage` commands, and
+reads a retained RFC capture. The measured rehearsal sets the cutover deadline
+to the larger of thirty minutes and twice the rehearsal duration. Recovery time
+is additional. Capacity and clone quotas remain enforced; a successful rehearsal
+does not establish whole-corpus capacity.
+
+The real cutover stops all writers, retains a fresh protected database/evidence
+snapshot, verifies old-image recovery, and runs the same offline commands on the
+permanent pair inside an internal Docker network while the Kubernetes pair is
+stopped. Exactly one new backend starts with collectors paused. The capacity
+guard remains active; other writer/maintenance entrypoints refuse an active
+upgrade. No shared-edge restart or provider smoke occurs in these commands.
+
+Before `upgrade-finish`, the operator must independently verify both MCP revisions
+(`2025-11-25`, `2026-07-28`) and both public transports, retained capture/search
+continuity, private-route/Host/Origin/mTLS isolation and existing shared services.
+Record the current upgrade journal's token and resulting booleans in root-owned mode-0600
+`/var/lib/devres-staging/upgrade/acceptance.json`:
+
+```json
+{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.fc7d9856","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
+```
+
+Finish qualifies a schema-ten coordinated backup/isolated restore before
+restoring schedules and the original backup timer. Observe ten minutes of
+readiness, restarts, provider errors, corpus status and capacity afterwards.
+Restart the shared OxiBelt container at most once only when the backend passes
+and public connectivity fails, then recheck every existing public route.
+
+Rollback preserves the failed database and evidence datasets, then restores the
+matching pre-upgrade pair, previous image and configuration. It never performs
+an image-only schema downgrade or discards post-cutover history. Preserved newer
+evidence may not be visible through the restored older service. Keep snapshot
+holds until the resulting restore is qualified; do not manually clear the
+upgrade journal or a capacity fence to resume writes.
+
+### Fresh deployment
 
 Install these reviewed assets together in the root-owned
 `/usr/local/libexec/devres-staging` directory. Run each command from that directory

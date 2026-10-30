@@ -1,7 +1,7 @@
 # This template is not usable until the private database placeholder is replaced.
 # Keep populated configuration in the root-owned runtime Secret, never in Git.
 [source]
-url = "https://github.com/PublicData-stream/dev-resources-MCP/releases/download/0.1.0-build.27d35cd6/source.tar.gz"
+url = "https://github.com/PublicData-stream/dev-resources-MCP/releases/download/0.1.0-build.fc7d9856/source.tar.gz"
 
 # First qualify transport, live fixed records, and coordinated restore with all
 # collectors paused. Activation changes only these eight booleans to true.
