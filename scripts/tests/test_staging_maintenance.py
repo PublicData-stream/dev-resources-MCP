@@ -113,6 +113,37 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIsNone(self.state.value["operation"])
         self.assertEqual(self.state.value["verified"], [])
 
+    def test_active_upgrade_blocks_snapshot_and_generic_resume(self):
+        from unittest.mock import patch
+        with patch.object(maintenance, 'upgrade_module') as upgrade:
+            upgrade.return_value.active.return_value = True
+            for entrypoint in (self.tool.snapshot, self.tool.resume):
+                with self.assertRaisesRegex(maintenance.MaintenanceError, 'upgrade_in_progress'):
+                    entrypoint()
+        self.assertFalse(self.host.commands)
+
+    def test_capacity_fence_stops_only_owned_upgrade_containers(self):
+        from unittest.mock import patch
+        token = 'a' * 24
+        prefix = 'devres-staging-restore-' + token
+        original = self.host.run
+        def run(args):
+            if args[:3] == ['docker', 'ps', '-a']:
+                self.assertIn('label=devres.restore-owner=' + token, args)
+                return prefix + '-postgres\n' + prefix + '-offline-1'
+            if args[:2] == ['docker', 'stop']:
+                self.host.commands.append(tuple(args))
+                return ''
+            return original(args)
+        self.tool.run = run
+        self.host.pool_free = maintenance.POOL_MIN_FREE
+        with patch.object(maintenance, 'upgrade_module') as upgrade:
+            upgrade.return_value.owned_containers.return_value = {
+                'token': token, 'label': 'devres.restore-owner', 'prefix': prefix}
+            self.assertTrue(self.tool.guard()['fenced'])
+        stopped = [c[-1] for c in self.host.commands if c[:2] == ('docker', 'stop')]
+        self.assertEqual(stopped, [prefix + '-postgres', prefix + '-offline-1'])
+
     def test_snapshot_preserves_original_zero_replicas(self):
         self.host.replicas = {"backend": 0, "postgres": 0}
         self.tool.snapshot()

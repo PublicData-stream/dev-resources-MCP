@@ -101,6 +101,15 @@ class FirewallTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_upgrade_fence_blocks_other_writer_entrypoints(self):
+        with patch.object(op, 'upgrade_module') as upgrade, patch.object(op, 'private_dirs') as dirs:
+            upgrade.return_value.active.return_value = True
+            for entrypoint in (op.prepare, op.start, op.collectors_on, op.backup):
+                with self.subTest(entrypoint=entrypoint.__name__):
+                    with self.assertRaisesRegex(op.OperatorError, 'upgrade_in_progress'):
+                        entrypoint()
+            dirs.assert_not_called()
+
     def test_prepare_api_failure_does_not_rewrite_credentials_or_storage(self):
         with patch.object(op, 'private_dirs'), patch.object(op, 'run', side_effect=op.OperatorError('command_failed:k3s')), patch.object(op, 'dataset') as ds:
             with self.assertRaises(op.OperatorError):

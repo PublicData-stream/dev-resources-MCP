@@ -10,6 +10,7 @@ import argparse
 import contextlib
 from datetime import datetime, timedelta, timezone
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,22 @@ SNAPSHOT_RE = re.compile(r"devres-\d{8}T\d{6}Z(?:-[a-z][a-z0-9-]{0,31})?\Z")
 LABEL_RE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 STATE_ROOT = Path("/var/lib/devres-staging")
 POSTGRES_IMAGE = "postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a"
+
+
+def upgrade_module():
+    path = Path(__file__).resolve().parent / 'upgrade.py'
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location('devres_upgrade_guard', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def require_no_upgrade():
+    module = upgrade_module()
+    if module is not None and module.active(STATE_ROOT):
+        raise MaintenanceError('upgrade_in_progress')
 
 
 class MaintenanceError(RuntimeError):
@@ -231,6 +248,17 @@ class Maintenance:
         if value.get("fence") or value.get("operation"):
             self.scale("backend", 0)
             self.stopped("backend")
+        if value.get("fence"):
+            module = upgrade_module()
+            owned = module.owned_containers(STATE_ROOT) if module is not None else None
+            if owned:
+                names = self.run(['docker', 'ps', '-a', '--filter',
+                                  'label=' + owned['label'] + '=' + owned['token'],
+                                  '--format', '{{.Names}}']).splitlines()
+                for name in names:
+                    if not name.startswith(owned['prefix'] + '-') or not re.fullmatch(r'[a-z0-9-]+', name):
+                        raise MaintenanceError('upgrade_container_inventory_changed')
+                    self.run(['docker', 'stop', '--time', '30', name])
         return {"fenced": bool(value.get("fence") or value.get("operation")),
                 "reason": value.get("fence", {}).get("reason") if value.get("fence") else None,
                 "counters": counters}
@@ -270,7 +298,9 @@ class Maintenance:
         if states != ["shut down"]:
             raise MaintenanceError("postgres_clean_shutdown_unconfirmed")
 
-    def snapshot(self, label=None):
+    def snapshot(self, label=None, *, upgrade=False):
+        if not upgrade:
+            require_no_upgrade()
         if label is not None and not LABEL_RE.fullmatch(label):
             raise MaintenanceError("invalid_snapshot_label")
         value = self.state.load()
@@ -358,6 +388,7 @@ class Maintenance:
         return {"verified": name, "expired_verified_snapshots_removed": len(removed)}
 
     def resume(self):
+        require_no_upgrade()
         value = self.state.load()
         if not value.get("fence") and not value.get("operation"):
             raise MaintenanceError("no_recovery_pending")

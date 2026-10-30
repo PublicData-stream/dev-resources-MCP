@@ -212,6 +212,7 @@ def install_profiles():
 
 
 def prepare():
+    require_no_upgrade()
     private_dirs()
     # Inventory failures and terminating Pods must not permit a Secret rewrite.
     existing_namespace = run(['k3s', 'kubectl', 'get', 'namespace', NS,
@@ -402,6 +403,7 @@ def edge_activate(rollback=False):
 
 
 def start():
+    require_no_upgrade()
     m = maintenance_module()
     with m.State().locked():
         tool = m.Maintenance(m.State())
@@ -420,7 +422,20 @@ def maintenance_module():
     return module
 
 
+def upgrade_module():
+    spec = importlib.util.spec_from_file_location('devres_upgrade', HERE / 'upgrade.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def require_no_upgrade():
+    if (HERE / 'upgrade.py').exists() and upgrade_module().active(STATE):
+        raise OperatorError('upgrade_in_progress')
+
+
 def collectors_on():
+    require_no_upgrade()
     m = maintenance_module()
     state = m.State()
     with state.locked():
@@ -447,6 +462,7 @@ def collectors_on():
 
 
 def backup():
+    require_no_upgrade()
     # Guard remains able to fence foreground writes during the isolated drill.
     from restore import verify
     m = maintenance_module()
@@ -468,7 +484,7 @@ def backup():
 def diagnostic_code(error):
     if isinstance(error, OperatorError):
         return str(error)
-    if (type(error).__name__ in {'RestoreError', 'MaintenanceError'}
+    if (type(error).__name__ in {'RestoreError', 'MaintenanceError', 'UpgradeError'}
             and re.fullmatch(r'[a-z][a-z0-9_]{0,100}', str(error))):
         return str(error)
     return type(error).__name__
@@ -477,7 +493,8 @@ def diagnostic_code(error):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'firewall', 'firewall-bootstrap', 'start', 'edge-prepare',
-                        'edge-activate', 'edge-rollback', 'collectors-on', 'backup'])
+                        'edge-activate', 'edge-rollback', 'collectors-on', 'backup',
+                        'upgrade-rehearse', 'upgrade', 'upgrade-rollback', 'upgrade-finish'])
     command = parser.parse_args().command
     if os.geteuid() != 0:
         raise OperatorError('root_required')
@@ -485,7 +502,11 @@ def main():
     commands = {'prepare': prepare, 'firewall': firewall, 'firewall-bootstrap': lambda: firewall(False), 'start': start,
                 'edge-prepare': edge_prepare, 'edge-activate': edge_activate,
                 'edge-rollback': lambda: edge_activate(True), 'collectors-on': collectors_on,
-                'backup': backup}
+                'backup': backup,
+                'upgrade-rehearse': lambda: upgrade_module().rehearse(),
+                'upgrade': lambda: upgrade_module().upgrade(),
+                'upgrade-rollback': lambda: upgrade_module().rollback(),
+                'upgrade-finish': lambda: upgrade_module().finalize()}
     commands[command]()
 
 
