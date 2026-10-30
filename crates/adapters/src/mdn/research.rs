@@ -1358,7 +1358,7 @@ fn resource_uri(
 
 pub fn schemas() -> Vec<Value> {
     let string = json!({"type":"string","minLength":1,"maxLength":256});
-    let snapshot = json!({"type":"string","pattern":"^[a-f0-9]{64}$"});
+    let snapshot = json!({"type":"string","pattern":"^(blake3:)?[0-9a-f]{64}$"});
     let path = json!({"type":"string","minLength":1,"maxLength":4096});
     let list_limit = json!({"type":"integer","minimum":1,"maximum":100,"default":20});
     let list_offset = json!({"type":"integer","minimum":0,"maximum":10000});

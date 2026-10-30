@@ -183,6 +183,60 @@ mod tests {
         }
     }
     #[test]
+    fn published_content_selectors_accept_blake3_and_legacy_ids() {
+        let legacy = "a".repeat(64);
+        let tagged = format!("blake3:{legacy}");
+        let mut families = std::collections::BTreeSet::new();
+        for descriptor in devres_adapters::Research::tool_schemas() {
+            let name = descriptor["name"].as_str().unwrap();
+            for (field, schema) in descriptor["inputSchema"]["properties"].as_object().unwrap() {
+                if !matches!(
+                    field.as_str(),
+                    "snapshot"
+                        | "view"
+                        | "compatibility_snapshot"
+                        | "from_snapshot"
+                        | "to_snapshot"
+                        | "capture"
+                        | "from_capture"
+                        | "to_capture"
+                        | "advisory_snapshot"
+                ) || schema["type"] != "string"
+                {
+                    continue;
+                }
+                let validator = jsonschema::validator_for(schema).unwrap();
+                for id in [&legacy, &tagged] {
+                    assert!(
+                        validator.is_valid(&json!(id)),
+                        "{name}.{field} rejects {id}"
+                    );
+                }
+                if schema.get("pattern").is_some() {
+                    for id in [
+                        format!("sha256:{legacy}"),
+                        format!("blake3:{}", "a".repeat(63)),
+                        format!("blake3:{}", "A".repeat(64)),
+                    ] {
+                        assert!(
+                            !validator.is_valid(&json!(id)),
+                            "{name}.{field} admits malformed selector {id}"
+                        );
+                    }
+                }
+                families.insert(name.split('.').next().unwrap().to_owned());
+            }
+        }
+        for family in [
+            "rfc", "crate", "advisory", "mdn", "whatwg", "w3c", "chromium", "npm",
+        ] {
+            assert!(
+                families.contains(family),
+                "missing {family} selector coverage"
+            );
+        }
+    }
+    #[test]
     fn discovery_has_exact_dotted_names_without_legacy_aliases() {
         let mut registry =
             server_info_registry(SourceOffer::new("https://source.test").unwrap()).unwrap();

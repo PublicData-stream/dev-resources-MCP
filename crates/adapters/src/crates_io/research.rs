@@ -802,7 +802,7 @@ pub fn schemas() -> Vec<Value> {
     let text = json!({"type":"string","minLength":1,"maxLength":256});
     let name = json!({"type":"string","minLength":1,"maxLength":64});
     let version = json!({"type":"string","minLength":1,"maxLength":128});
-    let snapshot = json!({"type":"string","pattern":"^[a-f0-9]{64}$"});
+    let snapshot = json!({"type":"string","pattern":"^(blake3:)?[0-9a-f]{64}$"});
     let path = json!({"type":"string","minLength":1,"maxLength":4096});
     let list = json!({"type":"integer","minimum":1,"maximum":100,"default":20});
     let offset = json!({"type":"integer","minimum":0,"maximum":10000,"default":0});

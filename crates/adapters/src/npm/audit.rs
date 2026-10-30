@@ -72,7 +72,7 @@ pub fn schemas() -> Vec<Value> {
         json!({"name":"npm.audit_lockfile","description":"Locally assess a supplied npm, pnpm, or Yarn lockfile against captured OSV npm evidence. Input, inventory, and report exist only for the request; no resolution, package execution, uploads, or enrollment occurs.","inputSchema":{"type":"object","additionalProperties":false,"properties":{
         "lockfile":{"type":"string","minLength":1,"maxLength":1048576},
         "lockfile_format":{"enum":["npm","pnpm","yarn_classic","yarn_berry"]},
-        "advisory_snapshot":{"type":"string","pattern":"^[a-f0-9]{64}$"},
+        "advisory_snapshot":{"type":"string","pattern":"^(blake3:)?[0-9a-f]{64}$"},
         "registry_context":{"type":"object","additionalProperties":false,"properties":{"default":{"enum":["npmjs","other","unknown"]},"scopes":{"type":"object","maxProperties":1000,"propertyNames":{"pattern":"^@[A-Za-z0-9][A-Za-z0-9._~-]*$"},"additionalProperties":{"enum":["npmjs","other","unknown"]}}}},
         "offset":{"type":"integer","minimum":0,"maximum":50000},"limit":{"type":"integer","minimum":1,"maximum":100}
     },"required":["lockfile","lockfile_format"]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),

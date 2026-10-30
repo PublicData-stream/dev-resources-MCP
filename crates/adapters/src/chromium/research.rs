@@ -2382,7 +2382,7 @@ fn matches_query(value: &Value, query: Option<&str>) -> bool {
 
 pub fn schemas() -> Vec<Value> {
     let id = json!({"type":"string","enum":["src","site","chrome","chrome-archive"]});
-    let hash = json!({"type":"string","pattern":"^[a-f0-9]{64}$"});
+    let hash = json!({"type":"string","pattern":"^(blake3:)?[0-9a-f]{64}$"});
     let path = json!({"type":"string","minLength":1,"maxLength":4096});
     let query = json!({"type":"string","minLength":1,"maxLength":256});
     let common = json!({"component":id,"snapshot":hash,"view":hash,"query":query,"offset":{"type":"integer","minimum":0,"maximum":10000,"default":0},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20},"cursor":{"type":"string","maxLength":16384}});
