@@ -145,12 +145,7 @@ fn save_immutable(root: &Path, name: &str, value: &Value) -> Result<()> {
 fn checked_id(value: &Value) -> Result<&str> {
     value
         .as_str()
-        .filter(|id| {
-            id.len() == 64
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        })
+        .filter(|id| devres_domain::valid_content_id(id))
         .ok_or_else(|| Error::integrity("Invalid WHATWG acceptance observation identity."))
 }
 
@@ -673,7 +668,8 @@ mod tests {
         let original = std::fs::read(root.path().join("frozen.json")).expect("original bytes");
         let failed = json!({"complete":false,"unavailable_publications":8});
         save(root.path(), "acceptance.json", &failed).expect("original failure");
-        let child = json!({"id":"b".repeat(64),"observations":{"kept":"fixed"}});
+        let child =
+            json!({"id":format!("blake3:{}", "b".repeat(64)),"observations":{"kept":"fixed"}});
         let envelope = save_recovery(root.path(), &parent, child.clone()).expect("successor");
         assert_eq!(
             read_recovery(root.path()).expect("recovery resume"),

@@ -22,8 +22,10 @@ fn snapshot(repository: &str, revision: &str, index: Value) -> Snapshot {
     }
 }
 fn view(content: &Snapshot, compatibility: &Snapshot, observed_at: i64) -> View {
-    let content_observation = format!("content-observation:{}", content.revision);
-    let compatibility_observation = format!("compatibility-observation:{}", compatibility.revision);
+    let content_observation =
+        digest(format!("content-observation:{}", content.revision).as_bytes());
+    let compatibility_observation =
+        digest(format!("compatibility-observation:{}", compatibility.revision).as_bytes());
     let id = digest(
         &serde_json::to_vec(&(
             &content.id,

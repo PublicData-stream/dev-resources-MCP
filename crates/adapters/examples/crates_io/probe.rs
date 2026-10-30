@@ -48,8 +48,9 @@ async fn capture(
     }
     store.capture(response, None, stop).await.map(Some)
 }
-fn expand_json(
+async fn expand_json(
     root: &Path,
+    store: &BulkArtifactStore,
     artifact: &BulkArtifact,
     target: &str,
     stop: &CancellationToken,
@@ -60,8 +61,11 @@ fn expand_json(
         .write(true)
         .open(&stage.0)
         .map_err(|_| Error::unavailable("Probe stage unavailable."))?;
-    let file = std::fs::File::open(root.join(&artifact.body_hash))
-        .map_err(|_| Error::unavailable("Probe capture unavailable."))?;
+    let file = store
+        .open(&artifact.body_hash, 32 * 1024 * 1024, stop.child_token())
+        .await?
+        .into_std()
+        .await;
     let mut decoder = flate2::read::MultiGzDecoder::new(file);
     let mut bytes = 0;
     let mut chunk = [0; 65536];
@@ -127,8 +131,11 @@ async fn probe(root: &Path, stop: CancellationToken) -> Result<Value> {
     )
     .await?
     .ok_or_else(|| Error::not_found("Fixed documentation platform record is absent."))?;
-    let file = std::fs::File::open(root.join(&platforms.body_hash))
-        .map_err(|_| Error::unavailable("Platform capture unavailable."))?;
+    let file = store
+        .open(&platforms.body_hash, 1024 * 1024, stop.child_token())
+        .await?
+        .into_std()
+        .await;
     let targets = crate_docs::parse_platforms(file, &ProcessingBudget::new(stop.child_token()))?;
     if targets.is_empty() {
         return Err(Error::integrity("Fixed documentation has no targets."));
@@ -146,8 +153,11 @@ async fn probe(root: &Path, stop: CancellationToken) -> Result<Value> {
     )
     .await?
     .ok_or_else(|| Error::not_found("Fixed documentation bundle is absent."))?;
-    let file = std::fs::File::open(root.join(&html.body_hash))
-        .map_err(|_| Error::unavailable("HTML capture unavailable."))?;
+    let file = store
+        .open(&html.body_hash, 32 * 1024 * 1024, stop.child_token())
+        .await?
+        .into_std()
+        .await;
     let html_summary =
         crate_docs::inspect_html_zip(file, &ProcessingBudget::new(stop.child_token()), |_| Ok(()))?;
     if html_summary.documents == 0 {
@@ -171,7 +181,7 @@ async fn probe(root: &Path, stop: CancellationToken) -> Result<Value> {
             stop.child_token(),
         )
         .await?;
-        json_results.push(match captured {Some(artifact)=>json!({"target":target.triple,"capture":artifact,"processing":expand_json(root,&artifact,&target.triple,&stop)?}),None=>json!({"target":target.triple,"status":"not_found"})});
+        json_results.push(match captured {Some(artifact)=>json!({"target":target.triple,"capture":artifact,"processing":expand_json(root,&store,&artifact,&target.triple,&stop).await?}),None=>json!({"target":target.triple,"status":"not_found"})});
     }
     // Read-only smart-HTTP advertisement only; never requests a registry pack.
     let git = capture(
@@ -226,7 +236,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             if verified != artifact {
                 return Err("replay artifact identity differs".into());
             }
-            results.push(json!({"target":target,"capture":artifact,"processing":expand_json(root,&artifact,target,&stop)?}));
+            results.push(json!({"target":target,"capture":artifact,"processing":expand_json(root,&store,&artifact,target,&stop).await?}));
         }
         let evidence = json!({"package":format!("{NAME}@{VERSION}"),"json":results,"network_attempts":0,"scope":"offline processing of retained fixed live captures"});
         let output = std::fs::OpenOptions::new()

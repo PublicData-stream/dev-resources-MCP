@@ -621,12 +621,6 @@ async fn canonical_history_snapshot(
     repository: &str,
     commit: &CommitOrder,
 ) -> Result<Snapshot> {
-    fn valid_id(id: &str) -> bool {
-        id.len() == 64
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }
     let key = format!("{repository}:{}:{PROCESSOR_VERSION}", commit.revision);
     let original = store
         .mdn_get("snapshot-keys", &key)
@@ -635,7 +629,7 @@ async fn canonical_history_snapshot(
     let original_id = original
         .data
         .as_str()
-        .filter(|id| valid_id(id))
+        .filter(|id| devres_domain::valid_content_id(id))
         .ok_or_else(|| Error::integrity("Invalid historical snapshot alias."))?;
     let original: Snapshot = mdn_inventory::decode(
         store
@@ -663,7 +657,7 @@ async fn canonical_history_snapshot(
     };
     let id = alias
         .as_str()
-        .filter(|id| valid_id(id))
+        .filter(|id| devres_domain::valid_content_id(id))
         .ok_or_else(|| Error::integrity("Invalid historical rebuild alias."))?;
     let repaired: Snapshot = mdn_inventory::decode(
         store

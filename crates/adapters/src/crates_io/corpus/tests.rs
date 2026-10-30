@@ -104,7 +104,7 @@ fn rustdoc(version: &str, target: &str, result_type: &str) -> Vec<u8> {
 fn index(archives: &[Vec<u8>; 2]) -> Vec<u8> {
     let mut result = String::new();
     for (position, version) in VERSIONS.iter().enumerate() {
-        let row = json!({"name":"example","vers":version,"deps":[{"name":"itoa","req":"^1.0","features":[],"optional":position==1,"default_features":true,"target":null,"kind":"normal"}],"features":{"default":[]},"cksum":digest(&archives[position]),"yanked":false,"rust_version":"1.85"});
+        let row = json!({"name":"example","vers":version,"deps":[{"name":"itoa","req":"^1.0","features":[],"optional":position==1,"default_features":true,"target":null,"kind":"normal"}],"features":{"default":[]},"cksum":crate::archive::sha256(&archives[position]),"yanked":false,"rust_version":"1.85"});
         result.push_str(&row.to_string());
         result.push('\n');
     }
@@ -382,7 +382,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     let mut archive_ids = Vec::new();
     let mut documentation_ids = Vec::new();
     for (position, version) in VERSIONS.iter().enumerate() {
-        let checksum = digest(&archives[position]);
+        let checksum = crate::archive::sha256(&archives[position]);
         let captured = seed(
             &corpus,
             &format!("cargo:archive:example:{version}:{checksum}"),
@@ -394,7 +394,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
             archives[position].clone(),
         )
         .await;
-        assert_eq!(captured.capture.body_hash, checksum);
+        assert_eq!(captured.capture.body_hash, digest(&archives[position]));
         archive_ids.push(captured.capture.id);
         seed(
             &corpus,

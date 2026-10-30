@@ -1,6 +1,7 @@
 //! Fixed-record npm evidence. Replay never constructs a network client.
 use devres_adapters::{
     bulk::{BulkArtifact, BulkArtifactStore, BulkBroker, BulkConfig, BulkRequest, BulkSource},
+    integrity as content_integrity,
     npm::audit as npm_audit,
     npm::processing as npm_processing,
     npm::source::Operation,
@@ -166,7 +167,8 @@ async fn verified(
         || receipt["validated_at"]
             .as_i64()
             .is_none_or(|value| value <= 0)
-        || artifact.relative_path != artifact.body_hash
+        || std::path::Path::new(&artifact.relative_path)
+            != content_integrity::relative_path(&artifact.body_hash)?
     {
         return Err(integrity());
     }
@@ -503,7 +505,7 @@ mod tests {
         std::fs::write(
             root.path()
                 .join("raw")
-                .join(artifact["body_hash"].as_str().expect("hash")),
+                .join(artifact["relative_path"].as_str().expect("artifact path")),
             b"tampered",
         )
         .expect("tamper");

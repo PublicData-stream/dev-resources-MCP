@@ -50,7 +50,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         max_bytes: 4096,
         media_type: "text/plain".into(),
     };
-    let capture = store
+    let canonical_capture = store
         .publish(
             &request,
             FetchResponse {
@@ -68,6 +68,13 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     let count:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM devres_chromium_evidence)+(SELECT count(*) FROM devres_chromium_state)+(SELECT count(*) FROM devres_chromium_statistics)").fetch_one(&inspection).await.unwrap();
     assert_eq!(count, 0, "new tables are empty before isolated downgrade");
     remove_integrity_schema(&inspection).await;
+    let capture = seed_legacy_capture(
+        &inspection,
+        root.path(),
+        &canonical_capture,
+        b"Synthetic retained public evidence",
+    )
+    .await;
     sqlx::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
         .execute(&inspection).await.expect("prepare owned schema-seven fixture");
     assert!(
@@ -300,4 +307,64 @@ DROP TABLE devres_integrity_control;
     .execute(pool)
     .await
     .expect("remove schema-ten-only fixture metadata");
+}
+
+// Simulate the original SHA-only capture representation after removing schema-ten
+// seals. Keep the already retained BLAKE3 body file as permanent source evidence.
+async fn seed_legacy_capture(
+    pool: &sqlx::PgPool,
+    root: &std::path::Path,
+    current: &devres_domain::Capture,
+    bytes: &[u8],
+) -> devres_domain::Capture {
+    use sha2::{Digest, Sha256};
+    let body_hash = hex::encode(Sha256::digest(bytes));
+    let id = hex::encode(Sha256::digest(
+        format!(
+            "{}\0{}\0{}\0{body_hash}",
+            current.key, current.source_url, current.media_type
+        )
+        .as_bytes(),
+    ));
+    let original_body = root.join(
+        devres_adapters::integrity::relative_path(&current.body_hash).expect("retained body path"),
+    );
+    assert_eq!(
+        tokio::fs::read(&original_body)
+            .await
+            .expect("retained body"),
+        bytes
+    );
+    tokio::fs::hard_link(&original_body, root.join(&body_hash))
+        .await
+        .expect("retain legacy SHA body path");
+    let mut tx = pool.begin().await.expect("fixture capture conversion");
+    let inserted = sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at) SELECT $1,source_key,source_url,$2,media_type,retrieved_at FROM devres_captures WHERE id=$3")
+        .bind(&id).bind(&body_hash).bind(&current.id)
+        .execute(&mut *tx).await.expect("seed original SHA capture metadata");
+    assert_eq!(inserted.rows_affected(), 1);
+    for statement in [
+        "UPDATE devres_heads SET capture_id=$1 WHERE capture_id=$2",
+        "UPDATE devres_observations SET capture_id=$1 WHERE capture_id=$2",
+        "UPDATE devres_rfc_import_observations SET capture_id=$1 WHERE capture_id=$2",
+    ] {
+        sqlx::query(statement)
+            .bind(&id)
+            .bind(&current.id)
+            .execute(&mut *tx)
+            .await
+            .expect("preserve retained capture observations");
+    }
+    let removed = sqlx::query("DELETE FROM devres_captures WHERE id=$1")
+        .bind(&current.id)
+        .execute(&mut *tx)
+        .await
+        .expect("replace only fixture capture representation");
+    assert_eq!(removed.rows_affected(), 1);
+    tx.commit().await.expect("commit fixture legacy capture");
+    devres_domain::Capture {
+        id,
+        body_hash,
+        ..current.clone()
+    }
 }

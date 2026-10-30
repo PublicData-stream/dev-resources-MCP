@@ -873,7 +873,7 @@ async fn index_publication_retries_after_database_failure_without_replacing_orph
     let snapshot = harness.store.snapshot(None).await.unwrap().unwrap();
     let published = harness.root.path().join(snapshot.index_path.unwrap());
     assert!(published.join("integrity.json").is_file());
-    let directories = std::fs::read_dir(harness.root.path().join("rfc-indexes"))
+    let directories = std::fs::read_dir(harness.root.path().join("rfc-indexes/blake3"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.is_dir())

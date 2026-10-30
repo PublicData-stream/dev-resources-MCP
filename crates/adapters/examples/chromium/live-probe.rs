@@ -810,7 +810,7 @@ mod tests {
             .await
             .is_err()
         );
-        std::fs::write(temporary.path().join(&artifact.body_hash), b"corrupt").unwrap();
+        std::fs::write(temporary.path().join(&artifact.relative_path), b"corrupt").unwrap();
         assert!(
             replay_body(
                 &artifacts,

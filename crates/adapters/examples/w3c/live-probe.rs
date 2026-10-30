@@ -1,6 +1,7 @@
 //! Fixed-record provider evidence, distinct from full corpus and transport acceptance.
 use devres_adapters::{
     bulk::{BulkArtifactStore, BulkBroker, BulkConfig, BulkRequest, BulkSource, GitOperation},
+    integrity,
     w3c::catalog::{self as w3c_catalog, ApiOperation},
     w3c::git::Repo,
     w3c::processing as w3c_processing,
@@ -144,14 +145,10 @@ async fn retained_css(
             .map_err(|_| Error::integrity("Invalid retained live metadata."))?;
         let hash = observation["body_hash"]
             .as_str()
-            .filter(|hash| {
-                hash.len() == 64
-                    && hash
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
+            .filter(|hash| integrity::valid_hash(hash))
             .ok_or_else(|| Error::integrity("Invalid retained live body identity."))?;
-        let raw = root.join(hash);
+        let relative_path = integrity::relative_path(hash)?;
+        let raw = root.join(&relative_path);
         if !raw
             .try_exists()
             .map_err(|_| Error::unavailable("Retained live body unavailable."))?
@@ -187,12 +184,16 @@ async fn retained_css(
             .read_to_end(&mut body)
             .await
             .map_err(|_| Error::unavailable("Retained live body unavailable."))?;
-        if observation["bytes"].as_u64() != Some(body.len() as u64)
-            || devres_adapters::w3c::inventory::digest(&body) != hash
-        {
+        if observation["bytes"].as_u64() != Some(body.len() as u64) {
             return Err(Error::integrity(
                 "Retained live body differs from its preflight.",
             ));
+        }
+        integrity::verify(hash, &body)?;
+        if !hash.starts_with("blake3:") {
+            // Legacy replay requires the same independent BLAKE3 evidence as
+            // ordinary retained reads, including the exact bytes just read.
+            integrity::verify_legacy_digest(&raw, &integrity::hash(&body), body.len() as u64)?;
         }
         let license = w3c_catalog::publication_license(&publication, &body);
         if license["decision"] != "approved" {
@@ -208,7 +209,7 @@ async fn retained_css(
             .as_secs();
         return Ok(Some(
             json!({"specification":"css-color-4","source_url":source,"capture_file_mtime":observed_at,"upstream_validated_at":null,"license":license,
-            "artifact":{"body_hash":hash,"bytes":body.len(),"relative_path":hash},"processing":css_processing(&body,cancel)?,
+            "artifact":{"body_hash":hash,"bytes":body.len(),"relative_path":relative_path},"processing":css_processing(&body,cancel)?,
             "replay":{"kind":"licensed_capture_reprocessed","preflight_metadata":path.file_name().and_then(|name|name.to_str()),"preflight_hash":devres_adapters::w3c::inventory::digest(&bytes),"original_capture_reused":true,"upstream_validation_time_available":false,"api_response_bytes_retained":false,"latest_metadata_revalidated":false}}),
         ));
     }
@@ -440,7 +441,7 @@ mod tests {
         let observed = devres_domain::unix_now() - 120;
         let file = std::fs::OpenOptions::new()
             .write(true)
-            .open(root.join(&artifact.body_hash))
+            .open(root.join(&artifact.relative_path))
             .unwrap();
         file.set_times(
             std::fs::FileTimes::new()
@@ -461,7 +462,32 @@ mod tests {
         );
         assert_eq!(replay["replay"]["latest_metadata_revalidated"], false);
         assert!(replay["processing"]["sections"].as_u64().unwrap() > 0);
-        std::fs::write(root.join(&artifact.body_hash), b"changed body").unwrap();
+        assert_eq!(replay["artifact"]["relative_path"], artifact.relative_path);
+        let legacy_hash = integrity::legacy_hash(&body);
+        let legacy_path = root.join(integrity::relative_path(&legacy_hash).unwrap());
+        std::fs::hard_link(root.join(&artifact.relative_path), &legacy_path).unwrap();
+        std::fs::write(root.join("license-preflight-1.json"),serde_json::to_vec(&json!({"source_url":source,"body_hash":legacy_hash,"bytes":body.len(),"synthetic":true})).unwrap()).unwrap();
+        assert!(
+            retained_css(root, &artifacts, &CancellationToken::new())
+                .await
+                .is_err(),
+            "legacy SHA replay requires independent BLAKE3 file evidence"
+        );
+        integrity::record_file(
+            root,
+            &legacy_path,
+            &integrity::hash(&body),
+            body.len() as u64,
+        )
+        .unwrap();
+        let legacy = retained_css(root, &artifacts, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy["artifact"]["body_hash"], legacy_hash);
+        assert_eq!(legacy["artifact"]["relative_path"], legacy_hash);
+        assert_eq!(legacy["capture_file_mtime"], observed);
+        std::fs::write(root.join(&artifact.relative_path), b"changed body").unwrap();
         assert!(
             retained_css(root, &artifacts, &CancellationToken::new())
                 .await
