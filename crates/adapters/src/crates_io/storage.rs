@@ -724,51 +724,61 @@ impl CrateCorpusStore for PgBlobStore {
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let retained = sqlx::query("SELECT published_sequence,summary,summary_integrity FROM devres_crate_generations WHERE id=$1 FOR UPDATE")
-            .bind(generation).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
-        if let Some(row) = retained {
-            let published: Option<i64> = row
-                .try_get("published_sequence")
-                .map_err(|_| storage_error())?;
-            let stored: Json<Value> = row.try_get("summary").map_err(|_| storage_error())?;
-            payload_integrity::checked(
-                "devres_crate_generations",
-                "",
-                generation,
-                payload_integrity::crate_generation_payload(published, &stored.0)?,
-                &row.try_get::<String, _>("summary_integrity")
-                    .map_err(|_| storage_error())?,
-            )?;
-            if published.is_some() {
-                if !generation.starts_with("blake3:") && stored.0 != summary {
+        let outcome: Result<()> = async {
+            let retained = sqlx::query("SELECT published_sequence,summary,summary_integrity FROM devres_crate_generations WHERE id=$1 FOR UPDATE")
+                .bind(generation).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+            if let Some(row) = retained {
+                let published: Option<i64> = row
+                    .try_get("published_sequence")
+                    .map_err(|_| storage_error())?;
+                let stored: Json<Value> = row.try_get("summary").map_err(|_| storage_error())?;
+                payload_integrity::checked(
+                    "devres_crate_generations",
+                    "",
+                    generation,
+                    payload_integrity::crate_generation_payload(published, &stored.0)?,
+                    &row.try_get::<String, _>("summary_integrity")
+                        .map_err(|_| storage_error())?,
+                )?;
+                if published.is_some() {
+                    if !generation.starts_with("blake3:") && stored.0 != summary {
+                        return Err(Error::integrity(
+                            "Legacy generation replay differs from retained publication.",
+                        ));
+                    }
+                    return Ok(());
+                }
+                if !generation.starts_with("blake3:") {
                     return Err(Error::integrity(
-                        "Legacy generation replay differs from retained publication.",
+                        "New content generations require tagged BLAKE3 identities.",
                     ));
                 }
-                return tx.commit().await.map_err(|_| storage_error());
-            }
-            if !generation.starts_with("blake3:") {
+            } else if !generation.starts_with("blake3:") {
                 return Err(Error::integrity(
                     "New content generations require tagged BLAKE3 identities.",
                 ));
             }
-        } else if !generation.starts_with("blake3:") {
-            return Err(Error::integrity(
-                "New content generations require tagged BLAKE3 identities.",
-            ));
+            let sequence: i64 = sqlx::query_scalar("SELECT nextval('devres_crate_content_sequence')")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            let digest = payload_integrity::digest(
+                "devres_crate_generations",
+                "",
+                generation,
+                &payload_integrity::crate_generation_payload(Some(sequence), &summary)?,
+            )?;
+            sqlx::query("INSERT INTO devres_crate_generations(id,published_sequence,summary,summary_integrity) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET published_sequence=EXCLUDED.published_sequence,summary=EXCLUDED.summary,summary_integrity=EXCLUDED.summary_integrity")
+                .bind(generation).bind(sequence).bind(Json(&summary)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+            Ok(())
         }
-        let sequence: i64 = sqlx::query_scalar("SELECT nextval('devres_crate_content_sequence')")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| storage_error())?;
-        let digest = payload_integrity::digest(
-            "devres_crate_generations",
-            "",
-            generation,
-            &payload_integrity::crate_generation_payload(Some(sequence), &summary)?,
-        )?;
-        sqlx::query("INSERT INTO devres_crate_generations(id,published_sequence,summary,summary_integrity) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET published_sequence=EXCLUDED.published_sequence,summary=EXCLUDED.summary,summary_integrity=EXCLUDED.summary_integrity")
-            .bind(generation).bind(sequence).bind(Json(&summary)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        .await;
+        if let Err(error) = outcome {
+            // The owner connection persists across calls. Finish rollback before
+            // returning so another connection cannot wait on retained row locks.
+            tx.rollback().await.map_err(|_| storage_error())?;
+            return Err(error);
+        }
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn contents(

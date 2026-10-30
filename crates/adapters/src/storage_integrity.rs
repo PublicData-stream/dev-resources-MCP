@@ -685,12 +685,16 @@ mod tests {
                 .code,
             "integrity"
         );
-        sqlx::query("UPDATE devres_crate_generations SET published_sequence=$2 WHERE id=$1")
-            .bind(&standalone)
-            .bind(standalone_sequence)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query("UPDATE devres_crate_generations SET published_sequence=$2 WHERE id=$1")
+                .bind(&standalone)
+                .bind(standalone_sequence)
+                .execute(&store.pool),
+        )
+        .await
+        .expect("rejected publication must release its row lock before returning")
+        .unwrap();
         sqlx::query("UPDATE devres_crate_content SET metadata_capture=$2 WHERE generation=$1")
             .bind(&generation)
             .bind(&second.id)
