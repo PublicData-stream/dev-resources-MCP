@@ -103,6 +103,13 @@ fn snapshot_key(repo: Repo, rev: &str) -> String {
 fn work_key(repo: Repo, rev: &str) -> String {
     format!("work:{}:{rev}:{PROCESSOR_VERSION}", repo.as_str())
 }
+fn dependents_key(path: &str) -> String {
+    // This is a mutable source-path lookup, shared with retained dependency state.
+    format!(
+        "dependents:{}",
+        crate::integrity::legacy_hash(path.as_bytes())
+    )
+}
 fn observation_key(o: &Observation) -> String {
     inventory::digest(format!("{}:{}", o.repo.as_str(), o.manifest.body_hash).as_bytes())
 }
@@ -336,10 +343,7 @@ impl MdnCorpus {
             .await
     }
     async fn register_dependent(&self, dependency: &str, path: &str) -> Result<()> {
-        let key = format!(
-            "dependents:{}",
-            crate::integrity::legacy_hash(dependency.as_bytes())
-        );
+        let key = dependents_key(dependency);
         let mut paths: BTreeSet<String> = self
             .store
             .mdn_state(&key)
@@ -445,13 +449,7 @@ impl MdnCorpus {
             let changed: BTreeSet<_> = work.changed.iter().cloned().collect();
             let mut candidates = BTreeSet::new();
             for path in &changed {
-                if let Some(reverse) = self
-                    .store
-                    .mdn_state(&format!(
-                        "dependents:{}",
-                        inventory::digest(path.as_bytes())
-                    ))
-                    .await?
+                if let Some(reverse) = self.store.mdn_state(&dependents_key(path)).await?
                     && let Some(paths) = reverse.as_array()
                 {
                     candidates.extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));

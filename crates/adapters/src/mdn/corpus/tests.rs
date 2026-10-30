@@ -793,6 +793,12 @@ async fn mdn_corpus_failed_include_projection_recovers_when_only_dependency_chan
             )
             .await
             .expect("including source remains available");
+        let failed_snapshot = fixture
+            .corpus
+            .snapshot(Repo::Content, &parent)
+            .await
+            .expect("failed inclusion snapshot lookup")
+            .expect("failed inclusion remains accounted");
         assert_eq!(
             source["page"]["text"],
             std::str::from_utf8(FETCH).expect("fixture text")
@@ -809,6 +815,28 @@ async fn mdn_corpus_failed_include_projection_recovers_when_only_dependency_chan
         assert_eq!(
             repaired["oid"], source["oid"],
             "only included source changed"
+        );
+        let historical_source = fixture
+            .corpus
+            .research()
+            .call(
+                "mdn.get",
+                json!({"path":FETCH_PATH,"representation":"source","snapshot":failed_snapshot.id}),
+            )
+            .await
+            .expect("failed inclusion generation retains its original source");
+        assert_eq!(historical_source["page"]["text"], source["page"]["text"]);
+        assert!(
+            fixture
+                .corpus
+                .research()
+                .call(
+                    "mdn.get",
+                    json!({"slug":"Web/API/Fetch","snapshot":failed_snapshot.id})
+                )
+                .await
+                .is_err(),
+            "repair must preserve the frozen failed inclusion generation"
         );
     }
 }
