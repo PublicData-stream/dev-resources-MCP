@@ -274,7 +274,7 @@ def prepare():
     print('prepared: writers paused; private credentials installed')
 
 
-def install_services():
+def install_services(activate=True):
     executable = str(HERE / 'staging.py')
     maintenance = str(HERE / 'maintenance.py')
     services = {
@@ -283,13 +283,16 @@ def install_services():
         'devres-staging-capacity.service': f'[Unit]\nDescription=Devres staging capacity fence\nAfter=k3s.service\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 {maintenance} guard\nSuccessExitStatus=75\n',
         'devres-staging-capacity.timer': '[Unit]\nDescription=Monitor devres staging storage\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\n[Install]\nWantedBy=timers.target\n',
         'devres-staging-backup.service': f'[Unit]\nDescription=Coordinated devres snapshot and restore verification\nAfter=k3s.service\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/usr/bin/python3 {executable} backup\n',
-        'devres-staging-backup.timer': '[Unit]\nDescription=Daily devres backup at 03 UTC\n[Timer]\nOnCalendar=*-*-* 03:00:00 UTC\nPersistent=true\n[Install]\nWantedBy=timers.target\n'}
+        'devres-staging-backup.timer': '[Unit]\nDescription=Daily devres backup at 03 UTC\n[Timer]\nOnCalendar=*-*-* 03:00:00 UTC\nPersistent=true\n[Install]\nWantedBy=timers.target\n',
+        'devres-staging-upgrade-expire@.service': f'[Unit]\nDescription=Recover expired devres upgrade %i\nAfter=k3s.service\n[Service]\nType=oneshot\nUser=root\nUMask=0077\nTimeoutStartSec=infinity\nSuccessExitStatus=75\nExecStart=/usr/bin/python3 {executable} upgrade-expire --token %i\n',
+        'devres-staging-upgrade-expire@.timer': '[Unit]\nDescription=Monitor devres upgrade deadline %i\n[Timer]\nOnBootSec=15s\nOnUnitInactiveSec=15s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n'}
     for name, text in services.items():
         write(Path('/etc/systemd/system') / name, text, 0o644)
     write('/etc/systemd/system/k3s.service.d/devres-staging-guard.conf',
           '[Unit]\nRequires=devres-staging-firewall.service\nAfter=devres-staging-firewall.service\n', 0o644)
     run(['systemctl', 'daemon-reload'])
-    run(['systemctl', 'enable', '--now', 'devres-staging-firewall.timer', 'devres-staging-capacity.timer'])
+    if activate:
+        run(['systemctl', 'enable', '--now', 'devres-staging-firewall.timer', 'devres-staging-capacity.timer'])
     # The daily timer is enabled after a successful real-evidence restore drill.
 
 
@@ -434,6 +437,12 @@ def require_no_upgrade():
         raise OperatorError('upgrade_in_progress')
 
 
+def refresh_services():
+    require_no_upgrade()
+    install_services(activate=False)
+    print('operator services refreshed; existing timer states preserved')
+
+
 def collectors_on():
     require_no_upgrade()
     m = maintenance_module()
@@ -494,8 +503,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'firewall', 'firewall-bootstrap', 'start', 'edge-prepare',
                         'edge-activate', 'edge-rollback', 'collectors-on', 'backup',
-                        'upgrade-rehearse', 'upgrade', 'upgrade-rollback', 'upgrade-finish'])
-    command = parser.parse_args().command
+                        'upgrade-rehearse', 'upgrade', 'upgrade-rollback', 'upgrade-finish',
+                        'upgrade-expire', 'refresh-services'])
+    parser.add_argument('--token')
+    args = parser.parse_args()
+    command = args.command
+    if command == 'upgrade-expire':
+        if not args.token or not re.fullmatch(r'[0-9a-f]{24}', args.token):
+            parser.error('valid_upgrade_token_required')
+    elif args.token is not None:
+        parser.error('token_only_for_upgrade_expire')
     if os.geteuid() != 0:
         raise OperatorError('root_required')
     os.umask(0o077)
@@ -506,7 +523,9 @@ def main():
                 'upgrade-rehearse': lambda: upgrade_module().rehearse(),
                 'upgrade': lambda: upgrade_module().upgrade(),
                 'upgrade-rollback': lambda: upgrade_module().rollback(),
-                'upgrade-finish': lambda: upgrade_module().finalize()}
+                'upgrade-finish': lambda: upgrade_module().finalize(),
+                'upgrade-expire': lambda: upgrade_module().expire(args.token),
+                'refresh-services': refresh_services}
     commands[command]()
 
 

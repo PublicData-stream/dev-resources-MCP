@@ -100,11 +100,67 @@ class FirewallTests(unittest.TestCase):
         self.assertEqual(rules.count(' drop\n'), 2)
 
 
+class ServiceTests(unittest.TestCase):
+    def installed(self, activate):
+        files, commands = {}, []
+        with patch.object(op, 'write', side_effect=lambda path, text, *args: files.update({str(path): text})), \
+                patch.object(op, 'run', side_effect=lambda args: commands.append(args)):
+            op.install_services(activate=activate)
+        return files, commands
+
+    def test_refresh_installs_token_specific_root_watchdog_without_activating_timers(self):
+        files, commands = self.installed(False)
+        service = files['/etc/systemd/system/devres-staging-upgrade-expire@.service']
+        timer = files['/etc/systemd/system/devres-staging-upgrade-expire@.timer']
+        self.assertIn('User=root\n', service)
+        self.assertIn('UMask=0077\n', service)
+        self.assertIn('TimeoutStartSec=infinity\n', service)
+        self.assertIn('SuccessExitStatus=75\n', service)
+        self.assertIn('upgrade-expire --token %i\n', service)
+        self.assertIn('OnBootSec=15s\n', timer)
+        self.assertIn('OnUnitInactiveSec=15s\n', timer)
+        self.assertIn('AccuracySec=1s\n', timer)
+        self.assertIn('WantedBy=timers.target\n', timer)
+        self.assertEqual(commands, [['systemctl', 'daemon-reload']])
+
+    def test_fresh_install_only_activates_original_firewall_and_capacity_timers(self):
+        _, commands = self.installed(True)
+        self.assertEqual(commands, [['systemctl', 'daemon-reload'],
+                         ['systemctl', 'enable', '--now', 'devres-staging-firewall.timer',
+                          'devres-staging-capacity.timer']])
+
+    def test_refresh_services_preserves_timers_and_refuses_active_upgrade(self):
+        with patch.object(op, 'upgrade_module') as upgrade, patch.object(op, 'install_services') as install:
+            upgrade.return_value.active.return_value = True
+            with self.assertRaisesRegex(op.OperatorError, 'upgrade_in_progress'):
+                op.refresh_services()
+            install.assert_not_called()
+            upgrade.return_value.active.return_value = False
+            op.refresh_services()
+            install.assert_called_once_with(activate=False)
+
+    def test_cli_requires_token_only_for_expiry_and_dispatches_exact_token(self):
+        import contextlib
+        import io
+        token = 'a' * 24
+        for argv in (['staging.py', 'upgrade-expire'],
+                     ['staging.py', 'upgrade-expire', '--token', '../bad'],
+                     ['staging.py', 'upgrade', '--token', token]):
+            with self.subTest(argv=argv), patch('sys.argv', argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    op.main()
+                self.assertEqual(error.exception.code, 2)
+        with patch('sys.argv', ['staging.py', 'upgrade-expire', '--token', token]), \
+                patch.object(op.os, 'geteuid', return_value=0), patch.object(op, 'upgrade_module') as upgrade:
+            op.main()
+            upgrade.return_value.expire.assert_called_once_with(token)
+
+
 class RecoveryTests(unittest.TestCase):
     def test_upgrade_fence_blocks_other_writer_entrypoints(self):
         with patch.object(op, 'upgrade_module') as upgrade, patch.object(op, 'private_dirs') as dirs:
             upgrade.return_value.active.return_value = True
-            for entrypoint in (op.prepare, op.start, op.collectors_on, op.backup):
+            for entrypoint in (op.prepare, op.start, op.collectors_on, op.backup, op.refresh_services):
                 with self.subTest(entrypoint=entrypoint.__name__):
                     with self.assertRaisesRegex(op.OperatorError, 'upgrade_in_progress'):
                         entrypoint()

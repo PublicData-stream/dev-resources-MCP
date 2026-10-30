@@ -37,6 +37,7 @@ TERMINAL = {'rehearsed', 'rehearsal_failed', 'complete', 'rolled_back'}
 TIMERS = ('devres-staging-backup.timer',)
 HOLD = 'devres-upgrade-protected'
 TOKEN = re.compile(r'[0-9a-f]{24}\Z')
+WATCHDOG = 'devres-staging-upgrade-expire@'
 
 
 class UpgradeError(RuntimeError):
@@ -157,6 +158,8 @@ class Upgrade:
     def save(self, phase=None, **updates):
         if phase is not None:
             self.record['phase'] = phase
+            if phase in TERMINAL and 'watchdog_timer' in self.record:
+                updates.setdefault('watchdog_cleanup_pending', True)
         self.record.update(updates)
         self.state.save(self.record)
 
@@ -209,6 +212,48 @@ class Upgrade:
     def restore_timers(self):
         for timer, state in self.record['timers'].items():
             self.run(['systemctl', 'start' if state == 'active' else 'stop', timer])
+        self.disarm_watchdog()
+
+    def watchdog_timer(self):
+        token = self.record['token']
+        if not TOKEN.fullmatch(token):
+            raise UpgradeError('invalid_upgrade_watch_token')
+        timer = WATCHDOG + token + '.timer'
+        if self.record.get('watchdog_timer', timer) != timer:
+            raise UpgradeError('upgrade_watchdog_identity_changed')
+        return timer
+
+    def arm_watchdog(self):
+        timer = self.watchdog_timer()
+        # Persist ownership before enabling: partial systemctl failure must still
+        # permit safe cleanup of this token's timer during admission recovery.
+        self.save(watchdog_timer=timer, watchdog_cleanup_pending=True)
+        self.run(['systemctl', 'enable', '--now', timer])
+        active = self.run(['systemctl', 'show', '-p', 'ActiveState', '--value', timer]).strip()
+        enabled = self.run(['systemctl', 'show', '-p', 'UnitFileState', '--value', timer]).strip()
+        if active != 'active' or enabled != 'enabled':
+            raise UpgradeError('upgrade_watchdog_not_armed')
+        self.save(watchdog_cleanup_pending=False)
+
+    def disarm_watchdog(self):
+        if 'watchdog_timer' not in self.record:
+            return True
+        timer = self.watchdog_timer()
+        try:
+            # Never stop the service: it may be executing this very rollback.
+            self.run(['systemctl', 'disable', '--now', timer])
+            active = self.run(['systemctl', 'show', '-p', 'ActiveState', '--value', timer]).strip()
+            enabled = self.run(['systemctl', 'show', '-p', 'UnitFileState', '--value', timer]).strip()
+            if active != 'inactive' or enabled != 'disabled':
+                raise UpgradeError('upgrade_watchdog_still_active')
+        except Exception:
+            # A terminal journal prevents stale timer invocations from touching
+            # workloads. Retry its cleanup separately, never roll back a fully
+            # accepted candidate merely because timer removal failed.
+            self.save(watchdog_cleanup_pending=True)
+            return False
+        self.save(watchdog_cleanup_pending=False)
+        return True
 
     def snapshot(self, label, paused=False):
         self.safe()
@@ -309,6 +354,7 @@ class Upgrade:
             if not rehearsal or rehearsal['phase'] != 'rehearsed' or not isinstance(rehearsal.get('deadline_seconds'), int):
                 raise UpgradeError('successful_rehearsal_required')
             mutated = False
+            drain_attempted = False
             original = None
             try:
                 original = self.begin('preparing_upgrade')
@@ -317,6 +363,8 @@ class Upgrade:
                           rehearsal_snapshot=rehearsal['snapshot'])
                 self.started = self.clock()
                 paused = restore.paused_config(original)
+                self.arm_watchdog()
+                drain_attempted = True
                 self.tool.scale('backend', 0)
                 self.tool.stopped('backend')
                 self.save(backend_drained=True)
@@ -379,7 +427,7 @@ class Upgrade:
                     self.tool.start('backend', 1)
                     self.save('rolled_back')
                     self.restore_timers()
-                elif self.record and original is None:
+                elif self.record and not drain_attempted:
                     # begin() cannot touch serving or its configuration. A timer
                     # admission failure can therefore be unwound independently.
                     self.save('rolled_back')
@@ -457,7 +505,8 @@ class Upgrade:
         self.tool.start('backend', 1)
         self.save('rolled_back', restored_version=OLD_VERSION)
         self.restore_timers()
-        return {'rolled_back': True, 'preserved': preserved, 'version': OLD_VERSION}
+        return {'rolled_back': True, 'preserved': preserved, 'version': OLD_VERSION,
+                'watchdog_disarmed': not self.record.get('watchdog_cleanup_pending', False)}
 
     def rollback(self):
         with self.state.locked():
@@ -465,6 +514,37 @@ class Upgrade:
             if not self.record or self.record['phase'] in TERMINAL:
                 raise UpgradeError('no_active_upgrade')
             return self._rollback()
+
+    def expire(self, expected_token, wall_clock=time.time):
+        if not isinstance(expected_token, str) or not TOKEN.fullmatch(expected_token):
+            raise UpgradeError('invalid_upgrade_watch_token')
+        # Do not enter through the capacity guard's maintenance lock. Both this
+        # path and finish/apply serialize on upgrade first, then maintenance.
+        with self.state.locked():
+            self.record = read_record(self.root.parent)
+            if not self.record or self.record['token'] != expected_token:
+                return {'expired': False}
+            if self.record['phase'] in TERMINAL:
+                if self.record.get('watchdog_cleanup_pending'):
+                    self.disarm_watchdog()
+                return {'expired': False}
+            # Recovery can stop after preserving only part of the pair or while
+            # the capacity guard owns maintenance. The same expired token may
+            # resume its GUID-checked swap on a later tick, still serialized by
+            # the upgrade lock; it must never abandon both workloads stopped.
+            if self.record['phase'] not in ('awaiting_acceptance', 'rolling_back'):
+                return {'expired': False}
+            deadline = self.record.get('deadline_at')
+            if (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+                    or not math.isfinite(deadline) or deadline <= 0):
+                raise UpgradeError('invalid_upgrade_deadline')
+            now = wall_clock()
+            if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+                raise UpgradeError('invalid_upgrade_wall_clock')
+            if now < deadline:
+                return {'expired': False}
+            result = self._rollback()
+            return {'expired': True, **result}
 
     def finish(self):
         with self.state.locked():
@@ -497,10 +577,12 @@ class Upgrade:
                 op.config_secret()
                 self.wall_remaining()
                 self.tool.start('backend', 1)
+                self.wall_remaining()
                 self.save('complete', verified_schema10_snapshot=snapshot)
                 self.restore_timers()
                 return {'complete': True, 'version': VERSION, 'snapshot': snapshot,
-                        'original_collectors_restored': True}
+                        'original_collectors_restored': True,
+                        'watchdog_disarmed': not self.record.get('watchdog_cleanup_pending', False)}
             except Exception:
                 self._rollback()
                 raise
@@ -527,3 +609,12 @@ def rollback():
 
 def finalize():
     print(json.dumps(Upgrade().finish(), sort_keys=True))
+
+
+def expire(token):
+    try:
+        print(json.dumps(Upgrade().expire(token), sort_keys=True))
+    except m.MaintenanceError as error:
+        if str(error) == 'maintenance_busy':
+            raise SystemExit(75) from None
+        raise

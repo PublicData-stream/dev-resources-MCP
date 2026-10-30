@@ -111,6 +111,7 @@ class UpgradeTests(unittest.TestCase):
         (self.root / 'state').mkdir(mode=0o700)
         (self.private / 'backend.toml').write_text(CONFIG)
         self.commands = []
+        self.watch_timers = {}
         self.inventory = {upgrade.m.DATASET + '/' + c for c in ('postgres', 'evidence')}
         self.guids = {upgrade.m.DATASET + '/postgres': '1', upgrade.m.DATASET + '/evidence': '2'}
         self.origins = {}
@@ -136,7 +137,16 @@ class UpgradeTests(unittest.TestCase):
     def fake_run(self, args, **kwargs):
         args = [str(v) for v in args]
         self.commands.append(args)
+        if args[:2] == ['systemctl', 'enable'] and args[-1].startswith(upgrade.WATCHDOG):
+            self.watch_timers[args[-1]] = True
+        if args[:2] == ['systemctl', 'disable'] and args[-1].startswith(upgrade.WATCHDOG):
+            self.watch_timers[args[-1]] = False
         if args[:2] == ['systemctl', 'show']:
+            if args[-1].startswith(upgrade.WATCHDOG):
+                enabled = self.watch_timers.get(args[-1], False)
+                if args[3] == 'UnitFileState':
+                    return 'enabled' if enabled else 'disabled'
+                return 'active' if enabled else 'inactive'
             return 'inactive' if args[-1].endswith('.service') else 'active'
         if 'pg_controldata' in args:
             return 'Database cluster state: shut down'
@@ -190,6 +200,49 @@ class UpgradeTests(unittest.TestCase):
         parsed = upgrade.tomllib.loads((self.private / 'backend.toml').read_text())
         self.assertTrue(all(not parsed[c]['enabled'] for c in upgrade.restore.COLLECTORS))
 
+    def test_watchdog_is_enabled_and_verified_before_first_backend_drain(self):
+        scale = self.tool.scale
+        def checked_scale(name, count):
+            if name == 'backend' and count == 0:
+                timer = self.instance.watchdog_timer()
+                self.assertTrue(self.watch_timers.get(timer))
+                self.assertIn(['systemctl', 'show', '-p', 'UnitFileState', '--value', timer], self.commands)
+            return scale(name, count)
+        self.tool.scale = checked_scale
+        self.instance.apply()
+        record = upgrade.read_record(self.root / 'state')
+        self.assertEqual(record['watchdog_timer'], upgrade.WATCHDOG + record['token'] + '.timer')
+        self.assertFalse(record['watchdog_cleanup_pending'])
+
+    def test_partly_enabled_watchdog_failure_restores_timer_without_draining(self):
+        run = self.instance.run
+        def fail(args, **kwargs):
+            result = run(args, **kwargs)
+            if args[:2] == ['systemctl', 'enable']:
+                raise RuntimeError('arming interrupted')
+            return result
+        self.instance.run = fail
+        with self.assertRaisesRegex(RuntimeError, 'arming interrupted'):
+            self.instance.apply()
+        self.assertFalse(any(c[0] == 'scale' for c in self.tool.commands))
+        self.assertEqual((self.private / 'backend.toml').read_text(), CONFIG)
+        record = upgrade.read_record(self.root / 'state')
+        self.assertEqual(record['phase'], 'rolled_back')
+        self.assertFalse(self.watch_timers[record['watchdog_timer']])
+        self.assertIn(['systemctl', 'start', 'devres-staging-backup.timer'], self.commands)
+
+    def test_watchdog_must_be_persistently_enabled_not_merely_active(self):
+        run = self.instance.run
+        def disabled(args, **kwargs):
+            if args[:4] == ['systemctl', 'show', '-p', 'UnitFileState']:
+                return 'disabled'
+            return run(args, **kwargs)
+        self.instance.run = disabled
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'watchdog_not_armed'):
+            self.instance.apply()
+        self.assertFalse(any(c[0] == 'scale' for c in self.tool.commands))
+        self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rolled_back')
+
     def test_rehearsal_restores_canonical_snapshot_and_old_pair_before_reporting_time(self):
         calls = []
         def verify(snapshot, **kwargs):
@@ -209,6 +262,8 @@ class UpgradeTests(unittest.TestCase):
         self.assertFalse(any(c[:2] == ['zfs', 'destroy'] and c[-1].startswith(upgrade.m.DATASET + '@')
                              for c in self.commands))
         self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rehearsed')
+        self.assertFalse(any(any(str(arg).startswith(upgrade.WATCHDOG) for arg in command)
+                             for command in self.commands))
 
     def test_wrong_existing_image_does_not_stop_workloads_or_attempt_rollback(self):
         with patch.object(self.tool, 'k', return_value='unexpected'), patch.object(self.instance, '_rollback') as rollback:
@@ -318,6 +373,193 @@ class UpgradeTests(unittest.TestCase):
         with self.assertRaisesRegex(upgrade.UpgradeError, 'deadline_exceeded'):
             self.instance.finish()
         self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rolled_back')
+
+    def test_watchdog_expires_without_finish_and_preserves_matching_pair(self):
+        self.instance.apply()
+        record = upgrade.read_record(self.root / 'state')
+        result = self.instance.expire(record['token'], wall_clock=lambda: record['deadline_at'])
+        self.assertTrue(result['expired'])
+        self.assertTrue(result['rolled_back'])
+        self.assertTrue(result['watchdog_disarmed'])
+        self.assertTrue(all(name in self.inventory for name in result['preserved'].values()))
+        self.assertEqual((self.private / 'backend.toml').read_text(), CONFIG)
+        self.assertFalse(any(c[:2] in (['zfs', 'destroy'], ['zfs', 'rollback']) for c in self.commands))
+        mutations = [c[1] for c in self.commands if c[:2] in (['zfs', 'rename'], ['zfs', 'clone'])]
+        self.assertEqual(mutations, ['rename', 'clone', 'rename', 'clone'])
+        self.assertFalse(self.instance.expire(record['token'], wall_clock=lambda: float('inf'))['expired'])
+
+    def test_watchdog_ignores_not_due_and_stale_tokens(self):
+        self.instance.apply()
+        record = upgrade.read_record(self.root / 'state')
+        commands = list(self.commands)
+        self.assertFalse(self.instance.expire(record['token'], wall_clock=lambda: record['deadline_at'] - 1)['expired'])
+        self.assertFalse(self.instance.expire('f' * 24, wall_clock=lambda: record['deadline_at'] + 1)['expired'])
+        self.assertEqual(self.commands, commands)
+
+    def test_watchdog_resumes_after_capacity_lock_contention_during_dataset_swap(self):
+        self.instance.apply()
+        record = upgrade.read_record(self.root / 'state')
+        due = lambda: record['deadline_at'] + 1
+        with self.instance.maintenance_state.locked():
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'maintenance_busy'):
+                self.instance.expire(record['token'], wall_clock=due)
+        interrupted = upgrade.read_record(self.root / 'state')
+        self.assertEqual(interrupted['phase'], 'rolling_back')
+        self.assertEqual(self.tool.counts, {'backend': 0, 'postgres': 0})
+        self.assertFalse(any(c[:2] == ['zfs', 'rename'] for c in self.commands))
+        commands = list(self.commands)
+        self.assertFalse(self.instance.expire(record['token'],
+                         wall_clock=lambda: record['deadline_at'] - 1)['expired'])
+        self.assertFalse(self.instance.expire('f' * 24, wall_clock=due)['expired'])
+        self.assertEqual(self.commands, commands)
+        result = self.instance.expire(record['token'], wall_clock=due)
+        self.assertTrue(result['rolled_back'])
+        self.assertTrue(all(name in self.inventory for name in result['preserved'].values()))
+        self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
+        self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rolled_back')
+
+    def test_watchdog_resumes_partial_preserving_clone_failure(self):
+        self.instance.apply()
+        record = upgrade.read_record(self.root / 'state')
+        due = lambda: record['deadline_at'] + 1
+        run = self.instance.run
+        def fail_clone(args, **kwargs):
+            if args[:2] == ['zfs', 'clone'] and args[-1].endswith('/evidence'):
+                raise RuntimeError('clone interrupted')
+            return run(args, **kwargs)
+        self.instance.run = fail_clone
+        with self.assertRaisesRegex(RuntimeError, 'clone interrupted'):
+            self.instance.expire(record['token'], wall_clock=due)
+        interrupted = upgrade.read_record(self.root / 'state')
+        self.assertEqual(interrupted['phase'], 'rolling_back')
+        self.assertEqual(self.tool.counts, {'backend': 0, 'postgres': 0})
+        self.assertTrue(all(name in self.inventory for name in interrupted['preserved'].values()))
+        preserved_guids = {name: self.guids[name] for name in interrupted['preserved'].values()}
+        self.instance.run = run
+        result = self.instance.expire(record['token'], wall_clock=due)
+        self.assertTrue(result['rolled_back'])
+        self.assertEqual({name: self.guids[name] for name in result['preserved'].values()}, preserved_guids)
+        self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
+        mutations = [c[1] for c in self.commands if c[:2] in (['zfs', 'rename'], ['zfs', 'clone'])]
+        self.assertEqual(mutations, ['rename', 'clone', 'rename', 'clone'])
+        self.assertFalse(any(c[:2] in (['zfs', 'destroy'], ['zfs', 'rollback']) for c in self.commands))
+
+    def test_watchdog_ignores_absent_rehearsal_terminal_and_running_journals(self):
+        for phase in [None, 'rehearsing', 'rehearsed', 'rehearsal_failed', 'complete',
+                      'rolled_back', 'running_migrate_storage', 'starting_candidate']:
+            with self.subTest(phase=phase):
+                if phase is None:
+                    (self.instance.root / 'state.json').unlink(missing_ok=True)
+                else:
+                    self.phase_record(phase)
+                commands = list(self.commands)
+                self.assertFalse(self.instance.expire('a' * 24)['expired'])
+                self.assertEqual(self.commands, commands)
+
+    def test_watchdog_rejects_invalid_tokens_and_deadlines_without_rollback(self):
+        for token in (None, '', '../bad', 'g' * 24):
+            with self.subTest(token=token), self.assertRaisesRegex(upgrade.UpgradeError, 'watch_token'):
+                self.instance.expire(token)
+        for deadline in (None, True, '100', 0, -1, float('nan'), float('inf'), float('-inf')):
+            with self.subTest(deadline=deadline):
+                self.phase_record('awaiting_acceptance', deadline_at=deadline)
+                with patch.object(self.instance, '_rollback') as rollback:
+                    with self.assertRaisesRegex(upgrade.UpgradeError, 'invalid_upgrade_deadline'):
+                        self.instance.expire('a' * 24)
+                    rollback.assert_not_called()
+
+    def test_watchdog_busy_lock_retries_and_cli_returns_temporary_status(self):
+        self.instance.apply()
+        token = upgrade.read_record(self.root / 'state')['token']
+        with self.instance.state.locked():
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'maintenance_busy'):
+                self.instance.expire(token)
+            with patch.object(upgrade, 'Upgrade', return_value=self.instance):
+                with self.assertRaises(SystemExit) as stopped:
+                    upgrade.expire(token)
+                self.assertEqual(stopped.exception.code, 75)
+
+    def test_watchdog_rejects_unusable_wall_clock_before_any_recovery(self):
+        self.phase_record('awaiting_acceptance', deadline_at=1000)
+        for now in (True, '1001', float('nan'), float('inf')):
+            with self.subTest(now=now), patch.object(self.instance, '_rollback') as rollback:
+                with self.assertRaisesRegex(upgrade.UpgradeError, 'invalid_upgrade_wall_clock'):
+                    self.instance.expire('a' * 24, wall_clock=lambda: now)
+                rollback.assert_not_called()
+
+    def test_expiry_holds_upgrade_lock_through_preserving_recovery(self):
+        self.instance.apply()
+        record = upgrade.read_record(self.root / 'state')
+        rollback = self.instance._rollback
+        def checked_rollback():
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'maintenance_busy'):
+                self.instance.finish()
+            return rollback()
+        with patch.object(self.instance, '_rollback', side_effect=checked_rollback):
+            self.assertTrue(self.instance.expire(record['token'],
+                            wall_clock=lambda: record['deadline_at'])['rolled_back'])
+
+    def test_finish_holds_lock_against_expiry_and_terminal_state_is_not_rolled_back(self):
+        self.instance.apply()
+        token = upgrade.read_record(self.root / 'state')['token']
+        receipt = {'version': upgrade.VERSION, 'token': token, 'http': True, 'webtransport': True,
+                   'revisions': ['2025-11-25', '2026-07-28'], 'retained': True,
+                   'isolation': True, 'shared_services': True}
+        upgrade.op.write(self.instance.root / 'acceptance.json', json.dumps(receipt))
+        def verify(*args, **kwargs):
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'maintenance_busy'):
+                self.instance.expire(token, wall_clock=lambda: float('inf'))
+            return {'schema': 10}
+        self.instance.verify = verify
+        self.assertTrue(self.instance.finish()['complete'])
+        with patch.object(self.instance, '_rollback') as rollback:
+            self.assertFalse(self.instance.expire(token)['expired'])
+            rollback.assert_not_called()
+
+    def test_watchdog_cleanup_failure_does_not_rollback_accepted_candidate(self):
+        self.instance.apply()
+        token = upgrade.read_record(self.root / 'state')['token']
+        receipt = {'version': upgrade.VERSION, 'token': token, 'http': True, 'webtransport': True,
+                   'revisions': ['2025-11-25', '2026-07-28'], 'retained': True,
+                   'isolation': True, 'shared_services': True}
+        upgrade.op.write(self.instance.root / 'acceptance.json', json.dumps(receipt))
+        run = self.instance.run
+        def fail(args, **kwargs):
+            if args[:2] == ['systemctl', 'disable']:
+                raise RuntimeError('timer cleanup unavailable')
+            return run(args, **kwargs)
+        self.instance.run = fail
+        with patch.object(self.instance, '_rollback') as rollback:
+            result = self.instance.finish()
+            rollback.assert_not_called()
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['watchdog_disarmed'])
+        self.assertTrue(upgrade.read_record(self.root / 'state')['watchdog_cleanup_pending'])
+        self.instance.run = run
+        self.assertFalse(self.instance.expire(token)['expired'])
+        self.assertFalse(upgrade.read_record(self.root / 'state')['watchdog_cleanup_pending'])
+        self.assertFalse(any(c[:2] == ['systemctl', 'stop'] and c[-1].endswith('.service') for c in self.commands))
+
+    def test_watchdog_cleanup_verifies_reboot_enablement_was_removed(self):
+        self.instance.apply()
+        token = upgrade.read_record(self.root / 'state')['token']
+        receipt = {'version': upgrade.VERSION, 'token': token, 'http': True, 'webtransport': True,
+                   'revisions': ['2025-11-25', '2026-07-28'], 'retained': True,
+                   'isolation': True, 'shared_services': True}
+        upgrade.op.write(self.instance.root / 'acceptance.json', json.dumps(receipt))
+        run = self.instance.run
+        def still_enabled(args, **kwargs):
+            if (args[:4] == ['systemctl', 'show', '-p', 'UnitFileState']
+                    and not self.watch_timers.get(args[-1], False)):
+                return 'enabled'
+            return run(args, **kwargs)
+        self.instance.run = still_enabled
+        with patch.object(self.instance, '_rollback') as rollback:
+            result = self.instance.finish()
+            rollback.assert_not_called()
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['watchdog_disarmed'])
+        self.assertTrue(upgrade.read_record(self.root / 'state')['watchdog_cleanup_pending'])
 
     def test_failed_new_snapshot_verification_preserves_candidate_then_rolls_back(self):
         self.instance.apply()

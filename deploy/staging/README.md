@@ -111,6 +111,7 @@ The upgrade changes only release identity and temporarily pauses collectors;
 the original eight scheduling settings, npm package list and budgets are restored.
 
 ```sh
+python3 staging.py refresh-services
 python3 staging.py upgrade-rehearse
 python3 staging.py upgrade
 # Complete independent retained-data, isolation, public HTTP/WebTransport and
@@ -120,6 +121,10 @@ python3 staging.py upgrade-finish
 python3 staging.py upgrade-rollback
 ```
 
+`refresh-services` installs the reviewed systemd units and reloads their definitions
+while preserving timer activation states. It refuses an active upgrade, so finish
+an existing rehearsal before refreshing an installed operator bundle.
+
 Rehearsal uses a protected coordinated snapshot and isolated `/tmp` clones with
 no provider egress. It first proves schema-nine recovery, then runs the exact new
 binary's `migrate-storage`, `verify-storage` and `activate-storage` commands, and
@@ -127,6 +132,14 @@ reads a retained RFC capture. The measured rehearsal sets the cutover deadline
 to the larger of thirty minutes and twice the rehearsal duration. Recovery time
 is additional. Capacity and clone quotas remain enforced; a successful rehearsal
 does not establish whole-corpus capacity.
+
+Before draining the real backend, the operator arms and verifies a root timer
+bound to that upgrade's token. Once the candidate is awaiting acceptance, an
+expired deadline invokes the preserving rollback even if the SSH approval channel
+is unavailable. The timer uses the same upgrade lock as migration and finish, and
+retries lock contention. Interrupted rollback resumes with the same token and
+preserved dataset identities. Finish and rollback disarm their own timer.
+Recovery is allowed to complete beyond the cutover deadline.
 
 Each isolated offline command has a 64 GiB memory limit and a separate 32 GiB
 `/tmp` tmpfs for reconstructable migration and visibility spill files. Check host
