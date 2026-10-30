@@ -312,9 +312,9 @@ class Drill:
                 self.sleep(1)
         self.postgres_started = True
 
-    def backend_args(self, memory='16g'):
+    def backend_args(self, memory='16g', scratch='1g'):
         return ['--user', '65532:65532', '--memory=' + memory,
-                '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=1g,uid=65532,gid=65532',
+                '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=' + scratch + ',uid=65532,gid=65532',
                 '-v', str(self.root / 'evidence') + ':/data',
                 '-v', str(self.root / 'config') + ':/etc/devres/config:ro',
                 '-v', str(self.root / 'tls') + ':/etc/devres/tls:ro']
@@ -338,7 +338,7 @@ class Drill:
             self.run(['docker', 'run', '-d', '--name', name, '--label', LABEL_KEY + '=' + self.token,
                       '--network', self.name, '--read-only', '--cap-drop=ALL',
                       '--security-opt=no-new-privileges', '--pids-limit=128',
-                      *self.backend_args(), '--entrypoint', '/usr/local/bin/devres-server', target, *args])
+                      *self.backend_args(memory='64g', scratch='32g'), '--entrypoint', '/usr/local/bin/devres-server', target, *args])
             # Count bounded polling intervals too, so injectable test clocks do
             # not turn a stalled command into an unbounded loop.
             started = time.monotonic()

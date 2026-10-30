@@ -252,7 +252,7 @@ class RestoreTests(unittest.TestCase):
         offline = next(c for c in runs if 'verify-storage' in c)
         self.assertIn(restore.SERVER, offline)
         self.assertIn('--read-only', offline)
-        self.assertIn('--memory=16g', offline)
+        self.assertIn('--memory=64g', offline)
         self.assertFalse(any('--publish' in c or '-p' in c for c in runs))
         removal = next(i for i, c in enumerate(self.host.commands)
                        if c[:3] == ['docker', 'rm', '-f'] and '-offline-' in c[-1])

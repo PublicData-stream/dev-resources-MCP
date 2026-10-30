@@ -128,6 +128,12 @@ to the larger of thirty minutes and twice the rehearsal duration. Recovery time
 is additional. Capacity and clone quotas remain enforced; a successful rehearsal
 does not establish whole-corpus capacity.
 
+Each isolated offline command has a 64 GiB memory limit and a separate 32 GiB
+`/tmp` tmpfs for reconstructable migration and visibility spill files. Check host
+headroom for both before rehearsal; tmpfs usage counts toward the memory limit.
+Restored serving retains its smaller independent limits. These scratch files are
+disposable and are never a replacement for the coordinated evidence snapshot.
+
 The real cutover stops all writers, retains a fresh protected database/evidence
 snapshot, verifies old-image recovery, and runs the same offline commands on the
 permanent pair inside an internal Docker network while the Kubernetes pair is
