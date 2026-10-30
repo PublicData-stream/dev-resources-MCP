@@ -1014,13 +1014,16 @@ async fn blake3_migration_rebuilds_shared_objects_and_catalogue_companions() {
         )
         .await
         .unwrap();
-    let mut map = BTreeMap::new();
+    let mut map = crate::migration_map::MigrationMap::new();
     corpus
         .migrate_blake3_graph(&mut map, CancellationToken::new())
         .await
         .unwrap();
     let migrated = store
-        .w3c_get("snapshots", &map[&format!("w3c:snapshots:{old}")])
+        .w3c_get(
+            "snapshots",
+            &map.get(&format!("w3c:snapshots:{old}")).unwrap(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1031,14 +1034,18 @@ async fn blake3_migration_rebuilds_shared_objects_and_catalogue_companions() {
         .unwrap();
     assert_eq!(
         member.projection.as_deref(),
-        Some(map[&format!("w3c:projections:{projection}")].as_str())
+        Some(
+            map.get(&format!("w3c:projections:{projection}"))
+                .unwrap()
+                .as_str()
+        )
     );
     assert_eq!(migrated.committed_at, 42);
     assert_eq!(migrated.validated_at, 41);
-    let canonical_catalog = &map[&format!("w3c:catalogs:{catalog_id}")];
+    let canonical_catalog = map.get(&format!("w3c:catalogs:{catalog_id}")).unwrap();
     assert_eq!(
         store
-            .w3c_get("catalog-captures", canonical_catalog)
+            .w3c_get("catalog-captures", &canonical_catalog)
             .await
             .unwrap()
             .unwrap()
@@ -1046,10 +1053,10 @@ async fn blake3_migration_rebuilds_shared_objects_and_catalogue_companions() {
         companion,
         "opaque metadata remains exact"
     );
-    let canonical_selector = &map[&format!("w3c:snapshot-keys:{selector}")];
+    let canonical_selector = map.get(&format!("w3c:snapshot-keys:{selector}")).unwrap();
     assert_eq!(
         store
-            .w3c_get("snapshot-keys", canonical_selector)
+            .w3c_get("snapshot-keys", &canonical_selector)
             .await
             .unwrap()
             .unwrap()
@@ -1072,7 +1079,7 @@ async fn blake3_migration_rebuilds_shared_objects_and_catalogue_companions() {
         .verify_blake3_graph(CancellationToken::new())
         .await
         .unwrap();
-    let canonical_projection = map[&format!("w3c:projections:{projection}")].clone();
+    let canonical_projection = map.get(&format!("w3c:projections:{projection}")).unwrap();
     let removed = store
         .rows
         .lock()

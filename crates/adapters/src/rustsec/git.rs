@@ -1566,7 +1566,7 @@ impl AdvisoryHistory {
     pub async fn migrate_blake3_manifest(
         &self,
         original: &BulkArtifact,
-        mappings: &mut std::collections::BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<BulkArtifact> {
         let mut manifest = self.read_manifest(original, cancel.clone()).await?;
@@ -1576,7 +1576,6 @@ impl AdvisoryHistory {
             }
             artifact.body_hash =
                 crate::integrity::migration_lookup(mappings, "body", &artifact.body_hash)
-                    .cloned()
                     .ok_or_else(|| {
                         Error::integrity("Retained Git manifest body is not qualified.")
                     })?;
@@ -1593,7 +1592,6 @@ impl AdvisoryHistory {
             for id in reference.snapshots.values_mut() {
                 if !id.starts_with("blake3:") {
                     *id = crate::integrity::migration_lookup(mappings, "advisory:snapshots", id)
-                        .cloned()
                         .ok_or_else(|| {
                             Error::integrity("Retained Git advisory snapshot is not migrated.")
                         })?;
@@ -1610,7 +1608,7 @@ impl AdvisoryHistory {
         let canonical = self.artifacts.capture_bytes(bytes, cancel).await?;
         let role = "advisory:manifest";
         if crate::integrity::migration_lookup(mappings, role, &original.body_hash)
-            .is_some_and(|existing| existing != &canonical.body_hash)
+            .is_some_and(|existing| existing != canonical.body_hash)
         {
             return Err(Error::integrity(
                 "Conflicting canonical Git manifest mapping.",

@@ -298,11 +298,11 @@ pub fn verify_legacy_file(path: &Path, deadline: Instant) -> Result<()> {
 
 /// Migration mappings retain their reference-role namespace even when two roles
 /// legitimately share the same old SHA-256 text.
-pub fn migration_lookup<'a>(
-    mappings: &'a std::collections::BTreeMap<String, String>,
+pub fn migration_lookup(
+    mappings: &crate::migration_map::MigrationMap,
     role: &str,
     old: &str,
-) -> Option<&'a String> {
+) -> Option<String> {
     mappings.get(&format!("{role}:{old}"))
 }
 
@@ -629,10 +629,13 @@ mod tests {
         assert!(ensure_directory_durable(&link.join("new")).is_err());
         assert!(!outside.path().join("new").exists());
         let old = "a".repeat(64);
-        let mappings = std::collections::BTreeMap::from([
+        let mut mappings = crate::migration_map::MigrationMap::new();
+        for (key, value) in [
             (format!("body:{old}"), hash(b"body")),
             (format!("capture:{old}"), hash(b"capture")),
-        ]);
+        ] {
+            crate::migration_map::insert(&mut mappings, key, value).unwrap();
+        }
         assert_ne!(
             migration_lookup(&mappings, "body", &old),
             migration_lookup(&mappings, "capture", &old)

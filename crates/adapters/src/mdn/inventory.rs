@@ -4,6 +4,9 @@ use devres_application::mdn::{
 };
 use devres_domain::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
+#[path = "inventory_migration.rs"]
+mod migration;
+pub(crate) use migration::{MigrationInventory, rebuild_inventory_memoized};
 pub fn digest(bytes: &[u8]) -> String {
     crate::integrity::hash(bytes)
 }
@@ -185,6 +188,22 @@ impl<'a> Staged<'a> {
         });
         self.nodes.insert(id.clone(), (node.clone(), encoded.bytes));
         Ok(id)
+    }
+    async fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        self.store.mdn_put_many(&self.rows).await?;
+        let nodes = std::mem::take(&mut self.nodes);
+        self.rows.clear();
+        self.bytes = 0;
+        // A failed write must never expose staged evidence through the cache.
+        if self.cache.enabled && self.cache.admit_writes {
+            for (id, (node, bytes)) in nodes {
+                self.cache.insert(id, node, bytes);
+            }
+        }
+        Ok(())
     }
     async fn commit(self) -> Result<()> {
         let Self {
@@ -522,12 +541,12 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     #[derive(Default)]
-    struct Memory {
-        rows: Mutex<BTreeMap<String, MdnRow>>,
-        singles: AtomicUsize,
-        reads: AtomicUsize,
-        batches: AtomicUsize,
-        fail_batch: AtomicBool,
+    pub(super) struct Memory {
+        pub(super) rows: Mutex<BTreeMap<String, MdnRow>>,
+        pub(super) singles: AtomicUsize,
+        pub(super) reads: AtomicUsize,
+        pub(super) batches: AtomicUsize,
+        pub(super) fail_batch: AtomicBool,
     }
     #[async_trait]
     impl MdnStore for Memory {
@@ -596,7 +615,7 @@ mod tests {
             unreachable!("unused fixture port")
         }
     }
-    fn member(path: &str) -> Member {
+    pub(super) fn member(path: &str) -> Member {
         Member {
             path: path.into(),
             oid: "a".repeat(40),

@@ -2,6 +2,7 @@
 use super::{PgBlobStore, payload_integrity, storage_error};
 use crate::integrity::{self, FileEvidence};
 use devres_domain::{Error, Result};
+use futures::TryStreamExt;
 use serde_json::{Value, json};
 use sqlx::{Connection, Row, types::Json};
 use std::{
@@ -9,6 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
+
+#[cfg(target_os = "linux")]
+#[path = "storage_migration_files.rs"]
+mod files;
+#[path = "storage_migration_walk.rs"]
+mod walk;
 
 const PROVIDERS: &[&str] = &["mdn", "whatwg", "w3c", "chromium", "npm"];
 const JSON_TABLES: &[(&str, &str)] = &[
@@ -37,6 +44,7 @@ pub(super) async fn prepare(
 CREATE TABLE devres_integrity_control(singleton boolean PRIMARY KEY CHECK(singleton),active boolean NOT NULL,files_complete boolean NOT NULL DEFAULT false,sql_complete boolean NOT NULL DEFAULT false,graph_complete boolean NOT NULL DEFAULT false);
 CREATE TABLE devres_content_aliases(namespace text NOT NULL,legacy text NOT NULL,canonical text NOT NULL CHECK(canonical ~ '^blake3:[0-9a-f]{64}$'),mapping_integrity text CHECK(mapping_integrity IS NULL OR mapping_integrity ~ '^blake3:[0-9a-f]{64}$'),PRIMARY KEY(namespace,legacy),UNIQUE(namespace,canonical,legacy));
 CREATE TABLE devres_integrity_files(path text PRIMARY KEY,digest text NOT NULL CHECK(digest ~ '^blake3:[0-9a-f]{64}$'),bytes bigint NOT NULL CHECK(bytes>=0));
+CREATE INDEX devres_integrity_files_digest_idx ON devres_integrity_files(digest);
 CREATE TABLE devres_integrity_graph_progress(provider text PRIMARY KEY,complete boolean NOT NULL,aliases_count bigint NOT NULL CHECK(aliases_count>=0),aliases_digest text NOT NULL CHECK(aliases_digest ~ '^blake3:[0-9a-f]{64}$'),progress_integrity text NOT NULL CHECK(progress_integrity ~ '^blake3:[0-9a-f]{64}$'));
 CREATE TABLE devres_integrity_provider_cutoffs(provider text PRIMARY KEY,legacy_cutoff bigint NOT NULL CHECK(legacy_cutoff>=0),cutoff_integrity text NOT NULL CHECK(cutoff_integrity ~ '^blake3:[0-9a-f]{64}$'));
 CREATE TABLE devres_integrity_staged_state(provider text NOT NULL,key text NOT NULL,data jsonb NOT NULL,data_integrity text NOT NULL CHECK(data_integrity ~ '^blake3:[0-9a-f]{64}$'),PRIMARY KEY(provider,key));
@@ -197,6 +205,11 @@ impl PgBlobStore {
                 "Storage is already BLAKE3 active; use verify-storage.",
             ));
         }
+        // Resume stores created by an earlier schema-ten binary without changing
+        // their format. Verification stays read-only; this private lookup index
+        // is created only while the migration owns the writer fence.
+        sqlx::raw_sql("CREATE INDEX IF NOT EXISTS devres_integrity_files_digest_idx ON devres_integrity_files(digest)")
+            .execute(&mut *self.owner.lock().await).await.map_err(|_| storage_error())?;
         self.verify_visibility_registry().await?;
         self.prepare_graph_cutoffs().await?;
         self.qualify_files(&cancel).await?;
@@ -211,48 +224,14 @@ impl PgBlobStore {
     }
 
     async fn qualify_files(&self, cancel: &CancellationToken) -> Result<()> {
-        let root = self.root.clone();
-        let mut stack = vec![root.clone()];
-        while let Some(directory) = stack.pop() {
-            canceled(cancel)?;
-            let mut entries = tokio::fs::read_dir(&directory)
-                .await
-                .map_err(|_| storage_error())?;
-            while let Some(entry) = entries.next_entry().await.map_err(|_| storage_error())? {
-                canceled(cancel)?;
-                let name = entry.file_name();
-                let name = name
-                    .to_str()
-                    .ok_or_else(|| Error::integrity("Unsupported retained path encoding."))?;
-                if name == ".devres-integrity"
-                    || name == ".devres-git-owned"
-                    || name.starts_with(".stage-")
-                    || name.starts_with(".bulk-stage-")
-                    || name.ends_with(".lock")
-                {
-                    continue;
-                }
-                let path = entry.path();
-                let kind = entry.file_type().await.map_err(|_| storage_error())?;
-                if kind.is_symlink() {
-                    return Err(Error::integrity("Unexpected retained storage link."));
-                }
-                if kind.is_dir() {
-                    // Bare mirrors are disposable; permanent packs/manifests live in archive roots.
-                    if name.ends_with(".git") || name == "git-index" || name == "mirrors" {
-                        continue;
-                    }
-                    if stack.len() >= 1024
-                        || path.components().count() > root.components().count() + 32
-                    {
-                        return Err(Error::capacity("Storage traversal bound exceeded."));
-                    }
-                    stack.push(path);
-                } else if kind.is_file() {
-                    self.qualify_file(&path, cancel).await?;
-                } else {
-                    return Err(Error::integrity("Unsupported retained filesystem member."));
-                }
+        #[cfg(target_os = "linux")]
+        if files::supported() {
+            return files::qualify(self, cancel).await;
+        }
+        let mut tree = walk::Tree::new(&self.root).await?;
+        while let Some(item) = tree.next(cancel).await? {
+            if let walk::Item::File(path) = item {
+                self.qualify_file(&path, cancel).await?;
             }
         }
         Ok(())
@@ -356,63 +335,48 @@ impl PgBlobStore {
             for suffix in ["evidence", "state"] {
                 canceled(cancel)?;
                 let table = format!("devres_{provider}_{suffix}");
-                let mut after = String::new();
-                loop {
+                let kind_expr = if suffix == "state" {
+                    "''::text"
+                } else {
+                    "kind"
+                };
+                let target = payload_integrity::SealTarget {
+                    table: &table,
+                    column: "data_integrity",
+                    kind_expr,
+                    key_expr: "key",
+                };
+                // One streaming read avoids repeated expression sorts and keeps
+                // only the currently admitted JSON payload in memory. The sole
+                // writer updates bounded locator/seal batches on its owner
+                // connection, so updated ctids are never revisited by this read.
+                let query = format!(
+                    "SELECT ctid::text AS locator,{kind_expr} AS kind,key,data,data_integrity FROM {table}"
+                );
+                let mut rows = sqlx::query(sqlx::AssertSqlSafe(query)).fetch(&self.pool);
+                let mut batch = payload_integrity::SealBatch::default();
+                while let Some(row) = rows.try_next().await.map_err(|_| storage_error())? {
                     canceled(cancel)?;
-                    let query = if suffix == "state" {
-                        format!(
-                            "SELECT ''::text AS kind,key,data,data_integrity,key AS page_key FROM {table} WHERE key>$1 ORDER BY key LIMIT 1"
-                        )
-                    } else {
-                        format!(
-                            "SELECT kind,key,data,data_integrity,kind||chr(1)||key AS page_key FROM {table} WHERE kind||chr(1)||key>$1 ORDER BY kind||chr(1)||key LIMIT 1"
-                        )
-                    };
-                    let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-                        .bind(&after)
-                        .fetch_all(&self.pool)
-                        .await
-                        .map_err(|_| storage_error())?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let mut owner = self.owner.lock().await;
-                    let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-                    for row in rows {
-                        let kind: String = row.try_get("kind").map_err(|_| storage_error())?;
-                        let key: String = row.try_get("key").map_err(|_| storage_error())?;
-                        let data: Json<Value> = row.try_get("data").map_err(|_| storage_error())?;
-                        let expected: Option<String> =
-                            row.try_get("data_integrity").map_err(|_| storage_error())?;
-                        let digest = payload_integrity::digest(&table, &kind, &key, &data.0)?;
-                        if let Some(expected) = expected {
-                            if digest != expected {
-                                return Err(Error::integrity("Retained SQL payload changed."));
-                            }
-                        } else if verify_only {
-                            return Err(Error::integrity("Retained SQL integrity missing."));
-                        } else {
-                            let update = if suffix == "state" {
-                                format!(
-                                    "UPDATE {table} SET data_integrity=$3 WHERE key=$2 AND $1::text=''"
-                                )
-                            } else {
-                                format!(
-                                    "UPDATE {table} SET data_integrity=$3 WHERE kind=$1 AND key=$2"
-                                )
-                            };
-                            sqlx::query(sqlx::AssertSqlSafe(update))
-                                .bind(&kind)
-                                .bind(&key)
-                                .bind(&digest)
-                                .execute(&mut *tx)
-                                .await
-                                .map_err(|_| storage_error())?;
+                    let kind: String = row.try_get("kind").map_err(|_| storage_error())?;
+                    let key: String = row.try_get("key").map_err(|_| storage_error())?;
+                    let data: Json<Value> = row.try_get("data").map_err(|_| storage_error())?;
+                    let expected: Option<String> =
+                        row.try_get("data_integrity").map_err(|_| storage_error())?;
+                    let digest = payload_integrity::digest(&table, &kind, &key, &data.0)?;
+                    if let Some(expected) = expected {
+                        if digest != expected {
+                            return Err(Error::integrity("Retained SQL payload changed."));
                         }
-                        after = row.try_get("page_key").map_err(|_| storage_error())?;
+                    } else if verify_only {
+                        return Err(Error::integrity("Retained SQL integrity missing."));
+                    } else {
+                        let locator = row.try_get("locator").map_err(|_| storage_error())?;
+                        batch
+                            .queue(self, cancel, &target, (locator, kind, key, digest))
+                            .await?;
                     }
-                    tx.commit().await.map_err(|_| storage_error())?;
                 }
+                batch.flush(self, cancel, &target).await?;
             }
         }
         Ok(())
@@ -422,115 +386,122 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             canceled(cancel)?;
-            let rows = sqlx::query("SELECT * FROM devres_captures WHERE id>$1 AND id NOT LIKE 'blake3:%' ORDER BY id LIMIT 100")
+            let rows = sqlx::query("SELECT c.*,f.digest AS qualified_body_digest FROM devres_captures c LEFT JOIN devres_integrity_files f ON f.path=CASE WHEN c.body_hash LIKE 'blake3:%' THEN 'blake3/'||substring(c.body_hash FROM 8) ELSE c.body_hash END WHERE c.id>$1 AND c.id NOT LIKE 'blake3:%' ORDER BY c.id LIMIT 100")
                 .bind(&after).fetch_all(&self.pool).await.map_err(|_| storage_error())?;
             if rows.is_empty() {
                 break;
             }
-            for row in rows {
-                canceled(cancel)?;
-                let id: String = row.try_get("id").map_err(|_| storage_error())?;
-                let body_hash: String = row.try_get("body_hash").map_err(|_| storage_error())?;
-                let key: String = row.try_get("source_key").map_err(|_| storage_error())?;
-                let url: String = row.try_get("source_url").map_err(|_| storage_error())?;
-                let media: String = row.try_get("media_type").map_err(|_| storage_error())?;
-                let time: i64 = row.try_get("retrieved_at").map_err(|_| storage_error())?;
-                integrity::verify(
-                    &id,
-                    format!("{key}\0{url}\0{media}\0{body_hash}").as_bytes(),
-                )?;
-                let legacy_capture = devres_domain::Capture {
-                    id: id.clone(),
-                    key: key.clone(),
-                    source_url: url.clone(),
-                    body_hash: body_hash.clone(),
-                    media_type: media.clone(),
-                    retrieved_at: time,
-                    validated_at: time,
-                };
-                let legacy_metadata = super::capture_metadata_digest(&legacy_capture)?;
-                let prior: Option<String> = row
-                    .try_get("metadata_integrity")
-                    .map_err(|_| storage_error())?;
-                if prior.as_ref().is_some_and(|v| v != &legacy_metadata) {
-                    return Err(Error::integrity("Legacy capture metadata changed."));
-                }
-                sqlx::query("UPDATE devres_captures SET metadata_integrity=$2 WHERE id=$1 AND metadata_integrity IS NULL")
-                    .bind(&id).bind(&legacy_metadata).execute(&mut *self.owner.lock().await).await.map_err(|_| storage_error())?;
-                let source = self.root.join(integrity::relative_path(&body_hash)?);
-                let evidence =
-                    sqlx::query("SELECT digest FROM devres_integrity_files WHERE path=$1")
-                        .bind(
-                            integrity::relative_path(&body_hash)?
-                                .to_string_lossy()
-                                .as_ref(),
-                        )
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(|_| storage_error())?;
-                let Some(evidence) = evidence else {
-                    return Err(Error::integrity(
-                        "Captured source file missing from migration.",
-                    ));
-                };
-                let digest: String = evidence.try_get("digest").map_err(|_| storage_error())?;
-                let canonical =
-                    integrity::hash(format!("{key}\0{url}\0{media}\0{digest}").as_bytes());
-                let target = self.root.join(integrity::relative_path(&digest)?);
-                publish_link(&source, &target).await?;
-                let mut owner = self.owner.lock().await;
-                let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-                let metadata_digest = super::capture_metadata_digest(&devres_domain::Capture {
-                    id: canonical.clone(),
-                    body_hash: digest.clone(),
-                    ..legacy_capture
-                })?;
-                sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
-                    .bind(&canonical).bind(&key).bind(&url).bind(&digest).bind(&media).bind(time).bind(&metadata_digest).execute(&mut *tx).await.map_err(|_| storage_error())?;
-                sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
-                    .bind(&id).bind(&canonical).bind(mapping_digest("capture",&id,&canonical)?).execute(&mut *tx).await.map_err(|_| storage_error())?;
-                let matches: bool = sqlx::query_scalar("SELECT canonical=$2 FROM devres_content_aliases WHERE namespace='capture' AND legacy=$1")
-                    .bind(&id).bind(&canonical).fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
-                if !matches {
-                    return Err(Error::integrity("Conflicting capture migration mapping."));
-                }
-                // Legacy observations remain exact; canonical reads consult their alias.
-                let head=sqlx::query("SELECT source_key,validated_at,etag,last_modified FROM devres_heads WHERE capture_id=$1").bind(&id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
-                if let Some(head) = head {
-                    let key: String = head.try_get("source_key").map_err(|_| storage_error())?;
-                    let data = json!({"source_key":key,"capture_id":canonical,"validated_at":head.try_get::<i64,_>("validated_at").map_err(|_|storage_error())?,"etag":head.try_get::<Option<String>,_>("etag").map_err(|_|storage_error())?,"last_modified":head.try_get::<Option<String>,_>("last_modified").map_err(|_|storage_error())?});
-                    let stage = format!("head:{key}");
-                    let digest = payload_integrity::digest(
-                        "devres_integrity_staged_state",
-                        "capture",
-                        &stage,
-                        &data,
+            self.fence().await?;
+            let mut owner = self.owner.lock().await;
+            let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+            let result: Result<()> = async {
+                for row in rows {
+                    canceled(cancel)?;
+                    let id: String = row.try_get("id").map_err(|_| storage_error())?;
+                    let body_hash: String = row.try_get("body_hash").map_err(|_| storage_error())?;
+                    let key: String = row.try_get("source_key").map_err(|_| storage_error())?;
+                    let url: String = row.try_get("source_url").map_err(|_| storage_error())?;
+                    let media: String = row.try_get("media_type").map_err(|_| storage_error())?;
+                    let time: i64 = row.try_get("retrieved_at").map_err(|_| storage_error())?;
+                    integrity::verify(
+                        &id,
+                        format!("{key}\0{url}\0{media}\0{body_hash}").as_bytes(),
                     )?;
-                    sqlx::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
-                        .bind(stage).bind(Json(&data)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+                    let legacy_capture = devres_domain::Capture {
+                        id: id.clone(),
+                        key: key.clone(),
+                        source_url: url.clone(),
+                        body_hash: body_hash.clone(),
+                        media_type: media.clone(),
+                        retrieved_at: time,
+                        validated_at: time,
+                    };
+                    let legacy_metadata = super::capture_metadata_digest(&legacy_capture)?;
+                    let prior: Option<String> = row
+                        .try_get("metadata_integrity")
+                        .map_err(|_| storage_error())?;
+                    if prior.as_ref().is_some_and(|v| v != &legacy_metadata) {
+                        return Err(Error::integrity("Legacy capture metadata changed."));
+                    }
+                    sqlx::query("UPDATE devres_captures SET metadata_integrity=$2 WHERE id=$1 AND metadata_integrity IS NULL")
+                        .bind(&id).bind(&legacy_metadata).execute(&mut *tx).await.map_err(|_| storage_error())?;
+                    let source = self.root.join(integrity::relative_path(&body_hash)?);
+                    let digest: Option<String> = row
+                        .try_get("qualified_body_digest")
+                        .map_err(|_| storage_error())?;
+                    let digest = digest.ok_or_else(|| {
+                        Error::integrity("Captured source file missing from migration.")
+                    })?;
+                    let canonical =
+                        integrity::hash(format!("{key}\0{url}\0{media}\0{digest}").as_bytes());
+                    let target = self.root.join(integrity::relative_path(&digest)?);
+                    // The preceding file qualification persisted this exact link
+                    // before its SQL checkpoint. Reuse that durable inode rather
+                    // than re-syncing all ancestor directories for every capture.
+                    if !same_regular_file(&source, &target).await? {
+                        publish_link(&source, &target).await?;
+                    }
+                    let metadata_digest = super::capture_metadata_digest(&devres_domain::Capture {
+                        id: canonical.clone(),
+                        body_hash: digest.clone(),
+                        ..legacy_capture
+                    })?;
+                    sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
+                        .bind(&canonical).bind(&key).bind(&url).bind(&digest).bind(&media).bind(time).bind(&metadata_digest).execute(&mut *tx).await.map_err(|_| storage_error())?;
+                    sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
+                        .bind(&id).bind(&canonical).bind(mapping_digest("capture",&id,&canonical)?).execute(&mut *tx).await.map_err(|_| storage_error())?;
+                    let matches: bool = sqlx::query_scalar("SELECT canonical=$2 FROM devres_content_aliases WHERE namespace='capture' AND legacy=$1")
+                        .bind(&id).bind(&canonical).fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
+                    if !matches {
+                        return Err(Error::integrity("Conflicting capture migration mapping."));
+                    }
+                    // Legacy observations remain exact; canonical reads consult their alias.
+                    let head=sqlx::query("SELECT source_key,validated_at,etag,last_modified FROM devres_heads WHERE capture_id=$1").bind(&id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+                    if let Some(head) = head {
+                        let key: String = head.try_get("source_key").map_err(|_| storage_error())?;
+                        let data = json!({"source_key":key,"capture_id":canonical,"validated_at":head.try_get::<i64,_>("validated_at").map_err(|_|storage_error())?,"etag":head.try_get::<Option<String>,_>("etag").map_err(|_|storage_error())?,"last_modified":head.try_get::<Option<String>,_>("last_modified").map_err(|_|storage_error())?});
+                        let stage = format!("head:{key}");
+                        let digest = payload_integrity::digest(
+                            "devres_integrity_staged_state",
+                            "capture",
+                            &stage,
+                            &data,
+                        )?;
+                        sqlx::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
+                            .bind(stage).bind(Json(&data)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
+                    }
+                    after = id;
                 }
-                tx.commit().await.map_err(|_| storage_error())?;
-                after = id;
+                canceled(cancel)?;
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                tx.rollback().await.map_err(|_| storage_error())?;
+                return Err(error);
             }
+            tx.commit().await.map_err(|_| storage_error())?;
         }
         Ok(())
     }
 
-    pub async fn migration_mappings(&self) -> Result<std::collections::BTreeMap<String, String>> {
+    pub async fn migration_mappings(&self) -> Result<crate::MigrationMap> {
+        self.migration_mappings_with_cancel(&CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn migration_mappings_with_cancel(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<crate::MigrationMap> {
         self.fence().await?;
-        let (count,bytes):(i64,i64)=sqlx::query_as("SELECT count(*)::bigint,COALESCE(sum(octet_length(namespace)+octet_length(legacy)+octet_length(canonical)+129),0)::bigint FROM devres_content_aliases")
-            .fetch_one(&self.pool).await.map_err(|_|storage_error())?;
-        if count > 1_000_000 || bytes > 64 * 1024 * 1024 {
-            return Err(Error::capacity("Migration mapping memory bound exceeded."));
-        }
-        let rows=sqlx::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace,legacy LIMIT 1000001")
-            .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
-        if rows.len() > 1_000_000 {
-            return Err(Error::capacity("Migration mapping memory bound exceeded."));
-        }
-        let mut mappings = std::collections::BTreeMap::new();
-        let mut bytes = 0_usize;
-        for row in rows {
+        // Stream verified rows directly into the compact, capacity-accounted
+        // working set. Holding an intermediate Vec of every SQL row would
+        // duplicate the advertised memory budget before admission.
+        let mut rows = sqlx::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace,legacy")
+            .fetch(&self.pool);
+        let mut mappings = crate::MigrationMap::new();
+        while let Some(row) = rows.try_next().await.map_err(|_| storage_error())? {
+            canceled(cancel)?;
             let namespace: String = row.try_get("namespace").map_err(|_| storage_error())?;
             let old: String = row.try_get("legacy").map_err(|_| storage_error())?;
             let new: String = row.try_get("canonical").map_err(|_| storage_error())?;
@@ -540,12 +511,7 @@ impl PgBlobStore {
             if mapping_digest(&namespace, &old, &new)? != expected {
                 return Err(Error::integrity("Migration mapping integrity failed."));
             }
-            let key = format!("{namespace}:{old}");
-            bytes = bytes.saturating_add(key.len() + new.len());
-            if bytes > 64 * 1024 * 1024 {
-                return Err(Error::capacity("Migration mapping byte bound exceeded."));
-            }
-            crate::migration_map::insert(&mut mappings, key, new)?;
+            crate::migration_map::insert(&mut mappings, format!("{namespace}:{old}"), new)?;
         }
         Ok(mappings)
     }
@@ -614,7 +580,7 @@ impl PgBlobStore {
     pub async fn record_migration_aliases(
         &self,
         provider: &str,
-        aliases: &[(String, String, String)],
+        aliases: &crate::MigrationAliases,
     ) -> Result<()> {
         if !matches!(
             provider,
@@ -622,10 +588,14 @@ impl PgBlobStore {
         ) {
             return Err(Error::invalid("Invalid migration provider."));
         }
-        for chunk in aliases.chunks(100) {
+        aliases.ensure_healthy()?;
+        for chunk in aliases.try_chunks(100) {
+            let chunk = chunk?;
+            self.fence().await?;
             let mut owner = self.owner.lock().await;
             let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-            for (kind, old, new) in chunk {
+            let result: Result<()> = async {
+            for (kind, old, new) in &chunk {
                 if kind.is_empty()
                     || kind.len() > 64
                     || !new.starts_with("blake3:")
@@ -642,8 +612,16 @@ impl PgBlobStore {
                     return Err(Error::integrity("Conflicting migration mapping."));
                 }
             }
+            self.fence().await?;
+            Ok(())
+            }.await;
+            if let Err(error) = result {
+                tx.rollback().await.map_err(|_| storage_error())?;
+                return Err(error);
+            }
             tx.commit().await.map_err(|_| storage_error())?;
         }
+        aliases.ensure_healthy()?;
         self.seal_alias_membership(provider).await?;
         Ok(())
     }
@@ -802,76 +780,45 @@ impl PgBlobStore {
     }
 
     async fn verify_file_inventory(&self, cancel: &CancellationToken) -> Result<u64> {
-        let mut stack = vec![self.root.clone()];
+        let mut tree = walk::Tree::new(&self.root).await?;
         let mut count = 0_u64;
-        while let Some(directory) = stack.pop() {
-            canceled(cancel)?;
-            let mut entries = tokio::fs::read_dir(&directory)
-                .await
-                .map_err(|_| storage_error())?;
-            while let Some(entry) = entries.next_entry().await.map_err(|_| storage_error())? {
-                canceled(cancel)?;
-                let name = entry.file_name();
-                let name = name
-                    .to_str()
+        while let Some(item) = tree.next(cancel).await? {
+            let path = match item {
+                walk::Item::Integrity(root) => {
+                    self.verify_descriptor_inventory(&root, cancel).await?;
+                    continue;
+                }
+                walk::Item::File(path) => path,
+            };
+            let target = path.clone();
+            let (digest, bytes) = tokio::task::spawn_blocking(move || {
+                integrity::file_digest(
+                    &target,
+                    crate::bulk::MAX_ARTIFACT_BYTES,
+                    Instant::now() + Duration::from_secs(3600),
+                )
+            })
+            .await
+            .map_err(|_| storage_error())??;
+            integrity::verify_legacy_digest(&path, &digest, bytes)?;
+            if path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|v| v.to_str())
+                == Some("blake3")
+            {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
                     .ok_or_else(|| Error::integrity("Invalid retained file encoding."))?;
-                if name == ".devres-integrity" {
-                    self.verify_descriptor_inventory(&directory, cancel).await?;
-                    continue;
-                }
-                if name == ".devres-git-owned"
-                    || name.starts_with(".stage-")
-                    || name.starts_with(".bulk-stage-")
-                    || name.ends_with(".lock")
-                {
-                    continue;
-                }
-                let kind = entry.file_type().await.map_err(|_| storage_error())?;
-                if kind.is_symlink() {
-                    return Err(Error::integrity("Retained storage symlink rejected."));
-                }
-                let path = entry.path();
-                if kind.is_dir() {
-                    if name.ends_with(".git") || name == "git-index" || name == "mirrors" {
-                        continue;
-                    }
-                    if stack.len() >= 1024
-                        || path.components().count() > self.root.components().count() + 32
-                    {
-                        return Err(Error::capacity("Retained file traversal exceeds bound."));
-                    }
-                    stack.push(path);
-                } else if kind.is_file() {
-                    let target = path.clone();
-                    let (digest, bytes) = tokio::task::spawn_blocking(move || {
-                        integrity::file_digest(
-                            &target,
-                            crate::bulk::MAX_ARTIFACT_BYTES,
-                            Instant::now() + Duration::from_secs(3600),
-                        )
-                    })
-                    .await
-                    .map_err(|_| storage_error())??;
-                    integrity::verify_legacy_digest(&path, &digest, bytes)?;
-                    // Explicit BLAKE3 filenames are authoritative independently of descriptors.
-                    if path
-                        .parent()
-                        .and_then(Path::file_name)
-                        .and_then(|v| v.to_str())
-                        == Some("blake3")
-                    {
-                        let hex = name.strip_suffix(".json").unwrap_or(name);
-                        if integrity::valid_hash(hex) && digest != format!("blake3:{hex}") {
-                            return Err(Error::integrity("BLAKE3 file address mismatch."));
-                        }
-                    }
-                    count = count
-                        .checked_add(1)
-                        .ok_or_else(|| Error::capacity("Retained file count overflow."))?;
-                } else {
-                    return Err(Error::integrity("Unexpected retained filesystem object."));
+                let hex = name.strip_suffix(".json").unwrap_or(name);
+                if integrity::valid_hash(hex) && digest != format!("blake3:{hex}") {
+                    return Err(Error::integrity("BLAKE3 file address mismatch."));
                 }
             }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::capacity("Retained file count overflow."))?;
         }
         Ok(count)
     }
@@ -1190,6 +1137,25 @@ async fn publish_metadata(target: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn same_regular_file(source: &Path, target: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let source = tokio::fs::symlink_metadata(source)
+        .await
+        .map_err(|_| storage_error())?;
+    if !source.is_file() || source.file_type().is_symlink() {
+        return Err(Error::integrity("Invalid retained source file."));
+    }
+    let target = match tokio::fs::symlink_metadata(target).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(storage_error()),
+    };
+    if !target.is_file() || target.file_type().is_symlink() {
+        return Err(Error::integrity("Invalid canonical source file."));
+    }
+    Ok(source.dev() == target.dev() && source.ino() == target.ino())
 }
 
 async fn publish_link(source: &Path, target: &Path) -> Result<()> {

@@ -63,6 +63,7 @@ pub use whatwg::research as whatwg_research;
 pub use chromium::{ChromiumConfig, ChromiumCorpus};
 pub use crates_io::{CrateConfig, CrateCorpus};
 pub use mdn::{MdnConfig, MdnCorpus};
+pub use migration_map::{MigrationAliases, MigrationMap};
 pub use network::HttpFetcher;
 pub use npm::{NpmConfig, NpmCorpus};
 pub use research::Research;

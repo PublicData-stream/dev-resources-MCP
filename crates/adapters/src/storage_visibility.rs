@@ -1,15 +1,13 @@
-//! Verified compatibility visibility, frozen in memory once storage is active.
+//! Verified compatibility visibility, frozen in disposable storage once active.
 use super::{PgBlobStore, events};
 use devres_domain::{Error, Result};
+use futures::TryStreamExt;
 use serde_json::json;
 use sqlx::Row;
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, atomic::Ordering},
-};
-
-const MAX_ENTRIES: i64 = 1_000_000;
-const MAX_BYTES: i64 = 64 * 1024 * 1024;
+#[path = "storage_visibility_spill.rs"]
+mod spill;
+pub(super) use spill::VisibilityValues;
+use std::{collections::BTreeMap, sync::atomic::Ordering};
 
 const CUTOFF_GROUPS: &[&str] = &[
     "mdn",
@@ -75,14 +73,24 @@ impl AliasMembership {
     }
 }
 
-pub(super) type VisibilityPairs = (Arc<Vec<String>>, Arc<Vec<String>>);
+pub(super) type VisibilityPairs = (VisibilityValues, VisibilityValues);
 
-#[derive(PartialEq, Eq)]
 pub(super) struct VisibilityRegistry {
-    aliases: BTreeMap<String, Arc<Vec<String>>>,
-    targets: BTreeMap<String, Arc<Vec<String>>>,
+    index: Option<spill::FrozenIndex>,
+    aliases_empty: bool,
     cutoffs: BTreeMap<String, i64>,
+    // The verified sorted membership commitment identifies every frozen edge.
+    memberships: BTreeMap<String, (i64, String)>,
+    progress: BTreeMap<String, (bool, i64, String, String)>,
 }
+impl PartialEq for VisibilityRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cutoffs == other.cutoffs
+            && self.memberships == other.memberships
+            && self.progress == other.progress
+    }
+}
+impl Eq for VisibilityRegistry {}
 
 fn invalid() -> Error {
     Error::integrity("Retained compatibility visibility integrity failed.")
@@ -106,6 +114,9 @@ fn verify_cutoff(provider: &str, cutoff: i64, expected: &str) -> Result<()> {
 
 impl VisibilityRegistry {
     async fn load(pool: &sqlx::PgPool, active: bool) -> Result<Self> {
+        Self::load_inner(pool, active, true).await
+    }
+    async fn load_inner(pool: &sqlx::PgPool, active: bool, freeze: bool) -> Result<Self> {
         // Admission and loading share one database snapshot: a concurrent pending
         // migration cannot grow the result between its byte check and allocation.
         let mut tx = pool.begin().await.map_err(|_| invalid())?;
@@ -113,13 +124,23 @@ impl VisibilityRegistry {
             .execute(&mut *tx)
             .await
             .map_err(|_| invalid())?;
-        let (count, bytes): (i64, i64) = sqlx::query_as("SELECT count(*)::bigint,COALESCE(sum(bytes),0)::bigint FROM (SELECT octet_length(namespace)+octet_length(legacy)+octet_length(canonical)+COALESCE(octet_length(mapping_integrity),0)+256 AS bytes FROM devres_content_aliases UNION ALL SELECT octet_length(provider)+COALESCE(octet_length(cutoff_integrity),0)+256 FROM devres_integrity_provider_cutoffs UNION ALL SELECT octet_length(provider)+COALESCE(octet_length(aliases_digest),0)+COALESCE(octet_length(progress_integrity),0)+256 FROM devres_integrity_graph_progress) registry")
+        // Check a single record's transient encodings before loading it. Total
+        // historical bytes are never a resident admission criterion.
+        let largest: i64 = sqlx::query_scalar("SELECT COALESCE(max(bytes),0)::bigint FROM (SELECT octet_length(namespace)::bigint+octet_length(legacy)+octet_length(canonical)+COALESCE(octet_length(mapping_integrity),0) AS bytes FROM devres_content_aliases UNION ALL SELECT octet_length(provider)::bigint+COALESCE(octet_length(cutoff_integrity),0) FROM devres_integrity_provider_cutoffs UNION ALL SELECT octet_length(provider)::bigint+COALESCE(octet_length(aliases_digest),0)+COALESCE(octet_length(progress_integrity),0) FROM devres_integrity_graph_progress) registry")
             .fetch_one(&mut *tx).await.map_err(|_| invalid())?;
-        if count > MAX_ENTRIES || bytes > MAX_BYTES {
-            return Err(capacity());
-        }
+        let transient = usize::try_from(largest)
+            .ok()
+            .and_then(|n| n.checked_mul(64))
+            .and_then(|n| n.checked_add(64 * 1024))
+            .ok_or_else(capacity)?;
+        let _transient = spill::Reservation::new(transient)?;
+        let mut index = if freeze {
+            Some(spill::FrozenIndex::new()?)
+        } else {
+            None
+        };
         let mut cutoffs = BTreeMap::new();
-        for row in sqlx::query("SELECT provider,legacy_cutoff,cutoff_integrity FROM devres_integrity_provider_cutoffs ORDER BY provider")
+        for row in sqlx::query("SELECT provider,legacy_cutoff,cutoff_integrity FROM devres_integrity_provider_cutoffs ORDER BY provider LIMIT 10")
             .fetch_all(&mut *tx).await.map_err(|_| invalid())? {
             let provider: String = row.try_get("provider").map_err(|_| invalid())?;
             let cutoff: i64 = row.try_get("legacy_cutoff").map_err(|_| invalid())?;
@@ -134,36 +155,87 @@ impl VisibilityRegistry {
         {
             return Err(invalid());
         }
-        let mut aliases: BTreeMap<String, Arc<Vec<String>>> = BTreeMap::new();
-        let mut targets: BTreeMap<String, Arc<Vec<String>>> = BTreeMap::new();
+        let mut aliases_empty = true;
         let mut memberships = ALIAS_GROUPS
             .iter()
             .map(|provider| Ok(((*provider).to_owned(), AliasMembership::new(provider)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        for row in sqlx::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace COLLATE \"C\",legacy COLLATE \"C\"")
-            .fetch_all(&mut *tx).await.map_err(|_| invalid())? {
+        let mut pending_namespace = String::new();
+        let mut pending_aliases = Vec::new();
+        let mut pending_bytes = 0_usize;
+        let mut rows = sqlx::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace COLLATE \"C\",legacy COLLATE \"C\"")
+            .fetch(&mut *tx);
+        while let Some(row) = rows.try_next().await.map_err(|_| invalid())? {
             let namespace: String = row.try_get("namespace").map_err(|_| invalid())?;
             let legacy: String = row.try_get("legacy").map_err(|_| invalid())?;
             let canonical: String = row.try_get("canonical").map_err(|_| invalid())?;
             let expected: String = row.try_get("mapping_integrity").map_err(|_| invalid())?;
-            if namespace.is_empty() || namespace.len() > 128 || legacy.is_empty()
-                || !canonical.starts_with("blake3:") || !crate::integrity::valid_hash(&canonical)
-                || events::event_digest("devres_content_aliases", &events::mapping_key(&namespace,&legacy)?,
-                    &json!({"namespace":namespace,"legacy":legacy,"canonical":canonical}))? != expected {
+            if namespace.is_empty()
+                || namespace.len() > 128
+                || legacy.is_empty()
+                || !canonical.starts_with("blake3:")
+                || !crate::integrity::valid_hash(&canonical)
+                || events::event_digest(
+                    "devres_content_aliases",
+                    &events::mapping_key(&namespace, &legacy)?,
+                    &json!({"namespace":namespace,"legacy":legacy,"canonical":canonical}),
+                )? != expected
+            {
                 return Err(invalid());
             }
-            memberships.get_mut(namespace.split_once(':').map_or(namespace.as_str(),|pair|pair.0))
-                .ok_or_else(invalid)?.push(&namespace,&legacy,&canonical)?;
-            Arc::get_mut(aliases.entry(namespace.clone()).or_insert_with(||Arc::new(Vec::new())))
-                .ok_or_else(invalid)?.push(legacy);
-            Arc::get_mut(targets.entry(namespace).or_insert_with(||Arc::new(Vec::new())))
-                .ok_or_else(invalid)?.push(canonical);
+            memberships
+                .get_mut(
+                    namespace
+                        .split_once(':')
+                        .map_or(namespace.as_str(), |pair| pair.0),
+                )
+                .ok_or_else(invalid)?
+                .push(&namespace, &legacy, &canonical)?;
+            aliases_empty = false;
+            if let Some(index) = index.as_mut() {
+                let bytes = legacy
+                    .len()
+                    .checked_add(canonical.len())
+                    .and_then(|n| n.checked_add(72))
+                    .ok_or_else(capacity)?;
+                if !pending_aliases.is_empty()
+                    && (namespace != pending_namespace
+                        || pending_bytes
+                            .checked_add(bytes)
+                            .is_none_or(|n| n > crate::MigrationAliases::BATCH_BYTES))
+                {
+                    index.push_batch(std::mem::take(&mut pending_namespace), &pending_aliases)?;
+                    pending_aliases.clear();
+                    pending_bytes = 0;
+                }
+                if pending_aliases.is_empty() {
+                    pending_namespace = namespace;
+                }
+                pending_aliases.push((String::new(), legacy, canonical));
+                pending_bytes = pending_bytes.checked_add(bytes).ok_or_else(capacity)?;
+                if pending_aliases.len() == crate::MigrationAliases::BATCH_ROWS
+                    || pending_bytes >= crate::MigrationAliases::BATCH_BYTES
+                {
+                    index.push_batch(std::mem::take(&mut pending_namespace), &pending_aliases)?;
+                    pending_aliases.clear();
+                    pending_bytes = 0;
+                }
+            }
+        }
+        drop(rows);
+        if !pending_aliases.is_empty() {
+            index
+                .as_mut()
+                .ok_or_else(invalid)?
+                .push_batch(pending_namespace, &pending_aliases)?;
         }
         let mut actual = memberships
             .into_iter()
             .map(|(provider, membership)| (provider, membership.finish()))
             .collect::<BTreeMap<_, _>>();
-        for row in sqlx::query("SELECT provider,complete,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress ORDER BY provider")
+        let verified_memberships = actual.clone();
+        let mut progress = BTreeMap::new();
+        for row in sqlx::query("SELECT provider,complete,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress ORDER BY provider LIMIT 11")
             .fetch_all(&mut *tx).await.map_err(|_|invalid())? {
             let provider:String=row.try_get("provider").map_err(|_|invalid())?;
             let complete:bool=row.try_get("complete").map_err(|_|invalid())?;
@@ -176,6 +248,7 @@ impl VisibilityRegistry {
                     &json!({"provider":provider,"complete":complete,"aliases_count":count,"aliases_digest":digest}))? != expected {
                 return Err(invalid());
             }
+            progress.insert(provider.clone(), (complete, count, digest.clone(), expected));
             if !complete {
                 if active { return Err(invalid()); }
                 continue;
@@ -187,12 +260,20 @@ impl VisibilityRegistry {
         }
         tx.commit().await.map_err(|_| invalid())?;
         Ok(Self {
-            aliases,
-            targets,
+            index,
+            aliases_empty,
             cutoffs,
+            memberships: verified_memberships,
+            progress,
         })
     }
-    fn pairs(&self, provider: &str, kind: &str, cutoff: Option<i64>) -> Result<VisibilityPairs> {
+    fn values(
+        &self,
+        provider: &str,
+        kind: &str,
+        cutoff: Option<i64>,
+        with_targets: bool,
+    ) -> Result<VisibilityPairs> {
         let cutoff_provider = match (provider, kind) {
             ("crate", "generations") => "crate_generation",
             ("crate", "inventories") => "crate_inventory",
@@ -201,23 +282,22 @@ impl VisibilityRegistry {
         };
         let watermark = self.cutoffs.get(cutoff_provider).ok_or_else(invalid)?;
         if cutoff.is_some_and(|cutoff| cutoff <= *watermark) {
-            return Ok((Arc::new(Vec::new()), Arc::new(Vec::new())));
+            return Ok((VisibilityValues::empty(), VisibilityValues::empty()));
         }
         let namespace = format!("{provider}:{kind}");
-        Ok((
-            self.aliases
-                .get(&namespace)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(Vec::new())),
-            self.targets
-                .get(&namespace)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(Vec::new())),
-        ))
+        let index = self.index.as_ref().ok_or_else(invalid)?;
+        if with_targets {
+            index.pairs(&namespace)
+        } else {
+            index
+                .aliases(&namespace)
+                .map(|old| (old, VisibilityValues::empty()))
+        }
     }
     #[cfg(test)]
-    fn aliases(&self, provider: &str, kind: &str, cutoff: Option<i64>) -> Result<Arc<Vec<String>>> {
-        self.pairs(provider, kind, cutoff).map(|pairs| pairs.0)
+    fn aliases(&self, provider: &str, kind: &str, cutoff: Option<i64>) -> Result<VisibilityValues> {
+        self.values(provider, kind, cutoff, false)
+            .map(|pairs| pairs.0)
     }
 }
 
@@ -241,8 +321,8 @@ impl PgBlobStore {
         provider: &str,
         kind: &str,
         cutoff: Option<i64>,
-    ) -> Result<Arc<Vec<String>>> {
-        self.visibility_pairs(provider, kind, cutoff)
+    ) -> Result<VisibilityValues> {
+        self.visibility_values(provider, kind, cutoff, false)
             .await
             .map(|pairs| pairs.0)
     }
@@ -252,12 +332,21 @@ impl PgBlobStore {
         kind: &str,
         cutoff: Option<i64>,
     ) -> Result<VisibilityPairs> {
+        self.visibility_values(provider, kind, cutoff, true).await
+    }
+    async fn visibility_values(
+        &self,
+        provider: &str,
+        kind: &str,
+        cutoff: Option<i64>,
+        with_targets: bool,
+    ) -> Result<VisibilityPairs> {
         if self.active.load(Ordering::Acquire) {
             return self
                 .visibility
                 .get_or_try_init(|| VisibilityRegistry::load(&self.pool, true))
                 .await?
-                .pairs(provider, kind, cutoff);
+                .values(provider, kind, cutoff, with_targets);
         }
         let cutoff_provider = match (provider, kind) {
             ("crate", "generations") => "crate_generation",
@@ -270,18 +359,18 @@ impl PgBlobStore {
             .zip(watermark)
             .is_some_and(|(cutoff, watermark)| cutoff <= watermark)
         {
-            return Ok((Arc::new(Vec::new()), Arc::new(Vec::new())));
+            return Ok((VisibilityValues::empty(), VisibilityValues::empty()));
         }
         let registry = VisibilityRegistry::load(&self.pool, false).await?;
         // Fresh empty stores have no migration cutoff until qualification starts.
-        if watermark.is_none() && registry.aliases.is_empty() {
-            return Ok((Arc::new(Vec::new()), Arc::new(Vec::new())));
+        if watermark.is_none() && registry.aliases_empty {
+            return Ok((VisibilityValues::empty(), VisibilityValues::empty()));
         }
-        registry.pairs(provider, kind, cutoff)
+        registry.values(provider, kind, cutoff, with_targets)
     }
     /// Activation requires completed receipts and watermarks while serving remains pending.
     pub(super) async fn verify_complete_visibility_registry(&self) -> Result<()> {
-        let retained = VisibilityRegistry::load(&self.pool, true).await?;
+        let retained = VisibilityRegistry::load_inner(&self.pool, true, false).await?;
         if self
             .visibility
             .get()
@@ -294,7 +383,8 @@ impl PgBlobStore {
     /// CLI verification reloads durable metadata even after public reads froze it.
     pub(super) async fn verify_visibility_registry(&self) -> Result<()> {
         let retained =
-            VisibilityRegistry::load(&self.pool, self.active.load(Ordering::Acquire)).await?;
+            VisibilityRegistry::load_inner(&self.pool, self.active.load(Ordering::Acquire), false)
+                .await?;
         if self
             .visibility
             .get()
@@ -346,15 +436,22 @@ mod tests {
         verify_cutoff("mdn", 12, &expected).unwrap();
         assert!(verify_cutoff("mdn", 13, &expected).is_err());
         assert!(verify_cutoff("npm", 12, &expected).is_err());
+        let mut index = spill::FrozenIndex::new().unwrap();
+        index
+            .push("mdn:projections".into(), "old".into(), "canonical".into())
+            .unwrap();
+        index
+            .push(
+                "crate:inventories".into(),
+                "original".into(),
+                "canonical".into(),
+            )
+            .unwrap();
         let registry = VisibilityRegistry {
-            aliases: BTreeMap::from([
-                ("mdn:projections".into(), Arc::new(vec!["old".into()])),
-                (
-                    "crate:inventories".into(),
-                    Arc::new(vec!["original".into()]),
-                ),
-            ]),
-            targets: BTreeMap::new(),
+            index: Some(index),
+            aliases_empty: false,
+            memberships: BTreeMap::new(),
+            progress: BTreeMap::new(),
             cutoffs: BTreeMap::from([("mdn".into(), 12), ("crate_inventory".into(), 20)]),
         };
         assert!(

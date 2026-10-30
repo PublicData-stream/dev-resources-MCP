@@ -1,5 +1,6 @@
 //! Integrity of immutable occurrence ordering and admission of new content IDs.
 use devres_domain::{Error, Result};
+use futures::TryStreamExt;
 use serde_json::{Value, json};
 use sqlx::{PgConnection, Row, postgres::PgRow};
 
@@ -154,58 +155,51 @@ pub(super) async fn backfill(
     cancel: &tokio_util::sync::CancellationToken,
     verify_only: bool,
 ) -> Result<()> {
+    use super::payload_integrity::{SealBatch, SealTarget, seal_not_cancelled};
     for &table in TABLES {
         // Include invalid sequence values rather than silently skipping corrupt rows.
-        let mut after: Option<i64> = None;
-        loop {
-            if cancel.is_cancelled() {
-                return Err(Error::new(
-                    "cancelled",
-                    "Occurrence integrity qualification canceled.",
-                ));
-            }
-            let sql = format!(
-                "SELECT sequence,kind,key,sequence_integrity FROM {table} WHERE ($1::bigint IS NULL OR sequence>$1) ORDER BY sequence LIMIT 1000"
-            );
-            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(after)
-                .fetch_all(&store.pool)
-                .await
-                .map_err(|_| failure())?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in rows {
-                let sequence: i64 = row.try_get("sequence").map_err(|_| failure())?;
-                let kind: String = row.try_get("kind").map_err(|_| failure())?;
-                let key: String = row.try_get("key").map_err(|_| failure())?;
-                let expected: Option<String> =
-                    row.try_get("sequence_integrity").map_err(|_| failure())?;
-                let seal = digest(table, &kind, &key, sequence)?;
-                after = Some(sequence);
-                match expected {
-                    Some(expected) if expected == seal => {}
-                    Some(_) => return Err(failure()),
-                    None if verify_only => return Err(failure()),
-                    None => {
-                        let sql = format!(
-                            "UPDATE {table} SET sequence_integrity=$2 WHERE sequence=$1 AND kind=$3 AND key=$4 AND sequence_integrity IS NULL"
-                        );
-                        let changed = sqlx::query(sqlx::AssertSqlSafe(sql))
-                            .bind(sequence)
-                            .bind(&seal)
-                            .bind(&kind)
-                            .bind(&key)
-                            .execute(&mut *store.owner.lock().await)
-                            .await
-                            .map_err(|_| failure())?;
-                        if changed.rows_affected() != 1 {
-                            return Err(failure());
-                        }
-                    }
+        seal_not_cancelled(cancel)?;
+        let sql = format!(
+            "SELECT ctid::text AS locator,sequence,kind,key,sequence_integrity FROM {table}"
+        );
+        let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&store.pool);
+        let mut batch = SealBatch::default();
+        let target = SealTarget {
+            table,
+            column: "sequence_integrity",
+            kind_expr: "kind",
+            key_expr: "key",
+        };
+        while let Some(row) = rows.try_next().await.map_err(|_| failure())? {
+            seal_not_cancelled(cancel)?;
+            let sequence: i64 = row.try_get("sequence").map_err(|_| failure())?;
+            let kind: String = row.try_get("kind").map_err(|_| failure())?;
+            let key: String = row.try_get("key").map_err(|_| failure())?;
+            let expected: Option<String> =
+                row.try_get("sequence_integrity").map_err(|_| failure())?;
+            let seal = digest(table, &kind, &key, sequence)?;
+            match expected {
+                Some(expected) if expected == seal => {}
+                Some(_) => return Err(failure()),
+                None if verify_only => return Err(failure()),
+                None => {
+                    batch
+                        .queue(
+                            store,
+                            cancel,
+                            &target,
+                            (
+                                row.try_get("locator").map_err(|_| failure())?,
+                                kind,
+                                key,
+                                seal,
+                            ),
+                        )
+                        .await?;
                 }
             }
         }
+        batch.flush(store, cancel, &target).await?;
     }
     Ok(())
 }

@@ -555,11 +555,11 @@ impl PgBlobStore {
     /// Publication pointers are staged; original rows and ordering remain untouched.
     pub async fn migrate_rfc_graph(
         &self,
-        mappings: &mut std::collections::BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<crate::migration_map::MigrationAliases> {
         self.fence().await?;
-        let mut aliases = Vec::new();
+        let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         let mut after = (String::new(), String::new());
         loop {
             migration_cancel(&cancel)?;
@@ -581,8 +581,8 @@ impl PgBlobStore {
                         old.clone(),
                         dataset.capture.id.clone(),
                     );
-                    crate::migration_map::reserve_alias(mappings, &alias)?;
-                    aliases.push(alias);
+
+                    aliases.push(alias)?;
                 }
                 after = (kind, old);
             }
@@ -633,15 +633,14 @@ impl PgBlobStore {
             self.save_snapshot(&snapshot).await?;
             if mappings
                 .get(&format!("rfc:snapshots:{old}"))
-                .is_some_and(|prior| prior != &id)
+                .is_some_and(|prior| prior != id)
             {
                 return Err(Error::integrity("Ambiguous RFC migration identity."));
             }
             crate::migration_map::insert(mappings, format!("rfc:snapshots:{old}"), id.clone())?;
             {
                 let alias = ("snapshots".into(), old.clone(), id);
-                crate::migration_map::reserve_alias(mappings, &alias)?;
-                aliases.push(alias);
+                aliases.push(alias)?;
             }
             after = found
                 .try_get("published_order")
@@ -694,6 +693,8 @@ impl PgBlobStore {
             .await?;
             after = key;
         }
+        mappings.ensure_healthy()?;
+        aliases.ensure_healthy()?;
         Ok(aliases)
     }
 }
@@ -706,25 +707,23 @@ fn migration_cancel(cancel: &tokio_util::sync::CancellationToken) -> Result<()> 
 }
 fn migration_reference(
     value: &str,
-    mappings: &std::collections::BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<String> {
     if value.starts_with("blake3:") && valid_hash(value) {
         return Ok(value.to_owned());
     }
     mappings
         .get(&format!("capture:{value}"))
-        .cloned()
         .ok_or_else(|| Error::integrity("Unresolved RFC migration reference."))
 }
 fn migrate_rfc_capture(
     capture: &mut Capture,
-    mappings: &std::collections::BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<()> {
     capture.id = migration_reference(&capture.id, mappings)?;
     if !capture.body_hash.starts_with("blake3:") {
         capture.body_hash = mappings
             .get(&format!("body:{}", capture.body_hash))
-            .cloned()
             .ok_or_else(|| Error::integrity("Unresolved RFC body reference."))?;
     }
     Ok(())
@@ -738,10 +737,13 @@ mod migration_tests {
         let old = "a".repeat(64);
         let capture_id = crate::integrity::hash(b"capture identity");
         let body = crate::integrity::hash(b"source body");
-        let maps = std::collections::BTreeMap::from([
+        let mut maps = crate::migration_map::MigrationMap::new();
+        for (key, value) in [
             (format!("capture:{old}"), capture_id.clone()),
             (format!("body:{old}"), body.clone()),
-        ]);
+        ] {
+            crate::migration_map::insert(&mut maps, key, value).unwrap();
+        }
         let mut capture = Capture {
             id: old.clone(),
             body_hash: old.clone(),

@@ -10,15 +10,14 @@ fn stop(cancel: &CancellationToken) -> Result<()> {
         Ok(())
     }
 }
-fn mapped(maps: &BTreeMap<String, String>, role: &str, id: &str) -> Result<String> {
+fn mapped(maps: &crate::migration_map::MigrationMap, role: &str, id: &str) -> Result<String> {
     if id.starts_with("blake3:") && valid_hash(id) {
         return Ok(id.into());
     }
     maps.get(&format!("{role}:{id}"))
-        .cloned()
         .ok_or_else(|| Error::integrity("Unresolved crate migration reference."))
 }
-fn remap_fields(value: &mut Value, maps: &BTreeMap<String, String>) -> Result<()> {
+fn remap_fields(value: &mut Value, maps: &crate::migration_map::MigrationMap) -> Result<()> {
     let Some(object) = value.as_object_mut() else {
         return Ok(());
     };
@@ -37,8 +36,8 @@ fn remap_fields(value: &mut Value, maps: &BTreeMap<String, String>) -> Result<()
     Ok(())
 }
 fn id_alias(
-    maps: &mut BTreeMap<String, String>,
-    aliases: &mut Vec<(String, String, String)>,
+    maps: &mut crate::migration_map::MigrationMap,
+    aliases: &mut crate::migration_map::MigrationAliases,
     kind: &str,
     old: &str,
     new: &str,
@@ -53,8 +52,7 @@ fn id_alias(
     crate::migration_map::insert(maps, key, new.into())?;
     {
         let alias = (kind.into(), old.into(), new.into());
-        crate::migration_map::reserve_alias(maps, &alias)?;
-        aliases.push(alias);
+        aliases.push(alias)?;
     }
     Ok(())
 }
@@ -62,11 +60,11 @@ fn id_alias(
 impl PgBlobStore {
     pub async fn migrate_crate_graph(
         self: &Arc<Self>,
-        maps: &mut BTreeMap<String, String>,
+        maps: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<crate::migration_map::MigrationAliases> {
         self.fence().await?;
-        let mut aliases = Vec::new();
+        let mut aliases = crate::migration_map::MigrationAliases::new(maps)?;
         self.migrate_crate_artifacts(maps, &cancel).await?;
         self.migrate_crate_inventories(maps, &mut aliases, &cancel)
             .await?;
@@ -151,12 +149,14 @@ impl PgBlobStore {
             payload_integrity::stage(self,"crate",&format!("job:{key}"),&json!({"source_key":key,"metadata_capture":mapped(maps,"capture",&metadata)?,"artifact":artifact.as_deref().map(|id|mapped(maps,"capture",id)).transpose()?})).await?;
             after = key;
         }
+        maps.ensure_healthy()?;
+        aliases.ensure_healthy()?;
         Ok(aliases)
     }
 
     async fn migrate_crate_artifacts(
         &self,
-        maps: &BTreeMap<String, String>,
+        maps: &crate::migration_map::MigrationMap,
         cancel: &CancellationToken,
     ) -> Result<()> {
         let mut after = String::new();
@@ -296,8 +296,8 @@ impl PgBlobStore {
 
     async fn migrate_crate_inventories(
         &self,
-        maps: &mut BTreeMap<String, String>,
-        aliases: &mut Vec<(String, String, String)>,
+        maps: &mut crate::migration_map::MigrationMap,
+        aliases: &mut crate::migration_map::MigrationAliases,
         cancel: &CancellationToken,
     ) -> Result<BTreeMap<i64, i64>> {
         let orphaned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_versions v LEFT JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id IS NULL)").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
@@ -388,8 +388,8 @@ impl PgBlobStore {
 
     async fn migrate_crate_generations(
         &self,
-        maps: &mut BTreeMap<String, String>,
-        aliases: &mut Vec<(String, String, String)>,
+        maps: &mut crate::migration_map::MigrationMap,
+        aliases: &mut crate::migration_map::MigrationAliases,
         cancel: &CancellationToken,
     ) -> Result<BTreeMap<i64, i64>> {
         let mut sequences = BTreeMap::new();
@@ -506,7 +506,7 @@ impl PgBlobStore {
 
     async fn migrate_crate_enrichment(
         &self,
-        maps: &BTreeMap<String, String>,
+        maps: &crate::migration_map::MigrationMap,
         cancel: &CancellationToken,
     ) -> Result<()> {
         let mut after = (String::new(), String::new(), String::new());

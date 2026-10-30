@@ -39,7 +39,21 @@ image. Existing configuration fields and limits retain their meaning.
    exist. Missing/corrupt evidence, unknown retained variants, conflicting mappings
    or exhausted space block progress. The migration identity working set is limited
    to 64 MiB and one million entries; exceeding it fails with a capacity error
-   while preserving history and pending activation. Recover the evidence or add
+   while preserving history and pending activation. Verified references and pending
+   alias records spill to private, disposable `/tmp` storage so these resident bounds
+   do not impose a cutoff on historical records. Preflight that scratch filesystem
+   separately; a restart reconstructs it from retained evidence. Scratch transactions
+   are not permanent checkpoints. Canonical MDN inventory replay memoizes shared
+   historical subtrees while preserving the reference rebuild's exact identities;
+   unsupported private optimization shapes use that reference rebuild.
+   Active compatibility visibility also freezes the verified alias generation in
+   private scratch storage. It materializes one requested namespace at a time,
+   sharing 64 MiB for caches and vectors and a limit of one million resident
+   entries across live views; an oversized view fails explicitly rather than
+   truncating aliases. This bounds the registry's
+   accounted storage, not total process RSS or SQL argument buffers. Restarting
+   reconstructs the frozen generation from verified durable aliases.
+   Recover the evidence or add
    reviewed format support before retrying; migration does not silently refetch
    or discard it.
 4. Activate only after migration and verification succeed:

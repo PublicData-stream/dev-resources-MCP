@@ -25,11 +25,18 @@ impl PgBlobStore {
         &self,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let mut after = String::new();
+        let mut after: Option<(String, String)> = None;
         loop {
             stop(cancel)?;
-            let rows=sqlx::query("SELECT namespace,legacy,canonical,namespace||chr(1)||legacy AS page_key FROM devres_content_aliases WHERE namespace||chr(1)||legacy>$1 ORDER BY namespace||chr(1)||legacy LIMIT 100")
-                .bind(&after).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            // Use the existing composite primary key instead of repeatedly
+            // sorting the entire alias table by a concatenated expression.
+            let rows = if let Some((namespace, legacy)) = &after {
+                sqlx::query("SELECT namespace,legacy,canonical FROM devres_content_aliases WHERE (namespace,legacy)>($1,$2) ORDER BY namespace,legacy LIMIT 100")
+                    .bind(namespace).bind(legacy).fetch_all(&self.pool).await.map_err(|_| storage_error())?
+            } else {
+                sqlx::query("SELECT namespace,legacy,canonical FROM devres_content_aliases ORDER BY namespace,legacy LIMIT 100")
+                    .fetch_all(&self.pool).await.map_err(|_| storage_error())?
+            };
             if rows.is_empty() {
                 break;
             }
@@ -121,7 +128,10 @@ impl PgBlobStore {
                 if !exists {
                     return Err(missing());
                 }
-                after = row.try_get("page_key").map_err(|_| storage_error())?;
+                after = Some((
+                    namespace,
+                    row.try_get("legacy").map_err(|_| storage_error())?,
+                ));
             }
         }
         Ok(())

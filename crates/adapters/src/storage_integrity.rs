@@ -2,11 +2,125 @@
 #[path = "storage_specialized_verify.rs"]
 mod specialized_closure;
 use devres_domain::{Error, Result};
+use futures::TryStreamExt;
 use serde_json::{Value, json};
-use sqlx::{Column, Executor, Postgres, Row, postgres::PgRow, types::Json};
+use sqlx::{Column, Connection, Executor, Postgres, Row, postgres::PgRow, types::Json};
+use tokio_util::sync::CancellationToken;
 
 fn failure() -> Error {
     Error::integrity("Retained SQL payload integrity failed.")
+}
+
+/// Fixed SQL expressions supplied only by the offline seal registries/callers.
+pub(super) struct SealTarget<'a> {
+    pub table: &'a str,
+    pub column: &'a str,
+    pub kind_expr: &'a str,
+    pub key_expr: &'a str,
+}
+
+/// Only identity/locator/seal metadata is retained. Payloads remain one-at-a-time,
+/// including the existing large RFC representation allowance.
+#[derive(Default)]
+pub(super) struct SealBatch {
+    locators: Vec<String>,
+    kinds: Vec<String>,
+    keys: Vec<String>,
+    seals: Vec<String>,
+    bytes: usize,
+}
+
+impl SealBatch {
+    const ROWS: usize = 1000;
+    const BYTES: usize = 8 * 1024 * 1024;
+
+    pub async fn queue(
+        &mut self,
+        store: &super::PgBlobStore,
+        cancel: &CancellationToken,
+        target: &SealTarget<'_>,
+        record: (String, String, String, String),
+    ) -> Result<()> {
+        let (locator, kind, key, seal) = record;
+        let bytes = [locator.len(), kind.len(), key.len(), seal.len(), 128]
+            .into_iter()
+            .try_fold(0_usize, |total, part| total.checked_add(part))
+            .filter(|&bytes| bytes <= Self::BYTES)
+            .ok_or_else(|| Error::capacity("Migration seal metadata exceeds its batch bound."))?;
+        if self.locators.len() >= Self::ROWS || self.bytes > Self::BYTES - bytes {
+            self.flush(store, cancel, target).await?;
+        }
+        self.locators.push(locator);
+        self.kinds.push(kind);
+        self.keys.push(key);
+        self.seals.push(seal);
+        self.bytes += bytes;
+        Ok(())
+    }
+
+    pub async fn flush(
+        &mut self,
+        store: &super::PgBlobStore,
+        cancel: &CancellationToken,
+        target: &SealTarget<'_>,
+    ) -> Result<()> {
+        if self.locators.is_empty() {
+            return Ok(());
+        }
+        seal_not_cancelled(cancel)?;
+        store.fence().await?;
+        let sql = format!(
+            "UPDATE {table} retained SET {column}=requested.seal_value FROM UNNEST($1::text[],$2::text[],$3::text[],$4::text[]) requested(seal_locator,seal_kind,seal_key,seal_value) WHERE retained.ctid=requested.seal_locator::tid AND ({kind})=requested.seal_kind AND ({key})=requested.seal_key AND retained.{column} IS NULL",
+            table = target.table,
+            column = target.column,
+            kind = target.kind_expr,
+            key = target.key_expr,
+        );
+        let mut owner = store.owner.lock().await;
+        let mut tx = owner.begin().await.map_err(|_| failure())?;
+        let result: Result<()> = async {
+            let changed = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&self.locators)
+                .bind(&self.kinds)
+                .bind(&self.keys)
+                .bind(&self.seals)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| failure())?;
+            if changed.rows_affected() != self.locators.len() as u64 {
+                return Err(failure());
+            }
+            seal_not_cancelled(cancel)?;
+            store.fence().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            // The owner connection is not returned to a pool. Transaction Drop
+            // only queues rollback there, leaving locks until its next command.
+            // Drain rollback before exposing a failed/cancelled batch to callers.
+            tx.rollback().await.map_err(|_| failure())?;
+            return Err(error);
+        }
+        tx.commit().await.map_err(|_| failure())?;
+        self.locators.clear();
+        self.kinds.clear();
+        self.keys.clear();
+        self.seals.clear();
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+pub(super) fn seal_not_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        Err(Error::new(
+            "cancelled",
+            "SQL integrity qualification canceled.",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Object-key ordering is stable because the workspace uses serde_json's ordered map.
@@ -224,34 +338,28 @@ pub(super) async fn backfill_specialized(
     verify_only: bool,
 ) -> Result<()> {
     for &(table, column, kind_expr, key_expr, predicate) in SPECIALIZED_PAYLOADS {
-        let mut after = String::from("(0,0)");
-        loop {
-            if cancel.is_cancelled() {
-                return Err(Error::new(
-                    "cancelled",
-                    "SQL integrity qualification canceled.",
-                ));
-            }
-            // A single admitted payload keeps memory bounded even for old 64 MiB RFC datasets.
-            // Updating ctid can cause a sealed row to be revisited once; its digest is then verified.
-            let sql = format!(
-                "SELECT ctid::text AS locator,{kind_expr} AS kind,{key_expr} AS key,{} AS data,{column}_integrity AS expected FROM {table} WHERE {predicate} AND ctid>$1::tid ORDER BY ctid LIMIT 1",
-                specialized_payload_expression(table, column)
-            );
-            let found = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(&after)
-                .fetch_optional(&store.pool)
-                .await
-                .map_err(|_| failure())?;
-            let Some(found) = found else {
-                break;
-            };
+        seal_not_cancelled(cancel)?;
+        // One statement snapshot sees each original tuple once even when the
+        // independent owner connection moves sealed tuples to new ctids.
+        let sql = format!(
+            "SELECT ctid::text AS locator,{kind_expr} AS kind,{key_expr} AS key,{} AS data,{column}_integrity AS expected FROM {table} WHERE {predicate}",
+            specialized_payload_expression(table, column)
+        );
+        let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&store.pool);
+        let mut batch = SealBatch::default();
+        let target = SealTarget {
+            table,
+            column: &format!("{column}_integrity"),
+            kind_expr,
+            key_expr,
+        };
+        while let Some(found) = rows.try_next().await.map_err(|_| failure())? {
+            seal_not_cancelled(cancel)?;
             let kind: String = found.try_get("kind").map_err(|_| failure())?;
             let key: String = found.try_get("key").map_err(|_| failure())?;
             let data: Json<Value> = found.try_get("data").map_err(|_| failure())?;
             let expected: Option<String> = found.try_get("expected").map_err(|_| failure())?;
             let digest = digest(table, &kind, &key, &data.0)?;
-            after = found.try_get("locator").map_err(|_| failure())?;
             if let Some(expected) = expected {
                 if expected != digest {
                     return Err(failure());
@@ -259,20 +367,22 @@ pub(super) async fn backfill_specialized(
             } else if verify_only {
                 return Err(failure());
             } else {
-                let sql = format!(
-                    "UPDATE {table} SET {column}_integrity=$2 WHERE ctid=$1::tid AND {column}_integrity IS NULL"
-                );
-                let changed = sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(&after)
-                    .bind(&digest)
-                    .execute(&mut *store.owner.lock().await)
-                    .await
-                    .map_err(|_| failure())?;
-                if changed.rows_affected() != 1 {
-                    return Err(failure());
-                }
+                batch
+                    .queue(
+                        store,
+                        cancel,
+                        &target,
+                        (
+                            found.try_get("locator").map_err(|_| failure())?,
+                            kind,
+                            key,
+                            digest,
+                        ),
+                    )
+                    .await?;
             }
         }
+        batch.flush(store, cancel, &target).await?;
     }
     Ok(())
 }

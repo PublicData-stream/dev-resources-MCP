@@ -2,7 +2,7 @@
 use super::*;
 use crate::bulk::BulkArtifact;
 
-type Aliases = Vec<(String, String, String)>;
+type Aliases = crate::migration_map::MigrationAliases;
 fn known_evidence_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -25,7 +25,7 @@ fn check(cancel: &CancellationToken) -> Result<()> {
     }
     Ok(())
 }
-fn mapped(mappings: &BTreeMap<String, String>, id: &str) -> Result<String> {
+fn mapped(mappings: &crate::migration_map::MigrationMap, id: &str) -> Result<String> {
     if id.starts_with("blake3:") && crate::integrity::valid_hash(id) {
         return Ok(id.to_owned());
     }
@@ -51,7 +51,7 @@ fn mapped(mappings: &BTreeMap<String, String>, id: &str) -> Result<String> {
         if let Some(value) =
             crate::integrity::migration_lookup(mappings, &format!("mdn:{kind}"), id)
         {
-            if found.as_ref().is_some_and(|prior| prior != value) {
+            if found.as_ref().is_some_and(|prior| prior != &value) {
                 return Err(Error::integrity("Ambiguous mdn migration reference role."));
             }
             found = Some(value.clone());
@@ -59,16 +59,19 @@ fn mapped(mappings: &BTreeMap<String, String>, id: &str) -> Result<String> {
     }
     found.ok_or_else(|| Error::integrity("MDN migration reference is not qualified."))
 }
-fn mapped_role(mappings: &BTreeMap<String, String>, kind: &str, id: &str) -> Result<String> {
+fn mapped_role(
+    mappings: &crate::migration_map::MigrationMap,
+    kind: &str,
+    id: &str,
+) -> Result<String> {
     if id.starts_with("blake3:") && crate::integrity::valid_hash(id) {
         return Ok(id.to_owned());
     }
     crate::integrity::migration_lookup(mappings, &format!("mdn:{kind}"), id)
-        .cloned()
         .ok_or_else(|| Error::integrity("Missing typed migration reference."))
 }
 fn record(
-    mappings: &mut BTreeMap<String, String>,
+    mappings: &mut crate::migration_map::MigrationMap,
     aliases: &mut Aliases,
     kind: &str,
     old: &str,
@@ -84,18 +87,19 @@ fn record(
     if old != new {
         {
             let alias = (kind.to_owned(), old.to_owned(), new.to_owned());
-            crate::migration_map::reserve_alias(mappings, &alias)?;
-            aliases.push(alias);
+            aliases.push(alias)?;
         }
     }
     Ok(())
 }
-fn artifact(artifact: &mut BulkArtifact, mappings: &BTreeMap<String, String>) -> Result<()> {
+fn artifact(
+    artifact: &mut BulkArtifact,
+    mappings: &crate::migration_map::MigrationMap,
+) -> Result<()> {
     artifact.body_hash = if artifact.body_hash.starts_with("blake3:") {
         artifact.body_hash.clone()
     } else {
         crate::integrity::migration_lookup(mappings, "body", &artifact.body_hash)
-            .cloned()
             .ok_or_else(|| Error::integrity("MDN raw migration body is not qualified."))?
     };
     artifact.relative_path = crate::integrity::relative_path(&artifact.body_hash)?
@@ -103,7 +107,7 @@ fn artifact(artifact: &mut BulkArtifact, mappings: &BTreeMap<String, String>) ->
         .into_owned();
     Ok(())
 }
-fn member(mut member: Member, mappings: &BTreeMap<String, String>) -> Result<Member> {
+fn member(mut member: Member, mappings: &crate::migration_map::MigrationMap) -> Result<Member> {
     if let Some(path) =
         crate::integrity::migration_lookup(mappings, "mdn:member-path", &member.path)
     {
@@ -122,7 +126,6 @@ fn member(mut member: Member, mappings: &BTreeMap<String, String>) -> Result<Mem
             body.to_owned()
         } else {
             crate::integrity::migration_lookup(mappings, "body", body)
-                .cloned()
                 .ok_or_else(|| Error::integrity("MDN raw migration body is not qualified."))?
         };
         raw["body_hash"] = json!(body);
@@ -140,12 +143,13 @@ impl MdnCorpus {
     /// distinct historical rebuild occurrences with otherwise identical content.
     pub async fn migrate_blake3_graph(
         &self,
-        mappings: &mut BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Aliases> {
         let _guard = self.processing.lock().await;
         let cutoff = self.store.mdn_cutoff().await?;
-        let mut aliases = Vec::new();
+        let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
+        let mut inventory_memo = inventory::MigrationInventory::new();
         for kind in ["projections", "projection-headers", "index-documents"] {
             let mut after = 0;
             loop {
@@ -235,8 +239,8 @@ impl MdnCorpus {
                         original_manifest.body_hash,
                         observation.manifest.body_hash.clone(),
                     );
-                    crate::migration_map::reserve_alias(mappings, &alias)?;
-                    aliases.push(alias);
+
+                    aliases.push(alias)?;
                 }
                 artifact(&mut observation.commits, mappings)?;
                 let id = observation_key(&observation);
@@ -315,11 +319,14 @@ impl MdnCorpus {
                     ));
                 }
                 let old_root = snapshot.inventory.clone();
-                snapshot.inventory =
-                    inventory::rebuild_inventory(self.store.as_ref(), &old_root, |value| {
-                        member(value, mappings)
-                    })
-                    .await?;
+                snapshot.inventory = inventory::rebuild_inventory_memoized(
+                    self.store.as_ref(),
+                    &old_root,
+                    |value| member(value, mappings),
+                    &mut inventory_memo,
+                    &cancel,
+                )
+                .await?;
                 record(
                     mappings,
                     &mut aliases,
@@ -457,15 +464,18 @@ impl MdnCorpus {
                 .mdn_set_state("storage-migration:index", &canonical)
                 .await?;
         }
+        drop(inventory_memo);
         self.migrate_auxiliary_graph(mappings, &mut aliases, cutoff, &cancel)
             .await?;
+        mappings.ensure_healthy()?;
+        aliases.ensure_healthy()?;
         Ok(aliases)
     }
 
     async fn migrate_frozen_index(
         &self,
         reference: &Value,
-        mappings: &BTreeMap<String, String>,
+        mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Value> {
         let mut offset = 0;
@@ -503,11 +513,12 @@ impl MdnCorpus {
 impl MdnCorpus {
     async fn migrate_auxiliary_graph(
         &self,
-        mappings: &mut BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         aliases: &mut Aliases,
         cutoff: i64,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        let mut inventory_memo = inventory::MigrationInventory::new();
         let kinds = self.store.mdn_migration_kinds().await?;
         const CORE: &[&str] = &[
             "projections",
@@ -621,7 +632,6 @@ impl MdnCorpus {
                                 "mdn:catalogs",
                                 &row.key,
                             )
-                            .cloned()
                             .ok_or_else(|| {
                                 Error::integrity("Missing canonical catalogue companion.")
                             })?,
@@ -631,7 +641,6 @@ impl MdnCorpus {
                                     "mdn:snapshot-keys",
                                     &row.key,
                                 )
-                                .cloned()
                                 .ok_or_else(|| {
                                     Error::integrity("Missing canonical snapshot selector.")
                                 })?
@@ -718,15 +727,20 @@ impl MdnCorpus {
                 crate::mdn::corpus::migration::collect_inventory_roots(&data, 0, &mut roots)?;
                 for root in roots {
                     if crate::integrity::migration_lookup(mappings, "mdn:nodes", &root).is_none() {
-                        let canonical =
-                            inventory::rebuild_inventory(self.store.as_ref(), &root, |member| {
+                        let canonical = inventory::rebuild_inventory_memoized(
+                            self.store.as_ref(),
+                            &root,
+                            |member| {
                                 let mut value = crate::mdn::inventory::value(&member)?;
                                 crate::mdn::corpus::migration::rewrite_operational(
                                     "mdn", &mut value, mappings, 0,
                                 )?;
                                 crate::mdn::inventory::decode(value)
-                            })
-                            .await?;
+                            },
+                            &mut inventory_memo,
+                            cancel,
+                        )
+                        .await?;
                         record(mappings, aliases, "nodes", &root, &canonical)?;
                     }
                 }
@@ -740,17 +754,13 @@ impl MdnCorpus {
                         _ => None,
                     };
                     if let Some(role) = role {
-                        let namespace = format!("mdn:{role}:");
-                        for (old, canonical) in mappings.iter() {
-                            if let Some(old) = old.strip_prefix(&namespace)
-                                && crate::integrity::legacy_hash(old.as_bytes()) == suffix
-                            {
-                                target = format!(
-                                    "{prefix}:{}",
-                                    crate::integrity::legacy_hash(canonical.as_bytes())
-                                );
-                                break;
-                            }
+                        let namespace = format!("mdn:{role}");
+                        if let Some(canonical) = mappings.lookup_legacy_key_hash(&namespace, suffix)
+                        {
+                            target = format!(
+                                "{prefix}:{}",
+                                crate::integrity::legacy_hash(canonical.as_bytes())
+                            );
                         }
                     }
                     if data.is_string() {
@@ -784,7 +794,7 @@ impl MdnCorpus {
 pub(crate) fn rewrite_operational(
     provider: &str,
     value: &mut Value,
-    mappings: &BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
     depth: usize,
 ) -> Result<()> {
     if depth > 64 {
@@ -820,7 +830,7 @@ pub(crate) fn rewrite_operational(
                     &old,
                 )
                 .ok_or_else(|| Error::integrity("Unqualified retained index checkpoint."))?;
-                let canonical: Value = serde_json::from_str(canonical)
+                let canonical: Value = serde_json::from_str(&canonical)
                     .map_err(|_| Error::integrity("Invalid canonical index reference."))?;
                 *object = canonical
                     .as_object()
@@ -857,7 +867,6 @@ pub(crate) fn rewrite_operational(
                             &format!("{provider}:publications"),
                             old,
                         )
-                        .cloned()
                         .ok_or_else(|| Error::integrity("Unresolved raw publication."))?
                     };
                     let data = crate::integrity::migration_lookup(
@@ -868,7 +877,7 @@ pub(crate) fn rewrite_operational(
                     .ok_or_else(|| {
                         Error::integrity("Unresolved canonical publication range proofs.")
                     })?;
-                    serde_json::from_str::<Value>(data).map_err(|_| {
+                    serde_json::from_str::<Value>(&data).map_err(|_| {
                         Error::integrity("Invalid canonical publication range proofs.")
                     })
                 })
@@ -882,7 +891,7 @@ pub(crate) fn rewrite_operational(
                         old,
                     )
                 {
-                    *data = serde_json::from_str(descriptor)
+                    *data = serde_json::from_str(&descriptor)
                         .map_err(|_| Error::integrity("Invalid migrated manifest descriptor."))?;
                     continue;
                 }
@@ -924,7 +933,7 @@ pub(crate) fn rewrite_operational(
                             &format!("{provider}:{kind}"),
                             old,
                         ) {
-                            if found.as_ref().is_some_and(|value| value != id) {
+                            if found.as_ref().is_some_and(|value| value != &id) {
                                 return Err(Error::integrity(
                                     "Ambiguous operational identifier role.",
                                 ));
@@ -1042,7 +1051,7 @@ pub(crate) fn rewrite_operational(
 fn reference_aux(
     provider: &str,
     value: &mut Value,
-    mappings: &BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
     kind: &str,
 ) -> Result<()> {
     let old = value
@@ -1062,7 +1071,7 @@ fn rewrite_role(
     provider: &str,
     role: &str,
     value: &mut Value,
-    mappings: &BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<()> {
     let old = value
         .as_str()

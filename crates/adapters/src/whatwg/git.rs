@@ -1535,7 +1535,7 @@ impl WhatwgGit {
     pub async fn migrate_blake3_manifest(
         &self,
         original: &BulkArtifact,
-        mappings: &mut std::collections::BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<BulkArtifact> {
         let mut manifest = self.read_manifest(original, cancel.clone()).await?;
@@ -1545,7 +1545,6 @@ impl WhatwgGit {
             }
             artifact.body_hash =
                 crate::integrity::migration_lookup(mappings, "body", &artifact.body_hash)
-                    .cloned()
                     .ok_or_else(|| {
                         Error::integrity("Retained Git manifest body is not qualified.")
                     })?;
@@ -1570,7 +1569,7 @@ impl WhatwgGit {
         self.verify_retained_manifest(&canonical, cancel).await?;
         let role = "whatwg:manifest";
         if crate::integrity::migration_lookup(mappings, role, &original.body_hash)
-            .is_some_and(|existing| existing != &canonical.body_hash)
+            .is_some_and(|existing| existing != canonical.body_hash)
         {
             return Err(Error::integrity(
                 "Conflicting canonical Git manifest mapping.",

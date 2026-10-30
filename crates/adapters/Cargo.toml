@@ -20,6 +20,8 @@ blake3 = { version = "=1.8.7", default-features = false, features = ["std", "pur
 sha1 = "0.11"
 hex = "0.4"
 fs2 = "0.4"
+redb = { version = "=4.4.0", default-features = false, features = ["std"] }
+tempfile = "3"
 httpdate = "1"
 tokio = { version = "1", features = ["process", "fs", "time", "sync", "io-util", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
@@ -38,7 +40,7 @@ toml = "0.9"
 url = "2"
 axum = "0.8"
 bytes = "1"
-nix = { version = "0.30", default-features = false, features = ["signal", "process", "resource"] }
+nix = { version = "0.30", default-features = false, features = ["signal", "process", "resource", "fs"] }
 lopdf = { version = "=0.46.0", default-features = false }
 zip = { version = "=9.0.0", default-features = false, features = ["deflate", "bzip2"] }
 csv-core = "0.1"
@@ -46,7 +48,6 @@ pulldown-cmark = { version = "0.13", default-features = false }
 yaml-rust2 = { version = "0.13", default-features = false }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "net"] }
 
 [[test]]
@@ -80,6 +81,18 @@ path = "tests/npm/processing.rs"
 [[test]]
 name = "persistence"
 path = "tests/shared/persistence.rs"
+
+[[test]]
+name = "migration_batching"
+path = "tests/shared/migration_batching.rs"
+
+[[test]]
+name = "seal_owner_loss"
+path = "tests/shared/seal_owner_loss.rs"
+
+[[test]]
+name = "file_migration_batching"
+path = "tests/shared/file_migration_batching.rs"
 
 [[test]]
 name = "research_resources"

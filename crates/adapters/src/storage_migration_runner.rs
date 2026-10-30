@@ -19,11 +19,13 @@ pub async fn migrate_storage_graphs(
     cancel: CancellationToken,
 ) -> devres_domain::Result<serde_json::Value> {
     store.migrate_storage(cancel.clone()).await?;
-    let mut mappings = store.migration_mappings().await?;
+    let mut mappings = store.migration_mappings_with_cancel(&cancel).await?;
     macro_rules! migrate {
         ($provider:literal,$operation:expr) => {
             if !store.migration_graph_done($provider).await? {
                 let aliases = $operation.await?;
+                mappings.ensure_healthy()?;
+                aliases.ensure_healthy()?;
                 store.record_migration_aliases($provider, &aliases).await?;
                 drop(aliases);
                 crate::migration_map::reset_aliases(&mut mappings)?;

@@ -2232,19 +2232,50 @@ async fn blake3_migration_preserves_distinct_frozen_snapshot_occurrences() {
             .expect("legacy snapshot");
         old.push((id, data, sequence));
     }
-    let mut mappings = BTreeMap::new();
+    let original_index = format!(
+        "snapshot-index:{}",
+        crate::integrity::legacy_hash(old[0].0.as_bytes())
+    );
+    let original_index_data = json!({"snapshots":[old[0].0],"offset":17});
+    store
+        .mdn_set_state(&original_index, &original_index_data)
+        .await
+        .expect("legacy snapshot index");
+    let mut mappings = crate::migration_map::MigrationMap::new();
     let aliases = corpus
         .migrate_blake3_graph(&mut mappings, CancellationToken::new())
         .await
         .expect("migration");
+    let canonical_snapshot = mappings
+        .get(&format!("mdn:snapshots:{}", old[0].0))
+        .expect("canonical snapshot mapping");
+    let canonical_index = format!(
+        "storage-migration:snapshot-index:{}",
+        crate::integrity::legacy_hash(canonical_snapshot.as_bytes())
+    );
+    assert_eq!(
+        store.mdn_state(&canonical_index).await.unwrap().unwrap(),
+        json!({"snapshots":[canonical_snapshot],"offset":17}),
+        "operational key hashes the canonical full ID while its payload retains the same position"
+    );
+    assert_eq!(
+        store.mdn_state(&original_index).await.unwrap().unwrap(),
+        original_index_data,
+        "the original operational snapshot index remains retained"
+    );
     assert_ne!(
-        mappings[&format!("mdn:snapshots:{}", old[0].0)],
-        mappings[&format!("mdn:snapshots:{}", old[1].0)],
+        mappings
+            .get(&format!("mdn:snapshots:{}", old[0].0))
+            .unwrap(),
+        mappings
+            .get(&format!("mdn:snapshots:{}", old[1].0))
+            .unwrap(),
         "historical occurrences cannot collapse"
     );
     assert_eq!(
         aliases
-            .iter()
+            .try_chunks(100)
+            .flat_map(|chunk| chunk.expect("read verified alias batch"))
             .filter(|(kind, _, _)| kind == "snapshots")
             .count(),
         2
@@ -2258,7 +2289,10 @@ async fn blake3_migration_preserves_distinct_frozen_snapshot_occurrences() {
         assert_eq!(retained.sequence, *sequence);
         assert_eq!(retained.data, *data);
         let canonical = store
-            .mdn_get("snapshots", &mappings[&format!("mdn:snapshots:{id}")])
+            .mdn_get(
+                "snapshots",
+                &mappings.get(&format!("mdn:snapshots:{id}")).unwrap(),
+            )
             .await
             .expect("read")
             .expect("canonical");

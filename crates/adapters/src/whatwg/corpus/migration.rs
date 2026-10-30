@@ -1,7 +1,7 @@
 //! Offline canonical graph reconstruction. Every source/processor generation stays frozen.
 use super::*;
 use crate::bulk::BulkArtifact;
-type Aliases = Vec<(String, String, String)>;
+type Aliases = crate::migration_map::MigrationAliases;
 fn known_evidence_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -36,7 +36,7 @@ fn check(cancel: &CancellationToken) -> Result<()> {
     }
     Ok(())
 }
-fn mapped(mappings: &BTreeMap<String, String>, id: &str) -> Result<String> {
+fn mapped(mappings: &crate::migration_map::MigrationMap, id: &str) -> Result<String> {
     if id.starts_with("blake3:") && crate::integrity::valid_hash(id) {
         return Ok(id.to_owned());
     }
@@ -62,7 +62,7 @@ fn mapped(mappings: &BTreeMap<String, String>, id: &str) -> Result<String> {
         if let Some(value) =
             crate::integrity::migration_lookup(mappings, &format!("whatwg:{kind}"), id)
         {
-            if found.as_ref().is_some_and(|prior| prior != value) {
+            if found.as_ref().is_some_and(|prior| prior != &value) {
                 return Err(Error::integrity(
                     "Ambiguous whatwg migration reference role.",
                 ));
@@ -72,16 +72,19 @@ fn mapped(mappings: &BTreeMap<String, String>, id: &str) -> Result<String> {
     }
     found.ok_or_else(|| Error::integrity("whatwg migration reference is not qualified."))
 }
-fn mapped_role(mappings: &BTreeMap<String, String>, kind: &str, id: &str) -> Result<String> {
+fn mapped_role(
+    mappings: &crate::migration_map::MigrationMap,
+    kind: &str,
+    id: &str,
+) -> Result<String> {
     if id.starts_with("blake3:") && crate::integrity::valid_hash(id) {
         return Ok(id.to_owned());
     }
     crate::integrity::migration_lookup(mappings, &format!("whatwg:{kind}"), id)
-        .cloned()
         .ok_or_else(|| Error::integrity("Missing typed migration reference."))
 }
 fn record(
-    mappings: &mut BTreeMap<String, String>,
+    mappings: &mut crate::migration_map::MigrationMap,
     aliases: &mut Aliases,
     kind: &str,
     old: &str,
@@ -99,19 +102,17 @@ fn record(
     if old != new {
         {
             let alias = (kind.to_owned(), old.to_owned(), new.to_owned());
-            crate::migration_map::reserve_alias(mappings, &alias)?;
-            aliases.push(alias);
+            aliases.push(alias)?;
         }
     }
     Ok(())
 }
-fn artifact(value: &mut Value, mappings: &BTreeMap<String, String>) -> Result<()> {
+fn artifact(value: &mut Value, mappings: &crate::migration_map::MigrationMap) -> Result<()> {
     let mut item: BulkArtifact = decode(value.clone())?;
     item.body_hash = if item.body_hash.starts_with("blake3:") {
         item.body_hash.clone()
     } else {
         crate::integrity::migration_lookup(mappings, "body", &item.body_hash)
-            .cloned()
             .ok_or_else(|| Error::integrity("Raw migration body is not qualified."))?
     };
     item.relative_path = crate::integrity::relative_path(&item.body_hash)?
@@ -120,14 +121,14 @@ fn artifact(value: &mut Value, mappings: &BTreeMap<String, String>) -> Result<()
     *value = encode(&item)?;
     Ok(())
 }
-fn reference(value: &mut Value, mappings: &BTreeMap<String, String>) -> Result<()> {
+fn reference(value: &mut Value, mappings: &crate::migration_map::MigrationMap) -> Result<()> {
     let id = value
         .as_str()
         .ok_or_else(|| Error::integrity("Invalid whatwg typed reference."))?;
     *value = json!(mapped(mappings, id)?);
     Ok(())
 }
-fn array(value: &mut Value, mappings: &BTreeMap<String, String>) -> Result<()> {
+fn array(value: &mut Value, mappings: &crate::migration_map::MigrationMap) -> Result<()> {
     let values = value
         .as_array_mut()
         .ok_or_else(|| Error::integrity("Invalid whatwg reference sequence."))?;
@@ -147,12 +148,12 @@ impl WhatwgCorpus {
     /// Only staged head records are written; the owner activates them atomically.
     pub async fn migrate_blake3_graph(
         &self,
-        mappings: &mut BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Aliases> {
         let _guard = self.processing.lock().await;
         let cutoff = self.store.whatwg_cutoff().await?;
-        let mut aliases = Vec::new();
+        let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         for kind in [
             "projection-chunks",
             "projection-references",
@@ -333,8 +334,8 @@ impl WhatwgCorpus {
                                 original.body_hash,
                                 canonical.body_hash.clone(),
                             );
-                            crate::migration_map::reserve_alias(mappings, &alias)?;
-                            aliases.push(alias);
+
+                            aliases.push(alias)?;
                         }
                         data["manifest"] = encode(&canonical)?;
                     }
@@ -561,12 +562,14 @@ impl WhatwgCorpus {
         }
         self.migrate_auxiliary_graph(mappings, &mut aliases, cutoff, &cancel)
             .await?;
+        mappings.ensure_healthy()?;
+        aliases.ensure_healthy()?;
         Ok(aliases)
     }
     async fn migrate_frozen_index(
         &self,
         reference: &Value,
-        mappings: &BTreeMap<String, String>,
+        mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Value> {
         let mut offset = 0;
@@ -604,7 +607,7 @@ impl WhatwgCorpus {
 impl WhatwgCorpus {
     async fn migrate_auxiliary_graph(
         &self,
-        mappings: &mut BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         aliases: &mut Aliases,
         cutoff: i64,
         cancel: &CancellationToken,
@@ -741,7 +744,6 @@ impl WhatwgCorpus {
                                 "whatwg:catalogs",
                                 &row.key,
                             )
-                            .cloned()
                             .ok_or_else(|| {
                                 Error::integrity("Missing canonical catalogue companion.")
                             })?,
@@ -751,7 +753,6 @@ impl WhatwgCorpus {
                                     "whatwg:snapshot-keys",
                                     &row.key,
                                 )
-                                .cloned()
                                 .ok_or_else(|| {
                                     Error::integrity("Missing canonical snapshot selector.")
                                 })?
@@ -863,17 +864,13 @@ impl WhatwgCorpus {
                         _ => None,
                     };
                     if let Some(role) = role {
-                        let namespace = format!("whatwg:{role}:");
-                        for (old, canonical) in mappings.iter() {
-                            if let Some(old) = old.strip_prefix(&namespace)
-                                && crate::integrity::legacy_hash(old.as_bytes()) == suffix
-                            {
-                                target = format!(
-                                    "{prefix}:{}",
-                                    crate::integrity::legacy_hash(canonical.as_bytes())
-                                );
-                                break;
-                            }
+                        let namespace = format!("whatwg:{role}");
+                        if let Some(canonical) = mappings.lookup_legacy_key_hash(&namespace, suffix)
+                        {
+                            target = format!(
+                                "{prefix}:{}",
+                                crate::integrity::legacy_hash(canonical.as_bytes())
+                            );
                         }
                     }
                     if data.is_string() {
@@ -905,7 +902,7 @@ impl WhatwgCorpus {
 fn reference_aux(
     provider: &str,
     value: &mut Value,
-    mappings: &BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
     kind: &str,
 ) -> Result<()> {
     let old = value

@@ -641,7 +641,7 @@ impl PgBlobStore {
     async fn rewrite_advisory_manifest(
         &self,
         descriptor: &Value,
-        mappings: &std::collections::BTreeMap<String, String>,
+        mappings: &crate::migration_map::MigrationMap,
         config: &devres_application::advisory::RustSecConfig,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value> {
@@ -762,12 +762,12 @@ impl PgBlobStore {
 
     pub async fn migrate_advisory_graph(
         &self,
-        mappings: &mut std::collections::BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         config: &devres_application::advisory::RustSecConfig,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<crate::migration_map::MigrationAliases> {
         self.fence().await?;
-        let mut aliases = Vec::new();
+        let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         // Original ref observations are identified by their retained manifest body.
         let mut after = 0_i64;
         loop {
@@ -799,13 +799,11 @@ impl PgBlobStore {
             crate::migration_map::insert(mappings, format!("advisory:refs:{old}"), new.clone())?;
             {
                 let alias = ("manifest".into(), old.clone(), new.clone());
-                crate::migration_map::reserve_alias(mappings, &alias)?;
-                aliases.push(alias);
+                aliases.push(alias)?;
             }
             {
                 let alias = ("refs".into(), old, new);
-                crate::migration_map::reserve_alias(mappings, &alias)?;
-                aliases.push(alias);
+                aliases.push(alias)?;
             }
         }
         let mut after = 0_i64;
@@ -840,7 +838,7 @@ impl PgBlobStore {
                 let map_key = format!("advisory:records:{old_record}");
                 if mappings
                     .get(&map_key)
-                    .is_some_and(|value| value != &new_record)
+                    .is_some_and(|value| value != new_record)
                 {
                     return Err(Error::integrity(
                         "Conflicting advisory record migration identity.",
@@ -849,8 +847,7 @@ impl PgBlobStore {
                 if !mappings.contains_key(&map_key) {
                     crate::migration_map::insert(mappings, map_key, new_record.clone())?;
                     let alias = ("records".into(), old_record, new_record);
-                    crate::migration_map::reserve_alias(mappings, &alias)?;
-                    aliases.push(alias);
+                    aliases.push(alias)?;
                 }
             }
             for capture in &mut snapshot.captures {
@@ -881,8 +878,7 @@ impl PgBlobStore {
             )?;
             {
                 let alias = ("snapshots".into(), old, new);
-                crate::migration_map::reserve_alias(mappings, &alias)?;
-                aliases.push(alias);
+                aliases.push(alias)?;
             }
         }
         // Natural Git keys keep their source meaning; canonical rows use separate keys.
@@ -934,8 +930,7 @@ impl PgBlobStore {
             crate::migration_map::insert(mappings, format!("advisory:{kind}:{old}"), new.clone())?;
             {
                 let alias = (kind, old, new);
-                crate::migration_map::reserve_alias(mappings, &alias)?;
-                aliases.push(alias);
+                aliases.push(alias)?;
             }
         }
         let defaults: Vec<(String, String)> =
@@ -977,6 +972,8 @@ impl PgBlobStore {
             .await?;
             after = key;
         }
+        mappings.ensure_healthy()?;
+        aliases.ensure_healthy()?;
         Ok(aliases)
     }
 }
@@ -992,19 +989,18 @@ fn advisory_migration_cancel(cancel: &tokio_util::sync::CancellationToken) -> Re
 fn advisory_migration_ref(
     role: &str,
     value: &str,
-    mappings: &std::collections::BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<String> {
     if value.starts_with("blake3:") && valid_hash(value) {
         return Ok(value.to_owned());
     }
     mappings
         .get(&format!("{role}:{value}"))
-        .cloned()
         .ok_or_else(|| Error::integrity("Unresolved advisory migration reference."))
 }
 fn migrate_advisory_artifact(
     value: &mut Value,
-    mappings: &std::collections::BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<()> {
     if value.is_null() {
         return Ok(());
@@ -1021,7 +1017,7 @@ fn migrate_advisory_artifact(
 /// Git revision/object identities and arbitrary upstream JSON remain unchanged.
 fn migrate_advisory_owned_refs(
     value: &mut Value,
-    mappings: &std::collections::BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<()> {
     let Some(object) = value.as_object_mut() else {
         return Ok(());
@@ -1097,10 +1093,13 @@ mod migration_tests {
         let old = "a".repeat(64);
         let snapshot = hash(b"snapshot");
         let body = hash(b"body");
-        let maps = std::collections::BTreeMap::from([
+        let mut maps = crate::migration_map::MigrationMap::new();
+        for (key, value) in [
             (format!("advisory:snapshots:{old}"), snapshot.clone()),
             (format!("advisory:manifest:{old}"), body.clone()),
-        ]);
+        ] {
+            crate::migration_map::insert(&mut maps, key, value).unwrap();
+        }
         let mut value = json!({"snapshot":old,"first_observation":old,"revision":old,"metadata":{"snapshot":old,"original":{"body_hash":old}},"refs":[{"snapshots":{"rustsec":old},"oid":old}]});
         migrate_advisory_owned_refs(&mut value, &maps).unwrap();
         assert_eq!(value["snapshot"], snapshot);

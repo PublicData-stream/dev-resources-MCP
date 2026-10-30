@@ -1,6 +1,7 @@
 //! Integrity for durable validation events, public heads and compatibility mappings.
 use super::{PgBlobStore, storage_error};
 use devres_domain::{Error, Result};
+use futures::TryStreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
 use tokio_util::sync::CancellationToken;
@@ -49,114 +50,95 @@ impl PgBlobStore {
         cancel: &CancellationToken,
         verify_only: bool,
     ) -> Result<()> {
+        use super::payload_integrity::{SealBatch, SealTarget, seal_not_cancelled};
         self.fence().await?;
-        for table in ["devres_observations", "devres_rfc_import_observations"] {
-            let mut after = 0_i64;
-            loop {
-                if cancel.is_cancelled() {
-                    return Err(Error::new(
-                        "cancelled",
-                        "Validation metadata qualification canceled.",
-                    ));
-                }
-                let sql = format!("SELECT * FROM {table} WHERE id>$1 ORDER BY id LIMIT 100");
-                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(after)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|_| storage_error())?;
-                if rows.is_empty() {
-                    break;
-                }
-                for row in rows {
-                    let id: i64 = row.try_get("id").map_err(|_| invalid())?;
-                    let payload = if table == "devres_observations" {
-                        http_payload(&row)?
-                    } else {
-                        import_payload(&row)?
-                    };
-                    let expected: Option<String> =
-                        row.try_get("event_integrity").map_err(|_| invalid())?;
-                    if let Some(expected) = expected {
-                        verify(table, &id.to_string(), &payload, &expected)?;
-                    } else if verify_only {
-                        return Err(invalid());
-                    } else {
-                        let sql = format!(
-                            "UPDATE {table} SET event_integrity=$2 WHERE id=$1 AND event_integrity IS NULL"
-                        );
-                        sqlx::query(sqlx::AssertSqlSafe(sql))
-                            .bind(id)
-                            .bind(event_digest(table, &id.to_string(), &payload)?)
-                            .execute(&mut *self.owner.lock().await)
-                            .await
-                            .map_err(|_| storage_error())?;
-                    }
-                    after = id;
-                }
-            }
-        }
-        let mut after = String::new();
-        loop {
-            if cancel.is_cancelled() {
-                return Err(Error::new(
-                    "cancelled",
-                    "Head integrity qualification canceled.",
-                ));
-            }
-            let rows = sqlx::query(
-                "SELECT * FROM devres_heads WHERE source_key>$1 ORDER BY source_key LIMIT 100",
-            )
-            .bind(&after)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|_| storage_error())?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in rows {
-                let key: String = row.try_get("source_key").map_err(|_| invalid())?;
-                let payload = head_payload(&row)?;
-                let expected: Option<String> =
-                    row.try_get("head_integrity").map_err(|_| invalid())?;
+        for (table, column, kind_expr, key_expr) in [
+            (
+                "devres_observations",
+                "event_integrity",
+                "''::text",
+                "id::text",
+            ),
+            (
+                "devres_rfc_import_observations",
+                "event_integrity",
+                "''::text",
+                "id::text",
+            ),
+            ("devres_heads", "head_integrity", "''::text", "source_key"),
+            (
+                "devres_content_aliases",
+                "mapping_integrity",
+                "namespace",
+                "legacy",
+            ),
+        ] {
+            seal_not_cancelled(cancel)?;
+            let sql = format!("SELECT ctid::text AS seal_locator,* FROM {table}");
+            let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&self.pool);
+            let mut batch = SealBatch::default();
+            let target = SealTarget {
+                table,
+                column,
+                kind_expr,
+                key_expr,
+            };
+            while let Some(row) = rows.try_next().await.map_err(|_| storage_error())? {
+                seal_not_cancelled(cancel)?;
+                let (kind, key, payload) = match table {
+                    "devres_observations" => (
+                        String::new(),
+                        row.try_get::<i64, _>("id")
+                            .map_err(|_| invalid())?
+                            .to_string(),
+                        http_payload(&row)?,
+                    ),
+                    "devres_rfc_import_observations" => (
+                        String::new(),
+                        row.try_get::<i64, _>("id")
+                            .map_err(|_| invalid())?
+                            .to_string(),
+                        import_payload(&row)?,
+                    ),
+                    "devres_heads" => (
+                        String::new(),
+                        row.try_get("source_key").map_err(|_| invalid())?,
+                        head_payload(&row)?,
+                    ),
+                    "devres_content_aliases" => (
+                        row.try_get("namespace").map_err(|_| invalid())?,
+                        row.try_get("legacy").map_err(|_| invalid())?,
+                        alias_payload(&row)?,
+                    ),
+                    _ => return Err(invalid()),
+                };
+                let digest_key = if table == "devres_content_aliases" {
+                    mapping_key(&kind, &key)?
+                } else {
+                    key.clone()
+                };
+                let expected: Option<String> = row.try_get(column).map_err(|_| invalid())?;
                 if let Some(expected) = expected {
-                    verify("devres_heads", &key, &payload, &expected)?;
+                    verify(table, &digest_key, &payload, &expected)?;
                 } else if verify_only {
                     return Err(invalid());
                 } else {
-                    sqlx::query("UPDATE devres_heads SET head_integrity=$2 WHERE source_key=$1 AND head_integrity IS NULL").bind(&key).bind(event_digest("devres_heads",&key,&payload)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+                    batch
+                        .queue(
+                            self,
+                            cancel,
+                            &target,
+                            (
+                                row.try_get("seal_locator").map_err(|_| invalid())?,
+                                kind,
+                                key,
+                                event_digest(table, &digest_key, &payload)?,
+                            ),
+                        )
+                        .await?;
                 }
-                after = key;
             }
-        }
-        let mut after = (String::new(), String::new());
-        loop {
-            if cancel.is_cancelled() {
-                return Err(Error::new(
-                    "cancelled",
-                    "Mapping integrity qualification canceled.",
-                ));
-            }
-            let rows=sqlx::query("SELECT * FROM devres_content_aliases WHERE (namespace,legacy)>($1,$2) ORDER BY namespace,legacy LIMIT 100").bind(&after.0).bind(&after.1).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in rows {
-                let namespace: String = row.try_get("namespace").map_err(|_| invalid())?;
-                let legacy: String = row.try_get("legacy").map_err(|_| invalid())?;
-                let key = mapping_key(&namespace, &legacy)?;
-                let payload = alias_payload(&row)?;
-                let expected: Option<String> =
-                    row.try_get("mapping_integrity").map_err(|_| invalid())?;
-                if let Some(expected) = expected {
-                    verify("devres_content_aliases", &key, &payload, &expected)?;
-                } else if verify_only {
-                    return Err(invalid());
-                } else {
-                    sqlx::query("UPDATE devres_content_aliases SET mapping_integrity=$3 WHERE namespace=$1 AND legacy=$2 AND mapping_integrity IS NULL").bind(&namespace).bind(&legacy).bind(event_digest("devres_content_aliases",&key,&payload)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
-                }
-                after = (namespace, legacy);
-            }
+            batch.flush(self, cancel, &target).await?;
         }
         Ok(())
     }

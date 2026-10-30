@@ -7,22 +7,21 @@ use crate::{
 use devres_application::npm::NpmStore;
 use devres_domain::{Error, Result};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-fn mapped(mappings: &BTreeMap<String, String>, role: &str, old: &str) -> Result<String> {
+fn mapped(mappings: &crate::migration_map::MigrationMap, role: &str, old: &str) -> Result<String> {
     if old.starts_with("blake3:") && integrity::valid_hash(old) {
         return Ok(old.to_owned());
     }
     integrity::migration_lookup(mappings, role, old)
-        .cloned()
         .ok_or_else(|| Error::integrity("npm migration reference is missing qualified evidence."))
 }
 fn field(
     data: &mut Value,
     key: &str,
     role: &str,
-    mappings: &BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<()> {
     let Some(value) = data.get_mut(key) else {
         return Ok(());
@@ -36,7 +35,7 @@ fn field(
     *value = json!(mapped(mappings, role, old)?);
     Ok(())
 }
-fn artifact(data: &mut Value, mappings: &BTreeMap<String, String>) -> Result<()> {
+fn artifact(data: &mut Value, mappings: &crate::migration_map::MigrationMap) -> Result<()> {
     let old = data["body_hash"]
         .as_str()
         .ok_or_else(|| Error::integrity("Invalid retained npm artifact."))?
@@ -60,7 +59,7 @@ fn artifact(data: &mut Value, mappings: &BTreeMap<String, String>) -> Result<()>
 pub(super) fn rewrite_references(
     kind: &str,
     value: &mut Value,
-    mappings: &BTreeMap<String, String>,
+    mappings: &crate::migration_map::MigrationMap,
 ) -> Result<()> {
     if matches!(kind, "advisories" | "failures") || !value.is_object() {
         return Ok(());
@@ -129,9 +128,9 @@ pub(super) fn rewrite_references(
 impl PgBlobStore {
     pub async fn migrate_npm_graph(
         self: &Arc<Self>,
-        mappings: &mut BTreeMap<String, String>,
+        mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<crate::migration_map::MigrationAliases> {
         let cutoff = self.npm_cutoff().await?;
         let kinds = self.npm_migration_kinds().await?;
         for kind in &kinds {
@@ -235,7 +234,7 @@ impl PgBlobStore {
             }
         }
         let index = NpmIndex::new(&self.root)?;
-        let mut aliases = Vec::new();
+        let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         for kind in &kinds {
             let mut after = 0;
             loop {
@@ -248,8 +247,7 @@ impl PgBlobStore {
                 }
                 for row in rows {
                     after = row.sequence;
-                    let Some(new) =
-                        integrity::migration_lookup(mappings, "npm:id", &row.key).cloned()
+                    let Some(new) = integrity::migration_lookup(mappings, "npm:id", &row.key)
                     else {
                         continue;
                     };
@@ -263,11 +261,7 @@ impl PgBlobStore {
                     }
                     self.npm_put(kind, &new, &data).await?;
                     let alias = (kind.clone(), row.key, new);
-                    crate::migration_map::reserve_alias(mappings, &alias)?;
-                    aliases.push(alias);
-                    if aliases.len() > 1_000_000 {
-                        return Err(Error::capacity("npm migration mapping bound exceeded."));
-                    }
+                    aliases.push(alias)?;
                 }
             }
         }
@@ -313,6 +307,8 @@ impl PgBlobStore {
                     .await?;
             }
         }
+        mappings.ensure_healthy()?;
+        aliases.ensure_healthy()?;
         Ok(aliases)
     }
 
@@ -320,7 +316,7 @@ impl PgBlobStore {
         &self,
         index: &NpmIndex,
         reference: &Value,
-        mappings: &BTreeMap<String, String>,
+        mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Value> {
         let mut after = 0;

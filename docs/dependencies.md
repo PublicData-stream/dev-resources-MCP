@@ -18,7 +18,7 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | tantivy 0.27 | Embedded positional search over whole RFCs and immutable crate/version/document shards, avoiding PostgreSQL position limits and a separate daemon. Defaults disabled; enable mmap, stemmer, stopwords and LZ4 only. Trusted index paths/schemas, restricted query syntax and verified immutable manifests contain the boundary. Its indexing, compression, tokenizer and proc-macro graph receives current advisory/license/source checks. |
 | base64, tokio-util | Bounded PDF encoding and managed collector/import cancellation. Existing graph packages become direct dependencies; neither enables caller-selected executables. |
 | zip 9.0.0, csv-core | ZIP is needed for the official docs.rs all-target HTML bundle; disabling BZIP2/Deflate would exclude supported provider artifacts. Defaults are disabled; enable only deflate and bzip2, with no encryption/extraction. A hand-written ZIP/decompression stack would duplicate security-sensitive parsing. csv-core supplies allocation-free incremental CSV decoding rather than whole-dump deserialization; an additional strict quoting/size layer rejects malformed input before projection. |
-| nix | Signal/process features terminate and reap the owned fixed Git process group on cancellation. Killing only the immediate child can leave Git helpers running; no caller-selected executable or package process is admitted. |
+| nix | Signal/process features terminate and reap the owned fixed Git process group on cancellation. Killing only the immediate child can leave Git helpers running; no caller-selected executable or package process is admitted. The existing locked package's `fs` feature exposes safe Linux `syncfs` for bounded offline migration batches; no new package or build script is added. |
 | rustsec, semver | Maintained canonical advisory parsing and version matching rather than reimplementing affected ranges. Disable rustsec defaults, including Git, index lookup, and automatic fix support. |
 | tracing/subscriber | Aggregate operational logging without request bodies or audit inputs. |
 
@@ -29,7 +29,7 @@ OSV types are not an import matcher. This module adds no dependency packages or
 build scripts. Upstream representation notices remain separate from AGPL code.
 The adapter's opt-in acceptance probe enables Tokio signal handling to cancel
 owned Git work cleanly; the server already enables that feature in this workspace.
-| rcgen, tempfile | Test-only disposable certificates and storage; not operator certificate provisioning. |
+| rcgen | Test-only disposable certificates; not operator certificate provisioning. |
 
 The resolved graph includes proc-macro build code and native cryptography build
 scripts (notably ring and aws-lc-sys through selected TLS dependencies). They run at
@@ -54,6 +54,44 @@ included as well. Operating-system packages retain their image-provided copyrigh
 information.
 
 ## BLAKE3 storage integrity
+
+Offline migration and frozen serving visibility use pinned `redb 4.4.0` with
+defaults disabled and only `std` enabled for disposable identity/alias spill
+storage. Keeping all historical
+references in memory would exhaust the bounded working set on multi-million-node
+corpora. A custom on-disk index would duplicate storage-engine correctness work;
+per-reference PostgreSQL round trips would retain the measured migration bottleneck.
+The maintained upstream package is MIT OR Apache-2.0, requires Rust 1.90, and adds
+only the already resolved `libc` on Linux. Its build script declares configuration
+flags; it neither downloads nor compiles external code. Version 4.4.0 includes
+the upstream page-cache memory-growth fix. See the
+[exact upstream source](https://github.com/cberner/redb/tree/v4.4.0).
+
+The explicit file backend has one shared 8 MiB cache and no mmap. Scratch records
+are BLAKE3-bound to their exact keys and live only in private `/tmp` storage;
+every restart reconstructs them from verified retained evidence. Nonpersistent
+transactions apply only to this disposable scratch. Permanent aliases, file
+checkpoints and evidence keep their existing durability rules. Cache and iterator
+bounds do not establish total process RSS. Existing `tempfile` becomes a direct
+runtime dependency for owned scratch cleanup; its resolved version and notices
+remain unchanged. Current advisory/license/source admission must cover the new
+resolved graph before publication.
+
+Serving reconstructs its private frozen alias generation from a single verified
+database snapshot. Namespace views retain the existing SQL filtering semantics;
+bounded cache and vector accounting is separate from SQL argument buffers and
+process RSS. Corrupt or unavailable scratch fails explicitly.
+
+Offline Linux migration uses the existing `nix 0.30.1` safe `syncfs` wrapper on
+kernels at least 5.8, whose writeback-error reporting is required. Two barriers
+per bounded batch first persist staged descriptor bytes, then persist published
+names and links before the ownership-fenced SQL checkpoint transaction commits.
+This replaces repeated individual syncs without relaxing persistence, identity,
+history retention or ordinary publication. Unsupported kernels and cross-device
+paths retain the existing individual durable-publication path. See the
+[Linux syscall contract](https://man7.org/linux/man-pages/man2/sync.2.html).
+The alternative direct `rustix` dependency would duplicate an existing safe API;
+disabling synchronous writes would weaken the storage contract and is not used.
 
 `blake3 1.8.7` is pinned with default features disabled and only `std` and `pure`
 enabled. The [official implementation](https://github.com/BLAKE3-team/BLAKE3/tree/1.8.7)
