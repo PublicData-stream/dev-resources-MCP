@@ -38,6 +38,8 @@ HASH_RE = re.compile(r'[0-9a-f]{64}\Z')
 CONTENT_RE = re.compile(r'(?:blake3:)?[0-9a-f]{64}\Z')
 MAX_RESPONSE = 1024 * 1024
 MAX_FIXED_BODY = 16 * 1024 * 1024
+CLONE_QUOTAS = ('64G', '512G')
+REHEARSAL_HEADROOM = 704 * 1024 * 1024 * 1024
 RECORD_SQL = "SELECT id, body_hash FROM devres_captures WHERE source_url='https://www.rfc-editor.org/rfc/rfc9000.txt' AND media_type='text/plain' ORDER BY retrieved_at DESC,id LIMIT 1"
 
 
@@ -198,7 +200,10 @@ def rpc(ip, method, params, private=PRIVATE):
 class Drill:
     def __init__(self, snapshot, run=execute, root=None, private=PRIVATE,
                  token=None, sleep=time.sleep, call=rpc, server=None, schema=None,
-                 config_text=None, source_dataset=None):
+                 config_text=None, source_dataset=None, clone_quota='64G'):
+        if type(clone_quota) is not str or clone_quota not in CLONE_QUOTAS:
+            raise RestoreError('invalid_restore_clone_quota')
+        self.clone_quota = clone_quota
         self.snapshot = validate_snapshot(snapshot)
         if schema is not None and (type(schema) is not int or schema not in PROFILES):
             raise RestoreError('restored_schema_mismatch')
@@ -237,6 +242,20 @@ class Drill:
             raise RestoreError('restore_dataset_ownership_changed')
 
     def prepare(self):
+        if self.clone_quota == '512G':
+            # This finite profile belongs only to the main migration rehearsal.
+            # Leave room for its ordinary nested restore and the existing pool
+            # reserve before creating even the temporary runtime directory.
+            available = self.run(['zpool', 'list', '-Hp', '-o', 'free',
+                                  DATASET.split('/', 1)[0]])
+            if (not isinstance(available, str)
+                    or not re.fullmatch(r'[0-9]{1,20}', available.strip())):
+                raise RestoreError('restore_clone_headroom_unavailable')
+            free = int(available.strip())
+            if free > 2**64 - 1:
+                raise RestoreError('restore_clone_headroom_unavailable')
+            if free < REHEARSAL_HEADROOM:
+                raise RestoreError('restore_clone_headroom_insufficient')
         if self.source_dataset != DATASET:
             source_owner = self.source_dataset.rsplit('-', 1)[1]
             for child in ('', '/postgres', '/evidence'):
@@ -248,7 +267,7 @@ class Drill:
         self.runtime_owned = True
         self.datasets.append(self.dataset)
         self.run(['zfs', 'create', '-o', OWNER_KEY + '=' + self.token,
-                  '-o', 'mountpoint=none', '-o', 'canmount=off', '-o', 'quota=64G',
+                  '-o', 'mountpoint=none', '-o', 'canmount=off', '-o', 'quota=' + self.clone_quota,
                   '-o', 'exec=off', '-o', 'setuid=off', '-o', 'devices=off', self.dataset])
         for child in ('postgres', 'evidence'):
             self.datasets.append(self.dataset + '/' + child)

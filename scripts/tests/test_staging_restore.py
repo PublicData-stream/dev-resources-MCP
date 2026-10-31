@@ -34,10 +34,13 @@ class FakeHost:
         self.offline_running = False
         self.offline_failure = False
         self.remove_failure = False
+        self.pool_free = str(restore.REHEARSAL_HEADROOM)
 
     def run(self, args):
         args = [str(v) for v in args]
         self.commands.append(args)
+        if args[:2] == ['zpool', 'list']:
+            return self.pool_free
         if args[:2] == ['zfs', 'create']:
             self.datasets.add(args[-1])
             return ''
@@ -201,6 +204,64 @@ class RestoreTests(unittest.TestCase):
                 restore.Drill(value, run=self.host.run)
         self.assertFalse(self.host.commands)
 
+    def test_clone_quota_accepts_only_reviewed_finite_profiles_before_commands(self):
+        for quota in (None, True, 0, 64, '0', 'unlimited', '256G', '1T', '512G;id', ' 64G', '64G\n'):
+            with self.subTest(quota=quota), self.assertRaisesRegex(restore.RestoreError, 'invalid_restore_clone_quota'):
+                self.drill(clone_quota=quota)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.host.commands)
+
+    def test_ordinary_clone_keeps_64g_without_new_pool_admission(self):
+        self.host.pool_free = 'unavailable'
+        tool = self.drill()
+        try:
+            with patch.object(restore.os, 'chown'):
+                tool.prepare()
+            creates = [c for c in self.host.commands if c[:2] == ['zfs', 'create']]
+            self.assertEqual(len(creates), 1)
+            self.assertIn('quota=64G', creates[0])
+            self.assertFalse(any(c[:2] == ['zpool', 'list'] for c in self.host.commands))
+        finally:
+            tool.cleanup()
+
+    def test_rehearsal_clone_requires_headroom_before_any_temporary_objects(self):
+        self.host.pool_free = str(restore.REHEARSAL_HEADROOM - 1)
+        tool = self.drill(clone_quota='512G')
+        with self.assertRaisesRegex(restore.RestoreError, 'clone_headroom_insufficient'):
+            tool.prepare()
+        self.assertEqual(self.host.commands, [['zpool', 'list', '-Hp', '-o', 'free', 'cachepool']])
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.host.datasets)
+        self.assertFalse(tool.runtime_owned)
+
+    def test_rehearsal_clone_accepts_exact_headroom_and_sets_only_owned_parent_quota(self):
+        tool = self.drill(clone_quota='512G')
+        try:
+            with patch.object(restore.os, 'chown'):
+                tool.prepare()
+            self.assertEqual(self.host.commands[0], ['zpool', 'list', '-Hp', '-o', 'free', 'cachepool'])
+            creates = [c for c in self.host.commands if c[:2] == ['zfs', 'create']]
+            self.assertEqual(len(creates), 1)
+            self.assertIn('quota=512G', creates[0])
+            self.assertEqual(creates[0][-1], tool.dataset)
+            self.assertNotEqual(tool.dataset, restore.DATASET)
+            self.assertFalse(any(c[:2] == ['zfs', 'set'] for c in self.host.commands))
+        finally:
+            tool.cleanup()
+
+    def test_rehearsal_clone_rejects_unparseable_or_out_of_range_pool_counters(self):
+        for value in ('', 'NaN', '-1', '+1', '1e12', '1\n2', '18446744073709551616', '9' * 21,
+                      None, True, 2**50):
+            with self.subTest(value=value):
+                self.host.commands.clear()
+                self.host.pool_free = value
+                tool = self.drill(clone_quota='512G')
+                with self.assertRaisesRegex(restore.RestoreError, 'clone_headroom_unavailable'):
+                    tool.prepare()
+                self.assertEqual(self.host.commands, [['zpool', 'list', '-Hp', '-o', 'free', 'cachepool']])
+                self.assertFalse(self.root.exists())
+                self.assertFalse(self.host.datasets)
+
     def test_paused_config_only_changes_eight_booleans(self):
         text = (self.private / 'backend.toml').read_text().replace('enabled = false', 'enabled = true')
         changed = restore.paused_config(text)
@@ -359,6 +420,8 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual({c[-2] for c in clones},
                          {source + '/' + child + '@' + SNAPSHOT for child in ('postgres', 'evidence')})
         self.assertTrue(all(source not in c[-1] for c in self.host.commands if c[:2] == ['zfs', 'destroy']))
+        self.assertTrue(all('quota=64G' in c for c in self.host.commands if c[:2] == ['zfs', 'create']))
+        self.assertFalse(any(c[:2] == ['zpool', 'list'] for c in self.host.commands))
 
     def test_nested_restore_refuses_unowned_source_before_creating_anything(self):
         source = 'cachepool/devres-staging-restore-' + 'b' * 24

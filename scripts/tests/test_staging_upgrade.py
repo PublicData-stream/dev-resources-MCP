@@ -69,9 +69,11 @@ class FakeTool:
 
 class FakeDrill:
     events = []
+    initializations = []
     fail_command = None
 
     def __init__(self, *args, **kwargs):
+        self.initializations.append(dict(kwargs))
         self.name = 'fake'
         self.token = 'b' * 24
         self.dataset = 'cachepool/devres-staging-restore-' + self.token
@@ -124,6 +126,7 @@ class UpgradeTests(unittest.TestCase):
         self.addCleanup(self.writer.stop)
         self.phase_record('rehearsed', deadline_seconds=1800, snapshot=SNAPSHOT)
         FakeDrill.events = []
+        FakeDrill.initializations = []
         FakeDrill.fail_command = None
 
     def phase_record(self, phase, **updates):
@@ -199,6 +202,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
         parsed = upgrade.tomllib.loads((self.private / 'backend.toml').read_text())
         self.assertTrue(all(not parsed[c]['enabled'] for c in upgrade.restore.COLLECTORS))
+        self.assertFalse(any(kwargs.get('clone_quota') == '512G' for kwargs in FakeDrill.initializations))
 
     def test_watchdog_is_enabled_and_verified_before_first_backend_drain(self):
         scale = self.tool.scale
@@ -254,6 +258,8 @@ class UpgradeTests(unittest.TestCase):
         result = self.instance.rehearsal()
         self.assertEqual(result['deadline_seconds'], 1802)
         self.assertEqual([kwargs['schema'] for _, kwargs in calls], [9, 10, 9])
+        self.assertEqual([kwargs.get('clone_quota') for kwargs in FakeDrill.initializations], ['512G'])
+        self.assertTrue(all('clone_quota' not in kwargs for _, kwargs in calls))
         self.assertEqual(calls[1][1]['source_dataset'],
                          'cachepool/devres-staging-restore-' + 'b' * 24)
         source = 'cachepool/devres-staging-restore-' + 'b' * 24 + '@' + SNAPSHOT + '-canonical'

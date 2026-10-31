@@ -284,7 +284,8 @@ class Upgrade:
                 self.verify(snapshot, schema=9, server=restore.OLD_SERVER, private=self.private,
                             config_text=original)
                 drill = self.drill(snapshot, schema=10, private=self.private,
-                                   config_text=target_config(original, paused=True))
+                                   config_text=target_config(original, paused=True),
+                                   clone_quota='512G')
                 self.save(live_token=drill.token)
                 canonical_snapshot = snapshot + '-canonical'
                 m.snapshot_name(canonical_snapshot)

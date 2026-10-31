@@ -133,6 +133,14 @@ to the larger of thirty minutes and twice the rehearsal duration. Recovery time
 is additional. Capacity and clone quotas remain enforced; a successful rehearsal
 does not establish whole-corpus capacity.
 
+Only the main migration rehearsal clone has a finite 512 GiB parent quota. Before
+creating its temporary runtime directory or ZFS objects, it requires at least
+704 GiB of current pool free space: 512 GiB for that clone, 64 GiB for a nested
+restore, and the existing 128 GiB pool reserve. Ordinary restores and the nested
+schema-nine/schema-ten restore checks retain their 64 GiB parent quotas. This
+profile changes neither the permanent datasets' quotas nor the pool's limits;
+the capacity guard remains active throughout the rehearsal.
+
 Before draining the real backend, the operator arms and verifies a root timer
 bound to that upgrade's token. Once the candidate is awaiting acceptance, an
 expired deadline invokes the preserving rollback even if the SSH approval channel
