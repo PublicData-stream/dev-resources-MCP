@@ -47,6 +47,9 @@ static WRITERS: Semaphore = Semaphore::const_new(1);
 static READERS: Semaphore = Semaphore::const_new(2);
 #[cfg(test)]
 pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+static VERIFY_COUNTS: std::sync::Mutex<BTreeMap<PathBuf, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 pub(crate) struct IndexDocument {
     pub number: u32,
@@ -260,6 +263,11 @@ fn index_files(path: &Path) -> Result<Vec<String>> {
 }
 
 fn verify(path: &Path, deadline: Instant) -> Result<()> {
+    #[cfg(test)]
+    {
+        let mut counts = VERIFY_COUNTS.lock().map_err(|_| unavailable())?;
+        *counts.entry(path.to_owned()).or_default() += 1;
+    }
     let manifest_path = path.join(MANIFEST);
     let metadata = fs::symlink_metadata(&manifest_path).map_err(|_| integrity())?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_MANIFEST {
@@ -768,20 +776,18 @@ pub(crate) async fn rebuild_frozen(
     let stop = cancel.child_token();
     let _guard = CancelOnDrop(stop.clone());
     let mut task = tokio::task::spawn_blocking(move || {
-        if stop.is_cancelled() {
-            return Err(Error::new("cancelled", "RFC migration canceled."));
-        }
+        migration_cancel(&stop)?;
         let target = format!("rfc-indexes/{}", index_suffix(&id)?);
         if root.join(&target).exists() {
             let mut original = BTreeMap::new();
             let mut retained = BTreeMap::new();
             for (path, output) in [(&relative, &mut original), (&target, &mut retained)] {
-                let mut after = 0;
+                let mut reader = FrozenDocuments::open(&root, path, &stop)?;
                 loop {
-                    if stop.is_cancelled() {
-                        return Err(Error::new("cancelled", "RFC migration canceled."));
+                    let documents = reader.next_page(1000)?;
+                    if documents.is_empty() {
+                        break;
                     }
-                    let (documents, next) = export_documents(&root, path, after, 1000)?;
                     for document in documents {
                         if output
                             .insert(
@@ -793,88 +799,146 @@ pub(crate) async fn rebuild_frozen(
                             return Err(integrity());
                         }
                     }
-                    match next {
-                        Some(next) => after = next,
-                        None => break,
-                    }
                 }
             }
+            migration_cancel(&stop)?;
             if original != retained {
                 return Err(integrity());
             }
             return Ok(target);
         }
         let mut builder = IndexBuilder::begin_from(&root, &id, None)?;
-        let mut after = 0;
+        let mut reader = FrozenDocuments::open(&root, &relative, &stop)?;
         loop {
-            if stop.is_cancelled() {
-                return Err(Error::new("cancelled", "RFC migration canceled."));
+            let documents = reader.next_page(1000)?;
+            if documents.is_empty() {
+                break;
             }
-            let (documents, next) = export_documents(&root, &relative, after, 1000)?;
             for document in documents {
-                if stop.is_cancelled() {
-                    return Err(Error::new("cancelled", "RFC migration canceled."));
-                }
+                migration_cancel(&stop)?;
                 builder.add_document(document)?;
             }
-            match next {
-                Some(next) => after = next,
-                None => break,
-            }
         }
+        migration_cancel(&stop)?;
         builder.finish()
     });
     tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "RFC migration canceled.")) }, result = &mut task => result.map_err(|_| unavailable())? }
 }
 
-/// Export exact retained text without selecting a moving corpus head.
-/// The caller owns the maintenance fence and executes this on a blocking worker.
-pub(crate) fn export_documents(
-    root: &Path,
-    relative: &str,
-    after: usize,
-    limit: usize,
-) -> Result<(Vec<IndexDocument>, Option<usize>)> {
-    if !(1..=1000).contains(&limit) {
-        return Err(Error::invalid("Invalid RFC index export page."));
+fn migration_cancel(cancel: &tokio_util::sync::CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        Err(Error::new("cancelled", "RFC migration canceled."))
+    } else {
+        Ok(())
     }
-    let _permit = READERS
-        .try_acquire()
-        .map_err(|_| Error::capacity("RFC index reader capacity exhausted."))?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let path = selected_directory(root, relative)?;
-    verify(&path, deadline)?;
-    let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
-    if index.schema() != schema() {
-        return Err(integrity());
+}
+
+/// One fully verified immutable generation, consumed only while its caller owns
+/// the maintenance fence. Keep its reader and forward cursor across page bounds;
+/// reopening a page would rehash every shard and rescan the retained prefix.
+pub(crate) struct FrozenDocuments {
+    _reader: tantivy::IndexReader,
+    searcher: tantivy::Searcher,
+    text_field: Field,
+    number_field: Field,
+    next_segment: usize,
+    segment_id: u32,
+    documents: std::vec::IntoIter<u32>,
+    admitted_documents: usize,
+    pending: Option<IndexDocument>,
+    first_page_deadline: Option<Instant>,
+    cancel: tokio_util::sync::CancellationToken,
+    _permit: SemaphorePermit<'static>,
+    #[cfg(test)]
+    visited_documents: usize,
+}
+
+impl FrozenDocuments {
+    pub(crate) fn open(
+        root: &Path,
+        relative: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        migration_cancel(cancel)?;
+        let permit = READERS
+            .try_acquire()
+            .map_err(|_| Error::capacity("RFC index reader capacity exhausted."))?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let path = selected_directory(root, relative)?;
+        verify(&path, deadline)?;
+        migration_cancel(cancel)?;
+        let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
+        if index.schema() != schema() {
+            return Err(integrity());
+        }
+        let reader = index.reader().map_err(|_| unavailable())?;
+        let searcher = reader.searcher();
+        if searcher.num_docs() > MAX_DOCUMENTS as u64 {
+            return Err(integrity());
+        }
+        let index_schema = index.schema();
+        let text_field = index_schema.get_field(TECHNICAL).map_err(|_| integrity())?;
+        let number_field = index_schema.get_field(NUMBER).map_err(|_| integrity())?;
+        check_deadline(deadline)?;
+        Ok(Self {
+            _reader: reader,
+            searcher,
+            text_field,
+            number_field,
+            next_segment: 0,
+            segment_id: 0,
+            documents: Vec::new().into_iter(),
+            admitted_documents: 0,
+            pending: None,
+            first_page_deadline: Some(deadline),
+            cancel: cancel.clone(),
+            _permit: permit,
+            #[cfg(test)]
+            visited_documents: 0,
+        })
     }
-    let reader = index.reader().map_err(|_| unavailable())?;
-    let searcher = reader.searcher();
-    let index_schema = index.schema();
-    let text_field = index_schema.get_field(TECHNICAL).map_err(|_| integrity())?;
-    let number_field = index_schema.get_field(NUMBER).map_err(|_| integrity())?;
-    let mut position = 0usize;
-    let mut bytes = 0usize;
-    let mut output = Vec::new();
-    for (segment_id, segment) in searcher.segment_readers().iter().enumerate() {
-        for document in segment.doc_ids_alive() {
+
+    fn next_document(&mut self, deadline: Instant) -> Result<Option<IndexDocument>> {
+        loop {
+            migration_cancel(&self.cancel)?;
             check_deadline(deadline)?;
-            if position < after {
-                position += 1;
+            let Some(document) = self.documents.next() else {
+                let Some(segment) = self.searcher.segment_readers().get(self.next_segment) else {
+                    return Ok(None);
+                };
+                self.segment_id = u32::try_from(self.next_segment).map_err(|_| integrity())?;
+                self.next_segment += 1;
+                // Tantivy's alive iterator borrows its segment. Retain only this
+                // segment's bounded live IDs, not a raw max_doc scan (which can
+                // include a large deleted prefix in older frozen generations).
+                let mut documents = Vec::new();
+                for document in segment.doc_ids_alive() {
+                    migration_cancel(&self.cancel)?;
+                    check_deadline(deadline)?;
+                    if self.admitted_documents >= MAX_DOCUMENTS {
+                        return Err(integrity());
+                    }
+                    self.admitted_documents += 1;
+                    documents.push(document);
+                }
+                check_deadline(deadline)?;
+                self.documents = documents.into_iter();
                 continue;
+            };
+            #[cfg(test)]
+            {
+                self.visited_documents += 1;
             }
-            if output.len() == limit {
-                return Ok((output, Some(position)));
-            }
-            let stored: TantivyDocument = searcher
-                .doc(tantivy::DocAddress::new(segment_id as u32, document))
+            let stored: TantivyDocument = self
+                .searcher
+                .doc(tantivy::DocAddress::new(self.segment_id, document))
                 .map_err(|_| integrity())?;
             let text = stored
-                .get_first(text_field)
+                .get_first(self.text_field)
                 .and_then(|v| v.as_str())
                 .ok_or_else(integrity)?;
             let number = stored
-                .get_first(number_field)
+                .get_first(self.number_field)
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok())
                 .filter(|v| (1..=999999).contains(v))
@@ -882,23 +946,49 @@ pub(crate) fn export_documents(
             if text.len() > MAX_TEXT {
                 return Err(Error::capacity("RFC index export text exceeds bound."));
             }
-            if !output.is_empty() && bytes.saturating_add(text.len()) > 32 * 1024 * 1024 {
-                return Ok((output, Some(position)));
-            }
-            bytes += text.len();
-            output.push(IndexDocument {
+            return Ok(Some(IndexDocument {
                 number,
                 text: text.to_owned(),
-            });
-            position += 1;
+            }));
         }
     }
-    if after > position {
-        return Err(Error::invalid(
-            "RFC export cursor exceeds retained membership.",
-        ));
+
+    pub(crate) fn next_page(&mut self, limit: usize) -> Result<Vec<IndexDocument>> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::invalid("Invalid RFC index export page."));
+        }
+        // Opening/verification and the first page share the original budget.
+        // Later pages each retain their own 15s budget; no generation-wide
+        // deadline turns a large, valid frozen export into a partial result.
+        let deadline = self
+            .first_page_deadline
+            .take()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
+        let mut bytes = 0usize;
+        let mut output = Vec::new();
+        while output.len() < limit {
+            migration_cancel(&self.cancel)?;
+            check_deadline(deadline)?;
+            let document = match self.pending.take() {
+                Some(document) => Some(document),
+                None => self.next_document(deadline)?,
+            };
+            let Some(document) = document else {
+                break;
+            };
+            if !output.is_empty() && bytes.saturating_add(document.text.len()) > MAX_QUEUED_BYTES {
+                // Keep this one <=16 MiB document for the next page, rather
+                // than discarding it or decoding it again after the byte bound.
+                self.pending = Some(document);
+                break;
+            }
+            bytes += document.text.len();
+            output.push(document);
+        }
+        migration_cancel(&self.cancel)?;
+        check_deadline(deadline)?;
+        Ok(output)
     }
-    Ok((output, None))
 }
 
 /// Called on an admitted blocking worker. Each reader opens only the selected immutable directory.
@@ -1023,6 +1113,33 @@ mod tests {
         fs::write(descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
     }
 
+    fn verification_count(root: &Path, relative: &str) -> u64 {
+        let path = selected_directory(root, relative).unwrap();
+        VERIFY_COUNTS
+            .lock()
+            .unwrap()
+            .get(&path)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn frozen_text(root: &Path, relative: &str) -> (BTreeMap<u32, String>, usize) {
+        let mut reader =
+            FrozenDocuments::open(root, relative, &tokio_util::sync::CancellationToken::new())
+                .unwrap();
+        let mut documents = BTreeMap::new();
+        loop {
+            let page = reader.next_page(237).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for document in page {
+                assert!(documents.insert(document.number, document.text).is_none());
+            }
+        }
+        (documents, reader.visited_documents)
+    }
+
     #[test]
     fn canonical_index_addresses_and_legacy_qualification_are_enforced() {
         let _test = TEST_SERIAL.blocking_lock();
@@ -1057,6 +1174,8 @@ mod tests {
         }
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(search(root.path(), &relative, "transport", TECHNICAL, 0, 20, None).is_err());
+        let stop = tokio_util::sync::CancellationToken::new();
+        assert!(FrozenDocuments::open(root.path(), &relative, &stop).is_err());
         qualify_legacy_file(root.path(), &manifest_path);
         for name in manifest["files"].as_object().unwrap().keys() {
             qualify_legacy_file(root.path(), &directory.join(name));
@@ -1065,12 +1184,20 @@ mod tests {
             search(root.path(), &relative, "transport", TECHNICAL, 0, 20, None).unwrap()["total"],
             1
         );
+        let mut reader = FrozenDocuments::open(root.path(), &relative, &stop).unwrap();
+        let page = reader.next_page(1).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].number, 1);
+        assert_eq!(page[0].text, "persistent transport");
+        assert!(reader.next_page(1).unwrap().is_empty());
+        drop(reader);
         let descriptor =
             crate::integrity::evidence_path(root.path(), &directory.join("meta.json")).unwrap();
         let mut evidence: Value = serde_json::from_slice(&fs::read(&descriptor).unwrap()).unwrap();
         evidence["digest"] = json!(crate::integrity::hash(b"wrong retained bytes"));
         fs::write(descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
         assert!(search(root.path(), &relative, "transport", TECHNICAL, 0, 20, None).is_err());
+        assert!(FrozenDocuments::open(root.path(), &relative, &stop).is_err());
     }
 
     #[tokio::test]
@@ -1107,6 +1234,249 @@ mod tests {
             .unwrap(),
             rebuilt
         );
+    }
+
+    #[tokio::test]
+    async fn frozen_rebuild_verifies_once_and_visits_each_live_document_once() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source_id = crate::integrity::hash(b"multi-page RFC source fixture");
+        let mut builder = IndexBuilder::begin(root.path(), &source_id).unwrap();
+        let mut expected = BTreeMap::new();
+        for number in 1..=2507 {
+            let text = format!("original frozen transport document {number}");
+            builder
+                .add_document(IndexDocument {
+                    number,
+                    text: text.clone(),
+                })
+                .unwrap();
+            expected.insert(number, text);
+            if number % 500 == 0 {
+                builder.writer.as_mut().unwrap().commit().unwrap();
+            }
+        }
+        // Frozen generations may retain deleted postings and segment boundaries.
+        // They must not reappear when the export cursor advances to a new page.
+        builder.remove_document(3).unwrap();
+        expected.remove(&3);
+        builder
+            .add_document(IndexDocument {
+                number: 1,
+                text: "replacement retained transport document".into(),
+            })
+            .unwrap();
+        expected.insert(1, "replacement retained transport document".into());
+        let original = builder.finish().unwrap();
+        let before = verification_count(root.path(), &original);
+        let canonical = crate::integrity::hash(b"multi-page RFC target fixture");
+        let started = Instant::now();
+        let rebuilt = rebuild_frozen(
+            root.path().to_owned(),
+            original.clone(),
+            canonical.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let rebuild_elapsed = started.elapsed();
+        assert_eq!(verification_count(root.path(), &original) - before, 1);
+        let (retained, visited) = frozen_text(root.path(), &rebuilt);
+        assert_eq!(retained, expected);
+        assert_eq!(visited, expected.len());
+        let (source, visited) = frozen_text(root.path(), &original);
+        assert_eq!(source, expected);
+        assert_eq!(visited, expected.len());
+        let source_before = verification_count(root.path(), &original);
+        let target_before = verification_count(root.path(), &rebuilt);
+        let started = Instant::now();
+        assert_eq!(
+            rebuild_frozen(
+                root.path().to_owned(),
+                original.clone(),
+                canonical,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            rebuilt
+        );
+        assert_eq!(
+            verification_count(root.path(), &original) - source_before,
+            1
+        );
+        assert_eq!(verification_count(root.path(), &rebuilt) - target_before, 1);
+        eprintln!(
+            "RFC frozen fixture: {} live documents across >2 pages; rebuild {:?}, retry {:?}; verification passes 1/source and 1/retry target",
+            expected.len(),
+            rebuild_elapsed,
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn frozen_pages_keep_byte_boundary_document_and_reader_admission() {
+        let _test = TEST_SERIAL.blocking_lock();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let text = format!("transport{}", " ".repeat(11 * 1024 * 1024));
+        let original = build(
+            root.path(),
+            &crate::integrity::hash(b"RFC export byte-boundary fixture"),
+            (1..=3)
+                .map(|number| IndexDocument {
+                    number,
+                    text: text.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut reader = FrozenDocuments::open(root.path(), &original, &stop).unwrap();
+        let first = reader.next_page(1000).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(reader.visited_documents, 3);
+        assert!(first.iter().map(|doc| doc.text.len()).sum::<usize>() <= MAX_QUEUED_BYTES);
+        let second = reader.next_page(1000).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            reader.visited_documents, 3,
+            "pending text is not decoded again"
+        );
+        assert!(reader.next_page(1000).unwrap().is_empty());
+        assert_eq!(
+            first
+                .into_iter()
+                .chain(second)
+                .map(|doc| (doc.number, doc.text))
+                .collect::<BTreeMap<_, _>>(),
+            (1..=3).map(|number| (number, text.clone())).collect()
+        );
+        let second_reader = FrozenDocuments::open(root.path(), &original, &stop).unwrap();
+        assert_eq!(
+            FrozenDocuments::open(root.path(), &original, &stop)
+                .err()
+                .unwrap()
+                .code,
+            "capacity"
+        );
+        drop(second_reader);
+        drop(reader);
+        assert_eq!(READERS.available_permits(), 2);
+    }
+
+    #[test]
+    fn frozen_reader_cancellation_and_deadlines_stop_before_more_documents() {
+        let _test = TEST_SERIAL.blocking_lock();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let original = build(
+            root.path(),
+            &crate::integrity::hash(b"RFC canceled export fixture"),
+            documents(&[(1, "retained transport"), (2, "retained protocol")]),
+        )
+        .unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut reader = FrozenDocuments::open(root.path(), &original, &stop).unwrap();
+        assert_eq!(reader.next_page(1).unwrap().len(), 1);
+        stop.cancel();
+        assert_eq!(reader.next_page(1).err().unwrap().code, "cancelled");
+        assert_eq!(reader.visited_documents, 1);
+        drop(reader);
+        let mut reader = FrozenDocuments::open(
+            root.path(),
+            &original,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        reader.first_page_deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(reader.next_page(1).err().unwrap().code, "capacity");
+        assert_eq!(reader.visited_documents, 0);
+        assert!(reader.next_page(0).is_err());
+        assert!(reader.next_page(1001).is_err());
+    }
+
+    #[tokio::test]
+    async fn frozen_rebuild_rejects_corrupt_source_or_different_retained_text() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let original = build(
+            root.path(),
+            &crate::integrity::hash(b"RFC source-integrity fixture"),
+            documents(&[(1, "original retained transport")]),
+        )
+        .unwrap();
+        let canceled_target = crate::integrity::hash(b"RFC canceled rebuild fixture");
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        assert_eq!(
+            rebuild_frozen(
+                root.path().to_owned(),
+                original.clone(),
+                canceled_target.clone(),
+                stop,
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "cancelled"
+        );
+        assert!(
+            !root
+                .path()
+                .join("rfc-indexes")
+                .join(index_suffix(&canceled_target).unwrap())
+                .exists()
+        );
+        let target_id = crate::integrity::hash(b"RFC retry-integrity fixture");
+        build(
+            root.path(),
+            &target_id,
+            documents(&[(1, "different retained transport")]),
+        )
+        .unwrap();
+        assert_eq!(
+            rebuild_frozen(
+                root.path().to_owned(),
+                original.clone(),
+                target_id,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "integrity"
+        );
+        let target_id = crate::integrity::hash(b"RFC incomplete source fixture");
+        fs::write(root.path().join(&original).join("meta.json"), b"{}").unwrap();
+        assert_eq!(
+            rebuild_frozen(
+                root.path().to_owned(),
+                original,
+                target_id.clone(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "integrity"
+        );
+        assert!(
+            !root
+                .path()
+                .join("rfc-indexes")
+                .join(index_suffix(&target_id).unwrap())
+                .exists()
+        );
+        assert!(
+            fs::read_dir(root.path().join("rfc-indexes"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stage-"))
+        );
+        assert_eq!(READERS.available_permits(), 2);
+        assert_eq!(WRITERS.available_permits(), 1);
     }
 
     #[test]

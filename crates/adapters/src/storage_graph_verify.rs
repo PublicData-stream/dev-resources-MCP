@@ -279,17 +279,14 @@ impl PgBlobStore {
                         _ => return Err(missing()),
                     }
                     if let Some(reference) = data.get("index").filter(|v| !v.is_null()) {
-                        let mut position = 0;
+                        let mut reader = index.frozen_documents(reference, cancel.clone()).await?;
                         loop {
-                            let (ids, next) = index
-                                .document_ids(reference, position, 128, cancel.clone())
-                                .await?;
+                            let (ids, has_more) = reader.next_page(128).await?;
                             for id in ids {
                                 self.npm_edge("documents", &Value::String(id)).await?;
                             }
-                            match next {
-                                Some(next) => position = next,
-                                None => break,
+                            if !has_more {
+                                break;
                             }
                         }
                     }

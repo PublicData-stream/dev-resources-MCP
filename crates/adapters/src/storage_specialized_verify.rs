@@ -24,6 +24,14 @@ fn stop(cancel: &CancellationToken) -> Result<()> {
     }
 }
 
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 async fn capture(store: &PgBlobStore, id: &str) -> Result<Capture> {
     let row=sqlx::query("SELECT id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity FROM devres_captures WHERE id=$1").bind(id).fetch_optional(&store.pool).await.map_err(|_|storage_error())?.ok_or_else(invalid)?;
     let capture = Capture {
@@ -132,14 +140,26 @@ impl PgBlobStore {
             for document in &value.documents {
                 capture_matches(self, &document.capture).await?;
             }
+            let retained = value
+                .documents
+                .iter()
+                .map(|document| {
+                    (
+                        document.number,
+                        document.format.as_str(),
+                        document.assurance.as_str(),
+                        document.capture.id.as_str(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
             for document in &value.search_documents {
                 if !selected.insert(document.number)
-                    || !value.documents.iter().any(|original| {
-                        original.number == document.number
-                            && original.format == document.format
-                            && original.assurance == document.assurance
-                            && original.capture.id == document.capture.id
-                    })
+                    || !retained.contains(&(
+                        document.number,
+                        document.format.as_str(),
+                        document.assurance.as_str(),
+                        document.capture.id.as_str(),
+                    ))
                 {
                     return Err(invalid());
                 }
@@ -148,22 +168,22 @@ impl PgBlobStore {
             if let Some(path) = value.index_path {
                 let root = self.root.clone();
                 let child = cancel.child_token();
+                let _cancel_guard = CancelOnDrop(child.clone());
                 let expected = selected.clone();
                 tokio::task::spawn_blocking(move || {
-                    let mut after = 0;
+                    let mut reader =
+                        crate::rfc::index::FrozenDocuments::open(&root, &path, &child)?;
                     let mut actual = BTreeSet::new();
                     loop {
                         stop(&child)?;
-                        let (rows, next) =
-                            crate::rfc::index::export_documents(&root, &path, after, 1)?;
+                        let rows = reader.next_page(1)?;
+                        if rows.is_empty() {
+                            break;
+                        }
                         for row in rows {
                             if !actual.insert(row.number) {
                                 return Err(invalid());
                             }
-                        }
-                        match next {
-                            Some(next) => after = next,
-                            None => break,
                         }
                     }
                     if actual != expected {
@@ -297,19 +317,26 @@ impl PgBlobStore {
                 let root = self.root.clone();
                 let reference = snapshot.index_manifest.clone();
                 let child = cancel.child_token();
-                let mut offset = 0_usize;
+                let _cancel_guard = CancelOnDrop(child.clone());
+                let worker_cancel = child.clone();
+                let mut reader = tokio::task::spawn_blocking(move || {
+                    crate::crates_io::index::FrozenDocuments::open(
+                        &root,
+                        &reference,
+                        &worker_cancel,
+                    )
+                })
+                .await
+                .map_err(|_| invalid())??;
                 loop {
                     stop(cancel)?;
-                    let root = root.clone();
-                    let reference = reference.clone();
-                    let child = child.clone();
-                    let (rows, next) = tokio::task::spawn_blocking(move || {
-                        crate::crates_io::index::export_documents(
-                            &root, &reference, offset, 1, &child,
-                        )
+                    let (next_reader, rows, has_more) = tokio::task::spawn_blocking(move || {
+                        let (rows, has_more) = reader.next_page(100)?;
+                        Ok::<_, Error>((reader, rows, has_more))
                     })
                     .await
                     .map_err(|_| invalid())??;
+                    reader = next_reader;
                     for (payload, _) in rows {
                         snapshot_capture_fields(self, &payload["record"]).await?;
                         if let Some(id) = payload["enrichment"]["artifact"].as_str() {
@@ -341,9 +368,8 @@ impl PgBlobStore {
                             return Err(invalid());
                         }
                     }
-                    match next {
-                        Some(next) => offset = next,
-                        None => break,
+                    if !has_more {
+                        break;
                     }
                 }
             }

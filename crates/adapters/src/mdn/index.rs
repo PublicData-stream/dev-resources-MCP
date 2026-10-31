@@ -414,6 +414,50 @@ impl MdnIndex {
             .and_then(|f| f.sync_all())
             .map_err(|_| failure())
     }
+    /// Open one exact retained generation for a bounded, forward-only traversal.
+    pub(crate) async fn frozen_documents(
+        &self,
+        reference: &Value,
+        cancel: CancellationToken,
+    ) -> Result<FrozenDocuments> {
+        let permit = READERS
+            .get_or_init(|| Arc::new(Semaphore::new(2)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| capacity())?;
+        let stop = cancel.child_token();
+        let mut cursor = FrozenDocuments {
+            cancel: stop.clone(),
+            state: None,
+            exhausted: false,
+        };
+        let this = self.clone();
+        let reference = reference.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let opened = this.open(&reference, &stop, deadline)?;
+            Ok::<_, Error>(FrozenDocumentState {
+                _permit: permit,
+                opened,
+                shard: 0,
+                segment: 0,
+                live: Vec::new(),
+                position: 0,
+                first_deadline: Some(deadline),
+            })
+        });
+        cursor.state = Some(tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                cursor.cancel.cancel();
+                let _ = task.await;
+                return Err(Error::new("cancelled", "MDN index export canceled."));
+            }
+            result = &mut task => result.map_err(|_| failure())??,
+        });
+        Ok(cursor)
+    }
+
     /// Export exact retained posting identities for private frozen-generation migration.
     /// Full document text remains in verified `index-documents` evidence rows.
     pub async fn document_ids(
@@ -1187,6 +1231,156 @@ struct OpenedShard {
 struct Opened {
     shards: Vec<Arc<OpenedShard>>,
 }
+
+/// Retain verified immutable readers for exactly one forward traversal.
+pub(crate) struct FrozenDocuments {
+    cancel: CancellationToken,
+    state: Option<FrozenDocumentState>,
+    exhausted: bool,
+}
+struct FrozenDocumentState {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    opened: Arc<Opened>,
+    shard: usize,
+    segment: usize,
+    live: Vec<u32>,
+    position: usize,
+    first_deadline: Option<Instant>,
+}
+impl Drop for FrozenDocuments {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+impl FrozenDocumentState {
+    fn next_address(
+        &mut self,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<Option<(usize, u32, u32)>> {
+        loop {
+            check(cancel, deadline)?;
+            if let Some(document) = self.live.get(self.position) {
+                let segment = self.segment.checked_sub(1).ok_or_else(integrity)?;
+                return Ok(Some((
+                    self.shard,
+                    u32::try_from(segment).map_err(|_| integrity())?,
+                    *document,
+                )));
+            }
+            let Some(shard) = self.opened.shards.get(self.shard) else {
+                return Ok(None);
+            };
+            let Some(segment) = shard.searcher.segment_readers().get(self.segment) else {
+                self.shard = self.shard.checked_add(1).ok_or_else(capacity)?;
+                self.segment = 0;
+                self.live.clear();
+                self.position = 0;
+                continue;
+            };
+            self.live.clear();
+            self.position = 0;
+            // The verified shard contains at most MAX_DOCS live documents. Keep
+            // only this segment's IDs, preserving Tantivy's sparse-delete walk.
+            for document in segment.doc_ids_alive() {
+                check(cancel, deadline)?;
+                if self.live.len() == MAX_DOCS {
+                    return Err(integrity());
+                }
+                self.live.push(document);
+            }
+            self.segment = self.segment.checked_add(1).ok_or_else(capacity)?;
+        }
+    }
+    fn page(
+        &mut self,
+        limit: usize,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(Vec<String>, bool)> {
+        let payload_field = field(&schema(), "payload")?;
+        let mut ids = Vec::new();
+        let mut bytes = 0usize;
+        while ids.len() < limit {
+            let Some((shard, segment, document)) = self.next_address(cancel, deadline)? else {
+                return Ok((ids, false));
+            };
+            let stored: TantivyDocument = self
+                .opened
+                .shards
+                .get(shard)
+                .ok_or_else(integrity)?
+                .searcher
+                .doc(tantivy::DocAddress::new(segment, document))
+                .map_err(|_| integrity())?;
+            let payload = stored
+                .get_first(payload_field)
+                .and_then(|value| value.as_str())
+                .ok_or_else(integrity)?;
+            if payload.len() > 128 * 1024 {
+                return Err(capacity());
+            }
+            let value: Value = serde_json::from_str(payload).map_err(|_| integrity())?;
+            let id = value["id"]
+                .as_str()
+                .filter(|id| valid_hash(id))
+                .ok_or_else(integrity)?;
+            bytes = bytes.checked_add(id.len()).ok_or_else(capacity)?;
+            if bytes > 16 * 1024 * 1024 {
+                return Err(capacity());
+            }
+            ids.push(id.to_owned());
+            self.position = self.position.checked_add(1).ok_or_else(capacity)?;
+        }
+        Ok((ids, self.next_address(cancel, deadline)?.is_some()))
+    }
+}
+impl FrozenDocuments {
+    pub(crate) async fn next_page(&mut self, limit: usize) -> Result<(Vec<String>, bool)> {
+        if !(1..=1000).contains(&limit) {
+            self.state = None;
+            self.cancel.cancel();
+            return Err(Error::invalid("Invalid index export page."));
+        }
+        if let Err(error) = check(&self.cancel, Instant::now() + Duration::from_secs(15)) {
+            self.state = None;
+            return Err(error);
+        }
+        if self.exhausted {
+            return Ok((Vec::new(), false));
+        }
+        // Taking the state before awaiting makes a dropped in-flight page
+        // permanently close this session instead of silently skipping postings.
+        let mut state = self
+            .state
+            .take()
+            .ok_or_else(|| Error::unavailable("MDN index export session is closed."))?;
+        let stop = self.cancel.child_token();
+        let _guard = CancelOnDrop(stop.clone());
+        let mut task = tokio::task::spawn_blocking(move || {
+            let deadline = state
+                .first_deadline
+                .take()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
+            let (ids, has_more) = state.page(limit, &stop, deadline)?;
+            Ok::<_, Error>((state, ids, has_more))
+        });
+        let (state, ids, has_more) = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                let _ = task.await;
+                return Err(Error::new("cancelled", "MDN index export canceled."));
+            }
+            result = &mut task => result.map_err(|_| failure())??,
+        };
+        if has_more {
+            self.state = Some(state);
+        } else {
+            self.exhausted = true;
+        }
+        Ok((ids, has_more))
+    }
+}
 static SHARD_CACHE: OnceLock<Mutex<HashMap<String, Weak<OpenedShard>>>> = OnceLock::new();
 struct TokenTotals;
 struct SegmentTotals {
@@ -1554,6 +1748,347 @@ fn query(field: Field, input: &str, mode: &str) -> Result<Box<dyn Query>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn raw_cursor(
+        root: &Path,
+        payloads: &[(&str, String)],
+        deleted: Option<&str>,
+    ) -> FrozenDocuments {
+        let index = Index::create_in_dir(root, schema()).expect("fixture index");
+        register(&index).expect("tokenizers");
+        let mut writer = index.writer(64 * 1024 * 1024).expect("writer");
+        writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+        for (id, payload) in payloads {
+            let mut document = TantivyDocument::default();
+            document.add_text(field(&schema(), "id").expect("id"), *id);
+            document.add_text(field(&schema(), "payload").expect("payload"), payload);
+            writer.add_document(document).expect("document");
+            writer.commit().expect("segment");
+        }
+        if let Some(id) = deleted {
+            writer.delete_term(Term::from_field_text(
+                field(&schema(), "id").expect("id"),
+                id,
+            ));
+            writer.commit().expect("deletion");
+        }
+        drop(writer);
+        let reader = index.reader().expect("reader");
+        let searcher = reader.searcher();
+        let permit = READERS
+            .get_or_init(|| Arc::new(Semaphore::new(2)))
+            .clone()
+            .try_acquire_owned()
+            .expect("reader permit");
+        FrozenDocuments {
+            cancel: CancellationToken::new(),
+            state: Some(FrozenDocumentState {
+                _permit: permit,
+                opened: Arc::new(Opened {
+                    shards: vec![Arc::new(OpenedShard {
+                        _reader: reader,
+                        searcher,
+                    })],
+                }),
+                shard: 0,
+                segment: 0,
+                live: Vec::new(),
+                position: 0,
+                first_deadline: Some(Instant::now() + Duration::from_secs(15)),
+            }),
+            exhausted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_cursor_verifies_once_per_operation_and_preserves_page_order() {
+        let _gate = TEST_GATE.lock().await;
+        let root = tempfile::tempdir_in("/tmp").expect("temp");
+        let index = MdnIndex::new(root.path()).expect("index");
+        let first = index
+            .publish(
+                None,
+                vec![doc("one", "One", "first")],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first");
+        let reference = index
+            .publish(
+                Some(&first),
+                vec![doc("two", "Two", "second"), doc("three", "Three", "third")],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second");
+        let expected = index
+            .document_ids(&reference, 0, 1000, CancellationToken::new())
+            .await
+            .expect("legacy order")
+            .0;
+        let verifier = MdnIndex::for_verification(root.path()).expect("verifier");
+        let mut cursor = verifier
+            .frozen_documents(&reference, CancellationToken::new())
+            .await
+            .expect("fresh proof");
+        let (mut actual, mut has_more) = cursor.next_page(1).await.expect("first page");
+        assert!(has_more);
+        // An operation retains its verified descriptor/readers. A different
+        // verification operation must independently detect the damaged parent.
+        let parent = root
+            .path()
+            .join(first["path"].as_str().expect("parent path"));
+        fs::write(parent, b"corrupt parent manifest").expect("damage");
+        while has_more {
+            let (page, more) = cursor.next_page(1).await.expect("retained proof");
+            actual.extend(page);
+            has_more = more;
+        }
+        assert_eq!(actual, expected);
+        assert!(
+            verifier
+                .frozen_documents(&reference, CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_cursor_large_pages_cross_shards_without_replaying_or_losing_postings() {
+        let _gate = TEST_GATE.lock().await;
+        let root = tempfile::tempdir_in("/tmp").expect("temp");
+        let index = MdnIndex::new(root.path()).expect("index");
+        let documents = (0..1005)
+            .map(|number| {
+                doc(
+                    &format!("posting-{number}"),
+                    &format!("Page{number}"),
+                    "source",
+                )
+            })
+            .collect::<Vec<_>>();
+        let ids = documents
+            .iter()
+            .map(|document| document.id.clone())
+            .collect::<BTreeSet<_>>();
+        let first = index
+            .publish(None, documents[..503].to_vec(), CancellationToken::new())
+            .await
+            .expect("first shard");
+        let reference = index
+            .publish(
+                Some(&first),
+                documents[503..].to_vec(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second shard");
+        let mut expected = index
+            .document_ids(&reference, 0, 1000, CancellationToken::new())
+            .await
+            .expect("first old page")
+            .0;
+        expected.extend(
+            index
+                .document_ids(&reference, expected.len(), 1000, CancellationToken::new())
+                .await
+                .expect("last old page")
+                .0,
+        );
+        let verifier = MdnIndex::for_verification(root.path()).expect("verifier");
+        for limit in [100, 1000] {
+            let mut cursor = verifier
+                .frozen_documents(&reference, CancellationToken::new())
+                .await
+                .expect("cursor");
+            let mut actual = Vec::new();
+            loop {
+                let (page, more) = cursor.next_page(limit).await.expect("page");
+                assert!(page.len() <= limit);
+                actual.extend(page);
+                if !more {
+                    break;
+                }
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), ids.len());
+            assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), ids);
+        }
+    }
+
+    #[test]
+    fn frozen_cursor_dropped_inflight_page_cannot_resume_or_retain_readers() {
+        use std::{future::Future as _, task::Poll};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let _gate = TEST_GATE.lock().await;
+            let root = tempfile::tempdir_in("/tmp").expect("temp");
+            let id = hash(b"abandoned page");
+            let mut cursor = raw_cursor(root.path(), &[(&id, json!({"id":id}).to_string())], None);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).expect("entered");
+                release_rx.recv().expect("release");
+            });
+            entered_rx.recv().expect("blocking worker occupied");
+            let mut page = Box::pin(cursor.next_page(1));
+            std::future::poll_fn(|context| {
+                assert!(page.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(page);
+            assert!(cursor.state.is_none());
+            assert!(cursor.next_page(1).await.is_err());
+            release_tx.send(()).expect("release worker");
+            blocker.await.expect("blocker");
+            // Both permits become available only after the canceled queued page
+            // drops its owned state; no detached worker may retain a session.
+            let permits = tokio::time::timeout(
+                Duration::from_secs(5),
+                READERS
+                    .get()
+                    .expect("readers")
+                    .clone()
+                    .acquire_many_owned(2),
+            )
+            .await
+            .expect("canceled page released readers")
+            .expect("permits");
+            drop(permits);
+        });
+    }
+
+    #[tokio::test]
+    async fn frozen_cursor_empty_bounds_cancel_deadline_and_reader_release() {
+        let _gate = TEST_GATE.lock().await;
+        let root = tempfile::tempdir_in("/tmp").expect("temp");
+        let index = MdnIndex::new(root.path()).expect("index");
+        let reference = index
+            .publish(None, Vec::new(), CancellationToken::new())
+            .await
+            .expect("empty");
+        let mut empty = index
+            .frozen_documents(&reference, CancellationToken::new())
+            .await
+            .expect("cursor");
+        assert_eq!(
+            empty.next_page(1).await.expect("empty page"),
+            (Vec::new(), false)
+        );
+        let mut invalid = index
+            .frozen_documents(&reference, CancellationToken::new())
+            .await
+            .expect("cursor");
+        assert_eq!(
+            invalid.next_page(1001).await.expect_err("bound").code,
+            "invalid_input"
+        );
+        assert!(invalid.next_page(1).await.is_err());
+        let mut expired = index
+            .frozen_documents(&reference, CancellationToken::new())
+            .await
+            .expect("cursor");
+        expired.state.as_mut().expect("state").first_deadline = Some(Instant::now());
+        assert_eq!(
+            expired.next_page(1).await.expect_err("deadline").code,
+            "capacity"
+        );
+        assert!(expired.next_page(1).await.is_err());
+        let cancel = CancellationToken::new();
+        let mut canceled = index
+            .frozen_documents(&reference, cancel.clone())
+            .await
+            .expect("cursor");
+        cancel.cancel();
+        assert_eq!(
+            canceled.next_page(1).await.expect_err("cancel").code,
+            "cancelled"
+        );
+        drop(canceled);
+        let held = index
+            .frozen_documents(&reference, CancellationToken::new())
+            .await
+            .expect("held");
+        let held_two = index
+            .frozen_documents(&reference, CancellationToken::new())
+            .await
+            .expect("held two");
+        assert!(
+            index
+                .frozen_documents(&reference, CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let stop = held.cancel.clone();
+        drop(held);
+        assert!(stop.is_cancelled());
+        drop(held_two);
+        assert!(
+            index
+                .frozen_documents(&reference, CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_cursor_skips_deleted_documents_and_closes_after_payload_failure() {
+        let _gate = TEST_GATE.lock().await;
+        let root = tempfile::tempdir_in("/tmp").expect("temp");
+        let ids = [hash(b"kept one"), hash(b"deleted"), hash(b"kept two")];
+        let payloads = ids
+            .iter()
+            .map(|id| (id.as_str(), json!({"id":id}).to_string()))
+            .collect::<Vec<_>>();
+        let mut cursor = raw_cursor(root.path(), &payloads, Some(&ids[1]));
+        let mut actual = Vec::new();
+        loop {
+            let (page, more) = cursor.next_page(1).await.expect("live posting");
+            actual.extend(page);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(
+            actual.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([ids[0].clone(), ids[2].clone()])
+        );
+        let bad_root = tempfile::tempdir_in("/tmp").expect("temp");
+        let mut bad = raw_cursor(
+            bad_root.path(),
+            &[(
+                &ids[0],
+                json!({"id":ids[0], "padding":"x".repeat(128 * 1024)}).to_string(),
+            )],
+            None,
+        );
+        assert_eq!(
+            bad.next_page(1).await.expect_err("oversized payload").code,
+            "capacity"
+        );
+        assert!(bad.next_page(1).await.is_err());
+        let corrupt_root = tempfile::tempdir_in("/tmp").expect("temp");
+        let mut corrupt = raw_cursor(
+            corrupt_root.path(),
+            &[(&ids[0], json!({"id":"invalid"}).to_string())],
+            None,
+        );
+        assert_eq!(
+            corrupt
+                .next_page(1)
+                .await
+                .expect_err("invalid payload identity")
+                .code,
+            "integrity"
+        );
+        assert!(corrupt.next_page(1).await.is_err());
+    }
+
     fn doc(id: &str, slug: &str, text: &str) -> IndexDocument {
         IndexDocument {
             id: hash(id.as_bytes()),

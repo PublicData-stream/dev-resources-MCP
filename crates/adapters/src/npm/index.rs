@@ -106,6 +106,14 @@ fn document(input: IndexDocument) -> Result<mdn_index::IndexDocument> {
         metadata: Value::Object(metadata),
     })
 }
+pub(crate) struct FrozenDocuments {
+    inner: mdn_index::FrozenDocuments,
+}
+impl FrozenDocuments {
+    pub(crate) async fn next_page(&mut self, limit: usize) -> Result<(Vec<String>, bool)> {
+        self.inner.next_page(limit).await.map_err(provider_error)
+    }
+}
 #[derive(Clone)]
 pub struct NpmIndex {
     inner: MdnIndex,
@@ -138,6 +146,19 @@ impl NpmIndex {
     }
     pub fn recover_stages(&self) -> Result<()> {
         self.inner.recover_stages().map_err(provider_error)
+    }
+    pub(crate) async fn frozen_documents(
+        &self,
+        index: &Value,
+        cancel: CancellationToken,
+    ) -> Result<FrozenDocuments> {
+        Ok(FrozenDocuments {
+            inner: self
+                .inner
+                .frozen_documents(&reference(index, false)?, cancel)
+                .await
+                .map_err(provider_error)?,
+        })
     }
     /// Bounded exact-posting export for offline migration of a frozen generation.
     pub async fn document_ids(

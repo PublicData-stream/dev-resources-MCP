@@ -49,6 +49,8 @@ const MAX_MANIFEST: usize = 2 * 1024 * 1024;
 static IDS: AtomicU64 = AtomicU64::new(0);
 static WRITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static READERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+#[cfg(test)]
+static OPEN_COUNTS: Mutex<BTreeMap<PathBuf, (u64, u64)>> = Mutex::new(BTreeMap::new());
 
 fn unavailable() -> Error {
     Error::unavailable("Crate search index unavailable.")
@@ -899,10 +901,20 @@ fn open(
     real_directory(&base)?;
     let directory = base.join(id);
     real_directory(&directory)?;
+    #[cfg(test)]
+    {
+        let mut counts = OPEN_COUNTS.lock().map_err(|_| unavailable())?;
+        counts.entry(directory.clone()).or_default().0 += 1;
+    }
     let key = format!("{}:{expected}", directory.display());
     let cache = CACHE.get_or_init(|| Mutex::new(ReaderCache::default()));
     if let Some(opened) = cache.lock().map_err(|_| unavailable())?.get(&key) {
         return Ok(opened);
+    }
+    #[cfg(test)]
+    {
+        let mut counts = OPEN_COUNTS.lock().map_err(|_| unavailable())?;
+        counts.entry(directory.clone()).or_default().1 += 1;
     }
     let path = directory.join("manifest.json");
     let meta = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
@@ -1005,7 +1017,6 @@ fn open(
 }
 
 pub(crate) type PayloadRewrite = Arc<dyn Fn(&mut Value) -> Result<()> + Send + Sync>;
-type FrozenDocumentPage = (Vec<(Value, String)>, Option<usize>);
 
 fn from_frozen_payload(payload: Value, text: String) -> Result<IndexDocument> {
     let class = payload["class"].as_str().ok_or_else(integrity)?;
@@ -1102,8 +1113,7 @@ pub(crate) async fn rebuild_frozen(
         .try_acquire_owned()
         .map_err(|_| capacity())?;
     let mut task = tokio::task::spawn_blocking(move || {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        open(&root, &reference, &stop, deadline)?;
+        let mut reader = FrozenDocuments::open(&root, &reference, &stop)?;
         let source = root.join(reference["path"].as_str().ok_or_else(integrity)?);
         let bytes = fs::read(source.join("manifest.json")).map_err(|_| unavailable())?;
         if bytes.len() > MAX_MANIFEST {
@@ -1111,10 +1121,9 @@ pub(crate) async fn rebuild_frozen(
         }
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
         let mut builder = Builder::begin(&root, owner, stop.clone(), permit)?;
-        let mut after = 0;
         loop {
             check(&stop, Instant::now() + Duration::from_secs(15))?;
-            let (documents, next) = export_documents(&root, &reference, after, 1000, &stop)?;
+            let (documents, has_more) = reader.next_page(1000)?;
             for (mut payload, text) in documents {
                 rewrite(&mut payload)?;
                 if !builder.add(from_frozen_payload(payload, text)?)? {
@@ -1123,9 +1132,8 @@ pub(crate) async fn rebuild_frozen(
                     ));
                 }
             }
-            match next {
-                Some(next) => after = next,
-                None => break,
+            if !has_more {
+                break;
             }
         }
         builder.gap_samples = manifest.gap_samples;
@@ -1176,72 +1184,179 @@ pub(crate) async fn rebuild_frozen(
     tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "Crate migration canceled.")) }, result = &mut task => result.map_err(|_| unavailable())? }
 }
 
-/// Export exact retained payload and indexed text for an offline frozen rebuild.
-/// The caller owns the maintenance fence and executes this on a blocking worker.
-pub(crate) fn export_documents(
-    root: &Path,
-    reference: &Value,
-    after: usize,
-    limit: usize,
-    cancel: &CancellationToken,
-) -> Result<FrozenDocumentPage> {
-    if !(1..=1000).contains(&limit) {
-        return Err(Error::invalid("Invalid crate index export page."));
+/// One immutable generation consumed under the caller's maintenance fence.
+/// Keep the verified readers and forward position across blocking page workers;
+/// restarting a page would repeat both opening and traversal of its prefix.
+pub(crate) struct FrozenDocuments {
+    opened: Arc<Opened>,
+    payload_field: Field,
+    text_field: Field,
+    shard: usize,
+    next_segment: usize,
+    segment_id: u32,
+    documents: std::vec::IntoIter<u32>,
+    admitted_documents: usize,
+    pending: Option<FrozenDocument>,
+    first_page_deadline: Option<Instant>,
+    failed: bool,
+    cancel: CancellationToken,
+    _permit: OwnedSemaphorePermit,
+    #[cfg(test)]
+    visited_documents: usize,
+}
+
+struct FrozenDocument {
+    payload: Value,
+    text: String,
+    // Preserve the original serialized payload size, rather than reserializing
+    // its Value and changing the retained export's byte accounting.
+    bytes: usize,
+}
+
+type FrozenDocumentPage = (Vec<(Value, String)>, bool);
+
+impl FrozenDocuments {
+    pub(crate) fn open(root: &Path, reference: &Value, cancel: &CancellationToken) -> Result<Self> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        check(cancel, deadline)?;
+        let permit = READERS
+            .get_or_init(|| Arc::new(Semaphore::new(2)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| capacity())?;
+        let opened = open(root, reference, cancel, deadline)?;
+        let schema = schema();
+        let payload_field = field(&schema, "payload")?;
+        let text_field = field(&schema, "technical")?;
+        check(cancel, deadline)?;
+        Ok(Self {
+            opened,
+            payload_field,
+            text_field,
+            shard: 0,
+            next_segment: 0,
+            segment_id: 0,
+            documents: Vec::new().into_iter(),
+            admitted_documents: 0,
+            pending: None,
+            first_page_deadline: Some(deadline),
+            failed: false,
+            cancel: cancel.clone(),
+            _permit: permit,
+            #[cfg(test)]
+            visited_documents: 0,
+        })
     }
-    let _permit = READERS
-        .get_or_init(|| Arc::new(Semaphore::new(2)))
-        .try_acquire()
-        .map_err(|_| capacity())?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let opened = open(root, reference, cancel, deadline)?;
-    let s = schema();
-    let payload_field = field(&s, "payload")?;
-    let text_field = field(&s, "technical")?;
-    let mut position = 0usize;
-    let mut bytes = 0usize;
-    let mut output = Vec::new();
-    for searcher in &opened.searchers {
-        for (segment_id, segment) in searcher.segment_readers().iter().enumerate() {
-            for document in segment.doc_ids_alive() {
-                check(cancel, deadline)?;
-                if position < after {
-                    position = position.checked_add(1).ok_or_else(capacity)?;
+
+    fn next_document(&mut self, deadline: Instant) -> Result<Option<FrozenDocument>> {
+        loop {
+            check(&self.cancel, deadline)?;
+            let Some(document) = self.documents.next() else {
+                let Some(searcher) = self.opened.searchers.get(self.shard) else {
+                    return Ok(None);
+                };
+                let Some(segment) = searcher.segment_readers().get(self.next_segment) else {
+                    self.shard += 1;
+                    self.next_segment = 0;
+                    self.admitted_documents = 0;
                     continue;
+                };
+                self.segment_id = u32::try_from(self.next_segment).map_err(|_| integrity())?;
+                self.next_segment += 1;
+                // Only one segment's live IDs are retained, bounded cumulatively
+                // per shard. Do not scan max_doc's potentially deleted prefix.
+                let mut documents = Vec::new();
+                for document in segment.doc_ids_alive() {
+                    check(&self.cancel, deadline)?;
+                    if self.admitted_documents >= MAX_DOCS {
+                        return Err(integrity());
+                    }
+                    self.admitted_documents += 1;
+                    documents.push(document);
                 }
-                if output.len() == limit {
-                    return Ok((output, Some(position)));
-                }
-                let stored: TantivyDocument = searcher
-                    .doc(tantivy::DocAddress::new(segment_id as u32, document))
-                    .map_err(|_| integrity())?;
-                let payload = stored
-                    .get_first(payload_field)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(integrity)?;
-                let text = stored
-                    .get_first(text_field)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(integrity)?;
-                let size = payload.len().checked_add(text.len()).ok_or_else(capacity)?;
-                if size > 16 * 1024 * 1024 {
-                    return Err(capacity());
-                }
-                if !output.is_empty() && bytes.saturating_add(size) > 16 * 1024 * 1024 {
-                    return Ok((output, Some(position)));
-                }
-                let value: Value = serde_json::from_str(payload).map_err(|_| integrity())?;
-                output.push((value, text.to_owned()));
-                bytes += size;
-                position = position.checked_add(1).ok_or_else(capacity)?;
+                check(&self.cancel, deadline)?;
+                self.documents = documents.into_iter();
+                continue;
+            };
+            let searcher = self
+                .opened
+                .searchers
+                .get(self.shard)
+                .ok_or_else(integrity)?;
+            #[cfg(test)]
+            {
+                self.visited_documents += 1;
             }
+            let stored: TantivyDocument = searcher
+                .doc(tantivy::DocAddress::new(self.segment_id, document))
+                .map_err(|_| integrity())?;
+            let payload = stored
+                .get_first(self.payload_field)
+                .and_then(|v| v.as_str())
+                .ok_or_else(integrity)?;
+            let text = stored
+                .get_first(self.text_field)
+                .and_then(|v| v.as_str())
+                .ok_or_else(integrity)?;
+            let bytes = payload.len().checked_add(text.len()).ok_or_else(capacity)?;
+            if bytes > 16 * 1024 * 1024 {
+                return Err(capacity());
+            }
+            return Ok(Some(FrozenDocument {
+                payload: serde_json::from_str(payload).map_err(|_| integrity())?,
+                text: text.to_owned(),
+                bytes,
+            }));
         }
     }
-    if after > position {
-        return Err(Error::invalid(
-            "Crate export cursor exceeds retained membership.",
-        ));
+
+    /// Returns exact retained rows and whether another row remains. An empty
+    /// generation returns (empty, false) on its first page.
+    pub(crate) fn next_page(&mut self, limit: usize) -> Result<FrozenDocumentPage> {
+        if self.failed {
+            return Err(integrity());
+        }
+        let result = self.read_page(limit);
+        self.failed = result.is_err();
+        result
     }
-    Ok((output, None))
+
+    fn read_page(&mut self, limit: usize) -> Result<FrozenDocumentPage> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::invalid("Invalid crate index export page."));
+        }
+        // Initial verification and first-page work share the original budget;
+        // subsequent pages retain separate bounds, not a generation-wide timer.
+        let deadline = self
+            .first_page_deadline
+            .take()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
+        let mut bytes = 0usize;
+        let mut output = Vec::new();
+        while output.len() < limit {
+            check(&self.cancel, deadline)?;
+            let document = match self.pending.take() {
+                Some(document) => Some(document),
+                None => self.next_document(deadline)?,
+            };
+            let Some(document) = document else {
+                break;
+            };
+            if !output.is_empty() && bytes.saturating_add(document.bytes) > 16 * 1024 * 1024 {
+                self.pending = Some(document);
+                break;
+            }
+            bytes += document.bytes;
+            output.push((document.payload, document.text));
+        }
+        if self.pending.is_none() {
+            // One bounded lookahead distinguishes an exact final full page from
+            // a continuation across deleted segments or shard boundaries.
+            self.pending = self.next_document(deadline)?;
+        }
+        check(&self.cancel, deadline)?;
+        Ok((output, self.pending.is_some()))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1761,3 +1876,446 @@ pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) static TEST_BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+mod frozen_tests {
+    use super::*;
+
+    type RetainedRows = BTreeMap<String, (Value, String)>;
+
+    fn document(number: usize, text: String) -> IndexDocument {
+        from_frozen_payload(
+            json!({
+                "class":"version",
+                "record":{
+                    "name":format!("fixture{number:05}"),
+                    "version":"1.0.0",
+                    "metadata_capture":hash(format!("capture {number}").as_bytes()),
+                    "record":{"yanked":false}
+                },
+                "enrichment":{}
+            }),
+            text,
+        )
+        .unwrap()
+    }
+
+    fn builder(root: &Path, store: Arc<tests::FixtureStore>) -> Builder {
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        Builder::begin(root, store, CancellationToken::new(), permit).unwrap()
+    }
+
+    fn counts(root: &Path, reference: &Value) -> (u64, u64) {
+        OPEN_COUNTS
+            .lock()
+            .unwrap()
+            .get(&root.join(reference["path"].as_str().unwrap()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn retained_rows(
+        root: &Path,
+        reference: &Value,
+        page_size: usize,
+    ) -> (RetainedRows, usize, usize) {
+        let mut reader = FrozenDocuments::open(root, reference, &CancellationToken::new()).unwrap();
+        let mut result = BTreeMap::new();
+        let mut pages = 0;
+        loop {
+            let (rows, has_more) = reader.next_page(page_size).unwrap();
+            pages += 1;
+            assert!(!has_more || !rows.is_empty());
+            for (payload, text) in rows {
+                let name = payload["record"]["name"].as_str().unwrap().to_owned();
+                assert!(result.insert(name, (payload, text)).is_none());
+            }
+            if !has_more {
+                break;
+            }
+        }
+        (result, reader.visited_documents, pages)
+    }
+
+    #[tokio::test]
+    async fn frozen_rebuild_opens_once_and_preserves_multishard_rows_deletions_and_gaps() {
+        let _serial = TEST_BUILD.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = tests::fixture();
+        let mut snapshot = store.snapshot.lock().unwrap().clone();
+        let mut builder = builder(root.path(), store.clone());
+        builder.document_limit = 600;
+        let mut expected = BTreeMap::new();
+        for number in 1..=2507 {
+            let input = document(number, format!("original retained transport {number}"));
+            expected.insert(
+                input.identity.name.clone(),
+                (input.payload.clone(), input.text.clone()),
+            );
+            assert!(builder.add(input).unwrap());
+            if number % 200 == 0 {
+                builder.writer.as_mut().unwrap().commit().unwrap();
+            }
+            if number == 300 {
+                builder
+                    .writer
+                    .as_ref()
+                    .unwrap()
+                    .delete_term(Term::from_field_text(
+                        field(&schema(), "name").unwrap(),
+                        "fixture00001",
+                    ));
+                builder.documents -= 1;
+                expected.remove("fixture00001");
+            }
+        }
+        assert!(
+            !builder
+                .add(document(99999, "a".repeat(MAX_TOKEN_LEN)))
+                .unwrap()
+        );
+        let original = builder.finish(&snapshot).unwrap();
+        assert!(original["shards"].as_u64().unwrap() > 1);
+        let before = counts(root.path(), &original);
+        snapshot.id = hash(b"canonical multishard frozen fixture");
+        snapshot.inventory.id = hash(b"canonical multishard fixture inventory");
+        let rewrite: PayloadRewrite = Arc::new(|payload| {
+            if let Some(capture) = payload["record"]["metadata_capture"].as_str() {
+                payload["record"]["metadata_capture"] = json!(hash(capture.as_bytes()));
+            }
+            Ok(())
+        });
+        let started = Instant::now();
+        let rebuilt = rebuild_frozen(
+            store.clone(),
+            root.path().to_owned(),
+            original.clone(),
+            snapshot.clone(),
+            rewrite.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        let after = counts(root.path(), &original);
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+        let (source, visited, pages) = retained_rows(root.path(), &original, 237);
+        assert_eq!(source, expected);
+        assert_eq!(visited, expected.len());
+        assert!(pages > 2);
+        for (payload, _) in expected.values_mut() {
+            rewrite(payload).unwrap();
+        }
+        let (retained, visited, _) = retained_rows(root.path(), &rebuilt, 237);
+        assert_eq!(retained, expected);
+        assert_eq!(visited, expected.len());
+        assert_eq!(rebuilt["skipped_documents"], 1);
+        assert_eq!(rebuilt["gap_samples"], original["gap_samples"]);
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join(original["path"].as_str().unwrap())
+                    .join("gaps.ndjson")
+            )
+            .unwrap(),
+            fs::read(
+                root.path()
+                    .join(rebuilt["path"].as_str().unwrap())
+                    .join("gaps.ndjson")
+            )
+            .unwrap(),
+        );
+        let before = counts(root.path(), &original);
+        let started = Instant::now();
+        let replay = rebuild_frozen(
+            store,
+            root.path().to_owned(),
+            original.clone(),
+            snapshot,
+            rewrite,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let replay_elapsed = started.elapsed();
+        let after = counts(root.path(), &original);
+        let replay_verifications = after.1 - before.1;
+        assert_eq!(after.0 - before.0, 1);
+        // The existing bounded cache can evict this generation while other
+        // fixture readers run. A cursor still opens and verifies at most once.
+        assert!(replay_verifications <= 1);
+        assert_eq!(retained_rows(root.path(), &replay, 1000).0, expected);
+        eprintln!(
+            "Crate frozen fixture: {} live rows, {pages} pages; rebuild {elapsed:?}, replay {replay_elapsed:?}; cold open/verification 1/1, replay open/verification 1/{replay_verifications}; exactly {} visits per full cursor",
+            expected.len(),
+            expected.len(),
+        );
+    }
+
+    #[test]
+    fn frozen_byte_pages_keep_pending_rows_and_reader_admission() {
+        let _serial = TEST_BUILD.blocking_lock();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = tests::fixture();
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let mut builder = builder(root.path(), store);
+        let text = format!("transport{}", " ".repeat(MAX_TEXT - 10));
+        for number in 1..=5 {
+            assert!(builder.add(document(number, text.clone())).unwrap());
+        }
+        let reference = builder.finish(&snapshot).unwrap();
+        let stop = CancellationToken::new();
+        let mut reader = FrozenDocuments::open(root.path(), &reference, &stop).unwrap();
+        let (first, more) = reader.next_page(1000).unwrap();
+        assert!(more);
+        assert_eq!(first.len(), 3);
+        assert_eq!(reader.visited_documents, 4);
+        let bytes: usize = first
+            .iter()
+            .map(|(payload, text)| serde_json::to_vec(payload).unwrap().len() + text.len())
+            .sum();
+        assert!(bytes <= 16 * 1024 * 1024);
+        let (last, more) = reader.next_page(1000).unwrap();
+        assert!(!more);
+        assert_eq!(last.len(), 2);
+        assert_eq!(reader.visited_documents, 5);
+        assert!(
+            first
+                .iter()
+                .chain(&last)
+                .all(|(_, retained)| retained == &text)
+        );
+        assert_eq!(
+            first
+                .into_iter()
+                .chain(last)
+                .map(|(payload, _)| payload["record"]["name"].as_str().unwrap().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            5
+        );
+        assert_eq!(reader.next_page(1000).unwrap(), (Vec::new(), false));
+        let second = FrozenDocuments::open(root.path(), &reference, &stop).unwrap();
+        assert_eq!(
+            FrozenDocuments::open(root.path(), &reference, &stop)
+                .err()
+                .unwrap()
+                .code,
+            "capacity"
+        );
+        drop(second);
+        drop(reader);
+        assert_eq!(READERS.get().unwrap().available_permits(), 2);
+    }
+
+    #[test]
+    fn frozen_cancellation_deadlines_empty_and_terminal_errors_are_bounded() {
+        let _serial = TEST_BUILD.blocking_lock();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = tests::fixture();
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let empty = builder(root.path(), store.clone())
+            .finish(&snapshot)
+            .unwrap();
+        let mut reader =
+            FrozenDocuments::open(root.path(), &empty, &CancellationToken::new()).unwrap();
+        assert_eq!(reader.next_page(1).unwrap(), (Vec::new(), false));
+        assert_eq!(reader.visited_documents, 0);
+        drop(reader);
+        let mut builder = builder(root.path(), store);
+        for number in 1..=3 {
+            assert!(
+                builder
+                    .add(document(number, "retained transport".into()))
+                    .unwrap()
+            );
+        }
+        let reference = builder.finish(&snapshot).unwrap();
+        let stop = CancellationToken::new();
+        let mut reader = FrozenDocuments::open(root.path(), &reference, &stop).unwrap();
+        assert_eq!(reader.next_page(1).unwrap().0.len(), 1);
+        assert_eq!(
+            reader.visited_documents, 2,
+            "bounded continuation lookahead"
+        );
+        stop.cancel();
+        assert_eq!(reader.next_page(1).unwrap_err().code, "cancelled");
+        assert_eq!(reader.visited_documents, 2);
+        assert_eq!(reader.next_page(1).unwrap_err().code, "integrity");
+        drop(reader);
+        assert_eq!(
+            FrozenDocuments::open(root.path(), &Value::Null, &stop)
+                .err()
+                .unwrap()
+                .code,
+            "cancelled"
+        );
+        let mut reader =
+            FrozenDocuments::open(root.path(), &reference, &CancellationToken::new()).unwrap();
+        reader.first_page_deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(reader.next_page(1).unwrap_err().code, "capacity");
+        assert_eq!(reader.visited_documents, 0);
+        assert_eq!(reader.next_page(1).unwrap_err().code, "integrity");
+        drop(reader);
+        for limit in [0, 1001] {
+            let mut reader =
+                FrozenDocuments::open(root.path(), &reference, &CancellationToken::new()).unwrap();
+            assert_eq!(reader.next_page(limit).unwrap_err().code, "invalid_input");
+        }
+    }
+
+    #[test]
+    fn frozen_open_rejects_manifest_and_shard_corruption_before_rows() {
+        let _serial = TEST_BUILD.blocking_lock();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = tests::fixture();
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        for name in ["manifest.json", "shard-0000/meta.json"] {
+            let mut builder = builder(root.path(), store.clone());
+            builder
+                .add(document(1, "retained transport".into()))
+                .unwrap();
+            let reference = builder.finish(&snapshot).unwrap();
+            let path = root
+                .path()
+                .join(reference["path"].as_str().unwrap())
+                .join(name);
+            fs::write(path, b"corrupt retained bytes").unwrap();
+            assert_eq!(
+                FrozenDocuments::open(root.path(), &reference, &CancellationToken::new())
+                    .err()
+                    .unwrap()
+                    .code,
+                "integrity"
+            );
+        }
+        assert_eq!(READERS.get().unwrap().available_permits(), 2);
+    }
+
+    fn qualify(root: &Path, path: &Path) {
+        let (digest, bytes) = crate::integrity::file_digest(
+            path,
+            MAX_SHARD,
+            Instant::now() + Duration::from_secs(15),
+        )
+        .unwrap();
+        let evidence = crate::integrity::FileEvidence {
+            version: 1,
+            path: path.strip_prefix(root).unwrap().to_str().unwrap().into(),
+            digest,
+            bytes,
+        };
+        let descriptor = crate::integrity::evidence_path(root, path).unwrap();
+        fs::write(descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn frozen_legacy_cursor_requires_manifest_and_file_blake3_evidence() {
+        let _serial = TEST_BUILD.blocking_lock();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = tests::fixture();
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let mut builder = builder(root.path(), store);
+        builder
+            .add(document(1, "retained transport".into()))
+            .unwrap();
+        let mut reference = builder.finish(&snapshot).unwrap();
+        let directory = root.path().join(reference["path"].as_str().unwrap());
+        let path = directory.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["version"] = json!(1);
+        for shard in manifest["shards"].as_array_mut().unwrap() {
+            let name = shard["name"].as_str().unwrap().to_owned();
+            for (file, descriptor) in shard["files"].as_object_mut().unwrap() {
+                descriptor.as_object_mut().unwrap().remove("digest");
+                descriptor["sha256"] = json!(crate::integrity::legacy_hash(
+                    &fs::read(directory.join(&name).join(file)).unwrap()
+                ));
+            }
+        }
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        reference.as_object_mut().unwrap().remove("digest");
+        reference["sha256"] = json!(crate::integrity::legacy_hash(&bytes));
+        let stop = CancellationToken::new();
+        assert!(FrozenDocuments::open(root.path(), &reference, &stop).is_err());
+        qualify(root.path(), &path);
+        let metadata = directory.join("shard-0000/meta.json");
+        let evidence_path = crate::integrity::evidence_path(root.path(), &metadata).unwrap();
+        fs::remove_file(&evidence_path).unwrap();
+        assert!(FrozenDocuments::open(root.path(), &reference, &stop).is_err());
+        qualify(root.path(), &metadata);
+        let mut evidence: Value =
+            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        evidence["digest"] = json!(hash(b"wrong legacy proof"));
+        fs::write(&evidence_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        assert!(FrozenDocuments::open(root.path(), &reference, &stop).is_err());
+        qualify(root.path(), &metadata);
+        let mut reader = FrozenDocuments::open(root.path(), &reference, &stop).unwrap();
+        let (rows, has_more) = reader.next_page(1).unwrap();
+        assert!(!has_more);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "retained transport");
+    }
+
+    #[tokio::test]
+    async fn frozen_rebuild_cancellation_and_rewrite_errors_remove_unpublished_stages() {
+        let _serial = TEST_BUILD.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = tests::fixture();
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let mut builder = builder(root.path(), store.clone());
+        builder
+            .add(document(1, "retained transport".into()))
+            .unwrap();
+        let reference = builder.finish(&snapshot).unwrap();
+        let failed: PayloadRewrite =
+            Arc::new(|_| Err(Error::integrity("Fixture rewrite rejected.")));
+        assert_eq!(
+            rebuild_frozen(
+                store.clone(),
+                root.path().to_owned(),
+                reference.clone(),
+                snapshot.clone(),
+                failed,
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "integrity"
+        );
+        let stop = CancellationToken::new();
+        let trigger = stop.clone();
+        let cancel: PayloadRewrite = Arc::new(move |_| {
+            trigger.cancel();
+            Ok(())
+        });
+        assert_eq!(
+            rebuild_frozen(
+                store,
+                root.path().to_owned(),
+                reference.clone(),
+                snapshot,
+                cancel,
+                stop
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "cancelled"
+        );
+        assert!(
+            fs::read_dir(root.path().join("crate-indexes"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stage-"))
+        );
+        assert_eq!(retained_rows(root.path(), &reference, 1).0.len(), 1);
+        assert_eq!(WRITER.get().unwrap().available_permits(), 1);
+        assert_eq!(READERS.get().unwrap().available_permits(), 2);
+    }
+}

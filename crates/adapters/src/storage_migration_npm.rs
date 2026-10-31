@@ -319,14 +319,12 @@ impl PgBlobStore {
         mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Value> {
-        let mut after = 0;
+        let mut reader = index.frozen_documents(reference, cancel.clone()).await?;
         let mut rebuilt = None;
         let mut docs = Vec::new();
         let mut text_bytes = 0_usize;
         loop {
-            let (ids, next) = index
-                .document_ids(reference, after, 128, cancel.clone())
-                .await?;
+            let (ids, has_more) = reader.next_page(128).await?;
             for old in ids {
                 let row = self
                     .npm_get("documents", &old)
@@ -370,9 +368,8 @@ impl PgBlobStore {
                 text_bytes = text_bytes.saturating_add(doc.text.len());
                 docs.push(doc);
             }
-            match next {
-                Some(next) => after = next,
-                None => break,
+            if !has_more {
+                break;
             }
         }
         if !docs.is_empty() {

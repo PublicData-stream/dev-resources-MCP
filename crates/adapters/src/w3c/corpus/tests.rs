@@ -722,6 +722,7 @@ async fn full_version_bodies_live_outside_compact_catalog_and_inventory_replays(
 async fn large_licensed_raw_is_retained_beyond_projection_limit() {
     use crate::w3c::git::tests::serve_fixture;
     use axum::{Router, body::Body, routing::get};
+    let _gate = crate::mdn::index::TEST_GATE.lock().await;
     let app = Router::new().route(
         "/TR/example/large.txt",
         get(|| async {

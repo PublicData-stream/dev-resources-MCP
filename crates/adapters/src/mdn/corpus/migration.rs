@@ -478,14 +478,14 @@ impl MdnCorpus {
         mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Value> {
-        let mut offset = 0;
+        let mut reader = self
+            .index
+            .frozen_documents(reference, cancel.clone())
+            .await?;
         let mut canonical = None;
         loop {
             check(&cancel)?;
-            let (ids, next) = self
-                .index
-                .document_ids(reference, offset, 100, cancel.clone())
-                .await?;
+            let (ids, has_more) = reader.next_page(100).await?;
             let mut documents = Vec::new();
             for id in ids {
                 let canonical_id = mapped_role(mappings, "index-documents", &id)?;
@@ -501,9 +501,8 @@ impl MdnCorpus {
                     .publish(canonical.as_ref(), documents, cancel.clone())
                     .await?,
             );
-            match next {
-                Some(next) => offset = next,
-                None => break,
+            if !has_more {
+                break;
             }
         }
         canonical.ok_or_else(|| Error::integrity("MDN frozen index migration missing."))
@@ -1313,13 +1312,10 @@ impl MdnCorpus {
         Ok(())
     }
     async fn verify_frozen_index(&self, index: &Value, cancel: &CancellationToken) -> Result<()> {
-        let mut offset = 0;
+        let mut reader = self.index.frozen_documents(index, cancel.clone()).await?;
         loop {
             check(cancel)?;
-            let (ids, next) = self
-                .index
-                .document_ids(index, offset, 100, cancel.clone())
-                .await?;
+            let (ids, has_more) = reader.next_page(100).await?;
             let unique = ids
                 .iter()
                 .cloned()
@@ -1336,9 +1332,8 @@ impl MdnCorpus {
                     return Err(Error::integrity("Retained MDN posting payload mismatch."));
                 }
             }
-            match next {
-                Some(next) => offset = next,
-                None => break,
+            if !has_more {
+                break;
             }
         }
         Ok(())
