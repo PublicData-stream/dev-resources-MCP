@@ -146,6 +146,12 @@ ends; private full rebuild provides compaction. Failures can leave unreferenced 
 directories, never missing published archives. Derived indexes
 are rebuildable from captures; corruption fails explicitly.
 
+Offline RFC replay keeps one newly rebuilt and fully verified canonical generation
+as a migration-local prototype. Each use re-verifies the frozen source and prototype
+and publishes a distinct target with its own integrity evidence; resumed targets
+never seed this cache. Capture references retain exact scalar validation semantics
+inside the existing 100-representation owner-lock groups.
+
 Rsync imports run privately under the same ownership fence with serving stopped.
 They use separate source keys and import observations, never HTTP validation.
 Snapshots prefer HTTPS per representation and label lower-assurance fallback.

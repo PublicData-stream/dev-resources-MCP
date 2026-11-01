@@ -9,6 +9,10 @@ use sqlx::{Connection, Row, types::Json};
 
 const MAX_JSON: usize = 64 * 1024 * 1024;
 
+#[cfg(test)]
+#[path = "storage_snapshot_batch_tests.rs"]
+mod snapshot_batch_tests;
+
 fn kind_checked(kind: &str) -> Result<()> {
     if matches!(kind, "catalogue" | "errata") {
         Ok(())
@@ -109,6 +113,58 @@ async fn check_capture(connection: &mut sqlx::PgConnection, capture: &Capture) -
         .bind(&capture.id).bind(&capture.key).bind(&capture.source_url).bind(&capture.body_hash)
         .bind(&capture.media_type).bind(capture.retrieved_at)
         .fetch_one(connection).await.map_err(|_| storage_error())?;
+    if !matches {
+        return Err(Error::integrity(
+            "RFC projection references a different or missing capture",
+        ));
+    }
+    Ok(())
+}
+
+async fn check_captures(connection: &mut sqlx::PgConnection, captures: &[&Capture]) -> Result<()> {
+    if captures.is_empty() {
+        return Ok(());
+    }
+    for capture in captures {
+        capture_checked(capture)?;
+    }
+    let ids: Vec<_> = captures.iter().map(|capture| capture.id.as_str()).collect();
+    let keys: Vec<_> = captures
+        .iter()
+        .map(|capture| capture.key.as_str())
+        .collect();
+    let urls: Vec<_> = captures
+        .iter()
+        .map(|capture| capture.source_url.as_str())
+        .collect();
+    let bodies: Vec<_> = captures
+        .iter()
+        .map(|capture| capture.body_hash.as_str())
+        .collect();
+    let media: Vec<_> = captures
+        .iter()
+        .map(|capture| capture.media_type.as_str())
+        .collect();
+    let times: Vec<_> = captures
+        .iter()
+        .map(|capture| capture.retrieved_at)
+        .collect();
+    // Keep each requested occurrence, including duplicate capture IDs. A count
+    // of matching distinct rows would change the scalar check's semantics.
+    // IS NOT TRUE also rejects corrupt NULL fields rather than letting SQL's
+    // three-valued logic hide a mismatched representation.
+    let matches: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM UNNEST($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::bigint[]) AS requested(id,source_key,source_url,body_hash,media_type,retrieved_at) LEFT JOIN devres_captures AS retained ON retained.id=requested.id WHERE retained.id IS NULL OR (retained.source_key=requested.source_key AND retained.source_url=requested.source_url AND retained.body_hash=requested.body_hash AND retained.media_type=requested.media_type AND retained.retrieved_at=requested.retrieved_at) IS NOT TRUE)",
+    )
+    .bind(ids)
+    .bind(keys)
+    .bind(urls)
+    .bind(bodies)
+    .bind(media)
+    .bind(times)
+    .fetch_one(connection)
+    .await
+    .map_err(|_| storage_error())?;
     if !matches {
         return Err(Error::integrity(
             "RFC projection references a different or missing capture",
@@ -356,24 +412,35 @@ impl RfcCorpusStore for PgBlobStore {
         for batch in snapshot.documents.chunks(100) {
             let mut owner = self.owner.lock().await;
             owner.ping().await.map_err(|_| storage_error())?;
+            let mut captures = Vec::with_capacity(batch.len());
             for document in batch {
-                if !unique.insert((
+                let locally_valid = if !unique.insert((
                     document.number,
                     document.format.as_str(),
                     document.assurance.as_str(),
                 )) {
-                    return Err(Error::invalid("Duplicate RFC snapshot representation"));
+                    Err(Error::invalid("Duplicate RFC snapshot representation"))
+                } else {
+                    job_checked(&JobSpec {
+                        key: document.capture.key.clone(),
+                        number: document.number,
+                        format: document.format.clone(),
+                        source_url: document.capture.source_url.clone(),
+                        assurance: document.assurance.clone(),
+                        due_at: 0,
+                    })
+                    .and_then(|()| capture_checked(&document.capture))
+                };
+                if let Err(error) = locally_valid {
+                    // The scalar loop checked earlier captures before reaching
+                    // this local error. Preserve that failure priority without
+                    // issuing one database request per valid representation.
+                    check_captures(&mut owner, &captures).await?;
+                    return Err(error);
                 }
-                job_checked(&JobSpec {
-                    key: document.capture.key.clone(),
-                    number: document.number,
-                    format: document.format.clone(),
-                    source_url: document.capture.source_url.clone(),
-                    assurance: document.assurance.clone(),
-                    due_at: 0,
-                })?;
-                check_capture(&mut owner, &document.capture).await?;
+                captures.push(&document.capture);
             }
+            check_captures(&mut owner, &captures).await?;
         }
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
@@ -588,6 +655,7 @@ impl PgBlobStore {
             }
         }
         let mut after = 0_i64;
+        let mut index_cache = crate::rfc::index::MigrationRebuildCache::default();
         loop {
             migration_cancel(&cancel)?;
             let found=sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%' AND published_order>$1 ORDER BY published_order LIMIT 1")
@@ -621,11 +689,12 @@ impl PgBlobStore {
             snapshot.id = id.clone();
             if let Some(path) = original_index {
                 snapshot.index_path = Some(
-                    crate::rfc::index::rebuild_frozen(
+                    crate::rfc::index::rebuild_frozen_cached(
                         self.root.clone(),
                         path,
                         id.clone(),
                         cancel.child_token(),
+                        &mut index_cache,
                     )
                     .await?,
                 );

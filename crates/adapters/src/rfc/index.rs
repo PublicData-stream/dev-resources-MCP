@@ -203,6 +203,19 @@ fn digest(path: &Path, deadline: Instant) -> Result<FileDigest> {
     digest_with_algorithm(path, deadline, false)
 }
 fn digest_with_algorithm(path: &Path, deadline: Instant, legacy: bool) -> Result<FileDigest> {
+    let (canonical, sha256) = digest_both(path, deadline)?;
+    Ok(if legacy {
+        FileDigest {
+            bytes: canonical.bytes,
+            digest: sha256,
+        }
+    } else {
+        canonical
+    })
+}
+
+// Preserve the actual BLAKE3 digest from the same read that checks a legacy SHA.
+fn digest_both(path: &Path, deadline: Instant) -> Result<(FileDigest, String)> {
     let metadata = fs::symlink_metadata(path).map_err(|_| unavailable())?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_INDEX_BYTES
     {
@@ -229,14 +242,13 @@ fn digest_with_algorithm(path: &Path, deadline: Instant, legacy: bool) -> Result
     if bytes != metadata.len() {
         return Err(integrity());
     }
-    Ok(FileDigest {
-        bytes,
-        digest: if legacy {
-            hex::encode(hasher.finalize())
-        } else {
-            format!("blake3:{}", blake3.finalize().to_hex())
+    Ok((
+        FileDigest {
+            bytes,
+            digest: format!("blake3:{}", blake3.finalize().to_hex()),
         },
-    })
+        hex::encode(hasher.finalize()),
+    ))
 }
 
 fn index_files(path: &Path) -> Result<Vec<String>> {
@@ -262,7 +274,23 @@ fn index_files(path: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+#[derive(Clone, Copy)]
+struct VerifiedGeneration {
+    fingerprint: blake3::Hash,
+    manifest: blake3::Hash,
+    canonical: bool,
+}
+
+fn fingerprint_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 fn verify(path: &Path, deadline: Instant) -> Result<()> {
+    verify_generation(path, deadline).map(|_| ())
+}
+
+fn verify_generation(path: &Path, deadline: Instant) -> Result<VerifiedGeneration> {
     #[cfg(test)]
     {
         let mut counts = VERIFY_COUNTS.lock().map_err(|_| unavailable())?;
@@ -288,6 +316,17 @@ fn verify(path: &Path, deadline: Instant) -> Result<()> {
     if files.len() != manifest.files.len() {
         return Err(integrity());
     }
+    let mut fingerprint = blake3::Hasher::new();
+    fingerprint_part(&mut fingerprint, b"devres:rfc:frozen-rebuild:v1;tantivy:0.27.0;technical:simple+lower;english:simple+lower+stop-en+stem-en");
+    // Selected directories contain the canonical root and validated relative ID.
+    // Distinct roots/paths must never share a migration prototype by accident.
+    fingerprint_part(&mut fingerprint, path.as_os_str().as_encoded_bytes());
+    fingerprint_part(
+        &mut fingerprint,
+        &serde_json::to_vec(&schema()).map_err(|_| integrity())?,
+    );
+    let manifest_digest = blake3::hash(&bytes);
+    fingerprint_part(&mut fingerprint, manifest_digest.as_bytes());
     let mut total = 0_u64;
     for name in files {
         let expected = manifest.files.get(&name).ok_or_else(integrity)?;
@@ -299,20 +338,29 @@ fn verify(path: &Path, deadline: Instant) -> Result<()> {
         if !expected.digest.starts_with("blake3:") {
             crate::integrity::verify_legacy_file(&path.join(&name), deadline)?;
         }
-        let actual = digest_with_algorithm(
-            &path.join(name),
-            deadline,
-            !expected.digest.starts_with("blake3:"),
-        )?;
+        let (actual, sha256) = digest_both(&path.join(&name), deadline)?;
         total = total.saturating_add(actual.bytes);
         if total > MAX_INDEX_BYTES {
             return Err(Error::capacity("RFC index size limit exceeded."));
         }
-        if actual.bytes != expected.bytes || actual.digest != expected.digest {
+        let checked_digest = if expected.digest.starts_with("blake3:") {
+            &actual.digest
+        } else {
+            &sha256
+        };
+        if actual.bytes != expected.bytes || checked_digest != &expected.digest {
             return Err(integrity());
         }
+        fingerprint_part(&mut fingerprint, name.as_bytes());
+        fingerprint_part(&mut fingerprint, &actual.bytes.to_le_bytes());
+        fingerprint_part(&mut fingerprint, actual.digest.as_bytes());
     }
-    Ok(())
+    check_deadline(deadline)?;
+    Ok(VerifiedGeneration {
+        fingerprint: fingerprint.finalize(),
+        manifest: manifest_digest,
+        canonical: manifest.version == 2,
+    })
 }
 
 /// One writer holds at most one source at the call boundary; callers can load captures sequentially.
@@ -325,6 +373,7 @@ pub(crate) struct IndexBuilder {
     relative: String,
     numbers: BTreeSet<u32>,
     queued_bytes: usize,
+    base_generation: Option<VerifiedGeneration>,
     published: bool,
     _permit: SemaphorePermit<'static>,
 }
@@ -363,10 +412,14 @@ impl IndexBuilder {
         ));
         fs::create_dir(&stage).map_err(|_| unavailable())?;
         let prepared = (|| {
+            let mut base_generation = None;
             let index = match base {
                 Some(relative) => {
                     let source = selected_directory(root, relative)?;
-                    verify(&source, Instant::now() + Duration::from_secs(15))?;
+                    base_generation = Some(verify_generation(
+                        &source,
+                        Instant::now() + Duration::from_secs(15),
+                    )?);
                     for name in index_files(&source)? {
                         let from = source.join(&name);
                         let to = stage.join(&name);
@@ -414,10 +467,10 @@ impl IndexBuilder {
             // detached merge writes after cancellation releases the store fence.
             // Full rebuild is the explicit compaction path within file limits.
             writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
-            Ok((index, writer, numbers))
+            Ok((index, writer, numbers, base_generation))
         })();
         match prepared {
-            Ok((index, writer, numbers)) => Ok(Self {
+            Ok((index, writer, numbers, base_generation)) => Ok(Self {
                 storage_root: fs::canonicalize(root).map_err(|_| unavailable())?,
                 writer: Some(writer),
                 index,
@@ -426,6 +479,7 @@ impl IndexBuilder {
                 relative: format!("rfc-indexes/{suffix}"),
                 numbers,
                 queued_bytes: 0,
+                base_generation,
                 published: false,
                 _permit: permit,
             }),
@@ -760,12 +814,74 @@ fn query(field: Field, input: &str, mode: &str) -> Result<Box<dyn Query>> {
     )))
 }
 
+/// One fresh canonical prototype from this migration invocation. No open index,
+/// reader, writer, descriptors, or document map survives a call boundary.
+#[derive(Default)]
+pub(crate) struct MigrationRebuildCache {
+    entry: Option<MigrationPrototype>,
+    #[cfg(test)]
+    operations: [usize; 3],
+}
+
+struct MigrationPrototype {
+    source: blake3::Hash,
+    relative: String,
+    manifest: blake3::Hash,
+}
+
+enum RebuildOperation {
+    Built,
+    Reused,
+    Resumed,
+}
+
+fn frozen_membership(reader: &mut FrozenDocuments) -> Result<BTreeMap<u32, String>> {
+    let mut membership = BTreeMap::new();
+    loop {
+        let documents = reader.next_page(1000)?;
+        if documents.is_empty() {
+            break;
+        }
+        for document in documents {
+            if membership
+                .insert(
+                    document.number,
+                    crate::integrity::hash(document.text.as_bytes()),
+                )
+                .is_some()
+            {
+                return Err(integrity());
+            }
+        }
+    }
+    Ok(membership)
+}
+
 /// Rebuild exactly one frozen index generation using its original admitted text.
+/// Standalone callers intentionally cannot reuse prototypes across invocations.
+#[cfg(test)]
 pub(crate) async fn rebuild_frozen(
     root: PathBuf,
     relative: String,
     id: String,
     cancel: tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    rebuild_frozen_cached(
+        root,
+        relative,
+        id,
+        cancel,
+        &mut MigrationRebuildCache::default(),
+    )
+    .await
+}
+
+pub(crate) async fn rebuild_frozen_cached(
+    root: PathBuf,
+    relative: String,
+    id: String,
+    cancel: tokio_util::sync::CancellationToken,
+    cache: &mut MigrationRebuildCache,
 ) -> Result<String> {
     struct CancelOnDrop(tokio_util::sync::CancellationToken);
     impl Drop for CancelOnDrop {
@@ -775,54 +891,129 @@ pub(crate) async fn rebuild_frozen(
     }
     let stop = cancel.child_token();
     let _guard = CancelOnDrop(stop.clone());
+    // Any failed/canceled operation discards the receipt, rather than retaining
+    // a possibly incomplete or externally changed candidate for another call.
+    let previous = cache.entry.take();
     let mut task = tokio::task::spawn_blocking(move || {
         migration_cancel(&stop)?;
         let target = format!("rfc-indexes/{}", index_suffix(&id)?);
+        // Every snapshot rechecks the complete original generation, including
+        // independent legacy evidence and SHA, before considering a cache hit.
+        let mut original = FrozenDocuments::open(&root, &relative, &stop)?;
+        let source = original.generation.fingerprint;
         if root.join(&target).exists() {
-            let mut original = BTreeMap::new();
-            let mut retained = BTreeMap::new();
-            for (path, output) in [(&relative, &mut original), (&target, &mut retained)] {
-                let mut reader = FrozenDocuments::open(&root, path, &stop)?;
-                loop {
-                    let documents = reader.next_page(1000)?;
-                    if documents.is_empty() {
-                        break;
-                    }
-                    for document in documents {
-                        if output
-                            .insert(
-                                document.number,
-                                crate::integrity::hash(document.text.as_bytes()),
-                            )
-                            .is_some()
-                        {
-                            return Err(integrity());
-                        }
-                    }
-                }
-            }
-            migration_cancel(&stop)?;
-            if original != retained {
+            let original_membership = frozen_membership(&mut original)?;
+            drop(original);
+            let mut retained = FrozenDocuments::open(&root, &target, &stop)?;
+            if original_membership != frozen_membership(&mut retained)? {
                 return Err(integrity());
             }
-            return Ok(target);
+            migration_cancel(&stop)?;
+            // Number/text equivalence alone does not prove clean rebuild scoring
+            // statistics. An existing target can never seed a new prototype.
+            return Ok((target, previous, RebuildOperation::Resumed));
+        }
+        if let Some(prototype) = previous.filter(|entry| entry.source == source) {
+            drop(original);
+            // begin_from verifies all current prototype bytes, then copies only
+            // writable metadata and hardlinks the permanent immutable shards.
+            let builder = IndexBuilder::begin_from(&root, &id, Some(&prototype.relative))?;
+            let generation = builder.base_generation.ok_or_else(integrity)?;
+            if !generation.canonical || generation.manifest != prototype.manifest {
+                return Err(integrity());
+            }
+            #[cfg(test)]
+            migration_test_pause(&target)?;
+            migration_cancel(&stop)?;
+            let result = builder.finish()?;
+            migration_cancel(&stop)?;
+            return Ok((result, Some(prototype), RebuildOperation::Reused));
         }
         let mut builder = IndexBuilder::begin_from(&root, &id, None)?;
-        let mut reader = FrozenDocuments::open(&root, &relative, &stop)?;
+        let mut membership = BTreeMap::new();
         loop {
-            let documents = reader.next_page(1000)?;
+            let documents = original.next_page(1000)?;
             if documents.is_empty() {
                 break;
             }
             for document in documents {
                 migration_cancel(&stop)?;
+                if membership
+                    .insert(
+                        document.number,
+                        crate::integrity::hash(document.text.as_bytes()),
+                    )
+                    .is_some()
+                {
+                    return Err(integrity());
+                }
                 builder.add_document(document)?;
             }
         }
+        drop(original);
+        #[cfg(test)]
+        migration_test_pause(&target)?;
         migration_cancel(&stop)?;
-        builder.finish()
+        let result = builder.finish()?;
+        migration_cancel(&stop)?;
+        // Admit only this invocation's newly built, fully verified canonical
+        // output, with exact unique live number/text equivalence to the source.
+        let mut retained = FrozenDocuments::open(&root, &result, &stop)?;
+        if !retained.generation.canonical || membership != frozen_membership(&mut retained)? {
+            return Err(integrity());
+        }
+        migration_cancel(&stop)?;
+        let prototype = MigrationPrototype {
+            source,
+            relative: result.clone(),
+            manifest: retained.generation.manifest,
+        };
+        Ok((result, Some(prototype), RebuildOperation::Built))
     });
-    tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "RFC migration canceled.")) }, result = &mut task => result.map_err(|_| unavailable())? }
+    let (result, entry, _operation) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => { let _ = task.await; return Err(Error::new("cancelled", "RFC migration canceled.")); },
+        result = &mut task => result.map_err(|_| unavailable())??,
+    };
+    cache.entry = entry;
+    #[cfg(test)]
+    {
+        cache.operations[match _operation {
+            RebuildOperation::Built => 0,
+            RebuildOperation::Reused => 1,
+            RebuildOperation::Resumed => 2,
+        }] += 1;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+struct MigrationTestPause {
+    target: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+static MIGRATION_TEST_PAUSE: std::sync::Mutex<Option<MigrationTestPause>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+fn migration_test_pause(target: &str) -> Result<()> {
+    let pause = {
+        let mut hook = MIGRATION_TEST_PAUSE.lock().map_err(|_| unavailable())?;
+        if hook.as_ref().is_some_and(|pause| pause.target == target) {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        pause
+            .release
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(|_| unavailable())?;
+    }
+    Ok(())
 }
 
 fn migration_cancel(cancel: &tokio_util::sync::CancellationToken) -> Result<()> {
@@ -838,6 +1029,7 @@ fn migration_cancel(cancel: &tokio_util::sync::CancellationToken) -> Result<()> 
 /// reopening a page would rehash every shard and rescan the retained prefix.
 pub(crate) struct FrozenDocuments {
     _reader: tantivy::IndexReader,
+    generation: VerifiedGeneration,
     searcher: tantivy::Searcher,
     text_field: Field,
     number_field: Field,
@@ -865,7 +1057,7 @@ impl FrozenDocuments {
             .map_err(|_| Error::capacity("RFC index reader capacity exhausted."))?;
         let deadline = Instant::now() + Duration::from_secs(15);
         let path = selected_directory(root, relative)?;
-        verify(&path, deadline)?;
+        let generation = verify_generation(&path, deadline)?;
         migration_cancel(cancel)?;
         let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
         if index.schema() != schema() {
@@ -882,6 +1074,7 @@ impl FrozenDocuments {
         check_deadline(deadline)?;
         Ok(Self {
             _reader: reader,
+            generation,
             searcher,
             text_field,
             number_field,
@@ -1113,6 +1306,19 @@ mod tests {
         fs::write(descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
     }
 
+    fn retained_index_bytes(root: &Path, relative: &str) -> BTreeMap<String, Vec<u8>> {
+        let directory = root.join(relative);
+        let mut names = index_files(&directory).unwrap();
+        names.push(MANIFEST.to_owned());
+        names
+            .into_iter()
+            .map(|name| {
+                let bytes = fs::read(directory.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect()
+    }
+
     fn verification_count(root: &Path, relative: &str) -> u64 {
         let path = selected_directory(root, relative).unwrap();
         VERIFY_COUNTS
@@ -1311,6 +1517,1116 @@ mod tests {
             expected.len(),
             rebuild_elapsed,
             started.elapsed(),
+        );
+    }
+
+    async fn cached_fixture_rebuild(
+        root: &Path,
+        source: &str,
+        name: &[u8],
+        cache: &mut MigrationRebuildCache,
+    ) -> Result<String> {
+        rebuild_frozen_cached(
+            root.to_owned(),
+            source.to_owned(),
+            crate::integrity::hash(name),
+            tokio_util::sync::CancellationToken::new(),
+            cache,
+        )
+        .await
+    }
+
+    fn fixture_target(name: &[u8]) -> String {
+        format!(
+            "rfc-indexes/{}",
+            index_suffix(&crate::integrity::hash(name)).unwrap()
+        )
+    }
+
+    fn assert_migration_drained(root: &Path) {
+        assert_eq!(READERS.available_permits(), 2);
+        assert_eq!(WRITERS.available_permits(), 1);
+        assert!(
+            fs::read_dir(root.join("rfc-indexes"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stage-"))
+        );
+    }
+
+    fn replace_fixture_generation(root: &Path, destination: &str, source: &str) {
+        let retained = retained_index_bytes(root, source);
+        fs::remove_dir_all(root.join(destination)).unwrap();
+        fs::create_dir(root.join(destination)).unwrap();
+        for (name, bytes) in retained {
+            fs::write(root.join(destination).join(name), bytes).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_cache_reuses_fresh_outputs_and_evicts_one_entry() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"cache source"),
+            documents(&[(1, "secure transport cats"), (2, "secure transport dogs")]),
+        )
+        .unwrap();
+        let other = build(
+            root.path(),
+            &crate::integrity::hash(b"other source"),
+            documents(&[(3, "independent protocol")]),
+        )
+        .unwrap();
+        let mut cache = MigrationRebuildCache::default();
+        let prototype = cached_fixture_rebuild(root.path(), &source, b"cache first", &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cache.operations, [1, 0, 0]);
+        let before_bytes = retained_index_bytes(root.path(), &prototype);
+        let source_before = verification_count(root.path(), &source);
+        let prototype_before = verification_count(root.path(), &prototype);
+        let copied = cached_fixture_rebuild(root.path(), &source, b"cache hit", &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cache.operations, [1, 1, 0]);
+        assert_eq!(verification_count(root.path(), &source) - source_before, 1);
+        assert_eq!(
+            verification_count(root.path(), &prototype) - prototype_before,
+            1
+        );
+        assert_eq!(retained_index_bytes(root.path(), &prototype), before_bytes);
+        assert_ne!(copied, prototype);
+        assert_eq!(
+            frozen_text(root.path(), &copied),
+            frozen_text(root.path(), &prototype)
+        );
+        assert_eq!(
+            search(root.path(), &copied, "transport", TECHNICAL, 0, 1, None).unwrap(),
+            search(root.path(), &prototype, "transport", TECHNICAL, 0, 1, None).unwrap()
+        );
+        // Reuse preserves the existing immutable segment files themselves.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            for name in index_files(&root.path().join(&prototype)).unwrap() {
+                if name != "meta.json" && name != ".managed.json" {
+                    assert_eq!(
+                        fs::metadata(root.path().join(&prototype).join(&name))
+                            .unwrap()
+                            .ino(),
+                        fs::metadata(root.path().join(&copied).join(name))
+                            .unwrap()
+                            .ino()
+                    );
+                }
+            }
+        }
+        let old_source = cache.entry.as_ref().unwrap().source;
+        cached_fixture_rebuild(root.path(), &other, b"cache evict", &mut cache)
+            .await
+            .unwrap();
+        assert_ne!(cache.entry.as_ref().unwrap().source, old_source);
+        cached_fixture_rebuild(root.path(), &source, b"cache return", &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cache.operations, [3, 1, 0]);
+        assert_migration_drained(root.path());
+    }
+
+    #[tokio::test]
+    async fn migration_cache_never_seeds_from_resumed_deleted_postings() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"resume source"),
+            documents(&[(1, "retained transport"), (2, "retained protocol")]),
+        )
+        .unwrap();
+        let target_id = crate::integrity::hash(b"resume dirty target");
+        let mut dirty = IndexBuilder::begin(root.path(), &target_id).unwrap();
+        dirty
+            .add_document(IndexDocument {
+                number: 1,
+                text: "deleted old postings and statistics".into(),
+            })
+            .unwrap();
+        dirty
+            .add_document(IndexDocument {
+                number: 2,
+                text: "retained protocol".into(),
+            })
+            .unwrap();
+        dirty.writer.as_mut().unwrap().commit().unwrap();
+        dirty
+            .add_document(IndexDocument {
+                number: 1,
+                text: "retained transport".into(),
+            })
+            .unwrap();
+        let dirty = dirty.finish().unwrap();
+        let index = crate::immutable_index::open(&root.path().join(&dirty)).unwrap();
+        let reader = index.reader().unwrap();
+        assert!(
+            reader
+                .searcher()
+                .segment_readers()
+                .iter()
+                .any(|segment| segment.num_deleted_docs() > 0)
+        );
+        drop(reader);
+        drop(index);
+        let mut cache = MigrationRebuildCache::default();
+        let resumed = rebuild_frozen_cached(
+            root.path().to_owned(),
+            source.clone(),
+            target_id,
+            tokio_util::sync::CancellationToken::new(),
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed, dirty);
+        assert_eq!(cache.operations, [0, 0, 1]);
+        assert!(cache.entry.is_none());
+        let clean = cached_fixture_rebuild(root.path(), &source, b"resume new output", &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cache.operations, [1, 0, 1]);
+        assert_eq!(cache.entry.as_ref().unwrap().relative, clean);
+        assert_eq!(
+            frozen_text(root.path(), &clean).0,
+            frozen_text(root.path(), &source).0
+        );
+        let index = crate::immutable_index::open(&root.path().join(clean)).unwrap();
+        let reader = index.reader().unwrap();
+        assert!(
+            reader
+                .searcher()
+                .segment_readers()
+                .iter()
+                .all(|segment| segment.num_deleted_docs() == 0)
+        );
+        drop(reader);
+        assert_migration_drained(root.path());
+    }
+
+    #[tokio::test]
+    async fn migration_cache_fingerprints_actual_generation_bytes_and_root() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"reused source path"),
+            documents(&[(1, "original transport")]),
+        )
+        .unwrap();
+        let replacement = build(
+            root.path(),
+            &crate::integrity::hash(b"replacement generation"),
+            documents(&[(1, "replacement protocol"), (2, "replacement transport")]),
+        )
+        .unwrap();
+        let mut cache = MigrationRebuildCache::default();
+        cached_fixture_rebuild(root.path(), &source, b"generation before", &mut cache)
+            .await
+            .unwrap();
+        let first_fingerprint = cache.entry.as_ref().unwrap().source;
+        replace_fixture_generation(root.path(), &source, &replacement);
+        let rebuilt = cached_fixture_rebuild(root.path(), &source, b"generation after", &mut cache)
+            .await
+            .unwrap();
+        assert_ne!(cache.entry.as_ref().unwrap().source, first_fingerprint);
+        assert_eq!(cache.operations, [2, 0, 0]);
+        assert_eq!(
+            frozen_text(root.path(), &rebuilt).0,
+            frozen_text(root.path(), &replacement).0
+        );
+        let changed_fingerprint = cache.entry.as_ref().unwrap().source;
+        let other_root = tempfile::tempdir_in("/tmp").unwrap();
+        fs::create_dir_all(other_root.path().join(&source)).unwrap();
+        for (name, bytes) in retained_index_bytes(root.path(), &source) {
+            fs::write(other_root.path().join(&source).join(name), bytes).unwrap();
+        }
+        cached_fixture_rebuild(
+            other_root.path(),
+            &source,
+            b"same bytes different root",
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_ne!(cache.entry.as_ref().unwrap().source, changed_fingerprint);
+        assert_eq!(cache.operations, [3, 0, 0]);
+        let root_fingerprint = cache.entry.as_ref().unwrap().source;
+        let alias = fixture_target(b"identical bytes distinct relative path");
+        fs::create_dir_all(other_root.path().join(&alias)).unwrap();
+        for (name, bytes) in retained_index_bytes(other_root.path(), &source) {
+            fs::write(other_root.path().join(&alias).join(name), bytes).unwrap();
+        }
+        cached_fixture_rebuild(
+            other_root.path(),
+            &alias,
+            b"relative path output",
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_ne!(cache.entry.as_ref().unwrap().source, root_fingerprint);
+        assert_eq!(cache.operations, [4, 0, 0]);
+        assert_migration_drained(root.path());
+    }
+
+    #[tokio::test]
+    async fn migration_cache_rejects_corrupt_or_replaced_prototype_without_publication() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"prototype integrity source"),
+            documents(&[(1, "retained transport")]),
+        )
+        .unwrap();
+        let mut cache = MigrationRebuildCache::default();
+        let prototype =
+            cached_fixture_rebuild(root.path(), &source, b"prototype corrupt", &mut cache)
+                .await
+                .unwrap();
+        fs::write(root.path().join(&prototype).join("meta.json"), b"{}").unwrap();
+        assert_eq!(
+            cached_fixture_rebuild(
+                root.path(),
+                &source,
+                b"corrupt prototype target",
+                &mut cache
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "integrity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(
+            !root
+                .path()
+                .join(fixture_target(b"corrupt prototype target"))
+                .exists()
+        );
+        assert_migration_drained(root.path());
+        let prototype =
+            cached_fixture_rebuild(root.path(), &source, b"prototype replaced", &mut cache)
+                .await
+                .unwrap();
+        let replacement = build(
+            root.path(),
+            &crate::integrity::hash(b"valid alternate prototype"),
+            documents(&[(1, "retained transport")]),
+        )
+        .unwrap();
+        // Same live text and valid v2 digests do not authorize replacing the
+        // exact fresh prototype generation whose scoring statistics were admitted.
+        replace_fixture_generation(root.path(), &prototype, &replacement);
+        assert_eq!(
+            cached_fixture_rebuild(
+                root.path(),
+                &source,
+                b"replaced prototype target",
+                &mut cache
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "integrity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(
+            !root
+                .path()
+                .join(fixture_target(b"replaced prototype target"))
+                .exists()
+        );
+        assert_migration_drained(root.path());
+    }
+
+    #[tokio::test]
+    async fn migration_cache_cancellation_drains_rebuild_and_reuse_before_returning() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"canceled cache source"),
+            documents(&[(1, "retained transport")]),
+        )
+        .unwrap();
+        for reuse in [false, true] {
+            let mut cache = MigrationRebuildCache::default();
+            if reuse {
+                cached_fixture_rebuild(
+                    root.path(),
+                    &source,
+                    b"canceled cache prototype",
+                    &mut cache,
+                )
+                .await
+                .unwrap();
+            }
+            let name = if reuse {
+                b"cancel reuse".as_slice()
+            } else {
+                b"cancel rebuild".as_slice()
+            };
+            let target = fixture_target(name);
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *MIGRATION_TEST_PAUSE.lock().unwrap() = Some(MigrationTestPause {
+                target: target.clone(),
+                entered: entered_tx,
+                release: release_rx,
+            });
+            let stop = tokio_util::sync::CancellationToken::new();
+            let token = stop.clone();
+            let root_path = root.path().to_owned();
+            let source_path = source.clone();
+            let id = crate::integrity::hash(name);
+            let task = tokio::spawn(async move {
+                let result =
+                    rebuild_frozen_cached(root_path, source_path, id, token, &mut cache).await;
+                (result, cache)
+            });
+            tokio::time::timeout(Duration::from_secs(15), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            stop.cancel();
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "cancellation must drain the blocked writer before returning"
+            );
+            assert!(!root.path().join(&target).exists());
+            release_tx.send(()).unwrap();
+            let (result, cache) = tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.unwrap_err().code, "cancelled");
+            assert!(cache.entry.is_none());
+            assert!(!root.path().join(&target).exists());
+            assert_migration_drained(root.path());
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_cache_rechecks_legacy_evidence_and_honors_reader_writer_admission() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::legacy_hash(b"cached qualified legacy input"),
+            documents(&[(1, "qualified retained transport")]),
+        )
+        .unwrap();
+        let directory = root.path().join(&source);
+        let manifest_path = directory.join(MANIFEST);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["version"] = json!(1);
+        for (name, descriptor) in manifest["files"].as_object_mut().unwrap() {
+            descriptor.as_object_mut().unwrap().remove("digest");
+            descriptor["sha256"] = json!(crate::integrity::legacy_hash(
+                &fs::read(directory.join(name)).unwrap()
+            ));
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        qualify_legacy_file(root.path(), &manifest_path);
+        for name in manifest["files"].as_object().unwrap().keys() {
+            qualify_legacy_file(root.path(), &directory.join(name));
+        }
+        let mut cache = MigrationRebuildCache::default();
+        cached_fixture_rebuild(root.path(), &source, b"legacy seed", &mut cache)
+            .await
+            .unwrap();
+        let source_before = verification_count(root.path(), &source);
+        cached_fixture_rebuild(root.path(), &source, b"legacy hit", &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cache.operations, [1, 1, 0]);
+        assert_eq!(verification_count(root.path(), &source) - source_before, 1);
+        let readers = READERS.try_acquire_many(2).unwrap();
+        assert_eq!(
+            cached_fixture_rebuild(root.path(), &source, b"reader busy target", &mut cache)
+                .await
+                .unwrap_err()
+                .code,
+            "capacity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(
+            !root
+                .path()
+                .join(fixture_target(b"reader busy target"))
+                .exists()
+        );
+        drop(readers);
+        cached_fixture_rebuild(root.path(), &source, b"writer admission seed", &mut cache)
+            .await
+            .unwrap();
+        let writer = WRITERS.try_acquire().unwrap();
+        assert_eq!(
+            cached_fixture_rebuild(root.path(), &source, b"writer busy target", &mut cache)
+                .await
+                .unwrap_err()
+                .code,
+            "capacity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(
+            !root
+                .path()
+                .join(fixture_target(b"writer busy target"))
+                .exists()
+        );
+        drop(writer);
+        cached_fixture_rebuild(root.path(), &source, b"evidence seed", &mut cache)
+            .await
+            .unwrap();
+        fs::remove_file(
+            crate::integrity::evidence_path(root.path(), &directory.join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cached_fixture_rebuild(root.path(), &source, b"missing evidence target", &mut cache)
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(
+            !root
+                .path()
+                .join(fixture_target(b"missing evidence target"))
+                .exists()
+        );
+        assert_migration_drained(root.path());
+    }
+
+    #[tokio::test]
+    async fn migration_cache_rejects_source_corruption_duplicate_membership_and_file_limits() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"cache invalid source"),
+            documents(&[(1, "retained transport")]),
+        )
+        .unwrap();
+        let mut cache = MigrationRebuildCache::default();
+        cached_fixture_rebuild(root.path(), &source, b"cache invalid prototype", &mut cache)
+            .await
+            .unwrap();
+        fs::write(root.path().join(&source).join("meta.json"), b"{}").unwrap();
+        assert_eq!(
+            cached_fixture_rebuild(root.path(), &source, b"cache invalid target", &mut cache)
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(
+            !root
+                .path()
+                .join(fixture_target(b"cache invalid target"))
+                .exists()
+        );
+        let duplicate_id = crate::integrity::hash(b"cache duplicate source");
+        let mut duplicate = IndexBuilder::begin(root.path(), &duplicate_id).unwrap();
+        let schema = duplicate.index.schema();
+        for text in ["first transport", "second protocol"] {
+            let mut document = TantivyDocument::new();
+            document.add_u64(schema.get_field(NUMBER).unwrap(), 1);
+            document.add_text(schema.get_field(TECHNICAL).unwrap(), text);
+            document.add_text(schema.get_field(ENGLISH).unwrap(), text);
+            duplicate
+                .writer
+                .as_mut()
+                .unwrap()
+                .add_document(document)
+                .unwrap();
+        }
+        let duplicate = duplicate.finish().unwrap();
+        assert_eq!(
+            cached_fixture_rebuild(root.path(), &duplicate, b"duplicate target", &mut cache)
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(
+            !root
+                .path()
+                .join(fixture_target(b"duplicate target"))
+                .exists()
+        );
+        let limited = build(
+            root.path(),
+            &crate::integrity::hash(b"cache file limit source"),
+            documents(&[(1, "bounded transport")]),
+        )
+        .unwrap();
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(root.path().join(&limited).join(MANIFEST)).unwrap())
+                .unwrap();
+        let files = manifest["files"].as_object_mut().unwrap();
+        for number in 0..=MAX_FILES {
+            files.insert(
+                format!("extra-{number}"),
+                json!({"bytes":0,"digest":crate::integrity::hash(b"")}),
+            );
+        }
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!((bytes.len() as u64) < MAX_MANIFEST);
+        fs::write(root.path().join(&limited).join(MANIFEST), bytes).unwrap();
+        assert_eq!(
+            cached_fixture_rebuild(root.path(), &limited, b"limited target", &mut cache)
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        assert!(cache.entry.is_none());
+        assert!(!root.path().join(fixture_target(b"limited target")).exists());
+        assert_migration_drained(root.path());
+    }
+
+    #[tokio::test]
+    async fn empty_delta_fresh_prototype_preserves_rebuild_queries_and_statistics() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let mut source = IndexBuilder::begin(
+            root.path(),
+            &crate::integrity::legacy_hash(b"deleted segmented legacy source"),
+        )
+        .unwrap();
+        let mut expected = BTreeMap::new();
+        for number in 1..=160 {
+            let animals = if number % 3 == 0 {
+                "cats and dogs"
+            } else {
+                "only cats"
+            };
+            let repetitions = "transport ".repeat((number % 5 + 1) as usize);
+            let text = format!(
+                "RFC {number}: A secure transport permits {animals}. {repetitions}{} The running clients negotiate a reliable protocol. A phrase near the end.",
+                "background paragraph without matching words. ".repeat(9)
+            );
+            source
+                .add_document(IndexDocument {
+                    number,
+                    text: text.clone(),
+                })
+                .unwrap();
+            expected.insert(number, text);
+            if number % 20 == 0 {
+                source.writer.as_mut().unwrap().commit().unwrap();
+            }
+        }
+        for number in [3, 20, 41, 80, 159] {
+            source.remove_document(number).unwrap();
+            expected.remove(&number);
+        }
+        for number in [1, 22, 101] {
+            let text = format!(
+                "Replacement RFC {number}: secure transport with cats and dogs. The running clients negotiate a reliable protocol. A phrase near the end."
+            );
+            source
+                .add_document(IndexDocument {
+                    number,
+                    text: text.clone(),
+                })
+                .unwrap();
+            expected.insert(number, text);
+        }
+        let original = source.finish().unwrap();
+        let original_directory = root.path().join(&original);
+        let manifest_path = original_directory.join(MANIFEST);
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        legacy["version"] = json!(1);
+        for (name, descriptor) in legacy["files"].as_object_mut().unwrap() {
+            descriptor.as_object_mut().unwrap().remove("digest");
+            descriptor["sha256"] = json!(crate::integrity::legacy_hash(
+                &fs::read(original_directory.join(name)).unwrap()
+            ));
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        qualify_legacy_file(root.path(), &manifest_path);
+        for name in legacy["files"].as_object().unwrap().keys() {
+            qualify_legacy_file(root.path(), &original_directory.join(name));
+        }
+        type SegmentStatistics = (u32, u32, u32, u64, u64);
+        type IndexStatistics = (u64, Vec<SegmentStatistics>, Vec<u64>);
+        fn statistics(root: &Path, relative: &str) -> IndexStatistics {
+            let index = crate::immutable_index::open(&root.join(relative)).unwrap();
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            let technical = index.schema().get_field(TECHNICAL).unwrap();
+            let english = index.schema().get_field(ENGLISH).unwrap();
+            let mut segments: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.num_docs(),
+                        segment.max_doc(),
+                        segment.num_deleted_docs(),
+                        segment
+                            .inverted_index(technical)
+                            .unwrap()
+                            .total_num_tokens(),
+                        segment.inverted_index(english).unwrap().total_num_tokens(),
+                    )
+                })
+                .collect();
+            segments.sort_unstable();
+            let frequencies = [
+                (technical, "transport"),
+                (technical, "cats"),
+                (english, "transport"),
+                (english, "cat"),
+                (english, "dog"),
+            ]
+            .into_iter()
+            .map(|(field, term)| {
+                searcher
+                    .doc_freq(&Term::from_field_text(field, term))
+                    .unwrap()
+            })
+            .collect();
+            (searcher.num_docs(), segments, frequencies)
+        }
+
+        let legacy_statistics = statistics(root.path(), &original);
+        assert!(legacy_statistics.1.len() >= 8);
+        assert!(legacy_statistics.1.iter().any(|segment| segment.2 > 0));
+        assert_eq!(legacy_statistics.0, expected.len() as u64);
+        assert_eq!(frozen_text(root.path(), &original).0, expected);
+        let prototype = rebuild_frozen(
+            root.path().to_owned(),
+            original.clone(),
+            crate::integrity::hash(b"fresh canonical prototype"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let control = rebuild_frozen(
+            root.path().to_owned(),
+            original.clone(),
+            crate::integrity::hash(b"independent from-empty canonical control"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(prototype, control);
+        let prototype_bytes = retained_index_bytes(root.path(), &prototype);
+        let prototype_statistics = statistics(root.path(), &prototype);
+        assert_eq!(prototype_statistics.0, expected.len() as u64);
+        assert!(
+            prototype_statistics
+                .1
+                .iter()
+                .all(|segment| segment.2 == 0 && segment.0 == segment.1)
+        );
+        assert_eq!(prototype_statistics, statistics(root.path(), &control));
+        assert_eq!(frozen_text(root.path(), &prototype).0, expected);
+        assert_eq!(frozen_text(root.path(), &control).0, expected);
+        let mut targets = vec![prototype.clone()];
+        for identity in [
+            b"empty-delta target one".as_slice(),
+            b"empty-delta target two".as_slice(),
+        ] {
+            // Exercise the exact existing helper with no document additions or removals.
+            let copied = IndexBuilder::begin_from(
+                root.path(),
+                &crate::integrity::hash(identity),
+                Some(&prototype),
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            assert_ne!(copied, prototype);
+            assert_ne!(copied, control);
+            assert!(!targets.contains(&copied));
+            assert_eq!(frozen_text(root.path(), &copied).0, expected);
+            assert_eq!(statistics(root.path(), &copied), prototype_statistics);
+            assert_eq!(
+                retained_index_bytes(root.path(), &prototype),
+                prototype_bytes
+            );
+            targets.push(copied);
+        }
+        let filters: [Option<&[u32]>; 2] = [None, Some(&[1, 2, 6, 22, 42, 101, 160])];
+        let cases = [
+            ("secure transport", TECHNICAL),
+            ("phrase near the end", TECHNICAL),
+            ("transport dogs", TECHNICAL),
+            ("protocol", TECHNICAL),
+            ("cat", ENGLISH),
+            ("\"running clients\"", ENGLISH),
+            ("-dog", ENGLISH),
+            ("dog OR only", ENGLISH),
+        ];
+        let mut compared = 0;
+        for (query, mode) in cases {
+            for allowed in filters {
+                let all = search(root.path(), &control, query, mode, 0, 100, allowed).unwrap();
+                assert!(
+                    all["total"].as_u64().unwrap() > 0,
+                    "fixture query has no hits: {query}"
+                );
+                for offset in [0, 7, 1000] {
+                    let baseline =
+                        search(root.path(), &control, query, mode, offset, 7, allowed).unwrap();
+                    if offset == 0 {
+                        assert_eq!(
+                            baseline["items"],
+                            json!(
+                                &all["items"].as_array().unwrap()
+                                    [..all["items"].as_array().unwrap().len().min(7)]
+                            )
+                        );
+                    }
+                    for target in &targets {
+                        assert_eq!(
+                            search(root.path(), target, query, mode, offset, 7, allowed).unwrap(),
+                            baseline,
+                            "full result mismatch: query={query}, mode={mode}, offset={offset}, target={target}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            retained_index_bytes(root.path(), &prototype),
+            prototype_bytes
+        );
+        assert_eq!(statistics(root.path(), &prototype), prototype_statistics);
+        assert_eq!(frozen_text(root.path(), &original).0, expected);
+        eprintln!(
+            "empty-delta fixture: {} legacy segments, {} retained docs, {} full JSON query/page/filter comparisons, two distinct empty-delta targets; prototype bytes and public Tantivy statistics unchanged",
+            legacy_statistics.1.len(),
+            expected.len(),
+            compared
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_delta_multisegment_prototype_preserves_control_rankings() {
+        let _test = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let mut original_builder = IndexBuilder::begin(
+            root.path(),
+            &crate::integrity::hash(b"multi-segment fixture source"),
+        )
+        .unwrap();
+        let mut expected = BTreeMap::new();
+        let mut input_bytes = 0;
+        for number in (1..=2400).rev() {
+            let animals = match number % 4 {
+                0 => "cats and dogs",
+                1 => "only cats today",
+                2 => "birds and dogs",
+                _ => "only birds today",
+            };
+            // Every technical document has the same token count and one tieanchor,
+            // so this query creates equal-score ties across all segment boundaries.
+            let text = format!(
+                "tieanchor A secure transport permits {animals}. Running clients negotiate reliable protocol. {}A phrase near the end.",
+                "background paragraph without matching words. ".repeat(9)
+            );
+            input_bytes += text.len();
+            expected.insert(number, text.clone());
+            original_builder
+                .add_document(IndexDocument { number, text })
+                .unwrap();
+        }
+        assert!(input_bytes < 32 * 1024 * 1024);
+        let original = original_builder.finish().unwrap();
+        let mut exported = Vec::new();
+        let mut original_reader = FrozenDocuments::open(
+            root.path(),
+            &original,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        loop {
+            let page = original_reader.next_page(237).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            exported.extend(page);
+        }
+        drop(original_reader);
+        assert_eq!(exported.len(), expected.len());
+        let exported_numbers: Vec<_> = exported.iter().map(|document| document.number).collect();
+        assert_eq!(exported_numbers, (1..=2400).rev().collect::<Vec<_>>());
+        let mut prototype_builder = IndexBuilder::begin_from(
+            root.path(),
+            &crate::integrity::hash(b"fresh manually segmented canonical prototype"),
+            None,
+        )
+        .unwrap();
+        for (ordinal, document) in exported.into_iter().enumerate() {
+            prototype_builder.add_document(document).unwrap();
+            if (ordinal + 1) % 200 == 0 {
+                // Test-only forced commits make a compact fixture multi-segment.
+                // Production flushes on >32MiB queued doubled text bytes instead.
+                prototype_builder.writer.as_mut().unwrap().commit().unwrap();
+            }
+        }
+        let prototype = prototype_builder.finish().unwrap();
+        let control = rebuild_frozen(
+            root.path().to_owned(),
+            original.clone(),
+            crate::integrity::hash(b"independent ordinary frozen rebuild control"),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(prototype, control);
+
+        type SegmentStatistics = (String, u32, u32, u32, u64, u64);
+        type AggregateStatistics = (u64, u64, u64, u64, u64, Vec<u64>);
+        fn statistics(
+            root: &Path,
+            relative: &str,
+        ) -> (Vec<SegmentStatistics>, AggregateStatistics) {
+            let index = crate::immutable_index::open(&root.join(relative)).unwrap();
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            let technical = index.schema().get_field(TECHNICAL).unwrap();
+            let english = index.schema().get_field(ENGLISH).unwrap();
+            let mut segments: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .map(|segment| {
+                    (
+                        format!("{:?}", segment.segment_id()),
+                        segment.num_docs(),
+                        segment.max_doc(),
+                        segment.num_deleted_docs(),
+                        segment
+                            .inverted_index(technical)
+                            .unwrap()
+                            .total_num_tokens(),
+                        segment.inverted_index(english).unwrap().total_num_tokens(),
+                    )
+                })
+                .collect();
+            segments.sort_unstable();
+            let max_docs = segments.iter().map(|segment| u64::from(segment.2)).sum();
+            let deleted_docs = segments.iter().map(|segment| u64::from(segment.3)).sum();
+            let technical_tokens = segments.iter().map(|segment| segment.4).sum();
+            let english_tokens = segments.iter().map(|segment| segment.5).sum();
+            let frequencies = [
+                (technical, "tieanchor"),
+                (technical, "transport"),
+                (technical, "cats"),
+                (technical, "dogs"),
+                (technical, "phrase"),
+                (english, "tieanchor"),
+                (english, "transport"),
+                (english, "cat"),
+                (english, "dog"),
+                (english, "run"),
+            ]
+            .into_iter()
+            .map(|(field, term)| {
+                searcher
+                    .doc_freq(&Term::from_field_text(field, term))
+                    .unwrap()
+            })
+            .collect();
+            (
+                segments,
+                (
+                    searcher.num_docs(),
+                    max_docs,
+                    deleted_docs,
+                    technical_tokens,
+                    english_tokens,
+                    frequencies,
+                ),
+            )
+        }
+
+        fn ordered_numbers(root: &Path, relative: &str) -> Vec<u32> {
+            let mut reader =
+                FrozenDocuments::open(root, relative, &tokio_util::sync::CancellationToken::new())
+                    .unwrap();
+            let mut numbers = Vec::new();
+            loop {
+                let page = reader.next_page(237).unwrap();
+                if page.is_empty() {
+                    break;
+                }
+                numbers.extend(page.into_iter().map(|document| document.number));
+            }
+            numbers
+        }
+        assert_eq!(ordered_numbers(root.path(), &control), exported_numbers);
+        let prototype_bytes = retained_index_bytes(root.path(), &prototype);
+        let prototype_statistics = statistics(root.path(), &prototype);
+        let control_statistics = statistics(root.path(), &control);
+        assert_eq!(prototype_statistics.0.len(), 12);
+        assert_eq!(control_statistics.0.len(), 1);
+        assert!(
+            prototype_statistics
+                .0
+                .iter()
+                .all(|segment| segment.1 == 200 && segment.2 == 200 && segment.3 == 0)
+        );
+        assert_eq!(prototype_statistics.1, control_statistics.1);
+        assert_eq!(prototype_statistics.1.0, 2400);
+        assert_eq!(prototype_statistics.1.2, 0);
+        assert_eq!(frozen_text(root.path(), &prototype).0, expected);
+        assert_eq!(frozen_text(root.path(), &control).0, expected);
+        let mut targets = vec![prototype.clone()];
+        for identity in [
+            b"multi-segment empty-delta target one".as_slice(),
+            b"multi-segment empty-delta target two".as_slice(),
+        ] {
+            let copied = IndexBuilder::begin_from(
+                root.path(),
+                &crate::integrity::hash(identity),
+                Some(&prototype),
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            assert_ne!(copied, prototype);
+            assert_ne!(copied, control);
+            assert!(!targets.contains(&copied));
+            assert_eq!(frozen_text(root.path(), &copied).0, expected);
+            assert_eq!(statistics(root.path(), &copied), prototype_statistics);
+            assert_eq!(
+                retained_index_bytes(root.path(), &prototype),
+                prototype_bytes
+            );
+            targets.push(copied);
+        }
+        let filters: [Option<&[u32]>; 2] = [
+            None,
+            Some(&[1, 2, 4, 100, 199, 200, 201, 399, 400, 401, 1200, 2399, 2400]),
+        ];
+        let cases = [
+            ("tieanchor", TECHNICAL),
+            ("secure transport", TECHNICAL),
+            ("phrase near the end", TECHNICAL),
+            ("transport dogs", TECHNICAL),
+            ("cat", ENGLISH),
+            ("\"running clients\"", ENGLISH),
+            ("-dog", ENGLISH),
+            ("dog OR only", ENGLISH),
+        ];
+        let pages = [
+            (0, 7),
+            (7, 7),
+            (13, 7),
+            (99, 7),
+            (100, 100),
+            (199, 7),
+            (200, 7),
+            (2393, 7),
+            (2399, 7),
+            (2400, 7),
+        ];
+        let mut comparisons = 0;
+        for (query, mode) in cases {
+            for allowed in filters {
+                let all = search(root.path(), &control, query, mode, 0, 100, allowed).unwrap();
+                assert!(
+                    all["total"].as_u64().unwrap() > 0,
+                    "fixture query has no hits: {query}"
+                );
+                for (offset, limit) in pages {
+                    let baseline =
+                        search(root.path(), &control, query, mode, offset, limit, allowed).unwrap();
+                    for target in &targets {
+                        assert_eq!(
+                            search(root.path(), target, query, mode, offset, limit, allowed)
+                                .unwrap(),
+                            baseline,
+                            "full result mismatch: query={query}, mode={mode}, offset={offset}, limit={limit}, target={target}"
+                        );
+                        comparisons += 1;
+                    }
+                }
+            }
+        }
+        // Exercise complete tied-result pagination, including per-segment top-K
+        // truncation, merge truncation and number ordering at adjacent page edges.
+        let mut previous_score = None;
+        let mut all_numbers = Vec::new();
+        for offset in (0..2400).step_by(100) {
+            let baseline = search(
+                root.path(),
+                &control,
+                "tieanchor",
+                TECHNICAL,
+                offset,
+                100,
+                None,
+            )
+            .unwrap();
+            assert_eq!(baseline["total"], 2400);
+            for target in &targets {
+                assert_eq!(
+                    search(
+                        root.path(),
+                        target,
+                        "tieanchor",
+                        TECHNICAL,
+                        offset,
+                        100,
+                        None
+                    )
+                    .unwrap(),
+                    baseline
+                );
+                comparisons += 1;
+            }
+            for item in baseline["items"].as_array().unwrap() {
+                if let Some(score) = &previous_score {
+                    assert_eq!(
+                        &item["score"], score,
+                        "tie fixture must produce exactly equal scores"
+                    );
+                }
+                previous_score = Some(item["score"].clone());
+                all_numbers.push(item["number"].as_u64().unwrap());
+            }
+        }
+        assert_eq!(all_numbers, (1..=2400).collect::<Vec<_>>());
+        assert_eq!(
+            retained_index_bytes(root.path(), &prototype),
+            prototype_bytes
+        );
+        assert_eq!(statistics(root.path(), &prototype), prototype_statistics);
+        eprintln!(
+            "multi-segment empty-delta fixture: {} documents, {} text bytes, {} canonical live-only segments versus {} control segment, {} exact JSON comparisons including complete tied pagination; prototype bytes/statistics unchanged",
+            expected.len(),
+            input_bytes,
+            prototype_statistics.0.len(),
+            control_statistics.0.len(),
+            comparisons
         );
     }
 
