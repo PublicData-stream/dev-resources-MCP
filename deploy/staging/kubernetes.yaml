@@ -197,7 +197,7 @@ spec:
             capabilities: {drop: [ALL]}
       containers:
         - name: backend
-          image: ghcr.io/publicdata-stream/dev-resources-server@sha256:a8652e4c1c66598fd210b2ced3fab5d1f38f234ef816f6fe9e8659cb8e0f4af8
+          image: ghcr.io/publicdata-stream/dev-resources-server@sha256:e4e41c18121111f024306e7fbd0feead7d6c7c71e4dcbe3c6e5554262498b78b
           imagePullPolicy: IfNotPresent
           args: [/etc/devres/config/backend.toml]
           ports:
