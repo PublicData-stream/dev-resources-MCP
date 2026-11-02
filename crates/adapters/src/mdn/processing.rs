@@ -794,6 +794,14 @@ mod tests {
         assert!(doc.gaps.iter().any(|g| g.code == "unsupported_macro"));
     }
     #[test]
+    fn nested_wikilink_like_images_remain_literal() {
+        let literal = format!("{}image{}", "![[".repeat(64), "]]".repeat(64));
+        let source = format!("---\ntitle: Test\nslug: Test\n---\n{literal}\n");
+        let doc = run(&source).expect("bounded literal Markdown");
+        assert!(doc.text.contains(&literal));
+        assert!(doc.links.is_empty());
+    }
+    #[test]
     fn includes_record_dependencies_and_cycles() {
         let body = b"---\ntitle: A\nslug: A\n---\n{{include('B')}}";
         let doc = process_document(

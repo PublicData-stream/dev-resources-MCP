@@ -677,6 +677,15 @@ mod tests {
         );
     }
     #[test]
+    fn nested_wikilink_like_images_remain_literal() {
+        let literal = format!("{}image{}", "![[".repeat(64), "]]".repeat(64));
+        let source = format!("# Guide\n\n{literal}\n");
+        let doc = process_document("docs/a.md", source.as_bytes(), CancellationToken::new())
+            .expect("bounded literal Markdown");
+        assert!(doc.text.contains(&literal));
+        assert!(doc.references.is_empty());
+    }
+    #[test]
     fn html_api_markup_is_explicit_and_scripts_remain_hidden() {
         let doc=process_document("docs/a.html",b"<h1>API</h1><section id=send data-api-name=send><p>Send data</p></section><script><a href=../hidden>hidden</a></script><a href=../README.md>parent</a>",CancellationToken::new()).unwrap();
         assert!(

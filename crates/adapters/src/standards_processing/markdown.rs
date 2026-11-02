@@ -99,6 +99,19 @@ pub(super) fn project(source: &str, budget: &Budget) -> Result<ProcessedDocument
 mod tests {
     use tokio_util::sync::CancellationToken;
     #[test]
+    fn nested_wikilink_like_images_remain_literal() {
+        let literal = format!("{}image{}", "![[".repeat(64), "]]".repeat(64));
+        let source = format!("# Standard\n\n{literal}\n");
+        let doc = super::super::process_document(
+            "README.md",
+            source.as_bytes(),
+            CancellationToken::new(),
+        )
+        .expect("bounded literal Markdown");
+        assert!(doc.text.contains(&literal));
+        assert!(doc.references.is_empty());
+    }
+    #[test]
     fn markdown_preserves_code_links_and_hides_raw_scripts() {
         let doc=super::super::process_document("README.md",b"# Standard\n\n## Examples {#examples}\n\n`<script>inert()</script>` [reference](https://url.spec.whatwg.org/)\n\n<script>hidden()</script>\n",CancellationToken::new()).unwrap();
         assert!(doc.text.contains("<script>inert()</script>"));

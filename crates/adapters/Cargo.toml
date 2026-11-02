@@ -44,7 +44,7 @@ nix = { version = "0.30", default-features = false, features = ["signal", "proce
 lopdf = { version = "=0.46.0", default-features = false }
 zip = { version = "=9.0.0", default-features = false, features = ["deflate", "bzip2"] }
 csv-core = "0.1"
-pulldown-cmark = { version = "0.13", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
 yaml-rust2 = { version = "0.13", default-features = false }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

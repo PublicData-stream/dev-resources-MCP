@@ -140,10 +140,18 @@ Operating-system Git and its notices remain separately licensed image contents.
 
 ## MDN processing dependencies
 
-`pulldown-cmark 0.13.5` provides bounded pull-event Markdown parsing instead of
+`pulldown-cmark 0.13.6` provides bounded pull-event Markdown parsing instead of
 inventing a Markdown grammar or running MDN's npm build. It is MIT licensed;
 default features are disabled, including executable/HTML-generation/SIMD extras.
 Its packaged build script is inactive without the generation-test feature.
+The minimum version is 0.13.6 to address
+[RUSTSEC-2026-0433](https://github.com/RustSec/advisory-db/blob/main/crates/pulldown-cmark/RUSTSEC-2026-0433.md),
+which fixes quadratic parsing of nested image wikilinks. Current MDN, Chromium,
+and shared standards parsers leave `ENABLE_WIKILINKS` disabled; the patch retains
+their existing Markdown options and projection contracts. The maintained upstream
+[0.13.6 patch](https://github.com/pulldown-cmark/pulldown-cmark/compare/v0.13.5...v0.13.6)
+changes wikilink handling without adding dependency requirements or build features.
+Upgrading the existing parser avoids a replacement parser or an advisory exception.
 `yaml-rust2 0.13.0` provides the YAML event interface needed to reject aliases,
 duplicate keys, excess nesting and oversized front matter before constructing a
 bounded JSON projection. It is MIT OR Apache-2.0, has no build script, and defaults
