@@ -6,7 +6,7 @@ collection, original licensing, conservative shared clocks and local lockfile
 matching. npm audit/security endpoints and linked documentation sites are not sources.
 
 All provider URLs are constructed by trusted adapters. The HTTP adapter rejects
-arbitrary schemes, hosts, credentials, ports, fragments, escaped paths, and redirects.
+arbitrary schemes, hosts, credentials, ports, fragments, escaped paths, and redirects except the exact legacy dump revalidation hop described below.
 Requests identify the application and repository. One adapter owns retries: at most
 one retry for transient HTTP statuses, respecting bounded Retry-After. Every attempt
 reserves its source rate slot. Foreground retrieval retains two transfer slots;
@@ -66,10 +66,17 @@ repository through a private HTTPS Git relay. Git runs only against an owned bar
 repository: no package checkout, hooks, caller configuration, credential helper or
 arbitrary remote is admitted. Canonical sparse-index paths supply exact versions,
 dependency declarations, checksums and yanked state. A fixed
-[`static.crates.io/db-dump.tar.gz`](https://static.crates.io/db-dump.tar.gz)
+[`cloudfront-static.crates.io/db-dump.tar.gz`](https://cloudfront-static.crates.io/db-dump.tar.gz)
 request supplies public enrichment as described by the
 [official dump format](https://github.com/rust-lang/crates.io/blob/main/crates/crates_io_database_dump/src/readme_for_tarball.md).
 CSV headers/fields and joins are bounded; archive SQL remains inert.
+New dump acquisition starts at that fixed CloudFront URL. Revalidation of a retained
+legacy dump may use `https://static.crates.io/db-dump.tar.gz` and follow exactly one
+HTTP 307 to `https://cloudfront-static.crates.io/db-dump.tar.gz`. Other redirect
+targets and additional hops are rejected. Both hosts share the existing static
+provider clock and transfer limits; each hop consumes admission and the operation
+retains a single transient retry owner. New captures identify the effective source
+URL; legacy capture identities and original provenance remain immutable.
 
 For each observed exact release, docs.rs routes are constructed from captured
 canonical package identity. `/crate/<name>/<version>/menus/platforms/` enumerates

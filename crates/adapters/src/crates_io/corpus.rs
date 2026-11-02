@@ -1,5 +1,8 @@
 //! Supervised registry collection. Inventories, acquisition and projections commit independently.
 #[cfg(test)]
+#[path = "corpus/dump_compat_tests.rs"]
+mod dump_compat_tests;
+#[cfg(test)]
 #[path = "corpus/tests.rs"]
 mod pipeline_tests;
 use crate::{
@@ -637,6 +640,18 @@ impl CrateCorpus {
                 .await?;
             return Ok(old.clone());
         }
+        let source = if matches!(source, BulkSource::DatabaseDump)
+            && previous.as_ref().is_some_and(|old| {
+                old.capture.source_url == "https://static.crates.io/db-dump.tar.gz"
+            }) {
+            BulkSource::LegacyDatabaseDump
+        } else {
+            source
+        };
+        let dump_source = matches!(
+            source,
+            BulkSource::DatabaseDump | BulkSource::LegacyDatabaseDump
+        );
         let url = source.url()?;
         let validators = previous
             .as_ref()
@@ -668,6 +683,13 @@ impl CrateCorpus {
                 )
                 .await?;
             old.capture.validated_at = unix_now();
+            if old.capture.id.starts_with("blake3:")
+                && old.capture.body_hash.starts_with("blake3:")
+                && dump_source
+            {
+                old.provenance["request_url"] = json!(url);
+                old.provenance["effective_url"] = json!(response.effective_url);
+            }
             self.store.save_artifact(&old, true).await?;
             return Ok(old);
         }
@@ -676,7 +698,8 @@ impl CrateCorpus {
                 "Public package representation is not available.",
             ));
         }
-        let provenance = json!({"transport":"https","etag":response.validators.etag,"last_modified":response.validators.last_modified});
+        let effective_url = response.effective_url.clone();
+        let provenance = json!({"transport":"https","etag":response.validators.etag,"last_modified":response.validators.last_modified,"request_url":url,"effective_url":effective_url});
         let media_type = if key.starts_with("cargo:docs-platforms:") {
             "text/html"
         } else if key.starts_with("cargo:docs-html:") {
@@ -685,7 +708,7 @@ impl CrateCorpus {
             "application/gzip"
         };
         let artifact = self.artifacts.capture(response, expected, stop).await?;
-        self.persist_artifact(key, &url, media_type, artifact, provenance, true)
+        self.persist_artifact(key, &effective_url, media_type, artifact, provenance, true)
             .await
     }
     async fn persist_artifact(

@@ -65,6 +65,8 @@ pub enum GitOperation {
 pub enum BulkSource {
     Npm(crate::npm::source::Operation),
     DatabaseDump,
+    /// Compatibility revalidation of retained captures from the former endpoint.
+    LegacyDatabaseDump,
     CrateArchive {
         name: String,
         version: String,
@@ -114,7 +116,8 @@ impl BulkSource {
                 Ok(format!("{}/{suffix}",repository.source_url()))
             }
             Self::WhatwgPublication(source) => {source.validate()?; Ok(source.as_str().to_owned())},
-            Self::DatabaseDump => Ok("https://static.crates.io/db-dump.tar.gz".into()),
+            Self::DatabaseDump => Ok("https://cloudfront-static.crates.io/db-dump.tar.gz".into()),
+            Self::LegacyDatabaseDump => Ok("https://static.crates.io/db-dump.tar.gz".into()),
             Self::CrateArchive { name, version } => {
                 package_identity(name, version)?;
                 Ok(format!("https://static.crates.io/crates/{name}/{name}-{version}.crate"))
@@ -157,7 +160,9 @@ impl BulkSource {
             Self::W3cDiscovery(operation) => operation.host(),
             Self::WhatwgPublication(source) => source.host(),
             Self::WhatwgGit { .. } => "github.com",
-            Self::DatabaseDump | Self::CrateArchive { .. } => "static.crates.io",
+            Self::DatabaseDump | Self::LegacyDatabaseDump | Self::CrateArchive { .. } => {
+                "static.crates.io"
+            }
             Self::Documentation { .. } => "docs.rs",
             Self::RegistryGit(_)
             | Self::RustSecGit(_)
@@ -256,6 +261,8 @@ pub struct BulkRequest {
     pub body: Vec<u8>,
 }
 pub struct BulkResponse {
+    /// Trusted constructed URL that supplied this response.
+    pub effective_url: String,
     pub status: u16,
     pub validators: Validators,
     pub content_length: Option<u64>,
@@ -520,7 +527,9 @@ impl BulkBroker {
         if request.body.len() > 1024 * 1024 || (!upload && !request.body.is_empty()) {
             return Err(Error::invalid("Invalid bulk request body."));
         }
-        let url = request.source.url()?;
+        let mut effective_url = request.source.url()?;
+        let mut redirected = false;
+        let mut retried = false;
         let chromium = matches!(request.source, BulkSource::Chromium(_));
         let w3c = matches!(
             request.source,
@@ -529,18 +538,21 @@ impl BulkBroker {
                 | BulkSource::W3cApi(_)
                 | BulkSource::W3cDiscovery(_)
         );
-        #[cfg(test)]
-        let url = if let Some(origin) = &self.test_origin {
-            let original =
-                url::Url::parse(&url).map_err(|_| Error::invalid("Invalid test source."))?;
-            let mut destination = origin.clone();
-            destination.set_path(original.path());
-            destination.set_query(original.query());
-            destination.to_string()
-        } else {
-            url
-        };
-        for attempt in 0..=1 {
+        // At most one transient retry and one narrowly authorized legacy hop.
+        for _ in 0..3 {
+            #[cfg(test)]
+            let url = if let Some(origin) = &self.test_origin {
+                let original = url::Url::parse(&effective_url)
+                    .map_err(|_| Error::invalid("Invalid test source."))?;
+                let mut destination = origin.clone();
+                destination.set_path(original.path());
+                destination.set_query(original.query());
+                destination.to_string()
+            } else {
+                effective_url.clone()
+            };
+            #[cfg(not(test))]
+            let url = effective_url.clone();
             let chromium_permit = if chromium {
                 Some(
                     bounded(&shutdown, request.deadline, async {
@@ -617,6 +629,22 @@ impl BulkBroker {
             })
             .await?;
             let status = response.status().as_u16();
+            if status == 307
+                && matches!(request.source, BulkSource::LegacyDatabaseDump)
+                && !redirected
+                && effective_url == "https://static.crates.io/db-dump.tar.gz"
+                && response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    == Some("https://cloudfront-static.crates.io/db-dump.tar.gz")
+            {
+                drop(response);
+                drop(permit);
+                redirected = true;
+                effective_url = "https://cloudfront-static.crates.io/db-dump.tar.gz".into();
+                continue;
+            }
             let retry_at = match &request.source {
                 BulkSource::Chromium(operation) => {
                     operation.retry_at(response.headers(), status)?
@@ -633,7 +661,8 @@ impl BulkBroker {
                 let previous = rates.get(clock).copied().unwrap_or(until);
                 rates.insert(clock.into(), previous.max(until));
             }
-            if attempt == 0 && retry_at.is_none() && matches!(status, 429 | 500 | 502 | 503 | 504) {
+            if !retried && retry_at.is_none() && matches!(status, 429 | 500 | 502 | 503 | 504) {
+                retried = true;
                 let delay = retry_after(response.headers());
                 drop(response);
                 drop(permit);
@@ -659,6 +688,7 @@ impl BulkBroker {
                 drop(response);
                 drop(permit);
                 return Ok(BulkResponse {
+                    effective_url,
                     status,
                     validators,
                     content_length,
@@ -712,6 +742,7 @@ impl BulkBroker {
                 Ok(Some((chunk, state)))
             });
             return Ok(BulkResponse {
+                effective_url,
                 status,
                 validators,
                 content_length,
@@ -1366,6 +1397,100 @@ mod tests {
             BulkBroker::fixture(url::Url::parse(&format!("http://{address}")).unwrap()).unwrap();
         (broker, task)
     }
+    #[tokio::test]
+    async fn legacy_dump_has_one_exact_redirect_and_one_shared_retry() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let router = Router::new().route(
+            "/db-dump.tar.gz",
+            get(move || {
+                let attempt = counted.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match attempt {
+                        0 => (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(
+                                "location",
+                                "https://cloudfront-static.crates.io/db-dump.tar.gz",
+                            )],
+                            "",
+                        )
+                            .into_response(),
+                        1 => (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")], "")
+                            .into_response(),
+                        _ => "dump".into_response(),
+                    }
+                }
+            }),
+        );
+        let (broker, task) = mock_broker(router).await;
+        let mut input = request(100);
+        input.source = BulkSource::LegacyDatabaseDump;
+        let mut response = broker.open(input, CancellationToken::new()).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.effective_url,
+            BulkSource::DatabaseDump.url().unwrap()
+        );
+        assert_eq!(response.stream.next().await.unwrap().unwrap(), b"dump");
+        assert_eq!(broker.attempt_count(), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn dump_redirect_policy_rejects_variations_and_second_hops() {
+        for (source, location, status, expected_calls) in [
+            (
+                BulkSource::DatabaseDump,
+                "https://cloudfront-static.crates.io/db-dump.tar.gz",
+                StatusCode::TEMPORARY_REDIRECT,
+                1,
+            ),
+            (
+                BulkSource::LegacyDatabaseDump,
+                "https://evil.example/db-dump.tar.gz",
+                StatusCode::TEMPORARY_REDIRECT,
+                1,
+            ),
+            (
+                BulkSource::LegacyDatabaseDump,
+                "https://cloudfront-static.crates.io/db-dump.tar.gz?other",
+                StatusCode::TEMPORARY_REDIRECT,
+                1,
+            ),
+            (
+                BulkSource::LegacyDatabaseDump,
+                "https://cloudfront-static.crates.io/db-dump.tar.gz",
+                StatusCode::FOUND,
+                1,
+            ),
+            (
+                BulkSource::LegacyDatabaseDump,
+                "https://cloudfront-static.crates.io/db-dump.tar.gz",
+                StatusCode::TEMPORARY_REDIRECT,
+                2,
+            ),
+        ] {
+            let router = Router::new().route(
+                "/db-dump.tar.gz",
+                get(move || async move { (status, [("location", location)], "") }),
+            );
+            let (broker, task) = mock_broker(router).await;
+            let mut input = request(100);
+            input.source = source;
+            let response = broker.open(input, CancellationToken::new()).await.unwrap();
+            assert_eq!(response.status, status.as_u16());
+            assert_eq!(broker.attempt_count(), expected_calls);
+            task.abort();
+        }
+        assert_eq!(
+            BulkSource::DatabaseDump.host(),
+            BulkSource::LegacyDatabaseDump.host()
+        );
+        assert_eq!(BulkSource::DatabaseDump.host(), "static.crates.io");
+    }
     fn request(max_bytes: u64) -> BulkRequest {
         BulkRequest {
             source: BulkSource::DatabaseDump,
@@ -1451,6 +1576,7 @@ mod tests {
             artifact
         );
         let response = BulkResponse {
+            effective_url: "https://cloudfront-static.crates.io/db-dump.tar.gz".into(),
             status: 200,
             validators: Validators::default(),
             content_length: Some(3),
@@ -1548,6 +1674,7 @@ mod tests {
             .map(|chunk| Ok(chunk.to_vec()))
             .collect();
         let response = BulkResponse {
+            effective_url: "https://cloudfront-static.crates.io/db-dump.tar.gz".into(),
             status: 200,
             validators: Validators::default(),
             content_length: Some(body.len() as u64),
