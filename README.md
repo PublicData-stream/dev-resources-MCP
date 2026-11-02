@@ -18,6 +18,26 @@ operational acceptance claim.
 research and lockfile-assessment workflows for ChatGPT, Codex, Claude Code, and
 Claude Connectors, with deployment-specific MCP connection packages.
 
+## Choosing research tools
+
+Generic `search` searches RFC metadata and Cargo packages when `sources` is omitted.
+For browser questions, select sources explicitly, for example
+`{"query":"fetch abort","sources":["mdn","whatwg"],"limit":3}`.
+Use `mdn.compat_search` for browser-support statements and dedicated standard tools
+for normative passages and symbols.
+
+RFC metadata search follows official index order; use precise terms such as
+`TLS 1.3`, or `rfc.fulltext_search` for ranked retained text. Package discovery keeps
+upstream ranking and version observations, which can include prereleases. Use
+exact-release metadata when choosing evidence for a particular version.
+
+WHATWG search returns provenance for its complete searched selection, independently
+of the hit-page limit. When the standard is known, a narrow call such as
+`whatwg.search` with `{"standard":"fetch","query":"TLS","limit":3}` reduces
+both scope and metadata. Keep returned views/snapshots and cursors fixed across pages.
+Present findings with relevant source citations and material freshness/coverage
+limitations; full capture metadata remains available in the tool evidence.
+
 ## Development
 
 Install Rust 1.99.1, Docker, Python 3, OpenSSL, and Git; the cluster gate also

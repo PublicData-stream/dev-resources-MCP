@@ -372,3 +372,31 @@ views freeze each effective component snapshot and validation observation. Archi
 Chrome sources and current website observations remain distinct identities and
 licenses. Public APIs read local published evidence; maintenance replays retained
 inputs without renewing online observations. See [Chromium](chromium.md).
+
+## Bounded foreground research
+
+HTTP admission waits for the existing four-message buffer reservation within the
+input timeout. Waiting and body collection share one deadline; request permits
+bound queued work. Memory ceilings, response limits and the connection watchdog
+remain unchanged. Private aggregate counters distinguish admission expiry from
+application failures without recording request data.
+
+Generic search validates its complete source selection before dispatch, keeps at
+most two source operations active, and returns results in requested source order.
+Each source has at most fifteen seconds, bounded by the caller's absolute deadline
+minus the smaller of one second and ten percent of the remaining budget. Completed
+sources survive another source's failure; expired or unstarted sources have explicit
+errors. Cancellation drops request-owned futures and preserves provider retry and
+admission ownership. Source errors do not establish an empty or complete corpus.
+
+Foreground npm reads validate full retained registry metadata with a bounded scan
+while materializing one release at a time. Unselected releases retain identity,
+declaration and duplicate-key validation. Selected metadata, tags and timestamp
+projections remain charged during the scan; input, nesting, time and output limits
+remain independent. Collector inventory parsing retains its existing behavior.
+
+MDN search bounds selection, membership preparation and index work together.
+Verified immutable projection memberships can be shared across requests, with
+bounded entries, bytes and identifiers. Active readers retain budget accounting
+after eviction. Default selection and freshness are checked through owner-fenced
+storage for every request; verification handles bypass the cache.

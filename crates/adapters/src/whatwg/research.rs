@@ -1652,7 +1652,7 @@ pub fn schemas() -> Vec<Value> {
     }
     add(
         "whatwg.search",
-        "Search immutable WHATWG sections using selected-corpus BM25. Defaults use canonical current editions; reuse view/snapshot and cursor.",
+        "Search immutable WHATWG sections using selected-corpus BM25. Limit caps hits; selections describes every searched standard. Set standard to narrow both scope and provenance. Defaults use canonical current editions; reuse view/snapshot and cursor.",
         search,
         vec!["query"],
     );

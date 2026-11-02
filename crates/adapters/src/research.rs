@@ -771,8 +771,8 @@ fn schemas() -> Vec<Value> {
     };
     add(
         "search",
-        "Search RFC metadata, crates.io packages, RustSec advisories, local MDN documents, WHATWG or W3C standards. Sources are independent; errors and freshness are explicit.",
-        json!({"query":text,"sources":{"type":"array","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium","npm"]},"minItems":1,"maxItems":8,"uniqueItems":true},"offset":offset,"limit":limit}),
+        "Search developer sources independently. Omitted sources search RFC metadata and Cargo packages only. Select mdn/whatwg/w3c for browser standards, rustsec for advisories, chromium for implementation docs, or npm for npm packages. Use dedicated research tools for full-text, compatibility, symbols and history.",
+        json!({"query":text,"sources":{"type":"array","description":"Omitted sources are rfc and cargo only. Explicit selection supports all eight source families; browser questions usually need mdn and whatwg.","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium","npm"]},"minItems":1,"maxItems":8,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(
@@ -783,7 +783,7 @@ fn schemas() -> Vec<Value> {
     );
     add(
         "rfc.search",
-        "Search the official RFC index by number, title, abstract and status. Reuse capture for stable pagination.",
+        "Search official RFC index metadata in index order, not relevance order. Use specific terms or rfc.fulltext_search for ranked retained text. Reuse capture for stable pagination.",
         json!({"query":text,"status":text,"offset":offset,"limit":limit,"capture":capture}),
         vec!["query"],
     );

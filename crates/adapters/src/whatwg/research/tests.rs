@@ -93,7 +93,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Memory>, Arc<WhatwgCorpus>, Snapsh
         whatwg::index::IndexDocument,
         whatwg::inventory,
     };
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
     let store = Arc::new(Memory::default());
     let corpus = Arc::new(
         WhatwgCorpus::new(
@@ -195,6 +195,202 @@ async fn fixture() -> (tempfile::TempDir, Arc<Memory>, Arc<WhatwgCorpus>, Snapsh
     store.whatwg_publish_view(&view).await.unwrap();
     (root, store, corpus, snapshot)
 }
+
+async fn add_search_standard(
+    store: &Memory,
+    corpus: &WhatwgCorpus,
+    template: &Snapshot,
+    standard: &str,
+    index: &Value,
+) -> Snapshot {
+    use crate::whatwg::{index::IndexDocument, inventory};
+    let index_id = digest(&(standard, "section")).unwrap();
+    let projection = json!({"index_ids":[index_id]});
+    let projection_id = digest(&projection).unwrap();
+    store
+        .whatwg_put("projections", &projection_id, &projection)
+        .await
+        .unwrap();
+    let empty = inventory::empty(store).await.unwrap();
+    let membership = inventory::update(
+        store,
+        &empty,
+        "index.html",
+        Some(Member {
+            path: "index.html".into(),
+            oid: digest(&(standard, "source")).unwrap(),
+            mode: "100644".into(),
+            kind: "blob".into(),
+            projection: Some(projection_id),
+            raw: None,
+            gaps: vec![],
+        }),
+    )
+    .await
+    .unwrap();
+    let index = corpus
+        .index()
+        .publish(
+            Some(index),
+            vec![IndexDocument {
+                id: index_id,
+                standard: standard.into(),
+                edition: "living".into(),
+                path: "index.html".into(),
+                title: format!("Synthetic {standard}"),
+                text: "dispatches event".into(),
+                kind: "section".into(),
+                metadata: json!({"synthetic":true}),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let snapshot = Snapshot {
+        id: digest(&(standard, "search-snapshot")).unwrap(),
+        standard: standard.into(),
+        repository: format!("whatwg/{standard}"),
+        inventory: membership,
+        index,
+        source_url: format!("https://{standard}.spec.whatwg.org/"),
+        ..template.clone()
+    };
+    store
+        .whatwg_put("snapshots", &snapshot.id, &json!(snapshot))
+        .await
+        .unwrap();
+    snapshot
+}
+
+#[tokio::test]
+async fn hit_page_limits_keep_full_search_provenance_and_explicit_standard_narrows_it() {
+    let _gate = crate::mdn::index::TEST_GATE.lock().await;
+    let (_root, store, corpus, dom) = fixture().await;
+    let html = add_search_standard(store.as_ref(), &corpus, &dom, "html", &dom.index).await;
+    let mut view = corpus.view(None).await.unwrap();
+    view.id = digest(&"two-standard-view").unwrap();
+    view.snapshots
+        .insert(html.standard.clone(), html.id.clone());
+    view.validations
+        .insert(html.standard.clone(), html.validated_at);
+    view.index = html.index.clone();
+    store.whatwg_publish_view(&view).await.unwrap();
+    let research = WhatwgResearch::new(corpus);
+    let small = research
+        .call("whatwg.search", json!({"query":"dispatches","limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(small["results"].as_array().unwrap().len(), 1);
+    assert_eq!(small["total"], 2);
+    let selected: BTreeSet<_> = small["selections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["standard"].as_str().unwrap())
+        .collect();
+    assert_eq!(selected, BTreeSet::from(["dom", "html"]));
+    let large = research
+        .call("whatwg.search", json!({"query":"dispatches","limit":100}))
+        .await
+        .unwrap();
+    assert_eq!(large["results"].as_array().unwrap().len(), 2);
+    assert_eq!(small["selections"], large["selections"]);
+    assert_eq!(small["view"], large["view"]);
+    let empty = research
+        .call(
+            "whatwg.search",
+            json!({"query":"unmatchedfixturetoken","limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty["total"], 0);
+    assert_eq!(empty["selections"], small["selections"]);
+    let narrow = research
+        .call(
+            "whatwg.search",
+            json!({"standard":"dom","query":"dispatches","limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(narrow["total"], 1);
+    assert_eq!(narrow["results"][0]["standard"], "dom");
+    assert_eq!(narrow["selections"].as_array().unwrap().len(), 1);
+    assert_eq!(narrow["selections"][0]["snapshot"], dom.id);
+    assert_eq!(narrow["view"], small["view"]);
+}
+
+#[tokio::test]
+async fn historical_search_view_and_cursor_preserve_membership_after_default_changes() {
+    let _gate = crate::mdn::index::TEST_GATE.lock().await;
+    let (_root, store, corpus, dom) = fixture().await;
+    let html = add_search_standard(store.as_ref(), &corpus, &dom, "html", &dom.index).await;
+    let mut frozen = corpus.view(None).await.unwrap();
+    frozen.id = digest(&"frozen-two-standard-view").unwrap();
+    frozen
+        .snapshots
+        .insert(html.standard.clone(), html.id.clone());
+    frozen
+        .validations
+        .insert(html.standard.clone(), html.validated_at);
+    frozen.index = html.index.clone();
+    store.whatwg_publish_view(&frozen).await.unwrap();
+    let research = WhatwgResearch::new(corpus.clone());
+    let first = research
+        .call(
+            "whatwg.search",
+            json!({"view":frozen.id,"query":"dispatches","limit":1}),
+        )
+        .await
+        .unwrap();
+    assert!(first["next_cursor"].is_string());
+    assert_eq!(first["total"], 2);
+    let fetch = add_search_standard(store.as_ref(), &corpus, &dom, "fetch", &frozen.index).await;
+    let mut successor = frozen.clone();
+    successor.id = digest(&"successor-three-standard-view").unwrap();
+    successor
+        .snapshots
+        .insert(fetch.standard.clone(), fetch.id.clone());
+    successor
+        .validations
+        .insert(fetch.standard.clone(), fetch.validated_at);
+    successor.index = fetch.index;
+    store.whatwg_publish_view(&successor).await.unwrap();
+    let current = research
+        .call("whatwg.search", json!({"query":"dispatches","limit":100}))
+        .await
+        .unwrap();
+    assert_eq!(current["total"], 3);
+    assert_eq!(current["view"], successor.id);
+    let next = research
+        .call(
+            "whatwg.search",
+            json!({"view":frozen.id,"query":"dispatches","cursor":first["next_cursor"],"limit":5}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next["results"].as_array().unwrap().len(), 1);
+    assert_eq!(next["total"], 2);
+    assert!(next["next_cursor"].is_null());
+    assert_eq!(next["view"], frozen.id);
+    assert_eq!(next["selections"], first["selections"]);
+    let standards = BTreeSet::from([
+        first["results"][0]["standard"].as_str().unwrap(),
+        next["results"][0]["standard"].as_str().unwrap(),
+    ]);
+    assert_eq!(standards, BTreeSet::from(["dom", "html"]));
+    assert_eq!(
+        research
+            .call(
+                "whatwg.search",
+                json!({"view":successor.id,"query":"dispatches","cursor":first["next_cursor"]})
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "invalid_input"
+    );
+}
+
 #[tokio::test]
 async fn immutable_text_source_symbols_search_and_resource_roundtrip() {
     let _gate = crate::mdn::index::TEST_GATE.lock().await;
