@@ -30,7 +30,7 @@ def module(name):
 op = module('staging')
 restore = module('restore')
 m = module('maintenance')
-VERSION = '0.1.0-build.c589ec85'
+VERSION = '0.1.0-build.b0a33793'
 OLD_VERSION = '0.1.0-build.27d35cd6'
 SOURCE = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
 TERMINAL = {'rehearsed', 'rehearsal_failed', 'complete', 'rolled_back'}
