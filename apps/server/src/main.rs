@@ -231,13 +231,14 @@ async fn main() -> Result<(), ServerError> {
         println!("{}", result?);
         return Ok(());
     }
+    let mdn_research = mdn_corpus.research();
     let research = Arc::new(
         devres_adapters::Research::new(retrieval)
             .await?
             .with_corpus(corpus.clone())
             .with_crate_corpus(crate_corpus.clone())
             .with_advisory_corpus(advisory_corpus.clone())
-            .with_mdn_research(mdn_corpus.research())
+            .with_mdn_research(mdn_research.clone())
             .with_whatwg_corpus(whatwg_corpus.clone())
             .with_w3c_corpus(w3c_corpus.clone())
             .with_chromium_corpus(chromium_corpus.clone())
@@ -388,7 +389,7 @@ async fn main() -> Result<(), ServerError> {
         HealthEndpoint {
             bind: config.health.bind,
         }
-        .with_metrics(String::new)
+        .with_metrics(move || mdn_research.metrics())
         .with_readiness(move || storage_ready.load(Ordering::Acquire)),
     )?;
     let server = server.bind().await?;

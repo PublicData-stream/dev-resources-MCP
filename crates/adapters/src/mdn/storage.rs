@@ -5,6 +5,7 @@ use devres_application::mdn::{MdnRow, MdnStore, MdnWrite, Snapshot, View, valida
 use devres_domain::{Error, Result};
 use serde_json::Value;
 use sqlx::{Connection, Row, types::Json};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn checked(kind: &str, key: &str) -> Result<()> {
     if kind.is_empty()
@@ -31,6 +32,36 @@ fn row(row: sqlx::postgres::PgRow) -> Result<MdnRow> {
         key: row.try_get("key").map_err(|_| storage_error())?,
         data: payload_integrity::row("devres_mdn_evidence", &row)?,
     })
+}
+
+fn remap_batch(
+    rows: impl IntoIterator<Item = Result<MdnRow>>,
+    original: &[String],
+    resolved: &[String],
+) -> Result<Vec<MdnRow>> {
+    let mut aliases = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for (key, canonical) in original.iter().zip(resolved) {
+        aliases.entry(canonical).or_default().insert(key);
+    }
+    let mut output = Vec::new();
+    for found in rows {
+        let mut found = found?;
+        let mut names = aliases
+            .remove(found.key.as_str())
+            .ok_or_else(|| Error::integrity("Unexpected MDN batch evidence key."))?;
+        if let Some(last) = names.pop_last() {
+            // The ordinary one-to-one read moves the payload. Clone only when
+            // distinct legacy selectors require more than one returned row.
+            for key in names {
+                let mut alias = found.clone();
+                alias.key = key.to_owned();
+                output.push(alias);
+            }
+            found.key = last.to_owned();
+            output.push(found);
+        }
+    }
+    Ok(output)
 }
 #[async_trait]
 impl MdnStore for PgBlobStore {
@@ -63,7 +94,8 @@ impl MdnStore for PgBlobStore {
         if bytes > 64 * 1024 * 1024 {
             return Err(Error::capacity("MDN batch read memory bound exceeded."));
         }
-        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND key=ANY($2::text[])").bind(kind).bind(keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(|found|{let found=row(found)?;let matches=resolved.iter().enumerate().filter(|(_,key)|**key==found.key).map(|(position,_)|original_keys[position].clone()).collect::<std::collections::BTreeSet<_>>();Ok(matches.into_iter().map(|key|{let mut value=found.clone();value.key=key;value}).collect::<Vec<_>>())}).collect::<Result<Vec<Vec<_>>>>().map(|rows|rows.into_iter().flatten().collect())
+        let rows = sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND key=ANY($2::text[])").bind(kind).bind(keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        remap_batch(rows.into_iter().map(row), original_keys, &resolved)
     }
     async fn mdn_migration_rows(
         &self,
@@ -344,3 +376,61 @@ CREATE TABLE devres_mdn_evidence (
 CREATE INDEX devres_mdn_evidence_page ON devres_mdn_evidence(kind,sequence);
 CREATE TABLE devres_mdn_state(key text PRIMARY KEY,data jsonb NOT NULL);
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_reads_preserve_alias_fanout_duplicates_missing_keys_and_payloads() {
+        let original = ["old", "canonical", "old", "missing", "one"].map(String::from);
+        let resolved = ["canonical", "canonical", "canonical", "absent", "one"].map(String::from);
+        let rows = [
+            Ok(MdnRow {
+                sequence: 7,
+                key: "canonical".into(),
+                data: serde_json::json!({"retained":[1,2,3]}),
+            }),
+            Ok(MdnRow {
+                sequence: 8,
+                key: "one".into(),
+                data: serde_json::json!({"other":true}),
+            }),
+        ];
+        let output = remap_batch(rows, &original, &resolved).expect("remap");
+        assert_eq!(
+            output
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            ["canonical", "old", "one"]
+        );
+        assert_eq!(output[0].data, output[1].data);
+        assert_eq!(output[0].sequence, output[1].sequence);
+        assert_eq!(output[2].sequence, 8);
+    }
+
+    #[test]
+    fn batch_errors_never_return_a_partial_success() {
+        let keys = ["one".into(), "two".into()];
+        let rows = [
+            Ok(MdnRow {
+                sequence: 1,
+                key: "one".into(),
+                data: serde_json::json!({}),
+            }),
+            Err(Error::integrity("injected damaged row seal")),
+        ];
+        assert_eq!(
+            remap_batch(rows, &keys, &keys)
+                .expect_err("damaged row")
+                .code,
+            "integrity"
+        );
+        assert!(
+            remap_batch([], &keys, &keys)
+                .expect("missing rows")
+                .is_empty()
+        );
+    }
+}

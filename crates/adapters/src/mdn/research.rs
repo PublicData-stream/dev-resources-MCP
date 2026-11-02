@@ -1,4 +1,6 @@
 //! Local read-only MDN research over immutable public-source snapshots.
+#[path = "membership.rs"]
+mod membership;
 use crate::{
     mdn::git::{MdnGit, Repo},
     mdn::index::{MdnIndex, SearchSpec},
@@ -11,14 +13,18 @@ use base64::{
 };
 use devres_application::mdn::{MdnStore, Member, Snapshot, View};
 use devres_domain::{Error, Result};
+use membership::MembershipCache;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
-    time::Duration,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +33,44 @@ const MAX_MEMBERS: usize = 1_000_000;
 const MAX_SCAN: usize = 10_000;
 const MAX_TEXT: usize = 4 * 1024 * 1024;
 static NORMALIZERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[derive(Default)]
+struct PhaseMetrics {
+    count: AtomicU64,
+    nanos: AtomicU64,
+}
+struct PhaseGuard<'a> {
+    metrics: &'a PhaseMetrics,
+    start: Instant,
+}
+impl PhaseMetrics {
+    fn start(&self) -> PhaseGuard<'_> {
+        PhaseGuard {
+            metrics: self,
+            start: Instant::now(),
+        }
+    }
+    fn metrics(&self, name: &str) -> String {
+        format!(
+            "devres_mdn_search_{name}_seconds_sum {}\ndevres_mdn_search_{name}_seconds_count {}\n",
+            Duration::from_nanos(self.nanos.load(Ordering::Relaxed)).as_secs_f64(),
+            self.count.load(Ordering::Relaxed),
+        )
+    }
+}
+impl Drop for PhaseGuard<'_> {
+    fn drop(&mut self) {
+        let nanos = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.metrics.nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.metrics.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+#[derive(Default)]
+struct SearchMetrics {
+    selection: PhaseMetrics,
+    membership: PhaseMetrics,
+    index: PhaseMetrics,
+}
 struct CancelOnDrop(CancellationToken);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -95,6 +139,8 @@ pub struct MdnResearch {
     content_git: MdnGit,
     compat_git: MdnGit,
     admission: Arc<Semaphore>,
+    memberships: MembershipCache,
+    metrics: SearchMetrics,
 }
 struct Selection {
     snapshot: Snapshot,
@@ -224,6 +270,8 @@ impl MdnResearch {
                 64 * 1024 * 1024,
             )?,
             admission: Arc::new(Semaphore::new(2)),
+            memberships: MembershipCache::new(false),
+            metrics: SearchMetrics::default(),
         })
     }
     pub fn new(store: Arc<dyn MdnStore>, root: &Path) -> Result<Self> {
@@ -246,7 +294,19 @@ impl MdnResearch {
                 None,
             )?,
             admission: Arc::new(Semaphore::new(2)),
+            memberships: MembershipCache::new(true),
+            metrics: SearchMetrics::default(),
         })
+    }
+    /// Aggregate private diagnostics; never includes selectors, queries or source text.
+    pub fn metrics(&self) -> String {
+        [
+            self.metrics.selection.metrics("selection"),
+            self.metrics.membership.metrics("membership"),
+            self.metrics.index.metrics("index"),
+            self.memberships.metrics(),
+        ]
+        .concat()
     }
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
         let _permit = self
@@ -388,25 +448,40 @@ impl MdnResearch {
         }
     }
     async fn search(&self, input: SearchInput, compat: bool) -> Result<Value> {
+        tokio::time::timeout(Duration::from_secs(15), self.search_inner(input, compat))
+            .await
+            .map_err(|_| Error::capacity("MDN search processing deadline exceeded."))?
+    }
+    async fn search_inner(&self, input: SearchInput, compat: bool) -> Result<Value> {
         if input.limit == 0 || input.limit > 100 || input.offset > 10_000 {
             return Err(Error::invalid(
                 "MDN search limit must be 1..100 and offset at most 10000.",
             ));
         }
-        let selection = self
-            .select(
+        let selection = {
+            let _phase = self.metrics.selection.start();
+            self.select(
                 input.snapshot.as_deref(),
                 if compat { "compat" } else { "content" },
                 None,
             )
-            .await?;
-        let members = self.all_members(&selection.snapshot).await?;
-        let ids = members
-            .into_iter()
-            .filter(|m| m.kind == if compat { "feature" } else { "article" })
-            .filter(|m| !m.gaps.iter().any(|g| g == "search_index_gap"))
-            .filter_map(|m| m.projection)
-            .collect();
+            .await?
+        };
+        let kind = if compat { "feature" } else { "article" };
+        let ids = {
+            let _phase = self.metrics.membership.start();
+            self.memberships
+                .get_or_build(&selection.snapshot.inventory, kind, || async {
+                    Ok(self
+                        .all_members(&selection.snapshot)
+                        .await?
+                        .into_iter()
+                        .filter(move |m| m.kind == kind)
+                        .filter(|m| !m.gaps.iter().any(|g| g == "search_index_gap"))
+                        .filter_map(|m| m.projection))
+                })
+                .await?
+        };
         let mut filters = BTreeMap::new();
         filters.insert(
             "kind".into(),
@@ -443,15 +518,17 @@ impl MdnResearch {
             limit: input.limit,
             cursor: input.cursor,
         };
-        let mut result = self
-            .index
-            .search(
-                &selection.snapshot.index,
-                ids,
-                spec,
-                CancellationToken::new(),
-            )
-            .await?;
+        let mut result = {
+            let _phase = self.metrics.index.start();
+            self.index
+                .search_owned(
+                    &selection.snapshot.index,
+                    ids,
+                    spec,
+                    CancellationToken::new(),
+                )
+                .await?
+        };
         result["provenance"] = selection.public();
         result["snapshot"] = json!(selection.selector());
         if let Some(rows) = result["results"].as_array_mut() {
@@ -1433,13 +1510,16 @@ mod tests {
     use devres_application::mdn::MdnRow;
     use std::sync::{
         Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     };
     #[derive(Default)]
     struct Memory {
         rows: Mutex<BTreeMap<(String, String), MdnRow>>,
         state: Mutex<BTreeMap<String, Value>>,
         sequence: AtomicI64,
+        node_batches: AtomicUsize,
+        node_pause: AtomicBool,
+        lost_owner: AtomicBool,
     }
     #[async_trait]
     impl MdnStore for Memory {
@@ -1447,12 +1527,35 @@ mod tests {
             Ok(self.sequence.load(Ordering::Relaxed))
         }
         async fn mdn_get(&self, kind: &str, key: &str) -> Result<Option<MdnRow>> {
+            if self.lost_owner.load(Ordering::Relaxed) {
+                return Err(Error::unavailable(
+                    "Storage ownership lost; restart required",
+                ));
+            }
             Ok(self
                 .rows
                 .lock()
                 .expect("rows")
                 .get(&(kind.into(), key.into()))
                 .cloned())
+        }
+        async fn mdn_get_many(&self, kind: &str, keys: &[String]) -> Result<Vec<MdnRow>> {
+            if self.lost_owner.load(Ordering::Relaxed) {
+                return Err(Error::unavailable(
+                    "Storage ownership lost; restart required",
+                ));
+            }
+            if kind == "nodes" {
+                self.node_batches.fetch_add(1, Ordering::Relaxed);
+                if self.node_pause.load(Ordering::Relaxed) {
+                    std::future::pending::<()>().await;
+                }
+            }
+            let rows = self.rows.lock().expect("rows");
+            Ok(keys
+                .iter()
+                .filter_map(|key| rows.get(&(kind.into(), key.clone())).cloned())
+                .collect())
         }
         async fn mdn_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
             let mut rows = self.rows.lock().expect("rows");
@@ -1496,6 +1599,11 @@ mod tests {
             Ok(rows)
         }
         async fn mdn_state(&self, key: &str) -> Result<Option<Value>> {
+            if self.lost_owner.load(Ordering::Relaxed) {
+                return Err(Error::unavailable(
+                    "Storage ownership lost; restart required",
+                ));
+            }
             Ok(self.state.lock().expect("state").get(key).cloned())
         }
         async fn mdn_set_state(&self, key: &str, data: &Value) -> Result<()> {
@@ -1830,5 +1938,267 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn retain_node(store: &Memory, node: &devres_application::mdn::InventoryNode) -> String {
+        let bytes = serde_json::to_vec(node).expect("node");
+        let id = crate::integrity::hash(&bytes);
+        let sequence = store.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        store.rows.lock().expect("rows").insert(
+            ("nodes".into(), id.clone()),
+            MdnRow {
+                sequence,
+                key: id.clone(),
+                data: serde_json::to_value(node).expect("node data"),
+            },
+        );
+        id
+    }
+
+    async fn searchable_fixture(
+        store: &Memory,
+        index: &MdnIndex,
+        kind: &str,
+        count: usize,
+    ) -> Snapshot {
+        use crate::mdn::index::IndexDocument;
+        use devres_application::mdn::InventoryNode;
+        let mut level = Vec::with_capacity(count);
+        let mut documents = Vec::with_capacity(count);
+        for position in 0..count {
+            let slug = format!("Fixture/{kind}/{position:06}");
+            let path = format!("files/{kind}/{position:06}/index.md");
+            let id = crate::integrity::hash(format!("{kind}:{position}").as_bytes());
+            let node = InventoryNode {
+                member: Some(Member {
+                    path: path.clone(),
+                    oid: "a".repeat(40),
+                    mode: "100644".into(),
+                    kind: kind.into(),
+                    projection: Some(id.clone()),
+                    raw: None,
+                    gaps: Vec::new(),
+                }),
+                members: 1,
+                searchable: 1,
+                ..Default::default()
+            };
+            level.push((retain_node(store, &node), 1));
+            documents.push(IndexDocument {
+                id,
+                kind: kind.into(),
+                slug,
+                title: format!("AbortController {kind} {position:06}"),
+                path,
+                text: "AbortController fetch abort network feature".into(),
+                metadata: json!({}),
+            });
+        }
+        while level.len() > 1 {
+            level = level
+                .chunks(64)
+                .map(|chunk| {
+                    let members = chunk.iter().map(|(_, members)| members).sum();
+                    let node = InventoryNode {
+                        children: chunk
+                            .iter()
+                            .enumerate()
+                            .map(|(position, (id, _))| (format!("part-{position}"), id.clone()))
+                            .collect(),
+                        members,
+                        searchable: members,
+                        ..Default::default()
+                    };
+                    (retain_node(store, &node), members)
+                })
+                .collect();
+        }
+        let inventory = level.pop().expect("nonempty fixture").0;
+        let reference = index
+            .publish(None, documents, CancellationToken::new())
+            .await
+            .expect("index fixture");
+        let snapshot = Snapshot {
+            id: crate::integrity::hash(format!("{kind}:{inventory}").as_bytes()),
+            repository: if kind == "article" {
+                "content"
+            } else {
+                "compat"
+            }
+            .into(),
+            revision: "a".repeat(40),
+            tree: "b".repeat(40),
+            parents: Vec::new(),
+            committed_at: 1,
+            inventory,
+            processor_version: 1,
+            index: reference,
+            coverage: json!({"accounted":true,"members":count}),
+        };
+        store
+            .mdn_put(
+                "snapshots",
+                &snapshot.id,
+                &serde_json::to_value(&snapshot).expect("snapshot"),
+            )
+            .await
+            .expect("retain snapshot");
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn corpus_sized_cold_and_warm_search_reuses_only_verified_membership() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let store = Arc::new(Memory::default());
+        let research = MdnResearch::new(store.clone(), dir.path()).expect("research");
+        let content = searchable_fixture(&store, &research.index, "article", 20_000).await;
+        let compat = searchable_fixture(&store, &research.index, "feature", 25_000).await;
+        view(&store, &content, &compat, devres_domain::unix_now()).await;
+        for (tool, snapshot, count) in [
+            ("mdn.search", &content, 20_000),
+            ("mdn.compat_search", &compat, 25_000),
+        ] {
+            store.node_batches.store(0, Ordering::Relaxed);
+            let first = research
+                .call(
+                    tool,
+                    json!({"query":"AbortController","snapshot":snapshot.id,"limit":2}),
+                )
+                .await
+                .expect("cold corpus search within internal budget");
+            assert_eq!(first["total"], count);
+            assert_eq!(first["results"].as_array().expect("results").len(), 2);
+            assert!(store.node_batches.load(Ordering::Relaxed) > 0);
+            store.node_batches.store(0, Ordering::Relaxed);
+            let warm = research
+                .call(
+                    tool,
+                    json!({"query":"AbortController","snapshot":snapshot.id,"limit":2}),
+                )
+                .await
+                .expect("warm search");
+            assert_eq!(first, warm);
+            let next = research
+                .call(tool, json!({"query":"AbortController","snapshot":snapshot.id,"limit":3,"cursor":first["next_cursor"]}))
+                .await
+                .expect("stable continuation");
+            assert_eq!(next["results"].as_array().expect("next results").len(), 3);
+            assert_ne!(first["results"][0]["id"], next["results"][0]["id"]);
+            let other = research
+                .call(
+                    tool,
+                    json!({"query":"network","snapshot":snapshot.id,"limit":2}),
+                )
+                .await
+                .expect("different query shares membership");
+            assert_eq!(other["total"], count);
+            assert_eq!(store.node_batches.load(Ordering::Relaxed), 0);
+        }
+        store.lost_owner.store(true, Ordering::Relaxed);
+        assert_eq!(
+            research
+                .call(
+                    "mdn.search",
+                    json!({"query":"AbortController","snapshot":content.id})
+                )
+                .await
+                .expect_err("owner fence still checked on cache hit")
+                .code,
+            "unavailable"
+        );
+        store.lost_owner.store(false, Ordering::Relaxed);
+        view(
+            &store,
+            &content,
+            &compat,
+            devres_domain::unix_now() - 8 * 86400,
+        )
+        .await;
+        assert_eq!(
+            research
+                .call("mdn.search", json!({"query":"AbortController"}))
+                .await
+                .expect_err("freshness still checked on cache hit")
+                .code,
+            "unavailable"
+        );
+        let metrics = research.metrics();
+        assert!(metrics.contains("devres_mdn_search_membership_cache_hits_total 6\n"));
+        assert!(metrics.contains("devres_mdn_search_membership_builds_completed_total 2\n"));
+        assert!(metrics.contains("devres_mdn_search_selection_seconds_count 10\n"));
+        assert!(!metrics.contains("AbortController"));
+        assert!(!metrics.contains(&content.id));
+        for line in metrics.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 2);
+            assert!(
+                fields[0]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            );
+            assert!(
+                fields[1]
+                    .parse::<f64>()
+                    .expect("numeric metric")
+                    .is_finite()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_inventory_and_cancelled_preparation_never_publish_cache_entries() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let store = Arc::new(Memory::default());
+        let research = MdnResearch::new(store.clone(), dir.path()).expect("research");
+        let snapshot = searchable_fixture(&store, &research.index, "article", 1).await;
+        let root_key = ("nodes".into(), snapshot.inventory.clone());
+        let original = store.rows.lock().expect("rows")[&root_key].clone();
+        store
+            .rows
+            .lock()
+            .expect("rows")
+            .get_mut(&root_key)
+            .expect("root")
+            .data["members"] = json!(999);
+        assert_eq!(
+            research
+                .call(
+                    "mdn.search",
+                    json!({"query":"AbortController","snapshot":snapshot.id})
+                )
+                .await
+                .expect_err("corrupt root rejected")
+                .code,
+            "integrity"
+        );
+        store.rows.lock().expect("rows").insert(root_key, original);
+        store.node_pause.store(true, Ordering::Relaxed);
+        tokio::time::pause();
+        let error = research
+            .call(
+                "mdn.search",
+                json!({"query":"AbortController","snapshot":snapshot.id}),
+            )
+            .await
+            .expect_err("stalled inventory has a bounded tool error");
+        assert_eq!(error.code, "capacity");
+        assert_eq!(error.message, "MDN search processing deadline exceeded.");
+        tokio::time::resume();
+        store.node_pause.store(false, Ordering::Relaxed);
+        let recovered = research
+            .call(
+                "mdn.search",
+                json!({"query":"AbortController","snapshot":snapshot.id}),
+            )
+            .await
+            .expect("cancelled fill releases coalescing lock");
+        assert_eq!(recovered["total"], 1);
+        let metrics = research.metrics();
+        assert!(metrics.contains("devres_mdn_search_membership_builds_failed_total 1\n"));
+        assert!(metrics.contains("devres_mdn_search_membership_builds_cancelled_total 1\n"));
+        assert!(metrics.contains("devres_mdn_search_membership_builds_completed_total 1\n"));
+        assert!(metrics.contains("devres_mdn_search_membership_seconds_count 3\n"));
     }
 }

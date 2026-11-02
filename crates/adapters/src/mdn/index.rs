@@ -973,6 +973,20 @@ impl MdnIndex {
         spec: SearchSpec,
         cancel: CancellationToken,
     ) -> Result<Value> {
+        self.search_owned(reference, Arc::new(members), spec, cancel)
+            .await
+    }
+    /// Keep immutable membership and its accounting owned by the blocking worker.
+    pub(crate) async fn search_owned<M>(
+        &self,
+        reference: &Value,
+        members: M,
+        spec: SearchSpec,
+        cancel: CancellationToken,
+    ) -> Result<Value>
+    where
+        M: AsRef<BTreeSet<String>> + Send + 'static,
+    {
         let permit = READERS
             .get_or_init(|| Arc::new(Semaphore::new(2)))
             .clone()
@@ -984,14 +998,14 @@ impl MdnIndex {
         let _cancel_guard = CancelOnDrop(stop.clone());
         let mut task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            this.search_sync(&reference, members, spec, &stop)
+            this.search_sync(&reference, members.as_ref(), spec, &stop)
         });
         tokio::select! {biased;_=cancel.cancelled()=>{let _=task.await;Err(Error::new("cancelled","MDN search canceled."))},result=&mut task=>result.map_err(|_|failure())?}
     }
     fn search_sync(
         &self,
         reference: &Value,
-        members: BTreeSet<String>,
+        members: &BTreeSet<String>,
         spec: SearchSpec,
         cancel: &CancellationToken,
     ) -> Result<Value> {
