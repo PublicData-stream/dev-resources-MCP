@@ -217,8 +217,8 @@ impl ServerHandler for McpHandler {
         let _permit = self.admit().await?;
         let cancel = context.ct.child_token();
         let _guard = cancel.clone().drop_guard();
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.limits.call_timeout_secs);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.limits.tool_timeout_secs(request.name.as_ref()));
         let progress = ProgressReporter::new(
             context.peer.clone(),
             token,

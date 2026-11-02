@@ -174,8 +174,21 @@ separate coverage states. No full-corpus capacity benchmark is implied.
 | `max_calls_per_connection` | 8 |
 | `io_timeout_secs` | 10 |
 | `call_timeout_secs` | 30 |
-| `idle_timeout_secs` | 60 |
+| `search_timeout_secs` | 75 |
+| `idle_timeout_secs` | 120 |
 | `shutdown_timeout_secs` | 15 |
+
+`search_timeout_secs` applies only to generic `search`; other tools and resource
+reads use `call_timeout_secs`. Generic search keeps at most two source operations
+active and caps each at 15 seconds, so its default permits four waves across all
+eight source families. Completed results survive source-local failures. Cancellation
+and shorter deadlines can still interrupt work.
+
+Timeout settings accept 1..86400 seconds. Existing explicit overrides remain valid.
+Keep connection idle and edge request/read ceilings above the intended search runtime
+with room for I/O; an explicitly shorter idle or edge timeout can interrupt a longer
+search. Shipped edge examples use 120-second request/read and WebTransport idle
+ceilings. Header/body input and stalled-write timeouts retain `io_timeout_secs`.
 
 `limits.rate_limit` defaults to enabled with 100 calls/second and burst 100.
 An optional `verified_tunnel` calls-per-second/burst override requires edge mTLS.

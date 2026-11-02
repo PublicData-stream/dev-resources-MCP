@@ -212,15 +212,19 @@ async fn guard(
             .fetch_add(1, Ordering::Relaxed);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let input_deadline =
-        tokio::time::Instant::now() + Duration::from_secs(context.limits.io_timeout_secs);
+    let request_started = tokio::time::Instant::now();
+    let input_deadline = request_started + Duration::from_secs(context.limits.io_timeout_secs);
     // A watchdog outside body polling also covers HTTP/2 flow-control stalls.
-    let watchdog = request
+    let mut watchdog = request
         .extensions()
         .get::<Arc<crate::timed_io::ConnectionState>>()
         .map(|state| {
             state.request(Duration::from_secs(
-                context.limits.call_timeout_secs + context.limits.io_timeout_secs,
+                context
+                    .limits
+                    .call_timeout_secs
+                    .max(context.limits.search_timeout_secs)
+                    + context.limits.io_timeout_secs,
             ))
         });
     let response_limit = context.limits.max_message_bytes;
@@ -269,6 +273,12 @@ async fn guard(
     {
         return response;
     }
+    let timeout_secs = request_timeout_secs(&context.limits, &parts.method, &bytes);
+    if let Some(watchdog) = &mut watchdog {
+        watchdog.reset_at(
+            request_started + Duration::from_secs(timeout_secs + context.limits.io_timeout_secs),
+        );
+    }
     let modern = parts.method == http::Method::POST
         && parts
             .headers
@@ -276,7 +286,7 @@ async fn guard(
             .and_then(|v| v.to_str().ok())
             == Some("2026-07-28");
     let response = match tokio::time::timeout(
-        Duration::from_secs(context.limits.call_timeout_secs),
+        Duration::from_secs(timeout_secs),
         next.run(Request::from_parts(parts, Body::from(bytes))),
     )
     .await
@@ -284,8 +294,7 @@ async fn guard(
         Ok(response) => response,
         Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
     };
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(context.limits.call_timeout_secs);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let response = crate::http_status::preserve_invalid_params_status(
         response,
         modern,
@@ -352,6 +361,41 @@ async fn guard(
         },
     );
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// Inspect only the bounded envelope; audit arguments remain borrowed input bytes.
+fn request_timeout_secs(
+    limits: &crate::config::Limits,
+    method: &http::Method,
+    bytes: &[u8],
+) -> u64 {
+    use serde::Deserialize;
+    use std::borrow::Cow;
+
+    #[derive(Deserialize)]
+    struct Params<'a> {
+        #[serde(borrow)]
+        name: Cow<'a, str>,
+    }
+    #[derive(Deserialize)]
+    struct Request<'a> {
+        #[serde(borrow)]
+        jsonrpc: Cow<'a, str>,
+        #[serde(borrow)]
+        method: Cow<'a, str>,
+        #[serde(rename = "id")]
+        _id: serde::de::IgnoredAny,
+        #[serde(borrow)]
+        params: Params<'a>,
+    }
+    if method == http::Method::POST
+        && let Ok(request) = serde_json::from_slice::<Request<'_>>(bytes)
+        && request.jsonrpc == "2.0"
+        && request.method == "tools/call"
+    {
+        return limits.tool_timeout_secs(&request.params.name);
+    }
+    limits.call_timeout_secs
 }
 
 enum BufferAdmissionError {
@@ -577,6 +621,33 @@ async fn bind_health(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn only_decoded_search_calls_select_the_extended_timeout() {
+        let limits = crate::config::Limits {
+            call_timeout_secs: 2,
+            search_timeout_secs: 7,
+            ..Default::default()
+        };
+        for bytes in [
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"fixture"}}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"se\u0061rch"}}"#,
+        ] {
+            assert_eq!(request_timeout_secs(&limits, &http::Method::POST, bytes), 7);
+            assert_eq!(request_timeout_secs(&limits, &http::Method::GET, bytes), 2);
+        }
+        for bytes in [
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"crate.search","arguments":{"query":"search"}}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"name":"search"}}"#,
+            br#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search"}}"#,
+            br#"{"jsonrpc":"invalid","id":1,"method":"tools/call","params":{"name":"search"}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","name":"crate.search"}}"#,
+            br#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search"}}]"#,
+            b"malformed",
+        ] {
+            assert_eq!(request_timeout_secs(&limits, &http::Method::POST, bytes), 2);
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn waiting_http_does_not_claim_webtransport_response_bytes() {

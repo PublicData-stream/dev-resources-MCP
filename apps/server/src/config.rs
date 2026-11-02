@@ -17,6 +17,8 @@ pub struct Limits {
     pub max_calls_per_connection: usize,
     pub io_timeout_secs: u64,
     pub call_timeout_secs: u64,
+    /// Generic search can visit four bounded source waves.
+    pub search_timeout_secs: u64,
     pub idle_timeout_secs: u64,
     pub shutdown_timeout_secs: u64,
     pub rate_limit: RateLimitConfig,
@@ -60,7 +62,8 @@ impl Default for Limits {
             max_calls_per_connection: 8,
             io_timeout_secs: 10,
             call_timeout_secs: 30,
-            idle_timeout_secs: 60,
+            search_timeout_secs: 75,
+            idle_timeout_secs: 120,
             shutdown_timeout_secs: 15,
             rate_limit: RateLimitConfig::default(),
         }
@@ -68,6 +71,14 @@ impl Default for Limits {
 }
 
 impl Limits {
+    pub fn tool_timeout_secs(&self, name: &str) -> u64 {
+        if name == "search" {
+            self.search_timeout_secs
+        } else {
+            self.call_timeout_secs
+        }
+    }
+
     pub fn tool_result_limit(&self) -> usize {
         self.max_tool_result_bytes
             .unwrap_or(self.max_message_bytes / 8)
@@ -99,6 +110,7 @@ impl Limits {
             || [
                 self.io_timeout_secs,
                 self.call_timeout_secs,
+                self.search_timeout_secs,
                 self.idle_timeout_secs,
                 self.shutdown_timeout_secs,
             ]
@@ -383,6 +395,30 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generic_search_timeout_is_independent_and_explicit_overrides_remain_valid() {
+        let defaults: Limits = toml::from_str("").unwrap();
+        assert_eq!(defaults.tool_timeout_secs("search"), 75);
+        assert_eq!(defaults.tool_timeout_secs("crate.search"), 30);
+        assert_eq!(defaults.tool_timeout_secs("search.other"), 30);
+        assert_eq!(defaults.idle_timeout_secs, 120);
+        defaults.validate().unwrap();
+        let explicit: Limits =
+            toml::from_str("call_timeout_secs=2\nsearch_timeout_secs=5\nidle_timeout_secs=1")
+                .unwrap();
+        assert_eq!(explicit.tool_timeout_secs("search"), 5);
+        assert_eq!(explicit.tool_timeout_secs("bounded"), 2);
+        assert_eq!(explicit.idle_timeout_secs, 1);
+        explicit.validate().unwrap();
+        for invalid in [0, 86401] {
+            let limits = Limits {
+                search_timeout_secs: invalid,
+                ..Limits::default()
+            };
+            assert!(limits.validate().is_err());
+        }
+    }
+
     #[test]
     fn strict_source_and_origin_validation() {
         for invalid in [

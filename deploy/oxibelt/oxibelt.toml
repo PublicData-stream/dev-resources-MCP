@@ -52,7 +52,9 @@ origin = "https://backend:8080"
 max_http_version = "h1"
 preserve_host = false
 connect_timeout_ms = 3000
-request_timeout_ms = 40000
+request_timeout_ms = 120000
+first_byte_timeout_ms = 120000
+read_timeout_ms = 120000
 [upstreams.tls.client_identity]
 cert_chain = "edge-client.pem"
 private_key = "edge-client-key.pem"
@@ -66,8 +68,10 @@ preserve_host = false
 webtransport = true
 webtransport_http3_draft = "draft02"
 connect_timeout_ms = 3000
-request_timeout_ms = 40000
-idle_timeout_ms = 65000
+request_timeout_ms = 120000
+first_byte_timeout_ms = 120000
+read_timeout_ms = 120000
+idle_timeout_ms = 120000
 [upstreams.tls.client_identity]
 cert_chain = "edge-client.pem"
 private_key = "edge-client-key.pem"

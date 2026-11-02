@@ -36,8 +36,9 @@ impl ConnectionState {
     pub fn request(self: &Arc<Self>, duration: Duration) -> RequestDeadline {
         self.active.fetch_add(1, Ordering::AcqRel);
         let cancel = self.cancel.clone();
+        let deadline = tokio::time::Instant::now() + duration;
         let task = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
+            tokio::time::sleep_until(deadline).await;
             cancel.cancel();
         });
         RequestDeadline {
@@ -72,6 +73,18 @@ impl Drop for RequestDeadline {
             *last = tokio::time::Instant::now();
         }
         self.state.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl RequestDeadline {
+    /// Retain the active-request reservation while selecting the decoded call's budget.
+    pub fn reset_at(&mut self, deadline: tokio::time::Instant) {
+        self.task.abort();
+        let cancel = self.state.cancel.clone();
+        self.task = tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            cancel.cancel();
+        });
     }
 }
 
@@ -147,6 +160,35 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TimedIo<T> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn retiming_watchdog_keeps_its_reservation_and_aborts_the_old_timer() {
+        let state = ConnectionState::new();
+        let started = tokio::time::Instant::now();
+        let mut watchdog = state.request(Duration::from_secs(8));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        watchdog.reset_at(started + Duration::from_secs(4));
+        assert_eq!(state.active.load(Ordering::Acquire), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!state.cancel.is_cancelled());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(state.cancel.is_cancelled());
+        drop(watchdog);
+        assert_eq!(state.active.load(Ordering::Acquire), 0);
+
+        let state = ConnectionState::new();
+        let mut watchdog = state.request(Duration::from_secs(2));
+        watchdog.reset_at(tokio::time::Instant::now() + Duration::from_secs(8));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert!(!state.cancel.is_cancelled());
+        drop(watchdog);
+        tokio::time::advance(Duration::from_secs(8)).await;
+        tokio::task::yield_now().await;
+        assert!(!state.cancel.is_cancelled());
+        assert_eq!(state.active.load(Ordering::Acquire), 0);
+    }
     #[tokio::test(start_paused = true)]
     async fn stalled_writer_deadline_releases_owned_work() {
         let (writer, _reader) = tokio::io::duplex(1);

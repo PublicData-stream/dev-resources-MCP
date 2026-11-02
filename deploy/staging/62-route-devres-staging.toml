@@ -28,4 +28,4 @@ allow_methods = ["CONNECT"]
 [routes.tls]
 ssl_early_data = "off"
 [routes.timeouts]
-webtransport_idle_timeout_ms = 65000
+webtransport_idle_timeout_ms = 120000

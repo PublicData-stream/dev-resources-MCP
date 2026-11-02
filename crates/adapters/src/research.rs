@@ -338,7 +338,7 @@ impl Research {
         self.search_with_context(
             input,
             tokio_util::sync::CancellationToken::new(),
-            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(75),
         )
         .await
     }
