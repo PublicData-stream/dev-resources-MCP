@@ -289,7 +289,7 @@ impl GitRegistry {
                     return if status.success() { Ok(()) } else { Err(git_error()) };
                 }
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                    directory_size(&self.root.join(REPO_NAME), self.max_repository_bytes)?;
+                    directory_size(&self.root.join(REPO_NAME), self.max_repository_bytes, GitScanMode::ActiveFetch)?;
                     if fs2::available_space(&self.root).map_err(|_| git_error())? < 1024 * 1024 * 1024 {
                         return Err(Error::capacity("Insufficient registry Git storage headroom; history is preserved."));
                     }
@@ -306,7 +306,11 @@ impl GitRegistry {
         shutdown: &CancellationToken,
         deadline: Instant,
     ) -> Result<BulkArtifact> {
-        directory_size(&self.root.join(REPO_NAME), self.max_repository_bytes)?;
+        directory_size(
+            &self.root.join(REPO_NAME),
+            self.max_repository_bytes,
+            GitScanMode::Settled,
+        )?;
         let packs = self.root.join(REPO_NAME).join("objects/pack");
         real_directory(&packs)?;
         let mut entries = tokio::fs::read_dir(&packs).await.map_err(|_| git_error())?;
@@ -462,7 +466,11 @@ impl GitRegistry {
                 }
                 Err(_) => return Err(git_error()),
             }
-            directory_size(&self.root.join(REPO_NAME), self.max_repository_bytes)?;
+            directory_size(
+                &self.root.join(REPO_NAME),
+                self.max_repository_bytes,
+                GitScanMode::Settled,
+            )?;
         }
         sync_directory(&pack_root).await?;
         if !evidence.shallow.is_empty() {
@@ -1425,7 +1433,7 @@ pub(crate) fn valid_pack_name(name: &str) -> bool {
 pub(crate) fn recover_working_stages(repository: &Path) -> Result<()> {
     // A single fenced mutator owns these private temporary files. No immutable
     // archive object or observed snapshot ref is considered disposable.
-    directory_size(repository, u64::MAX)?;
+    directory_size(repository, u64::MAX, GitScanMode::Settled)?;
     for relative in [
         "shallow.lock",
         "config.lock",
@@ -1491,23 +1499,69 @@ pub(crate) fn real_directory(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn directory_size(root: &Path, max_bytes: u64) -> Result<u64> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitScanMode {
+    Settled,
+    ActiveFetch,
+}
+
+pub(crate) fn directory_size(root: &Path, max_bytes: u64, mode: GitScanMode) -> Result<u64> {
+    directory_size_with_metadata(root, max_bytes, mode, 100_000, std::fs::DirEntry::metadata)
+}
+
+fn directory_size_with_metadata<F>(
+    root: &Path,
+    max_bytes: u64,
+    mode: GitScanMode,
+    max_members: usize,
+    mut metadata: F,
+) -> Result<u64>
+where
+    F: FnMut(&std::fs::DirEntry) -> std::io::Result<std::fs::Metadata>,
+{
+    // Only a fenced Git subprocess mutates this owned repository. Its temporary
+    // descendants can disappear between enumeration and inspection during fetch.
+    // Recovery and publication must inspect a settled repository strictly.
     let mut pending = vec![root.to_owned()];
     let mut files = 0usize;
     let mut bytes = 0_u64;
     while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory).map_err(|_| git_error())? {
+        let may_disappear = mode == GitScanMode::ActiveFetch && directory != root;
+        let directory_metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if may_disappear && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(git_error()),
+        };
+        if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+            return Err(Error::integrity("Invalid registry Git directory."));
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if may_disappear && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(git_error()),
+        };
+        for entry in entries {
             let entry = entry.map_err(|_| git_error())?;
-            let metadata = entry.metadata().map_err(|_| git_error())?;
-            let kind = entry.file_type().map_err(|_| git_error())?;
-            if kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
-                return Err(Error::integrity("Invalid registry Git filesystem member."));
-            }
+            // Disappearing members still consume the traversal work budget.
             files += 1;
-            if files > 100_000 {
+            if files > max_members {
                 return Err(Error::capacity(
                     "Registry Git filesystem member limit exceeded.",
                 ));
+            }
+            let metadata = match metadata(&entry) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if mode == GitScanMode::ActiveFetch
+                        && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(_) => return Err(git_error()),
+            };
+            let kind = metadata.file_type();
+            if kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
+                return Err(Error::integrity("Invalid registry Git filesystem member."));
             }
             if kind.is_dir() {
                 pending.push(entry.path());
@@ -1521,8 +1575,10 @@ pub(crate) fn directory_size(root: &Path, max_bytes: u64) -> Result<u64> {
             }
         }
     }
+    real_directory(root)?;
     Ok(bytes)
 }
+
 pub(crate) async fn sync_directory(path: &Path) -> Result<()> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
@@ -2136,3 +2192,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "git/scan_tests.rs"]
+mod scan_tests;

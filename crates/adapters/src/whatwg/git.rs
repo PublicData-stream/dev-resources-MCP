@@ -3,8 +3,8 @@
 use crate::{
     bulk::{self, BulkArtifact, BulkArtifactStore, BulkBroker},
     crates_io::git::{
-        self as crate_git, AUTH_HEADER, GitSource, ManagedChild, base_command, delimited,
-        directory_size, real_directory, run_command, valid_oid, valid_pack_name,
+        self as crate_git, AUTH_HEADER, GitScanMode, GitSource, ManagedChild, base_command,
+        delimited, directory_size, real_directory, run_command, valid_oid, valid_pack_name,
     },
 };
 use devres_domain::{Error, Result};
@@ -383,10 +383,10 @@ impl WhatwgGit {
         recover_locks(&self.repository())?;
         crate_git::recover_working_stages(&self.repository())?;
         self.artifacts.recover_stages().await?;
-        self.check_space()
+        self.check_space(GitScanMode::Settled)
     }
-    fn check_space(&self) -> Result<()> {
-        directory_size(&self.repository(), self.max_git_bytes)?;
+    fn check_space(&self, mode: GitScanMode) -> Result<()> {
+        directory_size(&self.repository(), self.max_git_bytes, mode)?;
         if fs2::available_space(&self.root).map_err(|_| failure())? < self.min_free_bytes {
             return Err(Error::capacity(
                 "WHATWG Git storage headroom exhausted; retained evidence is preserved.",
@@ -475,7 +475,7 @@ impl WhatwgGit {
                 _ = failed.cancelled() => break Err(relay.failure_reason.lock().ok().and_then(|reason| reason.clone()).unwrap_or_else(failure)),
                 _ = tokio::time::sleep_until(deadline) => break Err(Error::capacity("WHATWG Git synchronization deadline exceeded.")),
                 status = child.child.wait() => { child.finished = true; break match status { Ok(status) if status.success() => Ok(()), _ => Err(failure()) }; }
-                _ = tokio::time::sleep(Duration::from_millis(250)) => { if let Err(error) = self.check_space() { break Err(error); } }
+                _ = tokio::time::sleep(Duration::from_millis(250)) => { if let Err(error) = self.check_space(GitScanMode::ActiveFetch) { break Err(error); } }
             }
         };
         let stopped = child.terminate().await;
@@ -541,7 +541,7 @@ impl WhatwgGit {
         }
         stopped?;
         relay_result?;
-        self.check_space()?;
+        self.check_space(GitScanMode::Settled)?;
         let observed_at = devres_domain::unix_now();
         let refs = self.read_refs(&cancel, deadline).await?;
         let head = head.map_err(|error| {
@@ -998,7 +998,7 @@ impl WhatwgGit {
             deadline,
         )
         .await?;
-        self.check_space()
+        self.check_space(GitScanMode::Settled)
     }
     pub async fn commit_page(
         &self,
@@ -1487,7 +1487,7 @@ fn parse_diff(token: &[u8], raw_path: &[u8]) -> Result<TreeEntry> {
     })
 }
 fn recover_locks(repository: &Path) -> Result<()> {
-    directory_size(repository, u64::MAX)?;
+    directory_size(repository, u64::MAX, GitScanMode::Settled)?;
     fn walk(path: &Path) -> Result<()> {
         if !path.exists() {
             return Ok(());

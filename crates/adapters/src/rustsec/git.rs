@@ -3,8 +3,8 @@
 use crate::{
     bulk::{self, BulkArtifact, BulkArtifactStore, BulkBroker},
     crates_io::git::{
-        self as crate_git, AUTH_HEADER, ManagedChild, base_command, delimited, directory_size,
-        real_directory, run_command, valid_oid, valid_pack_name,
+        self as crate_git, AUTH_HEADER, GitScanMode, ManagedChild, base_command, delimited,
+        directory_size, real_directory, run_command, valid_oid, valid_pack_name,
     },
 };
 use devres_application::advisory::{
@@ -187,7 +187,7 @@ impl AdvisoryHistory {
             if value != b"devres-rustsec-history-v1\n" {
                 return Err(Error::integrity("RustSec Git ownership mismatch."));
             }
-            directory_size(&repository, u64::MAX)?;
+            directory_size(&repository, u64::MAX, GitScanMode::Settled)?;
         } else {
             match tokio::fs::OpenOptions::new()
                 .write(true)
@@ -219,7 +219,7 @@ impl AdvisoryHistory {
         // These paths are working artifacts only. Never remove packs or retained refs.
         recover_locks(&repository)?;
         crate_git::recover_working_stages(&repository)?;
-        directory_size(&repository, self.config.max_git_bytes)?;
+        directory_size(&repository, self.config.max_git_bytes, GitScanMode::Settled)?;
         Ok(())
     }
     pub async fn tick(&self, shutdown: CancellationToken) -> Result<()> {
@@ -373,7 +373,7 @@ impl AdvisoryHistory {
                 _ = tokio::time::sleep_until(deadline) => break Err(Error::capacity("RustSec Git synchronization deadline exceeded.")),
                 status = child.child.wait() => { child.finished = true; break match status { Ok(status) if status.success() => Ok(()), _ => Err(failure()) }; }
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                    if let Err(error) = self.check_space() { break Err(error); }
+                    if let Err(error) = self.check_space(GitScanMode::ActiveFetch) { break Err(error); }
                 }
             }
         };
@@ -389,7 +389,7 @@ impl AdvisoryHistory {
         }
         transfer?;
         stopped?;
-        self.check_space()?;
+        self.check_space(GitScanMode::Settled)?;
         let observed_at = devres_domain::unix_now();
         let refs = self.read_refs(&shutdown, deadline).await?;
         let mut roots: BTreeSet<String> =
@@ -468,8 +468,8 @@ impl AdvisoryHistory {
         *self.restored.lock().await = Some(state.manifest.body_hash.clone());
         Ok(state)
     }
-    fn check_space(&self) -> Result<()> {
-        directory_size(&self.repository(), self.config.max_git_bytes)?;
+    fn check_space(&self, mode: GitScanMode) -> Result<()> {
+        directory_size(&self.repository(), self.config.max_git_bytes, mode)?;
         if fs2::available_space(&self.root).map_err(|_| failure())? < self.config.min_free_bytes {
             return Err(Error::capacity(
                 "Insufficient RustSec Git storage headroom; retained history is preserved.",
@@ -799,7 +799,11 @@ impl AdvisoryHistory {
             deadline,
         )
         .await?;
-        directory_size(&self.repository(), self.config.max_git_bytes)?;
+        directory_size(
+            &self.repository(),
+            self.config.max_git_bytes,
+            GitScanMode::Settled,
+        )?;
         *self.restored.lock().await = Some(artifact.body_hash.clone());
         Ok(())
     }
@@ -1518,7 +1522,7 @@ fn valid_ref(name: &str) -> bool {
             .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
 }
 fn recover_locks(repository: &Path) -> Result<()> {
-    directory_size(repository, u64::MAX)?;
+    directory_size(repository, u64::MAX, GitScanMode::Settled)?;
     fn walk(path: &Path) -> Result<()> {
         if !path.exists() {
             return Ok(());
