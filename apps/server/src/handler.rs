@@ -22,6 +22,9 @@ pub struct Counters {
     pub calls: AtomicU64,
     pub failures: AtomicU64,
     pub rate_limited: AtomicU64,
+    pub http_request_rejected: AtomicU64,
+    pub http_buffer_wait_expired: AtomicU64,
+    pub http_shutdown_rejected: AtomicU64,
 }
 #[derive(Clone)]
 pub struct McpHandler {

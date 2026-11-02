@@ -181,6 +181,11 @@ async fn guard(
     next: Next,
 ) -> Response {
     if context.shutdown.is_cancelled() {
+        context
+            .handler
+            .counters
+            .http_shutdown_rejected
+            .fetch_add(1, Ordering::Relaxed);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let authority = request.uri().authority().map(|a| a.as_str()).or_else(|| {
@@ -200,8 +205,15 @@ async fn guard(
         return StatusCode::FORBIDDEN.into_response();
     }
     let Ok(request_permit) = context.requests.clone().try_acquire_owned() else {
+        context
+            .handler
+            .counters
+            .http_request_rejected
+            .fetch_add(1, Ordering::Relaxed);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let input_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(context.limits.io_timeout_secs);
     // A watchdog outside body polling also covers HTTP/2 flow-control stalls.
     let watchdog = request
         .extensions()
@@ -215,12 +227,35 @@ async fn guard(
     let buffers = context.buffers.clone();
     let reserve_bytes = context.limits.max_message_bytes * 4;
     // Reserve capacity before collecting, including room for the SDK's decoding and serialization copies.
-    let Ok(buffer_permit) = buffers.try_acquire_many_owned(reserve_bytes as u32) else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let buffer_permit = match reserve_http_buffers(
+        buffers,
+        reserve_bytes as u32,
+        input_deadline,
+        &context.shutdown,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(BufferAdmissionError::Shutdown) => {
+            context
+                .handler
+                .counters
+                .http_shutdown_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(BufferAdmissionError::Expired) => {
+            context
+                .handler
+                .counters
+                .http_buffer_wait_expired
+                .fetch_add(1, Ordering::Relaxed);
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let (parts, body) = request.into_parts();
-    let bytes = match tokio::time::timeout(
-        Duration::from_secs(context.limits.io_timeout_secs),
+    let bytes = match tokio::time::timeout_at(
+        input_deadline,
         to_bytes(body, context.limits.max_message_bytes),
     )
     .await
@@ -317,6 +352,40 @@ async fn guard(
         },
     );
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+enum BufferAdmissionError {
+    Shutdown,
+    Expired,
+}
+
+async fn reserve_http_buffers(
+    buffers: Arc<tokio::sync::Semaphore>,
+    bytes: u32,
+    deadline: tokio::time::Instant,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<tokio::sync::OwnedSemaphorePermit, BufferAdmissionError> {
+    loop {
+        if shutdown.is_cancelled() {
+            return Err(BufferAdmissionError::Shutdown);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(BufferAdmissionError::Expired);
+        }
+        match buffers.clone().try_acquire_many_owned(bytes) {
+            Ok(permit) => return Ok(permit),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(BufferAdmissionError::Expired),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        }
+        // A queued acquire_many partially reserves bytes. Leave all bytes available
+        // to active WebTransport responses until this entire reservation fits.
+        let retry = deadline.min(tokio::time::Instant::now() + Duration::from_millis(10));
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(BufferAdmissionError::Shutdown),
+            _ = tokio::time::sleep_until(retry) => {},
+        }
+    }
 }
 
 fn validate_version(headers: &http::HeaderMap, bytes: &[u8]) -> Option<Response> {
@@ -475,10 +544,13 @@ async fn bind_health(
                 let metrics = metrics.clone();
                 async move {
                     let mut output = format!(
-                        "devres_tool_calls_total {}\ndevres_tool_failures_total {}\ndevres_tool_rate_limited_total {}\n",
+                        "devres_tool_calls_total {}\ndevres_tool_failures_total {}\ndevres_tool_rate_limited_total {}\ndevres_http_request_rejected_total {}\ndevres_http_buffer_wait_expired_total {}\ndevres_http_shutdown_rejected_total {}\n",
                         context.handler.counters.calls.load(Ordering::Relaxed),
                         context.handler.counters.failures.load(Ordering::Relaxed),
-                        context.handler.counters.rate_limited.load(Ordering::Relaxed)
+                        context.handler.counters.rate_limited.load(Ordering::Relaxed),
+                        context.handler.counters.http_request_rejected.load(Ordering::Relaxed),
+                        context.handler.counters.http_buffer_wait_expired.load(Ordering::Relaxed),
+                        context.handler.counters.http_shutdown_rejected.load(Ordering::Relaxed)
                     );
                     let extra = metrics();
                     if extra.len() <= 16 * 1024 {
@@ -500,4 +572,79 @@ async fn bind_health(
         }
         .boxed(),
     })
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_http_does_not_claim_webtransport_response_bytes() {
+        const MIB: usize = 1024 * 1024;
+        let buffers = Arc::new(tokio::sync::Semaphore::new(64 * MIB));
+        let http = buffers
+            .clone()
+            .try_acquire_many_owned((32 * MIB) as u32)
+            .unwrap();
+        let frame = buffers
+            .clone()
+            .try_acquire_many_owned((8 * MIB + 8192) as u32)
+            .unwrap();
+        let available = buffers.available_permits();
+        let queued = buffers.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let signal = shutdown.clone();
+        let waiting = tokio::spawn(async move {
+            reserve_http_buffers(
+                queued,
+                (32 * MIB) as u32,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                &signal,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        assert_eq!(buffers.available_permits(), available);
+        let response = buffers
+            .clone()
+            .try_acquire_many_owned((8 * MIB) as u32)
+            .expect("active WebTransport response still fits");
+        drop(response);
+        drop(frame);
+        drop(http);
+        assert!(waiting.await.unwrap().is_ok());
+        assert_eq!(buffers.available_permits(), 64 * MIB);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_and_expired_waiters_hold_no_byte_permits() {
+        let buffers = Arc::new(tokio::sync::Semaphore::new(16));
+        let held = buffers.clone().acquire_many_owned(12).await.unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let future = reserve_http_buffers(
+            buffers.clone(),
+            8,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &shutdown,
+        );
+        tokio::pin!(future);
+        tokio::select! { _ = tokio::time::sleep(Duration::from_millis(20)) => {}, _ = &mut future => panic!("must wait") }
+        assert_eq!(buffers.available_permits(), 4);
+        shutdown.cancel();
+        assert!(matches!(future.await, Err(BufferAdmissionError::Shutdown)));
+        let signal = tokio_util::sync::CancellationToken::new();
+        assert!(matches!(
+            reserve_http_buffers(
+                buffers.clone(),
+                8,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+                &signal
+            )
+            .await,
+            Err(BufferAdmissionError::Expired)
+        ));
+        drop(held);
+        assert_eq!(buffers.available_permits(), 16);
+    }
 }
