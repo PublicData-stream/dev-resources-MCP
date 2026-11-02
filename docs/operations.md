@@ -420,6 +420,12 @@ or completed job does not prove whole-registry ingestion. Bootstrap and revalida
 may take substantial storage/time; no completion estimate or whole-corpus load
 benchmark is implied.
 
+The `pending_inventory` status field survives restart and reports the last durable
+record-or-gap cursor. It is null when there is no pending inventory. Oversized
+registry entries advance this checkpoint as capacity gaps while their raw Git
+evidence remains retained; they do not block unrelated crates from publication.
+A checkpoint does not establish a completion percentage or published research.
+
 The hourly Git index and daily public metadata dump are independent clocks. Exact
 archives are checksum-bound; docs.rs representations may change on rebuild and
 missing documentation is retried. Monitor per-kind failures, last successful

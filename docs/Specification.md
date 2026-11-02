@@ -183,6 +183,12 @@ Explicit historical snapshots remain fixed evidence. Defaults whose inventory ha
 not been validated within seven days are unavailable;
 historical selection does not imply current freshness.
 
+`crate.corpus_status` exposes `pending_inventory` as an inventory object or null.
+Its cursor marks the last durably staged record or coverage gap, including oversized
+registry entries. Pending data is not visible to research until publication; the
+checkpoint is not a completion percentage. Published `inventory` and `snapshot`
+remain separate states.
+
 Research defaults to all captured versions. List pages default to 20 and cap at 100;
 text pages cap at 32 KiB. Reuse the returned snapshot and cursor for stable continuation. Search cursors bind
 the exact snapshot and query/filters, allow a changed page size, and continue beyond

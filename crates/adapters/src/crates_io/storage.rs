@@ -1172,7 +1172,7 @@ impl CrateCorpusStore for PgBlobStore {
         let jobs:Json<Value>=sqlx::query_scalar("SELECT COALESCE(jsonb_agg(q),'[]'::jsonb) FROM (SELECT kind,state,count(*) AS count,count(artifact) AS retained,min(due_at) AS next_due FROM devres_crate_jobs GROUP BY kind,state ORDER BY kind,state) q").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         let errors:Json<Value>=sqlx::query_scalar("SELECT COALESCE(jsonb_agg(q),'[]'::jsonb) FROM (SELECT kind,last_error,count(*) AS count FROM devres_crate_jobs WHERE last_error IS NOT NULL GROUP BY kind,last_error ORDER BY kind,last_error) q").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         Ok(
-            json!({"jobs":jobs.0,"errors":errors.0,"inventory":self.latest_inventory().await?,"snapshot":self.snapshot(None).await?}),
+            json!({"jobs":jobs.0,"errors":errors.0,"inventory":self.latest_inventory().await?,"pending_inventory":self.pending_inventory().await?,"snapshot":self.snapshot(None).await?}),
         )
     }
 }

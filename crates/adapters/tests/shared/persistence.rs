@@ -378,6 +378,7 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
     let database = parsed.to_string();
     let root = tempfile::tempdir().unwrap();
     let store = PgBlobStore::connect(&database, root.path()).await.unwrap();
+    assert!(store.status().await.unwrap()["pending_inventory"].is_null());
     let now = devres_domain::unix_now();
     let record = |version: &str, yanked: bool| json!({"name":"example","vers":version,"deps":[],"features":{},"yanked":yanked,"cksum":"a".repeat(64)});
     let raw = format!("{}\n{}\n", record("1.0.0", false), record("2.0.0", false));
@@ -459,6 +460,17 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
         .await
         .unwrap();
     assert!(store.latest_inventory().await.unwrap().is_none());
+    let status = store.status().await.unwrap();
+    assert_eq!(status["pending_inventory"]["id"], epoch.id);
+    assert_eq!(status["pending_inventory"]["cursor"], "ex/am/example");
+    assert!(status["inventory"].is_null());
+    assert!(status["snapshot"].is_null());
+    drop(store);
+    let store = PgBlobStore::connect(&database, root.path()).await.unwrap();
+    assert_eq!(
+        store.status().await.unwrap()["pending_inventory"],
+        status["pending_inventory"]
+    );
     assert_eq!(
         store
             .pending_inventory()
@@ -473,6 +485,10 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
         .commit_inventory(&epoch.id, &manifest.id)
         .await
         .unwrap();
+    let status = store.status().await.unwrap();
+    assert!(status["pending_inventory"].is_null());
+    assert_eq!(status["inventory"]["id"], epoch.id);
+    assert!(status["snapshot"].is_null());
     assert_eq!(
         store
             .versions(&epoch.id, None, None, 1)
@@ -808,6 +824,9 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
         .stage_gap(&gap_epoch.id, "example", "integrity", "ex/am/example")
         .await
         .unwrap();
+    let status = store.status().await.unwrap();
+    assert_eq!(status["pending_inventory"]["cursor"], "ex/am/example");
+    assert_eq!(status["pending_inventory"]["id"], gap_epoch.id);
     store
         .commit_inventory(&gap_epoch.id, &manifest.id)
         .await
