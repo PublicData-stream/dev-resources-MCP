@@ -72,20 +72,13 @@ fn check(cancel: &CancellationToken, deadline: Instant) -> Result<()> {
     }
     Ok(())
 }
-fn slug(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|v| v.is_ascii_alphanumeric() || b"-_".contains(&v))
-}
 fn canonical_report(value: &str) -> Option<(String, String)> {
     let mut url = w3c_catalog::public_https(value).ok()?;
     if !matches!(url.host_str(), Some("www.w3.org" | "w3.org")) || url.fragment().is_some() {
         return None;
     }
     let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
-    if parts.len() != 2 || parts[0] != "TR" || !slug(parts[1]) {
+    if parts.len() != 2 || parts[0] != "TR" || !w3c_catalog::valid_shortname(parts[1]) {
         return None;
     }
     let shortname = parts[1].to_owned();
@@ -413,7 +406,9 @@ pub(crate) fn enrich_browser_specs(
         if row["organization"].as_str() != Some("W3C") {
             continue;
         }
-        let Some(shortname) = bounded_text(row.get("shortname")).filter(|v| slug(v)) else {
+        let Some(shortname) =
+            bounded_text(row.get("shortname")).filter(|v| w3c_catalog::valid_shortname(v))
+        else {
             continue;
         };
         let Some(report_url) = bounded_text(row.get("url")) else {
@@ -506,6 +501,48 @@ mod tests {
     }
     fn descriptor() -> Value {
         json!({"shortname":"css-color-4","organization":"W3C","url":"https://www.w3.org/TR/css-color-4/","nightly":{"url":"https://drafts.csswg.org/css-color-4/","repository":"https://github.com/w3c/csswg-drafts","sourcePath":"css-color-4/Overview.bs"}})
+    }
+    #[test]
+    fn dotted_reports_reconcile_with_exact_catalog_and_browser_spec_identities() {
+        let mut catalog = catalog();
+        catalog.standards = ["core-aam-1.1", "accname-1.1", "CSS22"]
+            .into_iter()
+            .map(specification)
+            .collect();
+        let html = b"<a href='/TR/core-aam-1.1/'>Core AAM</a><a href='/TR/accname-1.1/'>Accessible Name</a><a href='/TR/CSS22/'>CSS 2.2</a>";
+        reconcile_tr(&mut catalog, html, &evidence(), &CancellationToken::new()).unwrap();
+        assert!(catalog.gaps.is_empty());
+        let rows: Vec<_> = catalog
+            .standards
+            .iter()
+            .map(
+                |standard| json!({"shortname":standard.id,"organization":"W3C","url":standard.url}),
+            )
+            .collect();
+        enrich_browser_specs(
+            &mut catalog,
+            &serde_json::to_vec(&rows).unwrap(),
+            &evidence(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        for standard in &catalog.standards {
+            assert_eq!(
+                standard.metadata["tr_index"]["report"]["shortname"],
+                standard.id
+            );
+            assert_eq!(
+                standard.metadata["browser_specs"]["descriptor"]["shortname"],
+                standard.id
+            );
+        }
+        for report in [
+            "https://www.w3.org/TR/.hidden/",
+            "https://www.w3.org/TR/a..b/",
+            "https://www.w3.org/TR/a%2eb/",
+        ] {
+            assert!(canonical_report(report).is_none());
+        }
     }
     #[test]
     fn operations_have_only_fixed_official_metadata_destinations() {

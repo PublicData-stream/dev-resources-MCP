@@ -261,6 +261,109 @@ async fn approved_git_promotes_but_mixed_historical_license_never_archives_packs
     server.abort();
 }
 #[tokio::test]
+async fn dotted_catalog_bootstrap_hydrates_and_preserves_last_good_catalog_on_invalid_refresh() {
+    use crate::w3c::git::tests::serve_fixture;
+    use axum::{Json, Router, routing::get};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let invalid = Arc::new(AtomicBool::new(false));
+    let switch = invalid.clone();
+    let app = Router::new()
+        .route("/specifications", get(move || {
+            let invalid = switch.clone();
+            async move {
+                let name = if invalid.load(Ordering::SeqCst) { "../private" } else { "core-aam-1.1" };
+                Json(json!({"_links":{"specifications":[{"href":format!("https://api.w3.org/specifications/{name}"),"shortname":name,"title":"Core AAM"}]}}))
+            }
+        }))
+        .route("/TR/", get(|| async { "<a href='/TR/core-aam-1.1/'>Core AAM</a>" }))
+        .route("/browser-specs/index.json", get(|| async { Json(json!([{"shortname":"core-aam-1.1","organization":"W3C","url":"https://www.w3.org/TR/core-aam-1.1/"}])) }))
+        .route("/specifications/core-aam-1.1", get(|| async {
+            Json(json!({"shortname":"core-aam-1.1","title":"Core AAM","_links":{"latest-version":{"href":"https://api.w3.org/specifications/core-aam-1.1/versions/20260101"}}}))
+        }))
+        .route("/specifications/core-aam-1.1/versions", get(|| async {
+            Json(json!({"_links":{"version-history":[{"href":"https://api.w3.org/specifications/core-aam-1.1/versions/20260101","title":"First"}]}}))
+        }))
+        .route("/specifications/core-aam-1.1/versions/20260101", get(|| async {
+            Json(json!({"uri":"https://www.w3.org/TR/2026/WD-core-aam-1.1-20260101/","status":"Working Draft"}))
+        }));
+    let (broker, server) = serve_fixture(app).await;
+    let (_root, store, corpus) = corpus_fixture(broker.clone()).await;
+    let catalog = corpus
+        .acquire_catalog(CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(catalog.standards.len(), 1);
+    assert_eq!(catalog.standards[0].id, "core-aam-1.1");
+    assert!(catalog.gaps.is_empty());
+    let mut standard = corpus
+        .hydrate_standard(&catalog.standards[0], CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        standard.metadata["publication_url"],
+        "https://www.w3.org/TR/2026/WD-core-aam-1.1-20260101/"
+    );
+    corpus
+        .versions_step(&mut standard, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(standard.metadata["versions_complete"], true);
+    let record = standard.metadata["versions"][0]["record"].as_str().unwrap();
+    assert_eq!(
+        store
+            .w3c_get("version-records", record)
+            .await
+            .unwrap()
+            .unwrap()
+            .data["specification"],
+        "core-aam-1.1"
+    );
+    let previous = store.w3c_state("catalog").await.unwrap();
+    invalid.store(true, Ordering::SeqCst);
+    assert_eq!(
+        corpus
+            .acquire_catalog(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+    assert_eq!(store.w3c_state("catalog").await.unwrap(), previous);
+    assert_eq!(corpus.catalog().await.unwrap().id, catalog.id);
+    assert_eq!(broker.attempt_count(), 8);
+    server.abort();
+}
+
+#[tokio::test]
+async fn absent_default_reports_unavailable_even_with_a_retained_historical_view() {
+    use crate::w3c::git::tests::serve_fixture;
+    let (broker, server) = serve_fixture(axum::Router::new()).await;
+    let (_root, store, corpus) = corpus_fixture(broker.clone()).await;
+    let historical = View {
+        id: inventory::digest(b"historical-view"),
+        catalog: inventory::digest(b"historical-catalog"),
+        snapshots: BTreeMap::new(),
+        index: Value::Null,
+        validations: BTreeMap::new(),
+        validated_at: 1,
+    };
+    store
+        .w3c_put("views", &historical.id, &encode(&historical).unwrap())
+        .await
+        .unwrap();
+    let error = corpus.view(None).await.unwrap_err();
+    assert_eq!(error.code, "unavailable");
+    assert!(error.message.contains("w3c.corpus_status"));
+    assert_eq!(
+        corpus.view(Some(&historical.id)).await.unwrap().id,
+        historical.id
+    );
+    assert!(store.w3c_state("default").await.unwrap().is_none());
+    assert_eq!(broker.attempt_count(), 0);
+    server.abort();
+}
+
+#[tokio::test]
 async fn typed_hal_catalog_and_version_pages_resume_one_edition_at_a_time() {
     use crate::w3c::git::tests::serve_fixture;
     use axum::{Json, Router, routing::get};

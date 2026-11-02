@@ -100,6 +100,26 @@ fn css_processing(body: &[u8], cancel: &CancellationToken) -> Result<Value> {
     )
 }
 
+fn catalog_page_evidence(bytes: &[u8], observed_at: i64) -> Result<Value> {
+    let catalog = w3c_catalog::parse_page(bytes, observed_at)?;
+    let dotted: Vec<_> = catalog
+        .standards
+        .iter()
+        .filter(|standard| standard.id.contains('.'))
+        .map(|standard| standard.id.as_str())
+        .collect();
+    if dotted.is_empty() {
+        return Err(Error::integrity(
+            "Fixed W3C catalog page has no dotted specification identity.",
+        ));
+    }
+    Ok(
+        json!({"source_url":ApiOperation::Catalog{page:1}.url()?,"page":1,
+        "observed_at":observed_at,"catalog":catalog.id,"standards":catalog.standards.len(),
+        "dotted_shortnames":dotted,"has_next":w3c_catalog::page_has_next(bytes)?,"whole_catalog":false}),
+    )
+}
+
 async fn retained_css(
     root: &Path,
     artifacts: &BulkArtifactStore,
@@ -226,6 +246,18 @@ async fn run(root: &Path) -> Result<Value> {
         let _ = tokio::signal::ctrl_c().await;
         signal.cancel();
     });
+    let catalog_bytes = fetch(
+        &broker,
+        BulkSource::W3cApi(ApiOperation::Catalog { page: 1 }),
+        &cancel,
+    )
+    .await?;
+    let catalog_artifact = artifacts
+        .capture_bytes(catalog_bytes.clone(), cancel.clone())
+        .await?;
+    let catalog_observation = devres_domain::unix_now();
+    let mut catalog_page = catalog_page_evidence(&catalog_bytes, catalog_observation)?;
+    catalog_page["artifact"] = json!(catalog_artifact);
     let mut records = Vec::new();
     for shortname in ["css-color-4", "2dcontext"] {
         if shortname == "css-color-4"
@@ -337,7 +369,7 @@ async fn run(root: &Path) -> Result<Value> {
     }
     task.abort();
     Ok(
-        json!({"version":1,"stage":"complete","complete":true,"evidence":"bounded_provider_and_parser","whole_corpus":false,"transport_acceptance":false,"attempts":broker.attempt_count()-initial_attempts+github_broker.attempt_count()-initial_github_attempts,"attempts_before_invocation":{"w3c":initial_attempts,"github":initial_github_attempts},"budget_used":{"w3c":broker.attempt_count(),"github":github_broker.attempt_count()},"attempt_limit_per_provider":20,"git_advertisement_bytes":advertisement.len(),"records":records}),
+        json!({"version":1,"stage":"complete","complete":true,"evidence":"bounded_provider_and_parser","whole_corpus":false,"transport_acceptance":false,"attempts":broker.attempt_count()-initial_attempts+github_broker.attempt_count()-initial_github_attempts,"attempts_before_invocation":{"w3c":initial_attempts,"github":initial_github_attempts},"budget_used":{"w3c":broker.attempt_count(),"github":github_broker.attempt_count()},"attempt_limit_per_provider":20,"git_advertisement_bytes":advertisement.len(),"catalog_page":catalog_page,"records":records}),
     )
 }
 
@@ -419,8 +451,31 @@ async fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn fixed_catalog_receipt_requires_parsed_dotted_identities_and_keeps_page_scope() {
+        let bytes = br#"{"_links":{"specifications":[{"href":"https://api.w3.org/specifications/core-aam-1.1","title":"Core AAM"}],"next":{"href":"https://api.w3.org/specifications?page=2&items=100"}}}"#;
+        let evidence = catalog_page_evidence(bytes, 42).unwrap();
+        assert_eq!(evidence["dotted_shortnames"], json!(["core-aam-1.1"]));
+        assert_eq!(evidence["standards"], 1);
+        assert_eq!(evidence["page"], 1);
+        assert_eq!(evidence["has_next"], true);
+        assert_eq!(evidence["whole_catalog"], false);
+        assert_eq!(evidence["observed_at"], 42);
+        assert_eq!(
+            evidence["source_url"],
+            "https://api.w3.org/specifications?page=1&items=100"
+        );
+        assert!(catalog_page_evidence(br#"{"_embedded":{"specifications":[{"shortname":"css-color-4","title":"CSS Color"}]}}"#,42).is_err());
+        assert!(
+            catalog_page_evidence(
+                br#"{"_embedded":{"specifications":[{"shortname":"a..b","title":"Invalid"}]}}"#,
+                42
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn live_attempt_lock_excludes_concurrent_invocations() {
-        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let first = live_lock(temporary.path()).unwrap();
         assert!(live_lock(temporary.path()).is_err());
         drop(first);
@@ -429,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn retained_css_replay_preserves_capture_age_and_requires_exact_body() {
-        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let root = temporary.path();
         let artifacts = BulkArtifactStore::new(root, 64 * 1024 * 1024).unwrap();
         let source = "https://www.w3.org/TR/2026/CRD-css-color-4-20261026/";

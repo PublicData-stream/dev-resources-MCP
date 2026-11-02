@@ -745,7 +745,11 @@ impl W3cCorpus {
                     .ok_or_else(|| Error::not_found("W3C view not found."))?
                     .data,
             )?,
-            None => decode(self.store.w3c_state("default").await?.ok_or_else(failure)?)?,
+            None => decode(self.store.w3c_state("default").await?.ok_or_else(|| {
+                Error::unavailable(
+                    "W3C default evidence is unavailable; inspect w3c.corpus_status for collection and publication state.",
+                )
+            })?)?,
         };
         if let Some(repair) = self
             .store

@@ -11,6 +11,17 @@ pub const METADATA_VERSION: u32 = 1;
 pub const MAX_CATALOG: usize = 10_000;
 pub const DOCUMENT_LICENSE: &str = "https://www.w3.org/copyright/document-license-2023/";
 
+pub(crate) fn valid_shortname(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
 #[derive(Clone, Debug)]
 pub enum ApiOperation {
     Catalog { page: u32 },
@@ -20,7 +31,7 @@ pub enum ApiOperation {
 }
 impl ApiOperation {
     pub fn url(&self) -> Result<String> {
-        let slug = |s: &str| {
+        let version_slug = |s: &str| {
             !s.is_empty()
                 && s.len() <= 128
                 && s.bytes().all(|b| {
@@ -31,15 +42,19 @@ impl ApiOperation {
             Self::Catalog { page } if (1..=1000).contains(page) => {
                 format!("https://api.w3.org/specifications?page={page}&items=100")
             }
-            Self::Versions { shortname, page } if slug(shortname) && (1..=1000).contains(page) => {
+            Self::Versions { shortname, page }
+                if valid_shortname(shortname) && (1..=1000).contains(page) =>
+            {
                 format!(
                     "https://api.w3.org/specifications/{shortname}/versions?page={page}&items=100"
                 )
             }
-            Self::Specification { shortname } if slug(shortname) => {
+            Self::Specification { shortname } if valid_shortname(shortname) => {
                 format!("https://api.w3.org/specifications/{shortname}")
             }
-            Self::Version { shortname, version } if slug(shortname) && slug(version) => {
+            Self::Version { shortname, version }
+                if valid_shortname(shortname) && version_slug(version) =>
+            {
                 format!("https://api.w3.org/specifications/{shortname}/versions/{version}")
             }
             _ => return Err(Error::invalid("Invalid W3C API selector.")),
@@ -290,12 +305,7 @@ pub fn parse_page(bytes: &[u8], observed_at: i64) -> Result<Catalog> {
             .and_then(|u| u.trim_end_matches('/').rsplit('/').next());
         let id = text(row, "shortname")
             .or(derived_id)
-            .filter(|v| {
-                !v.is_empty()
-                    && v.len() <= 128
-                    && v.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            })
+            .filter(|value| valid_shortname(value))
             .ok_or_else(|| Error::integrity("W3C specification shortname missing."))?;
         if !seen.insert(id) {
             return Err(Error::integrity("Duplicate W3C specification identity."));
@@ -680,6 +690,123 @@ mod edition_root_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dotted_shortnames_preserve_hal_identities_and_canonical_api_paths() {
+        let names = ["core-aam-1.1", "accname-1.1", "CSS22"];
+        for collection in ["_links", "_embedded"] {
+            let rows: Vec<_> = names
+                .iter()
+                .map(|name| match collection {
+                    "_links" => json!({"href":format!("https://api.w3.org/specifications/{name}"),"title":name}),
+                    _ => json!({"shortname":name,"title":name,"shortlink":format!("https://www.w3.org/TR/{name}/")}),
+                })
+                .collect();
+            let mut page = json!({});
+            page[collection] = json!({"specifications":rows});
+            let bytes = serde_json::to_vec(&page).unwrap();
+            let parsed = parse_page(&bytes, 42).unwrap();
+            let ids: BTreeSet<_> = parsed.standards.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(ids, names.into_iter().collect());
+            for standard in parsed.standards {
+                let base = format!("https://api.w3.org/specifications/{}", standard.id);
+                assert_eq!(standard.metadata["api_url"], base);
+                assert_eq!(
+                    standard.url,
+                    format!("https://www.w3.org/TR/{}/", standard.id)
+                );
+                assert_eq!(
+                    ApiOperation::Specification {
+                        shortname: standard.id.clone()
+                    }
+                    .url()
+                    .unwrap(),
+                    base
+                );
+                assert_eq!(
+                    ApiOperation::Versions {
+                        shortname: standard.id.clone(),
+                        page: 1
+                    }
+                    .url()
+                    .unwrap(),
+                    format!("{base}/versions?page=1&items=100")
+                );
+                assert_eq!(
+                    ApiOperation::Version {
+                        shortname: standard.id,
+                        version: "20260101".into()
+                    }
+                    .url()
+                    .unwrap(),
+                    format!("{base}/versions/20260101")
+                );
+            }
+        }
+    }
+    #[test]
+    fn shortname_dots_never_admit_path_syntax_or_change_version_grammar() {
+        for name in [
+            "",
+            ".",
+            "..",
+            ".name",
+            "name.",
+            "name..version",
+            "../private",
+            "a/b",
+            "a\\b",
+            "%2e",
+            "a%2fb",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a?b",
+            "a#b",
+            "n\u{e4}me",
+        ] {
+            assert!(!valid_shortname(name), "{name:?}");
+            assert!(
+                ApiOperation::Specification {
+                    shortname: name.into()
+                }
+                .url()
+                .is_err()
+            );
+            assert!(
+                ApiOperation::Versions {
+                    shortname: name.into(),
+                    page: 1
+                }
+                .url()
+                .is_err()
+            );
+            assert!(
+                ApiOperation::Version {
+                    shortname: name.into(),
+                    version: "20260101".into()
+                }
+                .url()
+                .is_err()
+            );
+            let bytes = serde_json::to_vec(
+                &json!({"_embedded":{"specifications":[{"shortname":name,"title":"Invalid"}]}}),
+            )
+            .unwrap();
+            assert_eq!(parse_page(&bytes, 42).unwrap_err().code, "integrity");
+        }
+        assert!(valid_shortname(&"a".repeat(128)));
+        assert!(!valid_shortname(&"a".repeat(129)));
+        for version in ["1.1", "../private", "a/b", "%2e", "a?b", "a#b"] {
+            assert!(
+                ApiOperation::Version {
+                    shortname: "core-aam-1.1".into(),
+                    version: version.into()
+                }
+                .url()
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn tr_identity_and_external_qualification() {
         let c=parse(br#"{"_embedded":{"specifications":[{"shortname":"example","title":"Example","shortlink":"https://www.w3.org/TR/example/"}]}}"#,42).unwrap();
