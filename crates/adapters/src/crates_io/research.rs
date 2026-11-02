@@ -956,6 +956,65 @@ mod tests {
     use crate::crates_io::index::tests::{NoNetwork, fixture};
 
     #[tokio::test]
+    async fn rustls_versions_offset_200_returns_fifty_semantic_versions() {
+        let _serial = crate_index::TEST_BUILD.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let mut store = fixture();
+        let mutable = Arc::get_mut(&mut store).unwrap();
+        let template = mutable.versions[0].clone();
+        mutable.versions = (0..300)
+            .map(|patch| {
+                let version = format!("1.0.{patch}");
+                let mut row = template.clone();
+                row.name = "rustls".into();
+                row.version = version.clone();
+                row.record["name"] = json!("rustls");
+                row.record["vers"] = json!(version);
+                row
+            })
+            .collect();
+        mutable.versions.sort_by(|a, b| a.version.cmp(&b.version));
+        mutable.contents.clear();
+        let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let manifest = crate_index::build(
+            store.clone(),
+            retrieval.clone(),
+            root.path().to_path_buf(),
+            snapshot,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        store.snapshot.lock().unwrap().index_manifest = manifest;
+        let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
+        let page = research
+            .call(
+                "crate.versions",
+                json!({"name":"rustls","offset":200,"limit":50}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["total"], 300);
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 50);
+        for (position, item) in items.iter().enumerate() {
+            assert_eq!(
+                item["document"]["record"]["version"],
+                format!("1.0.{}", 99 - position)
+            );
+        }
+        let pinned = research
+            .call(
+                "crate.versions",
+                json!({"name":"rustls","offset":200,"limit":50,"snapshot":"c".repeat(64)}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pinned["items"], page["items"]);
+    }
+
+    #[tokio::test]
     async fn research_uses_frozen_snapshots_and_preserves_declared_dependency_scope() {
         let root = tempfile::tempdir().unwrap();
         let store = fixture();

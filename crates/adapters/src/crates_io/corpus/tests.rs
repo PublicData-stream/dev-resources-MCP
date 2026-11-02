@@ -181,10 +181,22 @@ async fn retained_inventory(
         &["mktree"],
         format!("040000 tree {am}\tam\n").as_bytes(),
     ));
+    // A retained oversized member precedes the ordinary crate in tree order.
+    // Its parsing gap must not prevent inventory and search publication.
+    let oversized = oid(git(
+        &repository,
+        &["hash-object", "-w", "--stdin"],
+        &vec![b'x'; 16 * 1024 * 1024 + 1],
+    ));
+    let one = oid(git(
+        &repository,
+        &["mktree"],
+        format!("100644 blob {oversized}\ta\n").as_bytes(),
+    ));
     let tree = oid(git(
         &repository,
         &["mktree"],
-        format!("040000 tree {ex}\tex\n").as_bytes(),
+        format!("040000 tree {one}\t1\n040000 tree {ex}\tex\n").as_bytes(),
     ));
     let revision = oid(git(
         &repository,
@@ -366,7 +378,15 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     assert_eq!(before.inventory.revision, revision);
     assert_eq!(before.inventory.validated_at, observed_at);
     assert_eq!(before.coverage["versions"], 2);
-    assert_eq!(before.coverage["inventory_complete"], true);
+    assert_eq!(before.coverage["inventory_complete"], false);
+    assert_eq!(before.coverage["inventory_enumeration_complete"], true);
+    assert_eq!(before.coverage["metadata_gaps"], 1);
+    let gaps: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_crate_inventory_gaps WHERE inventory=$1 AND name='a' AND error='capacity'")
+        .bind(&before.inventory.id)
+        .fetch_one(&sqlx::PgPool::connect(database.as_str()).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(gaps, 1);
     let research = crate::Research::new(retrieval.clone())
         .await
         .unwrap()

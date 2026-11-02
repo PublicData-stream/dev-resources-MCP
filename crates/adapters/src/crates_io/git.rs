@@ -66,6 +66,10 @@ pub struct GitSnapshot {
     #[serde(default)]
     pub observed_at: i64,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitIndexGap {
+    Capacity,
+}
 #[derive(Clone, Debug)]
 pub struct GitIndexRecord {
     pub name: String,
@@ -74,6 +78,7 @@ pub struct GitIndexRecord {
     pub revision: String,
     pub bytes: Vec<u8>,
     pub removed: bool,
+    pub gap: Option<GitIndexGap>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct EvidenceFile {
@@ -545,6 +550,7 @@ impl GitRegistry {
         &self,
         snapshot: &GitSnapshot,
         previous_revision: Option<String>,
+        cursor: Option<String>,
         shutdown: CancellationToken,
     ) -> Result<mpsc::Receiver<Result<GitIndexRecord>>> {
         if !valid_oid(&snapshot.revision)
@@ -553,6 +559,11 @@ impl GitRegistry {
                 .is_some_and(|value| !valid_oid(value))
         {
             return Err(Error::invalid("Invalid registry Git revision."));
+        }
+        if let Some(cursor) = &cursor
+            && (cursor.len() > 256 || index_name(cursor)?.is_none())
+        {
+            return Err(Error::invalid("Invalid registry inventory cursor."));
         }
         let (sender, receiver) = mpsc::channel(2);
         let root = self.root.clone();
@@ -565,6 +576,7 @@ impl GitRegistry {
                 root,
                 revision,
                 previous_revision,
+                cursor,
                 sender.clone(),
                 cancellation,
             );
@@ -1144,6 +1156,7 @@ async fn read_records(
     root: PathBuf,
     revision: String,
     previous: Option<String>,
+    cursor: Option<String>,
     sender: mpsc::Sender<Result<GitIndexRecord>>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -1170,7 +1183,7 @@ async fn read_records(
     cat_command
         .arg("--git-dir")
         .arg(root.join(REPO_NAME))
-        .args(["cat-file", "--batch"])
+        .args(["cat-file", "--batch-command"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     let mut cat = match ManagedChild::spawn(cat_command) {
@@ -1250,6 +1263,9 @@ async fn read_records(
             let Some(name) = index_name(&path)? else {
                 continue;
             };
+            if cursor.as_ref().is_some_and(|cursor| path <= *cursor) {
+                continue;
+            }
             if removed {
                 bulk::bounded(&shutdown, deadline, async {
                     sender
@@ -1260,6 +1276,7 @@ async fn read_records(
                             revision: revision.clone(),
                             bytes: Vec::new(),
                             removed: true,
+                            gap: None,
                         }))
                         .await
                         .map_err(|_| Error::unavailable("Registry Git record consumer stopped."))
@@ -1270,7 +1287,7 @@ async fn read_records(
             let object = oid.unwrap_or_else(|| format!("{revision}:{path}"));
             bulk::bounded(&shutdown, deadline, async {
                 cat_input
-                    .write_all(format!("{object}\n").as_bytes())
+                    .write_all(format!("info {object}\n").as_bytes())
                     .await
                     .map_err(|_| git_error())
             })
@@ -1281,16 +1298,48 @@ async fn read_records(
             let header = std::str::from_utf8(&header)
                 .map_err(|_| Error::integrity("Invalid registry Git object header."))?;
             let fields: Vec<_> = header.split(' ').collect();
-            if fields.len() != 3 || !valid_oid(fields[0]) || fields[1] != "blob" {
+            if fields.len() != 3
+                || fields[0] != object
+                || !valid_oid(fields[0])
+                || fields[1] != "blob"
+            {
                 return Err(Error::integrity("Registry Git object is not a blob."));
             }
             let length = fields[2]
-                .parse::<usize>()
-                .ok()
-                .filter(|length| *length <= MAX_RECORD)
-                .ok_or_else(|| {
-                    Error::capacity("Registry Git index blob exceeds its byte budget.")
-                })?;
+                .parse::<u64>()
+                .map_err(|_| Error::integrity("Invalid registry Git object size."))?;
+            if length > MAX_RECORD as u64 {
+                bulk::bounded(&shutdown, deadline, async {
+                    sender
+                        .send(Ok(GitIndexRecord {
+                            name,
+                            path,
+                            blob_oid: object,
+                            revision: revision.clone(),
+                            bytes: Vec::new(),
+                            removed: false,
+                            gap: Some(GitIndexGap::Capacity),
+                        }))
+                        .await
+                        .map_err(|_| Error::unavailable("Registry Git record consumer stopped."))
+                })
+                .await?;
+                continue;
+            }
+            bulk::bounded(&shutdown, deadline, async {
+                cat_input
+                    .write_all(format!("contents {object}\n").as_bytes())
+                    .await
+                    .map_err(|_| git_error())
+            })
+            .await?;
+            let contents_header = delimited(&mut cat_output, b'\n', 256, &shutdown, deadline)
+                .await?
+                .ok_or_else(|| Error::integrity("Truncated registry Git object header."))?;
+            if contents_header != header.as_bytes() {
+                return Err(Error::integrity("Registry Git object metadata changed."));
+            }
+            let length = length as usize;
             let mut bytes = vec![0; length];
             bulk::bounded(&shutdown, deadline, async {
                 cat_output
@@ -1319,6 +1368,7 @@ async fn read_records(
                 revision: revision.clone(),
                 bytes,
                 removed: false,
+                gap: None,
             };
             bulk::bounded(&shutdown, deadline, async {
                 sender
@@ -1827,6 +1877,102 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
     #[tokio::test]
+    async fn oversized_blob_is_a_gap_and_checkpoint_skips_blob_io() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let registry = GitRegistry::new(root.path(), 64 * 1024 * 1024).unwrap();
+        let stop = CancellationToken::new();
+        registry
+            .initialize(&stop, Instant::now() + Duration::from_secs(30))
+            .await
+            .unwrap();
+        let large = parse_oid_line(
+            &fixture_input(
+                &registry,
+                &["hash-object", "-w", "--stdin"],
+                &vec![b'x'; MAX_RECORD + 1],
+            )
+            .await,
+        )
+        .unwrap();
+        let small = parse_oid_line(
+            &fixture_input(&registry, &["hash-object", "-w", "--stdin"], b"ordinary").await,
+        )
+        .unwrap();
+        let one = parse_oid_line(
+            &fixture_input(
+                &registry,
+                &["mktree"],
+                format!("100644 blob {large}\ta\n100644 blob {small}\tb\n").as_bytes(),
+            )
+            .await,
+        )
+        .unwrap();
+        let tree = parse_oid_line(
+            &fixture_input(
+                &registry,
+                &["mktree"],
+                format!("040000 tree {one}\t1\n").as_bytes(),
+            )
+            .await,
+        )
+        .unwrap();
+        let revision = parse_oid_line(
+            &fixture_input(&registry, &["commit-tree", &tree], b"bounded fixture\n").await,
+        )
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel(2);
+        let result = read_records(
+            root.path().to_owned(),
+            revision.clone(),
+            None,
+            None,
+            sender,
+            stop.clone(),
+        )
+        .await;
+        result.unwrap();
+        let gap = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(gap.name, "a");
+        assert_eq!(gap.gap, Some(GitIndexGap::Capacity));
+        assert!(gap.bytes.is_empty());
+        let ordinary = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(ordinary.name, "b");
+        assert_eq!(ordinary.bytes, b"ordinary");
+        assert!(ordinary.gap.is_none());
+        assert!(receiver.recv().await.is_none());
+        // A checkpointed blob need not even be opened. Missing uncheckpointed objects remain fatal.
+        std::fs::remove_file(
+            root.path()
+                .join(REPO_NAME)
+                .join("objects")
+                .join(&large[..2])
+                .join(&large[2..]),
+        )
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel(2);
+        read_records(
+            root.path().to_owned(),
+            revision.clone(),
+            None,
+            Some("1/a".into()),
+            sender,
+            stop.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receiver.recv().await.unwrap().unwrap().name, "b");
+        assert!(receiver.recv().await.is_none());
+        let (sender, _receiver) = mpsc::channel(2);
+        assert_eq!(
+            read_records(root.path().to_owned(), revision, None, None, sender, stop)
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+    }
+
+    #[tokio::test]
     async fn git_inventory_is_incremental_and_reconstructible_from_retained_packs() {
         let root = tempfile::tempdir().unwrap();
         let archive = tempfile::tempdir().unwrap();
@@ -1864,7 +2010,7 @@ mod tests {
             observed_at,
         };
         let mut records = registry
-            .records(&snapshot, None, shutdown.clone())
+            .records(&snapshot, None, None, shutdown.clone())
             .await
             .unwrap();
         let record = records.recv().await.unwrap().unwrap();
@@ -1899,13 +2045,38 @@ mod tests {
             observed_at: changed_observed_at,
         };
         let mut records = registry
-            .records(&changed, Some(first.clone()), shutdown.clone())
+            .records(&changed, Some(first.clone()), None, shutdown.clone())
             .await
             .unwrap();
         let record = records.recv().await.unwrap().unwrap();
         assert!(record.removed);
         assert_eq!(record.path, "se/rd/serde");
         assert!(records.recv().await.is_none());
+        // Resuming an incremental deletion stream after its durable checkpoint
+        // must not replay the deletion, while an earlier checkpoint retains it.
+        let mut resumed = registry
+            .records(
+                &changed,
+                Some(first.clone()),
+                Some("se/rd/serde".into()),
+                shutdown.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(resumed.recv().await.is_none());
+        let mut earlier = registry
+            .records(
+                &changed,
+                Some(first.clone()),
+                Some("1/a".into()),
+                shutdown.clone(),
+            )
+            .await
+            .unwrap();
+        let deletion = earlier.recv().await.unwrap().unwrap();
+        assert!(deletion.removed);
+        assert_eq!(deletion.path, "se/rd/serde");
+        assert!(earlier.recv().await.is_none());
         let restored_root = tempfile::tempdir().unwrap();
         let restored = GitRegistry::new(restored_root.path(), 64 * 1024 * 1024).unwrap();
         let restored_snapshot = restored
@@ -1918,7 +2089,7 @@ mod tests {
             "Offline replay must preserve the original source observation time."
         );
         let mut records = restored
-            .records(&restored_snapshot, None, shutdown)
+            .records(&restored_snapshot, None, None, shutdown)
             .await
             .unwrap();
         assert_eq!(records.recv().await.unwrap().unwrap().bytes, content);

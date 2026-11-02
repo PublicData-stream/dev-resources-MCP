@@ -352,6 +352,7 @@ impl CrateCorpus {
             .records(
                 &snapshot,
                 previous.as_ref().map(|p| p.revision.clone()),
+                epoch.cursor.clone(),
                 stop.child_token(),
             )
             .await?;
@@ -362,6 +363,12 @@ impl CrateCorpus {
             }
             if stop.is_cancelled() {
                 return Err(Error::unavailable("Inventory import canceled."));
+            }
+            if record.gap.is_some() {
+                self.store
+                    .stage_gap(&epoch.id, &record.name, "capacity", &record.path)
+                    .await?;
+                continue;
             }
             let mut versions = Vec::new();
             if !record.removed {
@@ -397,9 +404,18 @@ impl CrateCorpus {
                         metadata_status: None,
                     })
                     .collect();
-                self.store
-                    .stage_crate(&epoch.id, &record.name, &versions, &record.path)
-                    .await?;
+                // This is the same deterministic per-crate serialization bound used by storage.
+                let encoded = serde_json::to_vec(&versions)
+                    .map_err(|_| Error::integrity("Invalid registry projection."))?;
+                if encoded.len() > 16 * 1024 * 1024 {
+                    self.store
+                        .stage_gap(&epoch.id, &record.name, "capacity", &record.path)
+                        .await?;
+                } else {
+                    self.store
+                        .stage_crate(&epoch.id, &record.name, &versions, &record.path)
+                        .await?;
+                }
             } else {
                 self.store
                     .stage_crate(&epoch.id, &record.name, &[], &record.path)
