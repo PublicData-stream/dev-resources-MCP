@@ -20,8 +20,11 @@ Claude Connectors, with deployment-specific MCP connection packages.
 
 ## Choosing research tools
 
-Generic `search` searches RFC metadata and Cargo packages when `sources` is omitted.
-For browser questions, select sources explicitly, for example
+Generic `search` searches all eight source families when `sources` is omitted:
+RFC, Cargo, RustSec, MDN, WHATWG, W3C, Chromium and npm. Each family keeps its
+existing search scope, ranking, pagination and errors; unavailable retained corpora
+remain visible as source errors. To narrow a browser question, select sources,
+for example
 `{"query":"fetch abort","sources":["mdn","whatwg"],"limit":3}`.
 Use `mdn.compat_search` for browser-support statements and dedicated standard tools
 for normative passages and symbols.

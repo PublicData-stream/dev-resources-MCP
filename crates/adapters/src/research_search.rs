@@ -85,6 +85,92 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn eight_stalled_sources_receive_four_bounded_waves() {
+        let sources = [
+            "rfc", "cargo", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+        ];
+        let calls = AtomicUsize::new(0);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = AtomicUsize::new(0);
+        let start = Instant::now();
+        let result = collect(
+            sources.map(str::to_owned).to_vec(),
+            CancellationToken::new(),
+            start + Duration::from_secs(75),
+            |_| {
+                let active = active.clone();
+                let calls = &calls;
+                let peak = &peak;
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    let _guard = Active(active);
+                    std::future::pending::<Result<Value>>().await
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let rows = result["sources"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["source"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            sources
+        );
+        assert!(rows.iter().all(|row| {
+            row["error"] == "unavailable: Search source deadline exceeded."
+                && row.get("result").is_none()
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let elapsed = Instant::now().duration_since(start);
+        assert!(elapsed >= Duration::from_secs(60));
+        assert!(elapsed < Duration::from_secs(61));
+    }
+
+    #[tokio::test]
+    async fn cancelling_all_source_search_drops_active_work_without_starting_queued_sources() {
+        let cancel = CancellationToken::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let calls = AtomicUsize::new(0);
+        let started = tokio::sync::Notify::new();
+        let run = collect(
+            [
+                "rfc", "cargo", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            cancel.clone(),
+            Instant::now() + Duration::from_secs(75),
+            |_| {
+                let active = active.clone();
+                let calls = &calls;
+                let started = &started;
+                async move {
+                    let count = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = Active(active);
+                    if count == 2 {
+                        started.notify_one();
+                    }
+                    std::future::pending::<Result<Value>>().await
+                }
+            },
+        );
+        let stop = async {
+            started.notified().await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(run, stop);
+        assert_eq!(result.unwrap_err().code, "cancelled");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stalled_first_source_keeps_siblings_and_requested_order() {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = AtomicUsize::new(0);

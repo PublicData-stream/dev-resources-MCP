@@ -73,7 +73,7 @@ references remain valid.
 | Tool | Inputs and result |
 | --- | --- |
 | `server.info` | Identity, supported revisions, licensing and corresponding-source URL |
-| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium`/`npm` sources, offset/limit; source-specific results/errors; omitted sources remain RFC and Cargo |
+| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium`/`npm` sources, offset/limit; source-specific results/errors; omitted sources search all eight families in that order |
 | `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, `w3c:<shortname>#<anchor>`, or immutable `devres://` resource URI |
 | `rfc.search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc.get` | RFC number and byte page; published text |
@@ -120,10 +120,19 @@ UTF-8 bytes; offsets must be character boundaries. Reuse returned capture IDs fo
 stable pagination. Search sources have separate ranking/paging, not one global rank.
 Direct dependencies are declarations, not a solved transitive graph.
 
+Generic `search` defaults to a 75-second tool deadline; other tools retain their
+30-second default. Explicit source selection searches only the requested families.
+Source scopes remain unchanged: RFC index metadata, upstream Cargo/npm package
+discovery, current local RustSec advisories and retained MDN/WHATWG/W3C/Chromium
+content. This default does not add historical revisions, package full-text or
+separate compatibility datasets to each family's search. Missing, expired or
+unavailable corpora return source-local errors alongside successful siblings.
+
 RFC research filters combine with AND: status, author substring, keyword substring,
 stream, area, working group, series membership and inclusive `YYYY-MM` publication
 bounds. Missing publication precision cannot satisfy a date bound. RFC query and
-filter strings cap at 256 Unicode characters. Generic `search` remains metadata-only.
+filter strings cap at 256 Unicode characters. The RFC branch of generic `search`
+remains metadata-only.
 
 Full-text defaults to lowercase technical tokens with document-level AND. English
 mode adds stemming and stopwords and accepts quoted phrases, `OR`, and minus

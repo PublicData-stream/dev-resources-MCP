@@ -730,7 +730,11 @@ struct SearchInput {
     limit: usize,
 }
 fn default_sources() -> Vec<String> {
-    vec!["rfc".into(), "cargo".into()]
+    [
+        "rfc", "cargo", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+    ]
+    .map(str::to_owned)
+    .to_vec()
 }
 
 #[derive(Deserialize)]
@@ -771,8 +775,8 @@ fn schemas() -> Vec<Value> {
     };
     add(
         "search",
-        "Search developer sources independently. Omitted sources search RFC metadata and Cargo packages only. Select mdn/whatwg/w3c for browser standards, rustsec for advisories, chromium for implementation docs, or npm for npm packages. Use dedicated research tools for full-text, compatibility, symbols and history.",
-        json!({"query":text,"sources":{"type":"array","description":"Omitted sources are rfc and cargo only. Explicit selection supports all eight source families; browser questions usually need mdn and whatwg.","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium","npm"]},"minItems":1,"maxItems":8,"uniqueItems":true},"offset":offset,"limit":limit}),
+        "Search all eight developer source families by default: RFC metadata, Cargo and npm package discovery, RustSec advisories, and retained MDN, WHATWG, W3C and Chromium content. Select sources to narrow the search. Results, ranking, paging and errors remain source-specific. Use dedicated research tools for package full-text, compatibility, symbols and history.",
+        json!({"query":text,"sources":{"type":"array","description":"Omitted sources search rfc, cargo, rustsec, mdn, whatwg, w3c, chromium and npm in that order. Explicit selection searches only those families in the requested order.","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium","npm"]},"minItems":1,"maxItems":8,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(

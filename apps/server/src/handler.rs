@@ -115,7 +115,7 @@ impl ServerHandler for McpHandler {
         };
         info.server_info = Implementation::new("dev-resources-MCP", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(format!(
-            "Read-only developer research. Public source references identify exact captures. Generic search defaults to RFC and Cargo; explicitly select browser, advisory or npm sources. Prefer dedicated research tools for full-text and exact evidence. Answer with relevant findings and source citations; include material freshness/coverage limitations without repeating every metadata field. Supplied lockfiles and audit results are request-only. Licensed under {} ({}). Corresponding source for this running server: {}",
+            "Read-only developer research. Public source references identify exact captures. Generic search defaults to all eight sources: RFC, Cargo, RustSec, MDN, WHATWG, W3C, Chromium and npm; explicitly select sources to narrow scope. Prefer dedicated research tools for full-text and exact evidence. Answer with relevant findings and source citations; include material freshness/coverage limitations without repeating every metadata field. Supplied lockfiles and audit results are request-only. Licensed under {} ({}). Corresponding source for this running server: {}",
             SourceOffer::LICENSE,
             SourceOffer::LICENSE_URL,
             self.source.url()

@@ -205,24 +205,41 @@ async fn malformed_and_oversized_npm_search_bodies_are_source_local() {
 }
 
 #[tokio::test]
-async fn omitted_sources_dispatch_only_rfc_and_cargo() {
+async fn omitted_sources_match_explicit_all_sources_and_keep_unavailable_corpora_visible() {
     let _serial = SERIAL.lock().await;
-    let (research, _, fetcher) = fixture((503, Vec::new())).await;
-    let result = research
-        .call("search", json!({"query":"fixture","limit":1}))
-        .await
+    let sources = [
+        "rfc", "cargo", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+    ];
+    for explicit in [false, true] {
+        let npm = serde_json::to_vec(
+            &json!({"objects":[{"package":{"name":"fixture","version":"1.0.0"}}],"total":1}),
+        )
         .unwrap();
-    assert_eq!(result["sources"][0]["source"], "rfc");
-    assert_eq!(result["sources"][0]["result"]["items"][0]["id"], "rfc:9000");
-    assert_eq!(result["sources"][1]["source"], "cargo");
-    assert_eq!(
-        result["sources"][1]["result"]["items"][0]["name"],
-        "fixture"
-    );
-    assert_eq!(result["sources"].as_array().unwrap().len(), 2);
-    let mut calls = fetcher.calls.lock().await.clone();
-    calls.sort();
-    assert_eq!(calls, [CARGO_KEY, "rfc:index"]);
+        let (research, store, fetcher) = fixture((200, npm)).await;
+        let mut arguments = json!({"query":"fixture","limit":1});
+        if explicit {
+            arguments["sources"] = json!(sources);
+        }
+        let result = research.call("search", arguments).await.unwrap();
+        let rows = result["sources"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["source"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            sources
+        );
+        assert_eq!(rows[0]["result"]["items"][0]["id"], "rfc:9000");
+        assert_eq!(rows[1]["result"]["items"][0]["name"], "fixture");
+        assert_eq!(rows[7]["result"]["items"][0]["id"], "npm:fixture@1.0.0");
+        for row in &rows[2..7] {
+            assert!(row["error"].as_str().unwrap().starts_with("unavailable:"));
+            assert!(row.get("result").is_none());
+        }
+        let mut calls = fetcher.calls.lock().await.clone();
+        calls.sort();
+        assert_eq!(calls, [CARGO_KEY, NPM_KEY, "rfc:index"]);
+        assert_eq!(store.0.lock().await.len(), 3);
+    }
 }
 
 #[tokio::test]

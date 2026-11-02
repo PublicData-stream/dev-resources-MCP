@@ -3,7 +3,7 @@
 The npm module covers public packages in an explicit operator catalog and public
 OSV npm advisory evidence. The catalog starts empty. Package retrieval does not
 enroll a package, and auditing does not fetch or enroll dependencies. Existing
-Cargo tools and generic search defaults are unchanged.
+Cargo tools retain their behavior.
 
 ## Public interfaces
 
@@ -12,7 +12,9 @@ release from full registry metadata. `npm.source_list` and `npm.source_read`
 verify distribution integrity before inspecting a published archive. Supply both
 `metadata_capture` and `archive_capture` to continue against fixed evidence.
 `fetch` accepts `npm:is-number@7.0.0` and scoped identities such as
-`npm:@types/is-number@7.0.5`. Generic `search` includes npm only when selected.
+`npm:@types/is-number@7.0.5`. Generic `search` includes npm among all eight default
+source families; an explicit source list narrows the search. Its npm branch keeps
+the official registry search behavior rather than searching local package content.
 
 Local research uses `npm.versions`, `npm.catalog_search`, `npm.document_get`,
 `npm.dependencies`, `npm.compare`, `npm.content_search`, and `npm.contract_get`.

@@ -377,17 +377,23 @@ inputs without renewing online observations. See [Chromium](chromium.md).
 
 HTTP admission waits for the existing four-message buffer reservation within the
 input timeout. Waiting and body collection share one deadline; request permits
-bound queued work. Memory ceilings, response limits and the connection watchdog
-remain unchanged. Private aggregate counters distinguish admission expiry from
+bound queued work. Memory ceilings and response limits remain unchanged. The
+connection watchdog covers the selected tool timeout and I/O allowance. Private
+aggregate counters distinguish admission expiry from
 application failures without recording request data.
 
-Generic search validates its complete source selection before dispatch, keeps at
-most two source operations active, and returns results in requested source order.
+Generic search defaults to all eight source families, validates its complete source
+selection before dispatch, keeps at most two source futures active, and returns
+results in requested source order. Its default 75-second tool budget permits four
+15-second waves; other tools retain their 30-second default. Explicit selections
+retain their requested order and provider-specific search behavior.
 Each source has at most fifteen seconds, bounded by the caller's absolute deadline
 minus the smaller of one second and ten percent of the remaining budget. Completed
 sources survive another source's failure; expired or unstarted sources have explicit
 errors. Cancellation drops request-owned futures and preserves provider retry and
 admission ownership. Source errors do not establish an empty or complete corpus.
+Dropping a source future does not forcibly stop a blocking worker; existing worker
+deadlines, cancellation checks and owned resource reservations remain in force.
 
 Foreground npm reads validate full retained registry metadata with a bounded scan
 while materializing one release at a time. Unselected releases retain identity,

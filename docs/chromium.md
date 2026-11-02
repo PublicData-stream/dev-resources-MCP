@@ -50,7 +50,8 @@ captured snapshot membership. Includes require bounded same-snapshot dependencie
 
 The dedicated tool family provides document catalog/search/get, explicit symbols,
 references, snapshots, history, comparisons, and aggregate corpus status. Generic
-`search` accepts explicit source `chromium`; omitted sources remain RFC and Cargo.
+`search` includes `chromium` among all eight default source families; an explicit
+source list narrows the search to the selected families.
 Generic `fetch` accepts `chromium:<component>/<path>#<anchor>`. Tool discovery owns
 the exact strict input schemas.
 
