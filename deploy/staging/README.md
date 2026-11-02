@@ -1,7 +1,7 @@
 # Staging deployment
 
 These host-specific assets deploy the existing accepted
-`0.1.0-build.b0a33793` server image into `devres-staging` on `piqua-serve`.
+`0.1.0-build.634eb5b5` server image into `devres-staging` on `piqua-serve`.
 The disposable [foundation](../kubernetes/foundation.yaml) remains separate.
 No package code is executed and no administrative HTTP route is added.
 
@@ -169,7 +169,7 @@ Record the current upgrade journal's token and resulting booleans in root-owned 
 `/var/lib/devres-staging/upgrade/acceptance.json`:
 
 ```json
-{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.b0a33793","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
+{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.634eb5b5","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
 ```
 
 Finish qualifies a schema-ten coordinated backup/isolated restore before
@@ -184,6 +184,47 @@ an image-only schema downgrade or discards post-cutover history. Preserved newer
 evidence may not be visible through the restored older service. Keep snapshot
 holds until the resulting restore is qualified; do not manually clear the
 upgrade journal or a capacity fence to resume writes.
+
+### Deadline-bound single migration
+
+For a supervised cutover with an absolute deadline, use the reviewed direct mode
+instead of repeating a full migration rehearsal. It preserves the backup/restore,
+exclusive-writer, integrity, capacity, acceptance and preserving-rollback gates:
+
+```sh
+# Recover only an explicitly identified abandoned rehearsal, if present:
+python3 staging.py upgrade-abort-rehearsal --token CURRENT_REHEARSAL_TOKEN
+python3 staging.py refresh-services
+# UTC epoch seconds; leave time before the operational deadline for recovery
+# and ten minutes of collector stability observation.
+python3 staging.py upgrade-direct --deadline-at ABSOLUTE_UTC_EPOCH
+# Independently complete the same acceptance receipt, then:
+python3 staging.py upgrade-finish
+```
+
+Run the direct driver as a root-owned systemd service so SSH loss does not end it.
+The deadline watchdog can terminate only the recorded driver identity and recover
+the matching old pair, including when migration still holds the upgrade lock.
+Recovery time is additional; successful deployment is never inferred from expiry.
+
+Direct mode freezes the original pair, takes a protected coordinated snapshot,
+proves its old-image recovery in an isolated clone, then migrates the permanent
+pair once. It does not promote an earlier clone while newer ingestion continues.
+The candidate must pass the ordinary acceptance and coordinated restore before
+collector settings and the previous backup timer state are restored.
+
+The accelerated direct migration admits at most 37 CPU cores and 192 GiB for the
+worker (including its 64 GiB `/tmp` tmpfs), plus 2 CPU cores and 16 GiB for its
+PostgreSQL container. Its 8 GiB shared buffers, larger WAL/checkpoint budget and
+WAL compression reduce avoidable I/O while fsync, full-page writes and synchronous
+commit remain enabled. It stops on host available memory below 32 GiB. Ordinary
+restore checks retain their smaller limits. These ceilings do not parallelize
+serial replay, relax application bounds, or establish a completion-time guarantee.
+
+Abandoned-rehearsal recovery requires the exact upgrade token, root-owned journal,
+verified driver identity and disposable object ownership. It retains permanent
+snapshots/history and refuses changed ownership or unknown nested resources.
+Never recover by deleting the journal or applying a schema-ten image to schema nine.
 
 ### Fresh deployment
 

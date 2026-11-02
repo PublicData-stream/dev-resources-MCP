@@ -1,6 +1,11 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -622,6 +627,289 @@ class UpgradeTests(unittest.TestCase):
             self.instance.apply()
         self.assertFalse(any(c[0] == 'start' for c in self.tool.commands))
         self.assertTrue(upgrade.active(self.root / 'state'))
+
+    def direct(self, seconds=1800):
+        return self.instance.apply_direct(time.time() + seconds)
+
+    def test_direct_requires_finite_future_absolute_deadline_before_admission(self):
+        for deadline in (None, True, '1000', 0, time.time() - 1, float('nan'), float('inf')):
+            with self.subTest(deadline=deadline):
+                before = list(self.commands)
+                with self.assertRaisesRegex(upgrade.UpgradeError, 'invalid_upgrade_deadline'):
+                    self.instance.apply_direct(deadline)
+                self.assertEqual(before, self.commands)
+
+    def test_direct_uses_one_fresh_frozen_pair_without_rehearsal(self):
+        (self.instance.root / 'state.json').unlink()
+        seen = []
+        def verify(snapshot, **kwargs):
+            self.assertEqual(self.tool.counts, {'backend': 0, 'postgres': 0})
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 1800)
+            kwargs['on_drill'](FakeDrill())
+            record = upgrade.read_record(self.root / 'state')
+            self.assertEqual(record['live_kind'], 'restore')
+            self.assertEqual(record['live_token'], 'b' * 24)
+            self.assertNotIn('dataset_guids', record)
+            seen.append((snapshot, kwargs['schema'], kwargs['server']))
+            return {'schema': 9}
+        self.instance.verify = verify
+        result = self.direct()
+        record = upgrade.read_record(self.root / 'state')
+        self.assertEqual(record['mode'], 'direct')
+        self.assertNotIn('rehearsal_snapshot', record)
+        self.assertEqual(record['phase'], 'awaiting_acceptance')
+        self.assertEqual(seen, [(SNAPSHOT, 9, upgrade.restore.OLD_SERVER)])
+        self.assertEqual(FakeDrill.events.count('migrate-storage'), 1)
+        self.assertEqual(FakeDrill.events.count('verify-storage'), 1)
+        self.assertEqual(FakeDrill.events.count('activate-storage'), 1)
+        self.assertTrue(result['candidate_ready'])
+        self.assertGreaterEqual(result['old_restore_seconds'], 0)
+
+    def test_direct_failed_old_restore_recovers_unmodified_pair_without_migration(self):
+        def fail(snapshot, **kwargs):
+            kwargs['on_drill'](FakeDrill())
+            raise RuntimeError('old restore failed')
+        self.instance.verify = fail
+        with self.assertRaisesRegex(RuntimeError, 'old restore failed'):
+            self.direct()
+        self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
+        self.assertEqual((self.private / 'backend.toml').read_text(), CONFIG)
+        self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rolled_back')
+        self.assertNotIn('migrate-storage', FakeDrill.events)
+        self.assertFalse(any(c[:2] == ['zfs', 'rename'] for c in self.commands))
+
+    def test_direct_migration_failure_preserves_pair_and_restores_original(self):
+        for command in ('migrate-storage', 'verify-storage', 'activate-storage'):
+            with self.subTest(command=command):
+                FakeDrill.events = []
+                FakeDrill.fail_command = command
+                with self.assertRaisesRegex(upgrade.UpgradeError, 'offline_command_failed'):
+                    self.direct()
+                self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rolled_back')
+                self.assertEqual((self.private / 'backend.toml').read_text(), CONFIG)
+                self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
+                self.assertNotIn('check', FakeDrill.events)
+                # Each attempt must start from a fresh canonical old pair.
+                self.inventory = {upgrade.m.DATASET + '/' + c for c in ('postgres', 'evidence')}
+                self.guids = {upgrade.m.DATASET + '/postgres': '1', upgrade.m.DATASET + '/evidence': '2'}
+                self.origins = {}
+
+    def test_direct_restore_cannot_run_past_cutoff_and_start_migration(self):
+        now = time.time()
+        def verify(snapshot, **kwargs):
+            kwargs['on_drill'](FakeDrill())
+            return {'schema': 9}
+        self.instance.verify = verify
+        with patch.object(upgrade.time, 'time', side_effect=lambda: now):
+            def elapsed_verify(snapshot, **kwargs):
+                nonlocal now
+                result = verify(snapshot, **kwargs)
+                now += 1801
+                return result
+            self.instance.verify = elapsed_verify
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'deadline_exceeded'):
+                self.direct()
+        self.assertNotIn('migrate-storage', FakeDrill.events)
+        self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rolled_back')
+
+    def test_direct_expiry_before_migration_restores_original_without_dataset_swap(self):
+        upgrade.op.write(self.instance.root / 'original-config.toml', CONFIG)
+        self.phase_record('pre_upgrade_restore', mode='direct', deadline_at=1000,
+                          drain_started=True, backend_drained=True, snapshot=SNAPSHOT)
+        self.tool.counts = {'backend': 0, 'postgres': 0}
+        self.assertTrue(self.instance.expire('a' * 24, wall_clock=lambda: 1000)['rolled_back'])
+        self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
+        self.assertFalse(any(c[:2] == ['zfs', 'rename'] for c in self.commands))
+
+    def test_direct_expiry_keeps_uncertain_snapshot_drain_fenced(self):
+        upgrade.op.write(self.instance.root / 'original-config.toml', CONFIG)
+        self.phase_record('pre_upgrade_restore', mode='direct', deadline_at=1000,
+                          drain_started=True, backend_drained=True)
+        self.tool.counts = {'backend': 0, 'postgres': 0}
+        with self.instance.maintenance_state.locked():
+            self.instance.maintenance_state.save({'version': 1, 'fence': None,
+                                                  'operation': {'phase': 'snapshotting'}, 'verified': []})
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'maintenance_fenced'):
+            self.instance.expire('a' * 24, wall_clock=lambda: 1000)
+        self.assertEqual(self.tool.counts, {'backend': 0, 'postgres': 0})
+        self.assertTrue(upgrade.active(self.root / 'state'))
+
+    def test_direct_watchdog_stops_exact_driver_holding_migration_lock(self):
+        self.direct()
+        record = upgrade.read_record(self.root / 'state')
+        script = '''import importlib.util,os,pathlib,signal,sys
+spec=importlib.util.spec_from_file_location('owned_upgrade',sys.argv[1])
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+state=module.m.State(pathlib.Path(sys.argv[2]))
+with state.locked():
+    record=module.read_record(pathlib.Path(sys.argv[2]).parent)
+    record.update(phase='running_migrate_storage',driver_pid=os.getpid(),driver_start=module.process_start(os.getpid()))
+    state.save(record)
+    print('locked',flush=True)
+    signal.pause()
+'''
+        child = subprocess.Popen([sys.executable, '-c', script, str(ROOT / 'deploy/staging/upgrade.py'),
+                                  str(self.instance.root)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.addCleanup(child.stdout.close)
+        self.assertTrue(select.select([child.stdout], [], [], 10)[0], 'child did not acquire upgrade lock')
+        self.assertEqual(child.stdout.readline().strip(), 'locked')
+        result = self.instance.expire(record['token'], wall_clock=lambda: record['deadline_at'])
+        self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+        self.assertTrue(result['rolled_back'])
+        self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
+        self.assertTrue(all(name in self.inventory for name in result['preserved'].values()))
+
+    def test_direct_watchdog_does_not_terminate_running_driver_before_deadline(self):
+        self.direct()
+        record = upgrade.read_record(self.root / 'state')
+        with self.instance.state.locked(), patch.object(upgrade, 'terminate_driver') as terminate:
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'maintenance_busy'):
+                self.instance.expire(record['token'], wall_clock=lambda: record['deadline_at'] - 1)
+            terminate.assert_not_called()
+
+    def test_direct_finish_journals_restore_owner_and_retains_absolute_cutoff(self):
+        self.direct()
+        record = upgrade.read_record(self.root / 'state')
+        receipt = {'version': upgrade.VERSION, 'token': record['token'], 'http': True, 'webtransport': True,
+                   'revisions': ['2025-11-25', '2026-07-28'], 'retained': True,
+                   'isolation': True, 'shared_services': True}
+        upgrade.op.write(self.instance.root / 'acceptance.json', json.dumps(receipt))
+        def verify(snapshot, **kwargs):
+            self.assertEqual(kwargs['schema'], 10)
+            self.assertLessEqual(kwargs['timeout'], 1800)
+            kwargs['on_drill'](FakeDrill())
+            self.assertEqual(upgrade.read_record(self.root / 'state')['live_kind'], 'restore')
+            return {'schema': 10}
+        self.instance.verify = verify
+        self.assertTrue(self.instance.finish()['complete'])
+        final = upgrade.read_record(self.root / 'state')
+        self.assertEqual(final['deadline_at'], record['deadline_at'])
+        self.assertIsNone(final['live_token'])
+
+    def test_pidfd_supervision_rejects_reused_process_before_signalling(self):
+        record = {'driver_pid': os.getpid() + 1000000, 'driver_start': '123'}
+        with patch.object(upgrade.os, 'pidfd_open', return_value=123), \
+                patch.object(upgrade.os, 'close'), \
+                patch.object(upgrade, 'process_start', return_value='124'), \
+                patch.object(upgrade.signal, 'pidfd_send_signal') as send:
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'identity_changed'):
+                upgrade.terminate_driver(record)
+            send.assert_not_called()
+
+    def detached_resources(self, kind='restore'):
+        token = upgrade.secrets.token_hex(12)
+        name = 'devres-staging-restore-' + token
+        runtime = Path('/tmp') / name
+        runtime.mkdir(mode=0o700)
+        self.addCleanup(lambda: runtime.exists() and upgrade.shutil.rmtree(runtime))
+        upgrade.op.write(runtime / 'owner', token)
+        for child in ('config', 'tls'):
+            (runtime / child).mkdir()
+        for child in ('postgres', 'evidence'):
+            if kind == 'permanent':
+                (runtime / child).symlink_to('/mnt/devres-staging/' + child)
+            else:
+                (runtime / child).mkdir()
+        dataset = 'cachepool/' + name
+        rows = {} if kind == 'permanent' else {
+            dataset: [dataset, '10', '-', 'none', 'off', token],
+            **{dataset + '/' + child: [dataset + '/' + child, str(index),
+                upgrade.m.DATASET + '/' + child + '@' + SNAPSHOT,
+                str(runtime / child), 'on', token] for index, child in enumerate(('postgres', 'evidence'), 11)}}
+        server = upgrade.restore.OLD_SERVER if kind == 'restore' else upgrade.restore.SERVER
+        container_id = 'c' * 64
+        mounts = {'/data': ('/mnt/devres-staging/evidence' if kind == 'permanent' else str(runtime / 'evidence'), True),
+                  '/etc/devres/config': (str(runtime / 'config'), False),
+                  '/etc/devres/tls': (str(runtime / 'tls'), False)}
+        container = {'Id': container_id, 'Name': '/' + name + '-backend',
+                     'Config': {'Image': server, 'Labels': {upgrade.restore.LABEL_KEY: token}},
+                     'HostConfig': {'NetworkMode': name, 'PortBindings': {}},
+                     'Mounts': [{'Type': 'bind', 'Destination': key, 'Source': value[0], 'RW': value[1]}
+                                for key, value in mounts.items()]}
+        objects = {'rows': rows, 'containers': {container_id: container},
+                   'network': {'Id': 'd' * 64, 'Name': name, 'Internal': True,
+                               'Labels': {upgrade.restore.LABEL_KEY: token},
+                               'Containers': {container_id: {}}}}
+        self.phase_record('pre_upgrade_restore' if kind == 'restore' else 'running_migrate_storage',
+                          mode='direct', live_kind=kind, live_schema=9 if kind == 'restore' else 10,
+                          live_token=token, live_snapshot=SNAPSHOT)
+        self.instance.record = upgrade.read_record(self.root / 'state')
+        def run(args, **kwargs):
+            self.commands.append(list(args))
+            if args[:2] == ['zfs', 'list']:
+                return '\n'.join('\t'.join(row) for row in objects['rows'].values())
+            if args[:2] == ['zfs', 'destroy']:
+                del objects['rows'][args[-1]]
+            if args[:2] == ['docker', 'ps']:
+                return '\n'.join(objects['containers'])
+            if args[:2] == ['docker', 'inspect']:
+                return json.dumps([objects['containers'][args[-1]]])
+            if args[:2] == ['docker', 'rm']:
+                del objects['containers'][args[-1]]
+                objects['network']['Containers'].pop(args[-1], None)
+            if args[:3] == ['docker', 'network', 'ls']:
+                return name if objects['network'] else ''
+            if args[:3] == ['docker', 'network', 'inspect']:
+                return json.dumps([objects['network']])
+            if args[:3] == ['docker', 'network', 'rm']:
+                objects['network'] = None
+            return ''
+        self.instance.run = run
+        return runtime, upgrade.owned_containers(self.root / 'state'), objects
+
+    def test_direct_cleanup_preflights_mounts_before_stopping_any_container(self):
+        runtime, owner, objects = self.detached_resources()
+        objects['containers']['c' * 64]['Mounts'][0]['Source'] = '/mnt/foreign-permanent-data'
+        before = len(self.commands)
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'container_mount_changed'):
+            self.instance.cleanup_owned_resources(owner)
+        self.assertFalse(any(args[:2] == ['docker', 'stop'] or args[:2] == ['zfs', 'destroy']
+                             for args in self.commands[before:]))
+        self.assertTrue(runtime.exists())
+
+    def test_direct_cleanup_rejects_changed_clone_origin_without_mutation(self):
+        _, owner, objects = self.detached_resources()
+        child = 'cachepool/' + owner['prefix'] + '/evidence'
+        objects['rows'][child][2] = upgrade.m.DATASET + '/evidence@unrelated'
+        before = len(self.commands)
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'dataset_ownership_changed'):
+            self.instance.cleanup_owned_resources(owner)
+        self.assertFalse(any(args[:2] == ['docker', 'stop'] or args[:2] == ['zfs', 'destroy']
+                             for args in self.commands[before:]))
+
+    def test_direct_cleanup_removes_only_verified_disposable_objects(self):
+        runtime, owner, objects = self.detached_resources()
+        self.instance.stop_owned()
+        self.assertEqual(objects, {'rows': {}, 'containers': {}, 'network': None})
+        self.assertFalse(runtime.exists())
+        self.assertIsNone(upgrade.read_record(self.root / 'state')['live_token'])
+        self.assertTrue(all(args[-1].startswith('cachepool/' + owner['prefix'])
+                            for args in self.commands if args[:2] == ['zfs', 'destroy']))
+
+    def test_direct_cleanup_handles_permanent_binds_without_deleting_permanent_data(self):
+        runtime, owner, objects = self.detached_resources(kind='permanent')
+        self.instance.stop_owned()
+        self.assertFalse(runtime.exists())
+        self.assertEqual(objects, {'rows': {}, 'containers': {}, 'network': None})
+        self.assertFalse(any(args[:2] == ['zfs', 'destroy'] for args in self.commands))
+
+    def test_direct_cleanup_recovers_partial_prepare_before_container_creation(self):
+        runtime, owner, objects = self.detached_resources(kind='permanent')
+        (runtime / 'evidence').unlink()
+        objects['containers'] = {}
+        objects['network']['Containers'] = {}
+        self.instance.stop_owned()
+        self.assertFalse(runtime.exists())
+        self.assertFalse(any(args[:2] == ['zfs', 'destroy'] for args in self.commands))
+
+    def test_direct_cleanup_rejects_missing_permanent_link_with_detached_writer(self):
+        runtime, owner, objects = self.detached_resources(kind='permanent')
+        (runtime / 'evidence').unlink()
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'permanent_mount_changed'):
+            self.instance.cleanup_owned_resources(owner)
+        self.assertFalse(any(args[:2] == ['docker', 'stop'] for args in self.commands))
 
 
 if __name__ == '__main__':

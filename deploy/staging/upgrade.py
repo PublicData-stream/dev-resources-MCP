@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
+import signal
 import stat
 import time
 import tomllib
@@ -30,7 +32,7 @@ def module(name):
 op = module('staging')
 restore = module('restore')
 m = module('maintenance')
-VERSION = '0.1.0-build.b0a33793'
+VERSION = '0.1.0-build.634eb5b5'
 OLD_VERSION = '0.1.0-build.27d35cd6'
 SOURCE = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
 TERMINAL = {'rehearsed', 'rehearsal_failed', 'complete', 'rolled_back'}
@@ -111,12 +113,68 @@ def target_config(text, paused=False):
     return restore.paused_config(result) if paused else result
 
 
+def process_start(pid):
+    """Linux process birth identity; a reused PID must never receive a signal."""
+    if type(pid) is not int or pid < 2:
+        raise UpgradeError('invalid_upgrade_driver_identity')
+    try:
+        value = (Path('/proc') / str(pid) / 'stat').read_text()
+    except FileNotFoundError:
+        return None
+    fields = value.rsplit(') ', 1)[-1].split()
+    if len(fields) < 20 or not fields[19].isdigit():
+        raise UpgradeError('invalid_upgrade_driver_identity')
+    return fields[19]
+
+
+def terminate_driver(record, lock_path=None):
+    """Stop only the overdue direct driver's exact Linux process instance."""
+    pid, born = record.get('driver_pid'), record.get('driver_start')
+    if (type(pid) is not int or pid < 2 or not isinstance(born, str)
+            or not born.isdigit() or pid == os.getpid()):
+        raise UpgradeError('invalid_upgrade_driver_identity')
+    try:
+        descriptor = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        current = process_start(pid)
+        if current is None:
+            return
+        if current != born:
+            raise UpgradeError('upgrade_driver_identity_changed')
+        if lock_path is not None:
+            info = Path(lock_path).stat()
+            key = (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino)
+            holders = []
+            for line in Path('/proc/locks').read_text().splitlines():
+                fields = line.split()
+                if len(fields) != 8 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']:
+                    continue
+                device = fields[5].split(':')
+                if len(device) == 3 and (int(device[0], 16), int(device[1], 16), int(device[2])) == key:
+                    holders.append(int(fields[4]))
+            if holders != [pid]:
+                raise UpgradeError('upgrade_driver_lock_owner_changed')
+        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        if not select.select([descriptor], [], [], 5)[0]:
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            if not select.select([descriptor], [], [], 5)[0]:
+                raise UpgradeError('upgrade_driver_did_not_stop')
+    except ProcessLookupError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 class LiveDrill(restore.Drill):
     """Reuse isolated command execution while never owning permanent datasets."""
 
+    accelerated = True
+
     def prepare(self):
         self.root.mkdir(mode=0o700, parents=False, exist_ok=False)
-        (self.root / 'owner').write_text(self.token)
+        op.write(self.root / 'owner', self.token, mode=0o600)
         self.runtime_owned = True
         for child in ('postgres', 'evidence'):
             (self.root / child).symlink_to(Path('/mnt/devres-staging') / child, target_is_directory=True)
@@ -347,25 +405,83 @@ class Upgrade:
         if remaining <= 0:
             raise UpgradeError('upgrade_deadline_exceeded')
         self.safe()
+        if self.record.get('mode') == 'direct':
+            remaining = min(remaining, self.wall_remaining())
         return min(86400, remaining)
 
     def apply(self):
+        return self._apply()
+
+    def apply_direct(self, deadline_at):
+        if (isinstance(deadline_at, bool) or not isinstance(deadline_at, (int, float))
+                or not math.isfinite(deadline_at) or deadline_at <= time.time()):
+            raise UpgradeError('invalid_upgrade_deadline')
+        if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+            raise UpgradeError('upgrade_driver_supervision_unavailable')
+        return self._apply(deadline_at=deadline_at)
+
+    def record_driver(self):
+        pid = os.getpid()
+        born = process_start(pid)
+        if born is None:
+            raise UpgradeError('upgrade_driver_supervision_unavailable')
+        self.save(driver_pid=pid, driver_start=born)
+
+    def verify_direct(self, snapshot, **kwargs):
+        """Expose the isolated restore owner before it can start any writer."""
+        def owner(drill):
+            self.save(live_token=drill.token, live_kind='restore', live_snapshot=snapshot,
+                      live_schema=kwargs['schema'])
+        result = self.verify(snapshot, private=self.private, timeout=self.wall_remaining(),
+                             on_drill=owner, **kwargs)
+        self.save(live_token=None, live_kind=None)
+        return result
+
+    def recover_original(self):
+        """Before migration, restore the unchanged old pair only if drain is certain."""
+        self.save('recovering_original')
+        self.stop_owned()
+        self.safe()
+        if self.record.get('drain_started') or self.record.get('backend_drained'):
+            self.tool.scale('backend', 0)
+            self.tool.stopped('backend')
+            original = (self.root / 'original-config.toml').read_text()
+            op.write(self.private / 'backend.toml', original)
+            op.config_secret()
+            self.tool.start('postgres', 1)
+            self.tool.start('backend', 1)
+        self.save('rolled_back')
+        self.restore_timers()
+        return {'rolled_back': True, 'version': OLD_VERSION,
+                'watchdog_disarmed': not self.record.get('watchdog_cleanup_pending', False)}
+
+    def _apply(self, deadline_at=None):
         with self.state.locked():
-            rehearsal = read_record(self.root.parent)
-            if not rehearsal or rehearsal['phase'] != 'rehearsed' or not isinstance(rehearsal.get('deadline_seconds'), int):
-                raise UpgradeError('successful_rehearsal_required')
+            direct = deadline_at is not None
+            if not direct:
+                rehearsal = read_record(self.root.parent)
+                if not rehearsal or rehearsal['phase'] != 'rehearsed' or not isinstance(rehearsal.get('deadline_seconds'), int):
+                    raise UpgradeError('successful_rehearsal_required')
             mutated = False
             drain_attempted = False
             original = None
             try:
                 original = self.begin('preparing_upgrade')
-                self.save(deadline_seconds=rehearsal['deadline_seconds'],
-                          deadline_at=time.time() + rehearsal['deadline_seconds'],
-                          rehearsal_snapshot=rehearsal['snapshot'])
+                if direct:
+                    self.save(mode='direct', deadline_seconds=deadline_at - time.time(),
+                              deadline_at=deadline_at)
+                    self.record_driver()
+                else:
+                    self.save(deadline_seconds=rehearsal['deadline_seconds'],
+                              deadline_at=time.time() + rehearsal['deadline_seconds'],
+                              rehearsal_snapshot=rehearsal['snapshot'])
                 self.started = self.clock()
                 paused = restore.paused_config(original)
+                self.remaining()
                 self.arm_watchdog()
                 drain_attempted = True
+                if direct:
+                    self.save(drain_started=True)
                 self.tool.scale('backend', 0)
                 self.tool.stopped('backend')
                 self.save(backend_drained=True)
@@ -374,9 +490,21 @@ class Upgrade:
                 # snapshot() preserves zero backend replicas and returns PG to one.
                 snapshot = self.snapshot('pre-blake3', paused=True)
                 self.save('pre_upgrade_restore', snapshot=snapshot)
-                old_receipt = self.verify(snapshot, schema=9, server=restore.OLD_SERVER,
-                                          private=self.private, config_text=original)
-                self.save(old_restore=old_receipt)
+                if direct:
+                    # Keep the exact source pair frozen throughout restore proof
+                    # and migration; no later-history merge or snapshot reuse.
+                    self.tool.scale('postgres', 0)
+                    self.tool.stopped('postgres')
+                    self.tool.postgres_shut_down()
+                    started = self.clock()
+                    old_receipt = self.verify_direct(snapshot, schema=9, server=restore.OLD_SERVER,
+                                                     config_text=original)
+                    self.save(old_restore=old_receipt,
+                              old_restore_seconds=max(0, self.clock() - started))
+                else:
+                    old_receipt = self.verify(snapshot, schema=9, server=restore.OLD_SERVER,
+                                              private=self.private, config_text=original)
+                    self.save(old_restore=old_receipt)
                 self.remaining()
                 self.tool.scale('postgres', 0)
                 self.tool.stopped('postgres')
@@ -386,7 +514,8 @@ class Upgrade:
                          for child in ('postgres', 'evidence')}
                 if any(not value.isdigit() for value in guids.values()):
                     raise UpgradeError('invalid_dataset_identity')
-                self.save('migrating', dataset_guids=guids, live_token=secrets.token_hex(12))
+                self.save('migrating', dataset_guids=guids, live_token=secrets.token_hex(12),
+                          live_kind='permanent' if direct else None)
                 mutated = True
                 drill = self.live(snapshot, schema=10, private=self.private,
                                   token=self.record['live_token'],
@@ -402,7 +531,7 @@ class Upgrade:
                         self.clean_stop(drill)
                     finally:
                         drill.cleanup()
-                self.save('starting_candidate', live_token=None)
+                self.save('starting_candidate', live_token=None, live_kind=None)
                 self.tool.postgres_shut_down()
                 op.write(self.private / 'backend.toml', target_config(original, paused=True))
                 op.config_secret()
@@ -413,10 +542,13 @@ class Upgrade:
                 self.remaining()
                 self.save('awaiting_acceptance')
                 return {'candidate_ready': True, 'collectors_paused': True,
-                        'snapshot': snapshot, 'version': VERSION}
+                        'snapshot': snapshot, 'version': VERSION,
+                        **({'old_restore_seconds': self.record['old_restore_seconds']} if direct else {})}
             except Exception:
                 if mutated:
                     self._rollback()
+                elif direct and self.record:
+                    self.recover_original()
                 elif self.record and original is not None and self.record.get('backend_drained'):
                     # Refuse uncertain partial snapshot drains; the original
                     # maintenance recovery fence must remain visible.
@@ -439,6 +571,10 @@ class Upgrade:
         owner = owned_containers(self.root.parent)
         if not owner:
             return
+        if self.record.get('mode') == 'direct':
+            self.cleanup_owned_resources(owner)
+            self.save(live_token=None, live_kind=None)
+            return
         names = self.run(['docker', 'ps', '-a', '--filter', 'label=' + owner['label'] + '=' + owner['token'],
                           '--format', '{{.Names}}']).splitlines()
         for name in names:
@@ -449,7 +585,165 @@ class Upgrade:
                 raise UpgradeError('upgrade_container_owner_changed')
             self.run(['docker', 'stop', '--time=120', name])
             self.run(['docker', 'rm', name])
-        self.save(live_token=None)
+        self.save(live_token=None, live_kind=None)
+
+    def owned_inventory(self, owner):
+        """Validate the whole detached inventory before the first cleanup mutation."""
+        token, name = owner['token'], owner['prefix']
+        kind = self.record.get('live_kind')
+        if kind not in ('restore', 'permanent'):
+            raise UpgradeError('invalid_upgrade_resource_kind')
+        runtime = Path('/tmp') / name
+        missing_links = False
+        if runtime.is_symlink():
+            raise UpgradeError('restore_runtime_ownership_changed')
+        if runtime.exists():
+            info = runtime.stat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise UpgradeError('restore_runtime_ownership_changed')
+            fd = os.open(runtime / 'owner', os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(fd)
+                marker = os.read(fd, 128).decode('ascii')
+            finally:
+                os.close(fd)
+            if (marker != token or not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077 or info.st_nlink != 1):
+                raise UpgradeError('restore_runtime_ownership_changed')
+            for child in ('config', 'tls'):
+                if (runtime / child).is_symlink():
+                    raise UpgradeError('restore_runtime_ownership_changed')
+            for child in ('postgres', 'evidence'):
+                path = runtime / child
+                if kind == 'restore' and path.is_symlink():
+                    raise UpgradeError('restore_runtime_ownership_changed')
+                if kind == 'permanent':
+                    if not path.exists() and not path.is_symlink():
+                        missing_links = True
+                    elif not path.is_symlink() or os.readlink(path) != '/mnt/devres-staging/' + child:
+                        raise UpgradeError('upgrade_permanent_mount_changed')
+        dataset = 'cachepool/' + name
+        datasets = {}
+        rows = self.run(['zfs', 'list', '-Hp', '-t', 'filesystem,snapshot', '-o',
+                         'name,guid,origin,mountpoint,canmount,' + restore.OWNER_KEY]).splitlines()
+        for line in rows:
+            row = line.split('\t')
+            child = row[0]
+            if child != dataset and not child.startswith((dataset + '/', dataset + '@')):
+                continue
+            if (len(row) != 6 or kind != 'restore'
+                    or child not in (dataset, dataset + '/postgres', dataset + '/evidence')):
+                raise UpgradeError('restore_dataset_tree_changed')
+            _, guid, origin, mountpoint, canmount, claimed = row
+            leaf = child.removeprefix(dataset + '/')
+            expected = ('-', 'none', 'off') if child == dataset else (
+                m.DATASET + '/' + leaf + '@' + self.record['live_snapshot'], str(runtime / leaf), 'on')
+            if claimed != token or not guid.isdigit() or (origin, mountpoint, canmount) != expected:
+                raise UpgradeError('restore_dataset_ownership_changed')
+            datasets[child] = guid
+        identifiers = set()
+        for filt in ('label=' + restore.LABEL_KEY + '=' + token, 'name=^/' + name + '-'):
+            identifiers.update(self.run(['docker', 'ps', '-a', '--no-trunc', '--filter', filt,
+                                         '--format', '{{.ID}}']).splitlines())
+        if len(identifiers) > 8 or any(not re.fullmatch(r'[0-9a-f]{64}', value) for value in identifiers):
+            raise UpgradeError('upgrade_container_inventory_changed')
+        containers = {}
+        for identifier in sorted(identifiers):
+            info = json.loads(self.run(['docker', 'inspect', '--type', 'container', identifier]))[0]
+            role = self.owned_container(info, owner, runtime)
+            if info.get('Id') != identifier:
+                raise UpgradeError('upgrade_container_inventory_changed')
+            containers[identifier] = role
+        network = self.run(['docker', 'network', 'ls', '--filter', 'name=^' + name + '$',
+                            '--format', '{{.Name}}']).strip()
+        network_id = None
+        if network:
+            if network != name:
+                raise UpgradeError('restore_network_inventory_changed')
+            info = json.loads(self.run(['docker', 'network', 'inspect', name]))[0]
+            if (info.get('Name') != name or not info.get('Internal')
+                    or info.get('Labels', {}).get(restore.LABEL_KEY) != token
+                    or not re.fullmatch(r'[0-9a-f]{64}', info.get('Id', ''))
+                    or not set(info.get('Containers', {})).issubset(identifiers)):
+                raise UpgradeError('restore_network_ownership_changed')
+            network_id = info['Id']
+        if (datasets or containers or network) and not runtime.is_dir():
+            raise UpgradeError('restore_runtime_required')
+        if containers and (not network or (kind == 'restore' and not datasets)):
+            raise UpgradeError('restore_container_storage_or_network_missing')
+        if containers and missing_links:
+            raise UpgradeError('upgrade_permanent_mount_changed')
+        return {'datasets': datasets, 'containers': containers, 'network': network_id}
+
+    def owned_container(self, info, owner, runtime):
+        name, token = owner['prefix'], owner['token']
+        role = info.get('Name', '').removeprefix('/').removeprefix(name + '-')
+        config, host = info.get('Config', {}), info.get('HostConfig', {})
+        if (info.get('Name') != '/' + name + '-' + role
+                or not re.fullmatch(r'postgres|backend|offline-[1-9][0-9]*', role)
+                or config.get('Labels', {}).get(restore.LABEL_KEY) != token
+                or host.get('NetworkMode') != name or host.get('PortBindings')):
+            raise UpgradeError('upgrade_container_inventory_changed')
+        server = (restore.OLD_SERVER if self.record.get('live_kind') == 'restore'
+                  and self.record.get('live_schema') == 9 else restore.SERVER)
+        if config.get('Image') != (restore.PG if role == 'postgres' else server):
+            raise UpgradeError('upgrade_container_image_changed')
+        expected = {'/var/lib/postgresql': (str(runtime / 'postgres'), True)} if role == 'postgres' else {
+            '/data': (str(runtime / 'evidence'), True),
+            '/etc/devres/config': (str(runtime / 'config'), False),
+            '/etc/devres/tls': (str(runtime / 'tls'), False)}
+        actual = {}
+        for mount in info.get('Mounts', []):
+            if mount.get('Type') == 'tmpfs' and mount.get('Destination') == '/tmp':
+                continue
+            destination = mount.get('Destination')
+            if mount.get('Type') != 'bind' or destination in actual:
+                raise UpgradeError('upgrade_container_mount_changed')
+            source = mount.get('Source')
+            if self.record.get('live_kind') == 'permanent':
+                for child in ('postgres', 'evidence'):
+                    if source == '/mnt/devres-staging/' + child:
+                        source = str(runtime / child)
+            actual[destination] = (source, mount.get('RW'))
+        if actual != expected:
+            raise UpgradeError('upgrade_container_mount_changed')
+        return role
+
+    def cleanup_owned_resources(self, owner):
+        """Remove only the preflighted token-owned detached direct resources."""
+        original = self.owned_inventory(owner)
+        runtime = Path('/tmp') / owner['prefix']
+        for identifier, role in sorted(original['containers'].items(),
+                                       key=lambda item: (item[1] == 'postgres', item[1] == 'backend')):
+            current = self.owned_inventory(owner)
+            if current['containers'].get(identifier) != role:
+                raise UpgradeError('upgrade_container_inventory_changed')
+            self.run(['docker', 'stop', '--time=' + ('120' if role == 'postgres' else '15'), identifier])
+            self.run(['docker', 'rm', identifier])
+        current = self.owned_inventory(owner)
+        if current['containers']:
+            raise UpgradeError('upgrade_writers_remain')
+        if current['network']:
+            if current['network'] != original['network']:
+                raise UpgradeError('restore_network_ownership_changed')
+            self.run(['docker', 'network', 'rm', current['network']])
+        for dataset in sorted(original['datasets'], key=len, reverse=True):
+            current = self.owned_inventory(owner)
+            if current['datasets'].get(dataset) != original['datasets'][dataset]:
+                raise UpgradeError('restore_dataset_ownership_changed')
+            self.run(['zfs', 'destroy', dataset])
+        remaining = self.owned_inventory(owner)
+        if remaining != {'datasets': {}, 'containers': {}, 'network': None}:
+            raise UpgradeError('restore_cleanup_incomplete')
+        if runtime.exists():
+            for line in Path('/proc/self/mountinfo').read_text().splitlines():
+                fields = line.split()
+                if len(fields) < 5:
+                    raise UpgradeError('restore_mount_inventory_invalid')
+                mounted = Path(re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4]))
+                if mounted == runtime or runtime in mounted.parents:
+                    raise UpgradeError('restore_runtime_mount_remains')
+            shutil.rmtree(runtime)
 
     def _rollback(self):
         if not self.record.get('snapshot') or not self.record.get('dataset_guids'):
@@ -521,37 +815,70 @@ class Upgrade:
             raise UpgradeError('invalid_upgrade_watch_token')
         # Do not enter through the capacity guard's maintenance lock. Both this
         # path and finish/apply serialize on upgrade first, then maintenance.
-        with self.state.locked():
-            self.record = read_record(self.root.parent)
-            if not self.record or self.record['token'] != expected_token:
-                return {'expired': False}
-            if self.record['phase'] in TERMINAL:
-                if self.record.get('watchdog_cleanup_pending'):
+        entered = False
+        try:
+            with self.state.locked():
+                entered = True
+                return self.expire_locked(expected_token, wall_clock)
+        except m.MaintenanceError as error:
+            if entered or str(error) != 'maintenance_busy':
+                raise
+            # A long-running direct command holds this lock. An independent
+            # root timer must be able to terminate that exact driver rather
+            # than retry the same busy lock forever. Detached containers are
+            # stopped only after the timer acquires the released lock.
+            record = read_record(self.root.parent)
+            if (not record or record['token'] != expected_token
+                    or record.get('mode') != 'direct'
+                    or record['phase'] in TERMINAL | {'rolling_back', 'recovering_original'}
+                    or not self.deadline_due(record, wall_clock)):
+                raise
+            terminate_driver(record, self.root / 'maintenance.lock')
+            with self.state.locked():
+                return self.expire_locked(expected_token, wall_clock)
+
+    @staticmethod
+    def deadline_due(record, wall_clock):
+        deadline = record.get('deadline_at')
+        if (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+                or not math.isfinite(deadline) or deadline <= 0):
+            raise UpgradeError('invalid_upgrade_deadline')
+        now = wall_clock()
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+            raise UpgradeError('invalid_upgrade_wall_clock')
+        return now >= deadline
+
+    def expire_locked(self, expected_token, wall_clock):
+        self.record = read_record(self.root.parent)
+        if not self.record or self.record['token'] != expected_token:
+            return {'expired': False}
+        if self.record['phase'] in TERMINAL:
+            if self.record.get('watchdog_cleanup_pending'):
+                if self.record.get('mode') == 'direct':
+                    self.restore_timers()
+                else:
                     self.disarm_watchdog()
-                return {'expired': False}
-            # Recovery can stop after preserving only part of the pair or while
-            # the capacity guard owns maintenance. The same expired token may
-            # resume its GUID-checked swap on a later tick, still serialized by
-            # the upgrade lock; it must never abandon both workloads stopped.
-            if self.record['phase'] not in ('awaiting_acceptance', 'rolling_back'):
-                return {'expired': False}
-            deadline = self.record.get('deadline_at')
-            if (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
-                    or not math.isfinite(deadline) or deadline <= 0):
-                raise UpgradeError('invalid_upgrade_deadline')
-            now = wall_clock()
-            if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
-                raise UpgradeError('invalid_upgrade_wall_clock')
-            if now < deadline:
-                return {'expired': False}
+            return {'expired': False}
+        direct = self.record.get('mode') == 'direct'
+        if not direct and self.record['phase'] not in ('awaiting_acceptance', 'rolling_back'):
+            return {'expired': False}
+        if not self.deadline_due(self.record, wall_clock):
+            return {'expired': False}
+        # A terminated pre-migration restore has never changed the permanent
+        # pair. Once migration may have started, use the preserving pair swap.
+        if direct and not self.record.get('dataset_guids'):
+            result = self.recover_original()
+        else:
             result = self._rollback()
-            return {'expired': True, **result}
+        return {'expired': True, **result}
 
     def finish(self):
         with self.state.locked():
             self.record = read_record(self.root.parent)
             if not self.record or self.record['phase'] != 'awaiting_acceptance':
                 raise UpgradeError('candidate_acceptance_required')
+            if self.record.get('mode') == 'direct':
+                self.record_driver()
             if time.time() >= self.record['deadline_at']:
                 self._rollback()
                 raise UpgradeError('upgrade_acceptance_deadline_exceeded')
@@ -564,9 +891,13 @@ class Upgrade:
             try:
                 self.wall_remaining()
                 snapshot = self.snapshot('post-blake3')
-                self.verify(snapshot, schema=10, server=restore.SERVER, private=self.private,
-                            config_text=(self.private / 'backend.toml').read_text(),
-                            timeout=self.wall_remaining())
+                if self.record.get('mode') == 'direct':
+                    self.verify_direct(snapshot, schema=10, server=restore.SERVER,
+                                       config_text=(self.private / 'backend.toml').read_text())
+                else:
+                    self.verify(snapshot, schema=10, server=restore.SERVER, private=self.private,
+                                config_text=(self.private / 'backend.toml').read_text(),
+                                timeout=self.wall_remaining())
                 self.wall_remaining()
                 with self.maintenance_state.locked():
                     self.tool.mark_verified(snapshot)
@@ -602,6 +933,10 @@ def rehearse():
 
 def upgrade():
     print(json.dumps(Upgrade().apply(), sort_keys=True))
+
+
+def upgrade_direct(deadline_at):
+    print(json.dumps(Upgrade().apply_direct(deadline_at), sort_keys=True))
 
 
 def rollback():

@@ -132,6 +132,52 @@ class RestoreTests(unittest.TestCase):
             return restore.verify(SNAPSHOT, run=self.host.run, root=self.root, private=self.private,
                                   token=TOKEN, sleep=lambda _: None, call=self.rpc, **kwargs)
 
+    def test_restore_owner_is_recorded_before_any_objects_are_created(self):
+        seen = []
+        def record(drill):
+            self.assertFalse(drill.runtime_owned)
+            self.assertFalse(self.host.commands)
+            seen.append(drill.token)
+        result = self.run_verify(on_drill=record)
+        self.assertEqual(seen, [TOKEN])
+        self.assertEqual(result['schema'], 9)
+
+    def test_failed_owner_record_cannot_start_clone(self):
+        def reject(drill):
+            raise RuntimeError('journal_unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'journal_unavailable'):
+            self.run_verify(on_drill=reject)
+        self.assertFalse(self.host.commands)
+        self.assertFalse(self.root.exists())
+
+    def test_accelerated_offline_guard_preserves_host_headroom(self):
+        tool = self.drill()
+        tool.accelerated = True
+        tool.postgres_started = True
+        with patch.object(tool, 'require_memory_headroom', side_effect=restore.RestoreError('host_memory_headroom_insufficient')):
+            with self.assertRaisesRegex(restore.RestoreError, 'headroom_insufficient'):
+                tool.offline('migrate-storage')
+        self.assertFalse(self.host.commands)
+
+    def test_accelerated_profile_bounds_cpu_memory_and_counts_scratch_inside_worker(self):
+        tool = self.drill()
+        tool.accelerated = True
+        tool.runtime_owned = True
+        with patch.object(tool, 'require_memory_headroom'):
+            tool.start_postgres()
+            tool.offline('migrate-storage')
+        pg, worker = [c for c in self.host.commands if c[:2] == ['docker', 'run']]
+        self.assertIn('--cpus=2', pg)
+        self.assertIn('--memory=16g', pg)
+        for setting in ('shared_buffers=8GB', 'max_wal_size=16GB', 'fsync=on',
+                        'full_page_writes=on', 'synchronous_commit=on'):
+            self.assertIn(setting, pg)
+        self.assertIn('--cpus=37', worker)
+        self.assertIn('--memory=192g', worker)
+        self.assertTrue(any('size=64g,' in a for a in worker))
+        self.assertIn('--read-only', worker)
+        self.assertIn('--security-opt=no-new-privileges', worker)
+
     def test_real_capture_hash_schema_and_resource_then_owned_cleanup(self):
         result = self.run_verify()
         self.assertEqual(result['schema'], 9)

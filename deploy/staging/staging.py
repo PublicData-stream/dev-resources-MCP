@@ -28,8 +28,8 @@ CERTS = EDGE / 'lego/data/certificates'
 HOST = 'dev-resources.staged.mcp.publicdata.stream'
 NS = 'devres-staging'
 PG = 'postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:0c8592f7323ece2c11d4b9dcc4f5cae48d681c6305d5c2575a09e805b47a6997'
-PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:0bb7faa99fedd2de8a6754b7c2561f3a19fc82489d860e522344e156b907bc7b'
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:23243e50c92a0a5ce430ab535ec90e4629ec721f5f5df26e6163bfe3976b6130'
+PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:3cd7cb5383880f77df65546532959ce3417da2601a3e7bfbad8e2df2cf452110'
 SNIPPETS = ('52-upstream-devres-staging.toml', '62-route-devres-staging.toml')
 OWNER = 'devres-staging-v1'
 COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
@@ -432,6 +432,13 @@ def upgrade_module():
     return module
 
 
+def recovery_module():
+    spec = importlib.util.spec_from_file_location('devres_recovery', HERE / 'recovery.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def require_no_upgrade():
     if (HERE / 'upgrade.py').exists() and upgrade_module().active(STATE):
         raise OperatorError('upgrade_in_progress')
@@ -493,7 +500,7 @@ def backup():
 def diagnostic_code(error):
     if isinstance(error, OperatorError):
         return str(error)
-    if (type(error).__name__ in {'RestoreError', 'MaintenanceError', 'UpgradeError'}
+    if (type(error).__name__ in {'RestoreError', 'MaintenanceError', 'UpgradeError', 'RecoveryError'}
             and re.fullmatch(r'[a-z][a-z0-9_]{0,100}', str(error))):
         return str(error)
     return type(error).__name__
@@ -504,15 +511,21 @@ def main():
     parser.add_argument('command', choices=['prepare', 'firewall', 'firewall-bootstrap', 'start', 'edge-prepare',
                         'edge-activate', 'edge-rollback', 'collectors-on', 'backup',
                         'upgrade-rehearse', 'upgrade', 'upgrade-rollback', 'upgrade-finish',
-                        'upgrade-expire', 'refresh-services'])
+                        'upgrade-expire', 'upgrade-direct', 'upgrade-abort-rehearsal', 'refresh-services'])
     parser.add_argument('--token')
+    parser.add_argument('--deadline-at', type=float)
     args = parser.parse_args()
     command = args.command
-    if command == 'upgrade-expire':
+    if command in ('upgrade-expire', 'upgrade-abort-rehearsal'):
         if not args.token or not re.fullmatch(r'[0-9a-f]{24}', args.token):
             parser.error('valid_upgrade_token_required')
     elif args.token is not None:
-        parser.error('token_only_for_upgrade_expire')
+        parser.error('token_only_for_upgrade_recovery')
+    if command == 'upgrade-direct':
+        if args.deadline_at is None:
+            parser.error('absolute_upgrade_deadline_required')
+    elif args.deadline_at is not None:
+        parser.error('deadline_only_for_upgrade_direct')
     if os.geteuid() != 0:
         raise OperatorError('root_required')
     os.umask(0o077)
@@ -525,6 +538,8 @@ def main():
                 'upgrade-rollback': lambda: upgrade_module().rollback(),
                 'upgrade-finish': lambda: upgrade_module().finalize(),
                 'upgrade-expire': lambda: upgrade_module().expire(args.token),
+                'upgrade-direct': lambda: upgrade_module().upgrade_direct(args.deadline_at),
+                'upgrade-abort-rehearsal': lambda: print(json.dumps(recovery_module().abort_rehearsal(args.token), sort_keys=True)),
                 'refresh-services': refresh_services}
     commands[command]()
 

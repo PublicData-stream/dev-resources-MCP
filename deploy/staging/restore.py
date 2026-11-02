@@ -27,8 +27,8 @@ PRIVATE = Path('/etc/devres-staging')
 DATASET = 'cachepool/devres-staging'
 PG = 'postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a'
 OLD_SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:02977361122a11d7f0a9eedea97437b15f2fccc17f82d2331f859d388359179e'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:0c8592f7323ece2c11d4b9dcc4f5cae48d681c6305d5c2575a09e805b47a6997'
-PROFILES = {9: (OLD_SERVER, '0.1.0-build.27d35cd6'), 10: (SERVER, '0.1.0-build.b0a33793')}
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:23243e50c92a0a5ce430ab535ec90e4629ec721f5f5df26e6163bfe3976b6130'
+PROFILES = {9: (OLD_SERVER, '0.1.0-build.27d35cd6'), 10: (SERVER, '0.1.0-build.634eb5b5')}
 SOURCE_PREFIX = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
 COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
 OWNER_KEY = 'org.publicdata:restore-owner'
@@ -263,7 +263,10 @@ class Drill:
                              self.source_dataset + child]).strip() != source_owner:
                     raise RestoreError('restore_source_ownership_changed')
         self.root.mkdir(mode=0o700, parents=False, exist_ok=False)
-        (self.root / 'owner').write_text(self.token)
+        marker = self.root / 'owner'
+        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w') as output:
+            output.write(self.token)
         self.runtime_owned = True
         self.datasets.append(self.dataset)
         self.run(['zfs', 'create', '-o', OWNER_KEY + '=' + self.token,
@@ -317,10 +320,16 @@ class Drill:
         self.run(['docker', 'run', '-d', '--name', pg, '--label', LABEL_KEY + '=' + self.token,
                   '--network', self.name, '--network-alias', 'postgres', '--read-only',
                   '--user', '999:999', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                  '--pids-limit=128', '--memory=2g', '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,uid=999,gid=999',
+                  '--pids-limit=128', *(['--cpus=2', '--memory=16g'] if getattr(self, 'accelerated', False)
+                                          else ['--memory=2g']), '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,uid=999,gid=999',
                   '-v', str(self.root / 'postgres') + ':/var/lib/postgresql',
                   '--entrypoint', 'postgres', PG, '-D', '/var/lib/postgresql/18/docker',
-                  '-c', 'listen_addresses=*', '-c', 'unix_socket_directories=/tmp'])
+                  '-c', 'listen_addresses=*', '-c', 'unix_socket_directories=/tmp',
+                  *(['-c', 'shared_buffers=8GB', '-c', 'effective_cache_size=128GB',
+                     '-c', 'maintenance_work_mem=2GB', '-c', 'max_wal_size=16GB',
+                     '-c', 'checkpoint_timeout=15min', '-c', 'wal_compression=on',
+                     '-c', 'fsync=on', '-c', 'full_page_writes=on', '-c', 'synchronous_commit=on']
+                    if getattr(self, 'accelerated', False) else [])])
         for attempt in range(60):
             try:
                 self.run(['docker', 'exec', pg, 'pg_isready', '-h', '127.0.0.1', '-U', 'devres_admin', '-d', 'devres'])
@@ -353,15 +362,22 @@ class Drill:
         args = [command, '/etc/devres/config/backend.toml']
         if command == 'migrate-storage':
             args.extend(['--to', 'blake3'])
+        accelerated = getattr(self, 'accelerated', False)
+        if accelerated:
+            self.require_memory_headroom()
         try:
             self.run(['docker', 'run', '-d', '--name', name, '--label', LABEL_KEY + '=' + self.token,
                       '--network', self.name, '--read-only', '--cap-drop=ALL',
                       '--security-opt=no-new-privileges', '--pids-limit=128',
-                      *self.backend_args(memory='64g', scratch='32g'), '--entrypoint', '/usr/local/bin/devres-server', target, *args])
+                      *(['--cpus=37'] if accelerated else []),
+                      *self.backend_args(memory='192g' if accelerated else '64g',
+                                         scratch='64g' if accelerated else '32g'), '--entrypoint', '/usr/local/bin/devres-server', target, *args])
             # Count bounded polling intervals too, so injectable test clocks do
             # not turn a stalled command into an unbounded loop.
             started = time.monotonic()
             for attempt in range(int(timeout) + 1):
+                if accelerated:
+                    self.require_memory_headroom()
                 state = json.loads(self.run(['docker', 'inspect', '--format', '{{json .State}}', name]))
                 if not state.get('Running'):
                     if state.get('ExitCode') != 0:
@@ -376,6 +392,19 @@ class Drill:
             # writer; failed cleanup deliberately prevents the next command.
             self.run(['docker', 'rm', '-f', name])
             self.containers.remove(name)
+
+    @staticmethod
+    def require_memory_headroom():
+        values = {}
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            key, _, value = line.partition(':')
+            if key == 'MemAvailable':
+                fields = value.split()
+                if len(fields) != 2 or fields[1] != 'kB' or not fields[0].isdigit():
+                    raise RestoreError('host_memory_headroom_unavailable')
+                values[key] = int(fields[0]) * 1024
+        if values.get('MemAvailable', 0) < 32 * 1024**3:
+            raise RestoreError('host_memory_headroom_insufficient')
 
     def select_profile(self, schema):
         server, version = PROFILES[schema]
@@ -489,10 +518,12 @@ class Drill:
             shutil.rmtree(self.root)
 
 
-def verify(snapshot, *, timeout=86400, **kwargs):
+def verify(snapshot, *, timeout=86400, on_drill=None, **kwargs):
     """Return bounded metadata only after real capture recovery and cleanup pass."""
     drill = Drill(snapshot, **kwargs)
     try:
+        if on_drill is not None:
+            on_drill(drill)
         return drill.check(timeout=timeout)
     finally:
         drill.cleanup()
