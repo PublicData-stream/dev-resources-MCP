@@ -141,6 +141,63 @@ fn aggregate_json_budget_spans_nested_containers() {
     );
 }
 
+#[tokio::test]
+async fn foreground_metadata_numbers_keep_precision_and_literal_marker_objects_stay_objects() {
+    let _serial = SERIAL.lock().await;
+    let bytes = br#"{"name":"fixture","versions":{"1.0.0":{"name":"fixture","version":"1.0.0","observations":{"decimal":478.37408,"precise":0.123456789012345678901234567890,"huge":184467440737095516161234567890,"exponent":1e400,"negative_zero":-0.0,"nested":[1.25,{"value":2.5}],"literal":{"$serde_json::private::Number":"478.37408"}}}}}"#;
+    let fetcher = Arc::new(FixtureFetcher {
+        responses: HashMap::from([("npm:metadata:fixture".into(), bytes.to_vec())]),
+        calls: AtomicUsize::new(0),
+    });
+    let packages = NpmPackages::new(Arc::new(Retrieval::new(
+        Arc::new(MemoryStore::default()),
+        fetcher,
+    )));
+    let parsed = packages
+        .call("npm.metadata", json!({"name":"fixture","version":"1.0.0"}))
+        .await
+        .unwrap();
+    let observed = &parsed["metadata"]["observations"];
+    for (key, token) in [
+        ("decimal", "478.37408"),
+        ("precise", "0.123456789012345678901234567890"),
+        ("huge", "184467440737095516161234567890"),
+        ("exponent", "1e+400"),
+        ("negative_zero", "-0.0"),
+    ] {
+        assert!(observed[key].is_number(), "{key} is a JSON number");
+        assert_eq!(observed[key].to_string(), token);
+    }
+    assert_eq!(observed["nested"][0].to_string(), "1.25");
+    assert_eq!(observed["nested"][1]["value"].to_string(), "2.5");
+    assert!(observed["literal"].is_object());
+    assert_eq!(
+        observed["literal"]["$serde_json::private::Number"],
+        "478.37408"
+    );
+    assert_eq!(
+        serde_json::to_string(&observed["literal"]).unwrap(),
+        r#"{"$serde_json::private::Number":"478.37408"}"#
+    );
+    let duplicate = br#"{"name":"fixture","versions":{},"literal":{"$serde_json::private::Number":"1","$serde_json::private::Number":"2"}}"#;
+    let fetcher = Arc::new(FixtureFetcher {
+        responses: HashMap::from([("npm:metadata:fixture".into(), duplicate.to_vec())]),
+        calls: AtomicUsize::new(0),
+    });
+    let packages = NpmPackages::new(Arc::new(Retrieval::new(
+        Arc::new(MemoryStore::default()),
+        fetcher,
+    )));
+    assert_eq!(
+        packages
+            .call("npm.metadata", json!({"name":"fixture","version":"1.0.0"}))
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+}
+
 #[test]
 fn qualified_unpublish_tombstone_has_empty_observed_inventory() {
     let bytes=br#"{"name":"example","time":{"unpublished":{"time":"2026-10-27T12:00:00.000Z","versions":["1.0.0"]}}}"#;
@@ -288,6 +345,50 @@ fn source_contracts_preserve_order_patterns_null_and_external_imports() {
             .iter()
             .any(|gap| gap["code"] == "binary_document")
     );
+}
+
+#[test]
+fn legacy_collector_and_ordered_contract_numeric_projection_stays_frozen() {
+    let package = br#"{"name":"@fixture/package","version":"1.0.0","exports":{".":{"node":"./node.js","default":"./index.js","score":478.37408,"huge":184467440737095516161234567890,"literal":{"$serde_json::private::Number":"1.25"}}}}"#;
+    let bytes = archive(&[("package/package.json", package)], false);
+    let projected = inspect_package(&bytes, &record(&bytes)).unwrap();
+    let contracts = &projected["contracts"];
+    let legacy_number = json!({"$serde_json::private::Number":"478.37408"});
+    assert_eq!(
+        contracts["declarations"]["exports"]["."]["score"],
+        legacy_number
+    );
+    let legacy_metadata = parse_packument(br#"{"name":"fixture","versions":{"1.0.0":{"name":"fixture","version":"1.0.0","score":478.37408}}}"#, "fixture").unwrap();
+    assert_eq!(legacy_metadata["versions"]["1.0.0"]["score"], legacy_number);
+    let exports = contracts["ordered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == "exports")
+        .unwrap();
+    let entries = exports["value"]["object"][0]["value"]["object"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["key"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["node", "default", "score", "huge", "literal"]
+    );
+    assert_eq!(
+        entries[2]["value"],
+        json!({"object":[{"key":"$serde_json::private::Number","value":"478.37408"}]})
+    );
+    assert_eq!(
+        entries[3]["value"],
+        json!({"object":[{"key":"$serde_json::private::Number","value":"184467440737095516161234567890"}]})
+    );
+    assert_eq!(
+        entries[4]["value"]["object"][0]["key"],
+        "$serde_json::private::Number"
+    );
+    assert_eq!(entries[4]["value"]["object"][0]["value"], "1.25");
 }
 
 #[test]
@@ -527,6 +628,124 @@ async fn tools_pin_both_captures_and_page_utf8_without_further_fetches() {
 }
 
 #[tokio::test]
+async fn legacy_source_capture_and_resource_keep_distribution_numeric_key() {
+    let _serial = SERIAL.lock().await;
+    let bytes = fixture_archive();
+    let mut manifest = record(&bytes);
+    manifest["dist"]["score"] = json!(1.25);
+    let raw = serde_json::to_vec(&json!({"name":"@fixture/package","versions":{"1.0.0":manifest}}))
+        .unwrap();
+    let legacy = parse_packument(&raw, "@fixture/package").unwrap();
+    let legacy_manifest = &legacy["versions"]["1.0.0"];
+    assert!(legacy_manifest["dist"]["score"].is_object());
+    let legacy_key = archive_key("@fixture/package", "1.0.0", legacy_manifest).unwrap();
+    assert_ne!(
+        legacy_key,
+        archive_key("@fixture/package", "1.0.0", &manifest).unwrap()
+    );
+    let metadata_key = "npm:metadata:@fixture/package".to_owned();
+    let metadata_url = "https://registry.npmjs.org/@fixture%2Fpackage".to_owned();
+    let archive_url = manifest["dist"]["tarball"].as_str().unwrap().to_owned();
+    let store = Arc::new(MemoryStore::default());
+    let mut captures = Vec::new();
+    for (key, url, media_type, body) in [
+        (
+            metadata_key.clone(),
+            metadata_url,
+            "application/json",
+            raw.clone(),
+        ),
+        (
+            legacy_key.clone(),
+            archive_url,
+            "application/gzip",
+            bytes.clone(),
+        ),
+    ] {
+        captures.push(
+            store
+                .publish(
+                    &FetchRequest {
+                        key,
+                        url,
+                        ttl_secs: 3600,
+                        max_bytes: 128 * 1024 * 1024,
+                        media_type: media_type.into(),
+                    },
+                    FetchResponse {
+                        status: 200,
+                        body,
+                        validators: Validators::default(),
+                    },
+                    devres_domain::unix_now(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let fetcher = Arc::new(FixtureFetcher {
+        responses: HashMap::new(),
+        calls: AtomicUsize::new(0),
+    });
+    let retrieval = Arc::new(Retrieval::new(store.clone(), fetcher.clone()));
+    let packages = NpmPackages::new(retrieval.clone());
+    let pinned = packages.call("npm.source_read", json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":captures[0].capture.id,"archive_capture":captures[1].capture.id})).await.unwrap();
+    assert_eq!(pinned["archive_capture"]["id"], captures[1].capture.id);
+    let mut old_uri = url::Url::parse("devres://npm-source/").unwrap();
+    old_uri
+        .query_pairs_mut()
+        .append_pair("name", "@fixture/package")
+        .append_pair("version", "1.0.0")
+        .append_pair("path", "index.js")
+        .append_pair("metadata_capture", &captures[0].capture.id)
+        .append_pair("archive_capture", &captures[1].capture.id)
+        .append_pair("offset", "0")
+        .append_pair("limit", "32768");
+    assert_eq!(pinned["resource_uri"], old_uri.as_str());
+    let research = devres_adapters::Research::new(retrieval).await.unwrap();
+    assert_eq!(
+        research.read_resource(old_uri.as_str()).await.unwrap()["page"],
+        pinned["page"]
+    );
+    let metadata = packages
+        .call(
+            "npm.metadata",
+            json!({"name":"@fixture/package","version":"1.0.0","capture":captures[0].capture.id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata["metadata"]["dist"]["score"].to_string(), "1.25");
+    assert!(metadata["metadata"]["dist"]["score"].is_number());
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+
+    // A cold source request must select the same distribution key, not mint a
+    // new one from the canonical numeric representation used by metadata.
+    let cold_store = Arc::new(MemoryStore::default());
+    let cold_fetcher = Arc::new(FixtureFetcher {
+        responses: HashMap::from([(metadata_key, raw), (legacy_key.clone(), bytes)]),
+        calls: AtomicUsize::new(0),
+    });
+    let cold = NpmPackages::new(Arc::new(Retrieval::new(
+        cold_store.clone(),
+        cold_fetcher.clone(),
+    )));
+    let fresh = cold
+        .call(
+            "npm.source_read",
+            json!({"name":"@fixture/package","version":"1.0.0","path":"index.js"}),
+        )
+        .await
+        .unwrap();
+    let archive_id = fresh["archive_capture"]["id"].as_str().unwrap();
+    assert_eq!(
+        cold_store.capture(archive_id).await.unwrap().capture.key,
+        legacy_key
+    );
+    assert_eq!(fresh["resource_uri"], old_uri.as_str());
+    assert_eq!(cold_fetcher.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn unsupported_archive_processing_preserves_integrity_verified_capture() {
     let _serial = SERIAL.lock().await;
     let bytes = archive(&[("legacy/package.json", b"{}")], false);
@@ -588,6 +807,45 @@ async fn search_capture_paging_stays_inside_fixed_provider_page() {
 }
 
 #[tokio::test]
+async fn search_and_exact_metadata_numeric_results_survive_json_round_trip_and_pins() {
+    let _serial = SERIAL.lock().await;
+    let store = Arc::new(MemoryStore::default());
+    let fetcher = Arc::new(FixtureFetcher {
+        responses: HashMap::from([
+            ("npm:search:fixture:0".into(), br#"{"objects":[{"package":{"name":"fixture","version":"1.0.0"},"score":{"final":478.37408,"detail":{"quality":0.123456789012345678901234567890}},"searchScore":1e400}],"total":1}"#.to_vec()),
+            ("npm:metadata:fixture".into(), br#"{"name":"fixture","versions":{"1.0.0":{"name":"fixture","version":"1.0.0","observed_score":478.37408,"large_observation":184467440737095516161234567890}}}"#.to_vec()),
+        ]),
+        calls: AtomicUsize::new(0),
+    });
+    let packages = NpmPackages::new(Arc::new(Retrieval::new(store, fetcher.clone())));
+    for (tool, args, number_path, token) in [
+        (
+            "npm.search",
+            json!({"query":"fixture","limit":1}),
+            "/items/0/score/final",
+            "478.37408",
+        ),
+        (
+            "npm.metadata",
+            json!({"name":"fixture","version":"1.0.0"}),
+            "/metadata/large_observation",
+            "184467440737095516161234567890",
+        ),
+    ] {
+        let first = packages.call(tool, args.clone()).await.unwrap();
+        assert!(first.pointer(number_path).unwrap().is_number());
+        assert_eq!(first.pointer(number_path).unwrap().to_string(), token);
+        let encoded = serde_json::to_vec(&first).unwrap();
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(first, decoded);
+        let mut pinned = args;
+        pinned["capture"] = first["capture"]["id"].clone();
+        assert_eq!(packages.call(tool, pinned).await.unwrap(), first);
+    }
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn checksum_failure_never_publishes_archive_bytes() {
     let _serial = SERIAL.lock().await;
     let bytes = fixture_archive();
@@ -638,4 +896,170 @@ async fn exact_metadata_does_not_return_other_release_timestamps() {
         .await
         .unwrap();
     assert!(stored.body.len() > 256 * 1024);
+}
+
+fn historical_packument(manifest: Value) -> Vec<u8> {
+    let declarations: serde_json::Map<String, Value> = (0..40)
+        .map(|index| (format!("dependency-{index}"), json!("^1.0.0")))
+        .collect();
+    let mut versions = serde_json::Map::new();
+    for index in 0..5_000 {
+        let version = format!("0.0.{index}");
+        versions.insert(
+            version.clone(),
+            json!({"name":"@fixture/package","version":version,"dependencies":declarations}),
+        );
+    }
+    versions.insert("1.0.0".into(), manifest);
+    serde_json::to_vec(&json!({"name":"@fixture/package","versions":versions,"dist-tags":{"latest":"1.0.0"},"time":{"created":"2020-01-01","1.0.0":"2021-01-01","modified":"2026-01-01"}})).unwrap()
+}
+
+#[tokio::test]
+async fn large_release_history_selects_metadata_and_replays_pinned_sources() {
+    let _serial = SERIAL.lock().await;
+    let archive = fixture_archive();
+    let manifest = record(&archive);
+    let metadata = historical_packument(manifest.clone());
+    assert!(metadata.len() < MAX_METADATA);
+    // The collector retains its existing whole-document materialization bound.
+    assert_eq!(
+        parse_packument(&metadata, "@fixture/package")
+            .unwrap_err()
+            .code,
+        "capacity"
+    );
+    let store = Arc::new(MemoryStore::default());
+    let fetcher = Arc::new(FixtureFetcher {
+        responses: HashMap::from([
+            ("npm:metadata:@fixture/package".into(), metadata.clone()),
+            (
+                archive_key("@fixture/package", "1.0.0", &manifest).unwrap(),
+                archive,
+            ),
+        ]),
+        calls: AtomicUsize::new(0),
+    });
+    let packages = NpmPackages::new(Arc::new(Retrieval::new(store.clone(), fetcher.clone())));
+    let response = packages
+        .call(
+            "npm.metadata",
+            json!({"name":"@fixture/package","version":"v1.0.0"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response["metadata"], manifest);
+    assert_eq!(response["time"]["published"], "2021-01-01");
+    let capture = response["capture"]["id"].as_str().unwrap();
+    assert_eq!(
+        store.capture(capture).await.unwrap().body.as_ref(),
+        metadata.as_slice()
+    );
+    let replay = packages
+        .call(
+            "npm.metadata",
+            json!({"name":"@fixture/package","version":"1.0.0","capture":capture}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["metadata"], manifest);
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    let listing = packages
+        .call(
+            "npm.source_list",
+            json!({"name":"@fixture/package","version":"1.0.0"}),
+        )
+        .await
+        .unwrap();
+    let archive_capture = listing["archive_capture"]["id"].as_str().unwrap();
+    let read = packages.call("npm.source_read", json!({"name":"@fixture/package","version":"1.0.0","path":"README.md","metadata_capture":capture,"archive_capture":archive_capture})).await.unwrap();
+    assert!(read["page"]["text"].as_str().unwrap().contains("# Fixture"));
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unrelated_invalid_releases_are_rejected_before_capture_publication() {
+    let _serial = SERIAL.lock().await;
+    for unrelated in [
+        json!({"name":"other","version":"2.0.0"}),
+        json!({"name":"@fixture/package","version":"3.0.0"}),
+        json!({"name":"@fixture/package","version":"2.0.0","dependencies":{"bad":false}}),
+    ] {
+        let bytes = serde_json::to_vec(&json!({"name":"@fixture/package","versions":{"1.0.0":{"name":"@fixture/package","version":"1.0.0"},"2.0.0":unrelated}})).unwrap();
+        let store = Arc::new(MemoryStore::default());
+        let fetcher = Arc::new(FixtureFetcher {
+            responses: HashMap::from([("npm:metadata:@fixture/package".into(), bytes.clone())]),
+            calls: AtomicUsize::new(0),
+        });
+        let packages = NpmPackages::new(Arc::new(Retrieval::new(store.clone(), fetcher.clone())));
+        assert_eq!(
+            packages
+                .call(
+                    "npm.metadata",
+                    json!({"name":"@fixture/package","version":"1.0.0"})
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        assert!(store.0.lock().await.is_empty());
+        // A previously retained capture must pass the same complete validation.
+        let capture = store
+            .publish(
+                &FetchRequest {
+                    key: "npm:metadata:@fixture/package".into(),
+                    url: "https://registry.npmjs.org/@fixture%2Fpackage".into(),
+                    ttl_secs: 3600,
+                    max_bytes: MAX_METADATA,
+                    media_type: "application/json".into(),
+                },
+                FetchResponse {
+                    status: 200,
+                    body: bytes,
+                    validators: Validators::default(),
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(packages.call("npm.metadata", json!({"name":"@fixture/package","version":"1.0.0","capture":capture.capture.id})).await.unwrap_err().code,"integrity");
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn selected_metadata_output_limit_retains_full_capture_and_applies_to_replay() {
+    let _serial = SERIAL.lock().await;
+    let bytes = serde_json::to_vec(&json!({"name":"@fixture/package","versions":{"1.0.0":{"name":"@fixture/package","version":"1.0.0","description":"x".repeat(256 * 1024)}}})).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let fetcher = Arc::new(FixtureFetcher {
+        responses: HashMap::from([("npm:metadata:@fixture/package".into(), bytes.clone())]),
+        calls: AtomicUsize::new(0),
+    });
+    let packages = NpmPackages::new(Arc::new(Retrieval::new(store.clone(), fetcher.clone())));
+    assert_eq!(
+        packages
+            .call(
+                "npm.metadata",
+                json!({"name":"@fixture/package","version":"1.0.0"})
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "capacity"
+    );
+    let capture = store.0.lock().await.values().next().cloned().unwrap();
+    assert_eq!(capture.body.as_ref(), bytes.as_slice());
+    assert_eq!(
+        packages
+            .call(
+                "npm.metadata",
+                json!({"name":"@fixture/package","version":"1.0.0","capture":capture.capture.id})
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "capacity"
+    );
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
 }

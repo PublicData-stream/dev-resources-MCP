@@ -3,8 +3,11 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devres_domain::{Error, Result};
 use semver::Version;
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Value, json};
+use serde::{
+    Deserialize,
+    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::{Map, Value, json, value::RawValue};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::{
@@ -22,6 +25,9 @@ const MAX_MEMBERS: usize = 20_000;
 const MAX_PROJECTED: usize = 64 * 1024 * 1024;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const PROCESSOR_VERSION: u32 = 1;
+
+mod packument;
+pub(crate) use packument::{select_packument, select_source_packument};
 
 pub fn validate_name(name: &str) -> Result<()> {
     let components: Vec<_> = if let Some(scoped) = name.strip_prefix('@') {
@@ -84,6 +90,7 @@ struct JsonBudget {
     limited: std::cell::Cell<bool>,
     deadline: Instant,
     ordered: bool,
+    canonical_numbers: bool,
 }
 impl JsonBudget {
     fn charge<E: de::Error>(&self, bytes: usize) -> std::result::Result<(), E> {
@@ -118,7 +125,43 @@ impl<'de> de::DeserializeSeed<'de> for Seed<'_> {
     ) -> std::result::Result<Node, D::Error> {
         self.0.nodes.set(self.0.nodes.get().saturating_add(1));
         self.0.charge::<D::Error>(128)?;
-        deserializer.deserialize_any(self)
+        if !self.0.canonical_numbers {
+            // Durable collector/archive projections retain their established
+            // representation until a separately versioned processor change.
+            return deserializer.deserialize_any(self);
+        }
+        // With arbitrary_precision, deserialize_any presents JSON numbers as a
+        // synthetic map. Inspect the original token instead: a real object with
+        // the same private marker key must remain an object and keep strict
+        // duplicate-key checks. The borrowed token adds no retained input copy.
+        let raw = <&'de RawValue>::deserialize(deserializer)?;
+        self.0.charge::<D::Error>(0)?;
+        if raw
+            .get()
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| *byte == b'-' || byte.is_ascii_digit())
+        {
+            self.0
+                .charge::<D::Error>(raw.get().len().saturating_mul(if self.0.ordered {
+                    2
+                } else {
+                    1
+                }))?;
+            let number = raw
+                .get()
+                .parse::<serde_json::Number>()
+                .map_err(de::Error::custom)?;
+            self.0.charge::<D::Error>(0)?;
+            return Ok(self.0.node(Value::Number(number)));
+        }
+        let budget = self.0;
+        let mut decoder = serde_json::Deserializer::from_str(raw.get());
+        let value =
+            de::Deserializer::deserialize_any(&mut decoder, self).map_err(de::Error::custom)?;
+        decoder.end().map_err(de::Error::custom)?;
+        budget.charge::<D::Error>(0)?;
+        Ok(value)
     }
 }
 impl<'de> Visitor<'de> for Seed<'_> {
@@ -208,6 +251,40 @@ impl<'de> Visitor<'de> for Seed<'_> {
 }
 
 fn decode(bytes: &[u8], max: usize, ordered: bool) -> Result<Node> {
+    decode_with_numbers(bytes, max, ordered, false)
+}
+
+fn decode_with_numbers(
+    bytes: &[u8],
+    max: usize,
+    ordered: bool,
+    canonical_numbers: bool,
+) -> Result<Node> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    check_json_input(bytes, max, deadline)?;
+    let budget = JsonBudget {
+        nodes: std::cell::Cell::new(0),
+        expanded: std::cell::Cell::new(0),
+        limited: std::cell::Cell::new(false),
+        deadline,
+        ordered,
+        canonical_numbers,
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = Seed(&budget).deserialize(&mut deserializer).map_err(|_| {
+        if budget.limited.get() {
+            Error::capacity("npm JSON aggregate node, expansion or time budget exceeded.")
+        } else {
+            Error::integrity("Malformed, duplicate-key or excessively nested npm JSON.")
+        }
+    })?;
+    deserializer
+        .end()
+        .map_err(|_| Error::integrity("Trailing data after npm JSON."))?;
+    Ok(value)
+}
+
+fn check_json_input(bytes: &[u8], max: usize, deadline: Instant) -> Result<()> {
     if bytes.is_empty() || bytes.len() > max {
         return Err(Error::capacity("npm JSON processing bound exceeded."));
     }
@@ -215,7 +292,10 @@ fn decode(bytes: &[u8], max: usize, ordered: bool) -> Result<Node> {
     let mut depth = 0usize;
     let mut quoted = false;
     let mut escaped = false;
-    for byte in bytes {
+    for (index, byte) in bytes.iter().enumerate() {
+        if index % 4096 == 0 && Instant::now() > deadline {
+            return Err(Error::capacity("npm JSON processing deadline exceeded."));
+        }
         if quoted {
             if escaped {
                 escaped = false;
@@ -238,29 +318,11 @@ fn decode(bytes: &[u8], max: usize, ordered: bool) -> Result<Node> {
             }
         }
     }
-    let budget = JsonBudget {
-        nodes: std::cell::Cell::new(0),
-        expanded: std::cell::Cell::new(0),
-        limited: std::cell::Cell::new(false),
-        deadline: Instant::now() + Duration::from_secs(15),
-        ordered,
-    };
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = Seed(&budget).deserialize(&mut deserializer).map_err(|_| {
-        if budget.limited.get() {
-            Error::capacity("npm JSON aggregate node, expansion or time budget exceeded.")
-        } else {
-            Error::integrity("Malformed, duplicate-key or excessively nested npm JSON.")
-        }
-    })?;
-    deserializer
-        .end()
-        .map_err(|_| Error::integrity("Trailing data after npm JSON."))?;
-    Ok(value)
+    Ok(())
 }
 
 pub(crate) fn parse_json(bytes: &[u8], max: usize) -> Result<Value> {
-    Ok(decode(bytes, max, false)?.value)
+    Ok(decode_with_numbers(bytes, max, false, true)?.value)
 }
 
 pub fn parse_packument(bytes: &[u8], name: &str) -> Result<Value> {
@@ -289,27 +351,7 @@ pub fn parse_packument(bytes: &[u8], name: &str) -> Result<Value> {
         .as_object()
         .ok_or_else(|| Error::integrity("npm version inventory is absent."))?;
     for (version, record) in versions {
-        if version.is_empty()
-            || version.len() > 256
-            || record["name"].as_str() != Some(name)
-            || record["version"].as_str() != Some(version)
-        {
-            return Err(Error::integrity("npm version manifest identity mismatch."));
-        }
-        for field in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
-            if let Some(dependencies) = record.get(field)
-                && !dependencies
-                    .as_object()
-                    .is_some_and(|entries| entries.values().all(Value::is_string))
-            {
-                return Err(Error::integrity("Malformed npm dependency declarations."));
-            }
-        }
+        validate_release(name, version, record)?;
     }
     if document.get("dist-tags").is_some_and(|tags| {
         !tags
@@ -319,6 +361,31 @@ pub fn parse_packument(bytes: &[u8], name: &str) -> Result<Value> {
         return Err(Error::integrity("Malformed npm dist-tag declarations."));
     }
     Ok(document)
+}
+
+fn validate_release(name: &str, version: &str, record: &Value) -> Result<()> {
+    if version.is_empty()
+        || version.len() > 256
+        || record["name"].as_str() != Some(name)
+        || record["version"].as_str() != Some(version)
+    {
+        return Err(Error::integrity("npm version manifest identity mismatch."));
+    }
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(dependencies) = record.get(field)
+            && !dependencies
+                .as_object()
+                .is_some_and(|entries| entries.values().all(Value::is_string))
+        {
+            return Err(Error::integrity("Malformed npm dependency declarations."));
+        }
+    }
+    Ok(())
 }
 
 fn unpublished_time(value: &str) -> bool {

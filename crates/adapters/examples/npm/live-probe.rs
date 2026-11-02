@@ -1,18 +1,27 @@
 //! Fixed-record npm evidence. Replay never constructs a network client.
+use async_trait::async_trait;
 use devres_adapters::{
     bulk::{BulkArtifact, BulkArtifactStore, BulkBroker, BulkConfig, BulkRequest, BulkSource},
     integrity as content_integrity,
+    npm::NpmPackages,
     npm::audit as npm_audit,
     npm::processing as npm_processing,
     npm::source::Operation,
 };
-use devres_domain::{Error, Result, Validators};
+use devres_application::{Cached, Fetcher, Retrieval, Store};
+use devres_domain::{
+    Capture, Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::io::AsyncReadExt;
@@ -22,6 +31,9 @@ mod root;
 
 const MARKER: &[u8] = b"devres-npm-live-v1\n";
 const RECORDS: [(&str, &str); 2] = [("is-number", "7.0.0"), ("@types/is-number", "7.0.5")];
+const METADATA_RECORDS: [(&str, &str); 2] = [("react", "18.3.1"), ("left-pad", "1.3.0")];
+const SEARCH_QUERY: &str = "TLS";
+const SEARCH_MAX: u64 = 2 * 1024 * 1024;
 const ADVISORY: &str = "GHSA-p6mc-m468-83gw";
 const MAX_EXPORT: u64 = 512 * 1024 * 1024;
 const MAX_RECEIPT: u64 = 1024 * 1024;
@@ -116,6 +128,7 @@ async fn fetch(
     request: FixedRequest<'_>,
     observations: &mut Value,
     cancel: &CancellationToken,
+    progress_name: &str,
 ) -> Result<()> {
     let FixedRequest {
         key,
@@ -150,7 +163,7 @@ async fn fetch(
     observations[key] = json!({"source_url":expected,"artifact":artifact,"validated_at":observed_at,"whole_source":false,"provider_endorsement":false});
     persist(
         root,
-        "live-progress.json",
+        progress_name,
         &json!({"version":1,"observations":observations,"whole_source":false,"provider_endorsement":false}),
     )
 }
@@ -337,14 +350,14 @@ async fn run(root: &Path, resume: bool) -> Result<Value> {
     });
     let result=async {
         for (name,version) in RECORDS {
-            fetch(root,&raw,&registry,FixedRequest{key:&format!("metadata:{name}"),operation:Operation::Metadata{name:name.into()},max:npm_processing::MAX_METADATA as u64},&mut observations,&cancel).await?;
+            fetch(root,&raw,&registry,FixedRequest{key:&format!("metadata:{name}"),operation:Operation::Metadata{name:name.into()},max:npm_processing::MAX_METADATA as u64},&mut observations,&cancel,"live-progress.json").await?;
             let metadata=receipt(&observations,&format!("metadata:{name}"))?;
             let bytes=body(&raw,metadata,npm_processing::MAX_METADATA as u64,&cancel).await?;
             let packument=npm_processing::parse_packument(&bytes,name)?;
             let url=packument["versions"][version]["dist"]["tarball"].as_str().ok_or_else(integrity)?.to_owned();
-            fetch(root,&raw,&registry,FixedRequest{key:&format!("archive:{name}@{version}"),operation:Operation::Archive{name:name.into(),version:version.into(),url},max:npm_processing::MAX_ARCHIVE as u64},&mut observations,&cancel).await?;
+            fetch(root,&raw,&registry,FixedRequest{key:&format!("archive:{name}@{version}"),operation:Operation::Archive{name:name.into(),version:version.into(),url},max:npm_processing::MAX_ARCHIVE as u64},&mut observations,&cancel,"live-progress.json").await?;
         }
-        fetch(root,&raw,&osv,FixedRequest{key:"osv:npm",operation:Operation::AdvisoryExport,max:MAX_EXPORT},&mut observations,&cancel).await?;
+        fetch(root,&raw,&osv,FixedRequest{key:"osv:npm",operation:Operation::AdvisoryExport,max:MAX_EXPORT},&mut observations,&cancel,"live-progress.json").await?;
         let evidence=inspect_observations(&raw,&observations,&cancel).await?;
         let receipt=json!({"version":1,"complete":true,"evidence":"bounded_provider_and_parser","whole_source":false,"provider_endorsement":false,"full_history":false,"transport_acceptance":false,"attempt_limit_per_provider":20,"registry_attempts":registry.attempt_count(),"osv_attempts":osv.attempt_count(),"observations":observations,"evidence_records":evidence});
         persist(root,"live-receipt.json",&receipt)?;Ok(receipt)
@@ -371,11 +384,212 @@ async fn replay(root: &Path) -> Result<Value> {
         json!({"version":1,"complete":true,"evidence":"offline_replay","network_attempts":0,"whole_source":false,"provider_endorsement":false,"original_receipt_sha256":digest(&std::fs::read(safe_file(root,"live-receipt.json")?).map_err(|_|unavailable())?),"original_observations":receipt["observations"],"evidence_records":evidence}),
     )
 }
+
+struct RetainedMetadata(HashMap<String, StoredCapture>);
+#[async_trait]
+impl Store for RetainedMetadata {
+    async fn latest(&self, _: &str) -> Result<Option<Cached>> {
+        Err(integrity())
+    }
+    async fn capture(&self, id: &str) -> Result<StoredCapture> {
+        self.0.get(id).cloned().ok_or_else(integrity)
+    }
+    async fn publish(&self, _: &FetchRequest, _: FetchResponse, _: i64) -> Result<StoredCapture> {
+        Err(integrity())
+    }
+    async fn revalidate(&self, _: &str, _: &str, _: Validators, _: i64) -> Result<StoredCapture> {
+        Err(integrity())
+    }
+}
+struct NoNetwork(AtomicUsize);
+#[async_trait]
+impl Fetcher for NoNetwork {
+    async fn fetch(&self, _: &FetchRequest, _: Option<&Validators>) -> Result<FetchResponse> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(Error::integrity(
+            "Retained npm inspection cannot fetch providers.",
+        ))
+    }
+}
+
+fn metadata_requests() -> Vec<(String, Operation, u64)> {
+    let mut requests = METADATA_RECORDS
+        .into_iter()
+        .map(|(name, _)| {
+            (
+                format!("metadata:{name}"),
+                Operation::Metadata { name: name.into() },
+                npm_processing::MAX_METADATA as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    requests.push((
+        "search:TLS".into(),
+        Operation::Search {
+            query: SEARCH_QUERY.into(),
+            offset: 0,
+            limit: 100,
+        },
+        SEARCH_MAX,
+    ));
+    requests
+}
+
+async fn inspect_metadata_observations(
+    raw: &BulkArtifactStore,
+    observations: &Value,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let requests = metadata_requests();
+    if observations
+        .as_object()
+        .is_none_or(|items| items.len() != requests.len())
+    {
+        return Err(integrity());
+    }
+    let mut captures = HashMap::new();
+    let mut pins = HashMap::new();
+    for (key, operation, max) in requests {
+        let saved = receipt(observations, &key)?;
+        let source_url = operation.url()?;
+        if saved["source_url"] != source_url {
+            return Err(integrity());
+        }
+        let bytes = body(raw, saved, max, cancel).await?;
+        let artifact: BulkArtifact =
+            serde_json::from_value(saved["artifact"].clone()).map_err(|_| integrity())?;
+        let validated_at = saved["validated_at"].as_i64().ok_or_else(integrity)?;
+        let request_key = match operation {
+            Operation::Metadata { name } => format!("npm:metadata:{name}"),
+            Operation::Search { .. } => format!("npm:search:{SEARCH_QUERY}:0"),
+            _ => return Err(integrity()),
+        };
+        pins.insert(key, artifact.body_hash.clone());
+        captures.insert(
+            artifact.body_hash.clone(),
+            StoredCapture {
+                capture: Capture {
+                    id: artifact.body_hash.clone(),
+                    key: request_key,
+                    source_url,
+                    body_hash: artifact.body_hash,
+                    media_type: "application/json".into(),
+                    retrieved_at: validated_at,
+                    validated_at,
+                },
+                body: bytes.into(),
+            },
+        );
+    }
+    let offline = Arc::new(NoNetwork(AtomicUsize::new(0)));
+    let packages = NpmPackages::new(Arc::new(Retrieval::new(
+        Arc::new(RetainedMetadata(captures)),
+        offline.clone(),
+    )));
+    let mut records = Vec::new();
+    for (name, version) in METADATA_RECORDS {
+        let key = format!("metadata:{name}");
+        let pin = pins.get(&key).ok_or_else(integrity)?;
+        let selected = packages
+            .call(
+                "npm.metadata",
+                json!({"name":name,"version":version,"capture":pin}),
+            )
+            .await?;
+        // Keep source times from observations. Derived stale flags change with
+        // wall time and are deliberately outside deterministic replay evidence.
+        records.push(json!({"name":name,"version":version,"metadata":selected["metadata"],"dist_tags":selected["dist_tags"],"time":selected["time"],"capture":observations[key]}));
+    }
+    let search = packages.call("npm.search",json!({"query":SEARCH_QUERY,"limit":3,"capture":pins.get("search:TLS").ok_or_else(integrity)?})).await?;
+    if offline.0.load(Ordering::SeqCst) != 0 {
+        return Err(integrity());
+    }
+    Ok(
+        json!({"packages":records,"search":{"query":SEARCH_QUERY,"items":search["items"],"total":search["total"],"capture":observations["search:TLS"]},"foreground_tools":["npm.metadata","npm.search"],"inspection_network_attempts":0}),
+    )
+}
+
+async fn run_metadata(root: &Path) -> Result<Value> {
+    if safe_file(root, "metadata-receipt.json")?.exists() {
+        return Err(Error::invalid(
+            "npm metadata receipt exists; use --replay-metadata.",
+        ));
+    }
+    let progress = safe_file(root, "metadata-progress.json")?;
+    let mut observations = if progress.exists() {
+        let saved = read_json(root, "metadata-progress.json")?;
+        if saved["version"] != 1
+            || saved["whole_source"] != false
+            || saved["provider_endorsement"] != false
+        {
+            return Err(integrity());
+        }
+        saved["observations"].clone()
+    } else {
+        json!({})
+    };
+    if !observations.is_object() {
+        return Err(integrity());
+    }
+    let registry = counted_broker(root, "registry")?;
+    let raw = raw_store(root, true)?;
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            stop.cancel();
+        }
+    });
+    let result = async {
+        for (key,operation,max) in metadata_requests() {
+            fetch(root,&raw,&registry,FixedRequest{key:&key,operation,max},&mut observations,&cancel,"metadata-progress.json").await?;
+        }
+        let evidence = inspect_metadata_observations(&raw,&observations,&cancel).await?;
+        let receipt = json!({"version":1,"mode":"fixed_metadata_and_search","complete":true,"evidence":"bounded_provider_and_foreground_parser","whole_source":false,"provider_endorsement":false,"full_history":false,"transport_acceptance":false,"attempt_limit_per_provider":20,"registry_attempts":registry.attempt_count(),"osv_attempts":0,"observations":observations,"evidence_records":evidence});
+        persist(root,"metadata-receipt.json",&receipt)?;
+        Ok(receipt)
+    }.await;
+    signal.abort();
+    result
+}
+
+async fn replay_metadata(root: &Path) -> Result<Value> {
+    // This branch constructs neither BulkBroker nor an HTTP client.
+    let saved = read_json(root, "metadata-receipt.json")?;
+    if saved["version"] != 1
+        || saved["mode"] != "fixed_metadata_and_search"
+        || saved["complete"] != true
+        || saved["whole_source"] != false
+        || saved["provider_endorsement"] != false
+        || saved["registry_attempts"].as_u64().is_none_or(|n| n > 20)
+        || saved["osv_attempts"] != 0
+    {
+        return Err(integrity());
+    }
+    let raw = raw_store(root, false)?;
+    let evidence =
+        inspect_metadata_observations(&raw, &saved["observations"], &CancellationToken::new())
+            .await?;
+    if evidence != saved["evidence_records"] {
+        return Err(integrity());
+    }
+    Ok(
+        json!({"version":1,"complete":true,"mode":"fixed_metadata_and_search","evidence":"offline_replay","network_attempts":0,"whole_source":false,"provider_endorsement":false,"original_receipt_sha256":digest(&std::fs::read(safe_file(root,"metadata-receipt.json")?).map_err(|_|unavailable())?),"original_observations":saved["observations"],"evidence_records":evidence}),
+    )
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 3 || !matches!(args[1].as_str(), "--live" | "--resume" | "--replay") {
-        eprintln!("usage: npm-live-probe --live|--resume|--replay OWNED_ROOT");
+    if args.len() != 3
+        || !matches!(
+            args[1].as_str(),
+            "--live" | "--resume" | "--replay" | "--live-metadata" | "--replay-metadata"
+        )
+    {
+        eprintln!(
+            "usage: npm-live-probe --live|--resume|--replay|--live-metadata|--replay-metadata OWNED_ROOT"
+        );
         std::process::exit(2);
     }
     let result = async {
@@ -389,10 +603,11 @@ async fn main() {
             .map_err(|_| unavailable())?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|_| Error::capacity("npm acceptance already owns this root."))?;
-        if args[1] == "--replay" {
-            replay(&root).await
-        } else {
-            run(&root, args[1] == "--resume").await
+        match args[1].as_str() {
+            "--replay" => replay(&root).await,
+            "--live-metadata" => run_metadata(&root).await,
+            "--replay-metadata" => replay_metadata(&root).await,
+            _ => run(&root, args[1] == "--resume").await,
         }
     }
     .await;
@@ -413,7 +628,7 @@ mod tests {
     use sha2::Sha512;
     use std::os::unix::fs::{PermissionsExt, symlink};
     fn owned() -> tempfile::TempDir {
-        let temporary = tempfile::tempdir_in("/tmp").expect("temporary root");
+        let temporary = tempfile::tempdir_in(std::env::temp_dir()).expect("temporary root");
         std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
             .expect("root permissions");
         std::fs::write(temporary.path().join("owner-v1"), MARKER).expect("marker");
@@ -516,6 +731,107 @@ mod tests {
             json!("https://example.invalid/is-number");
         persist(root.path(), "live-receipt.json", &receipt).expect("tamper receipt");
         assert!(replay(root.path()).await.is_err());
+    }
+
+    async fn metadata_evidence() -> (tempfile::TempDir, Value) {
+        let temporary = owned();
+        let raw = raw_store(temporary.path(), true).expect("raw");
+        let cancel = CancellationToken::new();
+        let mut observations = json!({});
+        for (key, operation, _) in metadata_requests() {
+            let value = match &operation {
+                Operation::Metadata { name } => {
+                    let version = METADATA_RECORDS
+                        .iter()
+                        .find(|(fixed, _)| *fixed == name.as_str())
+                        .expect("fixed package")
+                        .1;
+                    json!({"name":name,"versions":{version:{"name":name,"version":version,"dependencies":{"fixture":"^1.0.0"}}},"dist-tags":{"latest":version},"time":{"created":"2020-01-01",version:"2021-01-01","modified":"2026-01-01"}})
+                }
+                Operation::Search { .. } => {
+                    json!({"objects":[{"package":{"name":"tls-fixture","version":"1.0.0","description":"Synthetic TLS search fixture"},"score":{"final":478.37408,"detail":{"quality":0.875}},"searchScore":478.37408}],"total":1})
+                }
+                _ => panic!("metadata mode attempted archive or OSV acquisition"),
+            };
+            let artifact = raw
+                .capture_bytes(
+                    serde_json::to_vec(&value).expect("fixture JSON"),
+                    cancel.clone(),
+                )
+                .await
+                .expect("capture");
+            observations[key] = json!({"source_url":operation.url().expect("fixed source"),"artifact":artifact,"validated_at":1,"whole_source":false,"provider_endorsement":false});
+        }
+        let evidence = inspect_metadata_observations(&raw, &observations, &cancel)
+            .await
+            .expect("foreground inspection");
+        persist(temporary.path(),"metadata-receipt.json",&json!({"version":1,"mode":"fixed_metadata_and_search","complete":true,"whole_source":false,"provider_endorsement":false,"registry_attempts":0,"osv_attempts":0,"observations":observations,"evidence_records":evidence})).expect("metadata receipt");
+        (temporary, observations)
+    }
+
+    #[tokio::test]
+    async fn metadata_replay_exercises_foreground_tools_without_network_or_counter_changes() {
+        let (root, observations) = metadata_evidence().await;
+        persist(root.path(), "registry-attempt-count", &json!(19))
+            .expect("existing attempt ledger");
+        let original = std::fs::read(root.path().join("metadata-receipt.json")).expect("receipt");
+        let result = replay_metadata(root.path())
+            .await
+            .expect("offline metadata replay");
+        assert_eq!(result["network_attempts"], 0);
+        assert_eq!(result["original_observations"], observations);
+        assert_eq!(result["evidence_records"]["packages"][0]["name"], "react");
+        assert_eq!(
+            result["evidence_records"]["packages"][0]["version"],
+            "18.3.1"
+        );
+        assert_eq!(
+            result["evidence_records"]["packages"][1]["name"],
+            "left-pad"
+        );
+        assert_eq!(result["evidence_records"]["search"]["query"], "TLS");
+        assert!(result["evidence_records"]["search"]["items"][0]["score"]["final"].is_number());
+        assert_eq!(
+            result["evidence_records"]["search"]["items"][0]["score"]["final"].to_string(),
+            "478.37408"
+        );
+        assert_eq!(result["evidence_records"]["inspection_network_attempts"], 0);
+        assert_eq!(
+            std::fs::read(root.path().join("metadata-receipt.json")).expect("receipt"),
+            original
+        );
+        assert_eq!(
+            read_json(root.path(), "registry-attempt-count").expect("ledger"),
+            19
+        );
+        assert!(!root.path().join("osv-attempt-count").exists());
+        assert!(!root.path().join("live-receipt.json").exists());
+    }
+
+    #[tokio::test]
+    async fn metadata_replay_rejects_raw_source_and_attempt_provenance_tampering() {
+        let (root, observations) = metadata_evidence().await;
+        let path = observations["metadata:react"]["artifact"]["relative_path"]
+            .as_str()
+            .expect("capture path");
+        std::fs::write(root.path().join("raw").join(path), b"tampered").expect("tamper raw");
+        assert!(replay_metadata(root.path()).await.is_err());
+        let (root, _) = metadata_evidence().await;
+        let mut saved = read_json(root.path(), "metadata-receipt.json").expect("receipt");
+        saved["observations"]["metadata:react"]["source_url"] =
+            json!("https://example.invalid/react");
+        persist(root.path(), "metadata-receipt.json", &saved).expect("tamper source");
+        assert!(replay_metadata(root.path()).await.is_err());
+        saved["observations"]["metadata:react"]["source_url"] = json!(
+            Operation::Metadata {
+                name: "react".into()
+            }
+            .url()
+            .expect("fixed URL")
+        );
+        saved["registry_attempts"] = json!(21);
+        persist(root.path(), "metadata-receipt.json", &saved).expect("tamper counter");
+        assert!(replay_metadata(root.path()).await.is_err());
     }
     #[test]
     fn provider_budgets_survive_restarts_and_reject_symlinked_state() {

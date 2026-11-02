@@ -30,8 +30,22 @@ async fn process<T: Send + 'static>(
     .map_err(|_| Error::unavailable("npm processing worker failed."))?
 }
 
+#[derive(Clone, Copy)]
+enum MetadataNumbers {
+    Canonical,
+    ArchiveIdentity,
+}
+impl MetadataNumbers {
+    fn select(self, bytes: &[u8], name: &str, version: &str) -> Result<Value> {
+        match self {
+            Self::Canonical => npm_processing::select_packument(bytes, name, version),
+            Self::ArchiveIdentity => npm_processing::select_source_packument(bytes, name, version),
+        }
+    }
+}
+
 enum Validation {
-    Metadata(String),
+    Metadata(String, String, MetadataNumbers),
     Search,
     Archive(Value),
 }
@@ -43,14 +57,16 @@ struct Validator {
 impl ResponseValidator for Validator {
     async fn validate(&self, _: &FetchRequest, response: FetchResponse) -> Result<FetchResponse> {
         let validation = match &self.validation {
-            Validation::Metadata(name) => Validation::Metadata(name.clone()),
+            Validation::Metadata(name, version, numbers) => {
+                Validation::Metadata(name.clone(), version.clone(), *numbers)
+            }
             Validation::Search => Validation::Search,
             Validation::Archive(record) => Validation::Archive(record.clone()),
         };
         process(self.lease.clone(), move || {
             match validation {
-                Validation::Metadata(name) => {
-                    npm_processing::parse_packument(&response.body, &name)?;
+                Validation::Metadata(name, version, numbers) => {
+                    numbers.select(&response.body, &name, &version)?;
                 }
                 Validation::Search => {
                     search_document(&response.body)?;
@@ -211,7 +227,9 @@ impl NpmPackages {
     async fn packument(
         &self,
         name: &str,
+        version: &str,
         pin: Option<&str>,
+        numbers: MetadataNumbers,
         lease: Lease,
     ) -> Result<(StoredCapture, Value)> {
         npm_processing::validate_name(name)?;
@@ -234,7 +252,7 @@ impl NpmPackages {
                             media_type: "application/json".into(),
                         },
                         &Validator {
-                            validation: Validation::Metadata(name.into()),
+                            validation: Validation::Metadata(name.into(), version.into(), numbers),
                             lease: lease.clone(),
                         },
                     )
@@ -243,8 +261,8 @@ impl NpmPackages {
         };
         let body = stored.body.clone();
         let name = name.to_owned();
-        let document =
-            process(lease, move || npm_processing::parse_packument(&body, &name)).await?;
+        let version = version.to_owned();
+        let document = process(lease, move || numbers.select(&body, &name, &version)).await?;
         Ok((stored, document))
     }
     async fn search(&self, input: SearchInput) -> Result<Value> {
@@ -313,7 +331,13 @@ impl NpmPackages {
         npm_processing::parse_version(&input.version)?;
         let lease = Arc::new(archive::admit()?);
         let (stored, document) = self
-            .packument(&input.name, input.capture.as_deref(), lease)
+            .packument(
+                &input.name,
+                &input.version,
+                input.capture.as_deref(),
+                MetadataNumbers::Canonical,
+                lease,
+            )
             .await?;
         let record = selected(&document, &input.version)?;
         let original_version = record["version"].as_str().unwrap_or(&input.version);
@@ -343,7 +367,15 @@ impl NpmPackages {
             ));
         }
         npm_processing::parse_version(version)?;
-        let (metadata, document) = self.packument(name, metadata_pin, lease.clone()).await?;
+        let (metadata, document) = self
+            .packument(
+                name,
+                version,
+                metadata_pin,
+                MetadataNumbers::ArchiveIdentity,
+                lease.clone(),
+            )
+            .await?;
         let record = selected(&document, version)?;
         let original_version = record["version"]
             .as_str()
