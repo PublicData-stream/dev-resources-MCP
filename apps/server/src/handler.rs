@@ -231,7 +231,7 @@ impl ServerHandler for McpHandler {
         let value = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ErrorData::internal_error("request cancelled", None)),
-            result = tokio::time::timeout_at(deadline, (tool.invoke)(arguments, cancel.clone())) => {
+            result = tokio::time::timeout_at(deadline, (tool.invoke)(arguments, crate::registry::ToolCallContext { cancel: cancel.clone(), deadline })) => {
                 match result {
                     Ok(Ok(value)) => value,
                     Ok(Err(error)) => {

@@ -4,6 +4,9 @@ use crate::{
     crates_io::packages as cargo, rfc::corpus::RfcCorpus, rfc::source as rfc,
     rfc::tools as rfc_tools, rustsec::advisory,
 };
+#[path = "research_search.rs"]
+mod search_scheduling;
+
 use devres_application::Retrieval;
 use devres_domain::{Capture, Error, Result, StoredCapture};
 use serde::{Deserialize, Serialize};
@@ -181,6 +184,26 @@ impl Research {
         self
     }
 
+    /// Invoke with the request's existing absolute deadline; no new wire parameters.
+    pub async fn call_with_context(
+        &self,
+        tool: &str,
+        input: Value,
+        cancel: tokio_util::sync::CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value> {
+        if tool == "search" {
+            return self
+                .search_with_context(decode(input)?, cancel, deadline)
+                .await;
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::new("cancelled", "Request cancelled.")),
+            result = self.call(tool, input) => result,
+        }
+    }
+
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
         if crate::npm::schemas()
             .iter()
@@ -312,107 +335,119 @@ impl Research {
     }
 
     async fn search(&self, input: SearchInput) -> Result<Value> {
+        self.search_with_context(
+            input,
+            tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    async fn search_with_context(
+        &self,
+        input: SearchInput,
+        cancel: tokio_util::sync::CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value> {
         let page = Page {
             offset: input.offset,
             limit: input.limit,
         }
         .checked()?;
-        if input.sources.is_empty() || input.sources.len() > 8 {
-            return Err(Error::invalid("Select one to eight sources."));
-        }
-        let mut results = Vec::new();
-        let mut unique = std::collections::HashSet::new();
-        for source in input.sources {
-            if !unique.insert(source.clone()) {
-                return Err(Error::invalid("Duplicate search source."));
+        search_scheduling::collect(input.sources, cancel, deadline, |source| {
+            self.search_source(source, input.query.clone(), page)
+        })
+        .await
+    }
+
+    async fn search_source(&self, source: String, query: String, page: Page) -> Result<Value> {
+        match source.as_str() {
+            "npm" => {
+                self.npm
+                    .call(
+                        "npm.search",
+                        json!({"query":query,"offset":page.offset,"limit":page.limit}),
+                    )
+                    .await
             }
-            let output = match source.as_str() {
-                "npm" => {
-                    self.npm
+            "rfc" => {
+                rfc::search(
+                    &self.retrieval,
+                    rfc::SearchInput {
+                        query: query.clone(),
+                        status: None,
+                        offset: page.offset,
+                        limit: page.limit,
+                        capture: None,
+                    },
+                )
+                .await
+            }
+            "cargo" => {
+                cargo::search(
+                    &self.retrieval,
+                    cargo::SearchInput {
+                        query: query.clone(),
+                        offset: page.offset,
+                        limit: page.limit,
+                        capture: None,
+                    },
+                )
+                .await
+            }
+            "rustsec" => self.advisory.search(&query, page).await,
+            "chromium" => match self.chromium_research.as_ref() {
+                Some(research) => {
+                    research
                         .call(
-                            "npm.search",
-                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                            "chromium.search",
+                            json!({"query":query,"offset":page.offset,"limit":page.limit}),
                         )
                         .await
                 }
-                "rfc" => {
-                    rfc::search(
-                        &self.retrieval,
-                        rfc::SearchInput {
-                            query: input.query.clone(),
-                            status: None,
-                            offset: page.offset,
-                            limit: page.limit,
-                            capture: None,
-                        },
-                    )
-                    .await
-                }
-                "cargo" => {
-                    cargo::search(
-                        &self.retrieval,
-                        cargo::SearchInput {
-                            query: input.query.clone(),
-                            offset: page.offset,
-                            limit: page.limit,
-                            capture: None,
-                        },
-                    )
-                    .await
-                }
-                "rustsec" => self.advisory.search(&input.query, page).await,
-                "chromium" => match self.chromium_research.as_ref() {
-                    Some(research) => research
-                        .call(
-                            "chromium.search",
-                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
-                        )
-                        .await,
-                    None => Err(Error::unavailable(
-                        "Chromium corpus storage is not configured.",
-                    )),
-                },
-                "w3c" => match self.w3c_research.as_ref() {
-                    Some(research) => research
+                None => Err(Error::unavailable(
+                    "Chromium corpus storage is not configured.",
+                )),
+            },
+            "w3c" => match self.w3c_research.as_ref() {
+                Some(research) => {
+                    research
                         .call(
                             "w3c.search",
-                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                            json!({"query":query,"offset":page.offset,"limit":page.limit}),
                         )
-                        .await,
-                    None => Err(Error::unavailable("W3C corpus storage is not configured.")),
-                },
-                "whatwg" => match self.whatwg_research.as_ref() {
-                    Some(research) => research
+                        .await
+                }
+                None => Err(Error::unavailable("W3C corpus storage is not configured.")),
+            },
+            "whatwg" => match self.whatwg_research.as_ref() {
+                Some(research) => {
+                    research
                         .call(
                             "whatwg.search",
-                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                            json!({"query":query,"offset":page.offset,"limit":page.limit}),
                         )
-                        .await,
-                    None => Err(Error::unavailable(
-                        "WHATWG corpus storage is not configured.",
-                    )),
-                },
-                "mdn" => match self.mdn_research.as_ref() {
-                    Some(research) => research
+                        .await
+                }
+                None => Err(Error::unavailable(
+                    "WHATWG corpus storage is not configured.",
+                )),
+            },
+            "mdn" => match self.mdn_research.as_ref() {
+                Some(research) => {
+                    research
                         .call(
                             "mdn.search",
-                            json!({"query":input.query,"offset":page.offset,"limit":page.limit}),
+                            json!({"query":query,"offset":page.offset,"limit":page.limit}),
                         )
-                        .await,
-                    None => Err(Error::unavailable("MDN corpus storage is not configured.")),
-                },
-                _ => {
-                    return Err(Error::invalid(
-                        "Search sources are rfc, cargo, rustsec, mdn, whatwg, w3c, chromium, and npm.",
-                    ));
+                        .await
                 }
-            };
-            match output {
-                Ok(value) => results.push(json!({"source":source,"result":value})),
-                Err(error) => results.push(json!({"source":source,"error":error.to_string()})),
-            }
+                None => Err(Error::unavailable("MDN corpus storage is not configured.")),
+            },
+            _ => Err(Error::invalid(
+                "Search sources are rfc, cargo, rustsec, mdn, whatwg, w3c, chromium, and npm.",
+            )),
         }
-        Ok(json!({"sources":results}))
     }
 
     async fn fetch(&self, input: FetchInput) -> Result<Value> {

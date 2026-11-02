@@ -99,6 +99,10 @@ name = "research_resources"
 path = "tests/shared/research_resources.rs"
 
 [[test]]
+name = "search_isolation"
+path = "tests/search_isolation.rs"
+
+[[test]]
 name = "rfc_corpus"
 path = "tests/rfc/corpus.rs"
 

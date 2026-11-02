@@ -9,7 +9,14 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_REGISTERED_TOOLS: usize = 128;
 
-type Invoke = dyn Fn(Value, CancellationToken) -> BoxFuture<'static, Result<Value>> + Send + Sync;
+/// Request-owned cancellation and the absolute tool deadline. Never exposed on the wire.
+#[derive(Clone)]
+pub struct ToolCallContext {
+    pub cancel: CancellationToken,
+    pub deadline: tokio::time::Instant,
+}
+
+type Invoke = dyn Fn(Value, ToolCallContext) -> BoxFuture<'static, Result<Value>> + Send + Sync;
 type ResourceRead =
     dyn Fn(String, CancellationToken) -> BoxFuture<'static, Result<Value>> + Send + Sync;
 pub(crate) struct RegisteredTool {
@@ -34,6 +41,21 @@ impl ToolRegistry {
     ) -> std::result::Result<(), ServerError>
     where
         F: Fn(Value, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        self.register_with_context(descriptor, move |value, context| {
+            handler(value, context.cancel)
+        })
+    }
+
+    /// Deadline-aware registration; cancellation-only handlers retain `register`.
+    pub fn register_with_context<F, Fut>(
+        &mut self,
+        descriptor: Value,
+        handler: F,
+    ) -> std::result::Result<(), ServerError>
+    where
+        F: Fn(Value, ToolCallContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
         ensure_serialized_limit(&descriptor, 64 * 1024)?;
@@ -88,10 +110,14 @@ impl ToolRegistry {
                 .ok_or("missing tool name")?
                 .to_owned();
             let research = research.clone();
-            self.register(descriptor, move |value, _cancel| {
+            self.register_with_context(descriptor, move |value, context| {
                 let research = research.clone();
                 let name = name.clone();
-                async move { research.call(&name, value).await }
+                async move {
+                    research
+                        .call_with_context(&name, value, context.cancel, context.deadline)
+                        .await
+                }
             })?;
         }
         self.with_resource_reader(move |uri, _cancel| {
