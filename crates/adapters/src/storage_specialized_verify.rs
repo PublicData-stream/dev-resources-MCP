@@ -92,7 +92,11 @@ async fn snapshot_capture_fields(store: &PgBlobStore, value: &Value) -> Result<(
     Ok(())
 }
 impl PgBlobStore {
-    pub(crate) async fn verify_specialized_graphs(&self, cancel: &CancellationToken) -> Result<()> {
+    pub(crate) async fn verify_specialized_graphs(
+        &self,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<()> {
         self.fence().await?;
         let mut after = (String::new(), String::new());
         loop {
@@ -170,29 +174,29 @@ impl PgBlobStore {
                 let child = cancel.child_token();
                 let _cancel_guard = CancelOnDrop(child.clone());
                 let expected = selected.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut reader =
-                        crate::rfc::index::FrozenDocuments::open(&root, &path, &child)?;
-                    let mut actual = BTreeSet::new();
-                    loop {
-                        stop(&child)?;
-                        let rows = reader.next_page(1)?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        for row in rows {
-                            if !actual.insert(row.number) {
-                                return Err(invalid());
+                execution
+                    .run(cancel, move |_| {
+                        let mut reader =
+                            crate::rfc::index::FrozenDocuments::open(&root, &path, &child)?;
+                        let mut actual = BTreeSet::new();
+                        loop {
+                            stop(&child)?;
+                            let rows = reader.next_page(1)?;
+                            if rows.is_empty() {
+                                break;
+                            }
+                            for row in rows {
+                                if !actual.insert(row.number) {
+                                    return Err(invalid());
+                                }
                             }
                         }
-                    }
-                    if actual != expected {
-                        return Err(invalid());
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(|_| invalid())??;
+                        if actual != expected {
+                            return Err(invalid());
+                        }
+                        Ok(())
+                    })
+                    .await?;
             }
             after = key;
         }
@@ -319,23 +323,23 @@ impl PgBlobStore {
                 let child = cancel.child_token();
                 let _cancel_guard = CancelOnDrop(child.clone());
                 let worker_cancel = child.clone();
-                let mut reader = tokio::task::spawn_blocking(move || {
-                    crate::crates_io::index::FrozenDocuments::open(
-                        &root,
-                        &reference,
-                        &worker_cancel,
-                    )
-                })
-                .await
-                .map_err(|_| invalid())??;
+                let mut reader = execution
+                    .run(cancel, move |_| {
+                        crate::crates_io::index::FrozenDocuments::open(
+                            &root,
+                            &reference,
+                            &worker_cancel,
+                        )
+                    })
+                    .await?;
                 loop {
                     stop(cancel)?;
-                    let (next_reader, rows, has_more) = tokio::task::spawn_blocking(move || {
-                        let (rows, has_more) = reader.next_page(100)?;
-                        Ok::<_, Error>((reader, rows, has_more))
-                    })
-                    .await
-                    .map_err(|_| invalid())??;
+                    let (next_reader, rows, has_more) = execution
+                        .run(cancel, move |_| {
+                            let (rows, has_more) = reader.next_page(100)?;
+                            Ok::<_, Error>((reader, rows, has_more))
+                        })
+                        .await?;
                     reader = next_reader;
                     for (payload, _) in rows {
                         snapshot_capture_fields(self, &payload["record"]).await?;

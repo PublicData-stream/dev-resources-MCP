@@ -67,6 +67,11 @@ async fn streamed_migration_seals_cancel_rollback_resume_and_verify_without_rewr
         .await
         .unwrap();
 
+    // Accepted payloads larger than the concurrent default budget remain valid.
+    // Build it inside the disposable database to avoid a second test-side copy.
+    sqlx::query("INSERT INTO devres_advisory_records(id,data) SELECT 'exclusive-large-'||n,jsonb_build_object('public',repeat('x',65*1024*1024)) FROM generate_series(1,2) n")
+        .execute(&pool).await.unwrap();
+
     // Cancellation after UPDATE but before COMMIT must roll the whole page back.
     let mut blocker = pool.acquire().await.unwrap();
     sqlx::query("SELECT pg_advisory_lock(802171101,1)")
@@ -152,6 +157,9 @@ async fn streamed_migration_seals_cancel_rollback_resume_and_verify_without_rewr
             .await
             .unwrap();
     assert_eq!(retained.0, large, "single large payload survives unchanged");
+    let oversized_len: i64 = sqlx::query_scalar("SELECT length(data->>'public')::bigint FROM devres_advisory_records WHERE id='exclusive-large-1' AND data_integrity IS NOT NULL")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(oversized_len, 65 * 1024 * 1024);
     let identities: Vec<(String, String)> =
         sqlx::query_as("SELECT id,ctid::text FROM devres_advisory_records ORDER BY id")
             .fetch_all(&pool)

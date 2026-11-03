@@ -154,7 +154,9 @@ pub(super) async fn backfill(
     store: &super::PgBlobStore,
     cancel: &tokio_util::sync::CancellationToken,
     verify_only: bool,
+    execution: &crate::MigrationExecution,
 ) -> Result<()> {
+    use super::payload_integrity::pipeline::{SealData, SealRecord, SealWindow};
     use super::payload_integrity::{SealBatch, SealTarget, seal_not_cancelled};
     for &table in TABLES {
         // Include invalid sequence values rather than silently skipping corrupt rows.
@@ -163,7 +165,8 @@ pub(super) async fn backfill(
             "SELECT ctid::text AS locator,sequence,kind,key,sequence_integrity FROM {table}"
         );
         let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&store.pool);
-        let mut batch = SealBatch::default();
+        let mut batch = SealBatch::with_execution(execution);
+        let mut window = SealWindow::new(execution, verify_only);
         let target = SealTarget {
             table,
             column: "sequence_integrity",
@@ -177,27 +180,31 @@ pub(super) async fn backfill(
             let key: String = row.try_get("key").map_err(|_| failure())?;
             let expected: Option<String> =
                 row.try_get("sequence_integrity").map_err(|_| failure())?;
-            let seal = digest(table, &kind, &key, sequence)?;
-            match expected {
-                Some(expected) if expected == seal => {}
-                Some(_) => return Err(failure()),
-                None if verify_only => return Err(failure()),
-                None => {
-                    batch
-                        .queue(
-                            store,
-                            cancel,
-                            &target,
-                            (
-                                row.try_get("locator").map_err(|_| failure())?,
-                                kind,
-                                key,
-                                seal,
-                            ),
-                        )
-                        .await?;
+            let record = SealRecord::new(
+                row.try_get("locator").map_err(|_| failure())?,
+                kind,
+                key,
+                expected,
+                SealData::Sequence {
+                    table: table.to_owned(),
+                    sequence,
+                },
+            )?;
+            if window.needs_flush(&record) {
+                for sealed in window.flush(execution, cancel).await? {
+                    batch.queue(store, cancel, &target, sealed).await?;
                 }
             }
+            window.push(record)?;
+            // Process an oversized row before decoding the next candidate.
+            if window.stats().exclusive_oversized {
+                for sealed in window.flush(execution, cancel).await? {
+                    batch.queue(store, cancel, &target, sealed).await?;
+                }
+            }
+        }
+        for sealed in window.flush(execution, cancel).await? {
+            batch.queue(store, cancel, &target, sealed).await?;
         }
         batch.flush(store, cancel, &target).await?;
     }
@@ -322,10 +329,15 @@ mod tests {
             "integrity"
         );
         assert_eq!(
-            backfill(&store, &tokio_util::sync::CancellationToken::new(), true)
-                .await
-                .unwrap_err()
-                .code,
+            backfill(
+                &store,
+                &tokio_util::sync::CancellationToken::new(),
+                true,
+                &crate::MigrationExecution::default()
+            )
+            .await
+            .unwrap_err()
+            .code,
             "integrity"
         );
         drop(store);

@@ -224,11 +224,11 @@ impl PgBlobStore {
         self.prepare_graph_cutoffs().await?;
         execution.report("file_qualification", 0, 0, 0, 0);
         self.qualify_files(&cancel, execution).await?;
-        super::sequence_integrity::backfill(self, &cancel, false).await?;
+        super::sequence_integrity::backfill(self, &cancel, false, execution).await?;
         execution.report("sql_qualification", 0, 0, 0, 0);
-        self.qualify_sql(&cancel, false).await?;
-        payload_integrity::backfill_specialized(self, &cancel, false).await?;
-        self.backfill_events(&cancel, false).await?;
+        self.qualify_sql(&cancel, false, execution).await?;
+        payload_integrity::backfill_specialized(self, &cancel, false, execution).await?;
+        self.backfill_events(&cancel, false, execution).await?;
         execution.report("capture_replay", 0, 0, 0, 0);
         self.canonicalize_captures(&cancel).await?;
         sqlx::query("UPDATE devres_integrity_control SET files_complete=true,sql_complete=true WHERE singleton")
@@ -353,7 +353,12 @@ impl PgBlobStore {
         Ok(())
     }
 
-    async fn qualify_sql(&self, cancel: &CancellationToken, verify_only: bool) -> Result<()> {
+    async fn qualify_sql(
+        &self,
+        cancel: &CancellationToken,
+        verify_only: bool,
+        execution: &MigrationExecution,
+    ) -> Result<()> {
         for provider in PROVIDERS {
             for suffix in ["evidence", "state"] {
                 canceled(cancel)?;
@@ -377,27 +382,39 @@ impl PgBlobStore {
                     "SELECT ctid::text AS locator,{kind_expr} AS kind,key,data,data_integrity FROM {table}"
                 );
                 let mut rows = sqlx::query(sqlx::AssertSqlSafe(query)).fetch(&self.pool);
-                let mut batch = payload_integrity::SealBatch::default();
+                let mut batch = payload_integrity::SealBatch::with_execution(execution);
+                use payload_integrity::pipeline::{SealData, SealRecord, SealWindow};
+                let mut window = SealWindow::new(execution, verify_only);
                 while let Some(row) = rows.try_next().await.map_err(|_| storage_error())? {
                     canceled(cancel)?;
-                    let kind: String = row.try_get("kind").map_err(|_| storage_error())?;
-                    let key: String = row.try_get("key").map_err(|_| storage_error())?;
-                    let data: Json<Value> = row.try_get("data").map_err(|_| storage_error())?;
-                    let expected: Option<String> =
-                        row.try_get("data_integrity").map_err(|_| storage_error())?;
-                    let digest = payload_integrity::digest(&table, &kind, &key, &data.0)?;
-                    if let Some(expected) = expected {
-                        if digest != expected {
-                            return Err(Error::integrity("Retained SQL payload changed."));
+                    let record = SealRecord::new(
+                        row.try_get("locator").map_err(|_| storage_error())?,
+                        row.try_get("kind").map_err(|_| storage_error())?,
+                        row.try_get("key").map_err(|_| storage_error())?,
+                        row.try_get("data_integrity").map_err(|_| storage_error())?,
+                        SealData::Payload {
+                            table: table.clone(),
+                            payload: row
+                                .try_get::<Json<Value>, _>("data")
+                                .map_err(|_| storage_error())?
+                                .0,
+                        },
+                    )?;
+                    if window.needs_flush(&record) {
+                        for sealed in window.flush(execution, cancel).await? {
+                            batch.queue(self, cancel, &target, sealed).await?;
                         }
-                    } else if verify_only {
-                        return Err(Error::integrity("Retained SQL integrity missing."));
-                    } else {
-                        let locator = row.try_get("locator").map_err(|_| storage_error())?;
-                        batch
-                            .queue(self, cancel, &target, (locator, kind, key, digest))
-                            .await?;
                     }
+                    window.push(record)?;
+                    // Process an oversized row before decoding the next candidate.
+                    if window.stats().exclusive_oversized {
+                        for sealed in window.flush(execution, cancel).await? {
+                            batch.queue(self, cancel, &target, sealed).await?;
+                        }
+                    }
+                }
+                for sealed in window.flush(execution, cancel).await? {
+                    batch.queue(self, cancel, &target, sealed).await?;
                 }
                 batch.flush(self, cancel, &target).await?;
             }
@@ -719,15 +736,15 @@ impl PgBlobStore {
     ) -> Result<Value> {
         execution.report("verification", 0, 0, 0, 0);
         self.fence().await?;
-        super::sequence_integrity::backfill(self, &cancel, true).await?;
-        self.qualify_sql(&cancel, true).await?;
-        payload_integrity::backfill_specialized(self, &cancel, true).await?;
-        self.backfill_events(&cancel, true).await?;
+        super::sequence_integrity::backfill(self, &cancel, true, execution).await?;
+        self.qualify_sql(&cancel, true, execution).await?;
+        payload_integrity::backfill_specialized(self, &cancel, true, execution).await?;
+        self.backfill_events(&cancel, true, execution).await?;
         self.verify_visibility_registry().await?;
         self.verify_capture_inventory(&cancel).await?;
         self.verify_migration_alias_targets(&cancel).await?;
         self.verify_npm_graph(&cancel).await?;
-        self.verify_specialized_graphs(&cancel).await?;
+        self.verify_specialized_graphs(&cancel, execution).await?;
         crate::storage_migration_runner::verify_provider_graphs(
             &crate::MigrationSettings::default(),
             self.clone(),

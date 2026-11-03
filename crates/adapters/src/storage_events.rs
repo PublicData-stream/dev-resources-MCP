@@ -49,7 +49,9 @@ impl PgBlobStore {
         &self,
         cancel: &CancellationToken,
         verify_only: bool,
+        execution: &crate::MigrationExecution,
     ) -> Result<()> {
+        use super::payload_integrity::pipeline::{SealData, SealRecord, SealWindow};
         use super::payload_integrity::{SealBatch, SealTarget, seal_not_cancelled};
         self.fence().await?;
         for (table, column, kind_expr, key_expr) in [
@@ -76,7 +78,8 @@ impl PgBlobStore {
             seal_not_cancelled(cancel)?;
             let sql = format!("SELECT ctid::text AS seal_locator,* FROM {table}");
             let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&self.pool);
-            let mut batch = SealBatch::default();
+            let mut batch = SealBatch::with_execution(execution);
+            let mut window = SealWindow::new(execution, verify_only);
             let target = SealTarget {
                 table,
                 column,
@@ -118,25 +121,32 @@ impl PgBlobStore {
                     key.clone()
                 };
                 let expected: Option<String> = row.try_get(column).map_err(|_| invalid())?;
-                if let Some(expected) = expected {
-                    verify(table, &digest_key, &payload, &expected)?;
-                } else if verify_only {
-                    return Err(invalid());
-                } else {
-                    batch
-                        .queue(
-                            self,
-                            cancel,
-                            &target,
-                            (
-                                row.try_get("seal_locator").map_err(|_| invalid())?,
-                                kind,
-                                key,
-                                event_digest(table, &digest_key, &payload)?,
-                            ),
-                        )
-                        .await?;
+                let record = SealRecord::new(
+                    row.try_get("seal_locator").map_err(|_| invalid())?,
+                    kind,
+                    key,
+                    expected,
+                    SealData::Event {
+                        table: table.to_owned(),
+                        digest_key,
+                        payload,
+                    },
+                )?;
+                if window.needs_flush(&record) {
+                    for sealed in window.flush(execution, cancel).await? {
+                        batch.queue(self, cancel, &target, sealed).await?;
+                    }
                 }
+                window.push(record)?;
+                // Process an oversized row before decoding the next candidate.
+                if window.stats().exclusive_oversized {
+                    for sealed in window.flush(execution, cancel).await? {
+                        batch.queue(self, cancel, &target, sealed).await?;
+                    }
+                }
+            }
+            for sealed in window.flush(execution, cancel).await? {
+                batch.queue(self, cancel, &target, sealed).await?;
             }
             batch.flush(self, cancel, &target).await?;
         }

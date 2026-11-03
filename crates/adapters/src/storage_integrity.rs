@@ -1,4 +1,6 @@
 //! Rust-verified, versioned integrity envelopes for public SQL payloads.
+#[path = "migration_sql.rs"]
+pub(super) mod pipeline;
 #[path = "storage_specialized_verify.rs"]
 mod specialized_closure;
 use devres_domain::{Error, Result};
@@ -19,8 +21,8 @@ pub(super) struct SealTarget<'a> {
     pub key_expr: &'a str,
 }
 
-/// Only identity/locator/seal metadata is retained. Payloads remain one-at-a-time,
-/// including the existing large RFC representation allowance.
+/// Only identity/locator/seal metadata is retained here; the independent CPU
+/// window bounds payload work and preserves oversized representations.
 #[derive(Default)]
 pub(super) struct SealBatch {
     locators: Vec<String>,
@@ -28,9 +30,26 @@ pub(super) struct SealBatch {
     keys: Vec<String>,
     seals: Vec<String>,
     bytes: usize,
+    execution: Option<crate::MigrationExecution>,
+    committed: u64,
+}
+
+struct PublicationTime(Option<crate::MigrationExecution>, std::time::Instant);
+impl Drop for PublicationTime {
+    fn drop(&mut self) {
+        if let Some(execution) = &self.0 {
+            execution.record_publication(self.1.elapsed());
+        }
+    }
 }
 
 impl SealBatch {
+    pub fn with_execution(execution: &crate::MigrationExecution) -> Self {
+        Self {
+            execution: Some(execution.clone()),
+            ..Self::default()
+        }
+    }
     const ROWS: usize = 1000;
     const BYTES: usize = 8 * 1024 * 1024;
 
@@ -67,6 +86,7 @@ impl SealBatch {
         if self.locators.is_empty() {
             return Ok(());
         }
+        let _timing = PublicationTime(self.execution.clone(), std::time::Instant::now());
         seal_not_cancelled(cancel)?;
         store.fence().await?;
         let sql = format!(
@@ -92,6 +112,7 @@ impl SealBatch {
             }
             seal_not_cancelled(cancel)?;
             store.fence().await?;
+            seal_not_cancelled(cancel)?;
             Ok(())
         }
         .await;
@@ -103,6 +124,16 @@ impl SealBatch {
             return Err(error);
         }
         tx.commit().await.map_err(|_| failure())?;
+        self.committed += self.locators.len() as u64;
+        if let Some(execution) = &self.execution {
+            execution.report(
+                &format!("commit_{}", target.table),
+                self.committed,
+                self.committed,
+                self.committed,
+                0,
+            );
+        }
         self.locators.clear();
         self.kinds.clear();
         self.keys.clear();
@@ -336,7 +367,9 @@ pub(super) async fn backfill_specialized(
     store: &super::PgBlobStore,
     cancel: &tokio_util::sync::CancellationToken,
     verify_only: bool,
+    execution: &crate::MigrationExecution,
 ) -> Result<()> {
+    use pipeline::{SealData, SealRecord, SealWindow};
     for &(table, column, kind_expr, key_expr, predicate) in SPECIALIZED_PAYLOADS {
         seal_not_cancelled(cancel)?;
         // One statement snapshot sees each original tuple once even when the
@@ -346,7 +379,8 @@ pub(super) async fn backfill_specialized(
             specialized_payload_expression(table, column)
         );
         let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&store.pool);
-        let mut batch = SealBatch::default();
+        let mut batch = SealBatch::with_execution(execution);
+        let mut window = SealWindow::new(execution, verify_only);
         let target = SealTarget {
             table,
             column: &format!("{column}_integrity"),
@@ -359,28 +393,31 @@ pub(super) async fn backfill_specialized(
             let key: String = found.try_get("key").map_err(|_| failure())?;
             let data: Json<Value> = found.try_get("data").map_err(|_| failure())?;
             let expected: Option<String> = found.try_get("expected").map_err(|_| failure())?;
-            let digest = digest(table, &kind, &key, &data.0)?;
-            if let Some(expected) = expected {
-                if expected != digest {
-                    return Err(failure());
+            let record = SealRecord::new(
+                found.try_get("locator").map_err(|_| failure())?,
+                kind,
+                key,
+                expected,
+                SealData::Payload {
+                    table: table.to_owned(),
+                    payload: data.0,
+                },
+            )?;
+            if window.needs_flush(&record) {
+                for sealed in window.flush(execution, cancel).await? {
+                    batch.queue(store, cancel, &target, sealed).await?;
                 }
-            } else if verify_only {
-                return Err(failure());
-            } else {
-                batch
-                    .queue(
-                        store,
-                        cancel,
-                        &target,
-                        (
-                            found.try_get("locator").map_err(|_| failure())?,
-                            kind,
-                            key,
-                            digest,
-                        ),
-                    )
-                    .await?;
             }
+            window.push(record)?;
+            // Process an oversized row before decoding the next candidate.
+            if window.stats().exclusive_oversized {
+                for sealed in window.flush(execution, cancel).await? {
+                    batch.queue(store, cancel, &target, sealed).await?;
+                }
+            }
+        }
+        for sealed in window.flush(execution, cancel).await? {
+            batch.queue(store, cancel, &target, sealed).await?;
         }
         batch.flush(store, cancel, &target).await?;
     }
@@ -789,10 +826,15 @@ mod tests {
             "integrity"
         );
         assert_eq!(
-            backfill_specialized(&store, &tokio_util::sync::CancellationToken::new(), true)
-                .await
-                .unwrap_err()
-                .code,
+            backfill_specialized(
+                &store,
+                &tokio_util::sync::CancellationToken::new(),
+                true,
+                &crate::MigrationExecution::default()
+            )
+            .await
+            .unwrap_err()
+            .code,
             "integrity"
         );
         tokio::time::timeout(
