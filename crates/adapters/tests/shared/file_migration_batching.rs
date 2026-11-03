@@ -1,5 +1,5 @@
 //! Real PostgreSQL coverage for filesystem barriers followed by atomic checkpoints.
-use devres_adapters::{PgBlobStore, integrity};
+use devres_adapters::{MigrationExecution, MigrationExecutionOptions, PgBlobStore, integrity};
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -262,5 +262,121 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
     .execute(&admin)
     .await
     .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+async fn worker_counts_preserve_completed_file_inventory_and_descriptors() {
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut reference = None;
+    for workers in [1, 2, 64] {
+        let database = format!("devres_file_workers_{suffix}_{workers}");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path(&format!("/{database}"));
+        let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .unwrap();
+        sqlx::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress;")
+            .execute(&pool).await.unwrap();
+        drop(store);
+        let store = Arc::new(
+            PgBlobStore::connect_for_migration(url.as_str(), root.path())
+                .await
+                .unwrap(),
+        );
+        // More than two windows, with independent names sharing one inode and
+        // a canonical target that must be validated when it already exists.
+        let body = b"retained synthetic migration parity body";
+        let legacy = hex::encode(Sha256::digest(body));
+        let first = root.path().join(&legacy);
+        std::fs::write(&first, body).unwrap();
+        std::fs::create_dir(root.path().join("blake3")).unwrap();
+        std::fs::write(
+            root.path()
+                .join(integrity::relative_path(&integrity::hash(body)).unwrap()),
+            body,
+        )
+        .unwrap();
+        for index in 0..260 {
+            std::fs::hard_link(&first, root.path().join(format!("retained-{index:04}"))).unwrap();
+        }
+        let execution = MigrationExecution::new(
+            MigrationExecutionOptions::new(workers, 64 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        // Fixed-point inventories include canonical directories discovered after
+        // preparation; the subsequent resume must not rewrite SQL checkpoints.
+        for _ in 0..2 {
+            store
+                .migrate_storage_with_execution(CancellationToken::new(), &execution)
+                .await
+                .unwrap();
+        }
+        let before: Vec<(String, String, i64, String)> = sqlx::query_as(
+            "SELECT path,digest,bytes,ctid::text FROM devres_integrity_files ORDER BY path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        store
+            .migrate_storage_with_execution(CancellationToken::new(), &execution)
+            .await
+            .unwrap();
+        let after: Vec<(String, String, i64, String)> = sqlx::query_as(
+            "SELECT path,digest,bytes,ctid::text FROM devres_integrity_files ORDER BY path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            before, after,
+            "worker count {workers} rewrote checkpoints on resume"
+        );
+        let inventory: Vec<_> = after
+            .into_iter()
+            .map(|(path, digest, bytes, _)| {
+                let descriptor = std::fs::read(
+                    integrity::evidence_path(root.path(), &root.path().join(&path)).unwrap(),
+                )
+                .unwrap();
+                (path, digest, bytes, descriptor)
+            })
+            .collect();
+        assert_eq!(inventory.len(), 262);
+        let aliases: Vec<(String, String, String)> = sqlx::query_as("SELECT namespace,legacy,canonical FROM devres_content_aliases ORDER BY namespace,legacy")
+            .fetch_all(&pool).await.unwrap();
+        let completed = (inventory, aliases);
+        if let Some(reference) = &reference {
+            assert_eq!(
+                reference, &completed,
+                "worker count {workers} changed durable file identity"
+            );
+        } else {
+            reference = Some(completed);
+        }
+        assert!(execution.snapshot().high_water <= workers);
+        assert!(execution.snapshot().window_high_water <= 128);
+        assert_no_stages(root.path());
+        drop(store);
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
     admin.close().await;
 }

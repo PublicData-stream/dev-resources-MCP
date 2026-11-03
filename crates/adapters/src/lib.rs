@@ -11,7 +11,9 @@ mod research;
 mod standards_processing;
 mod storage;
 mod storage_migration_runner;
-pub use storage_migration_runner::{MigrationSettings, migrate_storage_graphs};
+pub use storage_migration_runner::{
+    MigrationSettings, migrate_storage_graphs, migrate_storage_graphs_with_execution,
+};
 
 pub mod chromium;
 pub mod crates_io;

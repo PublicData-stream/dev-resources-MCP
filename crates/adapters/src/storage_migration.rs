@@ -1,5 +1,6 @@
 //! Private, offline, resumable BLAKE3 qualification. Never performs network I/O.
 use super::{PgBlobStore, payload_integrity, storage_error};
+use crate::MigrationExecution;
 use crate::integrity::{self, FileEvidence};
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
@@ -194,6 +195,15 @@ impl PgBlobStore {
     /// Qualifies every permanent file and SQL payload before graph activation.
     /// Re-running verifies committed checkpoints rather than trusting their presence.
     pub async fn migrate_storage(&self, cancel: CancellationToken) -> Result<Value> {
+        self.migrate_storage_with_execution(cancel, &MigrationExecution::default())
+            .await
+    }
+
+    pub async fn migrate_storage_with_execution(
+        &self,
+        cancel: CancellationToken,
+        execution: &MigrationExecution,
+    ) -> Result<Value> {
         self.fence().await?;
         let active: bool =
             sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
@@ -212,32 +222,44 @@ impl PgBlobStore {
             .execute(&mut *self.owner.lock().await).await.map_err(|_| storage_error())?;
         self.verify_visibility_registry().await?;
         self.prepare_graph_cutoffs().await?;
-        self.qualify_files(&cancel).await?;
+        execution.report("file_qualification", 0, 0, 0, 0);
+        self.qualify_files(&cancel, execution).await?;
         super::sequence_integrity::backfill(self, &cancel, false).await?;
+        execution.report("sql_qualification", 0, 0, 0, 0);
         self.qualify_sql(&cancel, false).await?;
         payload_integrity::backfill_specialized(self, &cancel, false).await?;
         self.backfill_events(&cancel, false).await?;
+        execution.report("capture_replay", 0, 0, 0, 0);
         self.canonicalize_captures(&cancel).await?;
         sqlx::query("UPDATE devres_integrity_control SET files_complete=true,sql_complete=true WHERE singleton")
             .execute(&mut *self.owner.lock().await).await.map_err(|_| storage_error())?;
         Ok(json!({"format":1,"algorithm":"blake3","phase":"qualified","active":false}))
     }
 
-    async fn qualify_files(&self, cancel: &CancellationToken) -> Result<()> {
+    async fn qualify_files(
+        &self,
+        cancel: &CancellationToken,
+        execution: &MigrationExecution,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         if files::supported() {
-            return files::qualify(self, cancel).await;
+            return files::qualify(self, cancel, execution).await;
         }
         let mut tree = walk::Tree::new(&self.root).await?;
         while let Some(item) = tree.next(cancel).await? {
             if let walk::Item::File(path) = item {
-                self.qualify_file(&path, cancel).await?;
+                self.qualify_file(&path, cancel, execution).await?;
             }
         }
         Ok(())
     }
 
-    async fn qualify_file(&self, path: &Path, cancel: &CancellationToken) -> Result<()> {
+    async fn qualify_file(
+        &self,
+        path: &Path,
+        cancel: &CancellationToken,
+        execution: &MigrationExecution,
+    ) -> Result<()> {
         canceled(cancel)?;
         let relative = path
             .strip_prefix(&self.root)
@@ -246,15 +268,16 @@ impl PgBlobStore {
             .ok_or_else(|| Error::integrity("Invalid retained path."))?
             .to_owned();
         let owned = path.to_path_buf();
-        let (digest, bytes) = tokio::task::spawn_blocking(move || {
-            integrity::file_digest(
-                &owned,
-                crate::bulk::MAX_ARTIFACT_BYTES,
-                Instant::now() + Duration::from_secs(3600),
-            )
-        })
-        .await
-        .map_err(|_| storage_error())??;
+        let (digest, bytes) = execution
+            .run(cancel, move |token| {
+                integrity::file_digest_with_cancel(
+                    &owned,
+                    crate::bulk::MAX_ARTIFACT_BYTES,
+                    Instant::now() + Duration::from_secs(3600),
+                    &token,
+                )
+            })
+            .await?;
         canceled(cancel)?;
         // Content-addressed source files have authoritative legacy filename evidence.
         if let Some(name) = path.file_name().and_then(|v| v.to_str())
@@ -273,7 +296,7 @@ impl PgBlobStore {
                 .and_then(|v| v.to_str())
                 == Some("blake3");
             if !canonical {
-                verify_legacy_sha_file(path, hex)?;
+                verify_legacy_sha_file(path, hex, cancel, execution).await?;
             }
         }
         if let Some(name) = path.file_name().and_then(|v| v.to_str())
@@ -285,7 +308,7 @@ impl PgBlobStore {
                 .and_then(|v| v.to_str())
                 != Some("blake3")
         {
-            verify_legacy_sha_file(path, name)?;
+            verify_legacy_sha_file(path, name, cancel, execution).await?;
             let parent = path.parent().ok_or_else(storage_error)?;
             publish_link(path, &parent.join(integrity::relative_path(&digest)?)).await?;
             let namespace = "body";
@@ -562,16 +585,29 @@ impl PgBlobStore {
         self: &std::sync::Arc<Self>,
         cancel: CancellationToken,
     ) -> Result<Value> {
+        self.finish_graph_migration_with_execution(cancel, &MigrationExecution::default())
+            .await
+    }
+
+    pub async fn finish_graph_migration_with_execution(
+        self: &std::sync::Arc<Self>,
+        cancel: CancellationToken,
+        execution: &MigrationExecution,
+    ) -> Result<Value> {
         let ready:bool=sqlx::query_scalar("SELECT count(*)=8 FROM devres_integrity_graph_progress WHERE complete AND provider IN ('mdn','whatwg','w3c','chromium','npm','advisory','rfc','crate')")
             .fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if !ready {
             return Err(Error::integrity("Provider graph migration is incomplete."));
         }
-        self.qualify_files(&cancel).await?;
+        self.qualify_files(&cancel, execution).await?;
         self.seal_alias_membership("body").await?;
         self.seal_alias_membership("capture").await?;
         self.verify_complete_visibility_registry().await?;
-        let receipt = self.verify_storage(cancel).await?;
+        let receipt = self
+            .verify_storage_with_execution(cancel.clone(), execution)
+            .await?;
+        canceled(&cancel)?;
+        self.fence().await?;
         sqlx::query("UPDATE devres_integrity_control SET graph_complete=true WHERE singleton AND NOT active")
             .execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
         Ok(json!({"phase":"ready_for_activation","active":false,"verification":receipt}))
@@ -672,6 +708,16 @@ impl PgBlobStore {
         self: &std::sync::Arc<Self>,
         cancel: CancellationToken,
     ) -> Result<Value> {
+        self.verify_storage_with_execution(cancel, &MigrationExecution::default())
+            .await
+    }
+
+    pub async fn verify_storage_with_execution(
+        self: &std::sync::Arc<Self>,
+        cancel: CancellationToken,
+        execution: &MigrationExecution,
+    ) -> Result<Value> {
+        execution.report("verification", 0, 0, 0, 0);
         self.fence().await?;
         super::sequence_integrity::backfill(self, &cancel, true).await?;
         self.qualify_sql(&cancel, true).await?;
@@ -697,30 +743,43 @@ impl PgBlobStore {
             if rows.is_empty() {
                 break;
             }
+            let mut checks = Vec::with_capacity(rows.len());
             for row in rows {
                 let relative: String = row.try_get("path").map_err(|_| storage_error())?;
-                let path = self.root.join(&relative);
                 let expected: String = row.try_get("digest").map_err(|_| storage_error())?;
                 let bytes: i64 = row.try_get("bytes").map_err(|_| storage_error())?;
-                let target = path.clone();
-                let (actual, length) = tokio::task::spawn_blocking(move || {
-                    integrity::file_digest(
-                        &target,
-                        crate::bulk::MAX_ARTIFACT_BYTES,
-                        Instant::now() + Duration::from_secs(3600),
-                    )
-                })
-                .await
-                .map_err(|_| storage_error())??;
-                if actual != expected || length != bytes as u64 {
-                    return Err(Error::integrity("Retained checkpoint verification failed."));
-                }
-                integrity::verify_legacy_digest(&path, &actual, length)?;
-                after = relative;
-                files += 1;
+                checks.push((relative, expected, bytes));
+            }
+            let root = self.root.clone();
+            let verified = execution
+                .map_ordered(
+                    checks,
+                    &cancel,
+                    move |(relative, expected, bytes), token| {
+                        let path = root.join(&relative);
+                        let (actual, length) = integrity::file_digest_with_cancel(
+                            &path,
+                            crate::bulk::MAX_ARTIFACT_BYTES,
+                            Instant::now() + Duration::from_secs(3600),
+                            &token,
+                        )?;
+                        if actual != expected || bytes < 0 || length != bytes as u64 {
+                            return Err(Error::integrity(
+                                "Retained checkpoint verification failed.",
+                            ));
+                        }
+                        integrity::verify_legacy_digest(&path, &actual, length)?;
+                        Ok(relative)
+                    },
+                )
+                .await?;
+            files += verified.len() as u64;
+            if let Some(last) = verified.last() {
+                after.clone_from(last);
             }
         }
-        let inventoried = self.verify_file_inventory(&cancel).await?;
+        execution.report("file_inventory", 0, 0, 0, 0);
+        let inventoried = self.verify_file_inventory(&cancel, execution).await?;
         if files > inventoried {
             return Err(Error::integrity("Retained file inventory is incomplete."));
         }
@@ -779,54 +838,49 @@ impl PgBlobStore {
         Ok(())
     }
 
-    async fn verify_file_inventory(&self, cancel: &CancellationToken) -> Result<u64> {
+    async fn verify_file_inventory(
+        &self,
+        cancel: &CancellationToken,
+        execution: &MigrationExecution,
+    ) -> Result<u64> {
         let mut tree = walk::Tree::new(&self.root).await?;
         let mut count = 0_u64;
+        let mut paths = Vec::new();
         while let Some(item) = tree.next(cancel).await? {
-            let path = match item {
+            match item {
                 walk::Item::Integrity(root) => {
-                    self.verify_descriptor_inventory(&root, cancel).await?;
-                    continue;
+                    count = count
+                        .checked_add(
+                            verify_file_window(execution, cancel, std::mem::take(&mut paths))
+                                .await?,
+                        )
+                        .ok_or_else(|| Error::capacity("Retained file count overflow."))?;
+                    self.verify_descriptor_inventory(&root, cancel, execution)
+                        .await?;
                 }
-                walk::Item::File(path) => path,
-            };
-            let target = path.clone();
-            let (digest, bytes) = tokio::task::spawn_blocking(move || {
-                integrity::file_digest(
-                    &target,
-                    crate::bulk::MAX_ARTIFACT_BYTES,
-                    Instant::now() + Duration::from_secs(3600),
-                )
-            })
-            .await
-            .map_err(|_| storage_error())??;
-            integrity::verify_legacy_digest(&path, &digest, bytes)?;
-            if path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|v| v.to_str())
-                == Some("blake3")
-            {
-                let name = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .ok_or_else(|| Error::integrity("Invalid retained file encoding."))?;
-                let hex = name.strip_suffix(".json").unwrap_or(name);
-                if integrity::valid_hash(hex) && digest != format!("blake3:{hex}") {
-                    return Err(Error::integrity("BLAKE3 file address mismatch."));
+                walk::Item::File(path) => {
+                    paths.push(path);
+                    if paths.len() == 128 {
+                        count = count
+                            .checked_add(
+                                verify_file_window(execution, cancel, std::mem::take(&mut paths))
+                                    .await?,
+                            )
+                            .ok_or_else(|| Error::capacity("Retained file count overflow."))?;
+                    }
                 }
             }
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| Error::capacity("Retained file count overflow."))?;
         }
-        Ok(count)
+        count
+            .checked_add(verify_file_window(execution, cancel, paths).await?)
+            .ok_or_else(|| Error::capacity("Retained file count overflow."))
     }
 
     async fn verify_descriptor_inventory(
         &self,
         root: &Path,
         cancel: &CancellationToken,
+        execution: &MigrationExecution,
     ) -> Result<()> {
         let directory = root.join(".devres-integrity/files");
         let meta = tokio::fs::symlink_metadata(&directory)
@@ -838,6 +892,7 @@ impl PgBlobStore {
         let mut entries = tokio::fs::read_dir(&directory)
             .await
             .map_err(|_| storage_error())?;
+        let mut paths = Vec::new();
         while let Some(entry) = entries.next_entry().await.map_err(|_| storage_error())? {
             canceled(cancel)?;
             let name = entry.file_name();
@@ -847,46 +902,18 @@ impl PgBlobStore {
             if super::stage_name(name) {
                 continue;
             }
-            let metadata = tokio::fs::symlink_metadata(entry.path())
-                .await
-                .map_err(|_| storage_error())?;
-            if !metadata.is_file() || metadata.len() > 16384 {
-                return Err(Error::integrity("Invalid integrity evidence file."));
-            }
-            let bytes = tokio::fs::read(entry.path())
-                .await
-                .map_err(|_| storage_error())?;
-            let evidence: FileEvidence = serde_json::from_slice(&bytes)
-                .map_err(|_| Error::integrity("Invalid integrity evidence record."))?;
-            let relative = Path::new(&evidence.path);
-            if evidence.version != 1
-                || relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|v| !matches!(v, std::path::Component::Normal(_)))
-                || !evidence.digest.starts_with("blake3:")
-                || !integrity::valid_hash(&evidence.digest)
-            {
-                return Err(Error::integrity("Invalid retained evidence identity."));
-            }
-            let target = root.join(relative);
-            if integrity::evidence_path(root, &target)? != entry.path() {
-                return Err(Error::integrity("Integrity descriptor address mismatch."));
-            }
-            let owned = target.clone();
-            let limit = evidence.bytes;
-            let (digest, length) = tokio::task::spawn_blocking(move || {
-                integrity::file_digest(&owned, limit, Instant::now() + Duration::from_secs(3600))
-            })
-            .await
-            .map_err(|_| storage_error())??;
-            if digest != evidence.digest || length != evidence.bytes {
-                return Err(Error::integrity(
-                    "Retained evidence source missing or corrupt.",
-                ));
+            paths.push(entry.path());
+            if paths.len() == 128 {
+                verify_descriptor_window(
+                    execution,
+                    cancel,
+                    root.to_owned(),
+                    std::mem::take(&mut paths),
+                )
+                .await?;
             }
         }
-        Ok(())
+        verify_descriptor_window(execution, cancel, root.to_owned(), paths).await
     }
 
     async fn apply_staged_activation(
@@ -1017,6 +1044,15 @@ impl PgBlobStore {
         self: &std::sync::Arc<Self>,
         cancel: CancellationToken,
     ) -> Result<Value> {
+        self.activate_storage_with_execution(cancel, &MigrationExecution::default())
+            .await
+    }
+
+    pub async fn activate_storage_with_execution(
+        self: &std::sync::Arc<Self>,
+        cancel: CancellationToken,
+        execution: &MigrationExecution,
+    ) -> Result<Value> {
         let active: bool =
             sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
                 .fetch_one(&self.pool)
@@ -1026,9 +1062,13 @@ impl PgBlobStore {
             return Err(Error::invalid("Storage is already BLAKE3 active."));
         }
         self.verify_complete_visibility_registry().await?;
-        let receipt = self.verify_storage(cancel).await?;
+        let receipt = self
+            .verify_storage_with_execution(cancel.clone(), execution)
+            .await?;
         let mut owner = self.owner.lock().await;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let result: Result<()> = async {
+        canceled(&cancel)?;
         let ready: bool = sqlx::query_scalar("SELECT files_complete AND sql_complete AND graph_complete FROM devres_integrity_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
         if !ready {
@@ -1057,6 +1097,15 @@ impl PgBlobStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
+        canceled(&cancel)?;
+        self.fence().await?;
+                canceled(&cancel)?;
+        Ok(())
+        }.await;
+        if let Err(error) = result {
+            tx.rollback().await.map_err(|_| storage_error())?;
+            return Err(error);
+        }
         tx.commit().await.map_err(|_| storage_error())?;
         self.active
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1064,13 +1113,130 @@ impl PgBlobStore {
     }
 }
 
-fn verify_legacy_sha_file(path: &Path, expected: &str) -> Result<()> {
+async fn verify_file_window(
+    execution: &MigrationExecution,
+    cancel: &CancellationToken,
+    paths: Vec<PathBuf>,
+) -> Result<u64> {
+    let count = paths.len() as u64;
+    execution
+        .map_ordered(paths, cancel, move |path, token| {
+            let (digest, bytes) = integrity::file_digest_with_cancel(
+                &path,
+                crate::bulk::MAX_ARTIFACT_BYTES,
+                Instant::now() + Duration::from_secs(3600),
+                &token,
+            )?;
+            integrity::verify_legacy_digest(&path, &digest, bytes)?;
+            if path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|v| v.to_str())
+                == Some("blake3")
+            {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| Error::integrity("Invalid retained file encoding."))?;
+                let hex = name.strip_suffix(".json").unwrap_or(name);
+                if integrity::valid_hash(hex) && digest != format!("blake3:{hex}") {
+                    return Err(Error::integrity("BLAKE3 file address mismatch."));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(count)
+}
+
+async fn verify_descriptor_window(
+    execution: &MigrationExecution,
+    cancel: &CancellationToken,
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+) -> Result<()> {
+    execution
+        .map_ordered(paths, cancel, move |path, token| {
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+                .open(&path)
+                .map_err(|_| storage_error())?;
+            let metadata = file.metadata().map_err(|_| storage_error())?;
+            if !metadata.is_file() || metadata.len() > 16384 {
+                return Err(Error::integrity("Invalid integrity evidence file."));
+            }
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(16385)
+                .read_to_end(&mut bytes)
+                .map_err(|_| storage_error())?;
+            if bytes.len() as u64 != metadata.len() {
+                return Err(Error::integrity("Invalid integrity evidence file."));
+            }
+            let evidence: FileEvidence = serde_json::from_slice(&bytes)
+                .map_err(|_| Error::integrity("Invalid integrity evidence record."))?;
+            let relative = Path::new(&evidence.path);
+            if evidence.version != 1
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|v| !matches!(v, std::path::Component::Normal(_)))
+                || !evidence.digest.starts_with("blake3:")
+                || !integrity::valid_hash(&evidence.digest)
+            {
+                return Err(Error::integrity("Invalid retained evidence identity."));
+            }
+            let target = root.join(relative);
+            if integrity::evidence_path(&root, &target)? != path {
+                return Err(Error::integrity("Integrity descriptor address mismatch."));
+            }
+            let (digest, length) = integrity::file_digest_with_cancel(
+                &target,
+                evidence.bytes,
+                Instant::now() + Duration::from_secs(3600),
+                &token,
+            )?;
+            if digest != evidence.digest || length != evidence.bytes {
+                return Err(Error::integrity(
+                    "Retained evidence source missing or corrupt.",
+                ));
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
+async fn verify_legacy_sha_file(
+    path: &Path,
+    expected: &str,
+    cancel: &CancellationToken,
+    execution: &MigrationExecution,
+) -> Result<()> {
+    let path = path.to_owned();
+    let expected = expected.to_owned();
+    execution
+        .run(cancel, move |token| {
+            verify_legacy_sha_file_blocking(&path, &expected, &token)
+        })
+        .await
+}
+
+fn verify_legacy_sha_file_blocking(
+    path: &Path,
+    expected: &str,
+    cancel: &CancellationToken,
+) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|_| storage_error())?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 65536];
     loop {
+        canceled(cancel)?;
         let n = file.read(&mut buffer).map_err(|_| storage_error())?;
         if n == 0 {
             break;

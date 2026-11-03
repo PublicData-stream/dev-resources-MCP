@@ -18,11 +18,29 @@ pub async fn migrate_storage_graphs(
     store: Arc<crate::PgBlobStore>,
     cancel: CancellationToken,
 ) -> devres_domain::Result<serde_json::Value> {
-    store.migrate_storage(cancel.clone()).await?;
+    migrate_storage_graphs_with_execution(
+        config,
+        store,
+        cancel,
+        &crate::MigrationExecution::default(),
+    )
+    .await
+}
+
+pub async fn migrate_storage_graphs_with_execution(
+    config: &MigrationSettings,
+    store: Arc<crate::PgBlobStore>,
+    cancel: CancellationToken,
+    execution: &crate::MigrationExecution,
+) -> devres_domain::Result<serde_json::Value> {
+    store
+        .migrate_storage_with_execution(cancel.clone(), execution)
+        .await?;
     let mut mappings = store.migration_mappings_with_cancel(&cancel).await?;
     macro_rules! migrate {
         ($provider:literal,$operation:expr) => {
             if !store.migration_graph_done($provider).await? {
+                execution.report(concat!("graph_", $provider), 0, 0, 0, 0);
                 let aliases = $operation.await?;
                 mappings.ensure_healthy()?;
                 aliases.ensure_healthy()?;
@@ -96,7 +114,9 @@ pub async fn migrate_storage_graphs(
         "chromium",
         chromium.migrate_blake3_graph(&mut mappings, cancel.clone())
     );
-    store.finish_graph_migration(cancel).await
+    store
+        .finish_graph_migration_with_execution(cancel, execution)
+        .await
 }
 
 /// Read-only graph traversal; handles never start source acquisition.

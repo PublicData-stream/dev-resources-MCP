@@ -1,3 +1,4 @@
+mod offline_cli;
 use devres_server::{
     ServerBuilder, ServerError,
     config::{AccessPolicy, Config},
@@ -27,11 +28,11 @@ async fn main() -> Result<(), ServerError> {
         args.first().map(String::as_str),
         Some("migrate-storage" | "verify-storage" | "activate-storage")
     ) {
-        let (command, path) = match args.as_slice() {
-            [command, path, flag, algorithm] if command == "migrate-storage" && flag == "--to" && algorithm == "blake3" => (command.as_str(), path),
-            [command, path] if command == "verify-storage" || command == "activate-storage" => (command.as_str(), path),
-            _ => return Err("usage: devres-server migrate-storage CONFIG.toml --to blake3 | verify-storage CONFIG.toml | activate-storage CONFIG.toml".into()),
-        };
+        let offline = offline_cli::parse(&args)?;
+        let command = offline.command.as_str();
+        let path = &offline.path;
+        let execution = devres_adapters::MigrationExecution::new(offline.options)?;
+        execution.enable_progress();
         let config = Config::load(Path::new(path)).await?;
         let store = Arc::new(match command {
             "migrate-storage" => {
@@ -63,13 +64,25 @@ async fn main() -> Result<(), ServerError> {
             signal.cancel();
         });
         let result = match command {
-            "migrate-storage" => migrate_storage_graphs(&config, store.clone(), cancel).await,
-            "verify-storage" => store.verify_storage(cancel).await,
-            _ => store.activate_storage(cancel).await,
+            "migrate-storage" => {
+                migrate_storage_graphs(&config, store.clone(), cancel, &execution).await
+            }
+            "verify-storage" => {
+                store
+                    .verify_storage_with_execution(cancel, &execution)
+                    .await
+            }
+            _ => {
+                store
+                    .activate_storage_with_execution(cancel, &execution)
+                    .await
+            }
         };
         task.abort();
         let _ = task.await;
-        println!("{}", result?);
+        let receipt = result?;
+        execution.report("complete", 0, 0, 0, 0);
+        println!("{receipt}");
         return Ok(());
     }
     let mdn_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-mdn-index");
@@ -409,6 +422,7 @@ async fn migrate_storage_graphs(
     config: &Config,
     store: Arc<devres_adapters::PgBlobStore>,
     cancel: CancellationToken,
+    execution: &devres_adapters::MigrationExecution,
 ) -> devres_domain::Result<serde_json::Value> {
     let settings = devres_adapters::MigrationSettings {
         crates: config.crates.clone(),
@@ -419,7 +433,8 @@ async fn migrate_storage_graphs(
         chromium: config.chromium.clone(),
         npm: config.npm.clone(),
     };
-    devres_adapters::migrate_storage_graphs(&settings, store, cancel).await
+    devres_adapters::migrate_storage_graphs_with_execution(&settings, store, cancel, execution)
+        .await
 }
 
 async fn shutdown_signal() {

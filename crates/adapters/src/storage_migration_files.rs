@@ -1,5 +1,6 @@
 //! Bounded offline filesystem qualification; public publication helpers are unchanged.
 use super::{PgBlobStore, canceled, mapping_digest, storage_error};
+use crate::MigrationExecution;
 use crate::integrity::{self, FileEvidence};
 use devres_domain::{Error, Result};
 use sha2::{Digest, Sha256};
@@ -119,6 +120,19 @@ impl Batch {
 
 /// Only a successful second barrier can construct this SQL-publication permit.
 struct DurableBatch(Vec<Qualified>);
+
+#[derive(Default)]
+struct FileProgress {
+    admitted: u64,
+    completed: u64,
+    committed: u64,
+}
+
+impl FileProgress {
+    fn report(&self, phase: &str, execution: &MigrationExecution) {
+        execution.report(phase, self.admitted, self.completed, self.committed, 0);
+    }
+}
 
 fn open_nofollow(path: &Path) -> Result<File> {
     OpenOptions::new()
@@ -571,6 +585,8 @@ async fn flush(
     root_fd: &Arc<File>,
     dev: u64,
     cancel: &CancellationToken,
+    execution: &MigrationExecution,
+    progress: &mut FileProgress,
 ) -> Result<()> {
     if batch.entries.is_empty() {
         return Ok(());
@@ -579,65 +595,136 @@ async fn flush(
     let pending = std::mem::take(batch);
     let root = store.root.clone();
     let fd = Arc::clone(root_fd);
-    let token = cancel.clone();
-    let durable = tokio::task::spawn_blocking(move || {
-        publish(pending, &root, dev, &token, || {
-            #[cfg(target_os = "linux")]
-            {
-                nix::unistd::syncfs(fd.as_ref()).map_err(|_| storage_error())
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = &fd;
-                Err(storage_error())
-            }
-        })
-    })
-    .await
-    .map_err(|_| storage_error())??;
-    persist_sql(store, durable, cancel).await
+    let count = pending.entries.len() as u64;
+    let started = Instant::now();
+    let result = async {
+        let durable = execution
+            .run(cancel, move |token| {
+                publish(pending, &root, dev, &token, || {
+                    #[cfg(target_os = "linux")]
+                    {
+                        nix::unistd::syncfs(fd.as_ref()).map_err(|_| storage_error())
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = &fd;
+                        Err(storage_error())
+                    }
+                })
+            })
+            .await?;
+        persist_sql(store, durable, cancel).await
+    }
+    .await;
+    execution.record_publication(started.elapsed());
+    result?;
+    progress.committed += count;
+    progress.report("files", execution);
+    Ok(())
 }
 
-pub(super) async fn qualify(store: &PgBlobStore, cancel: &CancellationToken) -> Result<()> {
-    let root = store.root.clone();
-    let opened = root.clone();
-    let fd = Arc::new(
-        tokio::task::spawn_blocking(move || root_file(&opened))
-            .await
-            .map_err(|_| storage_error())??,
-    );
-    let dev = fd.metadata().map_err(|_| storage_error())?.dev();
-    let mut batch = Batch::default();
-    let mut tree = super::walk::Tree::new(&root).await?;
-    while let Some(item) = tree.next(cancel).await? {
-        let super::walk::Item::File(path) = item else {
-            continue;
-        };
-        // Reserve room before staging the next entry, so neither the
-        // temporary 129th file nor its metadata exceeds the batch bound.
-        if batch.entries.len() == FILES || batch.bytes > METADATA_BYTES - ENTRY_METADATA_BYTES {
-            flush(store, &mut batch, &fd, dev, cancel).await?;
+/// Reserve the complete window before starting preparations. Walking can fail,
+/// but cannot strand workers or descriptor stages because no job runs here.
+async fn next_window(
+    tree: &mut super::walk::Tree,
+    cancel: &CancellationToken,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(FILES);
+    while paths.len() < FILES {
+        // Every admitted path owns one slot through preparation and publication;
+        // there are no additional per-stage queues with independent allowances.
+        if (paths.len() + 1) * ENTRY_METADATA_BYTES > METADATA_BYTES {
+            break;
         }
-        let (source, base, token) = (path.clone(), root.clone(), cancel.clone());
-        let entry = tokio::task::spawn_blocking(move || prepare(&base, &source, dev, &token))
-            .await
-            .map_err(|_| storage_error())??;
-        if let Some(entry) = entry {
-            if entry.metadata_bytes() > ENTRY_METADATA_BYTES {
+        match tree.next(cancel).await? {
+            Some(super::walk::Item::File(path)) => paths.push(path),
+            Some(super::walk::Item::Integrity(_)) => (),
+            None => break,
+        }
+    }
+    Ok(paths)
+}
+
+async fn prepare_window(
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+    dev: u64,
+    cancel: &CancellationToken,
+    execution: &MigrationExecution,
+) -> Result<Vec<(PathBuf, Option<Qualified>)>> {
+    execution
+        .map_ordered(paths, cancel, move |path, token| {
+            let entry = prepare(&root, &path, dev, &token)?;
+            if entry.as_ref().is_some_and(|entry| {
+                entry.metadata_bytes() + path.as_os_str().len() + std::mem::size_of::<Qualified>()
+                    > ENTRY_METADATA_BYTES
+            }) {
                 return Err(Error::capacity(
                     "Migration file metadata exceeded its bound.",
                 ));
             }
-            if !batch.fits(&entry) {
-                flush(store, &mut batch, &fd, dev, cancel).await?;
-            }
-            batch.push(entry)?;
-        } else {
-            flush(store, &mut batch, &fd, dev, cancel).await?;
-            store.qualify_file(&path, cancel).await?;
+            Ok((path, entry))
+        })
+        .await
+}
+
+pub(super) async fn qualify(
+    store: &PgBlobStore,
+    cancel: &CancellationToken,
+    execution: &MigrationExecution,
+) -> Result<()> {
+    let root = store.root.clone();
+    let opened = root.clone();
+    let fd = Arc::new(execution.run(cancel, move |_| root_file(&opened)).await?);
+    let dev = fd.metadata().map_err(|_| storage_error())?.dev();
+    let mut tree = super::walk::Tree::new(&root).await?;
+    let mut progress = FileProgress::default();
+    loop {
+        let paths = next_window(&mut tree, cancel).await?;
+        if paths.is_empty() {
+            return Ok(());
         }
+        let count = paths.len() as u64;
+        progress.admitted += count;
+        progress.report("files", execution);
+        let prepared = prepare_window(root.clone(), paths, dev, cancel, execution).await?;
+        progress.completed += count;
+        progress.report("files", execution);
+        // All jobs have joined. Unpublished suffix entries remain RAII-owned
+        // while a prefix is published or a serial filesystem fallback runs.
+        let mut batch = Batch::default();
+        for (path, entry) in prepared {
+            if let Some(entry) = entry {
+                batch.push(entry)?;
+            } else {
+                flush(
+                    store,
+                    &mut batch,
+                    &fd,
+                    dev,
+                    cancel,
+                    execution,
+                    &mut progress,
+                )
+                .await?;
+                let started = Instant::now();
+                store.qualify_file(&path, cancel, execution).await?;
+                execution.record_publication(started.elapsed());
+                progress.committed += 1;
+                progress.report("files", execution);
+            }
+        }
+        flush(
+            store,
+            &mut batch,
+            &fd,
+            dev,
+            cancel,
+            execution,
+            &mut progress,
+        )
+        .await?;
     }
-    flush(store, &mut batch, &fd, dev, cancel).await
 }
 
 #[cfg(test)]
@@ -812,5 +899,166 @@ mod tests {
                 .is_none()
         );
         assert!(!integrity::evidence_path(&root, &path).unwrap().exists());
+    }
+
+    fn assert_no_stages(root: &Path) {
+        let directory = root.join(".devres-integrity/files");
+        if !directory.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(directory).unwrap() {
+            assert!(
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".stage-")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_window_reserves_paths_before_any_preparation() {
+        let (_temporary, root, _) = fixture();
+        for index in 0..FILES + 1 {
+            std::fs::write(root.join(format!("source-{index}")), b"public").unwrap();
+        }
+        let mut tree = super::super::walk::Tree::new(&root).await.unwrap();
+        let cancel = CancellationToken::new();
+        let first = next_window(&mut tree, &cancel).await.unwrap();
+        assert_eq!(first.len(), FILES);
+        assert_eq!(first.len() * ENTRY_METADATA_BYTES, METADATA_BYTES);
+        assert!(!root.join(".devres-integrity").exists());
+        assert_eq!(next_window(&mut tree, &cancel).await.unwrap().len(), 1);
+        assert!(next_window(&mut tree, &cancel).await.unwrap().is_empty());
+
+        let linked = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(linked.path().join("retained"), b"public").unwrap();
+        std::os::unix::fs::symlink(root.join("source-0"), linked.path().join("link")).unwrap();
+        let mut tree = super::super::walk::Tree::new(linked.path()).await.unwrap();
+        assert!(next_window(&mut tree, &cancel).await.is_err());
+        assert!(!linked.path().join(".devres-integrity").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_window_preserves_hard_link_descriptors_and_shared_targets() {
+        let (_temporary, root, dev) = fixture();
+        let body = b"retained shared public source";
+        let legacy = hex::encode(Sha256::digest(body));
+        let first = root.join(&legacy);
+        let second = root.join("hard-linked-source");
+        std::fs::write(&first, body).unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+        let paths = vec![first.clone(), second.clone()];
+        let execution = MigrationExecution::new(
+            crate::MigrationExecutionOptions::new(64, 64 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let prepared = prepare_window(
+            root.clone(),
+            paths,
+            dev,
+            &CancellationToken::new(),
+            &execution,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].0, first);
+        assert_eq!(prepared[1].0, second);
+        let mut batch = Batch::default();
+        for (_, entry) in prepared {
+            batch.push(entry.unwrap()).unwrap();
+        }
+        assert_ne!(batch.entries[0].descriptor, batch.entries[1].descriptor);
+        assert_eq!(batch.entries[0].digest, batch.entries[1].digest);
+        let durable = publish(batch, &root, dev, &CancellationToken::new(), || Ok(())).unwrap();
+        for entry in &durable.0 {
+            compare_descriptor(&entry.descriptor, &entry.encoded, dev).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(root.join(integrity::relative_path(&integrity::hash(body)).unwrap()))
+                .unwrap(),
+            body
+        );
+        drop(durable);
+        assert_no_stages(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_failure_drops_every_completed_unpublished_stage() {
+        let (_temporary, root, dev) = fixture();
+        let mut paths = Vec::new();
+        for index in 0..FILES - 1 {
+            let path = root.join(format!("source-{index}"));
+            std::fs::write(&path, b"retained public source").unwrap();
+            paths.push(path);
+        }
+        paths.push(root.join("missing"));
+        let execution = MigrationExecution::new(
+            crate::MigrationExecutionOptions::new(4, 64 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            prepare_window(
+                root.clone(),
+                paths,
+                dev,
+                &CancellationToken::new(),
+                &execution
+            )
+            .await
+            .is_err()
+        );
+        assert_no_stages(&root);
+        assert!(
+            std::fs::read_dir(root.join(".devres-integrity/files"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_drains_prepared_stages_before_return() {
+        let (_temporary, root, dev) = fixture();
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let path = root.join(format!("source-{index}"));
+            std::fs::write(&path, b"retained public source").unwrap();
+            paths.push(path);
+        }
+        let cancel = CancellationToken::new();
+        let staged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = staged.clone();
+        let signal = cancel.clone();
+        let execution = MigrationExecution::new(
+            crate::MigrationExecutionOptions::new(2, 64 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let base = root.clone();
+        let task = tokio::spawn(async move {
+            execution
+                .map_ordered(paths, &signal, move |path, token| {
+                    let entry = prepare(&base, &path, dev, &token)?;
+                    started.fetch_add(1, Ordering::SeqCst);
+                    while !token.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    canceled(&token)?;
+                    Ok(entry)
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while staged.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert_eq!(task.await.unwrap().err().unwrap().code, "cancelled");
+        assert_no_stages(&root);
     }
 }
