@@ -9,10 +9,12 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import shutil
 import socket
 import ssl
@@ -53,6 +55,46 @@ RESOURCE_PROFILES = {
                'worker_cpus': 37, 'postgres_cpus': 2, 'postgres_tuned': True,
                'host_memory_guard': True},
 }
+DIAGNOSTIC_ROOT = Path('/tmp/devres-offline-diagnostics')
+DIAGNOSTIC_LOG_BYTES = 64 * 1024
+DIAGNOSTIC_LOG_LINES = 64
+DIAGNOSTIC_LOG_SECONDS = 3
+DIAGNOSTIC_FILE_BYTES = 32 * 1024
+DIAGNOSTIC_INSPECT_FORMAT = ('{"owner":{{json (index .Config.Labels "' + LABEL_KEY
+    + '")}},"state":{"ExitCode":{{json .State.ExitCode}},"OOMKilled":{{json .State.OOMKilled}},'
+    '"Running":{{json .State.Running}},"ErrorPresent":{{if .State.Error}}true{{else}}false{{end}}}}')
+DIAGNOSTIC_PHASES = frozenset({
+    'file_qualification', 'sql_qualification', 'capture_replay', 'verification',
+    'file_inventory', 'files', 'complete', 'graph_rfc', 'graph_advisory',
+    'graph_crate', 'graph_npm', 'graph_mdn', 'graph_whatwg', 'graph_w3c', 'graph_chromium',
+})
+DIAGNOSTIC_ERROR_CODES = frozenset({'invalid_input', 'unavailable', 'not_found', 'capacity', 'integrity', 'cancelled'})
+# Only exact source-authored reasons become enums. Unknown free-form messages are
+# discarded even from private diagnostics; no body/configuration hashes are kept.
+DIAGNOSTIC_REASONS = {
+    'Durable storage unavailable': 'durable_storage_unavailable',
+    'Ambiguous RFC migration identity.': 'rfc_identity_ambiguous',
+    'Unresolved RFC migration reference.': 'rfc_reference_unresolved',
+    'Unresolved RFC body reference.': 'rfc_body_reference_unresolved',
+    'RFC graph migration canceled.': 'rfc_graph_cancelled',
+    'RFC corpus representation exceeds limit': 'rfc_corpus_capacity',
+    'RFC search index unavailable.': 'rfc_index_unavailable',
+    'RFC search index integrity verification failed.': 'rfc_index_integrity',
+    'RFC index file limit exceeded.': 'rfc_index_file_capacity',
+    'RFC index size limit exceeded.': 'rfc_index_size_capacity',
+    'RFC index writer is busy.': 'rfc_index_writer_busy',
+    'RFC index document limit exceeded.': 'rfc_index_document_capacity',
+    'RFC index manifest exceeds limit.': 'rfc_index_manifest_capacity',
+    'RFC searchable text exceeds 16 MiB.': 'rfc_text_capacity',
+    'Storage migration canceled.': 'storage_migration_cancelled',
+    'Migration mapping integrity failed.': 'migration_mapping_integrity',
+}
+DIAGNOSTIC_PROGRESS_COUNTS = frozenset({
+    'workers', 'payload_budget_bytes', 'admitted', 'completed', 'committed',
+    'active_jobs', 'jobs_high_water', 'window_high_water', 'payload_bytes',
+    'worker_wait_micros', 'publication_micros',
+})
+DIAGNOSTIC_PROGRESS_TIMES = frozenset({'elapsed_secs', 'phase_elapsed_secs', 'records_per_second'})
 RECORD_SQL = "SELECT id, body_hash FROM devres_captures WHERE source_url='https://www.rfc-editor.org/rfc/rfc9000.txt' AND media_type='text/plain' ORDER BY retrieved_at DESC,id LIMIT 1"
 
 
@@ -71,6 +113,151 @@ def execute(args):
     if len(p.stdout) > MAX_RESPONSE:
         raise RestoreError('restore_command_output_exceeds_bound')
     return p.stdout.strip()
+
+
+def bounded_diagnostic_output(arguments, byte_limit):
+    """Bound pipe reads before buffering; never echo Docker or application text."""
+    process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    captured = bytearray()
+    truncated = timed_out = False
+    deadline = time.monotonic() + DIAGNOSTIC_LOG_SECONDS
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not ready.select(remaining):
+                    timed_out = True
+                    break
+                data = os.read(process.stdout.fileno(), min(8192, byte_limit + 1 - len(captured)))
+                if not data:
+                    break
+                captured.extend(data)
+                if len(captured) > byte_limit:
+                    truncated = True
+                    break
+    finally:
+        # No follow mode is used. Kill/reap only this newly owned Docker client
+        # on a full pipe or timeout; worker removal remains the caller's finally.
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=1)
+        finally:
+            process.stdout.close()
+    return {'data': bytes(captured[:byte_limit]),
+            'truncated': truncated, 'timed_out': timed_out}
+
+
+def diagnostic_container_name(name):
+    if not re.fullmatch(r'devres-staging-restore-[0-9a-f]{24}-offline-[1-9][0-9]{0,7}', name):
+        raise RestoreError('invalid_diagnostic_container')
+    return name
+
+
+def read_terminal_logs(name):
+    return bounded_diagnostic_output(
+        ['docker', 'logs', '--tail', str(DIAGNOSTIC_LOG_LINES), diagnostic_container_name(name)],
+        DIAGNOSTIC_LOG_BYTES)
+
+
+def inspect_offline_failure(name):
+    # Select only ownership and fixed state fields. State.Error is never fetched
+    # as text, and even this small response has an execution and pipe byte cap.
+    result = bounded_diagnostic_output(
+        ['docker', 'inspect', '--format', DIAGNOSTIC_INSPECT_FORMAT, diagnostic_container_name(name)], 4096)
+    if result['truncated'] or result['timed_out']:
+        raise RestoreError('offline_diagnostic_inspect_unavailable')
+    return json.loads(result['data'])
+
+
+def diagnostic_terminal(logs):
+    """Keep typed progress and error enums only; free-form log bytes die here."""
+    data = logs['data']
+    if not isinstance(data, bytes) or len(data) > DIAGNOSTIC_LOG_BYTES:
+        raise RestoreError('invalid_diagnostic_log_bound')
+    events, dropped = [], 0
+    lines = data.splitlines()[-DIAGNOSTIC_LOG_LINES:]
+    progress_keys = {'event', 'phase'} | DIAGNOSTIC_PROGRESS_COUNTS | DIAGNOSTIC_PROGRESS_TIMES
+    for raw in lines:
+        line = raw.decode('utf-8', errors='replace')
+        try:
+            value = json.loads(line)
+        except (ValueError, RecursionError):
+            value = None
+        if (isinstance(value, dict) and set(value) == progress_keys
+                and value['event'] == 'offline_storage_progress'
+                and type(value['phase']) is str and value['phase'] in DIAGNOSTIC_PHASES
+                and all(type(value[key]) is int and 0 <= value[key] <= 2**64 - 1
+                        for key in DIAGNOSTIC_PROGRESS_COUNTS)
+                and 1 <= value['workers'] <= 64 and value['payload_budget_bytes'] > 0
+                and all(type(value[key]) in (int, float) and 0 <= value[key] <= 1e18
+                        and math.isfinite(value[key]) for key in DIAGNOSTIC_PROGRESS_TIMES)):
+            events.append(value)
+            continue
+        match = re.fullmatch(r'Error: Error \{ code: ("(?:[^"\\]|\\.)*"), message: ("(?:[^"\\]|\\.)*") \}', line)
+        if match:
+            try:
+                code, message = (json.loads(part) for part in match.groups())
+            except ValueError:
+                code = message = None
+            if code in DIAGNOSTIC_ERROR_CODES:
+                events.append({'event': 'application_error', 'code': code,
+                               'reason': DIAGNOSTIC_REASONS.get(message, 'unrecognized_message')})
+                continue
+        dropped += 1
+    return {'captured_bytes': len(data), 'truncated': logs['truncated'] is True,
+            'timed_out': logs['timed_out'] is True, 'dropped_lines': dropped,
+            'raw_logs_retained': False, 'events': events[-16:]}
+
+
+def write_private_diagnostic(root, filename, value, *, owner_uid=0):
+    """Exclusive, bounded, root-private /tmp output; owner override is for fixtures."""
+    root = Path(root)
+    if (not root.is_absolute() or Path('/tmp') not in root.parents or '..' in root.parts
+            or not re.fullmatch(r'[0-9a-f]{24}-offline-[1-9][0-9]{0,7}\.json', filename)
+            or os.geteuid() != owner_uid):
+        raise RestoreError('unsafe_diagnostic_destination')
+    data = (json.dumps(value, sort_keys=True, allow_nan=False) + '\n').encode()
+    if len(data) > DIAGNOSTIC_FILE_BYTES:
+        raise RestoreError('diagnostic_artifact_exceeds_bound')
+    directory = os.open('/tmp', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in root.parts[2:]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            info = os.fstat(child)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != owner_uid
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                os.close(child)
+                raise RestoreError('unsafe_diagnostic_directory')
+            os.close(directory)
+            directory = child
+        # Never delete prior diagnostics to make room for a new one.
+        with os.scandir(directory) as entries:
+            for count, _ in enumerate(entries, 1):
+                if count >= 64:
+                    raise RestoreError('diagnostic_directory_capacity')
+        descriptor = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner_uid
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise RestoreError('unsafe_diagnostic_artifact')
+            with os.fdopen(descriptor, 'wb', closefd=False) as output:
+                output.write(data)
+                output.flush()
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def validate_snapshot(value):
@@ -213,12 +400,17 @@ def rpc(ip, method, params, private=PRIVATE):
 class Drill:
     def __init__(self, snapshot, run=execute, root=None, private=PRIVATE,
                  token=None, sleep=time.sleep, call=rpc, server=None, schema=None,
-                 config_text=None, source_dataset=None, clone_quota='64G', resource_profile='restore'):
+                 config_text=None, source_dataset=None, clone_quota='64G', resource_profile='restore',
+                 diagnostic_root=DIAGNOSTIC_ROOT, log_reader=read_terminal_logs,
+                 diagnostic_writer=write_private_diagnostic, diagnostic_inspector=inspect_offline_failure):
         if type(clone_quota) is not str or clone_quota not in CLONE_QUOTAS:
             raise RestoreError('invalid_restore_clone_quota')
         if type(resource_profile) is not str or resource_profile not in RESOURCE_PROFILES:
             raise RestoreError('invalid_restore_resource_profile')
         self.resource_profile = resource_profile
+        self.diagnostic_root, self.log_reader = Path(diagnostic_root), log_reader
+        self.diagnostic_writer, self.diagnostic_inspector = diagnostic_writer, diagnostic_inspector
+        self.last_offline_diagnostic = None
         self.clone_quota = clone_quota
         self.snapshot = validate_snapshot(snapshot)
         if schema is not None and (type(schema) is not int or schema not in PROFILES):
@@ -367,6 +559,46 @@ class Drill:
                 '-v', str(self.root / 'config') + ':/etc/devres/config:ro',
                 '-v', str(self.root / 'tls') + ':/etc/devres/tls:ro']
 
+    def capture_offline_failure(self, command, name, state, error):
+        """Best effort only; never expose private paths or free-form failure text."""
+        self.last_offline_diagnostic = 'unavailable'
+        try:
+            inspected = self.diagnostic_inspector(name)
+            if not isinstance(inspected, dict) or inspected.get('owner') != self.token:
+                return
+            current = inspected.get('state')
+            if not isinstance(current, dict):
+                return
+            exit_code = current.get('ExitCode')
+            engine_error = state.get('Error') if isinstance(state, dict) else None
+            engine_error = engine_error if isinstance(engine_error, str) else None
+            failures = {'offline_command_failed', 'offline_command_timed_out',
+                        'host_memory_headroom_insufficient', 'host_memory_headroom_unavailable',
+                        'restore_command_failed', 'restore_command_unavailable_or_timed_out',
+                        'restore_command_output_exceeds_bound'}
+            failure = str(error) if isinstance(error, RestoreError) else None
+            value = {'version': 1, 'command': command, 'server': SERVER,
+                     'failure_code': failure if failure in failures else 'offline_execution_failed',
+                     'resource_profile': self.resource_profile, 'owner_token': self.token,
+                     'worker_sequence': self.offline_sequence,
+                     'exit_code': exit_code if type(exit_code) is int and -2**31 <= exit_code < 2**31 else None,
+                     'oom_killed': current.get('OOMKilled') if type(current.get('OOMKilled')) is bool else None,
+                     'running': current.get('Running') if type(current.get('Running')) is bool else None,
+                     'engine_error_present': current.get('ErrorPresent') if type(current.get('ErrorPresent')) is bool else None,
+                     'engine_error_class': {'': 'none', 'context deadline exceeded': 'deadline_exceeded',
+                                            'permission denied': 'permission_denied'}.get(engine_error,
+                                                'unrecognized' if current.get('ErrorPresent') else 'none')}
+            try:
+                value['terminal'] = diagnostic_terminal(self.log_reader(name))
+            except Exception:
+                value['terminal'] = {'unavailable': True, 'raw_logs_retained': False}
+            filename = self.token + '-offline-' + str(self.offline_sequence) + '.json'
+            self.diagnostic_writer(self.diagnostic_root, filename, value)
+            self.last_offline_diagnostic = 'saved'
+        except Exception:
+            # Diagnostics must not mask the original failure or suppress cleanup.
+            pass
+
     def offline(self, command, target=SERVER, timeout=86400):
         """Run one reviewed offline command; stop/remove its writer on every exit."""
         if command not in ('migrate-storage', 'verify-storage', 'activate-storage') or target != SERVER:
@@ -385,6 +617,7 @@ class Drill:
         args = [command, '/etc/devres/config/backend.toml']
         if command == 'migrate-storage':
             args.extend(['--to', 'blake3'])
+        state = None
         try:
             self.run(['docker', 'run', '-d', '--name', name, '--label', LABEL_KEY + '=' + self.token,
                       '--network', self.name, '--read-only', '--cap-drop=ALL',
@@ -406,6 +639,9 @@ class Drill:
                     raise RestoreError('offline_command_timed_out')
                 self.sleep(min(1, timeout))
             raise RestoreError('offline_command_timed_out')
+        except Exception as error:
+            self.capture_offline_failure(command, name, state, error)
+            raise
         finally:
             # Docker removal waits for container termination before dropping the
             # writer; failed cleanup deliberately prevents the next command.

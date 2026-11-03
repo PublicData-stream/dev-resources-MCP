@@ -197,6 +197,30 @@ evidence may not be visible through the restored older service. Keep snapshot
 holds until the resulting restore is qualified; do not manually clear the
 upgrade journal or a capacity fence to resume writes.
 
+### Offline failure diagnostics
+
+Before removing a failed offline worker, the operator rechecks its ownership
+label and fixed state fields with a separately bounded 4 KiB inspection, and attempts to retain bounded diagnostic metadata in root-owned0700
+`/tmp/devres-offline-diagnostics`, outside disposable clone cleanup. Files are
+exclusive0600 JSON; existing files, symlinks, unsafe parent ownership/modes and
+64 retained entries refuse new output. The directory is temporary
+operator evidence and is separate from permanent corpus storage and receipts.
+
+The Docker log reader requests at most 64 terminal lines and buffers no more than
+64 KiB, with a three-second read deadline and at most one further second to reap
+its owned Docker client. The ownership/state inspection has the same time limits. A single oversized line is truncated before buffering.
+Only fixed progress events with known phases and numeric fields, recognized
+application error-code/reason enums, and exit/OOM/engine-error metadata survive
+filtering. Raw logs, arbitrary error messages, credentials, request inputs and
+source bodies or their hashes are never written. Unknown messages are suppressed
+and unrecognized lines counted, so the record may still leave the exact cause
+unresolved. Inspect only the structured metadata; never copy private owner tokens
+into public evidence or receipts.
+
+Diagnostics are best effort. Read/write failure does not replace the original
+fixed error or prevent worker cleanup, and successful commands create no record.
+The metadata does not authorize retry, collector changes, recovery or publication.
+
 ### Deadline-bound single migration
 
 For a supervised cutover with an absolute deadline, use the reviewed direct mode

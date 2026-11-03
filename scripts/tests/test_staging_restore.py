@@ -1,6 +1,11 @@
 import hashlib
 import importlib.util
 import json
+import os
+import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -34,6 +39,8 @@ class FakeHost:
         self.offline_running = False
         self.offline_failure = False
         self.remove_failure = False
+        self.offline_oom = False
+        self.engine_error = ''
         self.pool_free = str(restore.REHEARSAL_HEADROOM)
 
     def run(self, args):
@@ -73,9 +80,11 @@ class FakeHost:
         if args[:2] == ['docker', 'run']:
             return 'container-id'
         if args[:2] == ['docker', 'inspect']:
+            if '{{json .Config.Labels}}' in args:
+                return json.dumps({restore.LABEL_KEY: self.owner})
             if '--format' in args:
-                return json.dumps({'Running': self.offline_running,
-                                   'ExitCode': 1 if self.corrupt or self.offline_failure else self.offline_exit})
+                return json.dumps({'Running': self.offline_running, 'OOMKilled': self.offline_oom,
+                                   'Error': self.engine_error, 'ExitCode': 1 if self.corrupt or self.offline_failure else self.offline_exit})
             return json.dumps([{'Config': {'Labels': {restore.LABEL_KEY: self.owner}},
                                 'NetworkSettings': {'Networks': {'devres-staging-restore-' + TOKEN: {'IPAddress': '172.28.0.2'}}}}])
         if args[:2] == ['docker', 'rm']:
@@ -114,6 +123,8 @@ class RestoreTests(unittest.TestCase):
             (self.private / name).write_text('disposable test certificate')
         self.host = FakeHost(self.root)
         self.calls = []
+        self.log_reads = []
+        self.terminal_logs = b''
 
     def rpc(self, ip, method, params, private):
         self.calls.append((method, params))
@@ -123,14 +134,254 @@ class RestoreTests(unittest.TestCase):
                                           'sourceUrl': restore.SOURCE_PREFIX + version + '/source.tar.gz'}}
         return {'contents': [{'text': BODY.decode()}]}
 
+    def read_logs(self, name):
+        self.log_reads.append(name)
+        self.assertFalse(any(c[:3] == ['docker', 'rm', '-f'] and c[-1] == name for c in self.host.commands))
+        return {'data': self.terminal_logs, 'truncated': False, 'timed_out': False}
+
+    def write_diagnostic(self, root, filename, value):
+        restore.write_private_diagnostic(root, filename, value, owner_uid=os.geteuid())
+
+    def inspect_failure(self, name):
+        self.host.commands.append(['docker', 'inspect', '--format', restore.DIAGNOSTIC_INSPECT_FORMAT, name])
+        return {'owner': self.host.owner, 'state': {
+            'ExitCode': 1 if self.host.corrupt or self.host.offline_failure else self.host.offline_exit,
+            'OOMKilled': self.host.offline_oom, 'Running': self.host.offline_running,
+            'ErrorPresent': bool(self.host.engine_error)}}
+
+    def diagnostic_arguments(self):
+        return {'diagnostic_root': self.base / 'diagnostics', 'log_reader': self.read_logs,
+                'diagnostic_writer': self.write_diagnostic, 'diagnostic_inspector': self.inspect_failure}
+
     def drill(self, **kwargs):
         return restore.Drill(SNAPSHOT, run=self.host.run, root=self.root, private=self.private,
-                             token=TOKEN, sleep=lambda _: None, call=self.rpc, **kwargs)
+                             token=TOKEN, sleep=lambda _: None, call=self.rpc, **self.diagnostic_arguments(), **kwargs)
 
     def run_verify(self, **kwargs):
         with patch.object(restore.os, 'chown'):
             return restore.verify(SNAPSHOT, run=self.host.run, root=self.root, private=self.private,
-                                  token=TOKEN, sleep=lambda _: None, call=self.rpc, **kwargs)
+                                  token=TOKEN, sleep=lambda _: None, call=self.rpc, **self.diagnostic_arguments(), **kwargs)
+
+    def progress(self, **updates):
+        value = {key: 1 for key in restore.DIAGNOSTIC_PROGRESS_COUNTS | restore.DIAGNOSTIC_PROGRESS_TIMES}
+        value.update(event='offline_storage_progress', phase='graph_rfc')
+        value.update(updates)
+        return value
+
+    def diagnostic(self):
+        files = list((self.base / 'diagnostics').glob('*.json'))
+        self.assertEqual(len(files), 1)
+        return files[0], json.loads(files[0].read_bytes())
+
+    def test_failed_worker_preserves_typed_error_and_exit_before_cleanup_without_raw_secrets(self):
+        secret = 'postgres://private:password-canary@secret.example/db source-body-canary'
+        self.host.offline_exit = 1
+        self.host.engine_error = secret
+        self.terminal_logs = (json.dumps(self.progress()) + '\n' + secret + '\n'
+            + 'Error: Error { code: "integrity", message: "Unresolved RFC migration reference." }\n'
+            + 'Error: Error { code: "unavailable", message: ' + json.dumps(secret) + ' }\n').encode()
+        tool = self.drill()
+        tool.postgres_started = True
+        with self.assertRaisesRegex(restore.RestoreError, '^offline_command_failed$') as failure:
+            tool.offline('migrate-storage')
+        path, value = self.diagnostic()
+        self.assertEqual(tool.last_offline_diagnostic, 'saved')
+        self.assertEqual(value['exit_code'], 1)
+        self.assertFalse(value['oom_killed'])
+        self.assertTrue(value['engine_error_present'])
+        self.assertEqual(value['engine_error_class'], 'unrecognized')
+        self.assertEqual(value['failure_code'], 'offline_command_failed')
+        self.assertEqual(value['terminal']['events'][-2:], [
+            {'event': 'application_error', 'code': 'integrity', 'reason': 'rfc_reference_unresolved'},
+            {'event': 'application_error', 'code': 'unavailable', 'reason': 'unrecognized_message'}])
+        self.assertEqual(value['terminal']['events'][0]['phase'], 'graph_rfc')
+        self.assertFalse(value['terminal']['raw_logs_retained'])
+        self.assertEqual(value['terminal']['dropped_lines'], 1)
+        self.assertNotIn(secret, path.read_text() + str(failure.exception) + repr(vars(tool)))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        self.assertEqual(path.stat().st_uid, os.geteuid())
+        self.assertEqual(self.host.commands[-1][:3], ['docker', 'rm', '-f'])
+        self.assertFalse(tool.containers)
+
+    def test_oom_failure_survives_runtime_tree_cleanup(self):
+        self.host.offline_exit = 137
+        self.host.offline_oom = True
+        tool = self.drill()
+        try:
+            with patch.object(restore.os, 'chown'):
+                tool.prepare()
+            tool.start_postgres()
+            with self.assertRaisesRegex(restore.RestoreError, 'offline_command_failed'):
+                tool.offline('verify-storage')
+        finally:
+            tool.cleanup()
+        path, value = self.diagnostic()
+        self.assertTrue(value['oom_killed'])
+        self.assertEqual(value['exit_code'], 137)
+        self.assertFalse(self.root.exists())
+        self.assertTrue(path.exists())
+
+    def test_timeout_retains_existing_error_and_cleanup(self):
+        self.host.offline_running = True
+        tool = self.drill()
+        tool.postgres_started = True
+        with self.assertRaisesRegex(restore.RestoreError, '^offline_command_timed_out$'):
+            tool.offline('activate-storage', timeout=1)
+        _, value = self.diagnostic()
+        self.assertEqual(value['failure_code'], 'offline_command_timed_out')
+        self.assertTrue(value['running'])
+        self.assertFalse(tool.containers)
+        self.assertEqual(self.host.commands[-1][:3], ['docker', 'rm', '-f'])
+
+    def test_diagnostic_writer_failure_cannot_mask_original_error_or_skip_removal(self):
+        self.host.offline_exit = 1
+        tool = self.drill()
+        tool.postgres_started = True
+        tool.diagnostic_writer = lambda *args: (_ for _ in ()).throw(OSError('secret storage-error-canary'))
+        with self.assertRaisesRegex(restore.RestoreError, '^offline_command_failed$'):
+            tool.offline('migrate-storage')
+        self.assertEqual(tool.last_offline_diagnostic, 'unavailable')
+        self.assertFalse(tool.containers)
+        self.assertEqual(self.host.commands[-1][:3], ['docker', 'rm', '-f'])
+
+    def test_unavailable_terminal_reader_still_retains_state_metadata(self):
+        self.host.offline_exit = 1
+        tool = self.drill()
+        tool.postgres_started = True
+        tool.log_reader = lambda *args: (_ for _ in ()).throw(RuntimeError('secret log-error-canary'))
+        with self.assertRaisesRegex(restore.RestoreError, '^offline_command_failed$'):
+            tool.offline('migrate-storage')
+        path, value = self.diagnostic()
+        self.assertEqual(value['terminal'], {'unavailable': True, 'raw_logs_retained': False})
+        self.assertNotIn('log-error-canary', path.read_text())
+        self.assertFalse(tool.containers)
+
+    def test_changed_worker_owner_prevents_log_access_and_artifact(self):
+        self.host.offline_exit = 1
+        self.host.owner = 'b' * 24
+        tool = self.drill()
+        tool.postgres_started = True
+        with self.assertRaisesRegex(restore.RestoreError, '^offline_command_failed$'):
+            tool.offline('migrate-storage')
+        self.assertFalse(self.log_reads)
+        self.assertFalse((self.base / 'diagnostics').exists())
+        self.assertFalse(tool.containers)
+
+    def test_success_does_not_read_logs_or_create_diagnostics(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        self.assertEqual(tool.offline('verify-storage'), {'command': 'verify-storage', 'completed': True})
+        self.assertFalse(self.log_reads)
+        self.assertFalse((self.base / 'diagnostics').exists())
+        self.assertIsNone(tool.last_offline_diagnostic)
+
+    def test_terminal_filter_drops_extra_fields_unknown_phases_and_bad_numeric_types(self):
+        secret = 'private-provider-body-canary'
+        invalid = [self.progress(phase=secret), self.progress(phase=[]), self.progress(admitted=True),
+                   self.progress(elapsed_secs=float('inf')), self.progress(payload=secret)]
+        data = ('\n'.join(json.dumps(value) for value in invalid) + '\n' + secret + '\n'
+                + json.dumps(self.progress())).encode()
+        value = restore.diagnostic_terminal({'data': data, 'truncated': True, 'timed_out': True})
+        self.assertEqual(value['dropped_lines'], 6)
+        self.assertEqual(value['events'], [self.progress()])
+        self.assertTrue(value['truncated'])
+        self.assertTrue(value['timed_out'])
+        self.assertNotIn(secret, json.dumps(value))
+        with self.assertRaisesRegex(restore.RestoreError, 'log_bound'):
+            restore.diagnostic_terminal({'data': b'x' * (restore.DIAGNOSTIC_LOG_BYTES + 1)})
+
+    def test_private_diagnostic_writer_refuses_links_unsafe_paths_and_overwrite(self):
+        filename = TOKEN + '-offline-1.json'
+        root = self.base / 'diagnostics'
+        self.write_diagnostic(root, filename, {'fixed': True})
+        with self.assertRaises(FileExistsError):
+            self.write_diagnostic(root, filename, {'fixed': False})
+        self.assertEqual(json.loads((root / filename).read_bytes()), {'fixed': True})
+        target = self.base / 'target'
+        target.write_text('private canary')
+        (root / (TOKEN + '-offline-2.json')).symlink_to(target)
+        with self.assertRaises(FileExistsError):
+            self.write_diagnostic(root, TOKEN + '-offline-2.json', {})
+        symlink = self.base / 'link'
+        symlink.symlink_to(root, target_is_directory=True)
+        with self.assertRaises(OSError):
+            self.write_diagnostic(symlink, TOKEN + '-offline-3.json', {})
+        root.chmod(0o755)
+        with self.assertRaisesRegex(restore.RestoreError, 'unsafe_diagnostic_directory'):
+            self.write_diagnostic(root, TOKEN + '-offline-3.json', {})
+        self.assertEqual(target.read_text(), 'private canary')
+        for path in (Path('/tmp'), Path('/var/lib/forbidden'), self.base / '..' / 'escape'):
+            with self.assertRaisesRegex(restore.RestoreError, 'unsafe_diagnostic_destination'):
+                self.write_diagnostic(path, filename, {})
+
+    def test_private_diagnostic_writer_requires_root_by_default_and_bounds_artifacts(self):
+        root = self.base / 'diagnostics'
+        filename = TOKEN + '-offline-1.json'
+        with patch.object(restore.os, 'geteuid', return_value=12345):
+            with self.assertRaisesRegex(restore.RestoreError, 'unsafe_diagnostic_destination'):
+                restore.write_private_diagnostic(root, filename, {})
+        with self.assertRaisesRegex(restore.RestoreError, 'artifact_exceeds_bound'):
+            self.write_diagnostic(root, filename, {'oversized': 'x' * restore.DIAGNOSTIC_FILE_BYTES})
+        self.assertFalse(root.exists())
+
+    def test_terminal_reader_bounds_single_huge_line_before_buffering(self):
+        original = subprocess.Popen
+        children = []
+        def spawn(args, **kwargs):
+            self.assertEqual(args[:4], ['docker', 'logs', '--tail', '64'])
+            child = original([sys.executable, '-I', '-B', '-c',
+                              'import os; os.write(1, b"x" * (8 * 1024 * 1024))'], **kwargs)
+            children.append(child)
+            return child
+        with patch.object(restore.subprocess, 'Popen', side_effect=spawn):
+            value = restore.read_terminal_logs('devres-staging-restore-' + TOKEN + '-offline-1')
+        self.assertEqual(len(value['data']), restore.DIAGNOSTIC_LOG_BYTES)
+        self.assertTrue(value['truncated'])
+        self.assertFalse(value['timed_out'])
+        self.assertIsNotNone(children[0].returncode)
+
+    def test_terminal_reader_times_out_and_reaps_stalled_docker_client(self):
+        original = subprocess.Popen
+        children = []
+        def spawn(args, **kwargs):
+            child = original([sys.executable, '-I', '-B', '-c', 'import time; time.sleep(60)'], **kwargs)
+            children.append(child)
+            return child
+        started = time.monotonic()
+        with patch.object(restore.subprocess, 'Popen', side_effect=spawn), patch.object(restore, 'DIAGNOSTIC_LOG_SECONDS', 0.05):
+            value = restore.read_terminal_logs('devres-staging-restore-' + TOKEN + '-offline-1')
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(value['timed_out'])
+        self.assertFalse(value['data'])
+        self.assertIsNotNone(children[0].returncode)
+
+    def test_diagnostic_inspection_has_its_own_pipe_bound_and_never_requests_raw_engine_error(self):
+        original = subprocess.Popen
+        children = []
+        def spawn(args, **kwargs):
+            self.assertEqual(args[:3], ['docker', 'inspect', '--format'])
+            self.assertIn('ErrorPresent', args[3])
+            self.assertNotIn('json .State.Error', args[3])
+            child = original([sys.executable, '-I', '-B', '-c',
+                              'import os; os.write(1, b"x" * (8 * 1024 * 1024))'], **kwargs)
+            children.append(child)
+            return child
+        with patch.object(restore.subprocess, 'Popen', side_effect=spawn):
+            with self.assertRaisesRegex(restore.RestoreError, 'inspect_unavailable'):
+                restore.inspect_offline_failure('devres-staging-restore-' + TOKEN + '-offline-1')
+        self.assertIsNotNone(children[0].returncode)
+
+    def test_diagnostic_inspection_timeout_is_best_effort_and_cleanup_still_runs(self):
+        self.host.offline_exit = 1
+        tool = self.drill()
+        tool.postgres_started = True
+        tool.diagnostic_inspector = lambda *args: (_ for _ in ()).throw(restore.RestoreError('offline_diagnostic_inspect_unavailable'))
+        with self.assertRaisesRegex(restore.RestoreError, '^offline_command_failed$'):
+            tool.offline('migrate-storage')
+        self.assertEqual(tool.last_offline_diagnostic, 'unavailable')
+        self.assertFalse(self.log_reads)
+        self.assertFalse(tool.containers)
 
     def test_restore_owner_is_recorded_before_any_objects_are_created(self):
         seen = []
@@ -217,7 +468,10 @@ class RestoreTests(unittest.TestCase):
                 tool.offline('migrate-storage')
         self.assertEqual(self.host.commands[-1][:3], ['docker', 'rm', '-f'])
         self.assertFalse(tool.containers)
-        self.assertFalse(any(c[:2] == ['docker', 'inspect'] for c in self.host.commands))
+        inspections = [c for c in self.host.commands if c[:2] == ['docker', 'inspect']]
+        # The failed guard prevents normal state polling; diagnostics first
+        # revalidate ownership before reading failure state and terminal logs.
+        self.assertIn(restore.DIAGNOSTIC_INSPECT_FORMAT, inspections[0])
 
     def test_upgrade_memory_guard_failure_before_start_does_not_claim_worker(self):
         tool = self.drill(resource_profile='upgrade')
