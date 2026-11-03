@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::{io::Read, path::Path, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +17,16 @@ pub struct FileEvidence {
 
 /// Streaming verification under the caller's existing admission/deadline.
 pub fn file_digest(path: &Path, max_bytes: u64, deadline: Instant) -> Result<(String, u64)> {
+    file_digest_with_cancel(path, max_bytes, deadline, &CancellationToken::new())
+}
+
+/// Offline verification additionally checks cooperative cancellation between reads.
+pub fn file_digest_with_cancel(
+    path: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<(String, u64)> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|_| Error::integrity("Retained file unavailable."))?;
     if !metadata.is_file() || metadata.len() > max_bytes {
@@ -30,6 +41,7 @@ pub fn file_digest(path: &Path, max_bytes: u64, deadline: Instant) -> Result<(St
     let mut count = 0_u64;
     let mut buffer = [0_u8; 65536];
     loop {
+        hash_not_cancelled(cancel)?;
         if Instant::now() >= deadline {
             return Err(Error::capacity(
                 "Retained file verification deadline exceeded.",
@@ -433,7 +445,38 @@ pub fn payload_hash(namespace: &str, key: &str, value: &serde_json::Value) -> Re
 /// exact decimal coefficient/exponent pairs so PostgreSQL numeric formatting does
 /// not change the checksum (e.g. 1.00 and 1e0), without conversion through f64.
 pub fn canonical_hash(value: &serde_json::Value) -> Result<String> {
-    fn encode(value: &serde_json::Value, out: &mut blake3::Hasher, depth: usize) -> Result<()> {
+    canonical_hash_with_cancel(value, &CancellationToken::new())
+}
+
+fn hash_not_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::new(
+            "cancelled",
+            "Offline integrity hashing canceled.",
+        ));
+    }
+    Ok(())
+}
+
+/// Identical canonical bytes, with bounded cancellation checkpoints for offline work.
+pub fn canonical_hash_with_cancel(
+    value: &serde_json::Value,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    fn update(out: &mut blake3::Hasher, bytes: &[u8], cancel: &CancellationToken) -> Result<()> {
+        for chunk in bytes.chunks(65536) {
+            hash_not_cancelled(cancel)?;
+            out.update(chunk);
+        }
+        Ok(())
+    }
+    fn encode(
+        value: &serde_json::Value,
+        out: &mut blake3::Hasher,
+        depth: usize,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        hash_not_cancelled(cancel)?;
         if depth > 128 {
             return Err(Error::capacity("Integrity value nesting exceeded."));
         }
@@ -447,7 +490,7 @@ pub fn canonical_hash(value: &serde_json::Value) -> Result<String> {
             serde_json::Value::String(v) => {
                 out.update(b"s");
                 out.update(&(v.len() as u64).to_be_bytes());
-                out.update(v.as_bytes());
+                update(out, v.as_bytes(), cancel)?;
             }
             serde_json::Value::Number(v) => {
                 out.update(b"d");
@@ -492,15 +535,20 @@ pub fn canonical_hash(value: &serde_json::Value) -> Result<String> {
                 out.update(b"a");
                 out.update(&(values.len() as u64).to_be_bytes());
                 for value in values {
-                    encode(value, out, depth + 1)?;
+                    encode(value, out, depth + 1, cancel)?;
                 }
             }
             serde_json::Value::Object(values) => {
                 out.update(b"o");
                 out.update(&(values.len() as u64).to_be_bytes());
                 for (key, value) in values {
-                    encode(&serde_json::Value::String(key.clone()), out, depth + 1)?;
-                    encode(value, out, depth + 1)?;
+                    encode(
+                        &serde_json::Value::String(key.clone()),
+                        out,
+                        depth + 1,
+                        cancel,
+                    )?;
+                    encode(value, out, depth + 1, cancel)?;
                 }
             }
         }
@@ -508,13 +556,62 @@ pub fn canonical_hash(value: &serde_json::Value) -> Result<String> {
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"devres-canonical-json-v1\0");
-    encode(value, &mut hasher, 0)?;
+    encode(value, &mut hasher, 0, cancel)?;
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_hashes_preserve_vectors_and_honor_cancellation() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"a":[1.00,1e0,-0,123456789012345678901234567890],"b":"public fixture"}"#,
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            canonical_hash(&value).unwrap(),
+            canonical_hash_with_cancel(&value, &cancel).unwrap()
+        );
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let path = root.path().join("public");
+        std::fs::write(&path, b"public fixture").unwrap();
+        assert_eq!(
+            file_digest(
+                &path,
+                1024,
+                Instant::now() + std::time::Duration::from_secs(5)
+            )
+            .unwrap(),
+            file_digest_with_cancel(
+                &path,
+                1024,
+                Instant::now() + std::time::Duration::from_secs(5),
+                &cancel
+            )
+            .unwrap()
+        );
+        cancel.cancel();
+        assert_eq!(
+            canonical_hash_with_cancel(&value, &cancel)
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
+        assert_eq!(
+            file_digest_with_cancel(
+                &path,
+                1024,
+                Instant::now() + std::time::Duration::from_secs(5),
+                &cancel
+            )
+            .unwrap_err()
+            .code,
+            "cancelled"
+        );
+    }
 
     #[test]
     fn vectors_and_namespace_validation() {
