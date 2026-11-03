@@ -135,6 +135,8 @@ class UpgradeTests(unittest.TestCase):
         FakeDrill.fail_command = None
 
     def phase_record(self, phase, **updates):
+        if phase == 'rehearsed':
+            updates.setdefault('rehearsal_identity', upgrade.rehearsal_identity())
         record = {'version': 1, 'fence': None, 'operation': None, 'verified': [],
                   'phase': phase, 'token': 'a' * 24,
                   'timers': {'devres-staging-backup.timer': 'active'}, **updates}
@@ -198,6 +200,7 @@ class UpgradeTests(unittest.TestCase):
     def test_successful_upgrade_orders_offline_stages_and_leaves_collectors_paused(self):
         result = self.instance.apply()
         self.assertTrue(result['candidate_ready'])
+        self.assertEqual(FakeDrill.initializations[-1]['resource_profile'], 'upgrade')
         self.assertEqual(FakeDrill.events, ['prepare', 'start_postgres', 'migrate-storage',
                          'verify-storage', 'activate-storage', 'cleanup'])
         record = upgrade.read_record(self.root / 'state')
@@ -262,6 +265,11 @@ class UpgradeTests(unittest.TestCase):
         self.instance.clock = lambda: next(clock)
         result = self.instance.rehearsal()
         self.assertEqual(result['deadline_seconds'], 1802)
+        self.assertEqual(FakeDrill.initializations[0]['resource_profile'], 'upgrade')
+        self.assertEqual(result['rehearsal_identity'], upgrade.rehearsal_identity())
+        self.assertTrue(all(value >= 0 for value in result['phase_seconds'].values()))
+        self.assertEqual(set(result['phase_seconds']), {'snapshot', 'old_restore', 'migrate-storage',
+                         'verify-storage', 'activate-storage', 'candidate_read', 'schema10_restore', 'rollback_restore'})
         self.assertEqual([kwargs['schema'] for _, kwargs in calls], [9, 10, 9])
         self.assertEqual([kwargs.get('clone_quota') for kwargs in FakeDrill.initializations], ['512G'])
         self.assertTrue(all('clone_quota' not in kwargs for _, kwargs in calls))
@@ -275,6 +283,53 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rehearsed')
         self.assertFalse(any(any(str(arg).startswith(upgrade.WATCHDOG) for arg in command)
                              for command in self.commands))
+
+    def test_old_or_changed_rehearsal_identity_cannot_drain_or_replace_journal(self):
+        identity = upgrade.rehearsal_identity()
+        changed = [None]
+        for key in ('server', 'version', 'source_url', 'bundle_sha256', 'resource_profile'):
+            value = dict(identity)
+            value[key] = 'changed'
+            changed.append(value)
+        for value in changed:
+            with self.subTest(identity=value):
+                before = self.phase_record('rehearsed', deadline_seconds=1800,
+                                           snapshot=SNAPSHOT, rehearsal_identity=value)
+                with self.assertRaisesRegex(upgrade.UpgradeError, 'matching_rehearsal_identity_required'):
+                    self.instance.apply()
+                self.assertEqual(upgrade.read_record(self.root / 'state'), before)
+                self.assertFalse(self.tool.commands)
+                self.assertFalse(self.commands)
+                self.assertEqual((self.private / 'backend.toml').read_text(), CONFIG)
+
+    def test_bundle_content_changes_rehearsal_identity(self):
+        directory = self.root / 'bundle'
+        directory.mkdir()
+        for name in upgrade.BUNDLE_FILES:
+            (directory / name).write_bytes((upgrade.HERE / name).read_bytes())
+        with patch.object(upgrade, 'HERE', directory):
+            before = upgrade.rehearsal_identity()
+            with (directory / 'recovery.py').open('a') as output:
+                output.write('\n# changed reviewed bundle\n')
+            after = upgrade.rehearsal_identity()
+        self.assertNotEqual(before['bundle_sha256'], after['bundle_sha256'])
+        self.assertEqual(before['resource_profile'], after['resource_profile'])
+
+    def test_resource_changes_change_rehearsal_identity(self):
+        before = upgrade.rehearsal_identity()
+        with patch.dict(upgrade.restore.RESOURCE_PROFILES['upgrade'], worker_memory='129g'):
+            after = upgrade.rehearsal_identity()
+        self.assertNotEqual(before['resource_profile'], after['resource_profile'])
+
+    def test_bundle_changed_during_rehearsal_cannot_publish_measured_receipt(self):
+        before = upgrade.rehearsal_identity()
+        after = {**before, 'bundle_sha256': 'changed'}
+        with patch.object(upgrade, 'rehearsal_identity', side_effect=[before, after]):
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'rehearsal_identity_changed'):
+                self.instance.rehearsal()
+        self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rehearsal_failed')
+        self.assertEqual(FakeDrill.events[-1], 'cleanup')
+        self.assertIn(['systemctl', 'start', 'devres-staging-backup.timer'], self.commands)
 
     def test_wrong_existing_image_does_not_stop_workloads_or_attempt_rollback(self):
         with patch.object(self.tool, 'k', return_value='unexpected'), patch.object(self.instance, '_rollback') as rollback:
@@ -657,6 +712,7 @@ class UpgradeTests(unittest.TestCase):
         result = self.direct()
         record = upgrade.read_record(self.root / 'state')
         self.assertEqual(record['mode'], 'direct')
+        self.assertEqual(FakeDrill.initializations[-1]['resource_profile'], 'direct')
         self.assertNotIn('rehearsal_snapshot', record)
         self.assertEqual(record['phase'], 'awaiting_acceptance')
         self.assertEqual(seen, [(SNAPSHOT, 9, upgrade.restore.OLD_SERVER)])

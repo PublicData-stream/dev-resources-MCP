@@ -150,18 +150,16 @@ class RestoreTests(unittest.TestCase):
         self.assertFalse(self.host.commands)
         self.assertFalse(self.root.exists())
 
-    def test_accelerated_offline_guard_preserves_host_headroom(self):
-        tool = self.drill()
-        tool.accelerated = True
+    def test_direct_offline_guard_preserves_host_headroom(self):
+        tool = self.drill(resource_profile='direct')
         tool.postgres_started = True
         with patch.object(tool, 'require_memory_headroom', side_effect=restore.RestoreError('host_memory_headroom_insufficient')):
             with self.assertRaisesRegex(restore.RestoreError, 'headroom_insufficient'):
                 tool.offline('migrate-storage')
         self.assertFalse(self.host.commands)
 
-    def test_accelerated_profile_bounds_cpu_memory_and_counts_scratch_inside_worker(self):
-        tool = self.drill()
-        tool.accelerated = True
+    def test_direct_profile_bounds_cpu_memory_and_counts_scratch_inside_worker(self):
+        tool = self.drill(resource_profile='direct')
         tool.runtime_owned = True
         with patch.object(tool, 'require_memory_headroom'):
             tool.start_postgres()
@@ -177,6 +175,64 @@ class RestoreTests(unittest.TestCase):
         self.assertTrue(any('size=64g,' in a for a in worker))
         self.assertIn('--read-only', worker)
         self.assertIn('--security-opt=no-new-privileges', worker)
+
+    def test_upgrade_profile_matches_requested_worker_database_and_scratch_limits(self):
+        tool = self.drill(resource_profile='upgrade')
+        tool.runtime_owned = True
+        with patch.object(tool, 'require_memory_headroom') as guard:
+            tool.start_postgres()
+            tool.offline('verify-storage')
+        pg, worker = [c for c in self.host.commands if c[:2] == ['docker', 'run']]
+        self.assertIn('--memory=32g', pg)
+        self.assertIn('--cpus=2', pg)
+        self.assertIn('shared_buffers=8GB', pg)
+        self.assertIn('fsync=on', pg)
+        self.assertIn('full_page_writes=on', pg)
+        self.assertIn('synchronous_commit=on', pg)
+        self.assertIn('--memory=128g', worker)
+        self.assertIn('--cpus=37', worker)
+        self.assertTrue(any('size=32g,' in arg for arg in worker))
+        self.assertEqual(guard.call_count, 3)
+
+    def test_ordinary_restore_profile_preserves_small_untuned_limits(self):
+        tool = self.drill()
+        tool.runtime_owned = True
+        with patch.object(tool, 'require_memory_headroom') as guard:
+            tool.start_postgres()
+            tool.offline('verify-storage')
+        pg, worker = [c for c in self.host.commands if c[:2] == ['docker', 'run']]
+        self.assertIn('--memory=2g', pg)
+        self.assertIn('--memory=64g', worker)
+        self.assertTrue(any('size=32g,' in arg for arg in worker))
+        self.assertFalse(any(arg.startswith('--cpus=') for c in (pg, worker) for arg in c))
+        self.assertNotIn('shared_buffers=8GB', pg)
+        guard.assert_not_called()
+
+    def test_upgrade_memory_guard_failure_removes_started_worker_before_retry(self):
+        tool = self.drill(resource_profile='upgrade')
+        tool.postgres_started = True
+        with patch.object(tool, 'require_memory_headroom', side_effect=[
+                None, restore.RestoreError('host_memory_headroom_insufficient')]):
+            with self.assertRaisesRegex(restore.RestoreError, 'headroom_insufficient'):
+                tool.offline('migrate-storage')
+        self.assertEqual(self.host.commands[-1][:3], ['docker', 'rm', '-f'])
+        self.assertFalse(tool.containers)
+        self.assertFalse(any(c[:2] == ['docker', 'inspect'] for c in self.host.commands))
+
+    def test_upgrade_memory_guard_failure_before_start_does_not_claim_worker(self):
+        tool = self.drill(resource_profile='upgrade')
+        tool.postgres_started = True
+        with patch.object(tool, 'require_memory_headroom', side_effect=restore.RestoreError('host_memory_headroom_insufficient')):
+            with self.assertRaisesRegex(restore.RestoreError, 'headroom_insufficient'):
+                tool.offline('migrate-storage')
+        self.assertFalse(tool.containers)
+        self.assertFalse(self.host.commands)
+
+    def test_unreviewed_resource_profile_fails_before_any_commands(self):
+        for profile in (None, True, 1, {}, 'accelerated', 'upgrade '):
+            with self.subTest(profile=profile), self.assertRaisesRegex(restore.RestoreError, 'invalid_restore_resource_profile'):
+                self.drill(resource_profile=profile)
+        self.assertFalse(self.host.commands)
 
     def test_real_capture_hash_schema_and_resource_then_owned_cleanup(self):
         result = self.run_verify()

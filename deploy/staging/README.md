@@ -149,11 +149,23 @@ retries lock contention. Interrupted rollback resumes with the same token and
 preserved dataset identities. Finish and rollback disarm their own timer.
 Recovery is allowed to complete beyond the cutover deadline.
 
-Each isolated offline command has a 64 GiB memory limit and a separate 32 GiB
-`/tmp` tmpfs for reconstructable migration and visibility spill files. Check host
-headroom for both before rehearsal; tmpfs usage counts toward the memory limit.
-Restored serving retains its smaller independent limits. These scratch files are
-disposable and are never a replacement for the coordinated evidence snapshot.
+The main rehearsal migration and ordinary permanent cutover use the same profile:
+128 GiB and 37 CPU cores for the offline worker, including a 32 GiB `/tmp` tmpfs,
+and 32 GiB and two CPU cores for PostgreSQL with the existing tuned PostgreSQL
+settings. Migration worker count and payload accounting retain the binary defaults.
+Both paths require at least 32 GiB of host available memory before each offline
+worker and during polling; limits are ceilings rather than reserved capacity.
+Ordinary and nested restore checks retain their 64 GiB worker, 32 GiB worker tmpfs
+and 2 GiB PostgreSQL limits, and restored serving retains its smaller limits.
+These scratch files are disposable and never replace the coordinated snapshot.
+
+A successful rehearsal binds its timing to the exact target image, source offer,
+operator bundle and migration profile. Changing any of these requires a new
+rehearsal before ordinary cutover. Report complete phase, acceptance and recovery
+timings, then agree the actual outage window before draining the permanent pair.
+The watchdog budget includes public acceptance and the post-cutover backup/restore;
+collector observation follows finish. Recheck identities, current data size and
+headroom at cutover. Never edit journal deadlines to extend an expired budget.
 
 The real cutover stops all writers, retains a fresh protected database/evidence
 snapshot, verifies old-image recovery, and runs the same offline commands on the

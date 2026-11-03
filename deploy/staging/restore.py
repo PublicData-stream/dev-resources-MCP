@@ -40,6 +40,19 @@ MAX_RESPONSE = 1024 * 1024
 MAX_FIXED_BODY = 16 * 1024 * 1024
 CLONE_QUOTAS = ('64G', '512G')
 REHEARSAL_HEADROOM = 704 * 1024 * 1024 * 1024
+# Resource admission is separate from schema/software restore identity. Scratch
+# lives inside each worker's memory ceiling, never in addition to it.
+RESOURCE_PROFILES = {
+    'restore': {'worker_memory': '64g', 'postgres_memory': '2g', 'scratch': '32g',
+                'worker_cpus': None, 'postgres_cpus': None, 'postgres_tuned': False,
+                'host_memory_guard': False},
+    'upgrade': {'worker_memory': '128g', 'postgres_memory': '32g', 'scratch': '32g',
+                'worker_cpus': 37, 'postgres_cpus': 2, 'postgres_tuned': True,
+                'host_memory_guard': True},
+    'direct': {'worker_memory': '192g', 'postgres_memory': '16g', 'scratch': '64g',
+               'worker_cpus': 37, 'postgres_cpus': 2, 'postgres_tuned': True,
+               'host_memory_guard': True},
+}
 RECORD_SQL = "SELECT id, body_hash FROM devres_captures WHERE source_url='https://www.rfc-editor.org/rfc/rfc9000.txt' AND media_type='text/plain' ORDER BY retrieved_at DESC,id LIMIT 1"
 
 
@@ -200,9 +213,12 @@ def rpc(ip, method, params, private=PRIVATE):
 class Drill:
     def __init__(self, snapshot, run=execute, root=None, private=PRIVATE,
                  token=None, sleep=time.sleep, call=rpc, server=None, schema=None,
-                 config_text=None, source_dataset=None, clone_quota='64G'):
+                 config_text=None, source_dataset=None, clone_quota='64G', resource_profile='restore'):
         if type(clone_quota) is not str or clone_quota not in CLONE_QUOTAS:
             raise RestoreError('invalid_restore_clone_quota')
+        if type(resource_profile) is not str or resource_profile not in RESOURCE_PROFILES:
+            raise RestoreError('invalid_restore_resource_profile')
+        self.resource_profile = resource_profile
         self.clone_quota = clone_quota
         self.snapshot = validate_snapshot(snapshot)
         if schema is not None and (type(schema) is not int or schema not in PROFILES):
@@ -315,13 +331,17 @@ class Drill:
     def start_postgres(self):
         if not self.runtime_owned or self.postgres_started:
             raise RestoreError('restore_postgres_state_invalid')
+        resources = RESOURCE_PROFILES[self.resource_profile]
+        if resources['host_memory_guard']:
+            self.require_memory_headroom()
         pg = self.name + '-postgres'
         self.containers.append(pg)
         self.run(['docker', 'run', '-d', '--name', pg, '--label', LABEL_KEY + '=' + self.token,
                   '--network', self.name, '--network-alias', 'postgres', '--read-only',
                   '--user', '999:999', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                  '--pids-limit=128', *(['--cpus=2', '--memory=16g'] if getattr(self, 'accelerated', False)
-                                          else ['--memory=2g']), '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,uid=999,gid=999',
+                  '--pids-limit=128',
+                  *(['--cpus=' + str(resources['postgres_cpus'])] if resources['postgres_cpus'] is not None else []),
+                  '--memory=' + resources['postgres_memory'], '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,uid=999,gid=999',
                   '-v', str(self.root / 'postgres') + ':/var/lib/postgresql',
                   '--entrypoint', 'postgres', PG, '-D', '/var/lib/postgresql/18/docker',
                   '-c', 'listen_addresses=*', '-c', 'unix_socket_directories=/tmp',
@@ -329,7 +349,7 @@ class Drill:
                      '-c', 'maintenance_work_mem=2GB', '-c', 'max_wal_size=16GB',
                      '-c', 'checkpoint_timeout=15min', '-c', 'wal_compression=on',
                      '-c', 'fsync=on', '-c', 'full_page_writes=on', '-c', 'synchronous_commit=on']
-                    if getattr(self, 'accelerated', False) else [])])
+                    if resources['postgres_tuned'] else [])])
         for attempt in range(60):
             try:
                 self.run(['docker', 'exec', pg, 'pg_isready', '-h', '127.0.0.1', '-U', 'devres_admin', '-d', 'devres'])
@@ -356,27 +376,26 @@ class Drill:
         if (not self.postgres_started or self.backend_started
                 or any(name.startswith(self.name + '-offline-') for name in self.containers)):
             raise RestoreError('offline_writer_exclusion_required')
+        resources = RESOURCE_PROFILES[self.resource_profile]
+        if resources['host_memory_guard']:
+            self.require_memory_headroom()
         self.offline_sequence += 1
         name = self.name + '-offline-' + str(self.offline_sequence)
         self.containers.append(name)
         args = [command, '/etc/devres/config/backend.toml']
         if command == 'migrate-storage':
             args.extend(['--to', 'blake3'])
-        accelerated = getattr(self, 'accelerated', False)
-        if accelerated:
-            self.require_memory_headroom()
         try:
             self.run(['docker', 'run', '-d', '--name', name, '--label', LABEL_KEY + '=' + self.token,
                       '--network', self.name, '--read-only', '--cap-drop=ALL',
                       '--security-opt=no-new-privileges', '--pids-limit=128',
-                      *(['--cpus=37'] if accelerated else []),
-                      *self.backend_args(memory='192g' if accelerated else '64g',
-                                         scratch='64g' if accelerated else '32g'), '--entrypoint', '/usr/local/bin/devres-server', target, *args])
+                      *(['--cpus=' + str(resources['worker_cpus'])] if resources['worker_cpus'] is not None else []),
+                      *self.backend_args(memory=resources['worker_memory'], scratch=resources['scratch']), '--entrypoint', '/usr/local/bin/devres-server', target, *args])
             # Count bounded polling intervals too, so injectable test clocks do
             # not turn a stalled command into an unbounded loop.
             started = time.monotonic()
             for attempt in range(int(timeout) + 1):
-                if accelerated:
+                if resources['host_memory_guard']:
                     self.require_memory_headroom()
                 state = json.loads(self.run(['docker', 'inspect', '--format', '{{json .State}}', name]))
                 if not state.get('Running'):

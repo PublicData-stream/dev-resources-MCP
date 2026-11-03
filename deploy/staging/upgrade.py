@@ -4,6 +4,7 @@
 No provider calls or shared-edge changes occur here. Public acceptance is a
 separate operator gate before ``finalize`` restores the original schedules.
 """
+import hashlib
 import importlib.util
 import json
 import math
@@ -40,10 +41,34 @@ TIMERS = ('devres-staging-backup.timer',)
 HOLD = 'devres-upgrade-protected'
 TOKEN = re.compile(r'[0-9a-f]{24}\Z')
 WATCHDOG = 'devres-staging-upgrade-expire@'
+BUNDLE_FILES = ('staging.py', 'restore.py', 'upgrade.py', 'maintenance.py', 'recovery.py')
 
 
 class UpgradeError(RuntimeError):
     """Fixed diagnostic codes only; command output and configuration stay private."""
+
+
+def rehearsal_identity():
+    """Bind measured timing to the exact reviewed executable bundle and profile."""
+    hashes = {}
+    for name in BUNDLE_FILES:
+        descriptor = os.open(HERE / name, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                raise UpgradeError('unsafe_upgrade_bundle')
+            with os.fdopen(descriptor, 'rb', closefd=False) as source:
+                data = source.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:
+                raise UpgradeError('unsafe_upgrade_bundle')
+            hashes[name] = hashlib.sha256(data).hexdigest()
+        finally:
+            os.close(descriptor)
+    bundle = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+    return {'server': restore.SERVER, 'version': VERSION,
+            'source_url': SOURCE + VERSION + '/source.tar.gz',
+            'bundle_sha256': bundle,
+            'resource_profile': {'name': 'upgrade', **restore.RESOURCE_PROFILES['upgrade']}}
 
 
 def journal_root(state_root=None):
@@ -169,8 +194,6 @@ def terminate_driver(record, lock_path=None):
 
 class LiveDrill(restore.Drill):
     """Reuse isolated command execution while never owning permanent datasets."""
-
-    accelerated = True
 
     def prepare(self):
         self.root.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -333,17 +356,23 @@ class Upgrade:
     def rehearsal(self):
         with self.state.locked():
             started = self.clock()
+            identity = rehearsal_identity()
+            phases = {}
+            phase_started = time.monotonic()
             admitted = False
             try:
                 original = self.begin('rehearsing')
                 admitted = True
                 snapshot = self.snapshot('upgrade-rehearsal')
                 self.save(snapshot=snapshot)
+                phases['snapshot'] = time.monotonic() - phase_started
+                phase_started = time.monotonic()
                 self.verify(snapshot, schema=9, server=restore.OLD_SERVER, private=self.private,
                             config_text=original)
+                phases['old_restore'] = time.monotonic() - phase_started
                 drill = self.drill(snapshot, schema=10, private=self.private,
                                    config_text=target_config(original, paused=True),
-                                   clone_quota='512G')
+                                   clone_quota='512G', resource_profile='upgrade')
                 self.save(live_token=drill.token)
                 canonical_snapshot = snapshot + '-canonical'
                 m.snapshot_name(canonical_snapshot)
@@ -353,8 +382,12 @@ class Upgrade:
                     drill.start_postgres()
                     for command in ('migrate-storage', 'verify-storage', 'activate-storage'):
                         self.safe()
+                        phase_started = time.monotonic()
                         drill.offline(command)
+                        phases[command] = time.monotonic() - phase_started
+                    phase_started = time.monotonic()
                     receipt = drill.check(prepared=True)
+                    phases['candidate_read'] = time.monotonic() - phase_started
                     self.clean_stop(drill)
                     control = self.run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
                                         '--user', '999:999', '--cap-drop=ALL',
@@ -368,12 +401,16 @@ class Upgrade:
                         raise UpgradeError('rehearsal_postgres_shutdown_unconfirmed')
                     self.run(['zfs', 'snapshot', '-r', drill.dataset + '@' + canonical_snapshot])
                     canonical_created = True
+                    phase_started = time.monotonic()
                     canonical_receipt = self.verify(canonical_snapshot, schema=10, server=restore.SERVER,
                                                     source_dataset=drill.dataset, private=self.private,
                                                     config_text=target_config(original, paused=True))
+                    phases['schema10_restore'] = time.monotonic() - phase_started
                     # Prove the matching old pair remains independently restorable.
+                    phase_started = time.monotonic()
                     rollback_receipt = self.verify(snapshot, schema=9, server=restore.OLD_SERVER,
                                                    private=self.private, config_text=original)
+                    phases['rollback_restore'] = time.monotonic() - phase_started
                     self.save(rehearsal_schema10_restore=canonical_receipt,
                               rehearsal_rollback_restore=rollback_receipt)
                 finally:
@@ -388,12 +425,16 @@ class Upgrade:
                             self.run(['zfs', 'destroy', '-r', drill.dataset + '@' + canonical_snapshot])
                         drill.cleanup()
                         self.save(live_token=None)
+                if rehearsal_identity() != identity:
+                    raise UpgradeError('rehearsal_identity_changed')
                 elapsed = max(1, math.ceil(self.clock() - started))
                 self.save('rehearsed', rehearsal_seconds=elapsed,
-                          deadline_seconds=max(1800, elapsed * 2), receipt=receipt)
+                          deadline_seconds=max(1800, elapsed * 2), receipt=receipt,
+                          rehearsal_identity=identity, phase_seconds=phases)
                 self.restore_timers()
                 return {'rehearsed': True, 'seconds': elapsed,
-                        'deadline_seconds': self.record['deadline_seconds'], 'snapshot': snapshot}
+                        'deadline_seconds': self.record['deadline_seconds'], 'snapshot': snapshot,
+                        'rehearsal_identity': identity, 'phase_seconds': phases}
             except Exception:
                 if admitted or self.record:
                     self.save('rehearsal_failed')
@@ -462,6 +503,8 @@ class Upgrade:
                 rehearsal = read_record(self.root.parent)
                 if not rehearsal or rehearsal['phase'] != 'rehearsed' or not isinstance(rehearsal.get('deadline_seconds'), int):
                     raise UpgradeError('successful_rehearsal_required')
+                if rehearsal.get('rehearsal_identity') != rehearsal_identity():
+                    raise UpgradeError('matching_rehearsal_identity_required')
             mutated = False
             drain_attempted = False
             original = None
@@ -519,7 +562,8 @@ class Upgrade:
                 mutated = True
                 drill = self.live(snapshot, schema=10, private=self.private,
                                   token=self.record['live_token'],
-                                  config_text=target_config(original, paused=True))
+                                  config_text=target_config(original, paused=True),
+                                  resource_profile='direct' if direct else 'upgrade')
                 try:
                     drill.prepare()
                     drill.start_postgres()
