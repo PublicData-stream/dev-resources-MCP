@@ -81,6 +81,54 @@ production migration, whole-provider coverage, native ARM64 execution, or hosted
 See [architecture](architecture.md#blake3-enforcement-and-schema-10) for identity,
 legacy cursor, exact-number and upstream-checksum boundaries.
 
+### Offline worker limits and progress
+
+`migrate-storage`, `verify-storage`, and `activate-storage` accept optional
+`--workers N` (1–64) and `--payload-budget-mib N` (positive integer). Existing
+command forms retain their meaning. Invalid, duplicate, unknown, or overflowing
+options fail before configuration or storage access. Defaults are the smaller of
+available parallelism and eight workers (one if detection fails), and 64 MiB of
+accounted concurrent SQL payload work. For example:
+
+```sh
+devres-server migrate-storage /etc/devres/server.toml --to blake3 --workers 4 --payload-budget-mib 64
+devres-server verify-storage /etc/devres/server.toml --workers 4
+devres-server activate-storage /etc/devres/server.toml --workers 4
+```
+
+One execution context bounds blocking submissions across nested offline phases.
+File preparation uses windows of at most 128 paths with 64 KiB reserved per path;
+filesystem barriers and SQL publication remain ordered. SQL hashing admits at
+most 128 records and accounts decoded payloads, cloned envelopes, identities,
+containers and scratch. An individually valid payload larger than the aggregate
+budget is hashed alone before admitting another record. Driver buffers, thread
+stacks, allocator overhead and one reader-held candidate remain additional costs;
+this charge is not process RSS. Existing mapping/visibility spill bounds and the
+1,000-row/8 MiB seal-metadata batch remain independent limits. The SQL pool stays
+at eight connections. Worker count is not a CPU quota.
+
+`--workers 1` is the serial reference. Provider graph replay stays serial, and all
+verification/activation checks and durability settings remain required. Cancellation
+is cooperative: offline callers signal the token and await completion so started
+blocking jobs join, unpublished stages are removed and transactions roll back.
+Aborting the outer async task or SIGKILL does not provide that cleanup guarantee.
+
+Aggregate JSON progress goes to stderr; the final command result remains JSON on
+stdout. Counts describe one pass, not unique corpus records or completion
+percentages. Job timing is aggregate waiting wall time and can overlap across
+workers; SQL/filesystem publication time is measured separately. No source text,
+request inputs, paths or credentials are included. Repeated verification passes
+remain separately identified.
+
+For reproducible isolated fixture timings, build the release example with locked
+resolution and `/tmp/rust/target`, then run `scripts/benchmark-migration.sh` through
+the temporary-state and isolated Docker wrappers. It creates fresh synthetic pairs,
+checks serial/parallel durable fingerprints, and measures backup/restore separately.
+See [migration measurements](migration-performance.md) for evidence and limitations.
+A fresh complete matching database/blob clone, measured acceptance and rollback
+reserve, and a newly agreed outage window remain prerequisites to any future
+production attempt. These fixture commands do not operate on staging or production.
+
 ## Local gates
 
 From the repository root, use the pinned toolchain and a working Docker daemon.

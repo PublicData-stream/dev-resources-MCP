@@ -30,6 +30,8 @@ cargo test --locked -p devres-adapters --test persistence -- --ignored --test-th
 cargo test --locked -p devres-adapters --test migration_batching -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test seal_owner_loss -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test file_migration_batching -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --test migration_parallel -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --example migration-benchmark -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test mdn_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test whatwg_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test w3c_persistence -- --ignored --test-threads=1

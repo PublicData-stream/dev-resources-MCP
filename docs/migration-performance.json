@@ -1,0 +1,1397 @@
+{
+  "fixture_filesystem": "ext4",
+  "initial_smoke_fixture": {
+    "metadata": {
+      "allowed_cpus": 18,
+      "architecture": "x86_64",
+      "binary_sha256": "4efe0b5a2d586b0f944a759f1bad6aad2840beb0076797ba7bbccc5bf94ed10b",
+      "cache_mode": "warm cache; no host cache drop",
+      "clock_ticks_per_second": 100,
+      "cpu_model": "AMD EPYC 4585PX 16-Core Processor",
+      "cpu_quota": "unavailable",
+      "full_corpus_benchmark": false,
+      "host_memory_kib": 31739964,
+      "kernel": "7.0.0-42-generic",
+      "logical_cpus": 18,
+      "memory_limit": "unavailable",
+      "options": [
+        "repeats=3",
+        "workers=1 4 8 16 32",
+        "rows=128",
+        "payload_kib=256",
+        "files=16",
+        "file_mib=8",
+        "payload_budget_mib=64",
+        "postgres_cpus=2",
+        "postgres_memory=1GiB",
+        "worker_cpu_quota=host/cgroup",
+        "revision_is_checkout_head_not_source_attestation=true"
+      ],
+      "revision": "c8904f9cbb22e274ed9cd93fcb01b20cc6f0958e"
+    },
+    "note": "Initial small fixture had no explicit pre-timing checkpoint/syncfs. Timing was variable and did not establish end-to-end improvement. Retained for context; not the performance acceptance experiment.",
+    "summary": {
+      "all_normalized_durable_results_equal": true,
+      "backup_restore_note": "separate backup/restore time files; excluded from migration speedup",
+      "cache_mode": "warm cache; fresh DB/blob pair for every repeat; no host cache drop",
+      "candidates": [
+        {
+          "median_phase_secs": {
+            "activation_including_verification": 0.203325106,
+            "migrate_including_graph_and_finish_verification": 0.936649131,
+            "standalone_verification": 0.184023761,
+            "startup_readback_and_durable_fingerprint": 0.122071813
+          },
+          "median_total_secs": 1.472986311,
+          "repeats": 3,
+          "run_total_secs": [
+            2.9163598079999997,
+            1.249183013,
+            1.472986311
+          ],
+          "workers": 1
+        },
+        {
+          "median_phase_secs": {
+            "activation_including_verification": 0.142693084,
+            "migrate_including_graph_and_finish_verification": 1.32982805,
+            "standalone_verification": 0.106462196,
+            "startup_readback_and_durable_fingerprint": 0.124510333
+          },
+          "median_total_secs": 1.692519757,
+          "repeats": 3,
+          "run_total_secs": [
+            2.40533169,
+            1.692519757,
+            1.16947323
+          ],
+          "workers": 4
+        }
+      ],
+      "durable_fingerprint": "0cb3953b0b24e3f77d465598bb217669c1abca5a18529bab66b8df004d313fd6",
+      "fixture": "pending-schema10-synthetic-v1",
+      "fixture_speedup_ratio": 1.0,
+      "full_corpus_speedup": "unmeasured",
+      "improvement_note": "every selected repeat must beat every serial repeat by more than two percent",
+      "limits": "synthetic sealing/files with empty provider graphs; excludes complete schema9 replay",
+      "reproducible_improvement_over_two_percent": false,
+      "resource_note": "phase RSS is process cumulative high water; CPU/I/O exclude PostgreSQL; WAL includes background activity",
+      "selected_workers": 1
+    }
+  },
+  "large_durable_fixture": {
+    "metadata": {
+      "allowed_cpus": 18,
+      "architecture": "x86_64",
+      "binary_sha256": "60b4d886635dfaa48023935de200483534038edfd65ab83c69b7daefdd30dce1",
+      "cache_mode": "warm cache; no host cache drop",
+      "clock_ticks_per_second": 100,
+      "cpu_model": "AMD EPYC 4585PX 16-Core Processor",
+      "cpu_quota": "unavailable",
+      "full_corpus_benchmark": false,
+      "host_memory_kib": 31739964,
+      "kernel": "7.0.0-42-generic",
+      "logical_cpus": 18,
+      "memory_limit": "unavailable",
+      "options": [
+        "repeats=3",
+        "workers=1 4 8 16 32",
+        "rows=128",
+        "payload_kib=256",
+        "files=64",
+        "file_mib=32",
+        "payload_budget_mib=64",
+        "postgres_cpus=2",
+        "postgres_memory=1GiB",
+        "worker_cpu_quota=host/cgroup",
+        "fixture_durability=checkpoint+syncfs_before_timing",
+        "revision_is_checkout_head_not_source_attestation=true"
+      ],
+      "revision": "c8904f9cbb22e274ed9cd93fcb01b20cc6f0958e"
+    },
+    "runs": [
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 24.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 32176.0,
+          "System time (seconds)": 0.84,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 1.0
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 647192.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 54324.0,
+          "System time (seconds)": 1.01,
+          "User time (seconds)": 5.6,
+          "wall_seconds": 8.84
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 1,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 448.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 31580.0,
+          "System time (seconds)": 0.01,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.7
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 3761568.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 13396.0,
+          "System time (seconds)": 0.29,
+          "User time (seconds)": 0.67,
+          "wall_seconds": 1.08
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 1,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 52516,
+              "read_bytes": 331358208,
+              "system_ticks": 48,
+              "user_ticks": 226,
+              "wal_bytes": 520488,
+              "wall_secs": 3.644291299,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 52516,
+              "read_bytes": 0,
+              "system_ticks": 22,
+              "user_ticks": 132,
+              "wal_bytes": 0,
+              "wall_secs": 1.582494075,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 54324,
+              "read_bytes": 0,
+              "system_ticks": 23,
+              "user_ticks": 136,
+              "wal_bytes": 102456,
+              "wall_secs": 2.783408728,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 54324,
+              "read_bytes": 0,
+              "system_ticks": 8,
+              "user_ticks": 66,
+              "wal_bytes": 22360,
+              "wall_secs": 0.789521706,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 546568,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6169795,
+          "workers": 1
+        },
+        "workers": 1
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 31848.0,
+          "System time (seconds)": 0.64,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 0.78
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 51232.0,
+          "System time (seconds)": 1.28,
+          "User time (seconds)": 5.79,
+          "wall_seconds": 8.67
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 2,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 32372.0,
+          "System time (seconds)": 0.01,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 3.14
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 13340.0,
+          "System time (seconds)": 0.08,
+          "User time (seconds)": 0.66,
+          "wall_seconds": 0.81
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 1,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 50868,
+              "read_bytes": 0,
+              "system_ticks": 45,
+              "user_ticks": 225,
+              "wal_bytes": 520456,
+              "wall_secs": 4.102973368,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 51232,
+              "read_bytes": 0,
+              "system_ticks": 55,
+              "user_ticks": 155,
+              "wal_bytes": 0,
+              "wall_secs": 2.167406137,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 51232,
+              "read_bytes": 0,
+              "system_ticks": 20,
+              "user_ticks": 135,
+              "wal_bytes": 102480,
+              "wall_secs": 1.602633325,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 51232,
+              "read_bytes": 0,
+              "system_ticks": 7,
+              "user_ticks": 64,
+              "wal_bytes": 22360,
+              "wall_secs": 0.762584175,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 714466,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6501493,
+          "workers": 1
+        },
+        "workers": 1
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 31864.0,
+          "System time (seconds)": 0.63,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 0.76
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 51248.0,
+          "System time (seconds)": 0.96,
+          "User time (seconds)": 5.52,
+          "wall_seconds": 7.65
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 3,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 31716.0,
+          "System time (seconds)": 0.01,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.78
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 12940.0,
+          "System time (seconds)": 0.15,
+          "User time (seconds)": 0.62,
+          "wall_seconds": 0.83
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 1,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 51248,
+              "read_bytes": 0,
+              "system_ticks": 45,
+              "user_ticks": 224,
+              "wal_bytes": 157120,
+              "wall_secs": 3.687188377,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 51248,
+              "read_bytes": 0,
+              "system_ticks": 23,
+              "user_ticks": 131,
+              "wal_bytes": 0,
+              "wall_secs": 1.574978599,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 51248,
+              "read_bytes": 0,
+              "system_ticks": 21,
+              "user_ticks": 133,
+              "wal_bytes": 116384,
+              "wall_secs": 1.596379733,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 51248,
+              "read_bytes": 0,
+              "system_ticks": 7,
+              "user_ticks": 64,
+              "wal_bytes": 16720,
+              "wall_secs": 0.754879953,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 670065,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6196795,
+          "workers": 1
+        },
+        "workers": 1
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 31392.0,
+          "System time (seconds)": 0.69,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.83
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 111896.0,
+          "System time (seconds)": 1.82,
+          "User time (seconds)": 6.2,
+          "wall_seconds": 2.23
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 1,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 32292.0,
+          "System time (seconds)": 0.01,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 5.36
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 12900.0,
+          "System time (seconds)": 0.16,
+          "User time (seconds)": 0.66,
+          "wall_seconds": 0.88
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 16,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 96832,
+              "read_bytes": 0,
+              "system_ticks": 91,
+              "user_ticks": 255,
+              "wal_bytes": 132840,
+              "wall_secs": 0.840818794,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 107632,
+              "read_bytes": 0,
+              "system_ticks": 42,
+              "user_ticks": 150,
+              "wal_bytes": 0,
+              "wall_secs": 0.259390737,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 112680,
+              "read_bytes": 0,
+              "system_ticks": 38,
+              "user_ticks": 149,
+              "wal_bytes": 120872,
+              "wall_secs": 0.27808281,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 113016,
+              "read_bytes": 0,
+              "system_ticks": 9,
+              "user_ticks": 65,
+              "wal_bytes": 22360,
+              "wall_secs": 0.803499117,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 44752,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 9291023,
+          "workers": 16
+        },
+        "workers": 16
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 32224.0,
+          "System time (seconds)": 0.67,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.84
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 107592.0,
+          "System time (seconds)": 1.64,
+          "User time (seconds)": 6.49,
+          "wall_seconds": 2.21
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 2,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 32104.0,
+          "System time (seconds)": 0.0,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 16.6
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 12884.0,
+          "System time (seconds)": 0.1,
+          "User time (seconds)": 0.65,
+          "wall_seconds": 1.18
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 16,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 97744,
+              "read_bytes": 0,
+              "system_ticks": 77,
+              "user_ticks": 271,
+              "wal_bytes": 132864,
+              "wall_secs": 0.783707346,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 104220,
+              "read_bytes": 0,
+              "system_ticks": 41,
+              "user_ticks": 160,
+              "wal_bytes": 0,
+              "wall_secs": 0.255642652,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 109020,
+              "read_bytes": 0,
+              "system_ticks": 36,
+              "user_ticks": 151,
+              "wal_bytes": 120872,
+              "wall_secs": 0.291827664,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 109332,
+              "read_bytes": 0,
+              "system_ticks": 8,
+              "user_ticks": 66,
+              "wal_bytes": 22360,
+              "wall_secs": 0.836229117,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 41528,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 9193001,
+          "workers": 16
+        },
+        "workers": 16
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 32388.0,
+          "System time (seconds)": 0.65,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 0.93
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 73216.0,
+          "System time (seconds)": 1.62,
+          "User time (seconds)": 6.27,
+          "wall_seconds": 3.55
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 3,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 32008.0,
+          "System time (seconds)": 0.01,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.73
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 12884.0,
+          "System time (seconds)": 0.09,
+          "User time (seconds)": 0.63,
+          "wall_seconds": 0.78
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 16,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 62460,
+              "read_bytes": 0,
+              "system_ticks": 76,
+              "user_ticks": 257,
+              "wal_bytes": 451248,
+              "wall_secs": 2.162558282,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 63176,
+              "read_bytes": 0,
+              "system_ticks": 41,
+              "user_ticks": 155,
+              "wal_bytes": 0,
+              "wall_secs": 0.261179528,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 74276,
+              "read_bytes": 0,
+              "system_ticks": 37,
+              "user_ticks": 150,
+              "wal_bytes": 102456,
+              "wall_secs": 0.323555269,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 74572,
+              "read_bytes": 0,
+              "system_ticks": 6,
+              "user_ticks": 64,
+              "wal_bytes": 22360,
+              "wall_secs": 0.76567039,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 1120356,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 9350979,
+          "workers": 16
+        },
+        "workers": 16
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 32764.0,
+          "System time (seconds)": 0.65,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 0.96
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 54484.0,
+          "System time (seconds)": 1.14,
+          "User time (seconds)": 5.84,
+          "wall_seconds": 3.06
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 1,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 31888.0,
+          "System time (seconds)": 0.0,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.89
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 13324.0,
+          "System time (seconds)": 0.1,
+          "User time (seconds)": 0.62,
+          "wall_seconds": 0.78
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 4,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 53424,
+              "read_bytes": 0,
+              "system_ticks": 54,
+              "user_ticks": 234,
+              "wal_bytes": 132840,
+              "wall_secs": 1.205310413,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 54360,
+              "read_bytes": 0,
+              "system_ticks": 25,
+              "user_ticks": 144,
+              "wal_bytes": 0,
+              "wall_secs": 0.496721726,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 54888,
+              "read_bytes": 0,
+              "system_ticks": 27,
+              "user_ticks": 143,
+              "wal_bytes": 120872,
+              "wall_secs": 0.525722235,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 55184,
+              "read_bytes": 0,
+              "system_ticks": 8,
+              "user_ticks": 63,
+              "wal_bytes": 22360,
+              "wall_secs": 0.794158401,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 43615,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6067187,
+          "workers": 4
+        },
+        "workers": 4
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 32576.0,
+          "System time (seconds)": 0.66,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 0.8
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 54956.0,
+          "System time (seconds)": 1.09,
+          "User time (seconds)": 5.89,
+          "wall_seconds": 3.87
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 2,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 31516.0,
+          "System time (seconds)": 0.0,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 2.67
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 12916.0,
+          "System time (seconds)": 0.07,
+          "User time (seconds)": 0.64,
+          "wall_seconds": 0.78
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 4,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 54956,
+              "read_bytes": 0,
+              "system_ticks": 50,
+              "user_ticks": 239,
+              "wal_bytes": 151888,
+              "wall_secs": 1.419513672,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 54956,
+              "read_bytes": 0,
+              "system_ticks": 25,
+              "user_ticks": 143,
+              "wal_bytes": 0,
+              "wall_secs": 0.507581373,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 54956,
+              "read_bytes": 0,
+              "system_ticks": 26,
+              "user_ticks": 143,
+              "wal_bytes": 116384,
+              "wall_secs": 1.144695693,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 54956,
+              "read_bytes": 0,
+              "system_ticks": 8,
+              "user_ticks": 63,
+              "wal_bytes": 22360,
+              "wall_secs": 0.759651181,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 231785,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6253462,
+          "workers": 4
+        },
+        "workers": 4
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 31848.0,
+          "System time (seconds)": 0.64,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.78
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 55416.0,
+          "System time (seconds)": 1.16,
+          "User time (seconds)": 5.86,
+          "wall_seconds": 4.1
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 3,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 32388.0,
+          "System time (seconds)": 0.02,
+          "User time (seconds)": 0.02,
+          "wall_seconds": 1.72
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 13356.0,
+          "System time (seconds)": 0.1,
+          "User time (seconds)": 0.61,
+          "wall_seconds": 0.77
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 4,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 52888,
+              "read_bytes": 0,
+              "system_ticks": 56,
+              "user_ticks": 241,
+              "wal_bytes": 505392,
+              "wall_secs": 1.453955768,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 53708,
+              "read_bytes": 0,
+              "system_ticks": 27,
+              "user_ticks": 139,
+              "wal_bytes": 0,
+              "wall_secs": 0.486388372,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 56180,
+              "read_bytes": 0,
+              "system_ticks": 26,
+              "user_ticks": 142,
+              "wal_bytes": 102456,
+              "wall_secs": 0.536461283,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 56464,
+              "read_bytes": 0,
+              "system_ticks": 6,
+              "user_ticks": 64,
+              "wal_bytes": 22360,
+              "wall_secs": 0.821718067,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 256627,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6333870,
+          "workers": 4
+        },
+        "workers": 4
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 32136.0,
+          "System time (seconds)": 0.66,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 0.81
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 55340.0,
+          "System time (seconds)": 1.22,
+          "User time (seconds)": 5.96,
+          "wall_seconds": 2.33
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 1,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 31956.0,
+          "System time (seconds)": 0.01,
+          "User time (seconds)": 0.02,
+          "wall_seconds": 2.98
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 13276.0,
+          "System time (seconds)": 0.19,
+          "User time (seconds)": 0.66,
+          "wall_seconds": 0.92
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 8,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 55768,
+              "read_bytes": 0,
+              "system_ticks": 57,
+              "user_ticks": 244,
+              "wal_bytes": 520560,
+              "wall_secs": 0.884609932,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 56140,
+              "read_bytes": 0,
+              "system_ticks": 28,
+              "user_ticks": 143,
+              "wal_bytes": 0,
+              "wall_secs": 0.318361339,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 56172,
+              "read_bytes": 0,
+              "system_ticks": 29,
+              "user_ticks": 144,
+              "wal_bytes": 102480,
+              "wall_secs": 0.315811651,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 56444,
+              "read_bytes": 0,
+              "system_ticks": 7,
+              "user_ticks": 65,
+              "wal_bytes": 586528,
+              "wall_secs": 0.772943908,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 49083,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6250027,
+          "workers": 8
+        },
+        "workers": 8
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 31480.0,
+          "System time (seconds)": 0.81,
+          "User time (seconds)": 0.0,
+          "wall_seconds": 1.02
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 60564.0,
+          "System time (seconds)": 1.53,
+          "User time (seconds)": 6.38,
+          "wall_seconds": 2.64
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 2,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 32104.0,
+          "System time (seconds)": 0.01,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.97
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 12748.0,
+          "System time (seconds)": 0.09,
+          "User time (seconds)": 0.69,
+          "wall_seconds": 0.87
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 8,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 58456,
+              "read_bytes": 0,
+              "system_ticks": 61,
+              "user_ticks": 256,
+              "wal_bytes": 150552,
+              "wall_secs": 0.978968598,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 60564,
+              "read_bytes": 0,
+              "system_ticks": 31,
+              "user_ticks": 145,
+              "wal_bytes": 0,
+              "wall_secs": 0.31087068,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 60564,
+              "read_bytes": 0,
+              "system_ticks": 48,
+              "user_ticks": 166,
+              "wal_bytes": 116328,
+              "wall_secs": 0.395912425,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 60564,
+              "read_bytes": 0,
+              "system_ticks": 12,
+              "user_ticks": 70,
+              "wal_bytes": 22360,
+              "wall_secs": 0.908113389,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 50939,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6976715,
+          "workers": 8
+        },
+        "workers": 8
+      },
+      {
+        "backup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 4195296.0,
+          "Maximum resident set size (kbytes)": 32156.0,
+          "System time (seconds)": 0.64,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.79
+        },
+        "command_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 688.0,
+          "Maximum resident set size (kbytes)": 60384.0,
+          "System time (seconds)": 1.5,
+          "User time (seconds)": 5.99,
+          "wall_seconds": 2.41
+        },
+        "peak_accounted_payload_bytes": 66812206,
+        "repeat": 3,
+        "restore_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 0.0,
+          "Maximum resident set size (kbytes)": 32156.0,
+          "System time (seconds)": 0.0,
+          "User time (seconds)": 0.01,
+          "wall_seconds": 0.7
+        },
+        "restored": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "restored_startup_readback": true
+        },
+        "restored_startup_usage": {
+          "Exit status": 0.0,
+          "File system inputs": 0.0,
+          "File system outputs": 8.0,
+          "Maximum resident set size (kbytes)": 12572.0,
+          "System time (seconds)": 0.09,
+          "User time (seconds)": 0.65,
+          "wall_seconds": 0.8
+        },
+        "result": {
+          "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+          "fixture": "pending-schema10-synthetic-v1",
+          "full_schema9_corpus": false,
+          "jobs_high_water": 8,
+          "payload_budget_mib": 64,
+          "phases": [
+            {
+              "phase": "migrate_including_graph_and_finish_verification",
+              "process_rss_high_water_kib": 58204,
+              "read_bytes": 0,
+              "system_ticks": 75,
+              "user_ticks": 249,
+              "wal_bytes": 151944,
+              "wall_secs": 0.937559722,
+              "write_bytes": 339968
+            },
+            {
+              "phase": "standalone_verification",
+              "process_rss_high_water_kib": 61484,
+              "read_bytes": 0,
+              "system_ticks": 33,
+              "user_ticks": 144,
+              "wal_bytes": 0,
+              "wall_secs": 0.330658717,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "activation_including_verification",
+              "process_rss_high_water_kib": 61492,
+              "read_bytes": 0,
+              "system_ticks": 32,
+              "user_ticks": 142,
+              "wal_bytes": 73848,
+              "wall_secs": 0.322215996,
+              "write_bytes": 4096
+            },
+            {
+              "phase": "startup_readback_and_durable_fingerprint",
+              "process_rss_high_water_kib": 61792,
+              "read_bytes": 0,
+              "system_ticks": 9,
+              "user_ticks": 64,
+              "wal_bytes": 22360,
+              "wall_secs": 0.781894648,
+              "write_bytes": 0
+            }
+          ],
+          "publication_micros": 42274,
+          "rss_note": "process high water, cumulative across phases; excludes PostgreSQL",
+          "timing_note": "fixture generation excluded; warm cache, no host cache drop",
+          "window_high_water": 122,
+          "worker_wait_micros": 6674405,
+          "workers": 8
+        },
+        "workers": 8
+      }
+    ],
+    "summary": {
+      "all_normalized_durable_results_equal": true,
+      "backup_restore_note": "separate backup/restore time files; excluded from migration speedup",
+      "cache_mode": "warm cache; fresh DB/blob pair for every repeat; no host cache drop",
+      "candidates": [
+        {
+          "median_phase_secs": {
+            "activation_including_verification": 1.602633325,
+            "migrate_including_graph_and_finish_verification": 3.687188377,
+            "standalone_verification": 1.582494075,
+            "startup_readback_and_durable_fingerprint": 0.762584175
+          },
+          "median_total_secs": 8.635597005,
+          "repeats": 3,
+          "run_total_secs": [
+            8.799715808,
+            8.635597005,
+            7.613426662
+          ],
+          "workers": 1
+        },
+        {
+          "median_phase_secs": {
+            "activation_including_verification": 0.536461283,
+            "migrate_including_graph_and_finish_verification": 1.419513672,
+            "standalone_verification": 0.496721726,
+            "startup_readback_and_durable_fingerprint": 0.794158401
+          },
+          "median_total_secs": 3.29852349,
+          "repeats": 3,
+          "run_total_secs": [
+            3.021912775,
+            3.831441919,
+            3.29852349
+          ],
+          "workers": 4
+        },
+        {
+          "median_phase_secs": {
+            "activation_including_verification": 0.322215996,
+            "migrate_including_graph_and_finish_verification": 0.937559722,
+            "standalone_verification": 0.318361339,
+            "startup_readback_and_durable_fingerprint": 0.781894648
+          },
+          "median_total_secs": 2.372329083,
+          "repeats": 3,
+          "run_total_secs": [
+            2.29172683,
+            2.593865092,
+            2.372329083
+          ],
+          "workers": 8
+        },
+        {
+          "median_phase_secs": {
+            "activation_including_verification": 0.291827664,
+            "migrate_including_graph_and_finish_verification": 0.840818794,
+            "standalone_verification": 0.259390737,
+            "startup_readback_and_durable_fingerprint": 0.803499117
+          },
+          "median_total_secs": 2.181791458,
+          "repeats": 3,
+          "run_total_secs": [
+            2.181791458,
+            2.1674067790000002,
+            3.512963469
+          ],
+          "workers": 16
+        }
+      ],
+      "durable_fingerprint": "ab8d7f7049dbc3f714efa1768494dba76ad0f17178b4fdc46d7287f8ab0cb12c",
+      "fixture": "pending-schema10-synthetic-v1",
+      "fixture_speedup_ratio": 3.9580304402310107,
+      "full_corpus_speedup": "unmeasured",
+      "improvement_note": "every selected repeat must beat every serial repeat by more than two percent",
+      "limits": "synthetic sealing/files with empty provider graphs; excludes complete schema9 replay",
+      "reproducible_improvement_over_two_percent": true,
+      "resource_note": "phase RSS is process cumulative high water; CPU/I/O exclude PostgreSQL; WAL includes background activity",
+      "selected_workers": 16
+    }
+  },
+  "recorded_utc_date": "2026-11-03",
+  "source_note": "Implementation base plus benchmark fixture/example and validation changes in the accompanying commit; revision is not a build attestation."
+}

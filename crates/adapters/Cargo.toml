@@ -169,3 +169,11 @@ path = "examples/w3c/probe.rs"
 [[example]]
 name = "whatwg-probe"
 path = "examples/whatwg/probe.rs"
+
+[[example]]
+name = "migration-benchmark"
+path = "examples/shared/migration-benchmark.rs"
+
+[[test]]
+name = "migration_parallel"
+path = "tests/shared/migration_parallel.rs"

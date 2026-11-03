@@ -1061,4 +1061,99 @@ mod tests {
         assert_eq!(task.await.unwrap().err().unwrap().code, "cancelled");
         assert_no_stages(&root);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_descriptor_high_water_scales_with_workers_not_window_size() {
+        const CHILD_MARKER: &str = "DEVRES_FILE_FD_BOUND_CHILD";
+        const TEST_NAME: &str = "storage::migration::files::tests::file_descriptor_high_water_scales_with_workers_not_window_size";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            // A separate test process excludes unrelated tests opening files
+            // while /proc/self/fd is sampled. Pass the marker only to the child;
+            // no process-global environment mutation is needed.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("devres-file-fd-bound: completed 4 cases"),
+                "isolated descriptor-bound test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        fn descriptor_count() -> usize {
+            std::fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for workers in [1, 4] {
+                    for (count, bytes) in [(8, 16 * 1024 * 1024_u64), (FILES, 1024 * 1024)] {
+                        let (_temporary, root, dev) = fixture();
+                        let mut paths = Vec::with_capacity(count);
+                        for index in 0..count {
+                            let path = root.join(format!("retained-{index}"));
+                            // Sparse regular files keep actual fixture writes
+                            // small while making the real streaming hash long
+                            // enough to observe open descriptors reliably.
+                            File::create(&path).unwrap().set_len(bytes).unwrap();
+                            paths.push(path);
+                        }
+                        let execution = MigrationExecution::new(
+                            crate::MigrationExecutionOptions::new(workers, 64 * 1024 * 1024)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        let cancel = CancellationToken::new();
+                        let signal = cancel.clone();
+                        let worker_execution = execution.clone();
+                        let base = root.clone();
+                        let baseline = descriptor_count();
+                        let task = tokio::spawn(async move {
+                            prepare_window(base, paths, dev, &signal, &worker_execution).await
+                        });
+                        let mut high_water = baseline;
+                        let deadline = Instant::now() + Duration::from_secs(60);
+                        let mut timed_out = false;
+                        while !task.is_finished() {
+                            high_water = high_water.max(descriptor_count());
+                            if Instant::now() >= deadline {
+                                // Even a failed timing bound must cooperatively
+                                // drain the real workers before the fixture drops.
+                                timed_out = true;
+                                cancel.cancel();
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        let result = task.await.unwrap();
+                        assert!(!timed_out, "descriptor sampling exceeded its deadline");
+                        let prepared = result.unwrap();
+                        assert_eq!(prepared.len(), count);
+                        assert!(high_water > baseline, "sampling missed active file reads");
+                        // Both windows obey the same bound: allow a source and
+                        // descriptor per active worker, plus fixed coordinator
+                        // slack, never one descriptor per admitted source path.
+                        assert!(
+                            high_water <= baseline + 2 * workers + 8,
+                            "workers={workers}, window={count}, baseline={baseline}, high_water={high_water}",
+                        );
+                        assert!(execution.snapshot().high_water <= workers);
+                        assert!(descriptor_count() <= baseline + 2);
+                        drop(prepared);
+                        assert_no_stages(&root);
+                    }
+                }
+            });
+        println!("devres-file-fd-bound: completed 4 cases");
+    }
 }
