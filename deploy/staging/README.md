@@ -1,7 +1,7 @@
 # Staging deployment
 
-These host-specific assets deploy the existing accepted
-`0.1.0-build.634eb5b5` server image into `devres-staging` on `piqua-serve`.
+These host-specific assets target the published
+`0.1.0-build.b91929db` server image into `devres-staging` on `piqua-serve`.
 The disposable [foundation](../kubernetes/foundation.yaml) remains separate.
 No package code is executed and no administrative HTTP route is added.
 
@@ -181,7 +181,7 @@ Record the current upgrade journal's token and resulting booleans in root-owned 
 `/var/lib/devres-staging/upgrade/acceptance.json`:
 
 ```json
-{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.634eb5b5","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
+{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.b91929db","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
 ```
 
 Finish qualifies a schema-ten coordinated backup/isolated restore before
