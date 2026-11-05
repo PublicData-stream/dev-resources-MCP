@@ -133,6 +133,14 @@ to the larger of thirty minutes and twice the rehearsal duration. Recovery time
 is additional. Capacity and clone quotas remain enforced; a successful rehearsal
 does not establish whole-corpus capacity.
 
+Each offline migration, verification or activation command has a finite seven-day
+ceiling, including nested restore verification. This is an execution bound, not
+a completion estimate. Cutover commands remain limited by the smaller remaining
+measured outage budget (or direct-mode absolute deadline); the watchdog and
+preserving rollback are unchanged. A failed rehearsal removes its disposable
+clone, so retrying starts from a fresh coordinated snapshot rather than resuming
+that removed clone. Never extend a running operation by editing its journal.
+
 Only the main migration rehearsal clone has a finite 512 GiB parent quota. Before
 creating its temporary runtime directory or ZFS objects, it requires at least
 704 GiB of current pool free space: 512 GiB for that clone, 64 GiB for a nested

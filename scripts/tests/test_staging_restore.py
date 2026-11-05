@@ -728,12 +728,48 @@ class RestoreTests(unittest.TestCase):
         finally:
             tool.cleanup()
 
+    def test_default_offline_command_can_finish_after_twenty_four_hours(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        self.host.offline_running = True
+        tool.sleep = lambda _: setattr(self.host, 'offline_running', False)
+        with patch.object(restore.time, 'monotonic', side_effect=[0, 90000]):
+            result = tool.offline('migrate-storage')
+        self.assertTrue(result['completed'])
+        self.assertFalse(any('-offline-' in name for name in tool.containers))
+
+    def test_default_seven_day_ceiling_still_removes_running_writer(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        self.host.offline_running = True
+        with patch.object(restore.time, 'monotonic', side_effect=[0, 604800]):
+            with self.assertRaisesRegex(restore.RestoreError, 'timed_out'):
+                tool.offline('migrate-storage')
+        self.assertFalse(any('-offline-' in name for name in tool.containers))
+        self.assertTrue(any(c[:3] == ['docker', 'rm', '-f'] and '-offline-' in c[-1]
+                            for c in self.host.commands))
+
+    def test_schema_ten_restore_propagates_extended_default_to_verification(self):
+        self.host.schema = '10'
+        original = restore.Drill.offline
+        timeouts = []
+        def record(tool, command, **kwargs):
+            timeouts.append(kwargs['timeout'])
+            return original(tool, command, **kwargs)
+        with patch.object(restore.Drill, 'offline', record):
+            result = self.run_verify(schema=10, server=restore.SERVER)
+        self.assertEqual(result['schema'], 10)
+        self.assertEqual(timeouts, [604800])
+
     def test_offline_commands_require_stopped_backend_and_reviewed_arguments(self):
         tool = self.drill()
         for command, target, timeout in (('serve', restore.SERVER, 1),
                                         ('verify-storage', restore.OLD_SERVER, 1),
                                         ('verify-storage', restore.SERVER, 0),
-                                        ('verify-storage', restore.SERVER, 86401)):
+                                        ('verify-storage', restore.SERVER, restore.OFFLINE_TIMEOUT_SECONDS + 1),
+                                        ('verify-storage', restore.SERVER, True),
+                                        ('verify-storage', restore.SERVER, float('nan')),
+                                        ('verify-storage', restore.SERVER, float('inf'))):
             with self.assertRaises(restore.RestoreError):
                 tool.offline(command, target, timeout)
         with self.assertRaisesRegex(restore.RestoreError, 'writer_exclusion'):

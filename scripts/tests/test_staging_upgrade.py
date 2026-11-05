@@ -176,6 +176,28 @@ class UpgradeTests(unittest.TestCase):
             self.origins[destination] = source
         return ''
 
+    def test_extended_command_budget_preserves_tighter_remaining_and_expiry(self):
+        self.instance.record = {'deadline_seconds': 900000, 'deadline_at': 900000}
+        self.instance.started = 0
+        self.instance.clock = lambda: 10
+        with patch.object(upgrade.time, 'time', return_value=10):
+            self.assertEqual(self.instance.remaining(), 604800)
+            self.assertEqual(self.instance.wall_remaining(), 604800)
+            self.instance.record.update(deadline_seconds=100000, deadline_at=100000)
+            self.assertEqual(self.instance.remaining(), 99990)
+            self.assertEqual(self.instance.wall_remaining(), 99990)
+            self.instance.record.update(mode='direct', deadline_at=50)
+            self.assertEqual(self.instance.remaining(), 40)
+            self.instance.record.update(deadline_at=10)
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'deadline_exceeded'):
+                self.instance.wall_remaining()
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'deadline_exceeded'):
+                self.instance.remaining()
+            self.instance.record.pop('mode')
+            self.instance.record['deadline_seconds'] = 10
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'deadline_exceeded'):
+                self.instance.remaining()
+
     def test_config_changes_only_source_and_requested_scheduling_booleans(self):
         original = upgrade.tomllib.loads(CONFIG)
         original['rfc']['enabled'] = True

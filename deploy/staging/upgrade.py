@@ -448,7 +448,7 @@ class Upgrade:
         self.safe()
         if self.record.get('mode') == 'direct':
             remaining = min(remaining, self.wall_remaining())
-        return min(86400, remaining)
+        return min(restore.OFFLINE_TIMEOUT_SECONDS, remaining)
 
     def apply(self):
         return self._apply()
@@ -968,7 +968,7 @@ class Upgrade:
         if remaining <= 0:
             raise UpgradeError('upgrade_deadline_exceeded')
         self.safe()
-        return min(86400, remaining)
+        return min(restore.OFFLINE_TIMEOUT_SECONDS, remaining)
 
 
 def rehearse():

@@ -38,6 +38,7 @@ LABEL_KEY = 'devres.restore-owner'
 TOKEN_RE = re.compile(r'[0-9a-f]{24}\Z')
 HASH_RE = re.compile(r'[0-9a-f]{64}\Z')
 CONTENT_RE = re.compile(r'(?:blake3:)?[0-9a-f]{64}\Z')
+OFFLINE_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 MAX_RESPONSE = 1024 * 1024
 MAX_FIXED_BODY = 16 * 1024 * 1024
 CLONE_QUOTAS = ('64G', '512G')
@@ -599,11 +600,11 @@ class Drill:
             # Diagnostics must not mask the original failure or suppress cleanup.
             pass
 
-    def offline(self, command, target=SERVER, timeout=86400):
+    def offline(self, command, target=SERVER, timeout=OFFLINE_TIMEOUT_SECONDS):
         """Run one reviewed offline command; stop/remove its writer on every exit."""
         if command not in ('migrate-storage', 'verify-storage', 'activate-storage') or target != SERVER:
             raise RestoreError('invalid_offline_command_or_image')
-        if type(timeout) not in (int, float) or not 0 < timeout <= 86400:
+        if type(timeout) not in (int, float) or not 0 < timeout <= OFFLINE_TIMEOUT_SECONDS:
             raise RestoreError('invalid_offline_timeout')
         if (not self.postgres_started or self.backend_started
                 or any(name.startswith(self.name + '-offline-') for name in self.containers)):
@@ -678,7 +679,7 @@ class Drill:
         path.write_text(changed)
         return server, version, source
 
-    def check(self, prepared=False, timeout=86400):
+    def check(self, prepared=False, timeout=OFFLINE_TIMEOUT_SECONDS):
         if not prepared:
             self.prepare()
             self.start_postgres()
@@ -773,7 +774,7 @@ class Drill:
             shutil.rmtree(self.root)
 
 
-def verify(snapshot, *, timeout=86400, on_drill=None, **kwargs):
+def verify(snapshot, *, timeout=OFFLINE_TIMEOUT_SECONDS, on_drill=None, **kwargs):
     """Return bounded metadata only after real capture recovery and cleanup pass."""
     drill = Drill(snapshot, **kwargs)
     try:
