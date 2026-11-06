@@ -1,10 +1,13 @@
 //! Deterministic offline fixture timing, never a complete schema-nine corpus benchmark.
 //! The shell harness owns the disposable database, and credentials enter through env.
 use devres_adapters::{
-    MigrationExecution, MigrationExecutionOptions, MigrationSettings, PgBlobStore,
-    migrate_storage_graphs_with_execution,
+    MigrationExecution, MigrationExecutionOptions, MigrationGraphOptions, MigrationSettings,
+    PgBlobStore, migrate_storage_graphs_with_execution,
 };
-use devres_application::Store;
+use devres_application::{
+    Fetcher, Retrieval, Store,
+    corpus::{Dataset, JobSpec, RfcCorpusStore, Snapshot},
+};
 use devres_domain::{FetchRequest, FetchResponse, Validators};
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -16,6 +19,201 @@ const BODY: &[u8] = b"synthetic public migration benchmark capture v1";
 const KEY: &str = "fixture:migration-benchmark";
 const FIXTURE_MARKER: &str = "devres:synthetic-migration-benchmark:v1";
 const MARKER_FILE: &str = ".devres-benchmark-fixture";
+const GRAPH_DOCUMENTS: usize = 32;
+
+struct OfflineOnly;
+#[async_trait::async_trait]
+impl Fetcher for OfflineOnly {
+    async fn fetch(
+        &self,
+        _: &FetchRequest,
+        _: Option<&Validators>,
+    ) -> devres_domain::Result<FetchResponse> {
+        Err(devres_domain::Error::integrity(
+            "Benchmark attempted source acquisition.",
+        ))
+    }
+}
+
+fn fixture_kind(graph_snapshots: usize) -> &'static str {
+    if graph_snapshots == 0 {
+        "pending-schema10-synthetic-v1"
+    } else {
+        "pending-schema10-graph-v1"
+    }
+}
+
+fn payload_seal(
+    table: &str,
+    kind: &str,
+    key: &str,
+    payload: &Value,
+) -> devres_domain::Result<String> {
+    devres_adapters::integrity::canonical_hash(
+        &json!({"version":1,"namespace":table,"key":[kind,key],"payload":payload}),
+    )
+}
+
+/// Build a real retained index through public offline maintenance; no provider is called.
+async fn seed_graphs(
+    store: &Arc<PgBlobStore>,
+    pool: &sqlx::PgPool,
+    root: &Path,
+    snapshots: usize,
+    generations: usize,
+) -> Result<()> {
+    let catalogue = store
+        .publish(
+            &FetchRequest {
+                key: "rfc:index".into(),
+                url: "https://www.rfc-editor.org/rfc-index.xml".into(),
+                ttl_secs: 86400,
+                max_bytes: 1024,
+                media_type: "application/xml".into(),
+            },
+            FetchResponse {
+                status: 200,
+                body: b"<rfc-index/>".to_vec(),
+                validators: Validators::default(),
+            },
+            1_700_000_000,
+        )
+        .await?;
+    store.save_dataset("catalogue", &Dataset {
+        capture:catalogue.capture.clone(),
+        records:(1..=GRAPH_DOCUMENTS).map(|number| json!({"number":number,"title":format!("Synthetic RFC {number}"),"formats":["txt"]})).collect(),
+    }).await?;
+    for number in 1..=GRAPH_DOCUMENTS {
+        let key = format!("rfc:text:{number}");
+        let url = format!("https://www.rfc-editor.org/rfc/rfc{number}.txt");
+        let text = format!(
+            "RFC {number} migrationanchor secure transport clients negotiate reliable protocols. {}",
+            "Bounded historical fixture text with immutable postings. ".repeat(512)
+        );
+        let captured = store
+            .publish(
+                &FetchRequest {
+                    key: key.clone(),
+                    url: url.clone(),
+                    ttl_secs: 86400,
+                    max_bytes: 65536,
+                    media_type: "text/plain".into(),
+                },
+                FetchResponse {
+                    status: 200,
+                    body: text.into_bytes(),
+                    validators: Validators::default(),
+                },
+                1_700_000_000,
+            )
+            .await?;
+        store
+            .schedule(&[JobSpec {
+                key: key.clone(),
+                number: number as u32,
+                format: "txt".into(),
+                source_url: url,
+                assurance: "https".into(),
+                due_at: 0,
+            }])
+            .await?;
+        store
+            .finish(&key, Some(&captured.capture), None, 1_700_086_400)
+            .await?;
+    }
+    let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(OfflineOnly)));
+    let corpus =
+        devres_adapters::RfcCorpus::new(retrieval, store.clone(), root, Default::default())?;
+    let mut frozen = Vec::with_capacity(generations);
+    for generation in 0..generations {
+        if generation != 0 {
+            let number = GRAPH_DOCUMENTS;
+            let key = format!("rfc:text:{number}");
+            let url = format!("https://www.rfc-editor.org/rfc/rfc{number}.txt");
+            let text = format!(
+                "RFC {number} migrationanchor secure transport clients negotiate reliable protocols generation{generation}. {}",
+                "Bounded historical fixture text with immutable postings. ".repeat(512),
+            );
+            let captured = store
+                .publish(
+                    &FetchRequest {
+                        key: key.clone(),
+                        url,
+                        ttl_secs: 86400,
+                        max_bytes: 65536,
+                        media_type: "text/plain".into(),
+                    },
+                    FetchResponse {
+                        status: 200,
+                        body: text.into_bytes(),
+                        validators: Validators::default(),
+                    },
+                    1_700_000_000 + generation as i64,
+                )
+                .await?;
+            store
+                .finish(
+                    &key,
+                    Some(&captured.capture),
+                    None,
+                    1_700_086_400 + generation as i64,
+                )
+                .await?;
+        }
+        let built = corpus.rebuild_index().await?;
+        let snapshot: Snapshot = store
+            .snapshot(built["snapshot"].as_str())
+            .await?
+            .ok_or("source RFC snapshot missing")?;
+        if snapshot.search_documents.len() != GRAPH_DOCUMENTS || snapshot.index_path.is_none() {
+            return Err("source RFC index fixture has incomplete membership".into());
+        }
+        frozen.push(snapshot);
+    }
+    // Only disposable fixture state is converted into retained legacy evidence.
+    sqlx::query("DELETE FROM devres_rfc_snapshots")
+        .execute(pool)
+        .await?;
+    for ordinal in 0..snapshots {
+        use sha2::{Digest, Sha256};
+        let mut snapshot = frozen[ordinal % generations].clone();
+        snapshot.id = hex::encode(Sha256::digest(format!("fixture-rfc-snapshot-{ordinal}")));
+        snapshot.created_at = 1_700_000_000 + ordinal as i64;
+        snapshot.complete = false;
+        snapshot.coverage = json!({"synthetic":true,"documents":GRAPH_DOCUMENTS,"ordinal":ordinal});
+        let order: i64 = sqlx::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('devres_rfc_snapshots','published_order'))",
+        )
+        .fetch_one(pool)
+        .await?;
+        let data = serde_json::to_value(&snapshot)?;
+        let payload = json!({"published_order":order,"catalogue_capture":snapshot.catalogue_capture,"errata_capture":snapshot.errata_capture,"created_at":snapshot.created_at,"complete":snapshot.complete,"data":data});
+        sqlx::query("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,data,created_at,complete,published_order,data_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+            .bind(&snapshot.id).bind(&snapshot.catalogue_capture).bind(&snapshot.errata_capture).bind(sqlx::types::Json(&data))
+            .bind(snapshot.created_at).bind(snapshot.complete).bind(order).bind(payload_seal("devres_rfc_snapshots","",&snapshot.id,&payload)?).execute(pool).await?;
+    }
+    // Independent provider lanes with retained evidence exercise cross-provider scheduling.
+    for (table, kind) in [
+        ("devres_npm_evidence", "failures"),
+        ("devres_advisory_rows", "legacy-gaps"),
+    ] {
+        for ordinal in 0..snapshots * 4 {
+            let key = format!("fixture-graph-{ordinal:08}");
+            let data = json!({"synthetic":true,"ordinal":ordinal,"payload":"public graph work ".repeat(4096)});
+            let sequence: i64 =
+                sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence($1,'sequence'))")
+                    .bind(table)
+                    .fetch_one(pool)
+                    .await?;
+            let sequence_seal = devres_adapters::integrity::canonical_hash(
+                &json!({"version":1,"namespace":table,"kind":kind,"key":key,"sequence":sequence}),
+            )?;
+            sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO {table}(sequence,kind,key,data,data_integrity,sequence_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6)")))
+                .bind(sequence).bind(kind).bind(&key).bind(sqlx::types::Json(&data)).bind(payload_seal(table,kind,&key,&data)?).bind(sequence_seal).execute(pool).await?;
+        }
+    }
+    Ok(())
+}
 
 async fn require_empty_database(pool: &sqlx::PgPool) -> Result<()> {
     // Inspect only PostgreSQL catalogs, in a read-only transaction, before any
@@ -86,13 +284,24 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     let payload_kib = count(args.get(1), 256, 2048)?;
     let files = count(args.get(2), 16, 128)?;
     let file_mib = count(args.get(3), 8, 32)?;
-    if root.exists() || args.len() > 4 {
+    let graph_snapshots = args
+        .get(4)
+        .map(|value| count(Some(value), 8, 64))
+        .transpose()?
+        .unwrap_or(0);
+    let graph_generations = count(args.get(5), 1, 64)?;
+    if (graph_snapshots == 0 && graph_generations != 1)
+        || (graph_snapshots > 0 && graph_generations > graph_snapshots)
+    {
+        return Err("graph generations must fit enabled graph snapshots".into());
+    }
+    if root.exists() || args.len() > 6 {
         return Err("prepare requires a new fixture root and bounded arguments".into());
     }
     let pool = sqlx::PgPool::connect(url).await?;
     require_empty_database(&pool).await?;
     std::fs::create_dir(root)?;
-    let store = PgBlobStore::connect(url, root).await?;
+    let store = Arc::new(PgBlobStore::connect(url, root).await?);
     sqlx::raw_sql("CREATE TABLE public.devres_benchmark_fixture(singleton boolean PRIMARY KEY CHECK(singleton),identity text NOT NULL)")
         .execute(&pool).await?;
     sqlx::query("INSERT INTO public.devres_benchmark_fixture VALUES(true,$1)")
@@ -117,6 +326,9 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
             1_700_000_000,
         )
         .await?;
+    if graph_snapshots > 0 {
+        seed_graphs(&store, &pool, root, graph_snapshots, graph_generations).await?;
+    }
     drop(store);
     // Only the harness's fresh database is converted to pending qualification.
     // Empty provider graphs still traverse the real replay/activation gates.
@@ -124,6 +336,11 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     // it only in this disposable conversion so activation installs it normally.
     sqlx::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress; ALTER TABLE devres_advisory_records ALTER COLUMN data_integrity DROP NOT NULL; ALTER TABLE devres_rfc_jobs DROP CONSTRAINT devres_rfc_capture_integrity_required;")
         .execute(&pool).await?;
+    if graph_snapshots > 0 {
+        sqlx::query("DELETE FROM devres_integrity_provider_cutoffs")
+            .execute(&pool)
+            .await?;
+    }
     let payload = "synthetic public fixture payload ".repeat((payload_kib * 1024).div_ceil(33));
     for ordinal in 0..rows {
         let data = json!({"synthetic":true,"ordinal":ordinal,"payload":payload,
@@ -156,9 +373,9 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     nix::unistd::syncfs(&directory)?;
     pool.close().await;
     Ok(
-        json!({"fixture":"pending-schema10-synthetic-v1","full_schema9_corpus":false,"durable_before_timing":true,
+        json!({"fixture":fixture_kind(graph_snapshots),"full_schema9_corpus":false,"durable_before_timing":true,
         "rows":rows,"payload_kib":payload_kib,"files":files,"file_mib":file_mib,
-        "capture":capture.capture.id,"seed_outside_timing":true}),
+        "capture":capture.capture.id,"seed_outside_timing":true,"graph_snapshots":graph_snapshots,"graph_generations":graph_generations,"rfc_index_documents":if graph_snapshots>0 {GRAPH_DOCUMENTS}else{0}}),
     )
 }
 
@@ -198,6 +415,15 @@ async fn metrics(pool: &sqlx::PgPool) -> Result<Value> {
         "rss_high_water_kib":status.get("VmHWM"),"wal_position_bytes":wal.parse::<u64>()?}))
 }
 
+fn open_file_descriptors() -> Result<usize> {
+    let mut count = 0_usize;
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        entry?;
+        count = count.checked_add(1).ok_or("descriptor count overflow")?;
+    }
+    Ok(count)
+}
+
 async fn phase<F, T>(
     name: &str,
     pool: &sqlx::PgPool,
@@ -209,7 +435,20 @@ where
 {
     let before = metrics(pool).await?;
     let start = Instant::now();
-    let result = work.await?;
+    let mut sampled_fd_high_water = open_file_descriptors()?;
+    let mut sampling = tokio::time::interval(std::time::Duration::from_millis(10));
+    sampling.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(work);
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut work => break result?,
+            _ = sampling.tick() => {
+                sampled_fd_high_water = sampled_fd_high_water.max(open_file_descriptors()?);
+            }
+        }
+    };
+    sampled_fd_high_water = sampled_fd_high_water.max(open_file_descriptors()?);
     let elapsed = start.elapsed().as_secs_f64();
     let after = metrics(pool).await?;
     let delta = |key: &str| {
@@ -221,17 +460,21 @@ where
     reports.push(json!({"phase":name,"wall_secs":elapsed,
         "user_ticks":delta("user_ticks"),"system_ticks":delta("system_ticks"),
         "read_bytes":delta("read_bytes"),"write_bytes":delta("write_bytes"),
-        "wal_bytes":delta("wal_position_bytes"),"process_rss_high_water_kib":after["rss_high_water_kib"]}));
+        "wal_bytes":delta("wal_position_bytes"),"sampled_fd_high_water":sampled_fd_high_water,"process_rss_high_water_kib":after["rss_high_water_kib"]}));
     Ok(result)
 }
 
 async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
     use futures::TryStreamExt;
+    let graph_fixture: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_snapshots)")
+            .fetch_one(pool)
+            .await?;
     let mut digest = blake3::Hasher::new();
     digest.update(b"devres:synthetic-migration-fingerprint:v1\0");
     // Compare all retained fixture SQL evidence, excluding physical tuple IDs,
     // connection statistics and execution timing. Table/row ordering is explicit.
-    for table in [
+    let mut tables = vec![
         "devres_benchmark_fixture",
         "devres_advisory_records",
         "devres_captures",
@@ -243,10 +486,29 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
         "devres_integrity_graph_progress",
         "devres_integrity_provider_cutoffs",
         "devres_integrity_staged_state",
-    ] {
+    ];
+    if graph_fixture {
+        tables.extend([
+            "devres_rfc_datasets",
+            "devres_rfc_dataset_heads",
+            "devres_rfc_jobs",
+            "devres_rfc_snapshots",
+            "devres_npm_evidence",
+            "devres_advisory_rows",
+        ]);
+    }
+    for table in tables {
         digest.update(table.as_bytes());
-        let query =
-            format!("SELECT to_jsonb(t)::text AS data FROM {table} t ORDER BY to_jsonb(t)::text");
+        // Tantivy segment UUIDs and the fixture's original unique build directory
+        // are physical artifacts. Full verification checks them; compare frozen
+        // manifests, rows and public query semantics independently of their names.
+        let query = if graph_fixture && table == "devres_rfc_snapshots" {
+            "SELECT ((to_jsonb(t)-'data_integrity') || jsonb_build_object('data',data-'index_path'))::text AS data FROM devres_rfc_snapshots t ORDER BY published_order".into()
+        } else if graph_fixture && table == "devres_integrity_files" {
+            "SELECT to_jsonb(t)::text AS data FROM devres_integrity_files t WHERE path NOT LIKE 'rfc-indexes/%' ORDER BY path".into()
+        } else {
+            format!("SELECT to_jsonb(t)::text AS data FROM {table} t ORDER BY to_jsonb(t)::text")
+        };
         let mut rows = sqlx::query(sqlx::AssertSqlSafe(query)).fetch(pool);
         while let Some(row) = rows.try_next().await? {
             let data: String = row.try_get("data")?;
@@ -254,7 +516,12 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
             digest.update(data.as_bytes());
         }
     }
-    fn visit(root: &Path, current: &Path, digest: &mut blake3::Hasher) -> Result<()> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        digest: &mut blake3::Hasher,
+        graph_fixture: bool,
+    ) -> Result<()> {
         use std::io::Read;
         let mut entries = std::fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
         entries.sort_by_key(|entry| entry.file_name());
@@ -264,12 +531,30 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
                 return Err("unexpected fixture symlink".into());
             }
             if kind.is_dir() {
-                visit(root, &entry.path(), digest)?;
+                if graph_fixture
+                    && current == root
+                    && matches!(entry.file_name().to_str(), Some("rfc-indexes"))
+                {
+                    continue;
+                }
+                visit(root, &entry.path(), digest, graph_fixture)?;
             } else if kind.is_file() {
                 if entry.file_name().to_string_lossy().starts_with(".stage-") {
                     return Err("unpublished fixture stage remained".into());
                 }
                 let path = entry.path();
+                if graph_fixture && path.starts_with(root.join(".devres-integrity/files")) {
+                    if entry.metadata()?.len() > 16 * 1024 {
+                        return Err("fixture integrity descriptor exceeds its bound".into());
+                    }
+                    let evidence: devres_adapters::integrity::FileEvidence =
+                        serde_json::from_slice(&std::fs::read(&path)?)?;
+                    // Only nondeterministic physical index descriptors normalize out.
+                    // Raw capture/file descriptors remain permanent fingerprint evidence.
+                    if evidence.path.starts_with("rfc-indexes/") {
+                        continue;
+                    }
+                }
                 let relative = path
                     .strip_prefix(root)?
                     .to_str()
@@ -292,13 +577,13 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
         }
         Ok(())
     }
-    visit(root, root, &mut digest)?;
+    visit(root, root, &mut digest, graph_fixture)?;
     Ok(digest.finalize().to_hex().to_string())
 }
 
 async fn readback(url: &str, root: &Path, pool: &sqlx::PgPool) -> Result<String> {
     require_fixture(pool, root).await?;
-    let store = PgBlobStore::connect(url, root).await?;
+    let store = Arc::new(PgBlobStore::connect(url, root).await?);
     store.check_health().await?;
     let id: String = sqlx::query_scalar("SELECT capture_id FROM devres_heads WHERE source_key=$1")
         .bind(KEY)
@@ -307,20 +592,74 @@ async fn readback(url: &str, root: &Path, pool: &sqlx::PgPool) -> Result<String>
     if store.capture(&id).await?.body.as_ref() != BODY {
         return Err("retained capture mismatch".into());
     }
-    drop(store);
-    fingerprint(pool, root).await
+    let durable = fingerprint(pool, root).await?;
+    let snapshots: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM devres_rfc_snapshots ORDER BY published_order")
+            .fetch_all(pool)
+            .await?;
+    if snapshots.is_empty() {
+        return Ok(durable);
+    }
+    let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(OfflineOnly)));
+    let corpus = Arc::new(devres_adapters::RfcCorpus::new(
+        retrieval.clone(),
+        store,
+        root,
+        Default::default(),
+    )?);
+    let research = devres_adapters::Research::new(retrieval)
+        .await?
+        .with_corpus(corpus);
+    let mut digest = blake3::Hasher::new();
+    digest.update(durable.as_bytes());
+    for snapshot in snapshots {
+        for (query, mode) in [("migrationanchor", "technical"), ("clients", "english")] {
+            let result = research
+                .call(
+                    "rfc.fulltext_search",
+                    json!({"query":query,"mode":mode,"snapshot":snapshot,"limit":100}),
+                )
+                .await?;
+            if result["total"] != GRAPH_DOCUMENTS as u64 {
+                return Err("RFC graph readback changed retained searchable membership".into());
+            }
+            digest.update(&serde_json::to_vec(&result)?);
+        }
+    }
+    Ok(digest.finalize().to_hex().to_string())
 }
 
-async fn run(url: &str, root: &Path, workers: usize, budget_mib: usize) -> Result<Value> {
-    let execution = MigrationExecution::new(MigrationExecutionOptions::new(
-        workers,
-        budget_mib
-            .checked_mul(1024 * 1024)
-            .ok_or("payload budget overflow")?,
-    )?)?;
+async fn run(
+    url: &str,
+    root: &Path,
+    workers: usize,
+    budget_mib: usize,
+    graph_budget_mib: usize,
+) -> Result<Value> {
+    let execution = MigrationExecution::new_with_graph_options(
+        MigrationExecutionOptions::new(
+            workers,
+            budget_mib
+                .checked_mul(1024 * 1024)
+                .ok_or("payload budget overflow")?,
+        )?,
+        MigrationGraphOptions::new(
+            graph_budget_mib
+                .checked_mul(1024 * 1024)
+                .ok_or("graph budget overflow")?,
+        )?,
+    )?;
     execution.enable_progress();
     let pool = sqlx::PgPool::connect(url).await?;
     require_fixture(&pool, root).await?;
+    let graph_snapshots: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let graph_generations: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT data->>'index_path') FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%'",
+    ).fetch_one(&pool).await?;
     let store = Arc::new(PgBlobStore::connect_for_migration(url, root).await?);
     let mut reports = Vec::new();
     phase(
@@ -373,15 +712,26 @@ async fn run(url: &str, root: &Path, workers: usize, budget_mib: usize) -> Resul
     .await?;
     pool.close().await;
     let snapshot = execution.snapshot();
-    if snapshot.active != 0 || snapshot.admitted != snapshot.completed {
+    if snapshot.active != 0
+        || snapshot.admitted != snapshot.completed
+        || snapshot.graph_active != 0
+        || snapshot.graph_memory_bytes != 0
+        || snapshot.graph_admitted != snapshot.graph_completed
+    {
         return Err("benchmark returned with unfinished work".into());
     }
     Ok(
-        json!({"fixture":"pending-schema10-synthetic-v1","full_schema9_corpus":false,
+        json!({"fixture":fixture_kind(graph_snapshots as usize),"full_schema9_corpus":false,
         "workers":workers,"payload_budget_mib":budget_mib,"phases":reports,
         "durable_fingerprint":durable_fingerprint,"jobs_high_water":snapshot.high_water,
         "window_high_water":snapshot.window_high_water,"worker_wait_micros":snapshot.worker_wait_micros,
-        "publication_micros":snapshot.publication_micros,"rss_note":"process high water, cumulative across phases; excludes PostgreSQL",
+        "publication_micros":snapshot.publication_micros,
+        "graph_memory_budget_mib":graph_budget_mib,"graph_snapshots":graph_snapshots,"graph_generations":graph_generations.max(1),
+        "graph_jobs_high_water":snapshot.graph_high_water,"graph_jobs_admitted":snapshot.graph_admitted,
+        "graph_memory_high_water":snapshot.graph_memory_high_water,
+        "fingerprint_kind":if graph_snapshots>0 {"logical SQL, non-index file bytes and full RFC query results; physical index files independently verified"}else{"logical SQL and all retained file bytes"},
+        "rss_note":"process high water, cumulative across phases; excludes PostgreSQL",
+        "fd_note":"10 ms sampled process descriptor high water; includes sampler directory; excludes PostgreSQL",
         "timing_note":"fixture generation excluded; warm cache, no host cache drop"}),
     )
 }
@@ -420,12 +770,13 @@ async fn main() -> Result<()> {
     }
     let result = match command.as_str() {
         "prepare" => prepare(&url, root, &args[2..]).await?,
-        "run" if args.len() <= 4 => {
+        "run" if args.len() <= 5 => {
             run(
                 &url,
                 root,
                 count(args.get(2), 1, 64)?,
                 count(args.get(3), 64, 4096)?,
+                count(args.get(4), 1024, 65536)?,
             )
             .await?
         }
@@ -514,7 +865,7 @@ mod tests {
         let root = temporary.path().join("blobs");
         let options = ["2", "1", "2", "1"].map(String::from);
         prepare(url.as_str(), &root, &options).await?;
-        let report = run(url.as_str(), &root, 2, 64).await?;
+        let report = run(url.as_str(), &root, 2, 64, 1024).await?;
         let phases = report["phases"]
             .as_array()
             .ok_or("missing benchmark phases")?;
@@ -546,6 +897,101 @@ mod tests {
         )))
         .execute(&admin)
         .await?;
+        admin.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL; real frozen-index replay, no provider traffic"]
+    async fn graph_fixture_has_serial_parallel_semantic_parity_and_bounded_work() -> Result<()> {
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
+        let admin = sqlx::PgPool::connect(&base).await?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let mut baseline = None;
+        for workers in [1, 2] {
+            let database = format!("devres_benchmark_graph_{suffix}_{workers}");
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
+                .execute(&admin)
+                .await?;
+            let mut url = url::Url::parse(&base)?;
+            url.set_path(&format!("/{database}"));
+            let temporary = tempfile::tempdir_in("/tmp")?;
+            let root = temporary.path().join("blobs");
+            prepare(
+                url.as_str(),
+                &root,
+                &["2", "1", "2", "1", "4", "2"].map(String::from),
+            )
+            .await?;
+            let report = run(url.as_str(), &root, workers, 64, 1024).await?;
+            assert_eq!(report["fixture"], "pending-schema10-graph-v1");
+            assert_eq!(report["graph_snapshots"], 4);
+            assert_eq!(report["graph_generations"], 2);
+            assert!(
+                report["phases"]
+                    .as_array()
+                    .ok_or("missing phases")?
+                    .iter()
+                    .all(|phase| phase["sampled_fd_high_water"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0))
+            );
+            assert!(report["graph_jobs_admitted"].as_u64().unwrap_or(0) >= 4);
+            let high_water = report["graph_jobs_high_water"]
+                .as_u64()
+                .ok_or("missing graph concurrency evidence")?;
+            assert!(high_water >= 1 && high_water <= workers as u64);
+            if workers > 1 {
+                assert!(
+                    high_water > 1,
+                    "graph fixture must execute actual overlapping units"
+                );
+            }
+            assert!(
+                report["graph_memory_high_water"]
+                    .as_u64()
+                    .ok_or("missing graph memory evidence")?
+                    <= 1024 * 1024 * 1024
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(&report["durable_fingerprint"], expected);
+            } else {
+                baseline = Some(report["durable_fingerprint"].clone());
+            }
+            let pool = sqlx::PgPool::connect(url.as_str()).await?;
+            let verified = fingerprint(&pool, &root).await?;
+            let body: String = sqlx::query_scalar("SELECT c.body_hash FROM devres_captures c JOIN devres_heads h ON h.capture_id=c.id WHERE h.source_key='rfc:text:1'")
+                .fetch_one(&pool).await?;
+            let descriptor = devres_adapters::integrity::evidence_path(
+                &root,
+                &root.join(devres_adapters::integrity::relative_path(&body)?),
+            )?;
+            let original = std::fs::read(&descriptor)?;
+            std::fs::remove_file(&descriptor)?;
+            assert_ne!(
+                fingerprint(&pool, &root).await?,
+                verified,
+                "loss of an unselected raw capture descriptor must change graph evidence"
+            );
+            std::fs::write(&descriptor, original)?;
+            assert_eq!(fingerprint(&pool, &root).await?, verified);
+            sqlx::query("DELETE FROM devres_rfc_dataset_heads WHERE kind='catalogue'")
+                .execute(&pool)
+                .await?;
+            assert_ne!(
+                fingerprint(&pool, &root).await?,
+                verified,
+                "catalogue head selection is durable graph evidence"
+            );
+            pool.close().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE {database} WITH (FORCE)"
+            )))
+            .execute(&admin)
+            .await?;
+        }
         admin.close().await;
         Ok(())
     }
