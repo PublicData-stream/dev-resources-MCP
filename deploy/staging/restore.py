@@ -29,8 +29,8 @@ PRIVATE = Path('/etc/devres-staging')
 DATASET = 'cachepool/devres-staging'
 PG = 'postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a'
 OLD_SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:02977361122a11d7f0a9eedea97437b15f2fccc17f82d2331f859d388359179e'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:491ba0afe42ebc564e1d40ddf1c884f0aaa34cc75517f1eeabb853d8e21f6c70'
-PROFILES = {9: (OLD_SERVER, '0.1.0-build.27d35cd6'), 10: (SERVER, '0.1.0-build.b91929db')}
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10'
+PROFILES = {9: (OLD_SERVER, '0.1.0-build.27d35cd6'), 10: (SERVER, '0.1.0-build.d373818b')}
 SOURCE_PREFIX = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
 COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
 OWNER_KEY = 'org.publicdata:restore-owner'
@@ -39,6 +39,8 @@ TOKEN_RE = re.compile(r'[0-9a-f]{24}\Z')
 HASH_RE = re.compile(r'[0-9a-f]{64}\Z')
 CONTENT_RE = re.compile(r'(?:blake3:)?[0-9a-f]{64}\Z')
 OFFLINE_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+OFFLINE_STOP_SECONDS = 120
+OFFLINE_OPTIONS = {'workers': 8, 'payload_budget_mib': 64, 'graph_memory_budget_mib': 1024}
 MAX_RESPONSE = 1024 * 1024
 MAX_FIXED_BODY = 16 * 1024 * 1024
 CLONE_QUOTAS = ('64G', '512G')
@@ -68,6 +70,7 @@ DIAGNOSTIC_PHASES = frozenset({
     'file_qualification', 'sql_qualification', 'capture_replay', 'verification',
     'file_inventory', 'files', 'complete', 'graph_rfc', 'graph_advisory',
     'graph_crate', 'graph_npm', 'graph_mdn', 'graph_whatwg', 'graph_w3c', 'graph_chromium',
+    'graph_rfc_indexes', 'graph_npm_rows',
 })
 DIAGNOSTIC_ERROR_CODES = frozenset({'invalid_input', 'unavailable', 'not_found', 'capacity', 'integrity', 'cancelled'})
 # Only exact source-authored reasons become enums. Unknown free-form messages are
@@ -95,12 +98,27 @@ DIAGNOSTIC_PROGRESS_COUNTS = frozenset({
     'active_jobs', 'jobs_high_water', 'window_high_water', 'payload_bytes',
     'worker_wait_micros', 'publication_micros',
 })
+DIAGNOSTIC_GRAPH_COUNTS = frozenset({
+    'graph_memory_budget_bytes', 'graph_admitted', 'graph_completed', 'graph_active_jobs',
+    'graph_jobs_high_water', 'graph_memory_bytes', 'graph_memory_high_water',
+})
 DIAGNOSTIC_PROGRESS_TIMES = frozenset({'elapsed_secs', 'phase_elapsed_secs', 'records_per_second'})
 RECORD_SQL = "SELECT id, body_hash FROM devres_captures WHERE source_url='https://www.rfc-editor.org/rfc/rfc9000.txt' AND media_type='text/plain' ORDER BY retrieved_at DESC,id LIMIT 1"
 
 
 class RestoreError(RuntimeError):
     """Fixed diagnostic code; provider content and command stderr stay private."""
+
+
+class OfflinePaused(RestoreError):
+    """The worker is stopped; its caller must preserve and checkpoint the pair."""
+
+    preserve_checkpoint = True
+
+    def __init__(self, command, command_completed=False):
+        super().__init__('offline_command_paused')
+        self.command = command
+        self.command_completed = command_completed
 
 
 def execute(args):
@@ -187,12 +205,16 @@ def diagnostic_terminal(logs):
             value = json.loads(line)
         except (ValueError, RecursionError):
             value = None
-        if (isinstance(value, dict) and set(value) == progress_keys
+        counts = DIAGNOSTIC_PROGRESS_COUNTS
+        if isinstance(value, dict) and set(value) == progress_keys | DIAGNOSTIC_GRAPH_COUNTS:
+            counts |= DIAGNOSTIC_GRAPH_COUNTS
+        if (isinstance(value, dict) and set(value) == {'event', 'phase'} | counts | DIAGNOSTIC_PROGRESS_TIMES
                 and value['event'] == 'offline_storage_progress'
                 and type(value['phase']) is str and value['phase'] in DIAGNOSTIC_PHASES
                 and all(type(value[key]) is int and 0 <= value[key] <= 2**64 - 1
-                        for key in DIAGNOSTIC_PROGRESS_COUNTS)
+                        for key in counts)
                 and 1 <= value['workers'] <= 64 and value['payload_budget_bytes'] > 0
+                and ('graph_memory_budget_bytes' not in value or value['graph_memory_budget_bytes'] > 0)
                 and all(type(value[key]) in (int, float) and 0 <= value[key] <= 1e18
                         and math.isfinite(value[key]) for key in DIAGNOSTIC_PROGRESS_TIMES)):
             events.append(value)
@@ -442,6 +464,7 @@ class Drill:
         self.runtime_owned = False
         self.postgres_started = False
         self.offline_sequence = 0
+        self.offline_options = dict(OFFLINE_OPTIONS)
         self.backend_started = False
 
     def owned(self, dataset):
@@ -600,12 +623,49 @@ class Drill:
             # Diagnostics must not mask the original failure or suppress cleanup.
             pass
 
-    def offline(self, command, target=SERVER, timeout=OFFLINE_TIMEOUT_SECONDS):
+    def pause_offline(self, command, name, state):
+        """Signal only the owned worker, then prove cooperative termination."""
+        found = json.loads(self.run(['docker', 'inspect', name]))
+        if (not isinstance(found, list) or len(found) != 1 or not isinstance(found[0], dict)
+                or found[0].get('Config', {}).get('Labels', {}).get(LABEL_KEY) != self.token
+                or not isinstance(found[0].get('Id'), str) or not HASH_RE.fullmatch(found[0]['Id'])
+                or found[0].get('Name') != '/' + name):
+            raise RestoreError('offline_worker_owner_changed')
+        identifier = found[0]['Id']
+        completed = state.get('Running') is False and state.get('ExitCode') == 0
+        if state.get('Running') is True:
+            try:
+                self.run(['docker', 'kill', '--signal=SIGTERM', identifier])
+            except Exception:
+                # The worker may finish between inspection and signalling.
+                # A successful stopped command remains a checkpoint boundary;
+                # a failed or still-running command must retain normal failure.
+                state = json.loads(self.run(['docker', 'inspect', '--format', '{{json .State}}', identifier]))
+                if state.get('Running') is not False or state.get('ExitCode') != 0:
+                    raise
+                completed = True
+            started = time.monotonic()
+            for attempt in range(OFFLINE_STOP_SECONDS + 1):
+                state = json.loads(self.run(['docker', 'inspect', '--format', '{{json .State}}', identifier]))
+                if state.get('Running') is False:
+                    break
+                if time.monotonic() - started >= OFFLINE_STOP_SECONDS or attempt >= OFFLINE_STOP_SECONDS:
+                    raise RestoreError('offline_cooperative_stop_unconfirmed')
+                self.sleep(1)
+        if (state.get('Running') is not False or state.get('OOMKilled') is True
+                or type(state.get('ExitCode')) is not int or state['ExitCode'] not in (0, 1)
+                or state.get('Error')):
+            raise RestoreError('offline_cooperative_stop_unconfirmed')
+        return completed, identifier
+
+    def offline(self, command, target=SERVER, timeout=OFFLINE_TIMEOUT_SECONDS, control=None):
         """Run one reviewed offline command; stop/remove its writer on every exit."""
         if command not in ('migrate-storage', 'verify-storage', 'activate-storage') or target != SERVER:
             raise RestoreError('invalid_offline_command_or_image')
         if type(timeout) not in (int, float) or not 0 < timeout <= OFFLINE_TIMEOUT_SECONDS:
             raise RestoreError('invalid_offline_timeout')
+        if control is not None and not callable(control):
+            raise RestoreError('invalid_offline_control')
         if (not self.postgres_started or self.backend_started
                 or any(name.startswith(self.name + '-offline-') for name in self.containers)):
             raise RestoreError('offline_writer_exclusion_required')
@@ -618,7 +678,12 @@ class Drill:
         args = [command, '/etc/devres/config/backend.toml']
         if command == 'migrate-storage':
             args.extend(['--to', 'blake3'])
+        for option, value in self.offline_options.items():
+            args.extend(['--' + option.replace('_', '-'), str(value)])
         state = None
+        paused = False
+        cleanup_allowed = True
+        cleanup_target = name
         try:
             self.run(['docker', 'run', '-d', '--name', name, '--label', LABEL_KEY + '=' + self.token,
                       '--network', self.name, '--read-only', '--cap-drop=ALL',
@@ -632,22 +697,33 @@ class Drill:
                 if resources['host_memory_guard']:
                     self.require_memory_headroom()
                 state = json.loads(self.run(['docker', 'inspect', '--format', '{{json .State}}', name]))
+                if not state.get('Running') and state.get('ExitCode') != 0:
+                    raise RestoreError('offline_command_failed')
+                if control is not None and control(self, command, name) is True:
+                    completed, cleanup_target = self.pause_offline(command, name, state)
+                    paused = True
+                    raise OfflinePaused(command, command_completed=completed)
                 if not state.get('Running'):
-                    if state.get('ExitCode') != 0:
-                        raise RestoreError('offline_command_failed')
                     return {'command': command, 'completed': True}
                 if time.monotonic() - started >= timeout or attempt >= timeout:
                     raise RestoreError('offline_command_timed_out')
                 self.sleep(min(1, timeout))
             raise RestoreError('offline_command_timed_out')
+        except OfflinePaused:
+            raise
         except Exception as error:
+            if isinstance(error, RestoreError) and str(error) == 'offline_worker_owner_changed':
+                # Latch writer exclusion until the owner mismatch is resolved;
+                # even failure cleanup must not signal another owner's worker.
+                cleanup_allowed = False
             self.capture_offline_failure(command, name, state, error)
             raise
         finally:
             # Docker removal waits for container termination before dropping the
             # writer; failed cleanup deliberately prevents the next command.
-            self.run(['docker', 'rm', '-f', name])
-            self.containers.remove(name)
+            if cleanup_allowed:
+                self.run(['docker', 'rm', *([] if paused else ['-f']), cleanup_target])
+                self.containers.remove(name)
 
     @staticmethod
     def require_memory_headroom():

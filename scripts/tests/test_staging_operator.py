@@ -155,6 +155,30 @@ class ServiceTests(unittest.TestCase):
             op.main()
             upgrade.return_value.expire.assert_called_once_with(token)
 
+    def test_checkpoint_cli_tokens_scope_and_read_only_preflight(self):
+        import contextlib
+        import io
+        token = 'a' * 24
+        invalid = (['upgrade-pause'], ['upgrade-resume', '--token', '../bad'],
+                   ['upgrade-status', '--token', token, '--pause-scope', 'all'],
+                   ['upgrade', '--receipt', '/tmp/receipt'],
+                   ['upgrade-resume', '--token', token, '--check'],
+                   ['upgrade-adopt-paused', '--token', token, '--receipt', 'relative'])
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), patch('sys.argv', ['staging.py', *arguments]), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as failure:
+                    op.main()
+                self.assertEqual(failure.exception.code, 2)
+        with patch('sys.argv', ['staging.py', 'upgrade-adopt-paused', '--token', token,
+                               '--receipt', '/tmp/receipt', '--check']), \
+                patch.object(op.os, 'geteuid', return_value=0), patch.object(op, 'upgrade_module') as module, \
+                contextlib.redirect_stdout(io.StringIO()):
+            module.return_value.Upgrade.return_value.checkpoint_adopt.return_value = {'check_passed': True}
+            op.main()
+            module.return_value.Upgrade.return_value.checkpoint_adopt.assert_called_once_with(
+                token, '/tmp/receipt', check_only=True)
+
 
 class RecoveryTests(unittest.TestCase):
     def test_upgrade_fence_blocks_other_writer_entrypoints(self):

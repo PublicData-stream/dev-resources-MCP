@@ -33,15 +33,16 @@ def module(name):
 op = module('staging')
 restore = module('restore')
 m = module('maintenance')
-VERSION = '0.1.0-build.b91929db'
+checkpoint = module('checkpoint')
+VERSION = '0.1.0-build.d373818b'
 OLD_VERSION = '0.1.0-build.27d35cd6'
 SOURCE = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
-TERMINAL = {'rehearsed', 'rehearsal_failed', 'complete', 'rolled_back'}
+TERMINAL = {'rehearsed', 'rehearsed_unqualified', 'rehearsal_failed', 'complete', 'rolled_back'}
 TIMERS = ('devres-staging-backup.timer',)
 HOLD = 'devres-upgrade-protected'
 TOKEN = re.compile(r'[0-9a-f]{24}\Z')
 WATCHDOG = 'devres-staging-upgrade-expire@'
-BUNDLE_FILES = ('staging.py', 'restore.py', 'upgrade.py', 'maintenance.py', 'recovery.py')
+BUNDLE_FILES = ('staging.py', 'restore.py', 'upgrade.py', 'maintenance.py', 'recovery.py', 'checkpoint.py')
 
 
 class UpgradeError(RuntimeError):
@@ -68,7 +69,8 @@ def rehearsal_identity():
     return {'server': restore.SERVER, 'version': VERSION,
             'source_url': SOURCE + VERSION + '/source.tar.gz',
             'bundle_sha256': bundle,
-            'resource_profile': {'name': 'upgrade', **restore.RESOURCE_PROFILES['upgrade']}}
+            'resource_profile': {'name': 'upgrade', **restore.RESOURCE_PROFILES['upgrade']},
+            'offline_options': dict(restore.OFFLINE_OPTIONS)}
 
 
 def journal_root(state_root=None):
@@ -155,6 +157,8 @@ def process_start(pid):
 def terminate_driver(record, lock_path=None):
     """Stop only the overdue direct driver's exact Linux process instance."""
     pid, born = record.get('driver_pid'), record.get('driver_start')
+    if record.get('driver_boot_id') and record['driver_boot_id'] != checkpoint.boot_id():
+        return
     if (type(pid) is not int or pid < 2 or not isinstance(born, str)
             or not born.isdigit() or pid == os.getpid()):
         raise UpgradeError('invalid_upgrade_driver_identity')
@@ -235,6 +239,36 @@ class Upgrade:
         self.private = Path(private if private is not None else op.PRIVATE)
         self.clock, self.drill, self.live, self.verify = clock, drill, live, verify
         self.record = None
+        self.restore_module = restore
+        self.dataset, self.hold = m.DATASET, HOLD
+        self.source_prefix, self.target_version = SOURCE, VERSION
+        self.write = op.write
+
+    def read_record(self):
+        return read_record(self.root.parent)
+
+    def identity(self):
+        result = rehearsal_identity()
+        record = self.record or {}
+        profile = record.get('resource_profile', 'direct' if record.get('mode') == 'direct' else 'upgrade')
+        if profile not in ('upgrade', 'direct'):
+            raise UpgradeError('invalid_upgrade_resource_profile')
+        result['resource_profile'] = {'name': profile, **restore.RESOURCE_PROFILES[profile]}
+        result['pause_scope'] = record.get('pause_scope', 'rehearsal')
+        return result
+
+    def snapshot_name(self, label):
+        return 'devres-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + label + '-' + secrets.token_hex(3)
+
+    @staticmethod
+    def validate_pause_scope(scope):
+        if scope not in ('rehearsal', 'all'):
+            raise UpgradeError('invalid_pause_scope')
+
+    def safe_unlocked(self):
+        value = self.maintenance_state.load()
+        if value.get('fence') or value.get('operation') or self.tool.capacity_reason(self.tool.metrics()):
+            raise UpgradeError('upgrade_capacity_or_maintenance_fenced')
 
     def save(self, phase=None, **updates):
         if phase is not None:
@@ -246,9 +280,7 @@ class Upgrade:
 
     def safe(self):
         with self.maintenance_state.locked():
-            value = self.maintenance_state.load()
-            if value.get('fence') or value.get('operation') or self.tool.capacity_reason(self.tool.metrics()):
-                raise UpgradeError('upgrade_capacity_or_maintenance_fenced')
+            self.safe_unlocked()
 
     def begin(self, phase):
         previous = read_record(self.root.parent)
@@ -282,6 +314,11 @@ class Upgrade:
                        'phase': phase, 'token': token, 'timers': timer_state,
                        'old_server': image, 'old_version': OLD_VERSION}
         self.save()
+        with checkpoint.control_lock(self.root):
+            request = self.root / 'pause-request.json'
+            if request.exists():
+                checkpoint.read_json(request)
+                request.unlink()
         (self.root / 'acceptance.json').unlink(missing_ok=True)
         op.write(self.root / 'original-config.toml', text)
         self.run(['systemctl', 'stop', *TIMERS])
@@ -353,7 +390,8 @@ class Upgrade:
         if drill.postgres_started:
             self.run(['docker', 'stop', '--time=120', drill.name + '-postgres'])
 
-    def rehearsal(self):
+    def rehearsal(self, pause_scope='rehearsal'):
+        self.validate_pause_scope(pause_scope)
         with self.state.locked():
             started = self.clock()
             identity = rehearsal_identity()
@@ -362,6 +400,8 @@ class Upgrade:
             admitted = False
             try:
                 original = self.begin('rehearsing')
+                self.save(pause_scope=pause_scope, timing_qualified=True)
+                self.record_driver()
                 admitted = True
                 snapshot = self.snapshot('upgrade-rehearsal')
                 self.save(snapshot=snapshot)
@@ -383,7 +423,7 @@ class Upgrade:
                     for command in ('migrate-storage', 'verify-storage', 'activate-storage'):
                         self.safe()
                         phase_started = time.monotonic()
-                        drill.offline(command)
+                        checkpoint.Lifecycle(self).offline(drill, command)
                         phases[command] = time.monotonic() - phase_started
                     phase_started = time.monotonic()
                     receipt = drill.check(prepared=True)
@@ -413,18 +453,28 @@ class Upgrade:
                     phases['rollback_restore'] = time.monotonic() - phase_started
                     self.save(rehearsal_schema10_restore=canonical_receipt,
                               rehearsal_rollback_restore=rollback_receipt)
+                except checkpoint.Paused:
+                    raise
+                except Exception as failure:
+                    if getattr(drill, 'runtime_owned', True):
+                        checkpoint.Lifecycle(self).preserve_failure(
+                            drill, allow_stop=not getattr(failure, 'unsafe_cleanup', False))
+                    raise
                 finally:
+                    preserved = self.record.get('phase') in checkpoint.PRESERVED
                     try:
-                        self.clean_stop(drill)
+                        if not preserved:
+                            self.clean_stop(drill)
                     finally:
-                        if canonical_created:
+                        if canonical_created and not preserved:
                             # This source is the token-owned disposable clone,
                             # never the permanent staging subtree. Nested clone
                             # cleanup must have completed before removal succeeds.
                             drill.owned(drill.dataset)
                             self.run(['zfs', 'destroy', '-r', drill.dataset + '@' + canonical_snapshot])
-                        drill.cleanup()
-                        self.save(live_token=None)
+                        if not preserved:
+                            drill.cleanup()
+                            self.save(live_token=None)
                 if rehearsal_identity() != identity:
                     raise UpgradeError('rehearsal_identity_changed')
                 elapsed = max(1, math.ceil(self.clock() - started))
@@ -435,14 +485,16 @@ class Upgrade:
                 return {'rehearsed': True, 'seconds': elapsed,
                         'deadline_seconds': self.record['deadline_seconds'], 'snapshot': snapshot,
                         'rehearsal_identity': identity, 'phase_seconds': phases}
+            except checkpoint.Paused:
+                return {'paused': True, 'timing_qualified': False}
             except Exception:
-                if admitted or self.record:
+                if (admitted or self.record) and self.record.get('phase') not in checkpoint.PRESERVED:
                     self.save('rehearsal_failed')
                     self.restore_timers()
                 raise
 
     def remaining(self):
-        remaining = self.record['deadline_seconds'] - (self.clock() - self.started)
+        remaining = self.record['deadline_at'] - time.time()
         if remaining <= 0:
             raise UpgradeError('upgrade_deadline_exceeded')
         self.safe()
@@ -450,23 +502,23 @@ class Upgrade:
             remaining = min(remaining, self.wall_remaining())
         return min(restore.OFFLINE_TIMEOUT_SECONDS, remaining)
 
-    def apply(self):
-        return self._apply()
+    def apply(self, pause_scope='rehearsal'):
+        return self._apply(pause_scope=pause_scope)
 
-    def apply_direct(self, deadline_at):
+    def apply_direct(self, deadline_at, pause_scope='rehearsal'):
         if (isinstance(deadline_at, bool) or not isinstance(deadline_at, (int, float))
                 or not math.isfinite(deadline_at) or deadline_at <= time.time()):
             raise UpgradeError('invalid_upgrade_deadline')
         if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
             raise UpgradeError('upgrade_driver_supervision_unavailable')
-        return self._apply(deadline_at=deadline_at)
+        return self._apply(deadline_at=deadline_at, pause_scope=pause_scope)
 
     def record_driver(self):
         pid = os.getpid()
         born = process_start(pid)
         if born is None:
             raise UpgradeError('upgrade_driver_supervision_unavailable')
-        self.save(driver_pid=pid, driver_start=born)
+        self.save(driver_pid=pid, driver_start=born, driver_boot_id=checkpoint.boot_id())
 
     def verify_direct(self, snapshot, **kwargs):
         """Expose the isolated restore owner before it can start any writer."""
@@ -496,7 +548,8 @@ class Upgrade:
         return {'rolled_back': True, 'version': OLD_VERSION,
                 'watchdog_disarmed': not self.record.get('watchdog_cleanup_pending', False)}
 
-    def _apply(self, deadline_at=None):
+    def _apply(self, deadline_at=None, pause_scope='rehearsal'):
+        self.validate_pause_scope(pause_scope)
         with self.state.locked():
             direct = deadline_at is not None
             if not direct:
@@ -505,11 +558,16 @@ class Upgrade:
                     raise UpgradeError('successful_rehearsal_required')
                 if rehearsal.get('rehearsal_identity') != rehearsal_identity():
                     raise UpgradeError('matching_rehearsal_identity_required')
+                if rehearsal.get('timing_qualified', True) is not True:
+                    raise UpgradeError('uninterrupted_rehearsal_required')
+                if rehearsal.get('pause_scope', 'rehearsal') != pause_scope:
+                    raise UpgradeError('matching_rehearsal_policy_required')
             mutated = False
             drain_attempted = False
             original = None
             try:
                 original = self.begin('preparing_upgrade')
+                self.save(pause_scope=pause_scope)
                 if direct:
                     self.save(mode='direct', deadline_seconds=deadline_at - time.time(),
                               deadline_at=deadline_at)
@@ -519,6 +577,7 @@ class Upgrade:
                               deadline_at=time.time() + rehearsal['deadline_seconds'],
                               rehearsal_snapshot=rehearsal['snapshot'])
                 self.started = self.clock()
+                self.record_driver()
                 paused = restore.paused_config(original)
                 self.remaining()
                 self.arm_watchdog()
@@ -558,7 +617,7 @@ class Upgrade:
                 if any(not value.isdigit() for value in guids.values()):
                     raise UpgradeError('invalid_dataset_identity')
                 self.save('migrating', dataset_guids=guids, live_token=secrets.token_hex(12),
-                          live_kind='permanent' if direct else None)
+                          live_kind='permanent', checkpoint_kind='permanent')
                 mutated = True
                 drill = self.live(snapshot, schema=10, private=self.private,
                                   token=self.record['live_token'],
@@ -569,25 +628,20 @@ class Upgrade:
                     drill.start_postgres()
                     for command in ('migrate-storage', 'verify-storage', 'activate-storage'):
                         self.save('running_' + command.replace('-', '_'))
-                        drill.offline(command, timeout=self.remaining())
+                        checkpoint.Lifecycle(self).offline(drill, command, timeout=self.remaining())
                 finally:
                     try:
-                        self.clean_stop(drill)
+                        if self.record.get('phase') not in checkpoint.PRESERVED:
+                            self.clean_stop(drill)
                     finally:
-                        drill.cleanup()
-                self.save('starting_candidate', live_token=None, live_kind=None)
-                self.tool.postgres_shut_down()
-                op.write(self.private / 'backend.toml', target_config(original, paused=True))
-                op.config_secret()
-                self.tool.k('set', 'image', 'deployment/backend', 'backend=' + restore.SERVER)
-                self.remaining()
-                self.tool.start('postgres', 1)
-                self.tool.start('backend', 1)
-                self.remaining()
-                self.save('awaiting_acceptance')
+                        if self.record.get('phase') not in checkpoint.PRESERVED:
+                            drill.cleanup()
+                self.start_candidate()
                 return {'candidate_ready': True, 'collectors_paused': True,
                         'snapshot': snapshot, 'version': VERSION,
                         **({'old_restore_seconds': self.record['old_restore_seconds']} if direct else {})}
+            except checkpoint.Paused:
+                return {'paused': True, 'deadline_at': self.record['deadline_at']}
             except Exception:
                 if mutated:
                     self._rollback()
@@ -615,7 +669,7 @@ class Upgrade:
         owner = owned_containers(self.root.parent)
         if not owner:
             return
-        if self.record.get('mode') == 'direct':
+        if self.record.get('live_kind') in ('restore', 'permanent'):
             self.cleanup_owned_resources(owner)
             self.save(live_token=None, live_kind=None)
             return
@@ -873,7 +927,7 @@ class Upgrade:
             # stopped only after the timer acquires the released lock.
             record = read_record(self.root.parent)
             if (not record or record['token'] != expected_token
-                    or record.get('mode') != 'direct'
+                    or 'deadline_at' not in record
                     or record['phase'] in TERMINAL | {'rolling_back', 'recovering_original'}
                     or not self.deadline_due(record, wall_clock)):
                 raise
@@ -904,13 +958,13 @@ class Upgrade:
                     self.disarm_watchdog()
             return {'expired': False}
         direct = self.record.get('mode') == 'direct'
-        if not direct and self.record['phase'] not in ('awaiting_acceptance', 'rolling_back'):
+        if 'deadline_at' not in self.record:
             return {'expired': False}
         if not self.deadline_due(self.record, wall_clock):
             return {'expired': False}
         # A terminated pre-migration restore has never changed the permanent
         # pair. Once migration may have started, use the preserving pair swap.
-        if direct and not self.record.get('dataset_guids'):
+        if not self.record.get('dataset_guids'):
             result = self.recover_original()
         else:
             result = self._rollback()
@@ -921,8 +975,7 @@ class Upgrade:
             self.record = read_record(self.root.parent)
             if not self.record or self.record['phase'] != 'awaiting_acceptance':
                 raise UpgradeError('candidate_acceptance_required')
-            if self.record.get('mode') == 'direct':
-                self.record_driver()
+            self.record_driver()
             if time.time() >= self.record['deadline_at']:
                 self._rollback()
                 raise UpgradeError('upgrade_acceptance_deadline_exceeded')
@@ -970,17 +1023,87 @@ class Upgrade:
         self.safe()
         return min(restore.OFFLINE_TIMEOUT_SECONDS, remaining)
 
+    def start_candidate(self):
+        self.save('starting_candidate', live_token=None, live_kind=None, offline_command=None)
+        self.tool.postgres_shut_down()
+        original = (self.root / 'original-config.toml').read_text()
+        op.write(self.private / 'backend.toml', target_config(original, paused=True))
+        op.config_secret()
+        self.tool.k('set', 'image', 'deployment/backend', 'backend=' + restore.SERVER)
+        self.wall_remaining()
+        self.tool.start('postgres', 1)
+        self.tool.start('backend', 1)
+        self.wall_remaining()
+        self.save('awaiting_acceptance')
 
-def rehearse():
-    print(json.dumps(Upgrade().rehearsal(), sort_keys=True))
+    def complete_resumed_rehearsal(self, drill):
+        self.save('rehearsal_restore_checks', offline_command=None)
+        started = time.monotonic()
+        receipt = drill.check(prepared=True)
+        phases = dict(self.record.get('resume_phase_seconds', {}))
+        phases['candidate_read'] = time.monotonic() - started
+        self.clean_stop(drill)
+        drill.postgres_started = False
+        lifecycle = checkpoint.Lifecycle(self)
+        lifecycle.clean_postgres(drill.root / 'postgres')
+        name = self.snapshot_name('resumed-canonical')
+        self.run(['zfs', 'snapshot', '-r', drill.dataset + '@' + name])
+        self.run(['zfs', 'hold', '-r', HOLD, drill.dataset + '@' + name])
+        config = (drill.root / 'config/backend.toml').read_text()
+        started = time.monotonic()
+        canonical = self.verify(name, schema=10, server=restore.SERVER,
+                                source_dataset=drill.dataset, private=self.private,
+                                config_text=config)
+        phases['schema10_restore'] = time.monotonic() - started
+        original = (self.root / 'original-config.toml').read_text()
+        started = time.monotonic()
+        rollback = self.verify(self.record['snapshot'], schema=9, server=restore.OLD_SERVER,
+                               private=self.private, config_text=original)
+        phases['rollback_restore'] = time.monotonic() - started
+        self.save('rehearsed_unqualified', timing_qualified=False, receipt=receipt,
+                  rehearsal_schema10_restore=canonical, rehearsal_rollback_restore=rollback,
+                  retained_candidate_snapshot=name,
+                  resume_phase_seconds=phases, resume_completed_epoch=time.time(),
+                  completed_target_identity=self.identity())
+        # Keep the exact pair and holds; terminal journal is archived before a
+        # later operation can replace its ownership/provenance inventory.
+        op.write(self.root / ('retained-' + self.record['token'] + '.json'),
+                 json.dumps(self.record, sort_keys=True) + '\n')
+        self.restore_timers()
+        return {'rehearsed': True, 'timing_qualified': False, 'retained_candidate': True,
+                'phase_seconds': phases}
+
+    def checkpoint_status(self, token):
+        return checkpoint.Lifecycle(self).status(token)
+
+    def checkpoint_pause(self, token):
+        return checkpoint.Lifecycle(self).pause(token)
+
+    def checkpoint_resume(self, token):
+        return checkpoint.Lifecycle(self).resume(token)
+
+    def checkpoint_adopt(self, token, receipt, check_only=False):
+        return checkpoint.Lifecycle(self).adopt(token, receipt, check_only=check_only)
+
+    def refresh_paused(self, token, refresh):
+        with self.state.locked():
+            self.record = checkpoint.Lifecycle(self).record(token)
+            if self.record['phase'] != 'rehearsal_paused':
+                raise UpgradeError('stopped_rehearsal_required')
+            checkpoint.Lifecycle(self).validate_paused(self.record)
+            refresh()
 
 
-def upgrade():
-    print(json.dumps(Upgrade().apply(), sort_keys=True))
+def rehearse(pause_scope='rehearsal'):
+    print(json.dumps(Upgrade().rehearsal(pause_scope=pause_scope), sort_keys=True))
 
 
-def upgrade_direct(deadline_at):
-    print(json.dumps(Upgrade().apply_direct(deadline_at), sort_keys=True))
+def upgrade(pause_scope='rehearsal'):
+    print(json.dumps(Upgrade().apply(pause_scope=pause_scope), sort_keys=True))
+
+
+def upgrade_direct(deadline_at, pause_scope='rehearsal'):
+    print(json.dumps(Upgrade().apply_direct(deadline_at, pause_scope=pause_scope), sort_keys=True))
 
 
 def rollback():

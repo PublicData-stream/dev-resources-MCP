@@ -28,8 +28,8 @@ CERTS = EDGE / 'lego/data/certificates'
 HOST = 'dev-resources.staged.mcp.publicdata.stream'
 NS = 'devres-staging'
 PG = 'postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:491ba0afe42ebc564e1d40ddf1c884f0aaa34cc75517f1eeabb853d8e21f6c70'
-PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:58e9239bf8ca5b0bb8054ef90591fcc47346191478d0d9f7448983e46bf9ebc3'
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10'
+PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:74b6e9020fe9868e7005f87ed0bc4a785dbd83a09ec9f6952b848f366d4a6512'
 SNIPPETS = ('52-upstream-devres-staging.toml', '62-route-devres-staging.toml')
 OWNER = 'devres-staging-v1'
 COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
@@ -72,6 +72,11 @@ def write(path, content, mode=0o600):
             out.flush()
             os.fsync(out.fileno())
         os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -284,7 +289,7 @@ def install_services(activate=True):
         'devres-staging-capacity.timer': '[Unit]\nDescription=Monitor devres staging storage\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\n[Install]\nWantedBy=timers.target\n',
         'devres-staging-backup.service': f'[Unit]\nDescription=Coordinated devres snapshot and restore verification\nAfter=k3s.service\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/usr/bin/python3 {executable} backup\n',
         'devres-staging-backup.timer': '[Unit]\nDescription=Daily devres backup at 03 UTC\n[Timer]\nOnCalendar=*-*-* 03:00:00 UTC\nPersistent=true\n[Install]\nWantedBy=timers.target\n',
-        'devres-staging-upgrade-expire@.service': f'[Unit]\nDescription=Recover expired devres upgrade %i\nAfter=k3s.service\n[Service]\nType=oneshot\nUser=root\nUMask=0077\nTimeoutStartSec=infinity\nSuccessExitStatus=75\nExecStart=/usr/bin/python3 {executable} upgrade-expire --token %i\n',
+        'devres-staging-upgrade-expire@.service': f'[Unit]\nDescription=Recover expired devres upgrade %i\nAfter=docker.service zfs-mount.service k3s.service\nWants=docker.service k3s.service\n[Service]\nType=oneshot\nUser=root\nUMask=0077\nTimeoutStartSec=infinity\nSuccessExitStatus=75\nExecStart=/usr/bin/python3 {executable} upgrade-expire --token %i\n',
         'devres-staging-upgrade-expire@.timer': '[Unit]\nDescription=Monitor devres upgrade deadline %i\n[Timer]\nOnBootSec=15s\nOnUnitInactiveSec=15s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n'}
     for name, text in services.items():
         write(Path('/etc/systemd/system') / name, text, 0o644)
@@ -444,9 +449,12 @@ def require_no_upgrade():
         raise OperatorError('upgrade_in_progress')
 
 
-def refresh_services():
-    require_no_upgrade()
-    install_services(activate=False)
+def refresh_services(token=None):
+    if token is None:
+        require_no_upgrade()
+        install_services(activate=False)
+    else:
+        upgrade_module().Upgrade().refresh_paused(token, lambda: install_services(activate=False))
     print('operator services refreshed; existing timer states preserved')
 
 
@@ -500,7 +508,7 @@ def backup():
 def diagnostic_code(error):
     if isinstance(error, OperatorError):
         return str(error)
-    if (type(error).__name__ in {'RestoreError', 'MaintenanceError', 'UpgradeError', 'RecoveryError'}
+    if (type(error).__name__ in {'RestoreError', 'MaintenanceError', 'UpgradeError', 'RecoveryError', 'CheckpointError'}
             and re.fullmatch(r'[a-z][a-z0-9_]{0,100}', str(error))):
         return str(error)
     return type(error).__name__
@@ -511,21 +519,37 @@ def main():
     parser.add_argument('command', choices=['prepare', 'firewall', 'firewall-bootstrap', 'start', 'edge-prepare',
                         'edge-activate', 'edge-rollback', 'collectors-on', 'backup',
                         'upgrade-rehearse', 'upgrade', 'upgrade-rollback', 'upgrade-finish',
-                        'upgrade-expire', 'upgrade-direct', 'upgrade-abort-rehearsal', 'refresh-services'])
+                        'upgrade-expire', 'upgrade-direct', 'upgrade-abort-rehearsal', 'refresh-services',
+                        'upgrade-status', 'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused'])
     parser.add_argument('--token')
     parser.add_argument('--deadline-at', type=float)
+    parser.add_argument('--pause-scope', choices=('rehearsal', 'all'))
+    parser.add_argument('--receipt')
+    parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     command = args.command
-    if command in ('upgrade-expire', 'upgrade-abort-rehearsal'):
+    if command in ('upgrade-expire', 'upgrade-abort-rehearsal', 'upgrade-status',
+                   'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused'):
         if not args.token or not re.fullmatch(r'[0-9a-f]{24}', args.token):
             parser.error('valid_upgrade_token_required')
-    elif args.token is not None:
+    elif args.token is not None and command != 'refresh-services':
         parser.error('token_only_for_upgrade_recovery')
     if command == 'upgrade-direct':
         if args.deadline_at is None:
             parser.error('absolute_upgrade_deadline_required')
     elif args.deadline_at is not None:
         parser.error('deadline_only_for_upgrade_direct')
+    if args.pause_scope is not None and command not in ('upgrade-rehearse', 'upgrade', 'upgrade-direct'):
+        parser.error('pause_scope_only_for_upgrade_initiation')
+    if command == 'upgrade-adopt-paused':
+        if not args.receipt or not Path(args.receipt).is_absolute():
+            parser.error('absolute_pause_receipt_required')
+    elif args.receipt is not None:
+        parser.error('receipt_only_for_paused_adoption')
+    if args.check and command != 'upgrade-adopt-paused':
+        parser.error('check_only_for_paused_adoption')
+    if command == 'refresh-services' and args.token is not None and not re.fullmatch(r'[0-9a-f]{24}', args.token):
+        parser.error('valid_upgrade_token_required')
     if os.geteuid() != 0:
         raise OperatorError('root_required')
     os.umask(0o077)
@@ -533,14 +557,18 @@ def main():
                 'edge-prepare': edge_prepare, 'edge-activate': edge_activate,
                 'edge-rollback': lambda: edge_activate(True), 'collectors-on': collectors_on,
                 'backup': backup,
-                'upgrade-rehearse': lambda: upgrade_module().rehearse(),
-                'upgrade': lambda: upgrade_module().upgrade(),
+                'upgrade-rehearse': lambda: upgrade_module().rehearse(pause_scope=args.pause_scope or 'rehearsal'),
+                'upgrade': lambda: upgrade_module().upgrade(pause_scope=args.pause_scope or 'rehearsal'),
                 'upgrade-rollback': lambda: upgrade_module().rollback(),
                 'upgrade-finish': lambda: upgrade_module().finalize(),
                 'upgrade-expire': lambda: upgrade_module().expire(args.token),
-                'upgrade-direct': lambda: upgrade_module().upgrade_direct(args.deadline_at),
+                'upgrade-direct': lambda: upgrade_module().upgrade_direct(args.deadline_at, pause_scope=args.pause_scope or 'rehearsal'),
                 'upgrade-abort-rehearsal': lambda: print(json.dumps(recovery_module().abort_rehearsal(args.token), sort_keys=True)),
-                'refresh-services': refresh_services}
+                'refresh-services': lambda: refresh_services(args.token),
+                'upgrade-status': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_status(args.token), sort_keys=True)),
+                'upgrade-pause': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_pause(args.token), sort_keys=True)),
+                'upgrade-resume': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_resume(args.token), sort_keys=True)),
+                'upgrade-adopt-paused': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_adopt(args.token, args.receipt, check_only=args.check), sort_keys=True))}
     commands[command]()
 
 

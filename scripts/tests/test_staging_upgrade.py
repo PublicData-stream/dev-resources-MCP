@@ -84,6 +84,9 @@ class FakeDrill:
         self.dataset = 'cachepool/devres-staging-restore-' + self.token
         self.root = Path('/tmp/fake-owned-restore')
         self.postgres_started = False
+        self.snapshot = args[0] if args else SNAPSHOT
+        self.resource_profile = kwargs.get('resource_profile', 'restore')
+        self.offline_sequence = 0
 
     def prepare(self):
         self.events.append('prepare')
@@ -161,7 +164,11 @@ class UpgradeTests(unittest.TestCase):
         if 'pg_controldata' in args:
             return 'Database cluster state: shut down'
         if args[:2] == ['zfs', 'get']:
-            return self.guids[args[-1]] if args[-2] == 'guid' else self.origins.get(args[-1], '-')
+            if args[-2] == 'guid':
+                if args[-1].startswith('cachepool/devres-staging-restore-') or args[-1] == upgrade.m.DATASET:
+                    return self.guids.get(args[-1], '3')
+                return self.guids[args[-1]]
+            return self.origins.get(args[-1], '-')
         if args[:2] == ['zfs', 'list']:
             return '\n'.join(sorted(self.inventory))
         if args[:2] == ['zfs', 'rename']:
@@ -346,7 +353,7 @@ class UpgradeTests(unittest.TestCase):
     def test_bundle_changed_during_rehearsal_cannot_publish_measured_receipt(self):
         before = upgrade.rehearsal_identity()
         after = {**before, 'bundle_sha256': 'changed'}
-        with patch.object(upgrade, 'rehearsal_identity', side_effect=[before, after]):
+        with patch.object(upgrade, 'rehearsal_identity', side_effect=[before, before, before, before, after]):
             with self.assertRaisesRegex(upgrade.UpgradeError, 'rehearsal_identity_changed'):
                 self.instance.rehearsal()
         self.assertEqual(upgrade.read_record(self.root / 'state')['phase'], 'rehearsal_failed')
@@ -596,7 +603,7 @@ class UpgradeTests(unittest.TestCase):
         upgrade.op.write(self.instance.root / 'acceptance.json', json.dumps(receipt))
         def verify(*args, **kwargs):
             with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'maintenance_busy'):
-                self.instance.expire(token, wall_clock=lambda: float('inf'))
+                self.instance.expire(token, wall_clock=lambda: time.time())
             return {'schema': 10}
         self.instance.verify = verify
         self.assertTrue(self.instance.finish()['complete'])

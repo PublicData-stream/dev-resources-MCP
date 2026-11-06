@@ -41,6 +41,8 @@ class FakeHost:
         self.remove_failure = False
         self.offline_oom = False
         self.engine_error = ''
+        self.ignore_term = False
+        self.complete_before_term = False
         self.pool_free = str(restore.REHEARSAL_HEADROOM)
 
     def run(self, args):
@@ -85,11 +87,21 @@ class FakeHost:
             if '--format' in args:
                 return json.dumps({'Running': self.offline_running, 'OOMKilled': self.offline_oom,
                                    'Error': self.engine_error, 'ExitCode': 1 if self.corrupt or self.offline_failure else self.offline_exit})
-            return json.dumps([{'Config': {'Labels': {restore.LABEL_KEY: self.owner}},
+            return json.dumps([{'Id': 'f' * 64, 'Name': '/' + args[-1],
+                                'Config': {'Labels': {restore.LABEL_KEY: self.owner}},
                                 'NetworkSettings': {'Networks': {'devres-staging-restore-' + TOKEN: {'IPAddress': '172.28.0.2'}}}}])
         if args[:2] == ['docker', 'rm']:
             if self.remove_failure and '-offline-' in args[-1]:
                 raise restore.RestoreError('restore_command_failed')
+            return ''
+        if args[:3] == ['docker', 'kill', '--signal=SIGTERM']:
+            if self.complete_before_term:
+                self.offline_running = False
+                self.offline_exit = 0
+                raise restore.RestoreError('restore_command_failed')
+            if not self.ignore_term:
+                self.offline_running = False
+                self.offline_exit = 1
             return ''
         if args[:2] == ['docker', 'exec']:
             if args[3] == 'pg_isready':
@@ -275,6 +287,130 @@ class RestoreTests(unittest.TestCase):
         self.assertFalse(self.log_reads)
         self.assertFalse((self.base / 'diagnostics').exists())
         self.assertIsNone(tool.last_offline_diagnostic)
+
+    def test_candidate_offline_commands_pass_exact_reviewed_limits(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        for command in ('migrate-storage', 'verify-storage', 'activate-storage'):
+            tool.offline(command)
+            started = [args for args in self.host.commands if args[:2] == ['docker', 'run']][-1]
+            self.assertEqual(started[started.index(restore.SERVER) + 1:], [command,
+                '/etc/devres/config/backend.toml', *(['--to', 'blake3'] if command == 'migrate-storage' else []),
+                '--workers', '8', '--payload-budget-mib', '64', '--graph-memory-budget-mib', '1024'])
+        self.assertEqual(tool.offline_options, restore.OFFLINE_OPTIONS)
+
+    def test_schema_nine_restore_does_not_receive_candidate_offline_flags(self):
+        self.run_verify(schema=9, server=restore.OLD_SERVER)
+        starts = [args for args in self.host.commands if args[:2] == ['docker', 'run']]
+        self.assertTrue(any(restore.OLD_SERVER in args for args in starts))
+        for args in starts:
+            self.assertNotIn('--workers', args)
+            self.assertNotIn('--payload-budget-mib', args)
+            self.assertNotIn('--graph-memory-budget-mib', args)
+
+    def test_pause_signals_worker_and_preserves_pair_without_force_removal(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        tool.containers.append(tool.name + '-postgres')
+        self.host.offline_running = True
+        calls = []
+        def control(drill, command, name):
+            calls.append((drill, command, name))
+            return True
+        with self.assertRaises(restore.OfflinePaused) as paused:
+            tool.offline('migrate-storage', control=control)
+        self.assertEqual(paused.exception.command, 'migrate-storage')
+        self.assertFalse(paused.exception.command_completed)
+        self.assertTrue(paused.exception.preserve_checkpoint)
+        self.assertEqual(calls, [(tool, 'migrate-storage', tool.name + '-offline-1')])
+        self.assertTrue(any(args[:3] == ['docker', 'kill', '--signal=SIGTERM'] for args in self.host.commands))
+        self.assertEqual(self.host.commands[-1], ['docker', 'rm', 'f' * 64])
+        self.assertEqual(tool.containers, [tool.name + '-postgres'])
+        self.assertTrue(tool.postgres_started)
+        self.assertFalse(self.log_reads)
+
+    def test_pause_after_activation_exit_reports_completion_without_signalling(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        with self.assertRaises(restore.OfflinePaused) as paused:
+            tool.offline('activate-storage', control=lambda *_: True)
+        self.assertTrue(paused.exception.command_completed)
+        self.assertFalse(any(args[:2] == ['docker', 'kill'] for args in self.host.commands))
+        self.assertEqual(self.host.commands[-1], ['docker', 'rm', 'f' * 64])
+
+    def test_pause_handles_successful_exit_between_inspection_and_sigterm(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        self.host.offline_running = True
+        self.host.complete_before_term = True
+        with self.assertRaises(restore.OfflinePaused) as paused:
+            tool.offline('activate-storage', control=lambda *_: True)
+        self.assertTrue(paused.exception.command_completed)
+        self.assertEqual(self.host.commands[-1], ['docker', 'rm', 'f' * 64])
+
+    def test_pause_cannot_hide_worker_failure_or_claim_a_forced_stop(self):
+        for kind in ('failed', 'unresponsive', 'oom'):
+            with self.subTest(kind=kind):
+                self.host.commands.clear()
+                self.host.offline_exit = 1 if kind == 'failed' else 0
+                self.host.offline_running = kind != 'failed'
+                self.host.ignore_term = kind == 'unresponsive'
+                self.host.offline_oom = kind == 'oom'
+                tool = self.drill()
+                tool.postgres_started = True
+                with self.assertRaises(restore.RestoreError) as failure:
+                    tool.offline('migrate-storage', control=lambda *_: True)
+                self.assertNotIsInstance(failure.exception, restore.OfflinePaused)
+                self.assertEqual(self.host.commands[-1][:3], ['docker', 'rm', '-f'])
+
+    def test_callback_deadline_failure_retains_failure_cleanup(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        self.host.offline_running = True
+        def deadline(*_):
+            raise restore.RestoreError('upgrade_deadline_exceeded')
+        with self.assertRaisesRegex(restore.RestoreError, '^upgrade_deadline_exceeded$'):
+            tool.offline('verify-storage', control=deadline)
+        self.assertEqual(self.host.commands[-1][:3], ['docker', 'rm', '-f'])
+
+    def test_pause_refuses_changed_worker_owner(self):
+        tool = self.drill()
+        tool.postgres_started = True
+        self.host.owner = 'b' * 24
+        self.host.offline_running = True
+        with self.assertRaisesRegex(restore.RestoreError, '^offline_worker_owner_changed$'):
+            tool.offline('migrate-storage', control=lambda *_: True)
+        self.assertFalse(any(args[:2] == ['docker', 'kill'] for args in self.host.commands))
+        self.assertFalse(any(args[:2] == ['docker', 'rm'] for args in self.host.commands))
+        self.assertEqual(tool.containers, [tool.name + '-offline-1'])
+        with self.assertRaisesRegex(restore.RestoreError, 'writer_exclusion'):
+            tool.offline('verify-storage')
+
+    def test_terminal_filter_accepts_exact_old_and_graph_progress_schemas(self):
+        old = self.progress()
+        graph = self.progress(phase='graph_rfc_indexes',
+                              **{key: 1 for key in restore.DIAGNOSTIC_GRAPH_COUNTS})
+        for phase in ('graph_rfc_indexes', 'graph_npm_rows'):
+            graph['phase'] = phase
+            output = restore.diagnostic_terminal({'data': ('\n'.join(map(json.dumps, [old, graph]))).encode(),
+                                                  'truncated': False, 'timed_out': False})
+            self.assertEqual(output['events'], [old, graph])
+            self.assertEqual(output['dropped_lines'], 0)
+
+    def test_terminal_filter_rejects_partial_graph_schemas_and_invalid_graph_numbers(self):
+        graph = self.progress(phase='graph_rfc_indexes',
+                              **{key: 1 for key in restore.DIAGNOSTIC_GRAPH_COUNTS})
+        partial = dict(graph)
+        del partial['graph_completed']
+        invalid = [partial, {**graph, 'graph_memory_bytes': True},
+                   {**graph, 'graph_memory_high_water': -1}, {**graph, 'graph_memory_budget_bytes': 0},
+                   {**graph, 'graph_completed': 2**64}, {**graph, 'graph_admitted': 'private-input-canary'},
+                   {**graph, 'untrusted': 'private-input-canary'}]
+        output = restore.diagnostic_terminal({'data': ('\n'.join(map(json.dumps, invalid))).encode(),
+                                              'truncated': False, 'timed_out': False})
+        self.assertEqual(output['events'], [])
+        self.assertEqual(output['dropped_lines'], len(invalid))
+        self.assertNotIn('private-input-canary', json.dumps(output))
 
     def test_terminal_filter_drops_extra_fields_unknown_phases_and_bad_numeric_types(self):
         secret = 'private-provider-body-canary'
