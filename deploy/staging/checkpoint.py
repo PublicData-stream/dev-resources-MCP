@@ -780,6 +780,99 @@ class Lifecycle:
             raise
         return {'adopted': True, 'bundle_transition': True, 'paused': True, 'timing_qualified': False}
 
+    def retirement_inventory(self, record):
+        """Prove one clean rehearsal and retain every existing recovery object."""
+        if (record.get('phase') != 'rehearsal_paused' or self.permanent(record)
+                or record.get('checkpoint_kind') != 'rehearsal'
+                or record.get('resource_profile') != 'upgrade'
+                or record.get('timing_qualified') is not False
+                or any(key in record for key in ('deadline_at', 'watchdog_timer', 'mode'))):
+            raise CheckpointError('formal_paused_rehearsal_required')
+        if record.get('target_identity') != self.u.identity():
+            raise CheckpointError('checkpoint_target_identity_changed')
+        if (not isinstance(record.get('timers'), dict)
+                or set(record['timers']) != {'devres-staging-backup.timer'}
+                or any(value not in ('active', 'inactive') for value in record['timers'].values())):
+            raise CheckpointError('retirement_timer_intent_invalid')
+        receipt = self.validate_paused(record)
+        original = read_bytes(Path(receipt['capsule']) / 'original-config.toml')
+        if original != read_bytes(self.root / 'original-config.toml'):
+            raise CheckpointError('checkpoint_original_configuration_changed')
+        self.validate_serving_pair(record, original.decode())
+        runtime = Path('/tmp') / ('devres-staging-restore-' + record['live_token'])
+        candidate = read_bytes(Path(receipt['capsule']) / 'config/backend.toml')
+        expected = tomllib.loads(self.restore.paused_config(original.decode()))
+        expected['source']['url'] = self.u.identity()['source_url']
+        if tomllib.loads(candidate.decode()) != expected:
+            raise CheckpointError('retirement_configuration_changed')
+        for relative in CAPSULE_FILES:
+            if relative == 'original-config.toml':
+                continue
+            if read_bytes(runtime / relative, private=False) != read_bytes(Path(receipt['capsule']) / relative):
+                raise CheckpointError('checkpoint_runtime_content_changed')
+            if relative.startswith('tls/') and read_bytes(runtime / relative, private=False) != read_bytes(
+                    self.u.private / Path(relative).name, private=False):
+                raise CheckpointError('checkpoint_transport_identity_changed')
+        self.restore.validate_snapshot(record['snapshot'])
+        source_guids = {}
+        for child in ('', '/postgres', '/evidence'):
+            snapshot = self.u.dataset + child + '@' + record['snapshot']
+            guid = self.u.run(['zfs', 'get', '-H', '-o', 'value', 'guid', snapshot]).strip()
+            holds = self.u.run(['zfs', 'holds', '-H', snapshot]).splitlines()
+            if (not guid.isdigit() or not any(len(row.split('\t')) >= 2 and row.split('\t')[1] == self.u.hold
+                                            for row in holds)):
+                raise CheckpointError('retirement_source_snapshot_changed')
+            source_guids[snapshot] = guid
+        self.u.safe_unlocked()
+        return receipt, {'dataset': receipt['dataset'], 'dataset_guids': receipt['dataset_guids'],
+                         'checkpoint': receipt['checkpoint'], 'checkpoint_guids': receipt['checkpoint_guids'],
+                         'checkpoint_hold': receipt['checkpoint_hold'], 'capsule': receipt['capsule'],
+                         'source_snapshot_guids': source_guids, 'source_hold': self.u.hold}
+
+    def retire(self, token):
+        """Release the operation fence without discarding paused rehearsal data."""
+        with self.u.state.locked():
+            self.u.record = self.record(token)
+            record = self.u.record
+            archive_path = self.root / ('retired-' + token + '.json')
+            already = record.get('phase') == 'rehearsal_retired'
+            if already:
+                retirement = record.get('retirement')
+                if (not isinstance(retirement, dict) or retirement.get('archive') != str(archive_path)
+                        or retirement.get('sha256') != digest(archive_path)):
+                    raise CheckpointError('retirement_archive_changed')
+                archive = read_json(archive_path)
+                paused_record = archive.get('record')
+                if not isinstance(paused_record, dict) or paused_record.get('token') != token:
+                    raise CheckpointError('retirement_archive_changed')
+                expected = {**paused_record, 'phase': 'rehearsal_retired', 'timing_qualified': False,
+                            'retirement': retirement,
+                            'retirement_timer_restore_pending': record.get('retirement_timer_restore_pending')}
+                if record != expected or type(record.get('retirement_timer_restore_pending')) is not bool:
+                    raise CheckpointError('retired_rehearsal_identity_changed')
+            else:
+                paused_record = record
+                archive = read_json(archive_path) if archive_path.exists() or archive_path.is_symlink() else None
+            # Follow the upgrade -> maintenance lock order used by snapshots.
+            with self.u.maintenance_state.locked():
+                receipt, inventory = self.retirement_inventory(paused_record)
+                payload = {'version': 1, 'token': token, 'record': paused_record,
+                           'receipt': receipt, 'receipt_sha256': digest(Path(paused_record['pause_receipt'])),
+                           'retained_resources': inventory, 'timing_qualified': False}
+                if archive is not None and archive != payload:
+                    raise CheckpointError('retirement_archive_changed')
+                if archive is None:
+                    self.u.write(archive_path, json.dumps(payload, sort_keys=True) + '\n')
+                if not already:
+                    self.u.save('rehearsal_retired', timing_qualified=False,
+                                retirement={'archive': str(archive_path), 'sha256': digest(archive_path)},
+                                retirement_timer_restore_pending=True)
+            if self.u.record['retirement_timer_restore_pending']:
+                self.u.restore_timers()
+                self.u.save(retirement_timer_restore_pending=False)
+            return {'retired': True, 'already_retired': already, 'retained_pair': True,
+                    'timing_qualified': False, 'timers_restored': True, 'serving_changed': False}
+
     def validate_dataset_tree(self, record, receipt):
         root = receipt['dataset']
         rows = self.u.run(['zfs', 'list', '-Hp', '-r', '-t', 'filesystem', '-o',

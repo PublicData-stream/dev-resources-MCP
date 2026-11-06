@@ -37,7 +37,7 @@ checkpoint = module('checkpoint')
 VERSION = '0.1.0-build.d373818b'
 OLD_VERSION = '0.1.0-build.27d35cd6'
 SOURCE = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
-TERMINAL = {'rehearsed', 'rehearsed_unqualified', 'rehearsal_failed', 'complete', 'rolled_back'}
+TERMINAL = {'rehearsed', 'rehearsed_unqualified', 'rehearsal_failed', 'rehearsal_retired', 'complete', 'rolled_back'}
 TIMERS = ('devres-staging-backup.timer',)
 HOLD = 'devres-upgrade-protected'
 TOKEN = re.compile(r'[0-9a-f]{24}\Z')
@@ -286,6 +286,8 @@ class Upgrade:
         previous = read_record(self.root.parent)
         if previous and previous['phase'] not in TERMINAL:
             raise UpgradeError('upgrade_already_active')
+        if previous and previous.get('retirement_timer_restore_pending'):
+            raise UpgradeError('retirement_timer_restore_required')
         self.safe()
         # No mutation before confirming the exact serving image and schema-nine source.
         image = self.tool.k('get', 'deployment', 'backend', '-o', 'jsonpath={.spec.template.spec.containers[0].image}').strip()
@@ -1085,6 +1087,9 @@ class Upgrade:
     def checkpoint_adopt(self, token, receipt, check_only=False, from_bundle_sha256=None):
         return checkpoint.Lifecycle(self).adopt(token, receipt, check_only=check_only,
                                                from_bundle_sha256=from_bundle_sha256)
+
+    def checkpoint_retire(self, token):
+        return checkpoint.Lifecycle(self).retire(token)
 
     def refresh_paused(self, token, refresh):
         with self.state.locked():

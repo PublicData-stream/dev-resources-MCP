@@ -266,6 +266,30 @@ Restored runtime `config` and `tls` directories are explicitly mode 0750 with
 root:65532 ownership even under `umask 077`; their files remain 0640. Private
 capsules remain root-only and are not made readable to the worker.
 
+To switch from an isolated rehearsal to an explicitly authorized direct cutover,
+first disable its owned automatic follow-up and pause it. Retire the clean formal
+checkpoint without removing its database/blob pair:
+
+```sh
+python3 staging.py upgrade-pause --token CURRENT_REHEARSAL_TOKEN
+python3 staging.py upgrade-retire-rehearsal --token CURRENT_REHEARSAL_TOKEN
+```
+
+Retirement requires the current reviewed bundle, exact dataset/checkpoint GUIDs
+and holds, inert capsule integrity, clean stopped PostgreSQL, matching runtime
+configuration/TLS and the unchanged old live service. It archives the journal and
+retained-resource inventory, keeps every dataset, checkpoint and capsule, and
+publishes terminal `rehearsal_retired` with unqualified timing. It starts no worker
+and does not promote the older clone. Running, failed or permanent operations
+cannot use this command. Timer restoration is retriable; a pending restoration
+blocks a new operation until retirement retry succeeds.
+
+The persistent backup timer may immediately start an overdue backup when its
+original active intent is restored. Wait for that owned backup and restore check
+to finish before direct admission. The existing `upgrade-abort-rehearsal` remains
+destructive cleanup for a separately identified abandoned disposable rehearsal;
+it is not the preserving path for changing cutover strategy.
+
 A completed resumed or mixed-version rehearsal proves continuation and recovery
 of that frozen pair; its timing is explicitly unqualified. Archive its receipts
 and retain the finished pair, then qualify a fresh current complete-pair rehearsal
@@ -344,8 +368,9 @@ instead of repeating a full migration rehearsal. It preserves the backup/restore
 exclusive-writer, integrity, capacity, acceptance and preserving-rollback gates:
 
 ```sh
-# Recover only an explicitly identified abandoned rehearsal, if present:
-python3 staging.py upgrade-abort-rehearsal --token CURRENT_REHEARSAL_TOKEN
+# Preserve an existing clean formal rehearsal before changing strategy:
+python3 staging.py upgrade-retire-rehearsal --token CURRENT_REHEARSAL_TOKEN
+# Let any restored persistent backup finish before direct admission.
 python3 staging.py refresh-services
 # UTC epoch seconds; leave time before the operational deadline for recovery
 # and ten minutes of collector stability observation.

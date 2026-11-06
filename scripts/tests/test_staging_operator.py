@@ -160,6 +160,8 @@ class ServiceTests(unittest.TestCase):
         import io
         token = 'a' * 24
         invalid = (['upgrade-pause'], ['upgrade-resume', '--token', '../bad'],
+                   ['upgrade-retire-rehearsal'],
+                   ['upgrade-retire-rehearsal', '--token', token, '--check'],
                    ['upgrade-status', '--token', token, '--pause-scope', 'all'],
                    ['upgrade', '--receipt', '/tmp/receipt'],
                    ['upgrade-resume', '--token', token, '--check'],
@@ -181,6 +183,12 @@ class ServiceTests(unittest.TestCase):
             op.main()
             module.return_value.Upgrade.return_value.checkpoint_adopt.assert_called_once_with(
                 token, '/tmp/receipt', check_only=True, from_bundle_sha256=None)
+        with patch('sys.argv', ['staging.py', 'upgrade-retire-rehearsal', '--token', token]), \
+                patch.object(op.os, 'geteuid', return_value=0), patch.object(op, 'upgrade_module') as module, \
+                contextlib.redirect_stdout(io.StringIO()):
+            module.return_value.Upgrade.return_value.checkpoint_retire.return_value = {'retired': True}
+            op.main()
+            module.return_value.Upgrade.return_value.checkpoint_retire.assert_called_once_with(token)
 
 
 class RecoveryTests(unittest.TestCase):

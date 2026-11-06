@@ -614,6 +614,152 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(any(call[:2] in (['zfs', 'snapshot'], ['docker', 'stop'])
                              for call in self.calls[before:]))
 
+    def paused_retirement(self):
+        self.u.save(checkpoint_kind='rehearsal')
+        return self.pause_pair()
+
+    def test_retire_preserves_checkpoint_and_admits_new_operation_without_timing_credit(self):
+        receipt = self.paused_retirement()
+        old_receipt = Path(self.u.record['pause_receipt'])
+        original = old_receipt.read_bytes()
+        before = len(self.calls)
+        result = self.lifecycle.retire(self.token)
+        self.assertTrue(result['retired'])
+        self.assertFalse(result['timing_qualified'])
+        current = upgrade.read_record(self.u.root.parent)
+        self.assertEqual(current['phase'], 'rehearsal_retired')
+        self.assertFalse(current['retirement_timer_restore_pending'])
+        self.assertFalse(upgrade.active(self.u.root.parent))
+        archive = cp.read_json(Path(current['retirement']['archive']))
+        self.assertEqual(archive['record']['phase'], 'rehearsal_paused')
+        self.assertEqual(archive['receipt'], receipt)
+        self.assertEqual(archive['retained_resources']['dataset_guids'], receipt['dataset_guids'])
+        self.assertEqual(old_receipt.read_bytes(), original)
+        self.assertTrue(self.runtime.exists())
+        self.assertFalse(any(call[:2] in (['zfs', 'destroy'], ['docker', 'rm'], ['docker', 'stop'])
+                             for call in self.calls[before:]))
+        self.assertIn(['systemctl', 'start', 'devres-staging-backup.timer'], self.calls[before:])
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'successful_rehearsal_required'):
+            self.u.apply()
+        with self.u.state.locked():
+            self.u.begin('preparing_upgrade')
+        self.assertNotEqual(self.u.record['token'], self.token)
+        self.assertTrue(old_receipt.exists())
+
+    def test_retirement_retry_is_inert_and_rechecks_preserved_resource_facts(self):
+        self.paused_retirement()
+        self.lifecycle.retire(self.token)
+        current = upgrade.read_record(self.u.root.parent)
+        archive = Path(current['retirement']['archive'])
+        original = archive.read_bytes()
+        before = len(self.calls)
+        self.assertTrue(self.lifecycle.retire(self.token)['already_retired'])
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertFalse(any(call[:2] in (['systemctl', 'start'], ['zfs', 'snapshot'], ['zfs', 'destroy'])
+                             for call in self.calls[before:]))
+        self.guids[self.drill.dataset] = '999'
+        with self.assertRaisesRegex(cp.CheckpointError, 'dataset_identity_changed'):
+            self.lifecycle.retire(self.token)
+
+    def test_retirement_refuses_running_failed_permanent_and_unreviewed_identity(self):
+        self.paused_retirement()
+        original = json.loads(json.dumps(self.u.record))
+        cases = ({'phase': 'rehearsal_running'}, {'phase': 'rehearsal_preserved_failed'},
+                 {'phase': 'upgrade_paused', 'checkpoint_kind': 'permanent', 'live_kind': 'permanent'},
+                 {'mode': 'direct'}, {'deadline_at': time.time() + 60},
+                 {'target_identity': {**original['target_identity'], 'bundle_sha256': 'a' * 64}},
+                 {'timers': {'unrelated.timer': 'active'}})
+        before = len(self.calls)
+        for changes in cases:
+            self.u.record = {**original, **changes}
+            self.u.save()
+            with self.subTest(changes=changes), self.assertRaises(cp.CheckpointError):
+                self.lifecycle.retire(self.token)
+        self.assertFalse((self.u.root / ('retired-' + self.token + '.json')).exists())
+        self.assertFalse(any(call[:2] == ['systemctl', 'start'] for call in self.calls[before:]))
+
+    def test_retirement_refuses_hold_capsule_and_live_configuration_drift(self):
+        self.paused_retirement()
+        before = len(self.calls)
+        self.bad_hold = True
+        with self.assertRaises(cp.CheckpointError):
+            self.lifecycle.retire(self.token)
+        self.bad_hold = False
+        source = self.u.private / 'backend.toml'
+        saved = source.read_text()
+        upgrade.op.write(source, saved + '\n# unexpected edit\n')
+        with self.assertRaisesRegex(cp.CheckpointError, 'serving_configuration_changed'):
+            self.lifecycle.retire(self.token)
+        upgrade.op.write(source, saved)
+        tls = self.runtime / 'tls/backend.pem'
+        upgrade.op.write(tls, 'changed fixture TLS', mode=0o640)
+        with self.assertRaisesRegex(cp.CheckpointError, 'runtime_content_changed'):
+            self.lifecycle.retire(self.token)
+        self.assertFalse(any(call[:2] == ['systemctl', 'start'] for call in self.calls[before:]))
+
+    def test_retirement_archive_write_failure_keeps_original_pause_and_timer_intent(self):
+        self.paused_retirement()
+        original = (self.u.root / 'state.json').read_bytes()
+        with patch.object(self.u, 'write', side_effect=OSError('fixture archive failure')):
+            with self.assertRaises(OSError):
+                self.lifecycle.retire(self.token)
+        self.assertEqual((self.u.root / 'state.json').read_bytes(), original)
+        self.assertTrue(upgrade.active(self.u.root.parent))
+
+    def test_retirement_requires_original_source_snapshot_holds(self):
+        self.paused_retirement()
+        run = self.u.run
+        source_snapshots = {upgrade.m.DATASET + child + '@' + self.u.record['snapshot']
+                            for child in ('', '/postgres', '/evidence')}
+        def missing_source_hold(args, **kwargs):
+            if args[:2] == ['zfs', 'holds'] and args[-1] in source_snapshots:
+                return ''
+            return run(args, **kwargs)
+        before = len(self.calls)
+        with patch.object(self.u, 'run', side_effect=missing_source_hold):
+            with self.assertRaisesRegex(cp.CheckpointError, 'retirement_source_snapshot_changed'):
+                self.lifecycle.retire(self.token)
+        self.assertFalse((self.u.root / ('retired-' + self.token + '.json')).exists())
+        self.assertFalse(any(call[:2] == ['systemctl', 'start'] for call in self.calls[before:]))
+
+    def test_retirement_publication_failure_reuses_durable_archive_on_retry(self):
+        self.paused_retirement()
+        original = (self.u.root / 'state.json').read_bytes()
+        with patch.object(self.u.state, 'save', side_effect=OSError('fixture terminal publication failure')):
+            with self.assertRaises(OSError):
+                self.lifecycle.retire(self.token)
+        archive = self.u.root / ('retired-' + self.token + '.json')
+        retained = archive.read_bytes()
+        self.assertEqual((self.u.root / 'state.json').read_bytes(), original)
+        self.assertTrue(upgrade.active(self.u.root.parent))
+        self.assertTrue(self.lifecycle.retire(self.token)['retired'])
+        self.assertEqual(archive.read_bytes(), retained)
+        self.assertFalse(upgrade.active(self.u.root.parent))
+
+    def test_retirement_timer_failure_blocks_admission_and_retry_restores_intent(self):
+        self.paused_retirement()
+        with patch.object(self.u, 'restore_timers', side_effect=upgrade.UpgradeError('fixture_timer_failure')):
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'fixture_timer_failure'):
+                self.lifecycle.retire(self.token)
+        current = upgrade.read_record(self.u.root.parent)
+        self.assertEqual(current['phase'], 'rehearsal_retired')
+        self.assertTrue(current['retirement_timer_restore_pending'])
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'retirement_timer_restore_required'):
+            self.u.begin('preparing_upgrade')
+        self.assertTrue(self.lifecycle.retire(self.token)['already_retired'])
+        self.assertFalse(upgrade.read_record(self.u.root.parent)['retirement_timer_restore_pending'])
+
+    def test_retirement_refuses_changed_archive_before_timer_mutation(self):
+        self.paused_retirement()
+        self.lifecycle.retire(self.token)
+        current = upgrade.read_record(self.u.root.parent)
+        archive = Path(current['retirement']['archive'])
+        upgrade.op.write(archive, archive.read_text() + '\n')
+        before = len(self.calls)
+        with self.assertRaisesRegex(cp.CheckpointError, 'retirement_archive_changed'):
+            self.lifecycle.retire(self.token)
+        self.assertEqual(len(self.calls), before)
+
 
 if __name__ == '__main__':
     unittest.main()

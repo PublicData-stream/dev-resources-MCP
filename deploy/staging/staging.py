@@ -520,7 +520,8 @@ def main():
                         'edge-activate', 'edge-rollback', 'collectors-on', 'backup',
                         'upgrade-rehearse', 'upgrade', 'upgrade-rollback', 'upgrade-finish',
                         'upgrade-expire', 'upgrade-direct', 'upgrade-abort-rehearsal', 'refresh-services',
-                        'upgrade-status', 'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused'])
+                        'upgrade-status', 'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused',
+                        'upgrade-retire-rehearsal'])
     parser.add_argument('--token')
     parser.add_argument('--deadline-at', type=float)
     parser.add_argument('--pause-scope', choices=('rehearsal', 'all'))
@@ -530,7 +531,7 @@ def main():
     args = parser.parse_args()
     command = args.command
     if command in ('upgrade-expire', 'upgrade-abort-rehearsal', 'upgrade-status',
-                   'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused'):
+                   'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused', 'upgrade-retire-rehearsal'):
         if not args.token or not re.fullmatch(r'[0-9a-f]{24}', args.token):
             parser.error('valid_upgrade_token_required')
     elif args.token is not None and command != 'refresh-services':
@@ -572,6 +573,7 @@ def main():
                 'upgrade-status': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_status(args.token), sort_keys=True)),
                 'upgrade-pause': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_pause(args.token), sort_keys=True)),
                 'upgrade-resume': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_resume(args.token), sort_keys=True)),
+                'upgrade-retire-rehearsal': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_retire(args.token), sort_keys=True)),
                 'upgrade-adopt-paused': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_adopt(args.token, args.receipt, check_only=args.check, from_bundle_sha256=args.from_bundle_sha256), sort_keys=True))}
     commands[command]()
 
