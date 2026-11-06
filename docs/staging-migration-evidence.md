@@ -244,3 +244,32 @@ installation has not executed; the existing SSH-MCP path remains available for
 the full manual candidate acceptance. New-release public acceptance, coordinated
 post-migration restore, collector restoration and ten-minute stability observation
 remain pending.
+
+## Gated continuation armed: 2026-11-06 10:44 UTC
+
+After separate explicit approval, the reviewed setup installed a source-restricted,
+expiring SSH key for the existing operator account and an exact-command sudo rule
+for the pinned root-owned continuation gate. Global SSH policy was unchanged.
+The original authorized-key bytes were preserved. Whole-policy `visudo` validation,
+exact installed key/rule hashes, actual strict-host-key `status` transport and
+rejection of an unapproved command passed. The independent cleanup timer was
+confirmed active and enabled for **2026-11-10 23:59 UTC**; successful observation
+also removes only this task's key and sudo rule.
+
+A single detached external coordinator is now waiting for R2's exact current
+candidate. Its process identity was checked after detachment; its initial state
+was `waiting`, with no admitted mutating stages and no transport retries. It
+alone owns subsequent proof and acceptance attempts. The sequence remains fresh
+external ingress/zero-egress evidence, full candidate acceptance and strict receipt,
+canonical finish with coordinated restore, then 21 stability samples over at least
+600 seconds and scoped credential cleanup. Every mutating stage is exclusive and
+has no automatic retry. This does not claim those future checks have passed.
+
+The coordinator survives its launching tool session; no restart of its execution
+environment was tested. Before successful finish, failed progression retains the
+server's canonical deadline watchdog. Finish intentionally disarms that watchdog;
+a later observation failure is recorded as incomplete and does not imply automatic
+rollback of an already completed candidate. At this update the migration still
+reported `running_migrate_storage`, with **290,432** committed pathname qualifications
+in the current pass and no observed OOM. These counters provide no total denominator
+or completion-time estimate.
