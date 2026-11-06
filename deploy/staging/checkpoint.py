@@ -180,9 +180,10 @@ class Lifecycle:
         raise CheckpointError('checkpoint_pause_pending')
 
     def control(self, drill, command, worker):
-        self.u.safe()
         if self.permanent(self.u.record):
             self.u.wall_remaining()
+        else:
+            self.u.safe()
         path = self.root / 'pause-request.json'
         if not path.exists():
             return False

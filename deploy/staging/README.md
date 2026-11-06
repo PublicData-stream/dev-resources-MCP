@@ -384,6 +384,13 @@ The deadline watchdog can terminate only the recorded driver identity and recove
 the matching old pair, including when migration still holds the upgrade lock.
 Recovery time is additional; successful deployment is never inferred from expiry.
 
+The migration heartbeat shares a maintenance lock with the periodic capacity
+guard. It waits up to ten seconds for lock acquisition, checking again every
+100 ms and respecting the existing absolute cutover deadline. After acquiring
+the lock it still checks every capacity and maintenance fence. Only acquisition
+contention is retried; a failed safety check or a persistently held lock remains
+fatal. Recovery retains the bounded wait even after the cutover deadline expires.
+
 Direct mode freezes the original pair, takes a protected coordinated snapshot,
 proves its old-image recovery in an isolated clone, then migrates the permanent
 pair once. It does not promote an earlier clone while newer ingestion continues.

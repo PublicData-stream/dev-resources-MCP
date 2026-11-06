@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -204,6 +205,146 @@ class UpgradeTests(unittest.TestCase):
             self.instance.record['deadline_seconds'] = 10
             with self.assertRaisesRegex(upgrade.UpgradeError, 'deadline_exceeded'):
                 self.instance.remaining()
+
+    def hold_maintenance_lock(self):
+        self.instance.maintenance_state.prepare()
+        script = '''import fcntl,os,sys
+fd=os.open(sys.argv[1],os.O_CREAT|os.O_RDWR,0o600)
+fcntl.flock(fd,fcntl.LOCK_EX)
+print('locked',flush=True)
+sys.stdin.buffer.read(1)
+os.close(fd)
+'''
+        child = subprocess.Popen([sys.executable, '-I', '-B', '-c', script,
+                                  str(self.instance.maintenance_state.root / 'maintenance.lock')],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        def cleanup():
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            child.stdin.close()
+            child.stdout.close()
+        self.addCleanup(cleanup)
+        self.assertTrue(select.select([child.stdout], [], [], 10)[0], 'child did not acquire maintenance lock')
+        self.assertEqual(child.stdout.readline().strip(), b'locked')
+        return child
+
+    def release_maintenance_lock(self, child, after=0.12):
+        def release():
+            child.stdin.write(b'x')
+            child.stdin.flush()
+        timer = threading.Timer(after, release)
+        timer.start()
+        self.addCleanup(timer.join, 2)
+        self.addCleanup(timer.cancel)
+
+    def test_safety_waits_for_real_short_guard_lock_without_holding_it_during_sleep(self):
+        child = self.hold_maintenance_lock()
+        self.release_maintenance_lock(child)
+        checked = []
+        original = self.instance.safe_unlocked
+        def check():
+            self.assertIsNotNone(child.poll())
+            # The safety check itself must own the actual maintenance lock.
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'maintenance_busy'):
+                with self.instance.maintenance_state.locked():
+                    self.fail('safety check did not retain its maintenance lock')
+            checked.append(True)
+            original()
+        with patch.object(self.instance, 'safe_unlocked', side_effect=check):
+            self.instance.safe()
+        self.assertEqual(checked, [True])
+        with self.instance.maintenance_state.locked():
+            pass
+
+    def test_safety_persistent_real_lock_fails_within_bound_without_checks(self):
+        self.hold_maintenance_lock()
+        started = time.monotonic()
+        with patch.object(upgrade, 'SAFETY_LOCK_WAIT_SECONDS', 0.15), \
+                patch.object(self.instance, 'safe_unlocked') as check:
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, '^maintenance_busy$'):
+                self.instance.safe()
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.12)
+        self.assertLess(elapsed, 1)
+        check.assert_not_called()
+
+    def test_safety_short_guard_release_still_rejects_fence_operation_and_capacity(self):
+        for failure in ('fence', 'operation', 'capacity'):
+            with self.subTest(failure=failure):
+                value = {'version': 1, 'fence': None, 'operation': None, 'verified': []}
+                if failure != 'capacity':
+                    value[failure] = {'phase': 'fenced'}
+                self.instance.maintenance_state.save(value)
+                child = self.hold_maintenance_lock()
+                self.release_maintenance_lock(child)
+                with patch.object(self.tool, 'capacity_reason', return_value='pool_low_free' if failure == 'capacity' else None), \
+                        patch.object(self.instance, 'safe_unlocked', wraps=self.instance.safe_unlocked) as check:
+                    with self.assertRaisesRegex(upgrade.UpgradeError, 'upgrade_capacity_or_maintenance_fenced'):
+                        self.instance.safe()
+                self.assertEqual(check.call_count, 1)
+                child.wait(timeout=5)
+                with self.instance.maintenance_state.locked():
+                    pass
+
+    def test_safety_body_busy_and_other_lock_errors_are_never_retried(self):
+        with patch.object(self.instance, 'safe_unlocked', side_effect=upgrade.m.MaintenanceError('maintenance_busy')) as check, \
+                patch.object(upgrade.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, '^maintenance_busy$'):
+                self.instance.safe()
+        self.assertEqual(check.call_count, 1)
+        sleep.assert_not_called()
+        with self.instance.maintenance_state.locked():
+            pass
+        with patch.object(self.instance.maintenance_state, 'locked', side_effect=upgrade.m.MaintenanceError('unsafe_lock_file')) as lock, \
+                patch.object(upgrade.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'unsafe_lock_file'):
+                self.instance.safe()
+        self.assertEqual(lock.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_safety_metrics_failure_is_checked_once_and_releases_lock(self):
+        with patch.object(self.tool, 'metrics', side_effect=upgrade.m.MaintenanceError('command_failed')) as metrics, \
+                patch.object(upgrade.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(upgrade.m.MaintenanceError, 'command_failed'):
+                self.instance.safe()
+        self.assertEqual(metrics.call_count, 1)
+        sleep.assert_not_called()
+        with self.instance.maintenance_state.locked():
+            pass
+
+    def test_safety_absolute_deadline_clips_real_lock_wait_and_never_checks_after_expiry(self):
+        self.hold_maintenance_lock()
+        started = time.monotonic()
+        with patch.object(self.instance, 'safe_unlocked') as check:
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'upgrade_deadline_exceeded'):
+                self.instance.safe(deadline_at=time.time() + 0.12)
+        self.assertLess(time.monotonic() - started, 1)
+        check.assert_not_called()
+
+    def test_safety_deadline_is_checked_after_acquisition_and_after_body(self):
+        for times, body_called in (([99, 100], False), ([99, 99, 100], True)):
+            with self.subTest(body_called=body_called):
+                with patch.object(upgrade.time, 'time', side_effect=times), \
+                        patch.object(self.instance, 'safe_unlocked') as check:
+                    with self.assertRaisesRegex(upgrade.UpgradeError, 'upgrade_deadline_exceeded'):
+                        self.instance.safe(deadline_at=100)
+                self.assertEqual(check.call_count, int(body_called))
+                with self.instance.maintenance_state.locked():
+                    pass
+
+    def test_wall_and_command_budget_recompute_after_wait_and_recovery_can_ignore_expired_cutoff(self):
+        for budget in (self.instance.wall_remaining, self.instance.remaining):
+            with self.subTest(budget=budget.__name__):
+                self.instance.record = {'deadline_at': 100, 'mode': 'direct'}
+                with patch.object(upgrade.time, 'time', side_effect=[90, 95]), \
+                        patch.object(self.instance, 'safe') as check:
+                    self.assertEqual(budget(), 5)
+                check.assert_called_once_with(deadline_at=100)
+        # The preserving recovery paths call safe() without an absolute deadline.
+        # Their lock grace remains usable after the failed attempt's cutoff.
+        with patch.object(upgrade.time, 'time', return_value=101):
+            self.instance.safe()
 
     def test_config_changes_only_source_and_requested_scheduling_booleans(self):
         original = upgrade.tomllib.loads(CONFIG)

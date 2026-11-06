@@ -174,3 +174,32 @@ accepts or finalizes automatically. Candidate acceptance retains both public
 transports/revisions, retained RFC/MDN, mTLS/Host/Origin/CNI/external isolation,
 private-health denial and all six shared-route gates. Until those gates pass,
 this record does not establish a completed public deployment.
+
+## Preserving rollback: 2026-11-06 10:06 UTC
+
+The first direct attempt rolled back after the operator reported the fixed code
+`maintenance_busy`. Its failure diagnostic still showed a running worker, no OOM
+or engine error, no application-error event, and **202,240 committed file records**.
+The one-minute capacity guard held the shared maintenance lock for about 141 ms;
+the diagnostic followed its completion by about 60 ms. The checkpoint heartbeat
+used the same nonblocking lock. These observations strongly support transient
+lock contention as the cause; an exact historical lock-owner trace was not retained.
+
+The canonical preserving rollback completed at approximately **10:00:44 UTC**.
+Independent checks verified the old schema-nine database, exact old image/source,
+matching original configuration and Kubernetes Secret, Ready serving pair,
+retained RFC bytes and restored collector/timer intent. The failed database and
+evidence datasets retain the original journaled GUIDs, are unmounted, and have
+clean-shutdown proof. The restored canonical pair has matching origins at the
+same protected pre-upgrade snapshot. The completed rollback's watchdog is disabled
+and inactive, with no cleanup pending.
+
+Public HTTP and WebTransport both passed both protocol revisions after recovery;
+HTTP reported the exact old release and source URL. The first WebTransport check
+failed transiently; both repeated checks passed without an edge restart. All six
+shared-route and configuration/certificate comparisons passed.
+
+A bounded lock-acquisition fix and separately reviewed second-attempt admission
+are required before another permanent migration. The incomplete continuation
+scripts remain inert; no temporary SSH authorization or sudoers capability was
+installed. The requested new release is **not yet publicly deployed**.

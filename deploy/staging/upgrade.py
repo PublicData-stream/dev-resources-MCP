@@ -4,6 +4,7 @@
 No provider calls or shared-edge changes occur here. Public acceptance is a
 separate operator gate before ``finalize`` restores the original schedules.
 """
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -43,6 +44,8 @@ HOLD = 'devres-upgrade-protected'
 TOKEN = re.compile(r'[0-9a-f]{24}\Z')
 WATCHDOG = 'devres-staging-upgrade-expire@'
 BUNDLE_FILES = ('staging.py', 'restore.py', 'upgrade.py', 'maintenance.py', 'recovery.py', 'checkpoint.py')
+SAFETY_LOCK_WAIT_SECONDS = 10
+SAFETY_LOCK_POLL_SECONDS = 0.1
 
 
 class UpgradeError(RuntimeError):
@@ -278,9 +281,43 @@ class Upgrade:
         self.record.update(updates)
         self.state.save(self.record)
 
-    def safe(self):
-        with self.maintenance_state.locked():
+    def safe(self, *, deadline_at=None):
+        """Wait briefly for the periodic guard, then perform every safety check.
+
+        Only lock acquisition contention is retryable. A failed check, metric,
+        or persistent lock remains fatal; recovery callers can omit the already
+        expired cutover deadline while retaining the same bounded lock wait.
+        """
+        def deadline_remaining():
+            if deadline_at is None:
+                return math.inf
+            now = time.time()
+            if self.deadline_due({'deadline_at': deadline_at}, lambda: now):
+                raise UpgradeError('upgrade_deadline_exceeded')
+            return deadline_at - now
+
+        started, contended = time.monotonic(), False
+        with contextlib.ExitStack() as acquired:
+            while True:
+                deadline_remaining()
+                if contended and time.monotonic() - started >= SAFETY_LOCK_WAIT_SECONDS:
+                    raise m.MaintenanceError('maintenance_busy')
+                try:
+                    acquired.enter_context(self.maintenance_state.locked())
+                except m.MaintenanceError as error:
+                    if str(error) != 'maintenance_busy':
+                        raise
+                    contended = True
+                    remaining = min(SAFETY_LOCK_WAIT_SECONDS - (time.monotonic() - started),
+                                    deadline_remaining())
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(SAFETY_LOCK_POLL_SECONDS, remaining))
+                else:
+                    break
+            deadline_remaining()
             self.safe_unlocked()
+            deadline_remaining()
 
     def begin(self, phase):
         previous = read_record(self.root.parent)
@@ -496,13 +533,7 @@ class Upgrade:
                 raise
 
     def remaining(self):
-        remaining = self.record['deadline_at'] - time.time()
-        if remaining <= 0:
-            raise UpgradeError('upgrade_deadline_exceeded')
-        self.safe()
-        if self.record.get('mode') == 'direct':
-            remaining = min(remaining, self.wall_remaining())
-        return min(restore.OFFLINE_TIMEOUT_SECONDS, remaining)
+        return self.wall_remaining()
 
     def apply(self, pause_scope='rehearsal'):
         return self._apply(pause_scope=pause_scope)
@@ -1019,10 +1050,15 @@ class Upgrade:
                 raise
 
     def wall_remaining(self):
-        remaining = self.record['deadline_at'] - time.time()
-        if remaining <= 0:
+        if self.deadline_due(self.record, time.time):
             raise UpgradeError('upgrade_deadline_exceeded')
-        self.safe()
+        self.safe(deadline_at=self.record['deadline_at'])
+        # Guard contention and metrics consume the same absolute budget. Never
+        # return a timeout computed before acquiring the maintenance lock.
+        now = time.time()
+        if self.deadline_due(self.record, lambda: now):
+            raise UpgradeError('upgrade_deadline_exceeded')
+        remaining = self.record['deadline_at'] - now
         return min(restore.OFFLINE_TIMEOUT_SECONDS, remaining)
 
     def start_candidate(self):
