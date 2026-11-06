@@ -63,6 +63,8 @@ pub enum GitOperation {
 }
 #[derive(Clone, Debug)]
 pub enum BulkSource {
+    /// Immutable, source-qualified attribution evidence through existing admission.
+    Attribution(crate::attribution_providers::AttributionSource),
     Npm(crate::npm::source::Operation),
     DatabaseDump,
     /// Compatibility revalidation of retained captures from the former endpoint.
@@ -97,6 +99,7 @@ pub enum BulkSource {
 impl BulkSource {
     pub fn url(&self) -> Result<String> {
         match self {
+            Self::Attribution(source) => source.url(),
             Self::Npm(operation) => operation.url(),
             Self::Chromium(operation) => operation.url(),
             Self::W3cGit { repository, operation } => {
@@ -152,6 +155,7 @@ impl BulkSource {
     }
     pub fn host(&self) -> &str {
         match self {
+            Self::Attribution(source) => source.host(),
             Self::Npm(operation) => operation.host(),
             Self::Chromium(operation) => operation.host(),
             Self::W3cGit { repository, .. } => repository.host(),
@@ -172,6 +176,7 @@ impl BulkSource {
     }
     fn media_type(&self) -> &'static str {
         match self {
+            Self::Attribution(source) => source.media_type(),
             Self::Npm(operation) => operation.media_type(),
             Self::Chromium(operation) => operation.media_type(),
             Self::W3cApi(_) => "application/hal+json",
@@ -290,6 +295,9 @@ pub struct BulkBroker {
     npm_advisory_rate: u32,
     attempt_budget: Option<usize>,
     attempts: AtomicUsize,
+    // Public immutable attribution evidence only. Per-broker ownership prevents
+    // fixture/live or policy-generation proof from crossing admission contexts.
+    attribution_cache: Mutex<std::collections::VecDeque<(String, Vec<u8>, serde_json::Value)>>,
     attempt_observer: Option<Arc<dyn Fn(usize) -> Result<()> + Send + Sync>>,
     #[cfg(test)]
     test_origin: Option<url::Url>,
@@ -344,10 +352,61 @@ impl BulkBroker {
             config,
             attempt_budget: None,
             attempts: AtomicUsize::new(0),
+            attribution_cache: Mutex::new(std::collections::VecDeque::new()),
             attempt_observer: None,
             #[cfg(test)]
             test_origin: None,
         })
+    }
+
+    /// Reuse only successful current-policy public evidence in this broker context.
+    pub(crate) async fn attribution_cached(
+        &self,
+        url: &str,
+    ) -> Option<(Vec<u8>, serde_json::Value)> {
+        let key = format!(
+            "{}:{url}",
+            devres_domain::attribution::ATTRIBUTION_POLICY_FINGERPRINT
+        );
+        let mut cache = self.attribution_cache.lock().await;
+        let position = cache.iter().position(|(id, _, _)| id == &key)?;
+        let entry = cache.remove(position)?;
+        let output = (entry.1.clone(), entry.2.clone());
+        cache.push_back(entry);
+        Some(output)
+    }
+    pub(crate) async fn attribution_cache(
+        &self,
+        url: &str,
+        body: &[u8],
+        receipt: &serde_json::Value,
+    ) {
+        const BYTES: usize = 64 * 1024 * 1024;
+        if body.len() > BYTES
+            || url.len() > 16384
+            || receipt["status"] != 200
+            || receipt["policy_fingerprint"]
+                != devres_domain::attribution::ATTRIBUTION_POLICY_FINGERPRINT
+            || receipt["body_hash"] != crate::integrity::hash(body)
+        {
+            return;
+        }
+        let key = format!(
+            "{}:{url}",
+            devres_domain::attribution::ATTRIBUTION_POLICY_FINGERPRINT
+        );
+        let mut cache = self.attribution_cache.lock().await;
+        if cache.iter().any(|(id, _, _)| id == &key) {
+            return;
+        }
+        let mut bytes: usize = cache.iter().map(|(_, body, _)| body.len()).sum();
+        while cache.len() >= 32 || bytes.saturating_add(body.len()) > BYTES {
+            let Some((_, body, _)) = cache.pop_front() else {
+                break;
+            };
+            bytes = bytes.saturating_sub(body.len());
+        }
+        cache.push_back((key, body.to_vec(), receipt.clone()));
     }
 
     /// Configure only npm provider clocks, preserving all existing provider policy.
@@ -537,6 +596,9 @@ impl BulkBroker {
                 | BulkSource::W3cPublication(_)
                 | BulkSource::W3cApi(_)
                 | BulkSource::W3cDiscovery(_)
+                | BulkSource::Attribution(
+                    crate::attribution_providers::AttributionSource::W3c { .. }
+                )
         );
         // At most one transient retry and one narrowly authorized legacy hop.
         for _ in 0..3 {

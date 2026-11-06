@@ -36,7 +36,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         .expect("inspection");
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("fresh schema ten");
+        .expect("fresh schema eleven");
     // Acceptance is a recognized opaque evidence role; production rejects unknown roles.
     let old = json!({"synthetic":true,"body":"Prior W3C evidence remains immutable"});
     store
@@ -111,13 +111,13 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     wait_owner_release(&inspection).await;
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
-        .expect("serve fully migrated schema ten");
+        .expect("serve fully migrated schema eleven");
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
             .fetch_one(&inspection)
             .await
             .unwrap(),
-        10
+        11
     );
     assert_eq!(
         store
@@ -296,6 +296,7 @@ BEGIN
     END LOOP;
 END;
 $fixture$;
+DROP TABLE IF EXISTS devres_attribution_targets,devres_attribution_sweeps,devres_attribution_generations,devres_attribution_control;
 DROP TABLE devres_integrity_staged_state;
 DROP TABLE devres_integrity_provider_cutoffs;
 DROP TABLE devres_integrity_graph_progress;

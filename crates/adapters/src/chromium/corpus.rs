@@ -28,6 +28,19 @@ use tokio_util::sync::CancellationToken;
 
 mod collection;
 mod licensing;
+
+/// Reuse the acquisition qualifier during exact attribution revalidation. A
+/// potentially capped legacy excerpt is never proof of complete notice text.
+pub(crate) fn attribution_license(component: &str, text: &str, source_url: &str) -> Value {
+    let value = licensing::qualify(component, text, source_url);
+    if value["notice"]
+        .as_str()
+        .is_some_and(|s| s.chars().count() >= 32768)
+    {
+        return serde_json::json!({"decision":"unresolved","gap":"complete_notice_exceeds_legacy_qualification_bound"});
+    }
+    value
+}
 #[path = "corpus/migration.rs"]
 mod migration;
 #[cfg(test)]

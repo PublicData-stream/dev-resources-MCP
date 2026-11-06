@@ -1,5 +1,8 @@
 //! Retrieval policy shared by every transport and research operation.
 pub mod advisory;
+pub mod attribution;
+pub mod attribution_gate;
+pub mod attribution_runtime;
 pub mod chromium;
 pub mod corpus;
 pub mod crate_corpus;

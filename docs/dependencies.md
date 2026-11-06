@@ -1,5 +1,11 @@
 # Dependency admission
 
+Attribution supervision makes the existing locked `tokio-util` cancellation token a
+direct application dependency with only `rt` enabled. It adds no package/version,
+build script, network destination or executable capability. The existing runtime
+was preferred over a second cancellation/retry implementation; source I/O stays in
+adapters and request-only audit data stays outside this supervision path.
+
 The committed Cargo.lock is the exact bootstrap graph. Rust is pinned to 1.99.1,
 rmcp to 3.7.0, wtransport to 0.7.2, sqlx to 0.9.0, and rustsec to 0.33.0.
 Manifest semver ranges for support libraries remain bounded by the committed lock;

@@ -742,6 +742,7 @@ impl PgBlobStore {
         self.backfill_events(&cancel, true, execution).await?;
         self.verify_visibility_registry().await?;
         self.verify_capture_inventory(&cancel).await?;
+        self.verify_attribution_storage(&cancel).await?;
         self.verify_migration_alias_targets(&cancel).await?;
         self.verify_npm_graph(&cancel).await?;
         self.verify_specialized_graphs(&cancel, execution).await?;

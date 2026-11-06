@@ -1,5 +1,8 @@
 //! Network, durable storage, and source-specific research adapters.
 mod archive;
+mod attribution;
+pub mod attribution_providers;
+pub use attribution::AttributionAdapter;
 pub mod bulk;
 pub(crate) mod immutable_index;
 pub mod integrity;

@@ -22,6 +22,8 @@ use tokio::{
 mod acceptance;
 #[path = "rustsec/storage.rs"]
 mod advisory_storage;
+#[path = "storage_attribution.rs"]
+mod attribution_storage;
 #[path = "chromium/storage.rs"]
 mod chromium_storage;
 #[path = "rfc/storage.rs"]
@@ -256,7 +258,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if !(2..=10).contains(&version) {
+        } else if !(2..=11).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -341,6 +343,16 @@ impl PgBlobStore {
             return Err(Error::unavailable(
                 "BLAKE3 storage migration is pending activation.",
             ));
+        }
+        if !maintenance && version <= 10 {
+            attribution_storage::prepare(&mut tx).await?;
+        }
+        if version == 11 {
+            if !maintenance {
+                attribution_storage::promote_control(&mut tx).await?;
+            } else {
+                attribution_storage::verify_supported_control(&mut tx).await?;
+            }
         }
         if !maintenance {
             sqlx::query("UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'")

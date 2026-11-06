@@ -1,4 +1,5 @@
 //! Transport-independent public-source capture and retrieval contracts.
+pub mod attribution;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -19,13 +20,20 @@ pub fn valid_content_id(value: &str) -> bool {
 pub struct Error {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 impl Error {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
+            details: None,
         }
+    }
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new("invalid_input", message)

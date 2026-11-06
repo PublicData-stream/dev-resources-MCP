@@ -959,6 +959,15 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         .activate_storage(tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
+    // Offline BLAKE3 conversion still ends at schema 10. Normal serving then
+    // performs only the bounded additive attribution bootstrap to schema 11.
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema")
+            .fetch_one(&fixture_pool)
+            .await
+            .unwrap(),
+        10
+    );
     drop(migrating);
     let store = PgBlobStore::connect(&url, root.path()).await.unwrap();
     assert_eq!(
@@ -966,7 +975,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
             .fetch_one(&fixture_pool)
             .await
             .unwrap(),
-        10
+        11
     );
     assert_eq!(
         store.capture(&original_id).await.unwrap().body,
