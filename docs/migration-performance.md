@@ -2,8 +2,9 @@
 
 This change preserves schema 10, hash encoding, identities, retained history,
 ordered durable publication and all migration/verification/activation gates.
-Provider graph replay remains serial. The implementation base is `c8904f9`;
-the fixture harness and final acceptance coverage are included with this report.
+The original measurements below cover SQL/file parallelism; provider graph replay
+was serial in that implementation (base `c8904f9`). The graph replay follow-up
+records separate measurements and acceptance evidence for the new implementation.
 
 ## Reproduce the fixture measurements
 
@@ -104,7 +105,7 @@ experiment. Its summary is retained alongside the larger run. The larger workloa
 was chosen before its run to make hashing substantial relative to fixed overhead;
 its results do not establish a benefit for every small or SQL-dominated workload.
 
-## Correctness and acceptance evidence
+## Original SQL/file acceptance evidence
 
 - Local native amd64 workspace suite: 725 tests passed; 29 were ignored by that
   command. The separately executed contributor PostgreSQL gate passed, including
@@ -139,3 +140,109 @@ complete-pair candidate benchmark, backup/restore proof, retained-history
 acceptance, and total measured time plus rollback reserve within a newly agreed
 outage window. Preserve the earlier failed-migration pair and current live pair.
 The previous outage cutoff is not reused.
+
+## Graph replay follow-up
+
+Graph preparation now shares bounded admission across all eight providers and
+within their independent phases. Per-provider SQL publication order, schema 10,
+identity preimages, per-use source verification and activation remain unchanged.
+The separate `--graph-memory-budget-mib` default is 1,024 MiB; progress records
+accounted graph memory separately from SQL payload work and process RSS.
+
+The benchmark supports `--graph-snapshots N` (1–64) to add nonempty retained RFC
+indexes with historical snapshots plus npm and RustSec evidence. Optional
+`--graph-generations N` (default one, at most the snapshot count) selects retained
+source generations; generation changes update one document while retaining the
+other sources. One generation measures repeated identical-index reuse; multiple
+generations measure changed historical indexes. For example, append
+`--graph-snapshots 16 --graph-generations 16 --graph-memory-budget-mib 2048 --workers "1 2 4 8"` to the
+reproduction command above. The original file/SQL workload remains the default.
+
+Graph runs compare semantic SQL/query fingerprints and restored readback;
+physical index files are independently verified in each run. Tantivy segment filenames
+and file digests can differ across independently created fresh indexes, so raw
+filesystem fingerprints do not establish cross-run graph equivalence. Existing
+canonical targets and their integrity evidence must still verify on resume;
+normalization never excuses changed retained evidence or changes identity inputs.
+Graph fixtures are synthetic local evidence, not a full-corpus or production
+migration measurement.
+
+### Retained graph measurements
+
+The graph run used 16 retained RFC snapshots with 16 different source generations,
+32 documents per index, npm/RustSec evidence, the default 128 SQL payloads and
+16 retained 8 MiB files. Each worker setting used three freshly prepared pairs,
+with preparation, checkpoint/syncfs and backup/restore outside migration timings.
+The host was the same AMD EPYC 4585PX model with 18 available logical CPUs and
+approximately 30 GiB RAM. PostgreSQL was capped at two CPUs and 1 GiB RAM;
+the SQL payload budget was 64 MiB and graph budget was 2,048 MiB.
+
+The release example binary SHA-256 was
+`bfc2f1bb19395079853a59b43ef7a6c03af0ee035d18430bf4e6db5482d33a98`.
+It was built from checkout base `1a6954b` plus this change; that base revision
+alone is not a source/build attestation. Exact aggregate measurements, phase CPU,
+I/O, WAL, sampled descriptors, and separate backup/restore times are in the
+[sanitized graph report](migration-graph-performance.json).
+
+| Workers | Phase total, median (s) | Whole command, median (s) | Whole command range (s) | Peak process RSS (MiB) | Sampled FDs | Graph charge peak (MiB) | Active graph jobs peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 12.799 | 12.84 | 11.85–13.85 | 163.2 | 24 | 198.8 | 1 |
+| 2 | 11.923 | 11.97 | 10.37–13.21 | 180.4 | 37 | 532.7 | 2 |
+| 4 | 9.062 | 9.11 | 7.11–9.46 | 181.9 | 51 | 1065.3 | 4 |
+| 8 | 9.592 | 9.65 | 6.36–10.45 | 244.3 | 79 | 1591.9 | 8 |
+
+Four workers improved the whole-command median **1.41×**. Every four-worker
+repeat beat every serial repeat by more than two percent. Eight workers did not
+improve the median further; these results do not justify raising the existing
+worker default. The conservative graph charge stayed below the configured budget.
+RSS is measured separately and excludes PostgreSQL/page cache. Descriptor counts
+are sampled every 10 ms, include the sampling directory, and can miss brief peaks.
+
+| Timed phase, median (s) | 1 worker | 2 workers | 4 workers | 8 workers |
+| --- | ---: | ---: | ---: | ---: |
+| Migration, including qualification, graph replay and finish verification | 9.898 | 8.925 | 5.645 | 5.704 |
+| Standalone verification | 1.012 | 1.007 | 0.988 | 0.988 |
+| Activation, including verification | 1.039 | 1.100 | 1.034 | 1.027 |
+| Startup/readback and durable fingerprint | 0.831 | 0.844 | 0.852 | 0.881 |
+
+These timings do not isolate RFC replay from qualification and finish verification.
+All twelve pairs and twelve coordinated restored copies had the same normalized
+SQL/query/non-index-file fingerprint:
+`1a4492f0ae783c438a9dd9ca991b6bb7dbe52188e62ad33fae193531d4fe24c2`.
+Each retained index was independently verified. Raw RFC integrity descriptors and
+dataset heads remain in the fingerprint; regression tests show their removal is
+detected. Only physical RFC index artifact names, paths and seals are normalized.
+
+An earlier experiment with 16 snapshots reusing one source generation produced
+phase-total medians of 9.946, 9.195 and 9.174 seconds at workers 1, 2 and 4.
+Its 1.084× median ratio had overlapping repeat ranges and did not establish a
+reliable improvement. That earlier binary also omitted raw RFC descriptors from
+fingerprint comparison, so its report is retained as exploratory timing only,
+outside the final correctness evidence. The changing-generation run above uses
+the corrected fingerprint; the two experiments are not a controlled comparison
+of binaries or workload speed. Neither fixture covers all eight nonempty provider
+graphs or a complete schema-nine corpus.
+
+### Graph implementation acceptance
+
+- Native amd64 workspace tests: 745 passed, 33 ignored. The separate real
+  PostgreSQL gate covers graph JSON preflight, retained RFC order and older partial
+  replay, crate prepared receipts and one-to-one adoption, plus the existing
+  provider history, owner, cancellation, integrity and restore fixtures.
+- The benchmark PostgreSQL tests cover populated-database refusal, full
+  activation/readback, changing/reused historical indexes, serial/parallel parity,
+  restored fingerprints, and descriptor/head loss detection.
+- Final formatting, workspace Clippy with warnings denied, current-advisory
+  audit, dependency/license/source checks, whitespace/Bash checks and 473 Python
+  script tests passed. No dependency or policy exception changed.
+- Independent integrated MCP/API, Upstream/Storage and Security Boundary source
+  reviews found no unresolved blockers. The final benchmark example also received
+  an independent review. These are agent reviews, not human GitHub approvals.
+- Local native amd64 Ubuntu harness/runtime startup and worker fixtures, pinned
+  OxiBelt HTTP/WebTransport, and disposable minikube NodePort TCP/UDP, CNI
+  isolation, PVC restart and coordinated restore passed. Production Alpine image
+  packaging, hosted/native arm64 CI, live providers and production operations
+  were not exercised by these checks.
+
+The complete-corpus cutover gate above still applies. No live rehearsal was resumed,
+and no release, registry publication or production deployment is established here.

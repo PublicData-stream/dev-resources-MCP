@@ -84,14 +84,17 @@ legacy cursor, exact-number and upstream-checksum boundaries.
 ### Offline worker limits and progress
 
 `migrate-storage`, `verify-storage`, and `activate-storage` accept optional
-`--workers N` (1–64) and `--payload-budget-mib N` (positive integer). Existing
+`--workers N` (1–64), `--payload-budget-mib N` and
+`--graph-memory-budget-mib N` (positive integers). Existing
 command forms retain their meaning. Invalid, duplicate, unknown, or overflowing
 options fail before configuration or storage access. Defaults are the smaller of
 available parallelism and eight workers (one if detection fails), and 64 MiB of
-accounted concurrent SQL payload work. For example:
+accounted concurrent SQL payload work. The separate graph-memory default is
+1,024 MiB of conservatively accounted graph working memory, not a process RSS
+limit. For example:
 
 ```sh
-devres-server migrate-storage /etc/devres/server.toml --to blake3 --workers 4 --payload-budget-mib 64
+devres-server migrate-storage /etc/devres/server.toml --to blake3 --workers 4 --payload-budget-mib 64 --graph-memory-budget-mib 1024
 devres-server verify-storage /etc/devres/server.toml --workers 4
 devres-server activate-storage /etc/devres/server.toml --workers 4
 ```
@@ -107,8 +110,43 @@ this charge is not process RSS. Existing mapping/visibility spill bounds and the
 1,000-row/8 MiB seal-metadata batch remain independent limits. The SQL pool stays
 at eight connections. Worker count is not a CPU quota.
 
-`--workers 1` is the serial reference. Provider graph replay stays serial, and all
-verification/activation checks and durability settings remain required. Cancellation
+`--workers 1` is the serial reference, including the original provider order.
+With more workers, all eight provider coordinators can advance concurrently;
+independent evidence and frozen-index work within each provider also shares the
+command's worker admission. Dependency phases, inventory-node publication and
+sequence-bearing SQL remain in the original order within each provider. The
+single non-reconnecting owner connection serializes durable writes; different
+providers can interleave without sharing their sequence allocators.
+
+Provider mapping overlays and MDN inventory memo records share one proof-checked
+scratch database/cache over a frozen qualified base. Namespace violations and
+conflicting shared Git-manifest mappings fail closed. Scratch is disposable and
+never replaces durable checkpoints or source evidence. Source cutoffs from an
+older partial schema-10 migration remain fixed on resume.
+
+Crate snapshot replay retains a checksummed prepared-result receipt before public
+snapshot publication. Resume verifies its source and exact frozen postings/gaps,
+then reuses the existing tuple without allocating another occurrence. Older
+receiptless canonical results are assigned one-to-one in legacy order from a
+frozen preexisting candidate set; that adoption path serializes crate snapshot
+preparation while other providers can continue. Fresh crate replay stays parallel.
+
+Graph windows reserve decoded input, clones, prepared results and index-buffer
+allowances before materializing work. Results retain admission through ordered
+publication. An individually valid graph unit larger than the graph-memory budget
+runs alone; progress reports the larger reservation. Existing per-record limits
+still apply. Mapping/visibility bounds and SQL payload charges remain separate;
+engine internals, stacks, allocator overhead and page cache prevent treating these
+charges as an RSS limit. Reader queries release pool connections before waiting
+for graph admission. Provider coordinators never hold worker admission while
+waiting for their own nested blocking work.
+
+Only explicit offline index paths use command admission instead of serving's
+reader/writer gates. Each Tantivy generation retains one indexing thread and no
+automatic merges. Target-qualified coordination prevents duplicate concurrent
+publication. Every use still verifies retained source and canonical/prototype
+evidence; existing resumed RFC targets never seed the prototype cache.
+All verification/activation checks and durability settings remain required. Cancellation
 is cooperative: offline callers signal the token and await completion so started
 blocking jobs join, unpublished stages are removed and transactions roll back.
 Aborting the outer async task or SIGKILL does not provide that cleanup guarantee.
@@ -116,7 +154,9 @@ Aborting the outer async task or SIGKILL does not provide that cleanup guarantee
 Aggregate JSON progress goes to stderr; the final command result remains JSON on
 stdout. Counts describe one pass, not unique corpus records or completion
 percentages. Job timing is aggregate waiting wall time and can overlap across
-workers; SQL/filesystem publication time is measured separately. No source text,
+workers; SQL/filesystem publication time is measured separately. Graph job counts,
+active/high-water jobs and accounted graph-memory usage are separate aggregates.
+No source text,
 request inputs, paths or credentials are included. Repeated verification passes
 remain separately identified.
 

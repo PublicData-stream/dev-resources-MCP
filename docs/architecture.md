@@ -105,6 +105,21 @@ a versioned namespace, original ID and typed frozen evidence, preserving distinc
 historical generations that share content. Byte objects may deduplicate without
 merging observations, source timestamps or history positions.
 
+Offline graph replay can prepare independent work across all eight providers.
+A frozen qualified mapping base and provider-local overlays share one bounded
+proof-checked scratch workspace. A lane publishes its original logical SQL stream
+in order, including inventory nodes and sequence-bearing rows, through the same
+exclusive owner connection. Shared Git-manifest proposals must agree. Ready
+index/evidence jobs share command-wide worker and graph-memory admission; provider
+coordinators do not reserve a worker while waiting for nested jobs. Serving
+reader/writer gates remain unchanged. Prepared immutable index files can precede
+their SQL references, but incomplete stages, provider completion receipts and
+activation retain their existing fences.
+Crate replay records its verified prepared snapshot before publication so a
+restart can reuse the same index and occurrence. Receiptless older targets are
+claimed in original source order with a frozen candidate cutoff; equal content
+cannot cause two retained occurrences to adopt one canonical target.
+
 Original files, records, indexes and selectors remain retained. Namespaced mappings
 separate body, capture and provider/entity roles; identical old hash text in two
 roles need not identify the same canonical object. Legacy selectors and unversioned
