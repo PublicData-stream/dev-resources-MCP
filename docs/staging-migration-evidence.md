@@ -1,7 +1,8 @@
 # Staging migration continuation: 2026-11-06
 
 This is an operational snapshot at **2026-11-06 08:53:25 UTC**, not a completed
-public cutover or complete-corpus performance report. The
+public cutover or complete-corpus performance report. A later direct-cutover
+update appears below and supersedes the earlier fresh-rehearsal plan. The
 [operator runbook](../deploy/staging/README.md) owns the execution and recovery
 procedure.
 
@@ -104,7 +105,7 @@ At the observation time:
 - The backup timer remained paused for the active rehearsal; original timer
   intent and protected recovery snapshots were retained.
 
-## Remaining gates
+## Earlier remaining gates
 
 The resumed pair must still complete verification, activation, retained readback
 and both schema-10/schema-9 recovery checks. Its mixed-version, interrupted timing
@@ -123,3 +124,53 @@ acceptance. New-version public HTTP/WebTransport, isolation, `upgrade-finish`,
 collector restoration and post-cutover observation remain pending. Whole-provider
 coverage, complete-corpus speedup and native ChatGPT/browser acceptance have not
 been established by this record.
+
+## Authorized direct cutover: 2026-11-06 09:48 UTC
+
+The operator authorized an immediate outage and one direct transition. The final
+operational deadline is **2026-11-10 23:59 UTC**. The automatic preserving-rollback
+cutoff is **2026-11-10 20:59 UTC**, leaving a three-hour recovery reserve; the
+reserve does not establish an observed recovery duration.
+
+The queued follow-up rehearsal was disconnected. The running isolated rehearsal
+was cleanly paused, then formally adopted into the signed `1a05dcd` operator
+bundle and retired with `upgrade-retire-rehearsal`. Its database/evidence pair,
+capsules, snapshots and holds remain retained, with unqualified timing. Retirement
+restored the original backup timer intent. A new coordinated daily snapshot,
+`devres-20261106T093725Z-daily`, and its isolated schema-nine restore passed before
+direct admission. The earlier backup failure was an `upgrade_in_progress` refusal,
+not a failed data-integrity check.
+
+The installed six-module operator bundle is
+`e81e1f13abb6c84acb96c161d32680a99186705fd5445bcb99d26ef6fa6362bb`.
+The integrated Python suite passed **526 tests**. Independent review covered
+preserving retirement, the direct driver, and the adapted acceptance toolkit;
+the latter two passed **11** and **72** mocked tests respectively.
+
+External isolation preflight observed both TCP and UDP ingress at the server,
+zero correlated egress, and zero kernel drops. Client TLS and UDP timed out. An
+environment-side TCP connect response did not correspond to a server SYN-ACK.
+This preflight does not replace the fresh candidate acceptance proof. A fresh
+six-route shared-edge baseline was captured and hash-pinned before draining.
+
+A root-owned systemd driver launched the canonical direct command once, with
+the exact absolute cutoff and default `rehearsal` pause scope. Its durable launch
+marker prevents automatic retries. At this update, the journal was
+`pre_upgrade_restore`, both Kubernetes Deployments had zero desired replicas,
+and the token-owned rollback timer was active and persistently enabled. The
+fresh old-image restore then passed in about nine seconds, and the journal
+advanced to `running_migrate_storage` on the permanent pair. The source
+`pre-blake3` snapshot retains its protected three-member hold; the older rehearsal
+clone is not promoted. The current worker runs the requested immutable release
+with eight workers, 64 MiB SQL and 1,024 MiB graph budgets, capped at 37 CPUs and
+192 GiB including its scratch space. Its private PostgreSQL is capped at two
+CPUs and 16 GiB. Both Kubernetes Deployments remain stopped while these exclusive
+writers run on an internal container network without host ports.
+
+Migration, verification, activation, candidate acceptance, `upgrade-finish`,
+collector restoration and ten-minute stability observation remain pending.
+The separate success barrier records that acceptance is required; it never
+accepts or finalizes automatically. Candidate acceptance retains both public
+transports/revisions, retained RFC/MDN, mTLS/Host/Origin/CNI/external isolation,
+private-health denial and all six shared-route gates. Until those gates pass,
+this record does not establish a completed public deployment.
