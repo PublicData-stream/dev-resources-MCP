@@ -1046,7 +1046,9 @@ impl PgBlobStore {
             } else if provider == "crate" && key.starts_with("job:") {
                 sqlx::query("UPDATE devres_crate_jobs SET metadata_capture=$2,artifact=$3 WHERE source_key=$1")
                     .bind(text("source_key")?).bind(text("metadata_capture")?).bind(data["artifact"].as_str()).execute(&mut **tx).await.map_err(|_|storage_error())?;
-            } else if provider == "crate" && key.starts_with("observation:") {
+            } else if provider == "crate"
+                && (key.starts_with("observation:") || key.starts_with("snapshot-prepared:"))
+            {
                 // Immutable, checksummed replay receipt. Its target occurrence was
                 // verified during qualification; it is not an activation update.
             } else {

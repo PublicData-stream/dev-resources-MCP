@@ -5,7 +5,10 @@ pub(crate) mod immutable_index;
 pub mod integrity;
 mod migration_execution;
 pub(crate) mod migration_map;
-pub use migration_execution::{MigrationExecution, MigrationExecutionOptions};
+pub use migration_execution::{
+    GraphPrepared, GraphReservation, MigrationExecution, MigrationExecutionOptions,
+    MigrationGraphOptions,
+};
 mod network;
 mod research;
 mod standards_processing;

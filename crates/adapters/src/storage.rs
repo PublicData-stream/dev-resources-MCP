@@ -42,6 +42,46 @@ mod migration_npm;
 mod npm_storage;
 #[path = "storage_integrity.rs"]
 mod payload_integrity;
+/// Shared conservative JSON residency accounting for private offline jobs.
+pub(crate) fn migration_value_charge(value: &serde_json::Value) -> devres_domain::Result<usize> {
+    payload_integrity::pipeline::value_charge(value, 0)
+}
+
+impl PgBlobStore {
+    /// Source state stays resident only after command-wide graph admission.
+    pub(crate) async fn migration_state_reservation(
+        &self,
+        provider: &str,
+        key: &str,
+        extra: usize,
+        execution: &crate::MigrationExecution,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::GraphReservation> {
+        let table = match provider {
+            "npm" => "devres_npm_state",
+            "advisory" => "devres_advisory_state",
+            _ => return Err(Error::invalid("Unknown graph state provider.")),
+        };
+        self.fence().await?;
+        let sql = format!(
+            "SELECT octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM {table} WHERE key=$1"
+        );
+        let shape: Option<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| storage_error())?;
+        let (bytes, nodes) = shape.unwrap_or((0, 0));
+        let charge = crate::MigrationExecution::graph_input_charge(
+            usize::try_from(bytes).map_err(|_| storage_error())?,
+            usize::try_from(nodes).map_err(|_| storage_error())?,
+        )?
+        .checked_add(extra)
+        .ok_or_else(|| Error::capacity("Graph state charge overflow."))?;
+        execution.graph_reserve(charge, cancel).await
+    }
+}
+
 #[path = "storage_sequence.rs"]
 mod sequence_integrity;
 #[path = "storage_visibility.rs"]

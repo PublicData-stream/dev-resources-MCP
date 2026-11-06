@@ -375,7 +375,7 @@ pub(crate) struct IndexBuilder {
     queued_bytes: usize,
     base_generation: Option<VerifiedGeneration>,
     published: bool,
-    _permit: SemaphorePermit<'static>,
+    _permit: Option<SemaphorePermit<'static>>,
 }
 
 impl IndexBuilder {
@@ -385,12 +385,22 @@ impl IndexBuilder {
     }
 
     pub(crate) fn begin_from(root: &Path, id: &str, base: Option<&str>) -> Result<Self> {
+        Self::begin_admitted(root, id, base, false)
+    }
+
+    fn begin_admitted(root: &Path, id: &str, base: Option<&str>, offline: bool) -> Result<Self> {
         if !valid_id(id) {
             return Err(Error::invalid("Invalid RFC search snapshot identifier."));
         }
-        let permit = WRITERS
-            .try_acquire()
-            .map_err(|_| Error::capacity("RFC index writer is busy."))?;
+        let permit = if offline {
+            None
+        } else {
+            Some(
+                WRITERS
+                    .try_acquire()
+                    .map_err(|_| Error::capacity("RFC index writer is busy."))?,
+            )
+        };
         let directory = directory(root)?;
         let suffix = index_suffix(id)?;
         let final_path = directory.join(&suffix);
@@ -816,13 +826,14 @@ fn query(field: Field, input: &str, mode: &str) -> Result<Box<dyn Query>> {
 
 /// One fresh canonical prototype from this migration invocation. No open index,
 /// reader, writer, descriptors, or document map survives a call boundary.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct MigrationRebuildCache {
     entry: Option<MigrationPrototype>,
     #[cfg(test)]
     operations: [usize; 3],
 }
 
+#[derive(Clone)]
 struct MigrationPrototype {
     source: blake3::Hash,
     relative: String,
@@ -876,6 +887,7 @@ pub(crate) async fn rebuild_frozen(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn rebuild_frozen_cached(
     root: PathBuf,
     relative: String,
@@ -895,80 +907,7 @@ pub(crate) async fn rebuild_frozen_cached(
     // a possibly incomplete or externally changed candidate for another call.
     let previous = cache.entry.take();
     let mut task = tokio::task::spawn_blocking(move || {
-        migration_cancel(&stop)?;
-        let target = format!("rfc-indexes/{}", index_suffix(&id)?);
-        // Every snapshot rechecks the complete original generation, including
-        // independent legacy evidence and SHA, before considering a cache hit.
-        let mut original = FrozenDocuments::open(&root, &relative, &stop)?;
-        let source = original.generation.fingerprint;
-        if root.join(&target).exists() {
-            let original_membership = frozen_membership(&mut original)?;
-            drop(original);
-            let mut retained = FrozenDocuments::open(&root, &target, &stop)?;
-            if original_membership != frozen_membership(&mut retained)? {
-                return Err(integrity());
-            }
-            migration_cancel(&stop)?;
-            // Number/text equivalence alone does not prove clean rebuild scoring
-            // statistics. An existing target can never seed a new prototype.
-            return Ok((target, previous, RebuildOperation::Resumed));
-        }
-        if let Some(prototype) = previous.filter(|entry| entry.source == source) {
-            drop(original);
-            // begin_from verifies all current prototype bytes, then copies only
-            // writable metadata and hardlinks the permanent immutable shards.
-            let builder = IndexBuilder::begin_from(&root, &id, Some(&prototype.relative))?;
-            let generation = builder.base_generation.ok_or_else(integrity)?;
-            if !generation.canonical || generation.manifest != prototype.manifest {
-                return Err(integrity());
-            }
-            #[cfg(test)]
-            migration_test_pause(&target)?;
-            migration_cancel(&stop)?;
-            let result = builder.finish()?;
-            migration_cancel(&stop)?;
-            return Ok((result, Some(prototype), RebuildOperation::Reused));
-        }
-        let mut builder = IndexBuilder::begin_from(&root, &id, None)?;
-        let mut membership = BTreeMap::new();
-        loop {
-            let documents = original.next_page(1000)?;
-            if documents.is_empty() {
-                break;
-            }
-            for document in documents {
-                migration_cancel(&stop)?;
-                if membership
-                    .insert(
-                        document.number,
-                        crate::integrity::hash(document.text.as_bytes()),
-                    )
-                    .is_some()
-                {
-                    return Err(integrity());
-                }
-                builder.add_document(document)?;
-            }
-        }
-        drop(original);
-        #[cfg(test)]
-        migration_test_pause(&target)?;
-        migration_cancel(&stop)?;
-        let result = builder.finish()?;
-        migration_cancel(&stop)?;
-        // Admit only this invocation's newly built, fully verified canonical
-        // output, with exact unique live number/text equivalence to the source.
-        let mut retained = FrozenDocuments::open(&root, &result, &stop)?;
-        if !retained.generation.canonical || membership != frozen_membership(&mut retained)? {
-            return Err(integrity());
-        }
-        migration_cancel(&stop)?;
-        let prototype = MigrationPrototype {
-            source,
-            relative: result.clone(),
-            manifest: retained.generation.manifest,
-        };
-        Ok((result, Some(prototype), RebuildOperation::Built))
+        rebuild_frozen_sync(root, relative, id, stop, previous, false)
     });
     let (result, entry, _operation) = tokio::select! {
         biased;
@@ -985,6 +924,143 @@ pub(crate) async fn rebuild_frozen_cached(
         }] += 1;
     }
     Ok(result)
+}
+
+/// Called only through the shared offline execution context. Its worker permit
+/// replaces serving reader/writer admission without changing those public gates.
+pub(crate) async fn rebuild_frozen_cached_with_execution(
+    root: PathBuf,
+    relative: String,
+    id: String,
+    cancel: tokio_util::sync::CancellationToken,
+    cache: &mut MigrationRebuildCache,
+    execution: &crate::MigrationExecution,
+) -> Result<String> {
+    let previous = cache.entry.take();
+    let (result, entry, _operation) = execution
+        .run(&cancel, move |stop| {
+            rebuild_frozen_sync(root, relative, id, stop, previous, true)
+        })
+        .await?;
+    cache.entry = entry;
+    #[cfg(test)]
+    {
+        cache.operations[match _operation {
+            RebuildOperation::Built => 0,
+            RebuildOperation::Reused => 1,
+            RebuildOperation::Resumed => 2,
+        }] += 1;
+    }
+    Ok(result)
+}
+
+fn rebuild_frozen_sync(
+    root: PathBuf,
+    relative: String,
+    id: String,
+    stop: tokio_util::sync::CancellationToken,
+    previous: Option<MigrationPrototype>,
+    offline: bool,
+) -> Result<(String, Option<MigrationPrototype>, RebuildOperation)> {
+    // Providers may prepare immutable files concurrently. Serialize a repeated
+    // root-qualified target so a second attempt verifies the first publication.
+    type TargetLocks = std::collections::BTreeMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>;
+    static TARGET_LOCKS: std::sync::OnceLock<std::sync::Mutex<TargetLocks>> =
+        std::sync::OnceLock::new();
+    let target_key = fs::canonicalize(&root)
+        .map_err(|_| unavailable())?
+        .join("rfc-indexes")
+        .join(index_suffix(&id)?);
+    let target_lock = {
+        let mut locks = TARGET_LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| unavailable())?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&target_key).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+                locks.insert(target_key, std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    let _target_guard = target_lock.lock().map_err(|_| unavailable())?;
+    migration_cancel(&stop)?;
+    let target = format!("rfc-indexes/{}", index_suffix(&id)?);
+    // Every snapshot rechecks the complete original generation, including
+    // independent legacy evidence and SHA, before considering a cache hit.
+    let mut original = FrozenDocuments::open_admitted(&root, &relative, &stop, offline)?;
+    let source = original.generation.fingerprint;
+    if root.join(&target).exists() {
+        let original_membership = frozen_membership(&mut original)?;
+        drop(original);
+        let mut retained = FrozenDocuments::open_admitted(&root, &target, &stop, offline)?;
+        if original_membership != frozen_membership(&mut retained)? {
+            return Err(integrity());
+        }
+        migration_cancel(&stop)?;
+        // Number/text equivalence alone does not prove clean rebuild scoring
+        // statistics. An existing target can never seed a new prototype.
+        return Ok((target, previous, RebuildOperation::Resumed));
+    }
+    if let Some(prototype) = previous.filter(|entry| entry.source == source) {
+        drop(original);
+        // begin_from verifies all current prototype bytes, then copies only
+        // writable metadata and hardlinks the permanent immutable shards.
+        let builder = IndexBuilder::begin_admitted(&root, &id, Some(&prototype.relative), offline)?;
+        let generation = builder.base_generation.ok_or_else(integrity)?;
+        if !generation.canonical || generation.manifest != prototype.manifest {
+            return Err(integrity());
+        }
+        #[cfg(test)]
+        migration_test_pause(&target)?;
+        migration_cancel(&stop)?;
+        let result = builder.finish()?;
+        migration_cancel(&stop)?;
+        return Ok((result, Some(prototype), RebuildOperation::Reused));
+    }
+    let mut builder = IndexBuilder::begin_admitted(&root, &id, None, offline)?;
+    let mut membership = BTreeMap::new();
+    loop {
+        let documents = original.next_page(1000)?;
+        if documents.is_empty() {
+            break;
+        }
+        for document in documents {
+            migration_cancel(&stop)?;
+            if membership
+                .insert(
+                    document.number,
+                    crate::integrity::hash(document.text.as_bytes()),
+                )
+                .is_some()
+            {
+                return Err(integrity());
+            }
+            builder.add_document(document)?;
+        }
+    }
+    drop(original);
+    #[cfg(test)]
+    migration_test_pause(&target)?;
+    migration_cancel(&stop)?;
+    let result = builder.finish()?;
+    migration_cancel(&stop)?;
+    // Admit only this invocation's newly built, fully verified canonical
+    // output, with exact unique live number/text equivalence to the source.
+    let mut retained = FrozenDocuments::open_admitted(&root, &result, &stop, offline)?;
+    if !retained.generation.canonical || membership != frozen_membership(&mut retained)? {
+        return Err(integrity());
+    }
+    migration_cancel(&stop)?;
+    let prototype = MigrationPrototype {
+        source,
+        relative: result.clone(),
+        manifest: retained.generation.manifest,
+    };
+    Ok((result, Some(prototype), RebuildOperation::Built))
 }
 
 #[cfg(test)]
@@ -1040,7 +1116,7 @@ pub(crate) struct FrozenDocuments {
     pending: Option<IndexDocument>,
     first_page_deadline: Option<Instant>,
     cancel: tokio_util::sync::CancellationToken,
-    _permit: SemaphorePermit<'static>,
+    _permit: Option<SemaphorePermit<'static>>,
     #[cfg(test)]
     visited_documents: usize,
 }
@@ -1051,10 +1127,25 @@ impl FrozenDocuments {
         relative: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
+        Self::open_admitted(root, relative, cancel, false)
+    }
+
+    fn open_admitted(
+        root: &Path,
+        relative: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+        offline: bool,
+    ) -> Result<Self> {
         migration_cancel(cancel)?;
-        let permit = READERS
-            .try_acquire()
-            .map_err(|_| Error::capacity("RFC index reader capacity exhausted."))?;
+        let permit = if offline {
+            None
+        } else {
+            Some(
+                READERS
+                    .try_acquire()
+                    .map_err(|_| Error::capacity("RFC index reader capacity exhausted."))?,
+            )
+        };
         let deadline = Instant::now() + Duration::from_secs(15);
         let path = selected_directory(root, relative)?;
         let generation = verify_generation(&path, deadline)?;
@@ -1564,6 +1655,156 @@ mod tests {
         for (name, bytes) in retained {
             fs::write(root.join(destination).join(name), bytes).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn offline_rebuilds_overlap_without_consuming_serving_admission() {
+        let _serial = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"offline overlap source"),
+            documents(&[(1, "transport transport cats"), (2, "transport dogs")]),
+        )
+        .unwrap();
+        let blocked_id = crate::integrity::hash(b"offline overlap blocked");
+        let target = format!("rfc-indexes/{}", index_suffix(&blocked_id).unwrap());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *MIGRATION_TEST_PAUSE.lock().unwrap() = Some(MigrationTestPause {
+            target,
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let execution = crate::MigrationExecution::new(
+            crate::MigrationExecutionOptions::new(2, 64 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let readers = READERS.try_acquire_many(2).unwrap();
+        let writer = WRITERS.try_acquire().unwrap();
+        let first_execution = execution.clone();
+        let first_root = root.path().to_owned();
+        let first_source = source.clone();
+        let first = tokio::spawn(async move {
+            let mut cache = MigrationRebuildCache::default();
+            let result = rebuild_frozen_cached_with_execution(
+                first_root,
+                first_source,
+                blocked_id,
+                tokio_util::sync::CancellationToken::new(),
+                &mut cache,
+                &first_execution,
+            )
+            .await;
+            (result, cache)
+        });
+        tokio::time::timeout(Duration::from_secs(15), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cache = MigrationRebuildCache::default();
+        let second = tokio::time::timeout(
+            Duration::from_secs(15),
+            rebuild_frozen_cached_with_execution(
+                root.path().to_owned(),
+                source.clone(),
+                crate::integrity::hash(b"offline overlap independent"),
+                tokio_util::sync::CancellationToken::new(),
+                &mut cache,
+                &execution,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !first.is_finished(),
+            "another independent rebuild completed while the first writer was blocked"
+        );
+        assert_eq!(execution.snapshot().high_water, 2);
+        assert_eq!(READERS.available_permits(), 0);
+        assert_eq!(WRITERS.available_permits(), 0);
+        release_tx.send(()).unwrap();
+        let (first_result, first_cache) = first.await.unwrap();
+        let first_path = first_result.unwrap();
+        assert_eq!(first_cache.operations, [1, 0, 0]);
+        drop(readers);
+        drop(writer);
+        assert_eq!(
+            frozen_text(root.path(), &first_path),
+            frozen_text(root.path(), &second)
+        );
+        assert_eq!(
+            search(root.path(), &first_path, "transport", TECHNICAL, 0, 2, None).unwrap(),
+            search(root.path(), &second, "transport", TECHNICAL, 0, 2, None).unwrap()
+        );
+        let resumed = rebuild_frozen_cached_with_execution(
+            root.path().to_owned(),
+            source,
+            crate::integrity::hash(b"offline overlap independent"),
+            tokio_util::sync::CancellationToken::new(),
+            &mut MigrationRebuildCache::default(),
+            &execution,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed, second);
+        assert_eq!(execution.snapshot().active, 0);
+        assert_migration_drained(root.path());
+    }
+
+    #[tokio::test]
+    async fn offline_cancellation_drains_owned_index_writer() {
+        let _serial = TEST_SERIAL.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let source = build(
+            root.path(),
+            &crate::integrity::hash(b"offline cancel source"),
+            documents(&[(1, "retained transport")]),
+        )
+        .unwrap();
+        let id = crate::integrity::hash(b"offline canceled target");
+        let target = format!("rfc-indexes/{}", index_suffix(&id).unwrap());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *MIGRATION_TEST_PAUSE.lock().unwrap() = Some(MigrationTestPause {
+            target: target.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let execution =
+            crate::MigrationExecution::new(crate::MigrationExecutionOptions::new(2, 1).unwrap())
+                .unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let token = stop.clone();
+        let context = execution.clone();
+        let root_path = root.path().to_owned();
+        let task = tokio::spawn(async move {
+            let mut cache = MigrationRebuildCache::default();
+            let result = rebuild_frozen_cached_with_execution(
+                root_path, source, id, token, &mut cache, &context,
+            )
+            .await;
+            (result, cache)
+        });
+        tokio::time::timeout(Duration::from_secs(15), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        stop.cancel();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(execution.snapshot().active, 1);
+        release_tx.send(()).unwrap();
+        let (result, cache) = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().code, "cancelled");
+        assert!(cache.entry.is_none());
+        assert!(!root.path().join(target).exists());
+        assert_eq!(execution.snapshot().active, 0);
+        assert_migration_drained(root.path());
     }
 
     #[tokio::test]

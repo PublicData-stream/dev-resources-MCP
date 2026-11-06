@@ -142,6 +142,16 @@ fn fields<const N: usize>(bytes: &[u8]) -> Result<[String; N]> {
     }
     values.try_into().map_err(|_| unavailable())
 }
+fn split_scope(key: &str) -> (&str, &str) {
+    if let Some(suffix) = key.strip_prefix("\0devres-scope:")
+        && let Some((scope, logical)) = suffix.split_once(':')
+        && !scope.is_empty()
+        && scope.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return (&key[..key.len() - logical.len()], logical);
+    }
+    ("", key)
+}
 fn index_namespace(namespace: &str) -> bool {
     namespace.split_once(':').is_some_and(|(provider, kind)| {
         matches!(provider, "mdn" | "whatwg" | "w3c" | "chromium")
@@ -293,8 +303,9 @@ impl Workspace {
                         .map_err(|_| unavailable())?
                         .is_some()
                 };
-                if let Some((namespace, old)) = legacy_index(key) {
-                    let index = secondary_key(&namespace, &hash_legacy(old));
+                let (prefix, logical) = split_scope(key);
+                if let Some((namespace, old)) = legacy_index(logical) {
+                    let index = format!("{prefix}{}", secondary_key(&namespace, &hash_legacy(old)));
                     let mut table = tx.open_table(SECONDARY).map_err(|_| unavailable())?;
                     if let Some(prior) = table.get(index.as_str()).map_err(|_| unavailable())? {
                         let prior =
@@ -326,14 +337,39 @@ impl Workspace {
             }
         })
     }
+    pub(super) fn put_shared(&self, key: &str, value: &str) -> Result<()> {
+        self.checked(|| {
+            let key = format!("\0devres-shared:{key}");
+            let encoded = encode(MAP_DOMAIN, key.as_bytes(), value.as_bytes())?;
+            let mut tx = self.db.begin_write().map_err(|_| unavailable())?;
+            tx.set_durability(Durability::None)
+                .map_err(|_| unavailable())?;
+            {
+                let mut table = tx.open_table(MAP).map_err(|_| unavailable())?;
+                if let Some(prior) = table.get(key.as_str()).map_err(|_| unavailable())?
+                    && decode(MAP_DOMAIN, key.as_bytes(), prior.value())? != value.as_bytes()
+                {
+                    return Err(Error::integrity(
+                        "Concurrent shared migration mapping conflicts.",
+                    ));
+                }
+                table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(|_| unavailable())?;
+            }
+            tx.commit().map_err(|_| unavailable())?;
+            Ok(())
+        })
+    }
     pub(super) fn lookup_legacy_key_hash(
         &self,
         namespace: &str,
         hash: &str,
     ) -> Result<Option<String>> {
         self.checked(|| {
+            let (prefix, logical_namespace) = split_scope(namespace);
             let index = secondary_key(namespace, hash);
-            if !index_namespace(namespace)
+            if !index_namespace(logical_namespace)
                 || hash.len() != 64
                 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
             {
@@ -352,7 +388,7 @@ impl Workspace {
             {
                 return Err(Error::integrity("Legacy migration scratch index changed."));
             }
-            let full_key = format!("{namespace}:{old}");
+            let full_key = format!("{prefix}{logical_namespace}:{old}");
             let map = tx.open_table(MAP).map_err(|_| unavailable())?;
             let primary = map
                 .get(full_key.as_str())
@@ -366,11 +402,18 @@ impl Workspace {
             Ok(Some(canonical))
         })
     }
-    pub(super) fn page(&self, after: Option<&str>) -> Result<VecDeque<(String, String)>> {
+    pub(super) fn page(
+        &self,
+        after: Option<&str>,
+        prefix: &str,
+    ) -> Result<VecDeque<(String, String)>> {
         self.checked(|| {
             let tx = self.db.begin_read().map_err(|_| unavailable())?;
             let table = tx.open_table(MAP).map_err(|_| unavailable())?;
-            let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+            let physical_after = after.map(|key| format!("{prefix}{key}"));
+            let lower = physical_after
+                .as_deref()
+                .map_or(Bound::Included(prefix), Bound::Excluded);
             let mut page = VecDeque::new();
             let mut bytes = 0_usize;
             for item in table
@@ -378,6 +421,12 @@ impl Workspace {
                 .map_err(|_| unavailable())?
             {
                 let (key, record) = item.map_err(|_| unavailable())?;
+                if prefix.is_empty() && key.value().starts_with('\0') {
+                    continue;
+                }
+                let Some(logical) = key.value().strip_prefix(prefix) else {
+                    break;
+                };
                 let value = decode(MAP_DOMAIN, key.value().as_bytes(), record.value())?;
                 let size = key
                     .value()
@@ -393,7 +442,7 @@ impl Workspace {
                 }
                 // A single already-admitted opaque representation is yielded
                 // alone, retaining the prior large-record admission behavior.
-                page.push_back((key.value().to_owned(), text(value)?));
+                page.push_back((logical.to_owned(), text(value)?));
                 bytes = bytes.checked_add(size).ok_or_else(capacity)?;
                 if page.len() == PAGE_ROWS || bytes >= PAGE_BYTES {
                     break;
@@ -402,7 +451,7 @@ impl Workspace {
             Ok(page)
         })
     }
-    fn group(&self) -> Result<u64> {
+    pub(super) fn group(&self) -> Result<u64> {
         self.ensure_healthy()?;
         self.groups
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
@@ -630,6 +679,7 @@ impl Iterator for AliasChunks {
 }
 
 pub(super) struct MapIter {
+    pub(super) prefix: String,
     pub(super) workspace: Option<Arc<Workspace>>,
     pub(super) page: VecDeque<(String, String)>,
     pub(super) after: Option<String>,
@@ -700,7 +750,7 @@ impl Iterator for MapIter {
         }
         let workspace = Arc::clone(self.workspace.as_ref()?);
         if self.page.is_empty() {
-            match workspace.page(self.after.as_deref()) {
+            match workspace.page(self.after.as_deref(), &self.prefix) {
                 Ok(page) => {
                     self.page = page;
                     self.after = None;

@@ -65,6 +65,59 @@ fn remap_batch(
 }
 #[async_trait]
 impl MdnStore for PgBlobStore {
+    async fn mdn_migration_positions(
+        &self,
+        kind: &str,
+        after: i64,
+        limit: usize,
+        cutoff: i64,
+    ) -> Result<Vec<(i64, String, usize, usize)>> {
+        checked(kind, "migration-size-page")?;
+        if after < 0 || cutoff < 0 || !(1..=128).contains(&limit) {
+            return Err(Error::invalid("Invalid migration sizing page."));
+        }
+        self.fence().await?;
+        let excluded = self.visibility_aliases("mdn", kind, Some(cutoff)).await?;
+        let positions: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+            "SELECT r.sequence,r.key,(octet_length(r.data::text)::bigint+COALESCE(octet_length(s.data::text),0)+COALESCE(octet_length(c.data::text),0))::bigint,(jsonb_array_length(jsonb_path_query_array(r.data,'strict $.**.type()'))::bigint+COALESCE(jsonb_array_length(jsonb_path_query_array(s.data,'strict $.**.type()')),0)+COALESCE(jsonb_array_length(jsonb_path_query_array(c.data,'strict $.**.type()')),0))::bigint FROM devres_mdn_evidence r LEFT JOIN devres_mdn_state s ON s.key=(CASE WHEN $1='observations' THEN r.data->>'repo'||'-observation' WHEN $1='snapshots' THEN 'rebuild-alias:'||(r.data->>'repository')||':'||(r.data->>'revision')||':'||(r.data->>'processor_version') ELSE NULL END) LEFT JOIN devres_mdn_evidence c ON $1='snapshots' AND c.kind='snapshot-keys' AND c.key=((r.data->>'repository')||':'||(r.data->>'revision')||':'||(r.data->>'processor_version')) WHERE r.kind=$1 AND r.sequence>$2 AND r.sequence<=$3 AND NOT(r.key=ANY($5::text[])) ORDER BY r.sequence LIMIT $4"
+        ).bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(excluded.as_ref())
+            .fetch_all(&self.pool).await.map_err(|_| storage_error())?;
+        positions
+            .into_iter()
+            .map(|(sequence, key, bytes, nodes)| {
+                Ok((
+                    sequence,
+                    key,
+                    usize::try_from(bytes).map_err(|_| {
+                        Error::capacity("Migration source size exceeds platform bounds.")
+                    })?,
+                    usize::try_from(nodes).map_err(|_| {
+                        Error::capacity("Migration source shape exceeds platform bounds.")
+                    })?,
+                ))
+            })
+            .collect()
+    }
+    async fn mdn_migration_state_bytes(&self, key: &str) -> Result<Option<(usize, usize)>> {
+        checked("state", key)?;
+        self.fence().await?;
+        let bytes: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_mdn_state WHERE key=$1"
+        ).bind(key).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
+        bytes
+            .map(|(bytes, nodes)| {
+                Ok((
+                    usize::try_from(bytes).map_err(|_| {
+                        Error::capacity("Migration state size exceeds platform bounds.")
+                    })?,
+                    usize::try_from(nodes).map_err(|_| {
+                        Error::capacity("Migration state shape exceeds platform bounds.")
+                    })?,
+                ))
+            })
+            .transpose()
+    }
+
     async fn mdn_cutoff(&self) -> Result<i64> {
         self.fence().await?;
         if let Some(cutoff) = self.migration_cutoff("mdn").await? {

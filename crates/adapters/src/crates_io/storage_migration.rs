@@ -10,6 +10,19 @@ fn stop(cancel: &CancellationToken) -> Result<()> {
         Ok(())
     }
 }
+
+async fn reserve_source(
+    execution: &crate::MigrationExecution,
+    cancel: &CancellationToken,
+    bytes: i64,
+    nodes: i64,
+) -> Result<crate::GraphReservation> {
+    let charge = crate::MigrationExecution::graph_input_charge(
+        usize::try_from(bytes).map_err(|_| storage_error())?,
+        usize::try_from(nodes).map_err(|_| storage_error())?,
+    )?;
+    execution.graph_reserve(charge, cancel).await
+}
 fn mapped(maps: &crate::migration_map::MigrationMap, role: &str, id: &str) -> Result<String> {
     if id.starts_with("blake3:") && valid_hash(id) {
         return Ok(id.into());
@@ -57,35 +70,414 @@ fn id_alias(
     Ok(())
 }
 
+/// Only targets retained before this replay can be adopted. Ownership is resolved
+/// in legacy order whenever an interrupted older replay left canonical rows.
+struct SnapshotAdoption {
+    cutoff: i64,
+    owners: crate::MigrationMap,
+}
+
+impl SnapshotAdoption {
+    fn permits(&self, old: &str, canonical: &str) -> bool {
+        self.owners
+            .get(&format!("canonical:{canonical}"))
+            .is_none_or(|owner| owner == old)
+            && self
+                .owners
+                .get(&format!("legacy:{old}"))
+                .is_none_or(|target| target == canonical)
+    }
+
+    fn claim(&mut self, old: &str, canonical: &str) -> Result<()> {
+        if !valid_hash(old)
+            || old.starts_with("blake3:")
+            || !valid_hash(canonical)
+            || !canonical.starts_with("blake3:")
+            || !self.permits(old, canonical)
+        {
+            return Err(Error::integrity(
+                "Crate snapshot replay occurrence ownership changed.",
+            ));
+        }
+        crate::migration_map::insert(
+            &mut self.owners,
+            format!("canonical:{canonical}"),
+            old.to_owned(),
+        )?;
+        crate::migration_map::insert(
+            &mut self.owners,
+            format!("legacy:{old}"),
+            canonical.to_owned(),
+        )?;
+        self.owners.ensure_healthy()
+    }
+}
+
+struct SnapshotSource<'a> {
+    legacy: &'a str,
+    integrity: &'a str,
+    adoption: &'a SnapshotAdoption,
+}
+
+fn snapshot_identity(snapshot: &Snapshot) -> Result<String> {
+    Ok(hash(serde_json::to_vec(&json!({"inventory":snapshot.inventory.id,"inventory_validated_at":snapshot.inventory.validated_at,"content_sequence":snapshot.content_sequence,"enrichment":snapshot.enrichment,"index":snapshot.index_manifest,"coverage":snapshot.coverage}))
+        .map_err(|_|Error::integrity("Snapshot identity failed."))?.as_slice()))
+}
+
+fn snapshot_base(snapshot: &Snapshot) -> Result<Value> {
+    let mut value = serde_json::to_value(snapshot).map_err(|_| storage_error())?;
+    let object = value.as_object_mut().ok_or_else(storage_error)?;
+    object.remove("id");
+    object.remove("index_manifest");
+    Ok(value)
+}
+
+fn snapshot_rewrite(maps: &crate::MigrationMap) -> crate::crates_io::index::PayloadRewrite {
+    let maps = maps.clone();
+    Arc::new(move |value: &mut Value| -> Result<()> {
+        let is_content = value["class"] == "content";
+        if let Some(record) = value.get_mut("record") {
+            remap_fields(record, &maps)?;
+            if is_content {
+                let id = record["id"].as_str().ok_or_else(storage_error)?.to_owned();
+                record["id"] = json!(mapped(&maps, "crate:content", &id)?);
+            }
+        } else {
+            remap_fields(value, &maps)?;
+        }
+        if let Some(enrichment) = value.get_mut("enrichment") {
+            remap_fields(enrichment, &maps)?;
+        }
+        Ok(())
+    })
+}
+
 impl PgBlobStore {
+    async fn crate_snapshot_adoption(
+        &self,
+        maps: &crate::MigrationMap,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<SnapshotAdoption> {
+        let cutoff: i64 = sqlx::query_scalar("SELECT COALESCE(max(sequence),0)::bigint FROM devres_crate_snapshots WHERE id LIKE 'blake3:%'")
+            .fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let mut adoption = SnapshotAdoption {
+            cutoff,
+            owners: maps.scratch()?,
+        };
+        let mut after = String::new();
+        loop {
+            stop(cancel)?;
+            let aliases: Vec<(String,String)> = sqlx::query_as("SELECT legacy,canonical FROM devres_content_aliases WHERE namespace='crate:snapshots' AND legacy>$1 ORDER BY legacy LIMIT 128")
+                .bind(&after).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            if aliases.is_empty() {
+                break;
+            }
+            for (old, canonical) in aliases {
+                if maps.get(&format!("crate:snapshots:{old}")).as_ref() != Some(&canonical) {
+                    return Err(Error::integrity("Qualified crate snapshot alias changed."));
+                }
+                adoption.claim(&old, &canonical)?;
+                after = old;
+            }
+        }
+        let mut after = String::new();
+        loop {
+            stop(cancel)?;
+            let source: Option<(String,i64,i64)> = sqlx::query_as("SELECT key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'snapshot-prepared:%' AND key>$1 ORDER BY key LIMIT 1")
+                .bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some((key, bytes, nodes)) = source else {
+                break;
+            };
+            let _reservation = reserve_source(execution, cancel, bytes, nodes).await?;
+            let row = sqlx::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1")
+                .bind(&key).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+            let data = payload_integrity::checked(
+                "devres_integrity_staged_state",
+                "crate",
+                &key,
+                row.try_get::<Json<Value>, _>("data")
+                    .map_err(|_| storage_error())?
+                    .0,
+                &row.try_get::<String, _>("data_integrity")
+                    .map_err(|_| storage_error())?,
+            )?;
+            let old = key
+                .strip_prefix("snapshot-prepared:")
+                .ok_or_else(storage_error)?;
+            if data["version"] != 1
+                || data["legacy_id"] != old
+                || data["source_integrity"]
+                    .as_str()
+                    .is_none_or(|seal| !valid_hash(seal) || !seal.starts_with("blake3:"))
+            {
+                return Err(Error::integrity(
+                    "Invalid prepared crate snapshot ownership receipt.",
+                ));
+            }
+            let snapshot: Snapshot =
+                serde_json::from_value(data["snapshot"].clone()).map_err(|_| storage_error())?;
+            adoption.claim(old, &snapshot_identity(&snapshot)?)?;
+            after = key;
+        }
+        adoption.owners.ensure_healthy()?;
+        Ok(adoption)
+    }
+
+    async fn validate_prepared_crate_snapshot(
+        &self,
+        expected: &Snapshot,
+        prepared: &Snapshot,
+        original_index: &Value,
+        maps: &crate::MigrationMap,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<bool> {
+        if snapshot_base(expected)? != snapshot_base(prepared)? {
+            return Err(Error::integrity(
+                "Prepared crate snapshot metadata changed.",
+            ));
+        }
+        if original_index.is_null() {
+            if !prepared.index_manifest.is_null() {
+                return Err(Error::integrity("Prepared crate snapshot added an index."));
+            }
+        } else {
+            if prepared.index_manifest.is_null() {
+                return Err(Error::integrity("Prepared crate snapshot lost its index."));
+            }
+            return crate::crates_io::index::verify_frozen_replay_with_execution(
+                self.root.clone(),
+                original_index.clone(),
+                prepared.index_manifest.clone(),
+                prepared.clone(),
+                snapshot_rewrite(maps),
+                cancel.child_token(),
+                execution,
+            )
+            .await;
+        }
+        Ok(true)
+    }
+
+    async fn prepare_crate_snapshot(
+        self: &Arc<Self>,
+        source: SnapshotSource<'_>,
+        mut snapshot: Snapshot,
+        original_index: Value,
+        maps: &crate::MigrationMap,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<Snapshot> {
+        let SnapshotSource {
+            legacy: old,
+            integrity: source_integrity,
+            adoption,
+        } = source;
+        let checkpoint = format!("snapshot-prepared:{old}");
+        let receipt = sqlx::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1")
+            .bind(&checkpoint).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+        if let Some(receipt) = receipt {
+            let data = payload_integrity::checked(
+                "devres_integrity_staged_state",
+                "crate",
+                &checkpoint,
+                receipt
+                    .try_get::<Json<Value>, _>("data")
+                    .map_err(|_| storage_error())?
+                    .0,
+                &receipt
+                    .try_get::<String, _>("data_integrity")
+                    .map_err(|_| storage_error())?,
+            )?;
+            if data["version"] != 1
+                || data["legacy_id"] != old
+                || data["source_integrity"] != source_integrity
+            {
+                return Err(Error::integrity("Prepared crate snapshot source changed."));
+            }
+            let prepared: Snapshot =
+                serde_json::from_value(data["snapshot"].clone()).map_err(|_| storage_error())?;
+            if !adoption.permits(old, &snapshot_identity(&prepared)?) {
+                return Err(Error::integrity(
+                    "Prepared crate snapshot is claimed by another occurrence.",
+                ));
+            }
+            if !self
+                .validate_prepared_crate_snapshot(
+                    &snapshot,
+                    &prepared,
+                    &original_index,
+                    maps,
+                    cancel,
+                    execution,
+                )
+                .await?
+            {
+                return Err(Error::integrity(
+                    "Prepared crate snapshot postings changed.",
+                ));
+            }
+            return Ok(prepared);
+        }
+
+        // Older schema-ten binaries could commit a canonical snapshot before
+        // sealing its aliases. Adopt only a fully verified matching occurrence.
+        let expected_base = snapshot_base(&snapshot)?;
+        let mut after = 0_i64;
+        let mut adopted = None;
+        loop {
+            stop(cancel)?;
+            let candidate:Option<(i64,String)> = sqlx::query_as("SELECT sequence,id FROM devres_crate_snapshots WHERE id LIKE 'blake3:%' AND sequence>$1 AND data-'id'-'index_manifest'=$2::jsonb AND (data->'index_manifest'<>'null'::jsonb)=$3 AND sequence<=$4 ORDER BY sequence LIMIT 1")
+                .bind(after).bind(Json(&expected_base)).bind(!original_index.is_null()).bind(adoption.cutoff).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some((sequence, id)) = candidate else {
+                break;
+            };
+            after = sequence;
+            if !adoption.permits(old, &id) {
+                continue;
+            }
+            let prepared = <Self as CrateCorpusStore>::snapshot(self, Some(&id))
+                .await?
+                .ok_or_else(|| Error::integrity("Retained crate snapshot disappeared."))?;
+            if snapshot_identity(&prepared)? != prepared.id {
+                return Err(Error::integrity(
+                    "Retained crate snapshot identity changed.",
+                ));
+            }
+            if self
+                .validate_prepared_crate_snapshot(
+                    &snapshot,
+                    &prepared,
+                    &original_index,
+                    maps,
+                    cancel,
+                    execution,
+                )
+                .await?
+            {
+                adopted = Some(prepared);
+                break;
+            }
+        }
+        if let Some(prepared) = adopted {
+            snapshot = prepared;
+        } else if !original_index.is_null() {
+            snapshot.index_manifest = crate::crates_io::index::rebuild_frozen_with_execution(
+                self.clone(),
+                self.root.clone(),
+                original_index,
+                snapshot.clone(),
+                snapshot_rewrite(maps),
+                cancel.child_token(),
+                execution,
+            )
+            .await?;
+        }
+        stop(cancel)?;
+        // Persist the immutable prepared result before allocating the public
+        // snapshot occurrence. A crash after either commit reuses this result.
+        payload_integrity::stage(self,"crate",&checkpoint,&json!({"version":1,"legacy_id":old,"source_integrity":source_integrity,"snapshot":snapshot})).await?;
+        Ok(snapshot)
+    }
+
+    async fn commit_prepared_crate_snapshot(&self, mut snapshot: Snapshot) -> Result<Snapshot> {
+        snapshot.id = snapshot_identity(&snapshot)?;
+        if let Some(retained) =
+            <Self as CrateCorpusStore>::snapshot(self, Some(&snapshot.id)).await?
+        {
+            if serde_json::to_value(&retained).map_err(|_| storage_error())?
+                != serde_json::to_value(&snapshot).map_err(|_| storage_error())?
+            {
+                return Err(Error::integrity(
+                    "Prepared crate snapshot publication changed.",
+                ));
+            }
+            return Ok(retained);
+        }
+        self.commit_snapshot(snapshot).await
+    }
+
     pub async fn migrate_crate_graph(
         self: &Arc<Self>,
         maps: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.migrate_crate_graph_with_execution(maps, cancel, &crate::MigrationExecution::default())
+            .await
+    }
+
+    pub async fn migrate_crate_graph_with_execution(
+        self: &Arc<Self>,
+        maps: &mut crate::MigrationMap,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<crate::migration_map::MigrationAliases> {
         self.fence().await?;
         let mut aliases = crate::migration_map::MigrationAliases::new(maps)?;
-        self.migrate_crate_artifacts(maps, &cancel).await?;
-        self.migrate_crate_inventories(maps, &mut aliases, &cancel)
+        let mut adoption = self
+            .crate_snapshot_adoption(maps, &cancel, execution)
+            .await?;
+        self.migrate_crate_artifacts(maps, &cancel, execution)
+            .await?;
+        self.migrate_crate_inventories(maps, &mut aliases, &cancel, execution)
             .await?;
         let generations = self
-            .migrate_crate_generations(maps, &mut aliases, &cancel)
+            .migrate_crate_generations(maps, &mut aliases, &cancel, execution)
             .await?;
-        self.migrate_crate_enrichment(maps, &cancel).await?;
+        self.migrate_crate_enrichment(maps, &cancel, execution)
+            .await?;
+        const JOB_BYTES: usize = 256 * 1024 * 1024;
         let mut after = 0_i64;
+        let mut admitted = 0_u64;
+        let mut committed = 0_u64;
         loop {
             stop(&cancel)?;
-            let row=sqlx::query("SELECT sequence,inventory,content_sequence,''::text AS kind,id AS key,data,data_integrity FROM devres_crate_snapshots WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(row) = row else {
+            let positions: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+                "SELECT sequence,id,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_crate_snapshots WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT $2"
+            ).bind(after).bind(if adoption.cutoff > 0 { 1_i64 } else { execution.options().workers as i64 })
+                .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            if positions.is_empty() {
                 break;
-            };
-            after = row.try_get("sequence").map_err(|_| storage_error())?;
-            let old: String = row.try_get("key").map_err(|_| storage_error())?;
+            }
+            let positions = execution.graph_input_window(
+                positions
+                    .into_iter()
+                    .map(|(seq, id, bytes, nodes)| {
+                        let charge = crate::MigrationExecution::graph_input_charge(
+                            usize::try_from(bytes).map_err(|_| storage_error())?,
+                            usize::try_from(nodes).map_err(|_| storage_error())?,
+                        )?
+                        .checked_add(JOB_BYTES)
+                        .ok_or_else(|| Error::capacity("Crate graph input charge overflow."))?;
+                        Ok(((seq, id), charge))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            after = positions.last().map_or(after, |((seq, _), _)| *seq);
+            admitted += positions.len() as u64;
+            let window_bytes = positions.iter().map(|(_, bytes)| *bytes).sum();
+            execution.report(
+                "graph_crate_snapshots",
+                admitted,
+                committed,
+                committed,
+                window_bytes,
+            );
+            let read_maps = &*maps;
+            let generations = &generations;
+            let read_adoption = &adoption;
+            let prepared = execution.graph_map_ordered(
+                positions, &cancel,
+                |(sequence, old), token| async move {
+                    let row=sqlx::query("SELECT sequence,inventory,content_sequence,''::text AS kind,id AS key,data,data_integrity FROM devres_crate_snapshots WHERE id=$1 AND sequence=$2")
+                        .bind(&old).bind(sequence).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+            let source_integrity: String = row.try_get("data_integrity").map_err(|_|storage_error())?;
             let mut snapshot: Snapshot =
                 serde_json::from_value(payload_integrity::row("devres_crate_snapshots", &row)?)
                     .map_err(|_| storage_error())?;
             let old_index = snapshot.index_manifest.take();
-            let inventory_id = mapped(maps, "crate:inventories", &snapshot.inventory.id)?;
+            let inventory_id = mapped(read_maps, "crate:inventories", &snapshot.inventory.id)?;
             snapshot.inventory = inventory(
                 sqlx::query("SELECT * FROM devres_crate_inventories WHERE id=$1")
                     .bind(&inventory_id)
@@ -99,40 +491,40 @@ impl PgBlobStore {
                 .map(|(_, value)| value)
                 .unwrap_or(&0);
             if let Some(id) = &snapshot.enrichment {
-                snapshot.enrichment = Some(mapped(maps, "capture", id)?);
+                snapshot.enrichment = Some(mapped(read_maps, "capture", id)?);
             }
-            remap_fields(&mut snapshot.coverage, maps)?;
+            remap_fields(&mut snapshot.coverage, read_maps)?;
             snapshot.coverage["content_sequence"] = json!(snapshot.content_sequence);
-            if !old_index.is_null() {
-                let maps = Arc::new(maps.clone());
-                let rewrite = Arc::new(move |value: &mut Value| -> Result<()> {
-                    let is_content = value["class"] == "content";
-                    if let Some(record) = value.get_mut("record") {
-                        remap_fields(record, &maps)?;
-                        if is_content {
-                            let id = record["id"].as_str().ok_or_else(storage_error)?.to_owned();
-                            record["id"] = json!(mapped(&maps, "crate:content", &id)?);
-                        }
-                    } else {
-                        remap_fields(value, &maps)?;
-                    }
-                    if let Some(enrichment) = value.get_mut("enrichment") {
-                        remap_fields(enrichment, &maps)?;
-                    }
-                    Ok(())
-                });
-                snapshot.index_manifest = crate::crates_io::index::rebuild_frozen(
-                    self.clone(),
-                    self.root.clone(),
-                    old_index,
-                    snapshot.clone(),
-                    rewrite,
-                    cancel.child_token(),
-                )
-                .await?;
+            snapshot = self.prepare_crate_snapshot(
+                SnapshotSource { legacy: &old, integrity: &source_integrity, adoption: read_adoption },snapshot,old_index,read_maps,&token,execution,
+            ).await?;
+                    Ok((old, snapshot))
+                },
+            ).await?;
+            execution.report(
+                "graph_crate_snapshots",
+                admitted,
+                admitted,
+                committed,
+                window_bytes,
+            );
+            for prepared in prepared {
+                stop(&cancel)?;
+                let (old, snapshot) = prepared.value();
+                adoption.claim(old, &snapshot_identity(snapshot)?)?;
+                let snapshot = self
+                    .commit_prepared_crate_snapshot(snapshot.clone())
+                    .await?;
+                id_alias(maps, &mut aliases, "snapshots", old, &snapshot.id)?;
+                committed += 1;
+                execution.report(
+                    "graph_crate_snapshots",
+                    admitted,
+                    admitted,
+                    committed,
+                    window_bytes,
+                );
             }
-            let snapshot = self.commit_snapshot(snapshot).await?;
-            id_alias(maps, &mut aliases, "snapshots", &old, &snapshot.id)?;
         }
         let mut after = String::new();
         loop {
@@ -158,10 +550,18 @@ impl PgBlobStore {
         &self,
         maps: &crate::migration_map::MigrationMap,
         cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<()> {
+        let mut committed = 0_u64;
         let mut after = String::new();
         loop {
             stop(cancel)?;
+            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT capture_id,bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' AND capture_id>$1 ORDER BY capture_id LIMIT 1) source").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some((source_bytes, source_nodes)) = source_size else {
+                break;
+            };
+            let _source_reservation =
+                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
             let row=sqlx::query("SELECT capture_id,bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' AND capture_id>$1 ORDER BY capture_id LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
@@ -189,10 +589,24 @@ impl PgBlobStore {
             remap_fields(&mut data, maps)?;
             sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING").bind(&new).bind(row.try_get::<i64,_>("bytes").map_err(|_|storage_error())?).bind(Json(&data)).bind(payload_integrity::digest("devres_crate_artifacts","",&new,&payload_integrity::crate_artifact_payload(u64::try_from(row.try_get::<i64,_>("bytes").map_err(|_|storage_error())?).map_err(|_|Error::integrity("Invalid artifact length."))?,&data))?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             after = old;
+            committed += 1;
+            execution.report(
+                "graph_crate_artifacts",
+                committed,
+                committed,
+                committed,
+                _source_reservation.accounted_bytes(),
+            );
         }
         let mut after = 0_i64;
         loop {
             stop(cancel)?;
+            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE capture_id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1) source").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some((source_bytes, source_nodes)) = source_size else {
+                break;
+            };
+            let _source_reservation =
+                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
             let row=sqlx::query("SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE capture_id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
@@ -299,6 +713,7 @@ impl PgBlobStore {
         maps: &mut crate::migration_map::MigrationMap,
         aliases: &mut crate::migration_map::MigrationAliases,
         cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<BTreeMap<i64, i64>> {
         let orphaned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_versions v LEFT JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id IS NULL)").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if orphaned {
@@ -310,6 +725,12 @@ impl PgBlobStore {
         let mut after = 0_i64;
         loop {
             stop(cancel)?;
+            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_inventories WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1) source").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some((source_bytes, source_nodes)) = source_size else {
+                break;
+            };
+            let _source_reservation =
+                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
             let row=sqlx::query("SELECT * FROM devres_crate_inventories WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
@@ -325,8 +746,16 @@ impl PgBlobStore {
             id_alias(maps, aliases, "inventories", &old, &new)?;
             sqlx::query("INSERT INTO devres_crate_inventory_gaps(inventory,name,error) SELECT $2,name,error FROM devres_crate_inventory_gaps WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             sqlx::query("INSERT INTO devres_crate_changes(inventory,name) SELECT $2,name FROM devres_crate_changes WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+            drop(row);
+            drop(_source_reservation);
             let mut cursor = String::new();
             loop {
+                let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>$2 ORDER BY name||'@'||version LIMIT 1) source").bind(&old).bind(&cursor).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+                let Some((source_bytes, source_nodes)) = source_size else {
+                    break;
+                };
+                let _source_reservation =
+                    reserve_source(execution, cancel, source_bytes, source_nodes).await?;
                 let row=sqlx::query("SELECT * FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>$2 ORDER BY name||'@'||version LIMIT 1").bind(&old).bind(&cursor).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
                 let Some(row) = row else {
                     break;
@@ -361,6 +790,12 @@ impl PgBlobStore {
         let mut after = (String::new(), String::new(), 0_i64);
         loop {
             stop(cancel)?;
+            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT v.* FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id NOT LIKE 'blake3:%' AND (v.name,v.version,v.valid_from)>($1,$2,$3) ORDER BY v.name,v.version,v.valid_from LIMIT 1) source").bind(&after.0).bind(&after.1).bind(after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some((source_bytes, source_nodes)) = source_size else {
+                break;
+            };
+            let _source_reservation =
+                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
             let row=sqlx::query("SELECT v.* FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id NOT LIKE 'blake3:%' AND (v.name,v.version,v.valid_from)>($1,$2,$3) ORDER BY v.name,v.version,v.valid_from LIMIT 1").bind(&after.0).bind(&after.1).bind(after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
@@ -391,6 +826,7 @@ impl PgBlobStore {
         maps: &mut crate::migration_map::MigrationMap,
         aliases: &mut crate::migration_map::MigrationAliases,
         cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<BTreeMap<i64, i64>> {
         let mut sequences = BTreeMap::new();
         let mut after = String::new();
@@ -401,6 +837,10 @@ impl PgBlobStore {
                 break;
             };
             stop(cancel)?;
+            let (source_bytes,source_nodes):(i64,i64) = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM devres_crate_generations source WHERE id=$1")
+                .bind(&old).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+            let _source_reservation =
+                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
             let row = sqlx::query("SELECT * FROM devres_crate_generations WHERE id=$1")
                 .bind(&old)
                 .fetch_one(&self.pool)
@@ -476,8 +916,17 @@ impl PgBlobStore {
                 sequences.insert(old_seq, new_seq);
             }
             id_alias(maps, aliases, "generations", &old, &new)?;
+            drop(summary);
+            drop(row);
+            drop(_source_reservation);
             after.clear();
             loop {
+                let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_content WHERE generation=$1 AND id>$2 ORDER BY id LIMIT 1) source").bind(&old).bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+                let Some((source_bytes, source_nodes)) = source_size else {
+                    break;
+                };
+                let _source_reservation =
+                    reserve_source(execution, cancel, source_bytes, source_nodes).await?;
                 let row=sqlx::query("SELECT * FROM devres_crate_content WHERE generation=$1 AND id>$2 ORDER BY id LIMIT 1").bind(&old).bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
                 let Some(row) = row else {
                     break;
@@ -508,10 +957,18 @@ impl PgBlobStore {
         &self,
         maps: &crate::migration_map::MigrationMap,
         cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<()> {
+        let mut committed = 0_u64;
         let mut after = (String::new(), String::new(), String::new());
         loop {
             stop(cancel)?;
+            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_enrichment WHERE artifact NOT LIKE 'blake3:%' AND (artifact,kind,external_id)>($1,$2,$3) ORDER BY artifact,kind,external_id LIMIT 1) source").bind(&after.0).bind(&after.1).bind(&after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some((source_bytes, source_nodes)) = source_size else {
+                break;
+            };
+            let _source_reservation =
+                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
             let row=sqlx::query("SELECT * FROM devres_crate_enrichment WHERE artifact NOT LIKE 'blake3:%' AND (artifact,kind,external_id)>($1,$2,$3) ORDER BY artifact,kind,external_id LIMIT 1").bind(&after.0).bind(&after.1).bind(&after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
@@ -523,6 +980,14 @@ impl PgBlobStore {
             let new = mapped(maps, "capture", &old)?;
             sqlx::query("INSERT INTO devres_crate_enrichment(artifact,kind,external_id,data,data_integrity) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(&new).bind(&kind).bind(&key).bind(Json(&data)).bind(payload_integrity::digest("devres_crate_enrichment",&format!("{new}:{kind}"),&key,&data)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             after = (old, kind, key);
+            committed += 1;
+            execution.report(
+                "graph_crate_enrichment",
+                committed,
+                committed,
+                committed,
+                _source_reservation.accounted_bytes(),
+            );
         }
         let heads:Vec<String>=sqlx::query_scalar("SELECT artifact FROM devres_crate_enrichment_heads WHERE artifact NOT LIKE 'blake3:%' ORDER BY sequence").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         for old in heads {
@@ -531,3 +996,7 @@ impl PgBlobStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "storage_migration_tests.rs"]
+mod tests;

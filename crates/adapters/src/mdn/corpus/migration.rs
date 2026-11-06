@@ -137,7 +137,157 @@ fn member(mut member: Member, mappings: &crate::migration_map::MigrationMap) -> 
     Ok(member)
 }
 
+// Includes a 64 MiB Tantivy writer, bounded frozen pages and decoded input/output.
+// This is an admission charge, not a process RSS measurement.
+pub(crate) const INDEX_REPLAY_BYTES: usize = 320 * 1024 * 1024;
+
+/// Structural metadata is computed before materializing PostgreSQL JSON values.
+/// The charge covers decoded containers, cloned payload/envelope and preparation.
+pub(crate) fn source_charge(bytes: usize, nodes: usize, extra: usize) -> Result<usize> {
+    crate::MigrationExecution::graph_input_charge(bytes, nodes)?
+        .checked_add(extra)
+        .ok_or_else(|| Error::capacity("Provider source graph accounting overflow."))
+}
+
+pub(crate) fn source_window(
+    positions: &[(i64, String, usize, usize)],
+    extra: usize,
+    execution: &crate::MigrationExecution,
+) -> Result<(usize, usize)> {
+    let mut count = 0usize;
+    let mut charge = 0usize;
+    let mut encoded = 0usize;
+    let budget = execution.graph_options().memory_budget_bytes;
+    let target = budget.saturating_sub(budget / 4).max(1);
+    for (_, _, bytes, nodes) in positions.iter().take(execution.graph_window_limit(1)) {
+        let item = source_charge(*bytes, *nodes, extra)?;
+        let next = charge
+            .checked_add(item)
+            .ok_or_else(|| Error::capacity("Provider graph window accounting overflow."))?;
+        let next_encoded = encoded
+            .checked_add(*bytes)
+            .ok_or_else(|| Error::capacity("Provider graph source length overflow."))?;
+        if count != 0 && (next > target || next_encoded > 64 * 1024 * 1024) {
+            break;
+        }
+        count += 1;
+        charge = next;
+        encoded = next_encoded;
+        // A valid individual row may exceed aggregate admission; it runs alone.
+        if charge > target {
+            break;
+        }
+    }
+    Ok((count, charge.max(1)))
+}
+
+/// Split before submission so completed results retain one bounded graph reservation.
+pub(crate) fn graph_window<T>(
+    pending: &mut std::collections::VecDeque<(T, usize)>,
+    execution: &crate::MigrationExecution,
+) -> Vec<(T, usize)> {
+    let mut window = Vec::new();
+    let mut bytes = 0usize;
+    while window.len() < execution.graph_window_limit(1) {
+        let Some((_, charge)) = pending.front() else {
+            break;
+        };
+        if !window.is_empty()
+            && bytes.saturating_add(*charge) > execution.graph_options().memory_budget_bytes
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(*charge);
+        if let Some(item) = pending.pop_front() {
+            window.push(item);
+        }
+    }
+    window
+}
+
 impl MdnCorpus {
+    async fn migration_page(
+        &self,
+        kind: &str,
+        after: i64,
+        cutoff: i64,
+        extra: usize,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<(
+        Vec<devres_application::mdn::MdnRow>,
+        crate::GraphReservation,
+    )> {
+        let positions = self
+            .store
+            .mdn_migration_positions(kind, after, execution.options().workers, cutoff)
+            .await?;
+        let (count, charge) =
+            crate::mdn::corpus::migration::source_window(&positions, extra, execution)?;
+        let reservation = execution.graph_reserve(charge, cancel).await?;
+        if count == 0 {
+            return Ok((Vec::new(), reservation));
+        }
+        let rows = self
+            .store
+            .mdn_rows(kind, after, count, Some(cutoff))
+            .await?;
+        if rows.len() != count
+            || rows
+                .iter()
+                .zip(&positions)
+                .any(|(row, position)| row.sequence != position.0 || row.key != position.1)
+        {
+            return Err(Error::integrity("Frozen provider source page changed."));
+        }
+        Ok((rows, reservation))
+    }
+
+    async fn migration_state(
+        &self,
+        key: &str,
+        extra: usize,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<(Option<Value>, crate::GraphReservation)> {
+        let size = self.store.mdn_migration_state_bytes(key).await?;
+        let charge = size.map_or(Ok(1), |(bytes, nodes)| {
+            crate::mdn::corpus::migration::source_charge(bytes, nodes, extra)
+        })?;
+        let reservation = execution.graph_reserve(charge, cancel).await?;
+        Ok((self.store.mdn_state(key).await?, reservation))
+    }
+
+    async fn migration_operational_state(
+        &self,
+        key: &str,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<Option<(Value, crate::GraphReservation)>> {
+        let staged_key = format!("storage-migration:{key}");
+        let mut charge = crate::mdn::corpus::migration::INDEX_REPLAY_BYTES;
+        for candidate in [&staged_key, key] {
+            if let Some((bytes, nodes)) = self.store.mdn_migration_state_bytes(candidate).await? {
+                charge = charge
+                    .checked_add(crate::mdn::corpus::migration::source_charge(
+                        bytes, nodes, 0,
+                    )?)
+                    .ok_or_else(|| Error::capacity("Operational state accounting overflow."))?;
+            }
+        }
+        let reservation = execution.graph_reserve(charge, cancel).await?;
+        // The retained checkpoint is still integrity-verified before skipping it.
+        if self.store.mdn_state(&staged_key).await?.is_some() {
+            return Ok(None);
+        }
+        let value = self
+            .store
+            .mdn_state(key)
+            .await?
+            .ok_or_else(|| Error::integrity("Provider migration state vanished."))?;
+        Ok(Some((value, reservation)))
+    }
+
     /// Retain every old generation and stage canonical heads for final activation.
     /// The versioned migration preimage includes the original ID to preserve
     /// distinct historical rebuild occurrences with otherwise identical content.
@@ -146,17 +296,93 @@ impl MdnCorpus {
         mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<Aliases> {
+        self.migrate_blake3_graph_with_execution(
+            mappings,
+            cancel,
+            &crate::MigrationExecution::default(),
+        )
+        .await
+    }
+
+    pub async fn migrate_blake3_graph_with_execution(
+        &self,
+        mappings: &mut crate::migration_map::MigrationMap,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<Aliases> {
         let _guard = self.processing.lock().await;
         let cutoff = self.store.mdn_cutoff().await?;
         let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
-        let mut inventory_memo = inventory::MigrationInventory::new();
+        let mut inventory_memo = inventory::MigrationInventory::new_shared(mappings)?;
         for kind in ["projections", "projection-headers", "index-documents"] {
             let mut after = 0;
             loop {
                 check(&cancel)?;
-                let rows = self.store.mdn_rows(kind, after, 100, Some(cutoff)).await?;
+                let (rows, page_reservation) = self
+                    .migration_page(kind, after, cutoff, 0, &cancel, execution)
+                    .await?;
                 if rows.is_empty() {
                     break;
+                }
+                if kind != "projections" {
+                    after = rows.last().map_or(after, |row| row.sequence);
+                    let mut pending = std::collections::VecDeque::new();
+                    for row in rows {
+                        if !row.key.starts_with("blake3:") {
+                            let charge = crate::MigrationExecution::graph_value_charge(&row.data)?
+                                .saturating_mul(3)
+                                .saturating_add(4096);
+                            pending.push_back((row, charge));
+                        }
+                    }
+                    while !pending.is_empty() {
+                        let references = mappings.clone();
+                        let prepared = execution
+                            .graph_map_ordered_reserved(
+                                graph_window(&mut pending, execution)
+                                    .into_iter()
+                                    .map(|(row, _)| row)
+                                    .collect(),
+                                page_reservation.clone(),
+                                &cancel,
+                                |row, token| {
+                                    let references = references.clone();
+                                    async move {
+                                        execution
+                                            .run(&token, move |token| {
+                                                check(&token)?;
+                                                let canonical = mapped_role(
+                                                    &references,
+                                                    "projections",
+                                                    &row.key,
+                                                )?;
+                                                let mut data = row.data;
+                                                if kind == "index-documents" {
+                                                    let mut document: IndexDocument =
+                                                        decoded(data)?;
+                                                    if document.id != row.key {
+                                                        return Err(Error::integrity(
+                                                            "MDN index document identity mismatch.",
+                                                        ));
+                                                    }
+                                                    document.id = canonical.clone();
+                                                    data = encoded(&document)?;
+                                                }
+                                                Ok((row.key, canonical, data))
+                                            })
+                                            .await
+                                    }
+                                },
+                            )
+                            .await?;
+                        drop(references);
+                        for prepared in prepared {
+                            let (old, canonical, data) = prepared.value();
+                            self.store.mdn_put(kind, canonical, data).await?;
+                            record(mappings, &mut aliases, kind, old, canonical)?;
+                        }
+                    }
+                    continue;
                 }
                 for row in rows {
                     after = row.sequence;
@@ -215,9 +441,15 @@ impl MdnCorpus {
         let mut after = 0;
         loop {
             check(&cancel)?;
-            let rows = self
-                .store
-                .mdn_rows("observations", after, 100, Some(cutoff))
+            let (rows, _page_reservation) = self
+                .migration_page(
+                    "observations",
+                    after,
+                    cutoff,
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
@@ -266,9 +498,15 @@ impl MdnCorpus {
         let mut after = 0;
         loop {
             check(&cancel)?;
-            let rows = self
-                .store
-                .mdn_rows("changes", after, 100, Some(cutoff))
+            let (rows, _page_reservation) = self
+                .migration_page(
+                    "changes",
+                    after,
+                    cutoff,
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
@@ -296,17 +534,52 @@ impl MdnCorpus {
                 record(mappings, &mut aliases, "changes", &row.key, &id)?;
             }
         }
-        let mut indexes = BTreeMap::<String, Value>::new();
         let mut after = 0;
         loop {
             check(&cancel)?;
-            let rows = self
-                .store
-                .mdn_rows("snapshots", after, 50, Some(cutoff))
+            let (rows, reservation) = self
+                .migration_page(
+                    "snapshots",
+                    after,
+                    cutoff,
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
             }
+            // Prepare file-only frozen replays concurrently; SQL inventories and
+            // snapshot sequences are still published in their original source order.
+            let mut references = BTreeMap::new();
+            for row in &rows {
+                let reference = &row.data["index"];
+                if !row.key.starts_with("blake3:") && !reference.is_null() {
+                    let key = serde_json::to_string(reference)
+                        .map_err(|_| Error::integrity("Invalid frozen index reference."))?;
+                    if mappings
+                        .get(&format!("mdn:index-reference:{key}"))
+                        .is_none()
+                    {
+                        references.entry(key).or_insert_with(|| reference.clone());
+                    }
+                }
+            }
+            let frozen_mappings = &*mappings;
+            let prepared_indexes = execution
+                .graph_map_ordered_reserved(
+                    references.into_iter().collect(),
+                    reservation.clone(),
+                    &cancel,
+                    |(key, reference), token| async move {
+                        let canonical = self
+                            .replay_frozen_index(&reference, frozen_mappings, token, execution)
+                            .await?;
+                        Ok((key, canonical))
+                    },
+                )
+                .await?;
             for row in rows {
                 after = row.sequence;
                 if row.key.starts_with("blake3:") {
@@ -337,17 +610,39 @@ impl MdnCorpus {
                 if !snapshot.index.is_null() {
                     let cache_key = serde_json::to_string(&snapshot.index)
                         .map_err(|_| Error::integrity("Invalid MDN frozen index."))?;
-                    snapshot.index = if let Some(reference) = indexes.get(&cache_key) {
-                        reference.clone()
+                    snapshot.index = if let Some(reference) =
+                        mappings.get(&format!("mdn:index-reference:{cache_key}"))
+                    {
+                        serde_json::from_str(&reference)
+                            .map_err(|_| Error::integrity("Invalid canonical index reference."))?
                     } else {
-                        let reference = self
-                            .migrate_frozen_index(&snapshot.index, mappings, cancel.clone())
-                            .await?;
-                        if indexes.len() < 4096 {
-                            indexes.insert(cache_key.clone(), reference.clone());
-                        }
-                        reference
+                        prepared_indexes
+                            .iter()
+                            .find(|prepared| prepared.value().0 == cache_key)
+                            .map(|prepared| prepared.value().1.clone())
+                            .ok_or_else(|| Error::integrity("Frozen index preparation missing."))?
                     };
+                    // Every use re-verifies both retained and canonical evidence.
+                    drop(
+                        self.index
+                            .frozen_documents_with_execution(
+                                &serde_json::from_str(&cache_key).map_err(|_| {
+                                    Error::integrity("Invalid frozen index reference.")
+                                })?,
+                                cancel.clone(),
+                                execution,
+                            )
+                            .await?,
+                    );
+                    drop(
+                        self.index
+                            .frozen_documents_with_execution(
+                                &snapshot.index,
+                                cancel.clone(),
+                                execution,
+                            )
+                            .await?,
+                    );
                     crate::migration_map::insert(
                         mappings,
                         format!("mdn:index-reference:{cache_key}"),
@@ -393,17 +688,24 @@ impl MdnCorpus {
                 }
             }
         }
-        let selected = self
-            .store
-            .mdn_state("default-view")
-            .await?
-            .and_then(|v| v.as_str().map(str::to_owned));
+        let selected = {
+            let (selected, _reservation) = self
+                .migration_state("default-view", 0, &cancel, execution)
+                .await?;
+            selected.and_then(|v| v.as_str().map(str::to_owned))
+        };
         let mut after = 0;
         loop {
             check(&cancel)?;
-            let rows = self
-                .store
-                .mdn_rows("views", after, 100, Some(cutoff))
+            let (rows, _page_reservation) = self
+                .migration_page(
+                    "views",
+                    after,
+                    cutoff,
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
@@ -444,49 +746,61 @@ impl MdnCorpus {
                 }
             }
         }
-        if let Some(reference) = self.store.mdn_state("index").await?
-            && !reference.is_null()
         {
-            let canonical = self
-                .migrate_frozen_index(&reference, mappings, cancel.clone())
+            let (source_index, _index_reservation) = self
+                .migration_state(
+                    "index",
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
-            crate::migration_map::insert(
-                mappings,
-                format!(
-                    "mdn:index-reference:{}",
-                    serde_json::to_string(&reference)
-                        .map_err(|_| Error::integrity("Invalid old index reference."))?
-                ),
-                serde_json::to_string(&canonical)
-                    .map_err(|_| Error::integrity("Invalid new index reference."))?,
-            )?;
-            self.store
-                .mdn_set_state("storage-migration:index", &canonical)
-                .await?;
+            if let Some(reference) = source_index
+                && !reference.is_null()
+            {
+                let canonical = self
+                    .replay_frozen_index(&reference, mappings, cancel.clone(), execution)
+                    .await?;
+                crate::migration_map::insert(
+                    mappings,
+                    format!(
+                        "mdn:index-reference:{}",
+                        serde_json::to_string(&reference)
+                            .map_err(|_| Error::integrity("Invalid old index reference."))?
+                    ),
+                    serde_json::to_string(&canonical)
+                        .map_err(|_| Error::integrity("Invalid new index reference."))?,
+                )?;
+                self.store
+                    .mdn_set_state("storage-migration:index", &canonical)
+                    .await?;
+            }
         }
         drop(inventory_memo);
-        self.migrate_auxiliary_graph(mappings, &mut aliases, cutoff, &cancel)
+        self.migrate_auxiliary_graph(mappings, &mut aliases, cutoff, &cancel, execution)
             .await?;
         mappings.ensure_healthy()?;
         aliases.ensure_healthy()?;
         Ok(aliases)
     }
 
-    async fn migrate_frozen_index(
+    async fn replay_frozen_index(
         &self,
         reference: &Value,
         mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<Value> {
         let mut reader = self
             .index
-            .frozen_documents(reference, cancel.clone())
+            .frozen_documents_with_execution(reference, cancel.clone(), execution)
             .await?;
         let mut canonical = None;
         loop {
             check(&cancel)?;
             let (ids, has_more) = reader.next_page(100).await?;
             let mut documents = Vec::new();
+            let mut text_bytes = 0_usize;
             for id in ids {
                 let canonical_id = mapped_role(mappings, "index-documents", &id)?;
                 let row = self
@@ -494,11 +808,26 @@ impl MdnCorpus {
                     .mdn_get("index-documents", &canonical_id)
                     .await?
                     .ok_or_else(|| Error::integrity("MDN frozen posting payload missing."))?;
-                documents.push(decoded(row.data)?);
+                let document: crate::mdn::index::IndexDocument = decoded(row.data)?;
+                crate::mdn::index::MdnIndex::validate_document_bounds(&document)?;
+                // Preserve the original 100-ID publication groups and the index
+                // engine's existing 64MiB text admission, before retaining more rows.
+                text_bytes = text_bytes
+                    .checked_add(document.text.len())
+                    .ok_or_else(|| Error::capacity("Frozen index replay text size overflow."))?;
+                if text_bytes > 64 * 1024 * 1024 {
+                    return Err(Error::capacity("Frozen index replay text budget exceeded."));
+                }
+                documents.push(document);
             }
             canonical = Some(
                 self.index
-                    .publish(canonical.as_ref(), documents, cancel.clone())
+                    .publish_with_execution(
+                        canonical.as_ref(),
+                        documents,
+                        cancel.clone(),
+                        execution,
+                    )
                     .await?,
             );
             if !has_more {
@@ -516,8 +845,9 @@ impl MdnCorpus {
         aliases: &mut Aliases,
         cutoff: i64,
         cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<()> {
-        let mut inventory_memo = inventory::MigrationInventory::new();
+        let mut inventory_memo = inventory::MigrationInventory::new_shared(mappings)?;
         let kinds = self.store.mdn_migration_kinds().await?;
         const CORE: &[&str] = &[
             "projections",
@@ -542,7 +872,16 @@ impl MdnCorpus {
                 let mut after = 0;
                 loop {
                     check(cancel)?;
-                    let rows = self.store.mdn_rows(kind, after, 100, Some(cutoff)).await?;
+                    let (rows, _page_reservation) = self
+                        .migration_page(
+                            kind,
+                            after,
+                            cutoff,
+                            crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                            cancel,
+                            execution,
+                        )
+                        .await?;
                     if rows.is_empty() {
                         break;
                     }
@@ -588,7 +927,12 @@ impl MdnCorpus {
                             .is_none()
                             {
                                 let canonical = self
-                                    .migrate_frozen_index(&reference, mappings, cancel.clone())
+                                    .replay_frozen_index(
+                                        &reference,
+                                        mappings,
+                                        cancel.clone(),
+                                        execution,
+                                    )
                                     .await?;
                                 crate::migration_map::insert(
                                     mappings,
@@ -689,18 +1033,11 @@ impl MdnCorpus {
                 if key.starts_with("storage-migration:") {
                     continue;
                 }
-                // Dedicated core phases stage selected heads; do not replace them
-                // with a generic copy of the legacy generation.
-                if self
-                    .store
-                    .mdn_state(&format!("storage-migration:{key}"))
+                let Some((mut data, _state_reservation)) = self
+                    .migration_operational_state(&key, cancel, execution)
                     .await?
-                    .is_some()
-                {
+                else {
                     continue;
-                }
-                let Some(mut data) = self.store.mdn_state(&key).await? else {
-                    return Err(Error::integrity("mdn migration state vanished."));
                 };
                 let mut references = Vec::new();
                 crate::mdn::corpus::migration::collect_index_references(&data, 0, &mut references)?;
@@ -711,7 +1048,7 @@ impl MdnCorpus {
                         .is_none()
                     {
                         let canonical = self
-                            .migrate_frozen_index(&reference, mappings, cancel.clone())
+                            .replay_frozen_index(&reference, mappings, cancel.clone(), execution)
                             .await?;
                         crate::migration_map::insert(
                             mappings,
@@ -1337,5 +1674,65 @@ impl MdnCorpus {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod graph_admission_tests {
+    use super::*;
+
+    fn execution(budget: usize) -> crate::MigrationExecution {
+        crate::MigrationExecution::new_with_graph_options(
+            crate::MigrationExecutionOptions::new(8, 64 * 1024 * 1024).expect("workers"),
+            crate::MigrationGraphOptions::new(budget).expect("graph budget"),
+        )
+        .expect("execution")
+    }
+
+    #[test]
+    fn structural_source_window_preserves_large_rows_as_singletons() {
+        let execution = execution(32 * 1024 * 1024);
+        let text = json!({"text":"x".repeat(16 * 1024 * 1024)});
+        let wide = Value::Object(
+            (0..10_000)
+                .map(|n| (format!("k{n}"), Value::Null))
+                .collect(),
+        );
+        for value in [text, wide] {
+            let encoded = serde_json::to_vec(&value).expect("fixture bytes").len();
+            let nodes = if value.get("text").is_some() {
+                2
+            } else {
+                10_001
+            };
+            let charge = source_charge(encoded, nodes, 0).expect("source charge");
+            assert!(
+                charge
+                    >= crate::MigrationExecution::graph_value_charge(&value)
+                        .expect("decoded charge")
+                        * 3
+            );
+            let positions = vec![
+                (1, "first".into(), encoded, nodes),
+                (2, "second".into(), 10, 1),
+            ];
+            let (count, admitted) =
+                source_window(&positions, 0, &execution).expect("large valid row admitted");
+            assert_eq!(count, 1);
+            assert_eq!(admitted, charge);
+            assert!(admitted > execution.graph_options().memory_budget_bytes);
+        }
+    }
+
+    #[test]
+    fn default_graph_budget_admits_concurrent_index_preparation() {
+        let execution = execution(1024 * 1024 * 1024);
+        let positions: Vec<_> = (0..8)
+            .map(|n| (n, format!("snapshot-{n}"), 2048, 24))
+            .collect();
+        let (count, charge) =
+            source_window(&positions, INDEX_REPLAY_BYTES, &execution).expect("snapshot window");
+        assert_eq!(count, 2);
+        assert!(charge <= execution.graph_options().memory_budget_bytes);
     }
 }

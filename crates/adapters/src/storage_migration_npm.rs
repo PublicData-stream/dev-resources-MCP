@@ -131,6 +131,20 @@ impl PgBlobStore {
         mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.migrate_npm_graph_with_execution(
+            mappings,
+            cancel,
+            &crate::MigrationExecution::default(),
+        )
+        .await
+    }
+
+    pub async fn migrate_npm_graph_with_execution(
+        self: &Arc<Self>,
+        mappings: &mut crate::MigrationMap,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<crate::migration_map::MigrationAliases> {
         let cutoff = self.npm_cutoff().await?;
         let kinds = self.npm_migration_kinds().await?;
         for kind in &kinds {
@@ -167,6 +181,20 @@ impl PgBlobStore {
                 if cancel.is_cancelled() {
                     return Err(Error::new("cancelled", "npm migration canceled."));
                 }
+                let shape: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_npm_evidence WHERE kind=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT 1")
+                    .bind(kind).bind(after).bind(cutoff).fetch_optional(&self.pool).await.map_err(|_|super::storage_error())?;
+                let Some((bytes, nodes)) = shape else {
+                    break;
+                };
+                let _input = execution
+                    .graph_reserve(
+                        crate::MigrationExecution::graph_input_charge(
+                            usize::try_from(bytes).map_err(|_| super::storage_error())?,
+                            usize::try_from(nodes).map_err(|_| super::storage_error())?,
+                        )?,
+                        &cancel,
+                    )
+                    .await?;
                 let rows = self.npm_rows(kind, after, 1, Some(cutoff), None).await?;
                 if rows.is_empty() {
                     break;
@@ -217,6 +245,9 @@ impl PgBlobStore {
                 if key.starts_with("storage-migration:") {
                     continue;
                 }
+                let _input = self
+                    .migration_state_reservation("npm", &key, 0, execution, &cancel)
+                    .await?;
                 if let Some(data) = self.npm_state(&key).await? {
                     for field in ["snapshot", "membership"] {
                         if let Some(group) = data.get(field).and_then(Value::as_str)
@@ -235,34 +266,101 @@ impl PgBlobStore {
         }
         let index = NpmIndex::new(&self.root)?;
         let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
+        // Source identifiers are small; decoded rows are loaded only after graph admission.
+        const JOB_BYTES: usize = 256 * 1024 * 1024;
+        let mut graph_admitted = 0_u64;
+        let mut graph_committed = 0_u64;
         for kind in &kinds {
-            let mut after = 0;
+            let mut after = 0_i64;
             loop {
                 if cancel.is_cancelled() {
                     return Err(Error::new("cancelled", "npm migration canceled."));
                 }
-                let rows = self.npm_rows(kind, after, 1, Some(cutoff), None).await?;
-                if rows.is_empty() {
+                let positions: Vec<(i64, String, i64, i64, bool)> = sqlx::query_as(
+                    "SELECT sequence,key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint,(data->'index' IS NOT NULL AND data->'index' <> 'null'::jsonb) FROM devres_npm_evidence WHERE kind=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT $4"
+                ).bind(kind).bind(after).bind(cutoff).bind(execution.options().workers as i64)
+                    .fetch_all(&self.pool).await.map_err(|_| super::storage_error())?;
+                if positions.is_empty() {
                     break;
                 }
-                for row in rows {
-                    after = row.sequence;
-                    let Some(new) = integrity::migration_lookup(mappings, "npm:id", &row.key)
-                    else {
-                        continue;
-                    };
-                    let mut data = row.data;
-                    let original_index = data.get("index").filter(|v| !v.is_null()).cloned();
-                    rewrite_references(kind, &mut data, mappings)?;
-                    if let Some(original) = original_index {
-                        data["index"] = self
-                            .rebuild_npm_frozen_index(&index, &original, mappings, cancel.clone())
+                let positions = execution.graph_input_window(
+                    positions
+                        .into_iter()
+                        .map(|(seq, id, bytes, nodes, indexed)| {
+                            let charge = crate::MigrationExecution::graph_input_charge(
+                                usize::try_from(bytes).map_err(|_| super::storage_error())?,
+                                usize::try_from(nodes).map_err(|_| super::storage_error())?,
+                            )?
+                            .checked_add(if indexed { JOB_BYTES } else { 0 })
+                            .ok_or_else(|| Error::capacity("npm graph input charge overflow."))?;
+                            Ok(((seq, id), charge))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )?;
+                after = positions.last().map_or(after, |((seq, _), _)| *seq);
+                graph_admitted += positions.len() as u64;
+                let read_mappings = &*mappings;
+                let index = &index;
+                let prepared = execution
+                    .graph_map_ordered(positions, &cancel, |(sequence, old), token| async move {
+                        let Some(new) = integrity::migration_lookup(read_mappings, "npm:id", &old)
+                        else {
+                            return Ok(None);
+                        };
+                        let row = self
+                            .npm_rows(kind, sequence - 1, 1, Some(cutoff), None)
+                            .await?
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| Error::integrity("Frozen npm row disappeared."))?;
+                        if row.key != old || row.sequence != sequence {
+                            return Err(Error::integrity("Frozen npm row changed."));
+                        }
+                        let mut data = row.data;
+                        let frozen_mappings = read_mappings.clone();
+                        let frozen_kind = kind.clone();
+                        let (mut data, original_index) = execution
+                            .run(&token, move |token| {
+                                if token.is_cancelled() {
+                                    return Err(Error::new("cancelled", "npm migration canceled."));
+                                }
+                                let original =
+                                    data.get("index").filter(|value| !value.is_null()).cloned();
+                                rewrite_references(&frozen_kind, &mut data, &frozen_mappings)?;
+                                Ok((data, original))
+                            })
                             .await?;
+                        if let Some(original) = original_index {
+                            data["index"] = self
+                                .rebuild_npm_frozen_index(
+                                    index,
+                                    &original,
+                                    read_mappings,
+                                    token,
+                                    execution,
+                                )
+                                .await?;
+                        }
+                        Ok(Some((old, new, data)))
+                    })
+                    .await?;
+                for result in prepared {
+                    if cancel.is_cancelled() {
+                        return Err(Error::new("cancelled", "npm migration canceled."));
                     }
-                    self.npm_put(kind, &new, &data).await?;
-                    let alias = (kind.clone(), row.key, new);
-                    aliases.push(alias)?;
+                    if let Some((old, new, data)) = result.value() {
+                        self.npm_put(kind, new, data).await?;
+                        aliases.push((kind.clone(), old.clone(), new.clone()))?;
+                        graph_committed += 1;
+                    }
                 }
+                execution.report(
+                    "graph_npm_rows",
+                    graph_admitted,
+                    graph_admitted,
+                    graph_committed,
+                    0,
+                );
             }
         }
         let mut after_state = String::new();
@@ -276,6 +374,9 @@ impl PgBlobStore {
                 if key.starts_with("storage-migration:") {
                     continue;
                 }
+                let _input = self
+                    .migration_state_reservation("npm", &key, JOB_BYTES, execution, &cancel)
+                    .await?;
                 let mut data = self
                     .npm_state(&key)
                     .await?
@@ -288,7 +389,13 @@ impl PgBlobStore {
                 rewrite_references("state", &mut data, mappings)?;
                 if let Some(reference) = original_index {
                     let rebuilt = self
-                        .rebuild_npm_frozen_index(&index, &reference, mappings, cancel.clone())
+                        .rebuild_npm_frozen_index(
+                            &index,
+                            &reference,
+                            mappings,
+                            cancel.clone(),
+                            execution,
+                        )
                         .await?;
                     if key == "index" {
                         data = rebuilt;
@@ -318,8 +425,11 @@ impl PgBlobStore {
         reference: &Value,
         mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<Value> {
-        let mut reader = index.frozen_documents(reference, cancel.clone()).await?;
+        let mut reader = index
+            .frozen_documents_with_execution(reference, cancel.clone(), execution)
+            .await?;
         let mut rebuilt = None;
         let mut docs = Vec::new();
         let mut text_bytes = 0_usize;
@@ -355,11 +465,12 @@ impl PgBlobStore {
                 {
                     rebuilt = Some(
                         index
-                            .publish_generation(
+                            .publish_generation_with_execution(
                                 rebuilt.as_ref(),
                                 std::mem::take(&mut docs),
                                 cancel.clone(),
                                 "blake3-migration",
+                                execution,
                             )
                             .await?,
                     );
@@ -375,7 +486,13 @@ impl PgBlobStore {
         if !docs.is_empty() {
             rebuilt = Some(
                 index
-                    .publish_generation(rebuilt.as_ref(), docs, cancel.clone(), "blake3-migration")
+                    .publish_generation_with_execution(
+                        rebuilt.as_ref(),
+                        docs,
+                        cancel.clone(),
+                        "blake3-migration",
+                        execution,
+                    )
                     .await?,
             );
         }
@@ -383,7 +500,13 @@ impl PgBlobStore {
             Some(reference) => Ok(reference),
             None => {
                 index
-                    .publish_generation(None, Vec::new(), cancel, "blake3-migration")
+                    .publish_generation_with_execution(
+                        None,
+                        Vec::new(),
+                        cancel,
+                        "blake3-migration",
+                        execution,
+                    )
                     .await
             }
         }

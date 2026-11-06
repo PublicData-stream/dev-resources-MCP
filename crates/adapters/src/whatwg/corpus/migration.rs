@@ -144,12 +144,109 @@ fn identity(kind: &str, old: &str, data: &Value) -> Result<String> {
     ))
 }
 impl WhatwgCorpus {
+    async fn migration_page(
+        &self,
+        kind: &str,
+        after: i64,
+        cutoff: i64,
+        extra: usize,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<(
+        Vec<devres_application::whatwg::Row>,
+        crate::GraphReservation,
+    )> {
+        let positions = self
+            .store
+            .whatwg_migration_positions(kind, after, execution.options().workers, cutoff)
+            .await?;
+        let (count, charge) =
+            crate::mdn::corpus::migration::source_window(&positions, extra, execution)?;
+        let reservation = execution.graph_reserve(charge, cancel).await?;
+        if count == 0 {
+            return Ok((Vec::new(), reservation));
+        }
+        let rows = self
+            .store
+            .whatwg_rows(kind, after, count, Some(cutoff))
+            .await?;
+        if rows.len() != count
+            || rows
+                .iter()
+                .zip(&positions)
+                .any(|(row, position)| row.sequence != position.0 || row.key != position.1)
+        {
+            return Err(Error::integrity("Frozen provider source page changed."));
+        }
+        Ok((rows, reservation))
+    }
+
+    async fn migration_state(
+        &self,
+        key: &str,
+        extra: usize,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<(Option<Value>, crate::GraphReservation)> {
+        let size = self.store.whatwg_migration_state_bytes(key).await?;
+        let charge = size.map_or(Ok(1), |(bytes, nodes)| {
+            crate::mdn::corpus::migration::source_charge(bytes, nodes, extra)
+        })?;
+        let reservation = execution.graph_reserve(charge, cancel).await?;
+        Ok((self.store.whatwg_state(key).await?, reservation))
+    }
+
+    async fn migration_operational_state(
+        &self,
+        key: &str,
+        cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<Option<(Value, crate::GraphReservation)>> {
+        let staged_key = format!("storage-migration:{key}");
+        let mut charge = crate::mdn::corpus::migration::INDEX_REPLAY_BYTES;
+        for candidate in [&staged_key, key] {
+            if let Some((bytes, nodes)) = self.store.whatwg_migration_state_bytes(candidate).await?
+            {
+                charge = charge
+                    .checked_add(crate::mdn::corpus::migration::source_charge(
+                        bytes, nodes, 0,
+                    )?)
+                    .ok_or_else(|| Error::capacity("Operational state accounting overflow."))?;
+            }
+        }
+        let reservation = execution.graph_reserve(charge, cancel).await?;
+        // The retained checkpoint is still integrity-verified before skipping it.
+        if self.store.whatwg_state(&staged_key).await?.is_some() {
+            return Ok(None);
+        }
+        let value = self
+            .store
+            .whatwg_state(key)
+            .await?
+            .ok_or_else(|| Error::integrity("Provider migration state vanished."))?;
+        Ok(Some((value, reservation)))
+    }
+
     /// Rebuild canonical content while retaining old snapshots, sequences and indexes.
     /// Only staged head records are written; the owner activates them atomically.
     pub async fn migrate_blake3_graph(
         &self,
         mappings: &mut crate::migration_map::MigrationMap,
         cancel: CancellationToken,
+    ) -> Result<Aliases> {
+        self.migrate_blake3_graph_with_execution(
+            mappings,
+            cancel,
+            &crate::MigrationExecution::default(),
+        )
+        .await
+    }
+
+    pub async fn migrate_blake3_graph_with_execution(
+        &self,
+        mappings: &mut crate::migration_map::MigrationMap,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<Aliases> {
         let _guard = self.processing.lock().await;
         let cutoff = self.store.whatwg_cutoff().await?;
@@ -162,38 +259,63 @@ impl WhatwgCorpus {
             let mut after = 0;
             loop {
                 check(&cancel)?;
-                let rows = self
-                    .store
-                    .whatwg_rows(kind, after, 100, Some(cutoff))
+                let (rows, page_reservation) = self
+                    .migration_page(kind, after, cutoff, 0, &cancel, execution)
                     .await?;
                 if rows.is_empty() {
                     break;
                 }
+                after = rows.last().map_or(after, |row| row.sequence);
+                let mut pending = VecDeque::new();
                 for row in rows {
-                    after = row.sequence;
-                    if row.key.starts_with("blake3:") {
-                        continue;
+                    if !row.key.starts_with("blake3:") {
+                        let charge = crate::MigrationExecution::graph_value_charge(&row.data)?
+                            .saturating_mul(3)
+                            .saturating_add(4096);
+                        pending.push_back((row, charge));
                     }
-                    let mut data = row.data;
-                    let id = if kind == "index-documents" {
-                        if data["id"].as_str() != Some(&row.key) {
-                            return Err(Error::integrity(
-                                "whatwg frozen posting identity mismatch.",
-                            ));
-                        }
-                        data["id"] = json!("");
-                        let id = identity(kind, &row.key, &data)?;
-                        data["id"] = json!(id);
-                        id
-                    } else {
-                        crate::integrity::verify(
-                            &row.key,
-                            &serde_json::to_vec(&data).map_err(|_| failure())?,
-                        )?;
-                        inventory::digest(&serde_json::to_vec(&data).map_err(|_| failure())?)
-                    };
-                    self.store.whatwg_put(kind, &id, &data).await?;
-                    record(mappings, &mut aliases, kind, &row.key, &id)?;
+                }
+                while !pending.is_empty() {
+                    let prepared = execution
+                        .graph_map_ordered_reserved(
+                            crate::mdn::corpus::migration::graph_window(&mut pending, execution)
+                                .into_iter()
+                                .map(|(row, _)| row)
+                                .collect(),
+                            page_reservation.clone(),
+                            &cancel,
+                            |row, token| async move {
+                                execution
+                                    .run(&token, move |token| {
+                                        check(&token)?;
+                                        let mut data = row.data;
+                                        let id = if kind == "index-documents" {
+                                            if data["id"].as_str() != Some(&row.key) {
+                                                return Err(Error::integrity(
+                                                    "whatwg frozen posting identity mismatch.",
+                                                ));
+                                            }
+                                            data["id"] = json!("");
+                                            let id = identity(kind, &row.key, &data)?;
+                                            data["id"] = json!(id);
+                                            id
+                                        } else {
+                                            let bytes =
+                                                serde_json::to_vec(&data).map_err(|_| failure())?;
+                                            crate::integrity::verify(&row.key, &bytes)?;
+                                            inventory::digest(&bytes)
+                                        };
+                                        Ok((row.key, id, data))
+                                    })
+                                    .await
+                            },
+                        )
+                        .await?;
+                    for prepared in prepared {
+                        let (old, id, data) = prepared.value();
+                        self.store.whatwg_put(kind, id, data).await?;
+                        record(mappings, &mut aliases, kind, old, id)?;
+                    }
                 }
             }
         }
@@ -210,9 +332,15 @@ impl WhatwgCorpus {
                 let mut after = 0;
                 loop {
                     check(&cancel)?;
-                    let rows = self
-                        .store
-                        .whatwg_rows(kind, after, 100, Some(cutoff))
+                    let (rows, _page_reservation) = self
+                        .migration_page(
+                            kind,
+                            after,
+                            cutoff,
+                            crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                            &cancel,
+                            execution,
+                        )
                         .await?;
                     if rows.is_empty() {
                         break;
@@ -271,9 +399,15 @@ impl WhatwgCorpus {
         let mut after = 0;
         loop {
             check(&cancel)?;
-            let rows = self
-                .store
-                .whatwg_rows("projections", after, 100, Some(cutoff))
+            let (rows, _page_reservation) = self
+                .migration_page(
+                    "projections",
+                    after,
+                    cutoff,
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
@@ -308,9 +442,15 @@ impl WhatwgCorpus {
             let mut after = 0;
             loop {
                 check(&cancel)?;
-                let rows = self
-                    .store
-                    .whatwg_rows(kind, after, 50, Some(cutoff))
+                let (rows, _page_reservation) = self
+                    .migration_page(
+                        kind,
+                        after,
+                        cutoff,
+                        crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                        &cancel,
+                        execution,
+                    )
                     .await?;
                 if rows.is_empty() {
                     break;
@@ -385,17 +525,52 @@ impl WhatwgCorpus {
                 }
             }
         }
-        let mut indexes = BTreeMap::<String, Value>::new();
         let mut after = 0;
         loop {
             check(&cancel)?;
-            let rows = self
-                .store
-                .whatwg_rows("snapshots", after, 25, Some(cutoff))
+            let (rows, reservation) = self
+                .migration_page(
+                    "snapshots",
+                    after,
+                    cutoff,
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
             }
+            // Prepare file-only frozen replays concurrently; SQL inventories and
+            // snapshot sequences are still published in their original source order.
+            let mut references = BTreeMap::new();
+            for row in &rows {
+                let reference = &row.data["index"];
+                if !row.key.starts_with("blake3:") && !reference.is_null() {
+                    let key = serde_json::to_string(reference)
+                        .map_err(|_| Error::integrity("Invalid frozen index reference."))?;
+                    if mappings
+                        .get(&format!("whatwg:index-reference:{key}"))
+                        .is_none()
+                    {
+                        references.entry(key).or_insert_with(|| reference.clone());
+                    }
+                }
+            }
+            let frozen_mappings = &*mappings;
+            let prepared_indexes = execution
+                .graph_map_ordered_reserved(
+                    references.into_iter().collect(),
+                    reservation.clone(),
+                    &cancel,
+                    |(key, reference), token| async move {
+                        let canonical = self
+                            .replay_frozen_index(&reference, frozen_mappings, token, execution)
+                            .await?;
+                        Ok((key, canonical))
+                    },
+                )
+                .await?;
             for row in rows {
                 after = row.sequence;
                 if row.key.starts_with("blake3:") {
@@ -446,17 +621,39 @@ impl WhatwgCorpus {
                 if !snapshot.index.is_null() {
                     let cache_key =
                         serde_json::to_string(&snapshot.index).map_err(|_| failure())?;
-                    snapshot.index = if let Some(index) = indexes.get(&cache_key) {
-                        index.clone()
+                    snapshot.index = if let Some(reference) =
+                        mappings.get(&format!("whatwg:index-reference:{cache_key}"))
+                    {
+                        serde_json::from_str(&reference)
+                            .map_err(|_| Error::integrity("Invalid canonical index reference."))?
                     } else {
-                        let index = self
-                            .migrate_frozen_index(&snapshot.index, mappings, cancel.clone())
-                            .await?;
-                        if indexes.len() < 4096 {
-                            indexes.insert(cache_key.clone(), index.clone());
-                        }
-                        index
+                        prepared_indexes
+                            .iter()
+                            .find(|prepared| prepared.value().0 == cache_key)
+                            .map(|prepared| prepared.value().1.clone())
+                            .ok_or_else(|| Error::integrity("Frozen index preparation missing."))?
                     };
+                    // Every use re-verifies both retained and canonical evidence.
+                    drop(
+                        self.index
+                            .frozen_documents_with_execution(
+                                &serde_json::from_str(&cache_key).map_err(|_| {
+                                    Error::integrity("Invalid frozen index reference.")
+                                })?,
+                                cancel.clone(),
+                                execution,
+                            )
+                            .await?,
+                    );
+                    drop(
+                        self.index
+                            .frozen_documents_with_execution(
+                                &snapshot.index,
+                                cancel.clone(),
+                                execution,
+                            )
+                            .await?,
+                    );
                     crate::migration_map::insert(
                         mappings,
                         format!("whatwg:index-reference:{cache_key}"),
@@ -497,17 +694,24 @@ impl WhatwgCorpus {
                     .await?;
             }
         }
-        let selected = self
-            .store
-            .whatwg_state("default")
-            .await?
-            .and_then(|v| v["id"].as_str().map(str::to_owned));
+        let selected = {
+            let (selected, _reservation) = self
+                .migration_state("default", 0, &cancel, execution)
+                .await?;
+            selected.and_then(|v| v["id"].as_str().map(str::to_owned))
+        };
         let mut after = 0;
         loop {
             check(&cancel)?;
-            let rows = self
-                .store
-                .whatwg_rows("views", after, 25, Some(cutoff))
+            let (rows, _page_reservation) = self
+                .migration_page(
+                    "views",
+                    after,
+                    cutoff,
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
             if rows.is_empty() {
                 break;
@@ -524,7 +728,7 @@ impl WhatwgCorpus {
                 }
                 if !view.index.is_null() {
                     view.index = self
-                        .migrate_frozen_index(&view.index, mappings, cancel.clone())
+                        .replay_frozen_index(&view.index, mappings, cancel.clone(), execution)
                         .await?;
                 }
                 view.id.clear();
@@ -540,47 +744,59 @@ impl WhatwgCorpus {
                 }
             }
         }
-        if let Some(index) = self.store.whatwg_state("index").await?
-            && !index.is_null()
         {
-            let canonical = self
-                .migrate_frozen_index(&index, mappings, cancel.clone())
+            let (source_index, _index_reservation) = self
+                .migration_state(
+                    "index",
+                    crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                    &cancel,
+                    execution,
+                )
                 .await?;
-            crate::migration_map::insert(
-                mappings,
-                format!(
-                    "whatwg:index-reference:{}",
-                    serde_json::to_string(&index)
-                        .map_err(|_| Error::integrity("Invalid old index reference."))?
-                ),
-                serde_json::to_string(&canonical)
-                    .map_err(|_| Error::integrity("Invalid new index reference."))?,
-            )?;
-            self.store
-                .whatwg_set_state("storage-migration:index", &canonical)
-                .await?;
+            if let Some(index) = source_index
+                && !index.is_null()
+            {
+                let canonical = self
+                    .replay_frozen_index(&index, mappings, cancel.clone(), execution)
+                    .await?;
+                crate::migration_map::insert(
+                    mappings,
+                    format!(
+                        "whatwg:index-reference:{}",
+                        serde_json::to_string(&index)
+                            .map_err(|_| Error::integrity("Invalid old index reference."))?
+                    ),
+                    serde_json::to_string(&canonical)
+                        .map_err(|_| Error::integrity("Invalid new index reference."))?,
+                )?;
+                self.store
+                    .whatwg_set_state("storage-migration:index", &canonical)
+                    .await?;
+            }
         }
-        self.migrate_auxiliary_graph(mappings, &mut aliases, cutoff, &cancel)
+        self.migrate_auxiliary_graph(mappings, &mut aliases, cutoff, &cancel, execution)
             .await?;
         mappings.ensure_healthy()?;
         aliases.ensure_healthy()?;
         Ok(aliases)
     }
-    async fn migrate_frozen_index(
+    async fn replay_frozen_index(
         &self,
         reference: &Value,
         mappings: &crate::migration_map::MigrationMap,
         cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<Value> {
         let mut reader = self
             .index
-            .frozen_documents(reference, cancel.clone())
+            .frozen_documents_with_execution(reference, cancel.clone(), execution)
             .await?;
         let mut canonical = None;
         loop {
             check(&cancel)?;
             let (ids, has_more) = reader.next_page(100).await?;
             let mut documents = Vec::new();
+            let mut text_bytes = 0_usize;
             for id in ids {
                 let canonical_id = mapped_role(mappings, "index-documents", &id)?;
                 let row = self
@@ -588,11 +804,26 @@ impl WhatwgCorpus {
                     .whatwg_get("index-documents", &canonical_id)
                     .await?
                     .ok_or_else(|| Error::integrity("whatwg frozen index payload missing."))?;
-                documents.push(decode(row.data)?);
+                let document: crate::whatwg::index::IndexDocument = decode(row.data)?;
+                crate::whatwg::index::WhatwgIndex::validate_document_bounds(&document)?;
+                // Preserve the original 100-ID publication groups and the index
+                // engine's existing 64MiB text admission, before retaining more rows.
+                text_bytes = text_bytes
+                    .checked_add(document.text.len())
+                    .ok_or_else(|| Error::capacity("Frozen index replay text size overflow."))?;
+                if text_bytes > 64 * 1024 * 1024 {
+                    return Err(Error::capacity("Frozen index replay text budget exceeded."));
+                }
+                documents.push(document);
             }
             canonical = Some(
                 self.index
-                    .publish(canonical.as_ref(), documents, cancel.clone())
+                    .publish_with_execution(
+                        canonical.as_ref(),
+                        documents,
+                        cancel.clone(),
+                        execution,
+                    )
                     .await?,
             );
             if !has_more {
@@ -610,6 +841,7 @@ impl WhatwgCorpus {
         aliases: &mut Aliases,
         cutoff: i64,
         cancel: &CancellationToken,
+        execution: &crate::MigrationExecution,
     ) -> Result<()> {
         let kinds = self.store.whatwg_migration_kinds().await?;
         const CORE: &[&str] = &[
@@ -651,9 +883,15 @@ impl WhatwgCorpus {
                 let mut after = 0;
                 loop {
                     check(cancel)?;
-                    let rows = self
-                        .store
-                        .whatwg_rows(kind, after, 100, Some(cutoff))
+                    let (rows, _page_reservation) = self
+                        .migration_page(
+                            kind,
+                            after,
+                            cutoff,
+                            crate::mdn::corpus::migration::INDEX_REPLAY_BYTES,
+                            cancel,
+                            execution,
+                        )
                         .await?;
                     if rows.is_empty() {
                         break;
@@ -700,7 +938,12 @@ impl WhatwgCorpus {
                             .is_none()
                             {
                                 let canonical = self
-                                    .migrate_frozen_index(&reference, mappings, cancel.clone())
+                                    .replay_frozen_index(
+                                        &reference,
+                                        mappings,
+                                        cancel.clone(),
+                                        execution,
+                                    )
                                     .await?;
                                 crate::migration_map::insert(
                                     mappings,
@@ -801,18 +1044,11 @@ impl WhatwgCorpus {
                 if key.starts_with("storage-migration:") {
                     continue;
                 }
-                // Dedicated core phases stage selected heads; do not replace them
-                // with a generic copy of the legacy generation.
-                if self
-                    .store
-                    .whatwg_state(&format!("storage-migration:{key}"))
+                let Some((mut data, _state_reservation)) = self
+                    .migration_operational_state(&key, cancel, execution)
                     .await?
-                    .is_some()
-                {
+                else {
                     continue;
-                }
-                let Some(mut data) = self.store.whatwg_state(&key).await? else {
-                    return Err(Error::integrity("whatwg migration state vanished."));
                 };
                 let mut references = Vec::new();
                 crate::mdn::corpus::migration::collect_index_references(&data, 0, &mut references)?;
@@ -823,7 +1059,7 @@ impl WhatwgCorpus {
                         .is_none()
                     {
                         let canonical = self
-                            .migrate_frozen_index(&reference, mappings, cancel.clone())
+                            .replay_frozen_index(&reference, mappings, cancel.clone(), execution)
                             .await?;
                         crate::migration_map::insert(
                             mappings,

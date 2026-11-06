@@ -48,7 +48,7 @@ fn sum(parts: impl IntoIterator<Item = usize>) -> Result<usize> {
 
 /// Conservative allocation charge, not serialized JSON length or a claim about RSS.
 /// BTree nodes are deliberately charged per entry with slack for their containers.
-fn value_charge(value: &Value, depth: usize) -> Result<usize> {
+pub(crate) fn value_charge(value: &Value, depth: usize) -> Result<usize> {
     if depth > 128 {
         return Err(Error::capacity("Integrity value nesting exceeded."));
     }

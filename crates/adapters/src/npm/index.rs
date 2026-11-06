@@ -160,6 +160,46 @@ impl NpmIndex {
                 .map_err(provider_error)?,
         })
     }
+    pub(crate) async fn frozen_documents_with_execution(
+        &self,
+        index: &Value,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<FrozenDocuments> {
+        Ok(FrozenDocuments {
+            inner: self
+                .inner
+                .frozen_documents_with_execution(&reference(index, false)?, cancel, execution)
+                .await
+                .map_err(provider_error)?,
+        })
+    }
+    pub(crate) async fn publish_generation_with_execution(
+        &self,
+        previous: Option<&Value>,
+        documents: Vec<IndexDocument>,
+        cancel: CancellationToken,
+        generation: &str,
+        execution: &crate::MigrationExecution,
+    ) -> Result<Value> {
+        let previous = previous.map(|value| reference(value, false)).transpose()?;
+        let documents = documents
+            .into_iter()
+            .map(document)
+            .collect::<Result<Vec<_>>>()?;
+        let result = self
+            .inner
+            .publish_generation_with_execution(
+                previous.as_ref(),
+                documents,
+                cancel,
+                generation,
+                execution,
+            )
+            .await
+            .map_err(provider_error)?;
+        reference(&result, true)
+    }
     /// Bounded exact-posting export for offline migration of a frozen generation.
     pub async fn document_ids(
         &self,

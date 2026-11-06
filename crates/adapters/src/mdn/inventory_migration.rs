@@ -12,11 +12,20 @@ pub(crate) struct MigrationInventory {
     nodes: NodeCache,
 }
 impl MigrationInventory {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
             records: crate::MigrationMap::new(),
             nodes: NodeCache::new(),
         }
+    }
+    pub(crate) fn new_shared(mappings: &crate::MigrationMap) -> Result<Self> {
+        Ok(Self {
+            records: mappings.scratch()?,
+            // Durable replay memo lives in shared bounded scratch; do not retain
+            // another unaccounted per-provider node cache between graph windows.
+            nodes: NodeCache::disabled(),
+        })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

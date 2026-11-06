@@ -156,6 +156,62 @@ pub struct View {
 /// Public source evidence only. Immutable rows reject replacement; state is private.
 #[async_trait]
 pub trait MdnStore: Send + Sync {
+    /// Private migration sizing before PostgreSQL JSON values are materialized.
+    /// Concrete persistent stores override this with a metadata-only query.
+    async fn mdn_migration_positions(
+        &self,
+        kind: &str,
+        after: i64,
+        limit: usize,
+        cutoff: i64,
+    ) -> Result<Vec<(i64, String, usize, usize)>> {
+        let rows = self.mdn_rows(kind, after, limit, Some(cutoff)).await?;
+        rows.into_iter()
+            .map(|row| {
+                let bytes = serde_json::to_vec(&row.data)
+                    .map_err(|_| devres_domain::Error::integrity("Invalid migration source row."))?
+                    .len();
+                fn nodes(value: &Value) -> usize {
+                    let children = match value {
+                        Value::Array(values) => {
+                            values.iter().map(nodes).fold(0usize, usize::saturating_add)
+                        }
+                        Value::Object(values) => values
+                            .values()
+                            .map(nodes)
+                            .fold(0usize, usize::saturating_add),
+                        _ => 0,
+                    };
+                    children.saturating_add(1)
+                }
+                Ok((row.sequence, row.key, bytes, nodes(&row.data)))
+            })
+            .collect()
+    }
+    async fn mdn_migration_state_bytes(&self, key: &str) -> Result<Option<(usize, usize)>> {
+        self.mdn_state(key)
+            .await?
+            .map(|value| {
+                fn nodes(value: &Value) -> usize {
+                    let children = match value {
+                        Value::Array(values) => {
+                            values.iter().map(nodes).fold(0usize, usize::saturating_add)
+                        }
+                        Value::Object(values) => values
+                            .values()
+                            .map(nodes)
+                            .fold(0usize, usize::saturating_add),
+                        _ => 0,
+                    };
+                    children.saturating_add(1)
+                }
+                serde_json::to_vec(&value)
+                    .map(|bytes| (bytes.len(), nodes(&value)))
+                    .map_err(|_| devres_domain::Error::integrity("Invalid migration source state."))
+            })
+            .transpose()
+    }
+
     /// Complete retained rows for private integrity verification, including aliases.
     async fn mdn_migration_rows(
         &self,

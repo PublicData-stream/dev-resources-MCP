@@ -766,172 +766,308 @@ impl PgBlobStore {
         config: &devres_application::advisory::RustSecConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.migrate_advisory_graph_with_execution(
+            mappings,
+            config,
+            cancel,
+            &crate::MigrationExecution::default(),
+        )
+        .await
+    }
+
+    pub async fn migrate_advisory_graph_with_execution(
+        &self,
+        mappings: &mut crate::MigrationMap,
+        config: &devres_application::advisory::RustSecConfig,
+        cancel: tokio_util::sync::CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<crate::migration_map::MigrationAliases> {
         self.fence().await?;
         let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         // Original ref observations are identified by their retained manifest body.
+        const MANIFEST_JOB_BYTES: usize = 64 * 1024 * 1024;
+        let mut graph_committed = 0_u64;
         let mut after = 0_i64;
         loop {
             advisory_migration_cancel(&cancel)?;
-            let found=sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='refs' AND key NOT LIKE 'blake3:%' AND key !~ ':processed:' AND sequence>$1 ORDER BY sequence LIMIT 1")
-                .bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(found) = found else {
+            let positions: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+                "SELECT sequence,key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_advisory_rows WHERE kind='refs' AND key NOT LIKE 'blake3:%' AND key !~ ':processed:' AND sequence>$1 ORDER BY sequence LIMIT $2"
+            ).bind(after).bind(execution.options().workers as i64)
+                .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            if positions.is_empty() {
                 break;
-            };
-            after = found.try_get("sequence").map_err(|_| storage_error())?;
-            let old: String = found.try_get("key").map_err(|_| storage_error())?;
-            let mut data = payload_integrity::row("devres_advisory_rows", &found)?;
-            let manifest = self
-                .rewrite_advisory_manifest(&data["manifest"], mappings, config, &cancel)
-                .await?;
-            let new = manifest["body_hash"]
-                .as_str()
-                .ok_or_else(storage_error)?
-                .to_owned();
-            crate::migration_map::insert(
-                mappings,
-                format!("advisory:manifest:{old}"),
-                new.clone(),
+            }
+            let positions = execution.graph_input_window(
+                positions
+                    .into_iter()
+                    .map(|(seq, old, bytes, nodes)| {
+                        let charge = crate::MigrationExecution::graph_input_charge(
+                            usize::try_from(bytes).map_err(|_| storage_error())?,
+                            usize::try_from(nodes).map_err(|_| storage_error())?,
+                        )?
+                        .checked_add(MANIFEST_JOB_BYTES)
+                        .ok_or_else(|| Error::capacity("Advisory input charge overflow."))?;
+                        Ok(((seq, old), charge))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
             )?;
-            data["manifest"] = manifest;
-            data["id"] = json!(new);
-            data["observation_sequence"] = json!(after);
-            self.put_advisory_row("refs", &new, &data).await?;
-            crate::migration_map::insert(mappings, format!("advisory:refs:{old}"), new.clone())?;
-            {
-                let alias = ("manifest".into(), old.clone(), new.clone());
-                aliases.push(alias)?;
+            after = positions
+                .last()
+                .map_or(after, |((sequence, _), _)| *sequence);
+            let read_mappings = &*mappings;
+            let prepared = execution.graph_map_ordered(
+                positions, &cancel,
+                |(sequence, old), token| async move {
+                    let found=sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='refs' AND sequence=$1 AND key=$2")
+                        .bind(sequence).bind(&old).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+                    let mut data = payload_integrity::row("devres_advisory_rows", &found)?;
+                    let manifest = self.rewrite_advisory_manifest(&data["manifest"], read_mappings, config, &token).await?;
+                    let new = manifest["body_hash"].as_str().ok_or_else(storage_error)?.to_owned();
+                    data["manifest"] = manifest;
+                    data["id"] = json!(new);
+                    data["observation_sequence"] = json!(sequence);
+                    Ok((old, new, data))
+                },
+            ).await?;
+            for prepared in prepared {
+                advisory_migration_cancel(&cancel)?;
+                let (old, new, data) = prepared.value();
+                crate::migration_map::insert(
+                    mappings,
+                    format!("advisory:manifest:{old}"),
+                    new.clone(),
+                )?;
+                self.put_advisory_row("refs", new, data).await?;
+                crate::migration_map::insert(
+                    mappings,
+                    format!("advisory:refs:{old}"),
+                    new.clone(),
+                )?;
+                aliases.push(("manifest".into(), old.clone(), new.clone()))?;
+                aliases.push(("refs".into(), old.clone(), new.clone()))?;
+                graph_committed += 1;
             }
-            {
-                let alias = ("refs".into(), old, new);
-                aliases.push(alias)?;
-            }
+            execution.report(
+                "graph_advisory_refs",
+                graph_committed,
+                graph_committed,
+                graph_committed,
+                0,
+            );
         }
+        const SNAPSHOT_JOB_BYTES: usize = 512 * 1024 * 1024;
+        let mut graph_committed = 0_u64;
         let mut after = 0_i64;
         loop {
             advisory_migration_cancel(&cancel)?;
-            let found=sqlx::query("SELECT sequence,id,format FROM devres_advisory_snapshots WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1")
-                .bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(found) = found else {
+            let positions: Vec<(i64, String, String, i64, i64)> = sqlx::query_as(
+                "SELECT sequence,id,format,octet_length(data::text)::bigint+COALESCE((SELECT sum(octet_length(r.data::text))::bigint FROM devres_advisory_members m JOIN devres_advisory_records r ON r.id=m.record WHERE m.snapshot=s.id),0),jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint+COALESCE((SELECT sum(jsonb_array_length(jsonb_path_query_array(r.data,'strict $.**.type()')))::bigint FROM devres_advisory_members m JOIN devres_advisory_records r ON r.id=m.record WHERE m.snapshot=s.id),0) FROM devres_advisory_snapshots s WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT $2"
+            ).bind(after).bind(execution.options().workers as i64)
+                .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            if positions.is_empty() {
                 break;
-            };
-            after = found.try_get("sequence").map_err(|_| storage_error())?;
-            let old: String = found.try_get("id").map_err(|_| storage_error())?;
-            let format: String = found.try_get("format").map_err(|_| storage_error())?;
-            let mut snapshot = self
-                .advisory_snapshot(Some(&old), &format)
-                .await?
-                .ok_or_else(|| Error::integrity("Legacy advisory snapshot missing."))?;
-            let old_records: Vec<String> = sqlx::query_scalar(
+            }
+            let positions = execution.graph_input_window(
+                positions
+                    .into_iter()
+                    .map(|(seq, old, format, bytes, nodes)| {
+                        let charge = crate::MigrationExecution::graph_input_charge(
+                            usize::try_from(bytes).map_err(|_| storage_error())?,
+                            usize::try_from(nodes).map_err(|_| storage_error())?,
+                        )?
+                        .checked_add(SNAPSHOT_JOB_BYTES)
+                        .ok_or_else(|| Error::capacity("Advisory input charge overflow."))?;
+                        Ok(((seq, old, format), charge))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            after = positions
+                .last()
+                .map_or(after, |((sequence, _, _), _)| *sequence);
+            let read_mappings = &*mappings;
+            let prepared = execution
+                .graph_map_ordered(positions, &cancel, |(_, old, format), token| async move {
+                    let mut snapshot = self
+                        .advisory_snapshot(Some(&old), &format)
+                        .await?
+                        .ok_or_else(|| Error::integrity("Legacy advisory snapshot missing."))?;
+                    let old_records: Vec<String> = sqlx::query_scalar(
                 "SELECT record FROM devres_advisory_members WHERE snapshot=$1 ORDER BY position",
             )
             .bind(&old)
             .fetch_all(&self.pool)
             .await
             .map_err(|_| storage_error())?;
-            if old_records.len() != snapshot.records.len() {
-                return Err(Error::integrity("Advisory migration membership changed."));
-            }
-            for (record, old_record) in snapshot.records.iter_mut().zip(old_records) {
-                record.body_hash = hash(record.body.as_bytes());
-                let value = serde_json::to_value(&*record).map_err(|_| storage_error())?;
-                let new_record = hash(&serde_json::to_vec(&value).map_err(|_| storage_error())?);
-                let map_key = format!("advisory:records:{old_record}");
-                if mappings
-                    .get(&map_key)
-                    .is_some_and(|value| value != new_record)
-                {
-                    return Err(Error::integrity(
-                        "Conflicting advisory record migration identity.",
-                    ));
+                    if old_records.len() != snapshot.records.len() {
+                        return Err(Error::integrity("Advisory migration membership changed."));
+                    }
+                    let read_mappings = read_mappings.clone();
+                    execution
+                        .run(&token, move |token| {
+                            advisory_migration_cancel(&token)?;
+                            let mut proposed = Vec::new();
+                            for (record, old_record) in snapshot.records.iter_mut().zip(old_records)
+                            {
+                                record.body_hash = hash(record.body.as_bytes());
+                                let value =
+                                    serde_json::to_value(&*record).map_err(|_| storage_error())?;
+                                let new_record =
+                                    hash(&serde_json::to_vec(&value).map_err(|_| storage_error())?);
+                                let map_key = format!("advisory:records:{old_record}");
+                                if read_mappings
+                                    .get(&map_key)
+                                    .is_some_and(|value| value != new_record)
+                                {
+                                    return Err(Error::integrity(
+                                        "Conflicting advisory record migration identity.",
+                                    ));
+                                }
+                                proposed.push((map_key, old_record, new_record));
+                            }
+                            for capture in &mut snapshot.captures {
+                                capture.id =
+                                    advisory_migration_ref("capture", &capture.id, &read_mappings)?;
+                                capture.body_hash = advisory_migration_ref(
+                                    "body",
+                                    &capture.body_hash,
+                                    &read_mappings,
+                                )?;
+                            }
+                            if let Some(observation) = snapshot.coverage["git_observation"].as_str()
+                            {
+                                snapshot.coverage["git_observation"] =
+                                    json!(advisory_migration_ref(
+                                        "advisory:manifest",
+                                        observation,
+                                        &read_mappings
+                                    )?);
+                            }
+                            snapshot.id = String::new();
+                            let identity = serde_json::to_value((
+                                "devres:storage-migration:advisory-snapshot:v1",
+                                &old,
+                                &snapshot,
+                            ))
+                            .map_err(|_| storage_error())?;
+                            let new = crate::integrity::canonical_hash(&identity)?;
+                            snapshot.id = new.clone();
+                            Ok((old, snapshot, proposed))
+                        })
+                        .await
+                })
+                .await?;
+            for prepared in prepared {
+                advisory_migration_cancel(&cancel)?;
+                let (old, snapshot, proposed) = prepared.value();
+                // Shared records discovered by other snapshots in this window must agree.
+                for (key, old_record, new_record) in proposed {
+                    if mappings.get(key).is_some_and(|id| id != *new_record) {
+                        return Err(Error::integrity(
+                            "Conflicting advisory record migration identity.",
+                        ));
+                    }
+                    if !mappings.contains_key(key) {
+                        crate::migration_map::insert(mappings, key.clone(), new_record.clone())?;
+                        aliases.push(("records".into(), old_record.clone(), new_record.clone()))?;
+                    }
                 }
-                if !mappings.contains_key(&map_key) {
-                    crate::migration_map::insert(mappings, map_key, new_record.clone())?;
-                    let alias = ("records".into(), old_record, new_record);
-                    aliases.push(alias)?;
-                }
+                self.publish_advisory_snapshot(snapshot, false).await?;
+                crate::migration_map::insert(
+                    mappings,
+                    format!("advisory:snapshots:{old}"),
+                    snapshot.id.clone(),
+                )?;
+                aliases.push(("snapshots".into(), old.clone(), snapshot.id.clone()))?;
+                graph_committed += 1;
             }
-            for capture in &mut snapshot.captures {
-                capture.id = advisory_migration_ref("capture", &capture.id, mappings)?;
-                capture.body_hash = advisory_migration_ref("body", &capture.body_hash, mappings)?;
-            }
-            if let Some(observation) = snapshot.coverage["git_observation"].as_str() {
-                snapshot.coverage["git_observation"] = json!(advisory_migration_ref(
-                    "advisory:manifest",
-                    observation,
-                    mappings
-                )?);
-            }
-            snapshot.id = String::new();
-            let identity = serde_json::to_value((
-                "devres:storage-migration:advisory-snapshot:v1",
-                &old,
-                &snapshot,
-            ))
-            .map_err(|_| storage_error())?;
-            let new = crate::integrity::canonical_hash(&identity)?;
-            snapshot.id = new.clone();
-            self.publish_advisory_snapshot(&snapshot, false).await?;
-            crate::migration_map::insert(
-                mappings,
-                format!("advisory:snapshots:{old}"),
-                new.clone(),
-            )?;
-            {
-                let alias = ("snapshots".into(), old, new);
-                aliases.push(alias)?;
-            }
+            execution.report(
+                "graph_advisory_snapshots",
+                graph_committed,
+                graph_committed,
+                graph_committed,
+                0,
+            );
         }
         // Natural Git keys keep their source meaning; canonical rows use separate keys.
+        const ROW_JOB_BYTES: usize = 64 * 1024 * 1024;
+        let mut graph_admitted = 0_u64;
+        let mut graph_committed = 0_u64;
         let mut after = 0_i64;
         loop {
             advisory_migration_cancel(&cancel)?;
-            let found=sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE key NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1")
-                .bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(found) = found else {
+            let positions: Vec<(i64, String, String, i64, i64)> = sqlx::query_as(
+                "SELECT sequence,kind,key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_advisory_rows WHERE key NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT $2"
+            ).bind(after).bind(execution.options().workers as i64)
+                .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+            if positions.is_empty() {
                 break;
-            };
-            after = found.try_get("sequence").map_err(|_| storage_error())?;
-            let kind: String = found.try_get("kind").map_err(|_| storage_error())?;
-            if !matches!(
-                kind.as_str(),
-                "refs"
-                    | "commits"
-                    | "processing"
-                    | "git-projections"
-                    | "legacy-heads"
-                    | "legacy-gaps"
-            ) {
-                return Err(Error::integrity(
-                    "Unrecognized advisory evidence family during migration.",
-                ));
             }
-            let old: String = found.try_get("key").map_err(|_| storage_error())?;
-            if kind == "refs" && !old.contains(":processed:") {
-                continue;
-            }
-            let mut data = payload_integrity::row("devres_advisory_rows", &found)?;
-            migrate_advisory_owned_refs(&mut data, mappings)?;
-            if kind == "refs"
-                && let Some(old_id) = data["id"].as_str()
-            {
-                data["id"] = json!(advisory_migration_ref(
-                    "advisory:manifest",
-                    old_id,
-                    mappings
-                )?);
-            }
-            if kind == "refs" && data.get("observation_sequence").is_none() {
-                data["observation_sequence"] = json!(after);
-            }
-            let new = crate::integrity::canonical_hash(
-                &json!({"version":1,"namespace":"advisory-row","kind":kind,"legacy_key":old,"payload":data}),
+            let positions = execution.graph_input_window(
+                positions
+                    .into_iter()
+                    .map(|(seq, kind, old, bytes, nodes)| {
+                        let charge = crate::MigrationExecution::graph_input_charge(
+                            usize::try_from(bytes).map_err(|_| storage_error())?,
+                            usize::try_from(nodes).map_err(|_| storage_error())?,
+                        )?
+                        .checked_add(ROW_JOB_BYTES)
+                        .ok_or_else(|| Error::capacity("Advisory input charge overflow."))?;
+                        Ok(((seq, kind, old), charge))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
             )?;
-            self.put_advisory_row(&kind, &new, &data).await?;
-            crate::migration_map::insert(mappings, format!("advisory:{kind}:{old}"), new.clone())?;
-            {
-                let alias = (kind, old, new);
-                aliases.push(alias)?;
+            after = positions
+                .last()
+                .map_or(after, |((sequence, _, _), _)| *sequence);
+            graph_admitted += positions.len() as u64;
+            let read_mappings = &*mappings;
+            let prepared = execution.graph_map_ordered(
+                positions, &cancel,
+                |(sequence, kind, old), token| async move {
+                    if !matches!(kind.as_str(), "refs" | "commits" | "processing" | "git-projections" | "legacy-heads" | "legacy-gaps") {
+                        return Err(Error::integrity("Unrecognized advisory evidence family during migration."));
+                    }
+                    if kind == "refs" && !old.contains(":processed:") { return Ok(None); }
+                    let found=sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE sequence=$1 AND kind=$2 AND key=$3")
+                        .bind(sequence).bind(&kind).bind(&old).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+                    let mut data = payload_integrity::row("devres_advisory_rows", &found)?;
+                    let read_mappings = read_mappings.clone();
+                    execution.run(&token, move |token| {
+                        advisory_migration_cancel(&token)?;
+                        migrate_advisory_owned_refs(&mut data, &read_mappings)?;
+                        if kind == "refs" && let Some(old_id) = data["id"].as_str() {
+                            data["id"] = json!(advisory_migration_ref("advisory:manifest", old_id, &read_mappings)?);
+                        }
+                        if kind == "refs" && data.get("observation_sequence").is_none() {
+                            data["observation_sequence"] = json!(sequence);
+                        }
+                        let new = crate::integrity::canonical_hash(&json!({
+                            "version":1,"namespace":"advisory-row","kind":kind,"legacy_key":old,"payload":data,
+                        }))?;
+                        Ok(Some((kind, old, new, data)))
+                    }).await
+                },
+            ).await?;
+            for prepared in prepared {
+                advisory_migration_cancel(&cancel)?;
+                if let Some((kind, old, new, data)) = prepared.value() {
+                    self.put_advisory_row(kind, new, data).await?;
+                    crate::migration_map::insert(
+                        mappings,
+                        format!("advisory:{kind}:{old}"),
+                        new.clone(),
+                    )?;
+                    aliases.push((kind.clone(), old.clone(), new.clone()))?;
+                    graph_committed += 1;
+                }
             }
+            execution.report(
+                "graph_advisory_rows",
+                graph_admitted,
+                graph_admitted,
+                graph_committed,
+                0,
+            );
         }
         let defaults: Vec<(String, String)> =
             sqlx::query_as("SELECT format,snapshot FROM devres_advisory_defaults ORDER BY format")
@@ -951,11 +1087,26 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             advisory_migration_cancel(&cancel)?;
-            let found=sqlx::query("SELECT ''::text AS kind,key,data,data_integrity FROM devres_advisory_state WHERE key>$1 ORDER BY key LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(found) = found else {
+            let key: Option<String> = sqlx::query_scalar(
+                "SELECT key FROM devres_advisory_state WHERE key>$1 ORDER BY key LIMIT 1",
+            )
+            .bind(&after)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| storage_error())?;
+            let Some(key) = key else {
                 break;
             };
-            let key: String = found.try_get("key").map_err(|_| storage_error())?;
+            let _input = self
+                .migration_state_reservation(
+                    "advisory",
+                    &key,
+                    MANIFEST_JOB_BYTES,
+                    execution,
+                    &cancel,
+                )
+                .await?;
+            let found=sqlx::query("SELECT ''::text AS kind,key,data,data_integrity FROM devres_advisory_state WHERE key=$1").bind(&key).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
             let mut data = payload_integrity::row("devres_advisory_state", &found)?;
             if let Some(manifest) = data.get_mut("manifest") {
                 *manifest = self

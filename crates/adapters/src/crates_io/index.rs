@@ -335,7 +335,7 @@ struct Builder {
     queued: usize,
     shard_bytes: u64,
     owner: Arc<dyn CrateCorpusStore>,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
     cancel: CancellationToken,
     published: bool,
     gaps: u64,
@@ -356,6 +356,15 @@ impl Builder {
         owner: Arc<dyn CrateCorpusStore>,
         cancel: CancellationToken,
         permit: OwnedSemaphorePermit,
+    ) -> Result<Self> {
+        Self::begin_admitted(root, owner, cancel, Some(permit))
+    }
+
+    fn begin_admitted(
+        root: &Path,
+        owner: Arc<dyn CrateCorpusStore>,
+        cancel: CancellationToken,
+        permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Self> {
         let canonical = fs::canonicalize(root).map_err(|_| unavailable())?;
         real_directory(&canonical)?;
@@ -888,6 +897,16 @@ fn open(
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<Arc<Opened>> {
+    open_inner(root, reference, cancel, deadline, false)
+}
+
+fn open_inner(
+    root: &Path,
+    reference: &Value,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    verification_only: bool,
+) -> Result<Arc<Opened>> {
     check(cancel, deadline)?;
     let path = reference["path"].as_str().ok_or_else(unavailable)?;
     let expected = reference_digest(reference)?;
@@ -908,7 +927,7 @@ fn open(
     }
     let key = format!("{}:{expected}", directory.display());
     let cache = CACHE.get_or_init(|| Mutex::new(ReaderCache::default()));
-    if let Some(opened) = cache.lock().map_err(|_| unavailable())?.get(&key) {
+    if !verification_only && let Some(opened) = cache.lock().map_err(|_| unavailable())?.get(&key) {
         return Ok(opened);
     }
     #[cfg(test)]
@@ -1011,8 +1030,10 @@ fn open(
         searchers,
         gaps: manifest.gaps,
     });
-    let mut cache = cache.lock().map_err(|_| unavailable())?;
-    cache.retain_history(key, opened.clone());
+    if !verification_only {
+        let mut cache = cache.lock().map_err(|_| unavailable())?;
+        cache.retain_history(key, opened.clone());
+    }
     Ok(opened)
 }
 
@@ -1091,6 +1112,7 @@ fn from_frozen_payload(payload: Value, text: String) -> Result<IndexDocument> {
 
 /// Rebuild only the exact postings and gaps from one immutable retained generation.
 /// The callback rewrites typed service references in payloads, never indexed text.
+#[cfg(test)]
 pub(crate) async fn rebuild_frozen(
     owner: Arc<dyn CrateCorpusStore>,
     root: PathBuf,
@@ -1113,75 +1135,292 @@ pub(crate) async fn rebuild_frozen(
         .try_acquire_owned()
         .map_err(|_| capacity())?;
     let mut task = tokio::task::spawn_blocking(move || {
-        let mut reader = FrozenDocuments::open(&root, &reference, &stop)?;
-        let source = root.join(reference["path"].as_str().ok_or_else(integrity)?);
-        let bytes = fs::read(source.join("manifest.json")).map_err(|_| unavailable())?;
-        if bytes.len() > MAX_MANIFEST {
-            return Err(capacity());
-        }
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
-        let mut builder = Builder::begin(&root, owner, stop.clone(), permit)?;
-        loop {
-            check(&stop, Instant::now() + Duration::from_secs(15))?;
-            let (documents, has_more) = reader.next_page(1000)?;
-            for (mut payload, text) in documents {
-                rewrite(&mut payload)?;
-                if !builder.add(from_frozen_payload(payload, text)?)? {
-                    return Err(Error::integrity(
-                        "Frozen crate migration changed indexed membership.",
-                    ));
-                }
-            }
-            if !has_more {
-                break;
-            }
-        }
-        builder.gap_samples = manifest.gap_samples;
-        for gap in &mut builder.gap_samples {
-            rewrite(gap)?;
-        }
-        if manifest.gaps > 0 {
-            let mut input = std::io::BufReader::new(
-                File::open(source.join("gaps.ndjson")).map_err(|_| unavailable())?,
-            );
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(builder.stage.join("gaps.ndjson"))
-                .map_err(|_| unavailable())?;
-            loop {
-                check(&stop, Instant::now() + Duration::from_secs(15))?;
-                let mut line = Vec::new();
-                let count = (&mut input)
-                    .take(16 * 1024 + 1)
-                    .read_until(b'\n', &mut line)
-                    .map_err(|_| unavailable())?;
-                if count == 0 {
-                    break;
-                }
-                if line.len() > 16 * 1024 || !line.ends_with(b"\n") {
-                    return Err(integrity());
-                }
-                let mut gap: Value = serde_json::from_slice(&line).map_err(|_| integrity())?;
-                rewrite(&mut gap)?;
-                let mut encoded = serde_json::to_vec(&gap).map_err(|_| integrity())?;
-                encoded.push(b'\n');
-                builder.gap_bytes = builder
-                    .gap_bytes
-                    .checked_add(encoded.len() as u64)
-                    .filter(|n| *n <= MAX_SHARD)
-                    .ok_or_else(capacity)?;
-                output.write_all(&encoded).map_err(|_| unavailable())?;
-                builder.gaps = builder.gaps.checked_add(1).ok_or_else(capacity)?;
-            }
-            output.sync_all().map_err(|_| unavailable())?;
-            if builder.gaps != manifest.gaps {
-                return Err(integrity());
-            }
-        }
-        builder.finish(&snapshot)
+        rebuild_frozen_sync(
+            owner,
+            root,
+            reference,
+            snapshot,
+            rewrite,
+            stop,
+            Some(permit),
+        )
     });
     tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "Crate migration canceled.")) }, result = &mut task => result.map_err(|_| unavailable())? }
+}
+
+/// Offline replay shares blocking admission with every other migration phase;
+/// serving writer/reader limits remain independent and unchanged.
+pub(crate) async fn rebuild_frozen_with_execution(
+    owner: Arc<dyn CrateCorpusStore>,
+    root: PathBuf,
+    reference: Value,
+    snapshot: Snapshot,
+    rewrite: PayloadRewrite,
+    cancel: CancellationToken,
+    execution: &crate::MigrationExecution,
+) -> Result<Value> {
+    let result = execution
+        .run(&cancel, move |stop| {
+            rebuild_frozen_sync(owner, root, reference, snapshot, rewrite, stop, None)
+        })
+        .await?;
+    if cancel.is_cancelled() {
+        return Err(Error::new("cancelled", "Crate migration canceled."));
+    }
+    Ok(result)
+}
+
+/// Requalify a previously prepared replay without creating another canonical
+/// generation. Only disposable proof-checked comparison scratch is written.
+pub(crate) async fn verify_frozen_replay_with_execution(
+    root: PathBuf,
+    original: Value,
+    canonical: Value,
+    snapshot: Snapshot,
+    rewrite: PayloadRewrite,
+    cancel: CancellationToken,
+    execution: &crate::MigrationExecution,
+) -> Result<bool> {
+    let equivalent = execution
+        .run(&cancel, move |token| {
+            let mut source = FrozenDocuments::open_admitted(&root, &original, &token, true)?;
+            let read_manifest = |reference: &Value| -> Result<Manifest> {
+                let path = root
+                    .join(reference["path"].as_str().ok_or_else(integrity)?)
+                    .join("manifest.json");
+                let bytes = fs::read(path).map_err(|_| unavailable())?;
+                if bytes.len() > MAX_MANIFEST {
+                    return Err(capacity());
+                }
+                serde_json::from_slice(&bytes).map_err(|_| integrity())
+            };
+            let source_manifest = read_manifest(&original)?;
+            let mut postings = crate::MigrationMap::new();
+            let mut expected_count = 0_u64;
+            loop {
+                let (documents, more) = source.next_page(1000)?;
+                for (mut payload, text) in documents {
+                    check(&token, Instant::now() + Duration::from_secs(15))?;
+                    from_frozen_payload(payload.clone(), text.clone())?;
+                    rewrite(&mut payload)?;
+                    from_frozen_payload(payload.clone(), text.clone())?;
+                    let digest = crate::integrity::canonical_hash_with_cancel(
+                        &json!(["crate-frozen-replay-posting-v1", payload, text]),
+                        &token,
+                    )?;
+                    let count = postings
+                        .get(&digest)
+                        .map(|value| value.parse::<u64>().map_err(|_| integrity()))
+                        .transpose()?
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or_else(capacity)?;
+                    crate::migration_map::insert(&mut postings, digest, count.to_string())?;
+                    expected_count = expected_count.checked_add(1).ok_or_else(capacity)?;
+                }
+                if !more {
+                    break;
+                }
+            }
+            drop(source);
+            let mut retained = FrozenDocuments::open_admitted(&root, &canonical, &token, true)?;
+            let retained_manifest = read_manifest(&canonical)?;
+            if retained_manifest.version != 2 {
+                return Err(integrity());
+            }
+            // A valid but unrelated old canonical occurrence is not a corrupt
+            // receipt. Keep scanning it so later malformed evidence still fails.
+            let mut equivalent = retained_manifest.inventory == snapshot.inventory.id
+                && retained_manifest.content_sequence == snapshot.content_sequence
+                && retained_manifest.enrichment == snapshot.enrichment
+                && retained_manifest.gaps == source_manifest.gaps;
+            let mut expected_samples = source_manifest.gap_samples;
+            for sample in &mut expected_samples {
+                rewrite(sample)?;
+            }
+            equivalent &= expected_samples == retained_manifest.gap_samples;
+            let mut actual_count = 0_u64;
+            loop {
+                let (documents, more) = retained.next_page(1000)?;
+                for (payload, text) in documents {
+                    check(&token, Instant::now() + Duration::from_secs(15))?;
+                    from_frozen_payload(payload.clone(), text.clone())?;
+                    let digest = crate::integrity::canonical_hash_with_cancel(
+                        &json!(["crate-frozen-replay-posting-v1", payload, text]),
+                        &token,
+                    )?;
+                    match postings.get(&digest) {
+                        Some(value) => {
+                            let count = value.parse::<u64>().map_err(|_| integrity())?;
+                            if let Some(count) = count.checked_sub(1) {
+                                crate::migration_map::insert(
+                                    &mut postings,
+                                    digest,
+                                    count.to_string(),
+                                )?;
+                            } else {
+                                equivalent = false;
+                            }
+                        }
+                        None => equivalent = false,
+                    }
+                    actual_count = actual_count.checked_add(1).ok_or_else(capacity)?;
+                }
+                if !more {
+                    break;
+                }
+            }
+            postings.ensure_healthy()?;
+            equivalent &= actual_count == expected_count;
+            let open_gaps =
+                |reference: &Value, present: bool| -> Result<Option<std::io::BufReader<File>>> {
+                    if !present {
+                        return Ok(None);
+                    }
+                    Ok(Some(std::io::BufReader::new(
+                        File::open(
+                            root.join(reference["path"].as_str().ok_or_else(integrity)?)
+                                .join("gaps.ndjson"),
+                        )
+                        .map_err(|_| unavailable())?,
+                    )))
+                };
+            let mut source_gaps = open_gaps(&original, source_manifest.gap_artifact.is_some())?;
+            let mut retained_gaps =
+                open_gaps(&canonical, retained_manifest.gap_artifact.is_some())?;
+            let mut source_count = 0_u64;
+            let mut retained_count = 0_u64;
+            loop {
+                check(&token, Instant::now() + Duration::from_secs(15))?;
+                let read_gap =
+                    |reader: &mut Option<std::io::BufReader<File>>| -> Result<Option<Value>> {
+                        let Some(reader) = reader else {
+                            return Ok(None);
+                        };
+                        let mut line = Vec::new();
+                        let bytes = reader
+                            .take(16 * 1024 + 1)
+                            .read_until(b'\n', &mut line)
+                            .map_err(|_| unavailable())?;
+                        if bytes == 0 {
+                            return Ok(None);
+                        }
+                        if line.len() > 16 * 1024 || !line.ends_with(b"\n") {
+                            return Err(integrity());
+                        }
+                        let value: Value =
+                            serde_json::from_slice(&line).map_err(|_| integrity())?;
+                        if !value.is_object() {
+                            return Err(integrity());
+                        }
+                        Ok(Some(value))
+                    };
+                let mut expected = read_gap(&mut source_gaps)?;
+                let actual = read_gap(&mut retained_gaps)?;
+                if expected.is_none() && actual.is_none() {
+                    break;
+                }
+                if let Some(expected) = &mut expected {
+                    rewrite(expected)?;
+                    source_count = source_count.checked_add(1).ok_or_else(capacity)?;
+                }
+                if actual.is_some() {
+                    retained_count = retained_count.checked_add(1).ok_or_else(capacity)?;
+                }
+                equivalent &= expected == actual;
+            }
+            if source_count != source_manifest.gaps || retained_count != retained_manifest.gaps {
+                return Err(integrity());
+            }
+            check(&token, Instant::now() + Duration::from_secs(15))?;
+            Ok(equivalent)
+        })
+        .await?;
+    if cancel.is_cancelled() {
+        return Err(Error::new(
+            "cancelled",
+            "Crate replay verification canceled.",
+        ));
+    }
+    Ok(equivalent)
+}
+
+fn rebuild_frozen_sync(
+    owner: Arc<dyn CrateCorpusStore>,
+    root: PathBuf,
+    reference: Value,
+    snapshot: Snapshot,
+    rewrite: PayloadRewrite,
+    stop: CancellationToken,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Result<Value> {
+    let mut reader = FrozenDocuments::open_admitted(&root, &reference, &stop, permit.is_none())?;
+    let source = root.join(reference["path"].as_str().ok_or_else(integrity)?);
+    let bytes = fs::read(source.join("manifest.json")).map_err(|_| unavailable())?;
+    if bytes.len() > MAX_MANIFEST {
+        return Err(capacity());
+    }
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
+    let mut builder = Builder::begin_admitted(&root, owner, stop.clone(), permit)?;
+    loop {
+        check(&stop, Instant::now() + Duration::from_secs(15))?;
+        let (documents, has_more) = reader.next_page(1000)?;
+        for (mut payload, text) in documents {
+            rewrite(&mut payload)?;
+            if !builder.add(from_frozen_payload(payload, text)?)? {
+                return Err(Error::integrity(
+                    "Frozen crate migration changed indexed membership.",
+                ));
+            }
+        }
+        if !has_more {
+            break;
+        }
+    }
+    builder.gap_samples = manifest.gap_samples;
+    for gap in &mut builder.gap_samples {
+        rewrite(gap)?;
+    }
+    if manifest.gaps > 0 {
+        let mut input = std::io::BufReader::new(
+            File::open(source.join("gaps.ndjson")).map_err(|_| unavailable())?,
+        );
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(builder.stage.join("gaps.ndjson"))
+            .map_err(|_| unavailable())?;
+        loop {
+            check(&stop, Instant::now() + Duration::from_secs(15))?;
+            let mut line = Vec::new();
+            let count = (&mut input)
+                .take(16 * 1024 + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|_| unavailable())?;
+            if count == 0 {
+                break;
+            }
+            if line.len() > 16 * 1024 || !line.ends_with(b"\n") {
+                return Err(integrity());
+            }
+            let mut gap: Value = serde_json::from_slice(&line).map_err(|_| integrity())?;
+            rewrite(&mut gap)?;
+            let mut encoded = serde_json::to_vec(&gap).map_err(|_| integrity())?;
+            encoded.push(b'\n');
+            builder.gap_bytes = builder
+                .gap_bytes
+                .checked_add(encoded.len() as u64)
+                .filter(|n| *n <= MAX_SHARD)
+                .ok_or_else(capacity)?;
+            output.write_all(&encoded).map_err(|_| unavailable())?;
+            builder.gaps = builder.gaps.checked_add(1).ok_or_else(capacity)?;
+        }
+        output.sync_all().map_err(|_| unavailable())?;
+        if builder.gaps != manifest.gaps {
+            return Err(integrity());
+        }
+    }
+    builder.finish(&snapshot)
 }
 
 /// One immutable generation consumed under the caller's maintenance fence.
@@ -1200,7 +1439,7 @@ pub(crate) struct FrozenDocuments {
     first_page_deadline: Option<Instant>,
     failed: bool,
     cancel: CancellationToken,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
     #[cfg(test)]
     visited_documents: usize,
 }
@@ -1217,14 +1456,29 @@ type FrozenDocumentPage = (Vec<(Value, String)>, bool);
 
 impl FrozenDocuments {
     pub(crate) fn open(root: &Path, reference: &Value, cancel: &CancellationToken) -> Result<Self> {
+        Self::open_admitted(root, reference, cancel, false)
+    }
+
+    fn open_admitted(
+        root: &Path,
+        reference: &Value,
+        cancel: &CancellationToken,
+        offline: bool,
+    ) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(15);
         check(cancel, deadline)?;
-        let permit = READERS
-            .get_or_init(|| Arc::new(Semaphore::new(2)))
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity())?;
-        let opened = open(root, reference, cancel, deadline)?;
+        let permit = if offline {
+            None
+        } else {
+            Some(
+                READERS
+                    .get_or_init(|| Arc::new(Semaphore::new(2)))
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| capacity())?,
+            )
+        };
+        let opened = open_inner(root, reference, cancel, deadline, offline)?;
         let schema = schema();
         let payload_field = field(&schema, "payload")?;
         let text_field = field(&schema, "technical")?;
@@ -1938,6 +2192,80 @@ mod frozen_tests {
     }
 
     #[tokio::test]
+    async fn offline_frozen_rebuilds_share_workers_and_bypass_serving_gates() {
+        let _serial = TEST_BUILD.lock().await;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = tests::fixture();
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let mut builder = builder(root.path(), store.clone());
+        assert!(
+            builder
+                .add(document(1, "retained transport cats".into()))
+                .unwrap()
+        );
+        assert!(
+            builder
+                .add(document(2, "retained transport dogs".into()))
+                .unwrap()
+        );
+        let reference = builder.finish(&snapshot).unwrap();
+        let writer = WRITER
+            .get_or_init(|| Arc::new(Semaphore::new(1)))
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let readers = READERS
+            .get_or_init(|| Arc::new(Semaphore::new(2)))
+            .clone()
+            .try_acquire_many_owned(2)
+            .unwrap();
+        let context =
+            crate::MigrationExecution::new(crate::MigrationExecutionOptions::new(2, 1024).unwrap())
+                .unwrap();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let rewrite: PayloadRewrite = Arc::new(move |_| {
+            gate.wait();
+            Ok(())
+        });
+        let (first, second) = tokio::join!(
+            rebuild_frozen_with_execution(
+                store.clone(),
+                root.path().to_owned(),
+                reference.clone(),
+                snapshot.clone(),
+                rewrite.clone(),
+                CancellationToken::new(),
+                &context
+            ),
+            rebuild_frozen_with_execution(
+                store.clone(),
+                root.path().to_owned(),
+                reference.clone(),
+                snapshot,
+                rewrite,
+                CancellationToken::new(),
+                &context
+            ),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(context.snapshot().high_water, 2);
+        assert_eq!(context.snapshot().active, 0);
+        assert_eq!(READERS.get().unwrap().available_permits(), 0);
+        assert_eq!(WRITER.get().unwrap().available_permits(), 0);
+        drop(readers);
+        drop(writer);
+        assert_eq!(
+            retained_rows(root.path(), &first, 100).0,
+            retained_rows(root.path(), &reference, 100).0
+        );
+        assert_eq!(
+            retained_rows(root.path(), &second, 100).0,
+            retained_rows(root.path(), &reference, 100).0
+        );
+    }
+
+    #[tokio::test]
     async fn frozen_rebuild_opens_once_and_preserves_multishard_rows_deletions_and_gaps() {
         let _serial = TEST_BUILD.lock().await;
         let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -2031,8 +2359,8 @@ mod frozen_tests {
             store,
             root.path().to_owned(),
             original.clone(),
-            snapshot,
-            rewrite,
+            snapshot.clone(),
+            rewrite.clone(),
             CancellationToken::new(),
         )
         .await
@@ -2050,6 +2378,84 @@ mod frozen_tests {
             expected.len(),
             expected.len(),
         );
+        let context =
+            crate::MigrationExecution::new(crate::MigrationExecutionOptions::new(2, 1024).unwrap())
+                .unwrap();
+        let directories = fs::read_dir(root.path().join("crate-indexes"))
+            .unwrap()
+            .count();
+        assert!(
+            verify_frozen_replay_with_execution(
+                root.path().to_owned(),
+                original.clone(),
+                rebuilt.clone(),
+                snapshot.clone(),
+                rewrite.clone(),
+                CancellationToken::new(),
+                &context,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            fs::read_dir(root.path().join("crate-indexes"))
+                .unwrap()
+                .count(),
+            directories,
+            "receipt verification creates no permanent index generation"
+        );
+        let mut wrong_snapshot = snapshot.clone();
+        wrong_snapshot.content_sequence += 1;
+        assert!(
+            verify_frozen_replay_with_execution(
+                root.path().to_owned(),
+                original.clone(),
+                rebuilt.clone(),
+                wrong_snapshot,
+                rewrite.clone(),
+                CancellationToken::new(),
+                &context
+            )
+            .await
+            .is_ok_and(|equivalent| !equivalent),
+            "a fully verified unrelated canonical manifest is a semantic nonmatch"
+        );
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(
+                root.path()
+                    .join(rebuilt["path"].as_str().unwrap())
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let shard = &manifest.shards[0];
+        let path = root
+            .path()
+            .join(rebuilt["path"].as_str().unwrap())
+            .join(&shard.name)
+            .join(shard.files.keys().next().unwrap());
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"changed after receipt")
+            .unwrap();
+        assert!(
+            verify_frozen_replay_with_execution(
+                root.path().to_owned(),
+                original,
+                rebuilt,
+                snapshot,
+                rewrite,
+                CancellationToken::new(),
+                &context
+            )
+            .await
+            .is_err(),
+            "receipt reuse rehashes canonical bytes after cached reads"
+        );
+        assert_eq!(context.snapshot().active, 0);
     }
 
     #[test]

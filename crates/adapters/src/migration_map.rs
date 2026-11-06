@@ -20,6 +20,9 @@ struct State {
     root: PathBuf,
     entries: AtomicUsize,
     failed: AtomicBool,
+    prefix: String,
+    provider: Option<String>,
+    base: Option<MigrationMap>,
 }
 
 /// Derived references spill below /tmp instead of imposing a total history cap.
@@ -58,8 +61,51 @@ impl MigrationMap {
                 root,
                 entries: AtomicUsize::new(0),
                 failed: AtomicBool::new(false),
+                prefix: String::new(),
+                provider: None,
+                base: None,
             }),
         }
+    }
+    /// Provider-local writes share one proof-checked scratch/cache with an immutable base.
+    pub(crate) fn fork(&self, provider: &str) -> Result<Self> {
+        if self.state.base.is_some()
+            || !matches!(
+                provider,
+                "rfc" | "advisory" | "crate" | "npm" | "mdn" | "whatwg" | "w3c" | "chromium"
+            )
+        {
+            return Err(Error::invalid("Invalid migration mapping scope."));
+        }
+        let workspace = self.workspace()?;
+        let scope = workspace.group()?;
+        Ok(Self {
+            state: Arc::new(State {
+                workspace: Mutex::new(Some(workspace)),
+                root: self.state.root.clone(),
+                entries: AtomicUsize::new(self.len()),
+                failed: AtomicBool::new(false),
+                prefix: format!("\0devres-scope:{scope}:"),
+                provider: Some(provider.to_owned()),
+                base: Some(self.clone()),
+            }),
+        })
+    }
+    /// Private memo records reuse the same bounded cache without inheriting references.
+    pub(crate) fn scratch(&self) -> Result<Self> {
+        let workspace = self.workspace()?;
+        let scope = workspace.group()?;
+        Ok(Self {
+            state: Arc::new(State {
+                workspace: Mutex::new(Some(workspace)),
+                root: self.state.root.clone(),
+                entries: AtomicUsize::new(0),
+                failed: AtomicBool::new(false),
+                prefix: format!("\0devres-scope:{scope}:"),
+                provider: None,
+                base: None,
+            }),
+        })
     }
     pub fn len(&self) -> usize {
         self.state.entries.load(Ordering::Acquire)
@@ -130,7 +176,11 @@ impl MigrationMap {
     }
     pub fn get(&self, key: &str) -> Option<String> {
         match self.existing_workspace() {
-            Ok(Some(workspace)) => workspace.get(key).ok().flatten(),
+            Ok(Some(workspace)) => workspace
+                .get(&format!("{}{key}", self.state.prefix))
+                .ok()
+                .flatten()
+                .or_else(|| self.state.base.as_ref().and_then(|base| base.get(key))),
             Ok(None) => None,
             Err(_) => {
                 self.state.failed.store(true, Ordering::Release);
@@ -144,9 +194,15 @@ impl MigrationMap {
     pub fn lookup_legacy_key_hash(&self, namespace: &str, hash: &str) -> Option<String> {
         match self.existing_workspace() {
             Ok(Some(workspace)) => workspace
-                .lookup_legacy_key_hash(namespace, hash)
+                .lookup_legacy_key_hash(&format!("{}{namespace}", self.state.prefix), hash)
                 .ok()
-                .flatten(),
+                .flatten()
+                .or_else(|| {
+                    self.state
+                        .base
+                        .as_ref()
+                        .and_then(|base| base.lookup_legacy_key_hash(namespace, hash))
+                }),
             Ok(None) => None,
             Err(_) => {
                 self.state.failed.store(true, Ordering::Release);
@@ -154,7 +210,7 @@ impl MigrationMap {
             }
         }
     }
-    pub fn iter(&self) -> impl Iterator<Item = (String, String)> + '_ {
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (String, String)> + '_> {
         let workspace = match self.existing_workspace() {
             Ok(value) => value,
             Err(_) => {
@@ -162,14 +218,35 @@ impl MigrationMap {
                 None
             }
         };
-        spill::MapIter {
+        let local = spill::MapIter {
+            prefix: self.state.prefix.clone(),
             workspace,
             page: std::collections::VecDeque::new(),
             after: None,
             done: false,
             charged: 0,
             charged_rows: 0,
-        }
+        };
+        let Some(base) = &self.state.base else {
+            return Box::new(local);
+        };
+        let mut left = base.iter().peekable();
+        let mut right = local.peekable();
+        Box::new(std::iter::from_fn(move || {
+            match (left.peek(), right.peek()) {
+                (Some((a, _)), Some((b, _))) => match a.cmp(b) {
+                    std::cmp::Ordering::Less => left.next(),
+                    std::cmp::Ordering::Equal => {
+                        left.next();
+                        right.next()
+                    }
+                    std::cmp::Ordering::Greater => right.next(),
+                },
+                (Some(_), None) => left.next(),
+                (None, Some(_)) => right.next(),
+                (None, None) => None,
+            }
+        }))
     }
 }
 
@@ -179,7 +256,38 @@ pub(crate) fn insert(map: &mut MigrationMap, key: String, value: String) -> Resu
         return Err(Error::integrity("Reserved migration identity."));
     }
     let workspace = map.workspace()?;
-    let existed = workspace.put(&key, &value)?;
+    let shared = key.starts_with("mdn:manifest:") || key.starts_with("mdn:manifest-descriptor:");
+    if let Some(provider) = &map.state.provider {
+        if !key.starts_with(&format!("{provider}:"))
+            && !(shared && matches!(provider.as_str(), "mdn" | "whatwg" | "w3c" | "chromium"))
+        {
+            return Err(Error::integrity(
+                "Migration mapping escaped its provider namespace.",
+            ));
+        }
+        if map
+            .state
+            .base
+            .as_ref()
+            .and_then(|base| base.get(&key))
+            .is_some_and(|old| old != value)
+        {
+            return Err(Error::integrity(
+                "Migration mapping conflicts with qualified evidence.",
+            ));
+        }
+        if shared {
+            workspace.put_shared(&key, &value)?;
+        }
+    } else if key.starts_with('\0') {
+        return Err(Error::integrity("Reserved migration mapping namespace."));
+    }
+    let existed_in_base = map
+        .state
+        .base
+        .as_ref()
+        .is_some_and(|base| base.contains_key(&key));
+    let existed = workspace.put(&format!("{}{key}", map.state.prefix), &value)? || existed_in_base;
     if !existed {
         map.state
             .entries
@@ -213,6 +321,45 @@ mod tests {
         format!("blake3:{}", id(n))
     }
 
+    #[test]
+    fn provider_forks_share_cache_but_isolate_writes_and_validate_shared_manifests() {
+        let mut base = MigrationMap::new();
+        insert(&mut base, "capture:legacy".into(), canonical(1)).unwrap();
+        let mut mdn = base.fork("mdn").unwrap();
+        let mut whatwg = base.fork("whatwg").unwrap();
+        assert!(Arc::ptr_eq(
+            &mdn.workspace().unwrap(),
+            &whatwg.workspace().unwrap()
+        ));
+        assert_eq!(mdn.get("capture:legacy"), Some(canonical(1)));
+        insert(&mut mdn, "mdn:projections:old".into(), canonical(2)).unwrap();
+        assert!(whatwg.get("mdn:projections:old").is_none());
+        assert!(base.get("mdn:projections:old").is_none());
+        assert!(insert(&mut whatwg, "mdn:projections:old".into(), canonical(2)).is_err());
+        assert!(insert(&mut mdn, "capture:legacy".into(), canonical(3)).is_err());
+        let shared = "mdn:manifest:legacy";
+        insert(&mut mdn, shared.into(), canonical(4)).unwrap();
+        insert(&mut whatwg, shared.into(), canonical(4)).unwrap();
+        assert_eq!(mdn.iter().collect::<BTreeMap<_, _>>().len(), 3);
+        assert_eq!(base.iter().count(), 1);
+        let reader = mdn.clone();
+        assert!(insert(&mut mdn, "mdn:projections:next".into(), canonical(5)).is_err());
+        drop(reader);
+        let old = "opaque:legacy-key";
+        insert(&mut mdn, format!("mdn:snapshot-keys:{old}"), canonical(6)).unwrap();
+        let digest = hex::encode(sha2::Sha256::digest(old.as_bytes()));
+        assert_eq!(
+            mdn.lookup_legacy_key_hash("mdn:snapshot-keys", &digest),
+            Some(canonical(6))
+        );
+        assert!(
+            whatwg
+                .lookup_legacy_key_hash("mdn:snapshot-keys", &digest)
+                .is_none()
+        );
+        assert!(insert(&mut whatwg, shared.into(), canonical(7)).is_err());
+        assert!(base.ensure_healthy().is_err());
+    }
     #[test]
     fn spill_replacements_iteration_and_algorithms_preserve_exact_strings() {
         let mut map = MigrationMap::new();

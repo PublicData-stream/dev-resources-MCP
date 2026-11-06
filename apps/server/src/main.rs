@@ -31,7 +31,10 @@ async fn main() -> Result<(), ServerError> {
         let offline = offline_cli::parse(&args)?;
         let command = offline.command.as_str();
         let path = &offline.path;
-        let execution = devres_adapters::MigrationExecution::new(offline.options)?;
+        let execution = devres_adapters::MigrationExecution::new_with_graph_options(
+            offline.options,
+            offline.graph_options,
+        )?;
         execution.enable_progress();
         let config = Config::load(Path::new(path)).await?;
         let store = Arc::new(match command {

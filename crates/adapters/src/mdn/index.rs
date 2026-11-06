@@ -43,6 +43,9 @@ const MAX_MANIFEST: usize = 2 * 1024 * 1024;
 static STAGE: AtomicU64 = AtomicU64::new(0);
 static WRITERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static READERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+type OfflineTargetLock = tokio::sync::Mutex<()>;
+static OFFLINE_TARGETS: OnceLock<Mutex<HashMap<PathBuf, Weak<OfflineTargetLock>>>> =
+    OnceLock::new();
 #[cfg(test)]
 pub(crate) static TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn failure() -> Error {
@@ -53,6 +56,59 @@ fn integrity() -> Error {
 }
 fn capacity() -> Error {
     Error::capacity("MDN search processing bound exceeded.")
+}
+
+async fn index_blocking<T, F>(
+    execution: Option<&crate::MigrationExecution>,
+    cancel: &CancellationToken,
+    work: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(CancellationToken) -> Result<T> + Send + 'static,
+{
+    if let Some(execution) = execution {
+        return execution.run(cancel, work).await;
+    }
+    let stop = cancel.child_token();
+    let _guard = CancelOnDrop(stop.clone());
+    let mut task = tokio::task::spawn_blocking(move || work(stop));
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = task.await;
+            Err(Error::new("cancelled", "MDN index work canceled."))
+        }
+        result = &mut task => result.map_err(|_| failure())?,
+    }
+}
+
+fn offline_target(
+    root: &Path,
+    documents: &[IndexDocument],
+    generation: &str,
+) -> Result<Arc<OfflineTargetLock>> {
+    let mut digest = blake3::Hasher::new();
+    digest.update(&FORMAT_VERSION.to_be_bytes());
+    digest.update(&(generation.len() as u64).to_be_bytes());
+    digest.update(generation.as_bytes());
+    for document in documents {
+        let bytes = serde_json::to_vec(document).map_err(|_| integrity())?;
+        digest.update(&(bytes.len() as u64).to_be_bytes());
+        digest.update(&bytes);
+    }
+    let key = root.join(digest.finalize().to_hex().as_str());
+    let mut targets = OFFLINE_TARGETS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| failure())?;
+    targets.retain(|_, target| target.strong_count() != 0);
+    if let Some(target) = targets.get(&key).and_then(Weak::upgrade) {
+        return Ok(target);
+    }
+    let target = Arc::new(OfflineTargetLock::new(()));
+    targets.insert(key, Arc::downgrade(&target));
+    Ok(target)
 }
 fn reference_digest(reference: &Value) -> Result<&str> {
     match (reference.get("digest"), reference.get("sha256")) {
@@ -309,7 +365,7 @@ fn document_payload(input: &IndexDocument) -> Result<String> {
     }
     Ok(payload)
 }
-fn document_counts(input: &IndexDocument, cancel: &CancellationToken) -> Result<[u64; 2]> {
+fn document_bounds(input: &IndexDocument) -> Result<()> {
     if !valid_hash(&input.id)
         || input.text.len() > 4 * 1024 * 1024
         || input.slug.len() > 4096
@@ -319,6 +375,10 @@ fn document_counts(input: &IndexDocument, cancel: &CancellationToken) -> Result<
         return Err(capacity());
     }
     document_payload(input)?;
+    Ok(())
+}
+fn document_counts(input: &IndexDocument, cancel: &CancellationToken) -> Result<[u64; 2]> {
+    document_bounds(input)?;
     let text = format!("{}\n{}\n{}", input.title, input.slug, input.text);
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut counts = [0u64; 2];
@@ -340,6 +400,10 @@ impl MdnIndex {
     /// Pure per-document admission; collectors retain source/projection and record a search gap on failure.
     pub fn validate_document(input: &IndexDocument, cancel: &CancellationToken) -> Result<()> {
         document_counts(input, cancel).map(|_| ())
+    }
+    /// Allocation bounds shared with frozen replay before retaining a whole group.
+    pub(crate) fn validate_document_bounds(input: &IndexDocument) -> Result<()> {
+        document_bounds(input)
     }
     /// Bind the expected index location without creating or recovering directories.
     pub(crate) fn for_verification(root: &Path) -> Result<Self> {
@@ -420,41 +484,67 @@ impl MdnIndex {
         reference: &Value,
         cancel: CancellationToken,
     ) -> Result<FrozenDocuments> {
-        let permit = READERS
-            .get_or_init(|| Arc::new(Semaphore::new(2)))
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity())?;
+        self.frozen_documents_inner(reference, cancel, None).await
+    }
+
+    /// Explicit maintenance admission bypasses the independent serving gates.
+    pub(crate) async fn frozen_documents_with_execution(
+        &self,
+        reference: &Value,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<FrozenDocuments> {
+        self.frozen_documents_inner(reference, cancel, Some(execution))
+            .await
+    }
+
+    async fn frozen_documents_inner(
+        &self,
+        reference: &Value,
+        cancel: CancellationToken,
+        execution: Option<&crate::MigrationExecution>,
+    ) -> Result<FrozenDocuments> {
+        let permit = if execution.is_none() {
+            Some(
+                READERS
+                    .get_or_init(|| Arc::new(Semaphore::new(2)))
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| capacity())?,
+            )
+        } else {
+            None
+        };
         let stop = cancel.child_token();
         let mut cursor = FrozenDocuments {
             cancel: stop.clone(),
+            execution: execution.cloned(),
             state: None,
             exhausted: false,
         };
-        let this = self.clone();
+        let mut this = self.clone();
+        // Offline consumers re-verify each retained generation, independently
+        // of serving readers cached by earlier operations.
+        if execution.is_some() {
+            this.verification_only = true;
+        }
         let reference = reference.clone();
-        let mut task = tokio::task::spawn_blocking(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let opened = this.open(&reference, &stop, deadline)?;
-            Ok::<_, Error>(FrozenDocumentState {
-                _permit: permit,
-                opened,
-                shard: 0,
-                segment: 0,
-                live: Vec::new(),
-                position: 0,
-                first_deadline: Some(deadline),
+        cursor.state = Some(
+            index_blocking(execution, &stop, move |token| {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let opened = this.open(&reference, &token, deadline)?;
+                Ok(FrozenDocumentState {
+                    _permit: permit,
+                    opened,
+                    shard: 0,
+                    segment: 0,
+                    live: Vec::new(),
+                    position: 0,
+                    first_deadline: Some(deadline),
+                })
             })
-        });
-        cursor.state = Some(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                cursor.cancel.cancel();
-                let _ = task.await;
-                return Err(Error::new("cancelled", "MDN index export canceled."));
-            }
-            result = &mut task => result.map_err(|_| failure())??,
-        });
+            .await?,
+        );
         Ok(cursor)
     }
 
@@ -534,6 +624,88 @@ impl MdnIndex {
         tokio::select! { biased; _ = cancel.cancelled() => { let _ = task.await; Err(Error::new("cancelled", "MDN index export canceled.")) }, result = &mut task => result.map_err(|_| failure())? }
     }
 
+    /// Exact posting export using the shared offline worker admission.
+    pub async fn document_ids_with_execution(
+        &self,
+        reference: &Value,
+        after: usize,
+        limit: usize,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<(Vec<String>, Option<usize>)> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::invalid("Invalid index export page."));
+        }
+        let mut reader = self
+            .frozen_documents_with_execution(reference, cancel, execution)
+            .await?;
+        let mut position = 0usize;
+        while position < after {
+            let (ids, more) = reader.next_page((after - position).min(1000)).await?;
+            position = position.checked_add(ids.len()).ok_or_else(capacity)?;
+            if position < after && !more {
+                return Err(Error::invalid(
+                    "Index export cursor exceeds retained membership.",
+                ));
+            }
+        }
+        let (ids, more) = reader.next_page(limit).await?;
+        position = position.checked_add(ids.len()).ok_or_else(capacity)?;
+        Ok((ids, more.then_some(position)))
+    }
+
+    pub async fn publish_with_execution(
+        &self,
+        previous: Option<&Value>,
+        documents: Vec<IndexDocument>,
+        cancel: CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<Value> {
+        self.publish_generation_with_execution(previous, documents, cancel, "", execution)
+            .await
+    }
+
+    /// Private offline publication shares command admission and coordinates identical targets.
+    pub async fn publish_generation_with_execution(
+        &self,
+        previous: Option<&Value>,
+        documents: Vec<IndexDocument>,
+        cancel: CancellationToken,
+        generation: &str,
+        execution: &crate::MigrationExecution,
+    ) -> Result<Value> {
+        self.require_writable()?;
+        if generation.len() > 128 || generation.chars().any(char::is_control) {
+            return Err(Error::invalid("Invalid MDN index processing generation."));
+        }
+        if documents.len() > MAX_DOCS {
+            return Err(capacity());
+        }
+        let root = self.root.clone();
+        let generation = generation.to_owned();
+        let (target, documents, generation) =
+            index_blocking(Some(execution), &cancel, move |token| {
+                check(&token, Instant::now() + Duration::from_secs(3600))?;
+                let target = offline_target(&root, &documents, &generation)?;
+                Ok((target, documents, generation))
+            })
+            .await?;
+        let _target = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::new("cancelled", "MDN indexing canceled.")),
+            guard = target.lock() => guard,
+        };
+        let mut this = self.clone();
+        // Public writability was checked above. Only uncached verification is
+        // changed for the private synchronous publication below.
+        this.verification_only = true;
+        let previous = previous.cloned();
+        index_blocking(Some(execution), &cancel, move |token| {
+            this.publish_sync(previous, documents, &token, &generation)
+        })
+        .await
+    }
+
     pub async fn publish(
         &self,
         previous: Option<&Value>,
@@ -581,6 +753,13 @@ impl MdnIndex {
         if documents.is_empty()
             && let Some(previous) = previous
         {
+            if self.verification_only {
+                self.open(
+                    &previous,
+                    cancel,
+                    Instant::now() + Duration::from_secs(3600),
+                )?;
+            }
             return Ok(previous);
         }
         if documents.len() > MAX_DOCS {
@@ -1249,11 +1428,12 @@ struct Opened {
 /// Retain verified immutable readers for exactly one forward traversal.
 pub(crate) struct FrozenDocuments {
     cancel: CancellationToken,
+    execution: Option<crate::MigrationExecution>,
     state: Option<FrozenDocumentState>,
     exhausted: bool,
 }
 struct FrozenDocumentState {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     opened: Arc<Opened>,
     shard: usize,
     segment: usize,
@@ -1371,22 +1551,15 @@ impl FrozenDocuments {
             .ok_or_else(|| Error::unavailable("MDN index export session is closed."))?;
         let stop = self.cancel.child_token();
         let _guard = CancelOnDrop(stop.clone());
-        let mut task = tokio::task::spawn_blocking(move || {
+        let (state, ids, has_more) = index_blocking(self.execution.as_ref(), &stop, move |token| {
             let deadline = state
                 .first_deadline
                 .take()
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
-            let (ids, has_more) = state.page(limit, &stop, deadline)?;
-            Ok::<_, Error>((state, ids, has_more))
-        });
-        let (state, ids, has_more) = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => {
-                let _ = task.await;
-                return Err(Error::new("cancelled", "MDN index export canceled."));
-            }
-            result = &mut task => result.map_err(|_| failure())??,
-        };
+            let (ids, has_more) = state.page(limit, &token, deadline)?;
+            Ok((state, ids, has_more))
+        })
+        .await?;
         if has_more {
             self.state = Some(state);
         } else {
@@ -1762,6 +1935,94 @@ fn query(field: Field, input: &str, mode: &str) -> Result<Box<dyn Query>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn offline_replay_bypasses_serving_gates_and_coordinates_identical_targets() {
+        let _gate = TEST_GATE.lock().await;
+        let root = tempfile::tempdir_in("/tmp").expect("fixture root");
+        let index = MdnIndex::new(root.path()).expect("index");
+        let _writer = WRITERS
+            .get_or_init(|| Arc::new(Semaphore::new(1)))
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("serving writer");
+        let _readers = READERS
+            .get_or_init(|| Arc::new(Semaphore::new(2)))
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .expect("serving readers");
+        let execution = crate::MigrationExecution::new(
+            crate::MigrationExecutionOptions::new(2, 64 * 1024 * 1024).expect("limits"),
+        )
+        .expect("execution");
+        let token = CancellationToken::new();
+        assert_eq!(
+            index
+                .publish(
+                    None,
+                    vec![doc("offline", "Offline", "retained")],
+                    token.clone()
+                )
+                .await
+                .expect_err("serving admission remains bounded")
+                .code,
+            "capacity"
+        );
+        let (first, second) = tokio::join!(
+            index.publish_with_execution(
+                None,
+                vec![doc("offline", "Offline", "retained")],
+                token.clone(),
+                &execution
+            ),
+            index.publish_with_execution(
+                None,
+                vec![doc("offline", "Offline", "retained")],
+                token.clone(),
+                &execution
+            ),
+        );
+        let first = first.expect("first publication");
+        assert_eq!(first, second.expect("identical concurrent target"));
+        let mut reader = index
+            .frozen_documents_with_execution(&first, token.clone(), &execution)
+            .await
+            .expect("offline reader");
+        let (ids, more) = reader.next_page(100).await.expect("posting page");
+        assert_eq!(ids, vec![doc("offline", "Offline", "retained").id]);
+        assert!(!more);
+        assert_eq!(execution.snapshot().active, 0, "all blocking jobs joined");
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(
+                root.path()
+                    .join(first["path"].as_str().expect("manifest path")),
+            )
+            .expect("manifest bytes"),
+        )
+        .expect("manifest");
+        let shard = manifest.shard.expect("shard");
+        let name = shard.files.keys().next().expect("retained file");
+        let path = root
+            .path()
+            .join("mdn-indexes/shards")
+            .join(index_suffix(&shard.id).expect("shard identity"))
+            .join(name);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("fixture file");
+        file.write_all(b"corrupt").expect("fixture corruption");
+        assert!(
+            index
+                .frozen_documents_with_execution(&first, token, &execution)
+                .await
+                .is_err(),
+            "subsequent offline use re-verifies immutable evidence"
+        );
+    }
+
     fn raw_cursor(
         root: &Path,
         payloads: &[(&str, String)],
@@ -1795,8 +2056,9 @@ mod tests {
             .expect("reader permit");
         FrozenDocuments {
             cancel: CancellationToken::new(),
+            execution: None,
             state: Some(FrozenDocumentState {
-                _permit: permit,
+                _permit: Some(permit),
                 opened: Arc::new(Opened {
                     shards: vec![Arc::new(OpenedShard {
                         _reader: reader,

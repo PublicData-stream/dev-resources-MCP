@@ -625,95 +625,203 @@ impl PgBlobStore {
         mappings: &mut crate::migration_map::MigrationMap,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.migrate_rfc_graph_with_execution(
+            mappings,
+            cancel,
+            &crate::MigrationExecution::default(),
+        )
+        .await
+    }
+
+    pub async fn migrate_rfc_graph_with_execution(
+        &self,
+        mappings: &mut crate::migration_map::MigrationMap,
+        cancel: tokio_util::sync::CancellationToken,
+        execution: &crate::MigrationExecution,
+    ) -> Result<crate::migration_map::MigrationAliases> {
         self.fence().await?;
         let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         let mut after = (String::new(), String::new());
         loop {
             migration_cancel(&cancel)?;
-            let rows=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE capture_id NOT LIKE 'blake3:%' AND (kind,capture_id)>($1,$2) ORDER BY kind,capture_id LIMIT 1")
-                .bind(&after.0).bind(&after.1).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
-            if rows.is_empty() {
+            let metadata=sqlx::query("SELECT kind,capture_id AS key,octet_length(data::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_datasets WHERE capture_id NOT LIKE 'blake3:%' AND (kind,capture_id)>($1,$2) ORDER BY kind,capture_id LIMIT 1")
+                .bind(&after.0).bind(&after.1).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let Some(metadata) = metadata else {
                 break;
-            }
-            for row in rows {
-                let kind: String = row.try_get("kind").map_err(|_| storage_error())?;
-                let old: String = row.try_get("key").map_err(|_| storage_error())?;
-                let mut dataset: Dataset =
-                    decode(payload_integrity::row("devres_rfc_datasets", &row)?)?;
-                migrate_rfc_capture(&mut dataset.capture, mappings)?;
-                self.save_dataset(&kind, &dataset).await?;
-                {
-                    let alias = (
-                        format!("dataset-{kind}"),
-                        old.clone(),
-                        dataset.capture.id.clone(),
-                    );
-
-                    aliases.push(alias)?;
-                }
-                after = (kind, old);
-            }
+            };
+            let kind: String = metadata.try_get("kind").map_err(|_| storage_error())?;
+            let old: String = metadata.try_get("key").map_err(|_| storage_error())?;
+            let charge = rfc_migration_input_charge(&metadata)?;
+            let _reservation = execution.graph_reserve(charge, &cancel).await?;
+            let row = sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2")
+                .bind(&kind).bind(&old).fetch_one(&self.pool).await.map_err(|_| storage_error())?;
+            let mut dataset: Dataset =
+                decode(payload_integrity::row("devres_rfc_datasets", &row)?)?;
+            migrate_rfc_capture(&mut dataset.capture, mappings)?;
+            self.save_dataset(&kind, &dataset).await?;
+            aliases.push((
+                format!("dataset-{kind}"),
+                old.clone(),
+                dataset.capture.id.clone(),
+            ))?;
+            after = (kind, old);
         }
         let mut after = 0_i64;
         let mut index_cache = crate::rfc::index::MigrationRebuildCache::default();
+        let mut admitted = 0_u64;
+        let mut committed = 0_u64;
         loop {
             migration_cancel(&cancel)?;
-            let found=sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%' AND published_order>$1 ORDER BY published_order LIMIT 1")
-                .bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(found) = found else {
-                break;
-            };
-            let old: String = found.try_get("key").map_err(|_| storage_error())?;
-            let mut snapshot: Snapshot =
-                decode(payload_integrity::row("devres_rfc_snapshots", &found)?)?;
-            snapshot.catalogue_capture =
-                migration_reference(&snapshot.catalogue_capture, mappings)?;
-            snapshot.errata_capture = snapshot
-                .errata_capture
-                .as_deref()
-                .map(|id| migration_reference(id, mappings))
-                .transpose()?;
-            for document in snapshot
-                .documents
-                .iter_mut()
-                .chain(snapshot.search_documents.iter_mut())
+            let mut window = Vec::new();
+            let mut window_bytes = 0_usize;
+            let mut next = after;
+            while window.len()
+                < execution
+                    .options()
+                    .workers
+                    .min(crate::migration_execution::MIGRATION_WINDOW_RECORDS)
             {
-                migrate_rfc_capture(&mut document.capture, mappings)?;
-            }
-            let original_index = snapshot.index_path.take();
-            snapshot.id = String::new();
-            let identity =
-                serde_json::to_value(("devres:storage-migration:snapshot:v1", &old, &snapshot))
+                let found=sqlx::query("SELECT published_order,id AS key,octet_length(data::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%' AND published_order>$1 ORDER BY published_order LIMIT 1")
+                    .bind(next).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+                let Some(found) = found else {
+                    break;
+                };
+                let payload_bytes = usize::try_from(
+                    found
+                        .try_get::<i64, _>("payload_bytes")
+                        .map_err(|_| storage_error())?,
+                )
+                .map_err(|_| storage_error())?;
+                // Typed snapshots, checksum envelopes and temporary JSON clones
+                // remain charged alongside a 64 MiB writer, queued documents,
+                // export page, pending document and membership bookkeeping.
+                let payload_nodes = usize::try_from(
+                    found
+                        .try_get::<i64, _>("payload_nodes")
+                        .map_err(|_| storage_error())?,
+                )
+                .map_err(|_| storage_error())?;
+                let estimated_bytes =
+                    crate::MigrationExecution::graph_input_charge(payload_bytes, payload_nodes)?
+                        .checked_add(192 * 1024 * 1024)
+                        .ok_or_else(|| {
+                            Error::capacity("RFC migration memory accounting overflow.")
+                        })?;
+                let proposed = window_bytes
+                    .checked_add(estimated_bytes)
+                    .ok_or_else(|| Error::capacity("RFC migration memory accounting overflow."))?;
+                if !window.is_empty() && proposed > execution.graph_options().memory_budget_bytes {
+                    break;
+                }
+                let old: String = found.try_get("key").map_err(|_| storage_error())?;
+                next = found
+                    .try_get("published_order")
                     .map_err(|_| storage_error())?;
-            let id = crate::integrity::canonical_hash(&identity)?;
-            snapshot.id = id.clone();
-            if let Some(path) = original_index {
-                snapshot.index_path = Some(
-                    crate::rfc::index::rebuild_frozen_cached(
-                        self.root.clone(),
-                        path,
-                        id.clone(),
-                        cancel.child_token(),
-                        &mut index_cache,
-                    )
-                    .await?,
+                window.push(((next, old), estimated_bytes));
+                window_bytes = proposed;
+                if window_bytes > execution.graph_options().memory_budget_bytes {
+                    break;
+                }
+            }
+            if window.is_empty() {
+                break;
+            }
+            admitted += window.len() as u64;
+            let previous = index_cache.clone();
+            let read_mappings: &crate::migration_map::MigrationMap = mappings;
+            let prepared = execution
+                .graph_map_ordered(
+                    window,
+                    &cancel,
+                    |(order, old), token| {
+                        let mut cache = previous.clone();
+                        let root = self.root.clone();
+                        async move {
+                            migration_cancel(&token)?;
+                            let found = sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE published_order=$1 AND id=$2")
+                                .bind(order).bind(&old).fetch_one(&self.pool).await.map_err(|_| storage_error())?;
+                            let mut snapshot: Snapshot =
+                                decode(payload_integrity::row("devres_rfc_snapshots", &found)?)?;
+                            snapshot.catalogue_capture =
+                                migration_reference(&snapshot.catalogue_capture, read_mappings)?;
+                            snapshot.errata_capture = snapshot
+                                .errata_capture
+                                .as_deref()
+                                .map(|id| migration_reference(id, read_mappings))
+                                .transpose()?;
+                            for document in snapshot
+                                .documents
+                                .iter_mut()
+                                .chain(snapshot.search_documents.iter_mut())
+                            {
+                                migrate_rfc_capture(&mut document.capture, read_mappings)?;
+                            }
+                            let original_index = snapshot.index_path.take();
+                            snapshot.id = String::new();
+                            let identity =
+                                serde_json::to_value(("devres:storage-migration:snapshot:v1", &old, &snapshot))
+                                    .map_err(|_| storage_error())?;
+                            snapshot.id = crate::integrity::canonical_hash(&identity)?;
+                            let changed_cache = if let Some(path) = original_index {
+                                snapshot.index_path = Some(
+                                    crate::rfc::index::rebuild_frozen_cached_with_execution(
+                                        root,
+                                        path,
+                                        snapshot.id.clone(),
+                                        token,
+                                        &mut cache,
+                                        execution,
+                                    )
+                                    .await?,
+                                );
+                                Some(cache)
+                            } else {
+                                None
+                            };
+                            Ok((order, old, snapshot, changed_cache))
+                        }
+                    },
+                )
+                .await?;
+            execution.report(
+                "graph_rfc_indexes",
+                admitted,
+                admitted,
+                committed,
+                window_bytes,
+            );
+            for prepared in prepared {
+                migration_cancel(&cancel)?;
+                let (order, old, snapshot, _) = prepared.value();
+                let publication = std::time::Instant::now();
+                self.save_snapshot(snapshot).await?;
+                execution.record_publication(publication.elapsed());
+                if mappings
+                    .get(&format!("rfc:snapshots:{old}"))
+                    .is_some_and(|prior| prior != snapshot.id)
+                {
+                    return Err(Error::integrity("Ambiguous RFC migration identity."));
+                }
+                crate::migration_map::insert(
+                    mappings,
+                    format!("rfc:snapshots:{old}"),
+                    snapshot.id.clone(),
+                )?;
+                aliases.push(("snapshots".into(), old.clone(), snapshot.id.clone()))?;
+                after = *order;
+                let (_, _, _, cache) = prepared.into_inner_after_commit();
+                if let Some(cache) = cache {
+                    index_cache = cache;
+                }
+                committed += 1;
+                execution.report(
+                    "graph_rfc_indexes",
+                    admitted,
+                    admitted,
+                    committed,
+                    window_bytes,
                 );
             }
-            self.save_snapshot(&snapshot).await?;
-            if mappings
-                .get(&format!("rfc:snapshots:{old}"))
-                .is_some_and(|prior| prior != id)
-            {
-                return Err(Error::integrity("Ambiguous RFC migration identity."));
-            }
-            crate::migration_map::insert(mappings, format!("rfc:snapshots:{old}"), id.clone())?;
-            {
-                let alias = ("snapshots".into(), old.clone(), id);
-                aliases.push(alias)?;
-            }
-            after = found
-                .try_get("published_order")
-                .map_err(|_| storage_error())?;
         }
         let heads: Vec<(String, String)> =
             sqlx::query_as("SELECT kind,capture_id FROM devres_rfc_dataset_heads ORDER BY kind")
@@ -733,12 +841,18 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             migration_cancel(&cancel)?;
-            let found=sqlx::query("SELECT source_key,capture_id,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE capture_metadata IS NOT NULL AND source_key>$1 ORDER BY source_key LIMIT 1")
+            let metadata=sqlx::query("SELECT source_key,octet_length(capture_metadata::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(capture_metadata,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_jobs WHERE capture_metadata IS NOT NULL AND source_key>$1 ORDER BY source_key LIMIT 1")
                 .bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(found) = found else {
+            let Some(metadata) = metadata else {
                 break;
             };
-            let key: String = found.try_get("source_key").map_err(|_| storage_error())?;
+            let key: String = metadata
+                .try_get("source_key")
+                .map_err(|_| storage_error())?;
+            let charge = rfc_migration_input_charge(&metadata)?;
+            let _reservation = execution.graph_reserve(charge, &cancel).await?;
+            let found = sqlx::query("SELECT source_key,capture_id,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE source_key=$1 AND capture_metadata IS NOT NULL")
+                .bind(&key).fetch_one(&self.pool).await.map_err(|_| storage_error())?;
             let data: Json<Value> = found
                 .try_get("capture_metadata")
                 .map_err(|_| storage_error())?;
@@ -766,6 +880,22 @@ impl PgBlobStore {
         aliases.ensure_healthy()?;
         Ok(aliases)
     }
+}
+
+fn rfc_migration_input_charge(metadata: &sqlx::postgres::PgRow) -> Result<usize> {
+    let encoded_bytes = usize::try_from(
+        metadata
+            .try_get::<i64, _>("payload_bytes")
+            .map_err(|_| storage_error())?,
+    )
+    .map_err(|_| storage_error())?;
+    let nodes = usize::try_from(
+        metadata
+            .try_get::<i64, _>("payload_nodes")
+            .map_err(|_| storage_error())?,
+    )
+    .map_err(|_| storage_error())?;
+    crate::MigrationExecution::graph_input_charge(encoded_bytes, nodes)
 }
 
 fn migration_cancel(cancel: &tokio_util::sync::CancellationToken) -> Result<()> {
@@ -801,6 +931,337 @@ fn migrate_rfc_capture(
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+    async fn rfc_graph_parallel_publication_preserves_order_and_legacy_partial_resume() {
+        use devres_application::Store;
+        use devres_domain::{FetchRequest, FetchResponse, Validators};
+        use std::sync::Arc;
+        let _indexes = crate::rfc::index::TEST_SERIAL.lock().await;
+        let base =
+            std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut expected = None;
+        for (workers, partial, small_budget) in [
+            (1, false, false),
+            (3, false, false),
+            (3, true, false),
+            (3, true, true),
+        ] {
+            let database = format!("devres_rfc_graph_{suffix}_{workers}_{partial}_{small_budget}");
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
+                .execute(&admin)
+                .await
+                .unwrap();
+            let mut url = url::Url::parse(&base).unwrap();
+            url.set_path(&format!("/{database}"));
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            let store = PgBlobStore::connect(url.as_str(), root.path())
+                .await
+                .unwrap();
+            let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+            let mut captures = Vec::new();
+            for (key, url, body) in [
+                (
+                    "rfc:index",
+                    "https://www.rfc-editor.org/rfc-index.xml",
+                    "catalogue",
+                ),
+                (
+                    "rfc:text:1",
+                    "https://www.rfc-editor.org/rfc/rfc1.txt",
+                    "transport cats",
+                ),
+                (
+                    "rfc:text:2",
+                    "https://www.rfc-editor.org/rfc/rfc2.txt",
+                    "transport dogs",
+                ),
+            ] {
+                captures.push(
+                    store
+                        .publish(
+                            &FetchRequest {
+                                key: key.into(),
+                                url: url.into(),
+                                ttl_secs: 3600,
+                                max_bytes: 1024,
+                                media_type: "text/plain".into(),
+                            },
+                            FetchResponse {
+                                status: 200,
+                                body: body.as_bytes().to_vec(),
+                                validators: Validators::default(),
+                            },
+                            1,
+                        )
+                        .await
+                        .unwrap()
+                        .capture,
+                );
+            }
+            let records = vec![Value::Array(vec![Value::Null; 2048])];
+            store
+                .save_dataset(
+                    "catalogue",
+                    &Dataset {
+                        capture: captures[0].clone(),
+                        records: records.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            let mut legacy_catalogue = captures[0].clone();
+            legacy_catalogue.body_hash = crate::integrity::legacy_hash(b"catalogue");
+            legacy_catalogue.id = crate::integrity::legacy_hash(
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    legacy_catalogue.key,
+                    legacy_catalogue.source_url,
+                    legacy_catalogue.media_type,
+                    legacy_catalogue.body_hash
+                )
+                .as_bytes(),
+            );
+            std::fs::write(root.path().join(&legacy_catalogue.body_hash), b"catalogue").unwrap();
+            let metadata_proof = super::super::capture_metadata_digest(&legacy_catalogue).unwrap();
+            sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7)")
+                .bind(&legacy_catalogue.id).bind(&legacy_catalogue.key).bind(&legacy_catalogue.source_url).bind(&legacy_catalogue.body_hash).bind(&legacy_catalogue.media_type).bind(legacy_catalogue.retrieved_at).bind(metadata_proof).execute(&pool).await.unwrap();
+            let legacy_dataset = serde_json::to_value(Dataset {
+                capture: legacy_catalogue.clone(),
+                records,
+            })
+            .unwrap();
+            let dataset_proof = payload_integrity::digest(
+                "devres_rfc_datasets",
+                "catalogue",
+                &legacy_catalogue.id,
+                &legacy_dataset,
+            )
+            .unwrap();
+            sqlx::query("INSERT INTO devres_rfc_datasets(kind,capture_id,data,data_integrity) VALUES('catalogue',$1,$2,$3)")
+                .bind(&legacy_catalogue.id).bind(Json(legacy_dataset)).bind(dataset_proof).execute(&pool).await.unwrap();
+            store
+                .schedule(&[JobSpec {
+                    key: captures[1].key.clone(),
+                    number: 1,
+                    format: "txt".into(),
+                    source_url: captures[1].source_url.clone(),
+                    assurance: "https".into(),
+                    due_at: 0,
+                }])
+                .await
+                .unwrap();
+            store
+                .finish(&captures[1].key, Some(&captures[1]), None, 10)
+                .await
+                .unwrap();
+            let documents: Vec<_> = (1..=2)
+                .map(|number| Document {
+                    number,
+                    format: "txt".into(),
+                    capture: captures[number as usize].clone(),
+                    assurance: "https".into(),
+                })
+                .collect();
+            let source = crate::rfc::index::build(
+                root.path(),
+                &crate::integrity::legacy_hash(b"retained RFC graph index"),
+                vec![
+                    crate::rfc::index::IndexDocument {
+                        number: 1,
+                        text: "transport cats".into(),
+                    },
+                    crate::rfc::index::IndexDocument {
+                        number: 2,
+                        text: "transport dogs".into(),
+                    },
+                ],
+            )
+            .unwrap();
+            let mut originals = Vec::new();
+            for order in 1..=3_i64 {
+                let old = crate::integrity::legacy_hash(
+                    format!("retained RFC graph snapshot {order}").as_bytes(),
+                );
+                let snapshot = Snapshot {
+                    id: old.clone(),
+                    catalogue_capture: legacy_catalogue.id.clone(),
+                    errata_capture: None,
+                    documents: documents.clone(),
+                    search_documents: documents.clone(),
+                    coverage: json!({"fixture":order,"wide":vec![Value::Null;2048]}),
+                    created_at: order + 10,
+                    complete: order != 2,
+                    index_path: Some(source.clone()),
+                    processor_version: 1,
+                };
+                let value = encoded(&snapshot).unwrap();
+                let proof = payload_integrity::digest(
+                    "devres_rfc_snapshots",
+                    "",
+                    &old,
+                    &payload_integrity::rfc_snapshot_payload(
+                        order,
+                        snapshot.catalogue_capture.clone(),
+                        None,
+                        snapshot.created_at,
+                        snapshot.complete,
+                        &value,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                sqlx::query("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,created_at,complete,data,data_integrity,published_order) OVERRIDING SYSTEM VALUE VALUES($1,$2,NULL,$3,$4,$5,$6,$7)")
+                    .bind(&old).bind(&snapshot.catalogue_capture).bind(snapshot.created_at).bind(snapshot.complete).bind(Json(value)).bind(proof).bind(order).execute(&pool).await.unwrap();
+                let coverage_nodes: i64 = sqlx::query_scalar("SELECT jsonb_array_length(jsonb_path_query_array(data->'coverage','strict $.**.type()'))::bigint FROM devres_rfc_snapshots WHERE id=$1")
+                    .bind(&old).fetch_one(&pool).await.unwrap();
+                assert_eq!(
+                    coverage_nodes, 2051,
+                    "actual PostgreSQL recursive shape metadata counts each JSON value"
+                );
+                originals.push(snapshot);
+            }
+            sqlx::query(
+                "SELECT setval(pg_get_serial_sequence('devres_rfc_snapshots','published_order'),3)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false WHERE singleton").execute(&pool).await.unwrap();
+            if partial {
+                // Produce the exact checkpoint shape written by the old serial
+                // schema-ten implementation, then reopen it in another invocation.
+                let mut canonical = originals[0].clone();
+                let old = canonical.id.clone();
+                canonical.catalogue_capture = captures[0].id.clone();
+                canonical.index_path = None;
+                canonical.id.clear();
+                canonical.id = crate::integrity::canonical_hash(
+                    &serde_json::to_value((
+                        "devres:storage-migration:snapshot:v1",
+                        &old,
+                        &canonical,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                canonical.index_path = Some(
+                    crate::rfc::index::rebuild_frozen(
+                        root.path().to_owned(),
+                        source.clone(),
+                        canonical.id.clone(),
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                store.save_snapshot(&canonical).await.unwrap();
+            }
+            drop(store);
+            let store = Arc::new(
+                PgBlobStore::connect_for_migration(url.as_str(), root.path())
+                    .await
+                    .unwrap(),
+            );
+            let budget = if small_budget {
+                8 * 1024 * 1024
+            } else {
+                1024 * 1024 * 1024
+            };
+            let context = crate::MigrationExecution::new_with_graph_options(
+                crate::MigrationExecutionOptions::new(workers, 64 * 1024 * 1024).unwrap(),
+                crate::MigrationGraphOptions::new(budget).unwrap(),
+            )
+            .unwrap();
+            let mut mappings = crate::migration_map::MigrationMap::new();
+            crate::migration_map::insert(
+                &mut mappings,
+                format!("capture:{}", legacy_catalogue.id),
+                captures[0].id.clone(),
+            )
+            .unwrap();
+            crate::migration_map::insert(
+                &mut mappings,
+                format!("body:{}", legacy_catalogue.body_hash),
+                captures[0].body_hash.clone(),
+            )
+            .unwrap();
+            let aliases = store
+                .migrate_rfc_graph_with_execution(
+                    &mut mappings,
+                    tokio_util::sync::CancellationToken::new(),
+                    &context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(aliases.try_chunks(100).next().unwrap().unwrap().len(), 4);
+            let staged_job: Json<Value> = sqlx::query_scalar(
+                "SELECT data FROM devres_integrity_staged_state WHERE provider='rfc' AND key=$1",
+            )
+            .bind(format!("job:{}", captures[1].key))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                staged_job.0["capture_metadata"],
+                serde_json::to_value(&captures[1]).unwrap()
+            );
+            let rows: Vec<Json<Value>> = sqlx::query_scalar("SELECT data FROM devres_rfc_snapshots WHERE id LIKE 'blake3:%' ORDER BY published_order").fetch_all(&pool).await.unwrap();
+            let rows: Vec<Value> = rows.into_iter().map(|row| row.0).collect();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row["coverage"]["fixture"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+            assert_eq!(
+                store.snapshot(None).await.unwrap().unwrap().id,
+                rows[2]["id"].as_str().unwrap()
+            );
+            let legacy_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(legacy_count, 3);
+            if let Some(expected) = &expected {
+                assert_eq!(&rows, expected);
+            } else {
+                expected = Some(rows);
+            }
+            assert_eq!(context.snapshot().active, 0);
+            assert_eq!(context.snapshot().graph_active, 0);
+            assert_eq!(context.snapshot().graph_memory_bytes, 0);
+            if small_budget {
+                assert_eq!(context.snapshot().graph_high_water, 1);
+                assert!(
+                    context.snapshot().graph_memory_high_water > budget,
+                    "a structurally wide valid singleton runs exclusively above the aggregate budget"
+                );
+            } else if workers > 1 {
+                assert!(context.snapshot().graph_high_water > 1);
+            }
+            drop(aliases);
+            drop(mappings);
+            drop(store);
+            pool.close().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE {database} WITH(FORCE)"
+            )))
+            .execute(&admin)
+            .await
+            .unwrap();
+        }
+        admin.close().await;
+    }
+
     #[test]
     fn capture_migration_keeps_body_and_capture_namespaces_distinct() {
         let old = "a".repeat(64);
