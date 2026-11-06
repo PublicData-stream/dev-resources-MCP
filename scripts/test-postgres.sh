@@ -31,6 +31,9 @@ cargo test --locked -p devres-adapters --test migration_batching -- --ignored --
 cargo test --locked -p devres-adapters --test seal_owner_loss -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test file_migration_batching -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test migration_parallel -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib rfc_graph_parallel_publication_preserves_order_and_legacy_partial_resume -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib graph_accounting_tests -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib crate_snapshot_preparation_receipts_resume_before_and_after_publication -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --example migration-benchmark -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test mdn_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test whatwg_persistence -- --ignored --test-threads=1

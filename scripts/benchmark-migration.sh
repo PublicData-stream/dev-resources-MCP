@@ -11,24 +11,35 @@ payload_kib=256
 files=16
 file_mib=8
 payload_budget_mib=64
+graph_memory_budget_mib=1024
+graph_snapshots=0
+graph_generations=1
 while (( $# )); do
   case "$1" in
-    --binary|--repeats|--workers|--rows|--payload-kib|--files|--file-mib|--payload-budget-mib)
+    --binary|--repeats|--workers|--rows|--payload-kib|--files|--file-mib|--payload-budget-mib|--graph-memory-budget-mib|--graph-snapshots|--graph-generations)
       [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo 'benchmark option requires a value' >&2; exit 2; }
       case "$1" in
         --binary) binary=$2 ;; --repeats) repeats=$2 ;; --workers) workers=$2 ;;
         --rows) rows=$2 ;; --payload-kib) payload_kib=$2 ;; --files) files=$2 ;;
         --file-mib) file_mib=$2 ;; --payload-budget-mib) payload_budget_mib=$2 ;;
+        --graph-memory-budget-mib) graph_memory_budget_mib=$2 ;; --graph-snapshots) graph_snapshots=$2 ;;
+        --graph-generations) graph_generations=$2 ;;
       esac
       shift 2 ;;
-    --help) echo 'usage: scripts/benchmark-migration.sh [--binary PATH] [--repeats N>=3] [--workers "1 4 8 16 32"] [--rows N] [--payload-kib N] [--files N] [--file-mib N] [--payload-budget-mib N]'; exit 0 ;;
+    --help) echo 'usage: scripts/benchmark-migration.sh [--binary PATH] [--repeats N>=3] [--workers "1 4 8 16 32"] [--rows N] [--payload-kib N] [--files N] [--file-mib N] [--payload-budget-mib N] [--graph-memory-budget-mib N] [--graph-snapshots 0..64] [--graph-generations N<=snapshots, default 1]'; exit 0 ;;
     *) echo 'unknown benchmark option' >&2; exit 2 ;;
   esac
 done
-for value in "$repeats" "$rows" "$payload_kib" "$files" "$file_mib" "$payload_budget_mib"; do
+for value in "$repeats" "$rows" "$payload_kib" "$files" "$file_mib" "$payload_budget_mib" "$graph_memory_budget_mib" "$graph_generations"; do
   [[ $value =~ ^[1-9][0-9]{0,4}$ ]] || { echo 'invalid bounded positive benchmark option' >&2; exit 2; }
 done
-(( repeats >= 3 && repeats <= 10 && rows <= 4096 && payload_kib <= 2048 && files <= 128 && file_mib <= 32 && payload_budget_mib <= 4096 )) || { echo 'benchmark option exceeds its bounded range' >&2; exit 2; }
+[[ $graph_snapshots =~ ^(0|[1-9][0-9]?)$ ]] || { echo 'invalid graph snapshot count' >&2; exit 2; }
+(( repeats >= 3 && repeats <= 10 && rows <= 4096 && payload_kib <= 2048 && files <= 128 && file_mib <= 32 && payload_budget_mib <= 4096 && graph_memory_budget_mib <= 65536 && graph_snapshots <= 64 )) || { echo 'benchmark option exceeds its bounded range' >&2; exit 2; }
+if (( graph_snapshots == 0 )); then
+  (( graph_generations == 1 )) || { echo 'graph generations require enabled graph snapshots' >&2; exit 2; }
+else
+  (( graph_generations <= graph_snapshots )) || { echo 'graph generations cannot exceed graph snapshots' >&2; exit 2; }
+fi
 [[ -x $binary ]] || { echo 'build the release migration-benchmark example first, or pass --binary' >&2; exit 2; }
 read -r -a matrix <<< "$workers"
 [[ ${matrix[0]:-} == 1 ]] || { echo 'workers must start with the serial reference 1' >&2; exit 2; }
@@ -63,6 +74,7 @@ trap 'exit 143' TERM
 python3 scripts/migration-benchmark-report.py metadata "$binary" "$(git rev-parse HEAD)" \
   "repeats=$repeats" "workers=$workers" "rows=$rows" "payload_kib=$payload_kib" \
   "files=$files" "file_mib=$file_mib" "payload_budget_mib=$payload_budget_mib" \
+  "graph_snapshots=$graph_snapshots" "graph_generations=$graph_generations" "graph_memory_budget_mib=$graph_memory_budget_mib" \
   'postgres_cpus=2' 'postgres_memory=1GiB' 'worker_cpu_quota=host/cgroup' 'fixture_durability=checkpoint+syncfs_before_timing' 'revision_is_checkout_head_not_source_attestation=true' > "$root/metadata.json"
 df -PT "$root" > "$root/filesystem.txt"
 # A private bridge permits the loopback-only published SQL port. Docker
@@ -88,10 +100,12 @@ for worker in "${matrix[@]}"; do
     mkdir -p "$output"
     export DEVRES_TEST_DATABASE_URL="postgres://devres:fixture-only@127.0.0.1:$port/devres_benchmark"
     psql 'CREATE DATABASE devres_benchmark'
-    "$binary" prepare "$output/blobs" "$rows" "$payload_kib" "$files" "$file_mib" > "$output/fixture.json" 2> "$output/prepare.stderr"
+    fixture_args=("$rows" "$payload_kib" "$files" "$file_mib")
+    if (( graph_snapshots > 0 )); then fixture_args+=("$graph_snapshots" "$graph_generations"); fi
+    "$binary" prepare "$output/blobs" "${fixture_args[@]}" > "$output/fixture.json" 2> "$output/prepare.stderr"
     # Fresh identical pair per run. Preparation, backup and restore are not timed as migration.
     /usr/bin/time -v -o "$output/process-time.txt" timeout --signal=TERM --kill-after=30s 15m \
-      "$binary" run "$output/blobs" "$worker" "$payload_budget_mib" > "$output/result.json" 2> "$output/progress.jsonl"
+      "$binary" run "$output/blobs" "$worker" "$payload_budget_mib" "$graph_memory_budget_mib" > "$output/result.json" 2> "$output/progress.jsonl"
     /usr/bin/time -v -o "$output/backup-time.txt" sh -eu -c '
       docker exec "$1" pg_dump -U devres -d devres_benchmark -Fc > "$2/database.dump"
       cp -a -- "$2/blobs" "$2/restored-blobs"

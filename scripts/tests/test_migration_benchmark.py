@@ -90,6 +90,83 @@ class BenchmarkReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'phase time'):
             REPORT.summarize(self.root, 3)
 
+    def graph_fixture(self, workers, seconds, generations=1):
+        for repeat in range(1, 4):
+            output = self.run_result(workers, repeat, seconds)
+            result = json.loads((output / 'result.json').read_text())
+            result.update(fixture='pending-schema10-graph-v1', graph_snapshots=8,
+                          graph_generations=generations,
+                          graph_memory_budget_mib=1024, graph_jobs_high_water=min(workers, 4),
+                          graph_jobs_admitted=72, graph_memory_high_water=512 * 1024 * 1024)
+            (output / 'result.json').write_text(json.dumps(result))
+
+    def test_nonempty_graph_workload_reports_resources_and_observed_parallelism(self):
+        self.graph_fixture(1, 12)
+        self.graph_fixture(4, 7)
+        report = REPORT.summarize(self.root, 3)
+        self.assertEqual(report['fixture'], 'pending-schema10-graph-v1')
+        self.assertTrue(report['graph_parallel_activity_observed'])
+        self.assertEqual(report['graph_memory_high_water_bytes'], 512 * 1024 * 1024)
+        self.assertIn('RFC frozen-index replay', report['limits'])
+        self.assertEqual(report['full_corpus_speedup'], 'unmeasured')
+
+    def test_graph_resource_counts_and_mixed_workloads_are_rejected(self):
+        self.graph_fixture(1, 12)
+        self.fixture(4, 7)
+        with self.assertRaisesRegex(ValueError, 'differing durable'):
+            REPORT.summarize(self.root, 3)
+        path = self.root / 'workers-1/repeat-1/result.json'
+        result = json.loads(path.read_text())
+        result['graph_jobs_high_water'] = 2
+        path.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, 'resource evidence'):
+            REPORT.summarize(self.root, 3)
+
+    def test_changing_generations_profile_is_preserved_and_cannot_mix(self):
+        self.graph_fixture(1, 12, generations=8)
+        self.graph_fixture(4, 7, generations=8)
+        report = REPORT.summarize(self.root, 3)
+        self.assertEqual(report['graph_snapshots'], 8)
+        self.assertEqual(report['graph_generations'], 8)
+        self.assertEqual(report['graph_memory_budget_mib'], 1024)
+        path = self.root / 'workers-4/repeat-1/result.json'
+        result = json.loads(path.read_text())
+        result['graph_generations'] = 1
+        path.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, 'differing durable'):
+            REPORT.summarize(self.root, 3)
+
+    def test_old_shared_generation_results_keep_their_original_profile(self):
+        self.graph_fixture(1, 12)
+        self.graph_fixture(4, 7)
+        for path in self.root.glob('workers-*/repeat-*/result.json'):
+            result = json.loads(path.read_text())
+            del result['graph_generations']
+            path.write_text(json.dumps(result))
+        report = REPORT.summarize(self.root, 3)
+        self.assertEqual(report['graph_generations'], 1)
+
+    def test_invalid_generation_counts_are_rejected(self):
+        self.graph_fixture(1, 12)
+        path = self.root / 'workers-1/repeat-1/result.json'
+        original = json.loads(path.read_text())
+        for generations in (0, -1, True, '1', 9):
+            result = dict(original, graph_generations=generations)
+            path.write_text(json.dumps(result))
+            with self.subTest(generations=generations), self.assertRaisesRegex(
+                    ValueError, 'generation count|resource evidence'):
+                REPORT.summarize(self.root, 3)
+
+    def test_metadata_records_profile_options_without_binary_path(self):
+        binary = self.root / 'private-binary-name'
+        binary.write_bytes(b'synthetic benchmark binary')
+        options = ['graph_snapshots=8', 'graph_generations=8', 'graph_memory_budget_mib=2048']
+        metadata = REPORT.metadata(binary, 'reviewed-source', options)
+        self.assertEqual(metadata['options'], options)
+        self.assertGreater(metadata['clock_ticks_per_second'], 0)
+        self.assertEqual(metadata['revision'], 'reviewed-source')
+        self.assertNotIn(str(binary), json.dumps(metadata))
+
 
 class BenchmarkCliTests(unittest.TestCase):
     script = Path(__file__).resolve().parents[1] / 'benchmark-migration.sh'
@@ -115,9 +192,20 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertIn('strictly increasing', self.rejected('--workers', '1 1').stderr)
         self.assertIn('strictly increasing', self.rejected('--workers', '1 65').stderr)
 
+    def test_generation_count_is_checked_before_infrastructure(self):
+        self.assertIn('requires a value', self.rejected('--graph-generations').stderr)
+        self.assertIn('positive', self.rejected('--graph-generations', '0').stderr)
+        self.assertIn('enabled graph snapshots', self.rejected('--graph-generations', '2').stderr)
+        self.assertIn('cannot exceed', self.rejected('--graph-snapshots', '8', '--graph-generations', '9').stderr)
+        self.assertIn('serial reference', self.rejected('--graph-generations', '1', '--workers', '4').stderr)
+        self.assertIn('serial reference', self.rejected('--graph-snapshots', '8', '--graph-generations', '8', '--workers', '4').stderr)
+
     def test_malformed_workload_is_checked_before_infrastructure(self):
         self.assertIn('positive', self.rejected('--rows', '0').stderr)
         self.assertIn('bounded range', self.rejected('--file-mib', '33').stderr)
+        self.assertIn('requires a value', self.rejected('--graph-snapshots', '-1').stderr)
+        self.assertIn('bounded range', self.rejected('--graph-snapshots', '65').stderr)
+        self.assertIn('positive', self.rejected('--graph-memory-budget-mib', '0').stderr)
 
 
 if __name__ == '__main__':
