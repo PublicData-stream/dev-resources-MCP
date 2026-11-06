@@ -7,6 +7,12 @@ if [[ ${1:-} != --live ]]; then
   exit 2
 fi
 shift
+if [[ ${1:-} == --attribution ]]; then
+  shift
+  test "$#" = 0 || { echo 'usage: scripts/live-smoke.sh --live --attribution' >&2; exit 2; }
+  parent=$(mktemp -d /tmp/devres-attribution-live.XXXXXX)
+  exec cargo run --locked -p devres-adapters --example attribution-live-probe -- --live "$parent/evidence"
+fi
 if [[ ${1:-} == --npm ]]; then
   shift
   test "$#" = 0 || { echo 'usage: scripts/live-smoke.sh --live --npm' >&2; exit 2; }

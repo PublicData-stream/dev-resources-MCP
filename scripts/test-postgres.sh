@@ -47,4 +47,5 @@ cargo test --locked -p devres-adapters --lib storage::sequence_integrity -- --ig
 cargo test --locked -p devres-adapters --lib storage::corpus_storage::snapshot_batch_tests -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::acceptance -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::visibility -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib attribution_storage -- --ignored --test-threads=1
 echo 'Real PostgreSQL persistence checks passed'
