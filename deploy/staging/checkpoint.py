@@ -201,6 +201,9 @@ class Lifecycle:
         if command not in COMMANDS:
             raise CheckpointError('invalid_checkpoint_command')
         permanent = self.permanent(self.u.record)
+        identity = self.u.identity()
+        if self.u.record.get('target_identity') and self.u.record['target_identity'] != identity:
+            raise CheckpointError('checkpoint_target_identity_changed')
         dataset = self.u.dataset if permanent else drill.dataset
         guids = self.pair_guids(dataset)
         previous_guids = self.u.record.get('live_dataset_guids')
@@ -214,7 +217,7 @@ class Lifecycle:
                         live_snapshot=drill.snapshot,
                         resource_profile=drill.resource_profile,
                         live_dataset_guids=guids,
-                        target_identity=self.u.identity())
+                        target_identity=identity)
         kwargs = {'control': self.control}
         if timeout is not None:
             kwargs['timeout'] = timeout
@@ -265,8 +268,12 @@ class Lifecycle:
             result[dataset + child] = value
         return result
 
-    def checkpoint(self, drill, command, completed=False):
+    def checkpoint(self, drill, command, completed=False, provenance=None):
         permanent = self.permanent(self.u.record)
+        identity = self.u.identity()
+        if ((provenance is None and self.u.record.get('target_identity') != identity)
+                or (provenance is not None and provenance.get('to_bundle_sha256') != identity['bundle_sha256'])):
+            raise CheckpointError('checkpoint_target_identity_changed')
         self.u.save('checkpoint_pausing', command_completed=completed)
         if getattr(drill, 'backend_started', False):
             raise CheckpointError('public_candidate_cannot_pause')
@@ -292,18 +299,25 @@ class Lifecycle:
                    'dataset': dataset, 'dataset_guids': guids, 'checkpoint': checkpoint,
                    'checkpoint_guids': snapshots, 'checkpoint_hold': self.u.hold,
                    'command': command, 'command_completed': completed,
-                   'capsule': str(capsule), 'target_identity': self.u.identity(),
+                   'capsule': str(capsule), 'target_identity': identity,
                    'resource_profile': drill.resource_profile,
                    'paused_at_epoch': time.time(), 'boot_id': boot_id(),
                    'timing_qualified': False}
         if permanent:
             self.u.wall_remaining()
             receipt['deadline_at'] = self.u.record['deadline_at']
+        if provenance is not None:
+            receipt['bundle_transition'] = provenance
         receipt_path = capsule / 'receipt.json'
         self.u.write(receipt_path, json.dumps(receipt, sort_keys=True) + '\n')
-        self.u.save('upgrade_paused' if permanent else 'rehearsal_paused',
-                    pause_receipt=str(receipt_path), pause_checkpoint=checkpoint,
-                    timing_qualified=False, driver_stopped=True)
+        if self.u.identity() != identity:
+            raise CheckpointError('checkpoint_target_identity_changed')
+        updates = {'pause_receipt': str(receipt_path), 'pause_checkpoint': checkpoint,
+                   'timing_qualified': False, 'driver_stopped': True}
+        if provenance is not None:
+            updates['target_identity'] = identity
+            updates['bundle_transitions'] = [*self.u.record.get('bundle_transitions', []), provenance]
+        self.u.save('upgrade_paused' if permanent else 'rehearsal_paused', **updates)
         (self.root / 'pause-request.json').unlink(missing_ok=True)
 
     def stop_postgres(self, drill):
@@ -499,11 +513,13 @@ class Lifecycle:
             raise CheckpointError('checkpoint_network_endpoints_changed')
         return runtime, identities
 
-    def adopt(self, token, receipt_path, check_only=False):
+    def adopt(self, token, receipt_path, check_only=False, from_bundle_sha256=None):
         """Import only the known R3 v1 paused shape; helper files remain inert."""
         with self.u.state.locked():
             self.u.record = self.record(token)
             record = self.u.record
+            if from_bundle_sha256 is not None:
+                return self.transition_bundle(receipt_path, from_bundle_sha256, check_only)
             if record['phase'] != 'rehearsal_paused' or self.permanent(record):
                 raise CheckpointError('legacy_paused_rehearsal_required')
             path = Path(receipt_path)
@@ -653,6 +669,7 @@ class Lifecycle:
                 if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o027:
                     raise CheckpointError('legacy_runtime_directory_changed')
                 os.chown(destination, os.geteuid(), 65532)
+                os.chmod(destination, 0o750)
             for relative in CAPSULE_FILES:
                 if relative == 'original-config.toml':
                     continue
@@ -679,6 +696,89 @@ class Lifecycle:
             # legacy PostgreSQL container, or use an already-clean stopped pair.
             self.checkpoint(drill, 'migrate-storage')
             return {'adopted': True, 'paused': True, 'timing_qualified': False}
+
+    def transition_bundle(self, receipt_path, from_bundle_sha256, check_only):
+        """Rebind one clean formal rehearsal to reviewed same-image code only."""
+        record = self.u.record
+        if (record['phase'] != 'rehearsal_paused' or self.permanent(record)
+                or record.get('timing_qualified') is not False):
+            raise CheckpointError('formal_paused_rehearsal_required')
+        if not isinstance(from_bundle_sha256, str) or not HEX.fullmatch(from_bundle_sha256):
+            raise CheckpointError('invalid_previous_bundle_digest')
+        current = self.u.identity()
+        path = Path(receipt_path)
+        receipt = self.validate_paused(record)
+        old = receipt['target_identity']
+        history = record.get('bundle_transitions', [])
+        if not isinstance(history, list):
+            raise CheckpointError('invalid_bundle_transition_history')
+        already = False
+        if old.get('bundle_sha256') == current.get('bundle_sha256'):
+            if not history or not isinstance(history[-1], dict):
+                raise CheckpointError('previous_bundle_digest_mismatch')
+            previous = history[-1]
+            if (previous.get('from_bundle_sha256') != from_bundle_sha256
+                    or previous.get('to_bundle_sha256') != current['bundle_sha256']
+                    or str(path) != previous.get('from_receipt')
+                    or digest(path) != previous.get('from_receipt_sha256')
+                    or receipt.get('bundle_transition') != previous):
+                raise CheckpointError('previous_bundle_transition_mismatch')
+            already = True
+        elif (old.get('bundle_sha256') != from_bundle_sha256
+              or not path.is_absolute() or path != Path(record['pause_receipt'])):
+            raise CheckpointError('previous_bundle_digest_mismatch')
+        if ({key: value for key, value in old.items() if key != 'bundle_sha256'} !=
+                {key: value for key, value in current.items() if key != 'bundle_sha256'}):
+            raise CheckpointError('bundle_transition_contract_changed')
+        capsule = Path(receipt['capsule'])
+        original = read_bytes(capsule / 'original-config.toml')
+        if original != read_bytes(self.root / 'original-config.toml'):
+            raise CheckpointError('checkpoint_original_configuration_changed')
+        self.validate_serving_pair(record, original.decode())
+        runtime = Path('/tmp') / ('devres-staging-restore-' + record['live_token'])
+        candidate = read_bytes(capsule / 'config/backend.toml')
+        expected = tomllib.loads(self.restore.paused_config(original.decode()))
+        expected['source']['url'] = current['source_url']
+        if tomllib.loads(candidate.decode()) != expected:
+            raise CheckpointError('bundle_transition_configuration_changed')
+        for relative in CAPSULE_FILES:
+            if relative == 'original-config.toml':
+                continue
+            if read_bytes(runtime / relative, private=False) != read_bytes(capsule / relative):
+                raise CheckpointError('checkpoint_runtime_content_changed')
+            if relative.startswith('tls/') and read_bytes(runtime / relative, private=False) != read_bytes(
+                    self.u.private / Path(relative).name, private=False):
+                raise CheckpointError('checkpoint_transport_identity_changed')
+        self.u.safe()
+        service = ['systemctl', 'show', '-p', 'ActiveState', '--value', 'devres-staging-backup.service']
+        if self.u.run(service).strip() not in ('inactive', 'failed'):
+            raise CheckpointError('backup_already_running')
+        if already or check_only:
+            return {'adopted': already, 'already_adopted': already, 'check_passed': True,
+                    'paused': True, 'timing_qualified': False}
+        self.u.run(['systemctl', 'stop', 'devres-staging-backup.timer'])
+        if self.u.run(service).strip() not in ('inactive', 'failed'):
+            raise CheckpointError('backup_started_during_checkpoint_admission')
+        provenance = {'from_bundle_sha256': from_bundle_sha256,
+                      'to_bundle_sha256': current['bundle_sha256'],
+                      'from_receipt': str(path), 'from_receipt_sha256': digest(path),
+                      'from_checkpoint': receipt['checkpoint']}
+        archive = self.root / ('bundle-transition-' + receipt['checkpoint'] + '-' + current['bundle_sha256'][:12] + '.json')
+        if archive.exists():
+            raise CheckpointError('bundle_transition_archive_exists')
+        self.u.write(archive, json.dumps({'version': 1, 'journal': record,
+                                        'receipt': receipt, 'provenance': provenance}, sort_keys=True) + '\n')
+        drill = self.u.drill(record['snapshot'], schema=10, private=self.u.private,
+                             token=record['live_token'], config_text=candidate.decode(),
+                             clone_quota='512G', resource_profile=receipt['resource_profile'])
+        drill.root, drill.postgres_started, drill.backend_started = runtime, False, False
+        try:
+            self.checkpoint(drill, receipt['command'], completed=receipt['command_completed'],
+                            provenance=provenance)
+        except Exception:
+            self.u.save('rehearsal_preserved_failed', timing_qualified=False)
+            raise
+        return {'adopted': True, 'bundle_transition': True, 'paused': True, 'timing_qualified': False}
 
     def validate_dataset_tree(self, record, receipt):
         root = receipt['dataset']
@@ -744,6 +844,7 @@ class Lifecycle:
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o027:
                 raise CheckpointError('checkpoint_runtime_directory_changed')
             os.chown(destination, os.geteuid(), 65532)
+            os.chmod(destination, 0o750)
         for relative in CAPSULE_FILES:
             if relative == 'original-config.toml':
                 continue

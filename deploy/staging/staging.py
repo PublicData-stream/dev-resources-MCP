@@ -526,6 +526,7 @@ def main():
     parser.add_argument('--pause-scope', choices=('rehearsal', 'all'))
     parser.add_argument('--receipt')
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--from-bundle-sha256')
     args = parser.parse_args()
     command = args.command
     if command in ('upgrade-expire', 'upgrade-abort-rehearsal', 'upgrade-status',
@@ -548,6 +549,9 @@ def main():
         parser.error('receipt_only_for_paused_adoption')
     if args.check and command != 'upgrade-adopt-paused':
         parser.error('check_only_for_paused_adoption')
+    if args.from_bundle_sha256 is not None and (command != 'upgrade-adopt-paused'
+            or not re.fullmatch(r'[0-9a-f]{64}', args.from_bundle_sha256)):
+        parser.error('valid_previous_bundle_digest_only_for_paused_adoption')
     if command == 'refresh-services' and args.token is not None and not re.fullmatch(r'[0-9a-f]{24}', args.token):
         parser.error('valid_upgrade_token_required')
     if os.geteuid() != 0:
@@ -568,7 +572,7 @@ def main():
                 'upgrade-status': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_status(args.token), sort_keys=True)),
                 'upgrade-pause': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_pause(args.token), sort_keys=True)),
                 'upgrade-resume': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_resume(args.token), sort_keys=True)),
-                'upgrade-adopt-paused': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_adopt(args.token, args.receipt, check_only=args.check), sort_keys=True))}
+                'upgrade-adopt-paused': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_adopt(args.token, args.receipt, check_only=args.check, from_bundle_sha256=args.from_bundle_sha256), sort_keys=True))}
     commands[command]()
 
 

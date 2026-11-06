@@ -487,6 +487,133 @@ class LifecycleTests(unittest.TestCase):
                 self.lifecycle.adopt(self.token, receipt, check_only=True)
             self.assertFalse(any(call[:2] == ['systemctl', 'stop'] for call in self.calls))
 
+    def test_runtime_directories_are_traversable_with_cli_umask(self):
+        receipt, _ = self.make_legacy()
+        previous = os.umask(0o077)
+        try:
+            self.lifecycle.adopt(self.token, receipt)
+            for folder in ('config', 'tls'):
+                self.assertEqual((self.runtime / folder).stat().st_mode & 0o777, 0o750)
+                shutil.rmtree(self.runtime / folder)
+            record = upgrade.read_record(self.u.root.parent)
+            formal = self.lifecycle.validate_paused(record)
+            self.lifecycle.attach(record, formal)
+            for folder in ('config', 'tls'):
+                self.assertEqual((self.runtime / folder).stat().st_mode & 0o777, 0o750)
+            for relative in cp.CAPSULE_FILES:
+                if relative != 'original-config.toml':
+                    self.assertEqual((self.runtime / relative).stat().st_mode & 0o777, 0o640)
+        finally:
+            os.umask(previous)
+
+    def old_formal_bundle(self):
+        self.pause_pair()
+        record = upgrade.read_record(self.u.root.parent)
+        path = Path(record['pause_receipt'])
+        receipt = cp.read_json(path)
+        receipt['target_identity']['bundle_sha256'] = 'a' * 64
+        record['target_identity'] = receipt['target_identity']
+        upgrade.op.write(path, json.dumps(receipt))
+        self.u.record = record
+        self.u.save()
+        return path, receipt
+
+    def test_same_image_bundle_transition_check_is_inert_and_commit_is_provenanced(self):
+        path, old = self.old_formal_bundle()
+        original = path.read_bytes()
+        journal = (self.u.root / 'state.json').read_bytes()
+        before = len(self.calls)
+        for _ in range(2):
+            result = self.lifecycle.adopt(self.token, path, check_only=True,
+                                           from_bundle_sha256='a' * 64)
+            self.assertTrue(result['check_passed'])
+            self.assertFalse(result['adopted'])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual((self.u.root / 'state.json').read_bytes(), journal)
+        self.assertFalse(any(call[:2] in (['zfs', 'snapshot'], ['systemctl', 'stop'])
+                             for call in self.calls[before:]))
+        result = self.lifecycle.adopt(self.token, path, from_bundle_sha256='a' * 64)
+        self.assertTrue(result['bundle_transition'])
+        current = upgrade.read_record(self.u.root.parent)
+        new_path = Path(current['pause_receipt'])
+        self.assertNotEqual(new_path, path)
+        self.assertEqual(path.read_bytes(), original)
+        new = self.lifecycle.validate_paused(current)
+        self.assertEqual(new['target_identity'], self.u.identity())
+        self.assertEqual(new['bundle_transition']['from_receipt_sha256'], hashlib.sha256(original).hexdigest())
+        self.assertEqual(new['bundle_transition']['from_bundle_sha256'], 'a' * 64)
+        self.assertEqual(new['bundle_transition']['to_bundle_sha256'], self.u.identity()['bundle_sha256'])
+        self.assertEqual(new['dataset_guids'], old['dataset_guids'])
+        after = len(self.calls)
+        self.assertTrue(self.lifecycle.adopt(self.token, path, from_bundle_sha256='a' * 64)['already_adopted'])
+        self.assertTrue(self.lifecycle.adopt(self.token, path, check_only=True,
+                                            from_bundle_sha256='a' * 64)['already_adopted'])
+        self.assertFalse(any(call[:2] in (['zfs', 'snapshot'], ['systemctl', 'stop'])
+                             for call in self.calls[after:]))
+
+    def test_bundle_transition_refuses_wrong_digest_or_changed_image_contract(self):
+        path, receipt = self.old_formal_bundle()
+        for wrong in ('b' * 64, 'not-a-digest'):
+            with self.assertRaises(cp.CheckpointError):
+                self.lifecycle.adopt(self.token, path, check_only=True, from_bundle_sha256=wrong)
+        original_identity = dict(receipt['target_identity'])
+        cases = {'server': 'ghcr.io/other/server@sha256:' + 'c' * 64,
+                 'version': '0.1.0-build.other', 'source_url': 'https://example.test/other',
+                 'offline_options': {'workers': 1, 'payload_budget_mib': 64, 'graph_memory_budget_mib': 1024},
+                 'resource_profile': {'name': 'upgrade', 'worker_memory': '1g'},
+                 'pause_scope': 'all'}
+        for field, value in cases.items():
+            receipt['target_identity'] = {**original_identity, field: value}
+            self.u.record['target_identity'] = receipt['target_identity']
+            self.u.save()
+            upgrade.op.write(path, json.dumps(receipt))
+            with self.subTest(field=field), self.assertRaises(cp.CheckpointError):
+                self.lifecycle.adopt(self.token, path, check_only=True, from_bundle_sha256='a' * 64)
+        self.assertFalse(any(call[:2] == ['systemctl', 'stop'] for call in self.calls))
+
+    def test_bundle_transition_refuses_permanent_or_failed_and_receipt_journal_disagreement(self):
+        path, receipt = self.old_formal_bundle()
+        self.u.record['target_identity'] = {**receipt['target_identity'], 'bundle_sha256': 'b' * 64}
+        self.u.save()
+        with self.assertRaisesRegex(cp.CheckpointError, 'receipt_identity_changed'):
+            self.lifecycle.adopt(self.token, path, check_only=True, from_bundle_sha256='a' * 64)
+        self.u.record['target_identity'] = receipt['target_identity']
+        for phase, kind in (('rehearsal_preserved_failed', 'restore'), ('upgrade_paused', 'permanent')):
+            self.u.save(phase, live_kind=kind)
+            with self.assertRaisesRegex(cp.CheckpointError, 'formal_paused_rehearsal_required'):
+                self.lifecycle.adopt(self.token, path, check_only=True, from_bundle_sha256='a' * 64)
+
+    def test_bundle_transition_failure_keeps_old_identity_and_receipt_paired(self):
+        path, old = self.old_formal_bundle()
+        original = path.read_bytes()
+        original_target = old['target_identity']
+        def fail_capsule(*args):
+            current = upgrade.read_record(self.u.root.parent)
+            self.assertEqual(current['target_identity'], original_target)
+            self.assertEqual(current['pause_receipt'], str(path))
+            self.assertEqual(current.get('bundle_transitions', []), [])
+            raise OSError('synthetic capsule fsync failure')
+        with patch.object(self.lifecycle, 'write_capsule', side_effect=fail_capsule):
+            with self.assertRaises(OSError):
+                self.lifecycle.adopt(self.token, path, from_bundle_sha256='a' * 64)
+        current = upgrade.read_record(self.u.root.parent)
+        self.assertEqual(current['phase'], 'rehearsal_preserved_failed')
+        self.assertEqual(current['target_identity'], original_target)
+        self.assertEqual(current['pause_receipt'], str(path))
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(any(call[:2] == ['zfs', 'destroy'] for call in self.calls))
+
+    def test_ordinary_checkpoint_or_next_worker_cannot_implicitly_rebind_bundle(self):
+        path, _ = self.old_formal_bundle()
+        original = path.read_bytes()
+        before = len(self.calls)
+        for operation in (self.lifecycle.checkpoint, self.lifecycle.offline):
+            with self.assertRaisesRegex(cp.CheckpointError, 'target_identity_changed'):
+                operation(self.drill, 'migrate-storage')
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(any(call[:2] in (['zfs', 'snapshot'], ['docker', 'stop'])
+                             for call in self.calls[before:]))
+
 
 if __name__ == '__main__':
     unittest.main()

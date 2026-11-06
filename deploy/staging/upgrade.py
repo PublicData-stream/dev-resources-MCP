@@ -1082,8 +1082,9 @@ class Upgrade:
     def checkpoint_resume(self, token):
         return checkpoint.Lifecycle(self).resume(token)
 
-    def checkpoint_adopt(self, token, receipt, check_only=False):
-        return checkpoint.Lifecycle(self).adopt(token, receipt, check_only=check_only)
+    def checkpoint_adopt(self, token, receipt, check_only=False, from_bundle_sha256=None):
+        return checkpoint.Lifecycle(self).adopt(token, receipt, check_only=check_only,
+                                               from_bundle_sha256=from_bundle_sha256)
 
     def refresh_paused(self, token, refresh):
         with self.state.locked():

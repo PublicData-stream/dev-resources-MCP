@@ -246,6 +246,26 @@ The `--check` form performs admission checks without adopting the pair, stopping
 the backup timer, changing runtime configuration or creating a snapshot. Use a
 separately staged reviewed bundle for this check before replacing installed code.
 
+A reviewed operator-only update may rebind a **formal paused rehearsal** to a new
+bundle without changing its candidate image. Use the current receipt's absolute
+path and explicitly identify its old bundle hash:
+
+```sh
+python3 staging.py upgrade-adopt-paused --token CURRENT_UPGRADE_TOKEN \
+  --receipt CURRENT_FORMAL_RECEIPT --from-bundle-sha256 PREVIOUS_BUNDLE_SHA256 --check
+python3 staging.py upgrade-adopt-paused --token CURRENT_UPGRADE_TOKEN \
+  --receipt CURRENT_FORMAL_RECEIPT --from-bundle-sha256 PREVIOUS_BUNDLE_SHA256
+```
+
+Only the executable bundle hash may differ. Image, version, source offer, offline
+options, resource profile and pause policy must match exactly. The operation
+revalidates the stopped pair and live old service, creates a held checkpoint and
+new capsule generation, and retains the old receipt plus transition provenance.
+Failed or permanent cutovers cannot use this entrypoint. No worker starts here.
+Restored runtime `config` and `tls` directories are explicitly mode 0750 with
+root:65532 ownership even under `umask 077`; their files remain 0640. Private
+capsules remain root-only and are not made readable to the worker.
+
 A completed resumed or mixed-version rehearsal proves continuation and recovery
 of that frozen pair; its timing is explicitly unqualified. Archive its receipts
 and retain the finished pair, then qualify a fresh current complete-pair rehearsal

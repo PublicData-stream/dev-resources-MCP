@@ -163,6 +163,9 @@ class ServiceTests(unittest.TestCase):
                    ['upgrade-status', '--token', token, '--pause-scope', 'all'],
                    ['upgrade', '--receipt', '/tmp/receipt'],
                    ['upgrade-resume', '--token', token, '--check'],
+                   ['upgrade-resume', '--token', token, '--from-bundle-sha256', 'a' * 64],
+                   ['upgrade-adopt-paused', '--token', token, '--receipt', '/tmp/receipt',
+                    '--from-bundle-sha256', 'wrong'],
                    ['upgrade-adopt-paused', '--token', token, '--receipt', 'relative'])
         for arguments in invalid:
             with self.subTest(arguments=arguments), patch('sys.argv', ['staging.py', *arguments]), \
@@ -177,7 +180,7 @@ class ServiceTests(unittest.TestCase):
             module.return_value.Upgrade.return_value.checkpoint_adopt.return_value = {'check_passed': True}
             op.main()
             module.return_value.Upgrade.return_value.checkpoint_adopt.assert_called_once_with(
-                token, '/tmp/receipt', check_only=True)
+                token, '/tmp/receipt', check_only=True, from_bundle_sha256=None)
 
 
 class RecoveryTests(unittest.TestCase):
