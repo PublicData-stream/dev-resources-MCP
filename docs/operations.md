@@ -1,5 +1,33 @@
 # Operations and acceptance
 
+## Automatic attribution upgrade (schema 11)
+
+Normal startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
+without corpus rewrite or provider acquisition. Existing offline schemas 1–9 to 10
+migration and activation remain required; inspection never bootstraps attribution.
+
+A supervised worker enumerates public history in bounded pages and prioritizes
+requested records. Old qualification withholds copied content until exact evidence
+and notices are reacquired and verified. Initial corpus upgrade can therefore reduce
+content availability. Status distinguishes enumeration from ready, pending, retryable
+and blocked repair. Disabled providers cannot acquire repair evidence. Unrecoverable
+history remains permanently stored and explicitly unavailable.
+Completion counters describe enqueued targets and observed sweep cutoffs. They do
+not certify all currently arriving source rows or universal historical notice scope.
+
+Back up PostgreSQL, the complete blob tree and `.devres-integrity` together. Restore
+acceptance includes attribution generations, queue/control seals, sweep progress and
+notice-resource readback. `verify-storage` checks attribution without network or repair
+writes; pending/blocked work is an operational gap, not storage corruption. An older
+schema-10 binary rejects schema 11. Rollback requires the coordinated pre-upgrade
+database/blob backup, never lowering the schema number or dropping tables.
+
+Local acceptance uses the disposable PostgreSQL/OxiBelt/minikube harness with fresh
+binaries and owned state under `/tmp`; Cargo output is `/tmp/rust/target`. Synthetic
+qualification is seeded only by the private fixture utility; production acquisition
+never accepts a synthetic hostname as upstream proof. Fixed-target live probes use
+at most 20 broker requests per provider without unrestricted collectors or sweeps.
+
 The [npm module](npm.md) adds schema 9, public catalog/advisory acquisition and
 local npm/pnpm/Yarn assessment. Include npm evidence and search data in coordinated
 backups. Private maintenance uses `devres-server rebuild-npm-index CONFIG.toml`
@@ -75,7 +103,7 @@ image. Existing configuration fields and limits retain their meaning.
 `verify-storage CONFIG.toml` also checks an active store after subsequent ingestion;
 it verifies retained file evidence and SQL envelopes without fetching sources,
 creating missing storage layouts, or updating database records. It requires an
-existing schema-10 store; missing integrity evidence is a failure.
+existing schema-10 or schema-11 store; missing integrity evidence is a failure.
 Passing local migration fixtures or a disposable cluster restore does not establish
 production migration, whole-provider coverage, native ARM64 execution, or hosted CI.
 See [architecture](architecture.md#blake3-enforcement-and-schema-10) for identity,

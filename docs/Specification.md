@@ -34,6 +34,30 @@ MCP tools. They require stopped serving/collection writers and preserve retained
 history and request-only audit privacy. Existing retrieval, freshness, licensing,
 paging, result-size and transport behavior continues to apply.
 
+Active schema-10 stores automatically receive additive schema-11 attribution
+tables at normal startup under the exclusive storage-owner fence. This bounded
+transition does not perform the schema 1–9 BLAKE3 conversion, scan the corpus or
+request upstream data. Pending conversion still requires offline activation.
+Schema-11 stores require a matching schema and attribution-policy binary.
+
+Content-bearing results require qualified, versioned attribution for their exact
+source evidence. Tools include structured `attribution` and readable notices;
+resource reads preserve the original page/blob as their first content item and
+append readable attribution. Complete notices are immutable paged resources under
+`devres://attribution/<generation>`. Required notices are never silently truncated.
+Source bytes, offsets, captures, historical memberships and cursor order stay fixed.
+Missing or obsolete qualification withholds copied content with `unavailable` and
+bounded public attribution details. Operational status remains available. Native
+resource errors retain their existing RPC mapping with sanitized details.
+
+Attribution repair is supervised public-source acquisition, separate from offline
+integrity migration. Reads prioritize durable jobs; a bounded local sweep enumerates
+retained history. Repair re-requests exact upstream evidence for the required policy,
+including governing notices. It never retargets historical selectors or treats a
+changed moving URL as the old representation. Disappeared, unsupported or unqualified
+evidence remains retained but publicly withheld. Request-only audits cannot enqueue
+work derived from caller inventories.
+
 ## MCP and transport
 
 Streamable HTTP uses `/mcp`. WebTransport `/mcp-wt/v1` is a custom binding: one
@@ -164,7 +188,8 @@ submitted lockfiles or audit reports. Source text remains untrusted content.
 
 The legacy crate tools retain their request-driven search, sparse-index and
 checksum-verified source behavior. Dedicated research tools use captured local
-snapshots and do not initiate provider traffic. Collection automatically enumerates
+snapshots; obsolete attribution can prioritize the separate exact-evidence repair
+described above. Collection automatically enumerates
 the official Git index, acquires exact archives, imports public database-dump
 metadata, and requests docs.rs documentation for every observed version and published
 target. Hourly index synchronization and daily metadata/documentation refreshes are
@@ -343,6 +368,7 @@ metadata from its publication pages. GitHub owner/repository identities, admitte
 publication destinations and their admission evidence are retained. Ordinary links,
 references, tests, scripts and package manifests cannot authorize new destinations.
 Public requests perform local evidence research and never initiate collection.
+They may prioritize attribution repair for already-retained exact evidence.
 
 | Tool | Capability |
 | --- | --- |
@@ -424,6 +450,7 @@ catalog's latest edition from an older effective selection and explain fallback.
 Default evidence is stale after 24 hours and unavailable beyond seven days;
 explicit historical snapshots/views remain readable. Public research is local and
 does not initiate collection. Collection is current-first with resumable history.
+Attribution repair for retained evidence follows the separate policy above.
 
 | Tool | Capability |
 | --- | --- |

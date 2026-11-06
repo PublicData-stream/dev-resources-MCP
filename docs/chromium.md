@@ -61,7 +61,9 @@ Archived Chrome content never silently replaces current website content. Histori
 snapshots, resource URIs, and cursors retain their original selection after refresh
 or processor upgrades. Comparisons describe observations, not API compatibility.
 
-Public research performs local reads and does not launch source requests. List pages
+Public research performs local reads. Obsolete attribution may queue the supervised
+exact-evidence repair described in [the specification](Specification.md); it does
+not enroll new corpus sources or change historical selections. List pages
 default to 20 and cap at 100; offset paging stops at 10,000 with cursor continuation.
 Text and decoded byte pages cap at 32 KiB. Text offsets count UTF-8 bytes. Technical
 AND search and English query modes use snapshot-selected BM25 statistics.

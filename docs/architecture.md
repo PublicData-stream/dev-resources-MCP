@@ -48,6 +48,18 @@ ordered snapshot membership, fixed legacy aliases and resumable Git-history stat
 Versions 1–9 preserve earlier capture identities. Schema 10 adds explicit BLAKE3
 identities and permanent legacy compatibility mappings; older binaries reject it.
 
+Schema 11 adds checksummed attribution policy control, immutable notice generations,
+durable repair targets/claims and bounded history-sweep checkpoints. Normal startup
+expands active schema 10 atomically before serving, without network acquisition or
+bulk backfill. Schemas 1–9 and pending integrity activation keep their offline gates.
+A policy epoch/fingerprint prevents serving under an incompatible requirement.
+Application policy gates copied-content routes and supervises one repair lane;
+adapters construct exact source requests through the existing broker. SQL publication
+checks claim ownership and source/policy identity. Source rows and raw bodies remain
+immutable, with explicit generation/occurrence bindings outside capture hashes.
+Unknown mappings are blocked, never inferred from common body hashes. Audits pass
+only public snapshot evidence and never schedule inventory-derived work.
+
 New blobs use `blake3/<64 lowercase hex>` paths in an operator-owned directory;
 public hash identifiers use `blake3:<64 lowercase hex>`. Legacy SHA-256 paths remain
 retained compatibility evidence. Publication writes a unique staging file, fsyncs
@@ -73,8 +85,8 @@ archive capture; checksum verification precedes archive parsing.
 
 ## BLAKE3 enforcement and schema 10
 
-Fresh stores initialize with enforced schema 10. Older stores require explicit
-private offline migration; serving rejects an older schema or pending migration.
+Fresh stores initialize with enforced BLAKE3 and schema 11. Schemas 1–9 require explicit
+private offline migration; serving rejects pre-10 schemas or pending migration.
 The maintenance path acquires the same exclusive owner fence before any provider
 workers or listeners start. It makes no upstream requests and never executes
 inspected package code.
@@ -213,6 +225,7 @@ commits exactly that membership. Background prewarming validates retained shard
 files before activation and after restart; foreground cold-open/search work has a
 separate 15-second budget. Newer work completed during indexing belongs to a later
 snapshot. Requests never rebuild indexes or launch collection work.
+They may prioritize attribution repair for already-retained exact sources.
 
 ## Privacy and isolation
 

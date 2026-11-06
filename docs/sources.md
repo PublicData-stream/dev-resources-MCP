@@ -24,8 +24,15 @@ shared transfer slot. Both paths share provider host clocks.
 API/docs.rs hosts retain at most one attempt/second. Official Git/sparse-index and
 static.crates.io budgets are independently configurable; defaults are one and five
 attempts/second respectively. RFC host aliases share a source budget. API limits
-must not be raised beyond the provider's published policy. Cache hits make no source requests;
+must not be raised beyond the provider's published policy. Attribution-ready cache hits make no source requests;
 conditional revalidation records the observation without replacing body content.
+Obsolete attribution schedules separate supervised exact-evidence repair even with
+a fresh source TTL. Each policy generation requires actual upstream acquisition.
+A conditional response qualifies only its exact representation when retained body
+and all required notice evidence suffice; otherwise a full response is needed.
+Repair shares source clocks, transfer limits and the existing bounded retry owner.
+Notice links never grant outbound authority. Retain versioned notices, member
+exceptions and derivation requirements rather than using provider-wide placeholders.
 Legacy crate search/sparse-index captures have one-hour freshness. Exact archives
 bound to an index checksum may be reused for one year; this does not extend the
 freshness of moving version/yanked metadata.

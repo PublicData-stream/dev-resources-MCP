@@ -29,6 +29,13 @@ origin lists reject every present Origin. The source URL is advertised, not fetc
 or verified by the server; a syntactically valid offer is not evidence that the
 corresponding source is actually available.
 
+Attribution repair uses existing per-provider `enabled` settings and source budgets;
+it adds no public administration endpoint or configuration table. Disabled providers
+make no repair requests. Their retained current qualification remains usable, but
+obsolete/missing qualification stays unavailable until repair succeeds. Existing
+foreground source access retains its separate collector-setting semantics. Source
+freshness and attribution policy versions are independent.
+
 ## Resource defaults
 
 The optional `[rfc]` table defaults to automatic permanent corpus collection:
