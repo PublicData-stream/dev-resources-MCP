@@ -1,9 +1,19 @@
 # Staging deployment
 
 These host-specific assets target the published
-`0.1.0-build.b91929db` server image into `devres-staging` on `piqua-serve`.
+`0.1.0-build.d373818b` server image into `devres-staging` on `piqua-serve`.
 The disposable [foundation](../kubernetes/foundation.yaml) remains separate.
 No package code is executed and no administrative HTTP route is added.
+
+The reviewed release commit is `d373818b211f9126117ce4ee5709c859e5318b84`.
+Use the immutable public indexes below, including their accepted native amd64 and
+arm64 manifests. Do not retag a different build as this version.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Server image index | `4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10` |
+| Probe image index | `74b6e9020fe9868e7005f87ed0bc4a785dbd83a09ec9f6952b848f366d4a6512` |
+| Corresponding `source.tar.gz` | `2ff98ccd72e9a2dc69423ca680f4a2bedebfdc2b63abb2008f13e30800974d79` |
 
 The public endpoints are
 `https://dev-resources.staged.mcp.publicdata.stream/mcp` and
@@ -122,8 +132,9 @@ python3 staging.py upgrade-rollback
 ```
 
 `refresh-services` installs the reviewed systemd units and reloads their definitions
-while preserving timer activation states. It refuses an active upgrade, so finish
-an existing rehearsal before refreshing an installed operator bundle.
+while preserving timer activation states. An active operation normally refuses
+refresh. The token-qualified exception is a fully verified, stopped rehearsal
+checkpoint; a permanent cutover must keep its exact installed bundle and watchdog.
 
 Rehearsal uses a protected coordinated snapshot and isolated `/tmp` clones with
 no provider egress. It first proves schema-nine recovery, then runs the exact new
@@ -137,9 +148,10 @@ Each offline migration, verification or activation command has a finite seven-da
 ceiling, including nested restore verification. This is an execution bound, not
 a completion estimate. Cutover commands remain limited by the smaller remaining
 measured outage budget (or direct-mode absolute deadline); the watchdog and
-preserving rollback are unchanged. A failed rehearsal removes its disposable
-clone, so retrying starts from a fresh coordinated snapshot rather than resuming
-that removed clone. Never extend a running operation by editing its journal.
+preserving rollback are unchanged. A checkpoint pause preserves its database/blob
+pair rather than entering ordinary disposable-clone cleanup. A preserved failure
+is not a successful pause: inspect its ownership and recovery state before retrying.
+Never extend a running operation by editing its journal.
 
 Only the main migration rehearsal clone has a finite 512 GiB parent quota. Before
 creating its temporary runtime directory or ZFS objects, it requires at least
@@ -160,7 +172,9 @@ Recovery is allowed to complete beyond the cutover deadline.
 The main rehearsal migration and ordinary permanent cutover use the same profile:
 128 GiB and 37 CPU cores for the offline worker, including a 32 GiB `/tmp` tmpfs,
 and 32 GiB and two CPU cores for PostgreSQL with the existing tuned PostgreSQL
-settings. Migration worker count and payload accounting retain the binary defaults.
+settings. Candidate offline commands explicitly use eight workers, a 64 MiB SQL
+payload budget and a 1,024 MiB graph-memory budget. These options are bound into
+the measured profile; schema-nine restore commands keep their old-image options.
 Both paths require at least 32 GiB of host available memory before each offline
 worker and during polling; limits are ceilings rather than reserved capacity.
 Ordinary and nested restore checks retain their 64 GiB worker, 32 GiB worker tmpfs
@@ -174,6 +188,80 @@ timings, then agree the actual outage window before draining the permanent pair.
 The watchdog budget includes public acceptance and the post-cutover backup/restore;
 collector observation follows finish. Recheck identities, current data size and
 headroom at cutover. Never edit journal deadlines to extend an expired budget.
+
+### Checkpoint pause and explicit resume
+
+The private lifecycle commands are:
+
+```sh
+python3 staging.py upgrade-status --token CURRENT_UPGRADE_TOKEN
+python3 staging.py upgrade-pause --token CURRENT_UPGRADE_TOKEN
+python3 staging.py upgrade-resume --token CURRENT_UPGRADE_TOKEN
+```
+
+Starting commands accept `--pause-scope rehearsal|all`, defaulting to `rehearsal`.
+Rehearsal checkpoints can be paused by default. Permanent-pair pause/resume requires
+`all` recorded when starting that cutover; it is not enabled retroactively by a
+pause request. Only its offline migration, verification and activation phases are
+eligible, after pre-upgrade recovery proof and before the public candidate starts.
+Preparation, snapshotting, restore proof, public acceptance, finish and rollback
+are not pause points.
+
+A pause request is token-bound and acknowledged by the owning driver. It signals
+only its owned worker with SIGTERM, waits for termination, cleanly stops PostgreSQL,
+confirms the cluster is shut down, and creates a held coordinated checkpoint plus
+a private integrity-checked recovery capsule. Failed or uncertain shutdown never
+reports a clean pause. Checkpoint and failure paths preserve committed progress;
+scratch is reconstructed, not treated as migration evidence. Capsules contain
+inert configuration and identity data, never executable resume instructions.
+
+Reboot does not automatically resume migration. Explicit resume rechecks the exact
+pair, snapshots, ownership, images, bundle and execution profile, then reconstructs
+missing owned runtime files under `/tmp`. Durable activation state is reconciled
+before choosing the next command, including an activation whose result was lost
+after commit. An already-active store is not sent through migration again.
+
+For permanent cutovers, the original absolute deadline continues through pause
+and reboot. Keep the enabled token-specific watchdog and zero Kubernetes writers;
+expiry wins pause/resume races and runs preserving pair rollback. PID identity is
+bound to the boot as well as process birth, so an old journal cannot signal a
+reused process. Pausing does not restore collectors, backup timers or public serving.
+
+The specific earlier version-one rehearsal receipt can be imported with:
+
+```sh
+python3 staging.py upgrade-adopt-paused --token CURRENT_UPGRADE_TOKEN \
+  --receipt /var/lib/devres-staging/upgrade/rehearsal-pause-2.json --check
+python3 staging.py upgrade-adopt-paused --token CURRENT_UPGRADE_TOKEN \
+  --receipt /var/lib/devres-staging/upgrade/rehearsal-pause-2.json
+```
+
+Adoption validates the receipt chain, capsule inventory and hashes, dataset GUIDs,
+origins, ownership, held snapshots, stopped containers and clean PostgreSQL state.
+It preserves the old records and checkpoints and records the reviewed image/bundle
+transition. Legacy Python helpers and free-form command fields are never executed.
+The timer intent comes from the original rehearsal record, not a timer state
+changed by reboot. A new pre-adoption checkpoint protects the same pair.
+The `--check` form performs admission checks without adopting the pair, stopping
+the backup timer, changing runtime configuration or creating a snapshot. Use a
+separately staged reviewed bundle for this check before replacing installed code.
+
+A completed resumed or mixed-version rehearsal proves continuation and recovery
+of that frozen pair; its timing is explicitly unqualified. Archive its receipts
+and retain the finished pair, then qualify a fresh current complete-pair rehearsal
+with the exact target image, bundle and profile before ordinary cutover. Never
+promote the older clone while newer live ingestion continues. Restore original
+backup-timer intent only at a verified safe terminal boundary; a missed persistent
+backup may run immediately and must serialize through the maintenance lock.
+
+`scripts/test-staging-worker.sh` is a separate fixture-only acceptance gate. It
+requires the built server and migration-benchmark example, starts disposable
+PostgreSQL with bind state below `/tmp`, interrupts real RFC graph replay with
+SIGTERM, resumes the same pair, and checks committed checkpoints plus restored
+query readback. It performs no provider acquisition and does not establish ZFS,
+systemd, remote-corpus or production acceptance. Set `DEVRES_SERVER_BINARY` and
+`MIGRATION_BENCHMARK_BINARY` to select already-built binaries; shared-cache Cargo
+builds must use the privileged channel and `/tmp/rust/target`.
 
 The real cutover stops all writers, retains a fresh protected database/evidence
 snapshot, verifies old-image recovery, and runs the same offline commands on the
@@ -189,7 +277,7 @@ Record the current upgrade journal's token and resulting booleans in root-owned 
 `/var/lib/devres-staging/upgrade/acceptance.json`:
 
 ```json
-{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.b91929db","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
+{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.d373818b","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
 ```
 
 Finish qualifies a schema-ten coordinated backup/isolated restore before
