@@ -448,3 +448,227 @@ async fn disconnect_drops_in_flight_tool_inputs() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn attribution_notices_reach_both_http_revisions_and_resource_pages() {
+    let source = SourceOffer::new("https://source.test/attribution-fixture").unwrap();
+    let mut registry = server_info_registry(source.clone()).unwrap();
+    let notice_uri = format!("devres://attribution/{}", "a".repeat(64));
+    let attribution = json!({"readable_notice":"Copyright fixture authors; original terms apply.","resource_uri":notice_uri,"generations":[]});
+    let tool_attribution = attribution.clone();
+    registry.register(json!({"name":"fixture.attribution","description":"Public synthetic attribution fixture.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true}}),move |_,_| {
+        let attribution=tool_attribution.clone();
+        async move { Ok(json!({"page":{"text":"original page","offset":12},"attribution":attribution})) }
+    }).unwrap();
+    registry.with_resource_reader(move |uri,_| {
+        let attribution=attribution.clone();
+        async move { Ok(json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":"original page","_meta":{"attribution":attribution}}, {"uri":attribution["resource_uri"],"mimeType":"text/plain","text":attribution["readable_notice"]}]})) }
+    });
+    let mut builder = ServerBuilder::new(registry, Limits::default(), source);
+    builder
+        .register_endpoint(HttpEndpoint {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            access: AccessPolicy {
+                allowed_hosts: vec!["backend".into()],
+                allowed_origins: vec![],
+            },
+            tls: None,
+            edge_mtls: None,
+        })
+        .unwrap();
+    let server = builder.bind().await.unwrap();
+    let http = server.addresses()[0].1[0];
+    let shutdown = CancellationToken::new();
+    let signal = shutdown.clone();
+    let task = tokio::spawn(async move { server.run(signal).await });
+    let client = reqwest::Client::new();
+    for revision in ["2026-07-28", "2025-11-25"] {
+        let request = |method: &str, mut params: Value| {
+            let mut request = client
+                .post(format!("http://{http}/mcp"))
+                .header("host", "backend")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", revision);
+            if revision == "2026-07-28" {
+                params["_meta"] = meta();
+                request = request.header("mcp-method", method);
+                if let Some(name) = params
+                    .get("name")
+                    .or_else(|| params.get("uri"))
+                    .and_then(Value::as_str)
+                {
+                    request = request.header("mcp-name", name);
+                }
+            }
+            request.json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        };
+        if revision == "2025-11-25" {
+            let response=request("initialize",json!({"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"attribution-fixture","version":"1"}})).send().await.unwrap();
+            assert!(response.status().is_success());
+            let _ = response_json(response).await;
+        }
+        let tool = response_json(
+            request(
+                "tools/call",
+                json!({"name":"fixture.attribution","arguments":{}}),
+            )
+            .send()
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            tool["result"]["structuredContent"]["page"]["text"],
+            "original page"
+        );
+        let content = tool["result"]["content"].as_array().unwrap();
+        assert!(content.iter().any(|item| item["type"] == "text"
+            && item["text"] == "Copyright fixture authors; original terms apply."));
+        assert!(
+            content
+                .iter()
+                .any(|item| item["type"] == "resource_link" && item["uri"] == notice_uri)
+        );
+        let resource = response_json(
+            request("resources/read", json!({"uri":"devres://capture/fixture"}))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resource["result"]["contents"][0]["text"], "original page");
+        assert_eq!(
+            resource["result"]["contents"][1]["text"],
+            "Copyright fixture authors; original terms apply."
+        );
+        assert_eq!(
+            resource["result"]["contents"][0]["_meta"]["attribution"]["resource_uri"],
+            notice_uri
+        );
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oversized_attribution_error_details_are_omitted_in_both_http_revisions() {
+    let source = SourceOffer::new("https://source.test/error-fixture").unwrap();
+    let mut registry = server_info_registry(source.clone()).unwrap();
+    registry.register(json!({"name":"fixture.attribution_error","description":"Synthetic bounded error.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true}}),|_,_|async {
+        Err(devres_domain::Error::unavailable("Attribution repair is pending.").with_details(json!({"attribution_status":"unavailable","subjects":[{"key":"public-fixture-".repeat(8192)}]})))
+    }).unwrap();
+    registry.with_resource_reader(|uri,_|async move {
+        if uri.ends_with("/required-notice-too-large") {
+            return Ok(json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":"original-selected-page"},
+                {"uri":"devres://attribution/fixture","mimeType":"text/plain","text":"mandatory-notice".repeat(8192)}]}));
+        }
+        Err(devres_domain::Error::unavailable("Attribution repair is pending.").with_details(json!({"attribution_status":"unavailable","subjects":[{"key":"public-fixture-".repeat(8192)}]})))
+    });
+    let limits = Limits {
+        max_message_bytes: 8192,
+        max_tool_result_bytes: None,
+        ..Default::default()
+    };
+    let mut builder = ServerBuilder::new(registry, limits, source);
+    builder
+        .register_endpoint(HttpEndpoint {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            access: AccessPolicy {
+                allowed_hosts: vec!["backend".into()],
+                allowed_origins: vec![],
+            },
+            tls: None,
+            edge_mtls: None,
+        })
+        .unwrap();
+    let server = builder.bind().await.unwrap();
+    let http = server.addresses()[0].1[0];
+    let shutdown = CancellationToken::new();
+    let signal = shutdown.clone();
+    let task = tokio::spawn(async move { server.run(signal).await });
+    let client = reqwest::Client::new();
+    for revision in ["2026-07-28", "2025-11-25"] {
+        let request = |method: &str, mut params: Value| {
+            let mut request = client
+                .post(format!("http://{http}/mcp"))
+                .header("host", "backend")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", revision);
+            if revision == "2026-07-28" {
+                params["_meta"] = meta();
+                request = request.header("mcp-method", method);
+                if let Some(name) = params
+                    .get("name")
+                    .or_else(|| params.get("uri"))
+                    .and_then(Value::as_str)
+                {
+                    request = request.header("mcp-name", name);
+                }
+            }
+            request.json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        };
+        if revision == "2025-11-25" {
+            let initialized=request("initialize",json!({"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"error-fixture","version":"1"}})).send().await.unwrap();
+            assert!(initialized.status().is_success());
+            let _ = response_json(initialized).await;
+        }
+        for (method, args) in [
+            (
+                "tools/call",
+                json!({"name":"fixture.attribution_error","arguments":{}}),
+            ),
+            ("resources/read", json!({"uri":"devres://capture/fixture"})),
+        ] {
+            let response = request(method, args).send().await.unwrap();
+            let raw = response.text().await.unwrap();
+            assert!(
+                raw.len() < 8192,
+                "oversized public error escaped configured message bound"
+            );
+            assert!(!raw.contains("public-fixture-"));
+            let value = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .or_else(|| {
+                    raw.lines()
+                        .filter_map(|line| line.strip_prefix("data:"))
+                        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                })
+                .unwrap();
+            if method == "tools/call" {
+                assert_eq!(value["result"]["isError"], true);
+                assert_eq!(value["result"]["structuredContent"]["code"], "unavailable");
+                assert!(
+                    value["result"]["structuredContent"]
+                        .get("details")
+                        .is_none()
+                );
+            } else {
+                assert_eq!(value["error"]["code"], -32602);
+                assert!(value["error"].get("data").is_none_or(Value::is_null));
+            }
+        }
+        let oversized = response_json(
+            request(
+                "resources/read",
+                json!({"uri":"devres://capture/required-notice-too-large"}),
+            )
+            .send()
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(oversized["error"]["code"], -32603);
+        assert!(!oversized.to_string().contains("original-selected-page"));
+        assert!(!oversized.to_string().contains("mandatory-notice"));
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

@@ -408,7 +408,7 @@ impl NpmResearch {
             return Ok(
                 json!({"name":name,"version":version,"path":path,"kind":row["kind"],"snapshot":snapshot_summary(snapshot),
                 "page":crate::research::text_page(text,input.offset,input.limit.unwrap_or(32768))?,"resource_uri":uri,
-                "provenance":{"metadata":row["release"],"archive":row["artifact"]},"gaps":projection["gaps"],"notices":"Original package license and notices apply; source is inert."}),
+                "provenance":{"metadata":row["release"],"archive":projection["artifact"]},"gaps":projection["gaps"],"notices":"Original package license and notices apply; source is inert."}),
             );
         }
         Err(Error::not_found(
@@ -585,6 +585,23 @@ impl NpmResearch {
             )
             .await?;
         result["snapshot"] = snapshot_summary(&snapshot);
+        if let Some(results) = result.get_mut("results").and_then(Value::as_array_mut) {
+            for hit in results {
+                let name = hit
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(failure)?
+                    .to_owned();
+                let version = hit
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .ok_or_else(failure)?
+                    .to_owned();
+                let projection = self.projection(&snapshot, &name, &version).await?;
+                hit["provenance"] =
+                    json!({"archive":projection["artifact"],"metadata":projection["release"]});
+            }
+        }
         Ok(result)
     }
     async fn discovery(
@@ -705,7 +722,28 @@ impl NpmResearch {
                 let matched = crate::npm::audit::match_record(record, name, version)?;
                 complete &= matched["complete"] == true;
                 if matched["matched"] == true {
-                    bounded_push(&mut output, &mut output_bytes, advisory_summary(record))?;
+                    let mut summary = advisory_summary(record);
+                    if record["rights_gap"] != true {
+                        let filter = json!({"snapshot":snapshot["membership"],"id":record["id"]});
+                        let rows = self
+                            .corpus
+                            .store
+                            .npm_rows("advisory-members", 0, 2, None, Some(&filter))
+                            .await?;
+                        if rows.len() != 1 {
+                            return Err(failure());
+                        }
+                        let raw_id = rows[0].data["raw"].as_str().ok_or_else(failure)?;
+                        let raw = self
+                            .corpus
+                            .store
+                            .npm_get("advisory-raw", raw_id)
+                            .await?
+                            .ok_or_else(failure)?
+                            .data;
+                        summary["source_capture"] = advisory_source_evidence(&raw, record);
+                    }
+                    bounded_push(&mut output, &mut output_bytes, summary)?;
                 }
             }
             let mut result = self.page(&input, &snapshot, query, selected_cursor, output)?;
@@ -772,10 +810,21 @@ impl NpmResearch {
                     let original = std::str::from_utf8(&bytes).map_err(|_| failure())?;
                     return Ok(
                         json!({"advisory":advisory_summary(&record),"snapshot":snapshot_summary(&snapshot),"representation":input.representation.as_deref().unwrap_or("source"),
-                        "page":crate::research::text_page(original,input.offset,input.limit.unwrap_or(32768))?,"provenance":raw,"resource_uri":resource(&snapshot,"advisory",&json!({"id":record["id"]}))?}),
+                        "page":crate::research::text_page(original,input.offset,input.limit.unwrap_or(32768))?,"provenance":raw,"source_capture":advisory_source_evidence(&raw,&record),"resource_uri":resource(&snapshot,"advisory",&json!({"id":record["id"]}))?}),
                     );
                 }
-                let projected = advisory_summary(&record);
+                let mut projected = advisory_summary(&record);
+                if record["rights_gap"] != true {
+                    let raw_id = row.data["raw"].as_str().ok_or_else(failure)?;
+                    let raw = self
+                        .corpus
+                        .store
+                        .npm_get("advisory-raw", raw_id)
+                        .await?
+                        .ok_or_else(failure)?
+                        .data;
+                    projected["source_capture"] = advisory_source_evidence(&raw, &record);
+                }
                 if input.name.as_ref().is_some_and(|name| {
                     !record["packages"]
                         .as_array()
@@ -884,7 +933,9 @@ impl NpmResearch {
             }
             text
         };
-        Ok(json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":text}]}))
+        Ok(
+            json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":text,"_meta":{"source_evidence":crate::research::resource_evidence(&value)}}]}),
+        )
     }
 }
 fn resource(snapshot: &Value, kind: &str, key: &Value) -> Result<String> {
@@ -985,6 +1036,11 @@ fn matches_catalog(row: &Value, input: &Input) -> Result<bool> {
     }
     Ok(true)
 }
+fn advisory_source_evidence(raw: &Value, record: &Value) -> Value {
+    json!({"id":record["id"],"source_url":raw["source_url"],"body_hash":raw["artifact"]["body_hash"],
+        "member_path":raw["member_path"],"export_hash":raw["export_hash"],"advisory":advisory_summary(record)})
+}
+
 fn advisory_summary(record: &Value) -> Value {
     json!({"id":record["id"],"packages":record["packages"],"classification":record["classification"],
     "matching_complete":record["matching_complete"],"license":record["license"],"attribution_url":record["attribution_url"],"rights_gap":record["rights_gap"],

@@ -707,6 +707,14 @@ async fn legacy_source_capture_and_resource_keep_distribution_numeric_key() {
         research.read_resource(old_uri.as_str()).await.unwrap()["page"],
         pinned["page"]
     );
+    let resource = research.read_resource(old_uri.as_str()).await.unwrap();
+    assert_eq!(resource["contents"][0]["text"], pinned["page"]["text"]);
+    assert_eq!(resource["contents"][0]["uri"], old_uri.as_str());
+    assert_eq!(
+        resource["contents"][0]["_meta"]["source_evidence"]["archive_capture"]["id"],
+        captures[1].capture.id
+    );
+
     let metadata = packages
         .call(
             "npm.metadata",

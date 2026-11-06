@@ -533,14 +533,33 @@ impl MdnResearch {
         result["snapshot"] = json!(selection.selector());
         if let Some(rows) = result["results"].as_array_mut() {
             for row in rows {
-                if let Some(path) = row["path"].as_str() {
+                if let Some(path) = row["path"].as_str().map(str::to_owned) {
                     row["resource_uri"] = json!(resource_uri(
                         &selection.snapshot.repository,
                         &selection.snapshot.id,
                         "source",
-                        path,
+                        &path,
                         None
                     ));
+                    if let Some(member) = crate::mdn::inventory::get(
+                        self.store.as_ref(),
+                        &selection.snapshot.inventory,
+                        &path,
+                    )
+                    .await?
+                    {
+                        let source_path = member
+                            .raw
+                            .as_ref()
+                            .and_then(|raw| raw["source_path"].as_str())
+                            .unwrap_or(&member.path);
+                        row["oid"] = json!(member.oid);
+                        row["source_path"] = json!(source_path);
+                        row["source_url"] = json!(source_url(&selection.snapshot, source_path));
+                        row["revision"] = json!(selection.snapshot.revision);
+                        row["repository"] = json!(selection.snapshot.repository);
+                        row["license"] = license(&selection.snapshot);
+                    }
                 }
             }
         }
@@ -910,7 +929,7 @@ impl MdnResearch {
         })
         .await
         .map_err(|_| failure())??;
-        let mut result = json!({"feature":feature,"snapshot":snapshot.id,"revision":snapshot.revision,"metadata":record["data"].as_object().map(|v|v.iter().filter(|(key,_)|key.as_str()!="support").map(|(k,v)|(k.clone(),v.clone())).collect::<serde_json::Map<String,Value>>()),"original":resolved.original,"resolved":resolved.resolved,"gaps":resolved.gaps,"source_path":member.raw.as_ref().and_then(|r|r["source_path"].as_str()),"source_url":source_url(snapshot,member.raw.as_ref().and_then(|r|r["source_path"].as_str()).unwrap_or(&member.path)),"license":license(snapshot),"resource_uri":resource_uri("compat",&snapshot.id,"feature",feature,None)});
+        let mut result = json!({"feature":feature,"oid":member.oid,"repository":snapshot.repository,"snapshot":snapshot.id,"revision":snapshot.revision,"metadata":record["data"].as_object().map(|v|v.iter().filter(|(key,_)|key.as_str()!="support").map(|(k,v)|(k.clone(),v.clone())).collect::<serde_json::Map<String,Value>>()),"original":resolved.original,"resolved":resolved.resolved,"gaps":resolved.gaps,"source_path":member.raw.as_ref().and_then(|r|r["source_path"].as_str()),"source_url":source_url(snapshot,member.raw.as_ref().and_then(|r|r["source_path"].as_str()).unwrap_or(&member.path)),"license":license(snapshot),"resource_uri":resource_uri("compat",&snapshot.id,"feature",feature,None)});
         if let Some(browser) = browser {
             let original = result["original"].get(browser).cloned();
             if original.is_none()
@@ -998,7 +1017,7 @@ impl MdnResearch {
             .map(|(version, data)| json!({"version":version,"data":data}))
             .collect();
         Ok(
-            json!({"snapshot":selection.selector(),"browser":input.browser,"metadata":metadata,"releases":rows,"total":releases.len(),"offset":input.offset,"next_offset":if input.offset+input.limit<releases.len(){Some(input.offset+input.limit)}else{None},"provenance":selection.public(),"license":license(&selection.snapshot),"resource_uri":resource_uri("compat",&selection.snapshot.id,"browser",&input.browser,None)}),
+            json!({"snapshot":selection.selector(),"browser":input.browser,"oid":member.oid,"source_path":member.raw.as_ref().and_then(|raw|raw["source_path"].as_str()),"source_url":source_url(&selection.snapshot,member.raw.as_ref().and_then(|raw|raw["source_path"].as_str()).unwrap_or(&member.path)),"metadata":metadata,"releases":rows,"total":releases.len(),"offset":input.offset,"next_offset":if input.offset+input.limit<releases.len(){Some(input.offset+input.limit)}else{None},"provenance":selection.public(),"license":license(&selection.snapshot),"resource_uri":resource_uri("compat",&selection.snapshot.id,"browser",&input.browser,None)}),
         )
     }
     async fn discovery(&self, input: DiscoveryInput, history: bool) -> Result<Value> {
@@ -1281,15 +1300,15 @@ impl MdnResearch {
         };
         if let Some(text) = output["page"]["text"].as_str() {
             Ok(
-                json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":text,"_meta":{"provenance":output["provenance"],"source_url":output["source_url"],"license":output["license"],"gaps":output["gaps"]}}]}),
+                json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":text,"_meta":{"source_evidence":crate::research::resource_evidence(&output),"provenance":output["provenance"],"source_url":output["source_url"],"license":output["license"],"gaps":output["gaps"]}}]}),
             )
         } else if let Some(bytes) = output["page"]["data"].as_str() {
             Ok(
-                json!({"contents":[{"uri":uri,"mimeType":"application/octet-stream","blob":bytes,"_meta":{"provenance":output["provenance"],"source_url":output["source_url"],"license":output["license"],"gaps":output["gaps"]}}]}),
+                json!({"contents":[{"uri":uri,"mimeType":"application/octet-stream","blob":bytes,"_meta":{"source_evidence":crate::research::resource_evidence(&output),"provenance":output["provenance"],"source_url":output["source_url"],"license":output["license"],"gaps":output["gaps"]}}]}),
             )
         } else {
             Ok(
-                json!({"contents":[{"uri":uri,"mimeType":"application/json","text":serde_json::to_string(&output).map_err(|_|integrity())?}]}),
+                json!({"contents":[{"uri":uri,"mimeType":"application/json","text":serde_json::to_string(&output).map_err(|_|integrity())?,"_meta":{"source_evidence":crate::research::resource_evidence(&output)}}]}),
             )
         }
     }

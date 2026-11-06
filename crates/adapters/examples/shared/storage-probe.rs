@@ -1,4 +1,6 @@
 //! Offline persistence acceptance utility. Credentials enter only through env.
+#[path = "storage-attribution-fixture.rs"]
+mod attribution_fixture;
 use devres_adapters::PgBlobStore;
 use devres_application::Store;
 use devres_application::advisory::{AdvisoryRecord, AdvisorySnapshot, AdvisoryStore};
@@ -912,7 +914,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::var("BLOB_DIR")?;
     let store = std::sync::Arc::new(PgBlobStore::connect(&database, &root).await?);
     let request = FetchRequest {
-        key: "fixture:storage-probe".into(),
+        key: "rfc:fixture-storage-probe".into(),
         url: "https://fixtures.invalid/devres/storage-probe".into(),
         ttl_secs: 3600,
         max_bytes: 4096,
@@ -955,6 +957,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => return Err("Expected write, read, or fixture-ids".into()),
     };
+    if std::env::args().nth(1).as_deref() == Some("write") {
+        attribution_fixture::seed(store.clone(), std::path::Path::new(&root), &stored).await?;
+    }
     if stored.body != b"Synthetic dev-resources persistence acceptance fixture\n" {
         return Err("Fixture mismatch".into());
     }

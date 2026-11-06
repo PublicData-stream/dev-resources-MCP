@@ -703,7 +703,9 @@ impl AdvisoryResearch {
         input.validate()?;
         let _read_permit = admit_reads().await?;
         let result = self.get(&input).await?;
-        Ok(json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":result["page"]["text"]}]}))
+        Ok(
+            json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":result["page"]["text"],"_meta":{"source_evidence":crate::research::resource_evidence(&result)}}]}),
+        )
     }
 }
 
@@ -833,6 +835,8 @@ fn record_summary(snapshot: &AdvisorySnapshot, record: &AdvisoryRecord) -> Value
     if let Some(object) = metadata.as_object_mut() {
         object.remove("original");
         object.insert("body_hash".into(), json!(record.body_hash));
+        object.insert("source_url".into(), json!(source_url(snapshot, record)));
+        object.insert("revision".into(), json!(snapshot.revision));
         object.insert("path".into(), json!(record.path));
         object.insert("resource_uri".into(), json!(resource_uri(snapshot, record)));
     }

@@ -2364,7 +2364,7 @@ impl ChromiumResearch {
         let processing_gaps = output
             .get("processing_gaps")
             .unwrap_or(&output["page"]["processing_gaps"]);
-        let metadata = json!({"provenance":output["selection"],"source_url":output["source_metadata"]["source_url"],"source_path":output["path"],"source_metadata":output["source_metadata"],"derived_notice":DERIVED_NOTICE,"license":output["license"],"gaps":{"member":output["gaps"],"processing":processing_gaps,"coverage":output["selection"]["coverage"]}});
+        let metadata = json!({"source_evidence":crate::research::resource_evidence(&output),"provenance":output["selection"],"source_url":output["source_metadata"]["source_url"],"source_path":output["path"],"source_metadata":output["source_metadata"],"derived_notice":DERIVED_NOTICE,"license":output["license"],"gaps":{"member":output["gaps"],"processing":processing_gaps,"coverage":output["selection"]["coverage"]}});
         Ok(if parts[2] == "bytes" {
             json!({"contents":[{"uri":uri,"mimeType":"application/octet-stream","blob":output["page"]["base64"],"_meta":metadata}]})
         } else {

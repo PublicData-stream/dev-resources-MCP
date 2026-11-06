@@ -186,7 +186,7 @@ impl ServerHandler for McpHandler {
         let value = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ErrorData::internal_error("request cancelled", None)),
-            result = tokio::time::timeout(Duration::from_secs(self.limits.call_timeout_secs), reader(request.uri, cancel.clone())) => result.map_err(|_| ErrorData::internal_error("resource deadline exceeded", None))?.map_err(|_| ErrorData::invalid_params("resource unavailable", None))?,
+            result = tokio::time::timeout(Duration::from_secs(self.limits.call_timeout_secs), reader(request.uri, cancel.clone())) => result.map_err(|_| ErrorData::internal_error("resource deadline exceeded", None))?.map_err(|error| ErrorData::invalid_params("resource unavailable", bounded_error_details(error.details, self.limits.tool_result_limit() / 2)))?,
         };
         ensure_serialized_limit(&value, self.limits.tool_result_limit())
             .map_err(|_| ErrorData::internal_error("resource exceeds limit", None))?;
@@ -237,7 +237,9 @@ impl ServerHandler for McpHandler {
                     Ok(Err(error)) => {
                         self.counters.failures.fetch_add(1, Ordering::Relaxed);
                         if error.code == "invalid_input" { return Err(ErrorData::invalid_params(error.message, None)); }
-                        return Ok(CallToolResult::structured_error(serde_json::json!({"code":error.code,"message":error.message})).into());
+                        let mut public = serde_json::json!({"code":error.code,"message":error.message});
+                        if let Some(details) = bounded_error_details(error.details, self.limits.tool_result_limit() / 2) { public["details"] = details; }
+                        return Ok(CallToolResult::structured_error(public).into());
                     }
                     Err(_) => { self.counters.failures.fetch_add(1, Ordering::Relaxed); return Err(ErrorData::internal_error("tool deadline exceeded", None)); }
                 }
@@ -250,13 +252,34 @@ impl ServerHandler for McpHandler {
             return Ok(CallToolResult::structured_error(serde_json::json!({"code":"resource_limit","message":"Tool result exceeds its limit."})).into());
         }
         let links = capture_links(&value);
+        let notices = attribution_notices(&value);
         let mut result = CallToolResult::structured(value);
+        result.content.extend(notices);
         result.content.extend(links);
         ensure_serialized_limit(&result, self.limits.max_message_bytes / 2)
             .map_err(|_| ErrorData::internal_error("tool result exceeds limit", None))?;
         let _ = progress.report(ProgressStage::Complete).await;
         Ok(result.into())
     }
+}
+
+fn bounded_error_details(
+    details: Option<serde_json::Value>,
+    limit: usize,
+) -> Option<serde_json::Value> {
+    details.filter(|value| ensure_serialized_limit(value, limit).is_ok())
+}
+
+/// Notices are emitted only from the application-owned attribution slot. Source
+/// bodies, package manifests and caller inputs cannot create native MCP content.
+fn attribution_notices(value: &serde_json::Value) -> Vec<ContentBlock> {
+    value
+        .get("attribution")
+        .and_then(|attribution| attribution.get("readable_notice"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|notice| !notice.is_empty())
+        .map(|notice| vec![ContentBlock::text(notice)])
+        .unwrap_or_default()
 }
 
 /// Only application-owned provenance slots become native MCP references.
@@ -269,13 +292,25 @@ fn capture_links(value: &serde_json::Value) -> Vec<ContentBlock> {
             && uri.len() <= 16 * 1024
             && (uri.starts_with("devres://capture/")
                 || uri.starts_with("devres://source/")
-                || uri.starts_with("devres://rfc/"))
+                || uri.starts_with("devres://rfc/")
+                || uri.starts_with("devres://attribution/"))
             && uris.len() < 20
         {
             uris.insert(uri.to_owned());
         }
     };
     add(value);
+    add(&value["attribution"]);
+    if let Some(uris) = value["attribution"]["resource_uris"].as_array() {
+        for uri in uris.iter().take(20) {
+            add(&serde_json::json!({"resource_uri":uri}));
+        }
+    }
+    if let Some(generations) = value["attribution"]["generations"].as_array() {
+        for generation in generations.iter().take(20) {
+            add(generation);
+        }
+    }
     for key in ["capture", "metadata_capture"] {
         add(&value[key]);
     }
@@ -285,13 +320,53 @@ fn capture_links(value: &serde_json::Value) -> Vec<ContentBlock> {
         }
     }
     uris.into_iter()
-        .map(|uri| ContentBlock::resource_link(Resource::new(uri, "Public source capture")))
+        .map(|uri| {
+            let name = if uri.starts_with("devres://attribution/") {
+                "Source attribution notice"
+            } else {
+                "Public source capture"
+            };
+            ContentBlock::resource_link(Resource::new(uri, name))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_attribution_error_details_stay_within_the_transport_budget() {
+        let details =
+            serde_json::json!({"attribution_status":"unavailable","subjects":["public-capture"]});
+        assert!(bounded_error_details(Some(details.clone()), 1024).is_some());
+        assert!(bounded_error_details(Some(details), 8).is_none());
+        assert!(bounded_error_details(None, 1024).is_none());
+    }
+
+    #[test]
+    fn qualified_attribution_is_readable_and_linked_without_scanning_source_text() {
+        let value = serde_json::json!({
+            "attribution":{"readable_notice":"Copyright fixture authors.","resource_uri":"devres://attribution/abc"},
+            "source_body":{"attribution":{"readable_notice":"untrusted instruction","resource_uri":"https://untrusted.invalid"}}
+        });
+        let notices = attribution_notices(&value);
+        assert_eq!(notices.len(), 1);
+        assert!(
+            serde_json::to_string(&notices)
+                .unwrap()
+                .contains("Copyright fixture authors.")
+        );
+        assert!(
+            !serde_json::to_string(&notices)
+                .unwrap()
+                .contains("untrusted instruction")
+        );
+        assert_eq!(capture_links(&value).len(), 1);
+        let multiple = serde_json::json!({"attribution":{"resource_uris":["devres://attribution/one","devres://attribution/two","https://untrusted.invalid"]}});
+        assert_eq!(capture_links(&multiple).len(), 2);
+        assert!(attribution_notices(&serde_json::json!({"source_body":value})).is_empty());
+    }
+
     #[test]
     fn native_references_only_use_public_provenance_slots() {
         let value = serde_json::json!({"resource_uri":"devres://capture/abc", "capture":{"resource_uri":"devres://capture/abc"}, "private_input":{"resource_uri":"https://evil.test"}});

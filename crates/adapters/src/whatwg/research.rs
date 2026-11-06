@@ -636,6 +636,36 @@ impl WhatwgResearch {
             .index()
             .search(&reference, members, spec, cancel)
             .await?;
+        if let Some(hits) = result.get_mut("results").and_then(Value::as_array_mut) {
+            for hit in hits {
+                let standard = hit["standard"]
+                    .as_str()
+                    .ok_or_else(|| Error::integrity("WHATWG search hit standard is missing."))?;
+                let snapshot = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.standard == standard)
+                    .ok_or_else(|| {
+                        Error::integrity("WHATWG search hit is outside selected evidence.")
+                    })?;
+                let path = hit["path"]
+                    .as_str()
+                    .ok_or_else(|| Error::integrity("WHATWG search hit path is missing."))?
+                    .to_owned();
+                let member = self
+                    .corpus
+                    .member(snapshot, &path)
+                    .await?
+                    .ok_or_else(|| Error::integrity("WHATWG search hit member is absent."))?;
+                hit["selection"] = public_selection(
+                    snapshot,
+                    selector.snapshot.is_some() || selector.view.is_some(),
+                    view.as_ref(),
+                );
+                hit["license"] = source_license(snapshot);
+                hit["resource_uri"] = json!(resource(snapshot, "text", &path, None));
+                hit["citation"] = json!({"source_url":snapshot.source_url,"revision":snapshot.revision,"path":path,"object_hash":member.oid,"projection":member.projection});
+            }
+        }
         result["view"] = json!(view.as_ref().map(|v| &v.id));
         result["selections"] = json!(
             snapshots
@@ -695,6 +725,7 @@ impl WhatwgResearch {
                 }
                 selected = Some((
                     member.path.clone(),
+                    member.oid.clone(),
                     symbol_index,
                     symbol,
                     member.gaps.clone(),
@@ -702,13 +733,15 @@ impl WhatwgResearch {
                 ));
             }
         }
-        let (path, symbol_index, symbol, gaps, processing_gaps) = selected.ok_or_else(|| {
-            Error::not_found("WHATWG symbol is absent from the selected snapshot.")
-        })?;
+        let (path, oid, symbol_index, symbol, gaps, processing_gaps) =
+            selected.ok_or_else(|| {
+                Error::not_found("WHATWG symbol is absent from the selected snapshot.")
+            })?;
         Ok(
             json!({"selection":public_selection(&snapshot,input.snapshot.is_some()||input.view.is_some(),selected_view.as_ref()),"path":path,
             "kind":symbol.kind,"name":symbol.name,"anchor":symbol.anchor,"scope":symbol.scope,"symbol_index":symbol_index,"page":text_page(&symbol.text,input.offset,input.limit)?,
-            "resource_uri":symbol_resource(&snapshot,&path,symbol_index),"license":source_license(&snapshot),"gaps":gaps,"processing_gaps":processing_gaps}),
+            "resource_uri":symbol_resource(&snapshot,&path,symbol_index),"license":source_license(&snapshot),"gaps":gaps,"processing_gaps":processing_gaps,
+            "citation":{"source_url":snapshot.source_url,"revision":snapshot.revision,"path":path,"object_hash":oid}}),
         )
     }
     async fn list(&self, tool: &str, input: ListInput, cancel: CancellationToken) -> Result<Value> {
@@ -807,7 +840,8 @@ impl WhatwgResearch {
                         {
                             continue;
                         }
-                        let value = json!({"standard":snapshot.standard,"snapshot":snapshot.id,"path":member.path,"reference":reference,"resolution":resolved});
+                        let value = json!({"standard":snapshot.standard,"snapshot":snapshot.id,"path":member.path,"reference":reference,"resolution":resolved,
+                            "license":source_license(snapshot),"citation":{"source_url":snapshot.source_url,"revision":snapshot.revision,"path":member.path,"object_hash":member.oid}});
                         if matches_query(&value, input.query.as_deref()) {
                             items.push(value);
                         }
@@ -820,7 +854,8 @@ impl WhatwgResearch {
                         {
                             continue;
                         }
-                        let value = json!({"standard":snapshot.standard,"snapshot":snapshot.id,"path":member.path,"symbol_index":symbol_index,"symbol":{"kind":symbol.kind,"name":symbol.name,"anchor":symbol.anchor,"scope":symbol.scope,"text_bytes":symbol.text.len()},"resource_uri":symbol_resource(snapshot,&member.path,symbol_index)});
+                        let value = json!({"standard":snapshot.standard,"snapshot":snapshot.id,"path":member.path,"symbol_index":symbol_index,"symbol":{"kind":symbol.kind,"name":symbol.name,"anchor":symbol.anchor,"scope":symbol.scope,"text_bytes":symbol.text.len()},"resource_uri":symbol_resource(snapshot,&member.path,symbol_index),
+                            "license":source_license(snapshot),"citation":{"source_url":snapshot.source_url,"revision":snapshot.revision,"path":member.path,"object_hash":member.oid}});
                         if matches_query(&value, input.query.as_deref()) {
                             items.push(value);
                         }
@@ -1590,7 +1625,7 @@ impl WhatwgResearch {
         let processing_gaps = output
             .get("processing_gaps")
             .unwrap_or(&output["page"]["processing_gaps"]);
-        let metadata = json!({"provenance":output["selection"],"source_url":output["selection"]["source_url"],"source_path":output["path"],"license":output["license"],"gaps":{"member":output["gaps"],"processing":processing_gaps,"coverage":output["selection"]["coverage"]}});
+        let metadata = json!({"source_evidence":crate::research::resource_evidence(&output),"provenance":output["selection"],"source_url":output["selection"]["source_url"],"source_path":output["path"],"license":output["license"],"gaps":{"member":output["gaps"],"processing":processing_gaps,"coverage":output["selection"]["coverage"]}});
         Ok(if parts[2] == "bytes" {
             json!({"contents":[{"uri":uri,"mimeType":"application/octet-stream","blob":output["page"]["base64"],"_meta":metadata}]})
         } else {

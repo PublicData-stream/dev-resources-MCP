@@ -190,7 +190,7 @@ async fn main() -> Result<(), ServerError> {
     w3c_corpus.initialize_status().await?;
     let chromium_corpus = Arc::new(devres_adapters::chromium::ChromiumCorpus::new(
         store.clone(),
-        broker,
+        broker.clone(),
         &config.storage.blob_dir,
         config.chromium.clone(),
     )?);
@@ -248,6 +248,30 @@ async fn main() -> Result<(), ServerError> {
         return Ok(());
     }
     let mdn_research = mdn_corpus.research();
+    let enabled_attribution: Vec<String> = [
+        ("rfc", config.rfc.enabled),
+        ("crates", config.crates.enabled),
+        ("rustsec", config.rustsec.enabled),
+        ("mdn", config.mdn.enabled),
+        ("whatwg", config.whatwg.enabled),
+        ("w3c", config.w3c.enabled),
+        ("chromium", config.chromium.enabled),
+        ("npm", config.npm.enabled),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(name, _)| name.to_owned())
+    .collect();
+    let attribution = Arc::new(
+        devres_application::attribution_runtime::AttributionRuntime::new(
+            store.clone(),
+            Arc::new(devres_adapters::AttributionAdapter::new(
+                broker.clone(),
+                store.clone(),
+            )),
+            enabled_attribution,
+        )?,
+    );
     let research = Arc::new(
         devres_adapters::Research::new(retrieval)
             .await?
@@ -258,7 +282,8 @@ async fn main() -> Result<(), ServerError> {
             .with_whatwg_corpus(whatwg_corpus.clone())
             .with_w3c_corpus(w3c_corpus.clone())
             .with_chromium_corpus(chromium_corpus.clone())
-            .with_npm_corpus(npm_corpus.clone()),
+            .with_npm_corpus(npm_corpus.clone())
+            .with_attribution_gate(attribution.clone()),
     );
     if let Some((command, manifest)) = crate_command {
         let shutdown = CancellationToken::new();
@@ -304,6 +329,9 @@ async fn main() -> Result<(), ServerError> {
     let mut registry = server_info_registry(config.source.url.clone())?;
     registry.register_research(research)?;
     let mut server = ServerBuilder::new(registry, config.limits, config.source.url);
+    server.register_worker("attribution-repair", move |shutdown| async move {
+        attribution.run(shutdown).await.map_err(Into::into)
+    })?;
     server.register_worker("rfc-collector", move |shutdown| async move {
         corpus.run(shutdown).await.map_err(Into::into)
     })?;

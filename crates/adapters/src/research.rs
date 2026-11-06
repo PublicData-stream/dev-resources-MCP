@@ -7,7 +7,7 @@ use crate::{
 #[path = "research_search.rs"]
 mod search_scheduling;
 
-use devres_application::Retrieval;
+use devres_application::{Retrieval, attribution_gate::AttributionGate};
 use devres_domain::{Capture, Error, Result, StoredCapture};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ use std::{
 
 pub struct Research {
     retrieval: Arc<Retrieval>,
+    attribution_gate: Option<Arc<dyn AttributionGate>>,
     advisory: advisory::Advisories,
     advisory_research: Option<crate::rustsec::research::AdvisoryResearch>,
     corpus: Option<std::sync::Arc<RfcCorpus>>,
@@ -114,6 +115,7 @@ pub(crate) fn text_page(text: &str, offset: usize, limit: usize) -> Result<Value
 impl Research {
     pub async fn new(retrieval: Arc<Retrieval>) -> Result<Self> {
         Ok(Self {
+            attribution_gate: None,
             npm: crate::npm::NpmPackages::new(retrieval.clone()),
             npm_corpus: None,
             npm_research: None,
@@ -127,6 +129,12 @@ impl Research {
             w3c_research: None,
             chromium_research: None,
         })
+    }
+
+    /// Production composition installs this gate before registering any tools.
+    pub fn with_attribution_gate(mut self, gate: Arc<dyn AttributionGate>) -> Self {
+        self.attribution_gate = Some(gate);
+        self
     }
 
     pub fn with_corpus(mut self, corpus: std::sync::Arc<RfcCorpus>) -> Self {
@@ -193,9 +201,15 @@ impl Research {
         deadline: tokio::time::Instant,
     ) -> Result<Value> {
         if tool == "search" {
-            return self
-                .search_with_context(decode(input)?, cancel, deadline)
-                .await;
+            let output = self
+                .search_with_context(decode(input)?, cancel.clone(), deadline)
+                .await?;
+            return tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(Error::new("cancelled", "Request cancelled.")),
+                result = tokio::time::timeout_at(deadline, self.qualify_output("search", "mixed", output)) =>
+                    result.map_err(|_| Error::unavailable("Attribution qualification deadline exceeded."))?,
+            };
         }
         tokio::select! {
             biased;
@@ -205,6 +219,118 @@ impl Research {
     }
 
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        let provider = if tool == "fetch" {
+            input
+                .get("id")
+                .and_then(Value::as_str)
+                .map(provider_for_identifier)
+                .unwrap_or("unknown")
+        } else {
+            provider_for_tool(tool)
+        }
+        .to_owned();
+        // Resource fetches run the exact same resource gate, rather than deriving
+        // a second subject from their serialized page or notice attachments.
+        let resource_fetch = tool == "fetch"
+            && input
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("devres://"));
+        let output = self.call_unqualified(tool, input).await?;
+        if resource_fetch {
+            return Ok(output);
+        }
+        self.qualify_output(tool, &provider, output).await
+    }
+
+    async fn qualify_output(&self, tool: &str, provider: &str, mut output: Value) -> Result<Value> {
+        let Some(gate) = &self.attribution_gate else {
+            return Ok(output);
+        };
+        if !output.is_object() {
+            return Err(Error::integrity("Invalid public tool representation."));
+        }
+        if tool.ends_with(".corpus_status") {
+            output["attribution"] = gate.status().await?;
+            return Ok(output);
+        }
+        if metadata_only_discovery(tool, &output) {
+            output["attribution"] = json!({"status":"metadata_only","copied_content":false});
+            return Ok(output);
+        }
+        let attribution = if matches!(tool, "audit.lockfile" | "npm.audit_lockfile") {
+            self.qualify_audit(tool, &output, gate.as_ref()).await?
+        } else {
+            gate.qualify(provider, &output).await?
+        };
+        output["attribution"] = attribution;
+        Ok(output)
+    }
+
+    async fn qualify_audit(
+        &self,
+        tool: &str,
+        output: &Value,
+        gate: &dyn AttributionGate,
+    ) -> Result<Value> {
+        // The report stays in request memory. Select only immutable public
+        // records again by their source identifiers, without dependency fields.
+        let ids = audit_advisory_ids(output)?;
+        if ids.is_empty() {
+            return Ok(json!({"status":"metadata_only","copied_content":false}));
+        }
+        let snapshot = output
+            .pointer("/snapshot/id")
+            .and_then(Value::as_str)
+            .filter(|id| devres_domain::valid_content_id(id))
+            .ok_or_else(|| {
+                Error::unavailable("Public advisory snapshot attribution is unavailable.")
+            })?;
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            let record = if tool == "audit.lockfile" {
+                let format = output
+                    .pointer("/snapshot/format")
+                    .and_then(Value::as_str)
+                    .unwrap_or("rustsec");
+                self.advisory_research
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::unavailable("Public advisory source storage is unavailable.")
+                    })?
+                    .call(
+                        "advisory.get",
+                        json!({"id":id,"snapshot":snapshot,"format":format,"limit":1}),
+                    )
+                    .await?
+            } else {
+                self.npm_research
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::unavailable("Public npm advisory source storage is unavailable.")
+                    })?
+                    .call(
+                        "npm.advisory_get",
+                        json!({"id":id,"snapshot":snapshot,"limit":1}),
+                    )
+                    .await?
+            };
+            records.push(resource_evidence(&record));
+        }
+        // audit:* is read-only: no matching subset, inventory or report may
+        // create persistent targets, repairs, or caller-to-advisory associations.
+        gate.qualify(
+            if tool == "audit.lockfile" {
+                "audit:rustsec"
+            } else {
+                "audit:npm"
+            },
+            &json!({"records":records}),
+        )
+        .await
+    }
+
+    async fn call_unqualified(&self, tool: &str, input: Value) -> Result<Value> {
         if crate::npm::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
@@ -326,12 +452,55 @@ impl Research {
             "crate.metadata" => cargo::metadata(&self.retrieval, decode(input)?).await,
             "crate.source_list" => cargo::source_list(&self.retrieval, decode(input)?).await,
             "crate.source_read" => cargo::source_read(&self.retrieval, decode(input)?).await,
-            "advisory.lookup" => self.advisory.lookup(decode(input)?).await,
+            "advisory.lookup" => {
+                self.advisory_summary_sources(self.advisory.lookup(decode(input)?).await?)
+                    .await
+            }
             "audit.lockfile" => self.advisory.audit(decode(input)?).await,
             "search" => self.search(decode(input)?).await,
             "fetch" => self.fetch(decode(input)?).await,
             _ => Err(Error::not_found("Unknown research tool.")),
         }
+    }
+
+    async fn advisory_summary_sources(&self, mut output: Value) -> Result<Value> {
+        let Some(research) = &self.advisory_research else {
+            return Ok(output);
+        };
+        let Some(snapshot) = output
+            .pointer("/snapshot/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Ok(output);
+        };
+        let format = output
+            .pointer("/snapshot/format")
+            .and_then(Value::as_str)
+            .unwrap_or("rustsec")
+            .to_owned();
+        if let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) {
+            if items.len() > 100 {
+                return Err(Error::capacity(
+                    "Advisory provenance page exceeds its bound.",
+                ));
+            }
+            for item in items {
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::integrity("Public advisory identity missing."))?
+                    .to_owned();
+                let record = research
+                    .call(
+                        "advisory.get",
+                        json!({"id":id,"snapshot":snapshot,"format":format,"limit":1}),
+                    )
+                    .await?;
+                item["source_capture"] = resource_evidence(&record);
+            }
+        }
+        Ok(output)
     }
 
     async fn search(&self, input: SearchInput) -> Result<Value> {
@@ -395,7 +564,10 @@ impl Research {
                 )
                 .await
             }
-            "rustsec" => self.advisory.search(&query, page).await,
+            "rustsec" => {
+                self.advisory_summary_sources(self.advisory.search(&query, page).await?)
+                    .await
+            }
             "chromium" => match self.chromium_research.as_ref() {
                 Some(research) => {
                     research
@@ -590,6 +762,42 @@ impl Research {
         {
             return Err(Error::invalid("Invalid capture resource URI."));
         }
+        if url.host_str() == Some("attribution") {
+            let id = url
+                .path()
+                .strip_prefix('/')
+                .filter(|id| devres_domain::valid_content_id(id))
+                .ok_or_else(|| Error::invalid("Invalid attribution generation."))?;
+            let (offset, limit) = resource_page(&url)?;
+            return self
+                .attribution_gate
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Attribution storage is not configured."))?
+                .bundle(id, offset, limit)
+                .await;
+        }
+        let output = self.read_resource_unqualified(uri).await?;
+        let Some(gate) = &self.attribution_gate else {
+            return Ok(output);
+        };
+        let provider = provider_for_resource(url.host_str().unwrap_or("unknown"));
+        let attribution = gate.qualify(provider, &output).await?;
+        attach_resource_attribution(output, attribution)
+    }
+
+    async fn read_resource_unqualified(&self, uri: &str) -> Result<Value> {
+        if uri.len() > 16384 {
+            return Err(Error::invalid("Resource URI is too long."));
+        }
+        let url = url::Url::parse(uri).map_err(|_| Error::invalid("Invalid resource URI."))?;
+        if url.scheme() != "devres"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(Error::invalid("Invalid capture resource URI."));
+        }
         if url.host_str() == Some("chromium") {
             return self
                 .chromium_research
@@ -599,10 +807,14 @@ impl Research {
                 .await;
         }
         if url.host_str() == Some("npm-source") {
-            return self
+            let mut output = self
                 .npm
                 .call("npm.source_read", crate::npm::source_input_from_uri(uri)?)
-                .await;
+                .await?;
+            // The direct adapter historically returned source_read fields here.
+            // Retain them while adding the valid MCP resource envelope.
+            output["contents"] = json!([{"uri":uri,"mimeType":"text/plain","text":output["page"]["text"],"_meta":{"source_evidence":resource_evidence(&output)}}]);
+            return Ok(output);
         }
         if url.host_str() == Some("npm") {
             return self
@@ -640,7 +852,7 @@ impl Research {
             let input = cargo::source_input_from_uri(&url)?;
             let output = cargo::source_read(&self.retrieval, input).await?;
             return Ok(
-                json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":output["page"]["text"]}]}),
+                json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":output["page"]["text"],"_meta":{"source_evidence":resource_evidence(&output)}}]}),
             );
         }
         if url.host_str() == Some("advisory") {
@@ -661,9 +873,9 @@ impl Research {
             )
             .await?;
             return Ok(if value["format"] == "pdf" {
-                json!({"contents":[{"uri":uri,"mimeType":"application/pdf","blob":value["page"]["data"]}]})
+                json!({"contents":[{"uri":uri,"mimeType":"application/pdf","blob":value["page"]["data"],"_meta":{"source_evidence":resource_evidence(&value)}}]})
             } else {
-                json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":value["page"]["text"]}]})
+                json!({"contents":[{"uri":uri,"mimeType":"text/plain","text":value["page"]["text"],"_meta":{"source_evidence":resource_evidence(&value)}}]})
             });
         }
         if url.host_str() != Some("capture") {
@@ -709,13 +921,444 @@ impl Research {
         })?;
         let page = text_page(text, offset, limit)?;
         Ok(
-            json!({"contents":[{"uri":uri,"mimeType":stored.capture.media_type,"text":page["text"]}]}),
+            json!({"contents":[{"uri":uri,"mimeType":stored.capture.media_type,"text":page["text"],"_meta":{"source_evidence":{"capture":capture_json(&stored.capture,0),"source_key":stored.capture.key,"media_type":stored.capture.media_type}}}]}),
         )
     }
 
     pub fn tool_schemas() -> Vec<Value> {
         schemas()
     }
+}
+
+/// Source evidence excludes the copied page, preserving identity and notices
+/// without duplicating a maximum-sized body inside MCP metadata.
+pub(crate) fn resource_evidence(output: &Value) -> Value {
+    let mut evidence = output.clone();
+    if let Some(object) = evidence.as_object_mut() {
+        object.remove("page");
+        object.remove("contents");
+        object.remove("original");
+        object.remove("resolved");
+        object.remove("contracts");
+        if let Some(advisory) = object.get_mut("advisory").and_then(Value::as_object_mut) {
+            for field in ["original", "description", "details", "summary"] {
+                advisory.remove(field);
+            }
+        }
+        if let Some(advisory) = object
+            .get_mut("source_capture")
+            .and_then(|source| source.get_mut("advisory"))
+            .and_then(Value::as_object_mut)
+        {
+            for field in ["original", "description", "details", "summary"] {
+                advisory.remove(field);
+            }
+        }
+    }
+    evidence
+}
+
+/// Empty search pages and natural version facts do not reproduce upstream
+/// prose. This is a narrow schema-aware exception, never targets-empty success.
+fn metadata_only_discovery(tool: &str, output: &Value) -> bool {
+    fn copied(value: &Value, depth: usize) -> bool {
+        if depth > 24 {
+            return true;
+        }
+        match value {
+            Value::Object(object) => object.iter().any(|(key, value)| {
+                let populated = !value.is_null()
+                    && value.as_str() != Some("")
+                    && value.as_array().is_none_or(|values| !values.is_empty());
+                (populated
+                    && matches!(
+                        key.as_str(),
+                        "text"
+                            | "body"
+                            | "description"
+                            | "summary"
+                            | "title"
+                            | "abstract"
+                            | "abstract_text"
+                            | "snippet"
+                            | "content"
+                            | "original"
+                            | "resolved"
+                            | "contracts"
+                            | "source_text"
+                            | "license_text"
+                            | "notice"
+                    ))
+                    || copied(value, depth + 1)
+            }),
+            Value::Array(values) => values.iter().any(|value| copied(value, depth + 1)),
+            _ => false,
+        }
+    }
+    fn natural_metadata(value: &Value, key: &str, depth: usize) -> bool {
+        if depth > 24 {
+            return false;
+        }
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => true,
+            Value::String(text) => {
+                matches!(
+                    key,
+                    "id" | "revision"
+                        | "format"
+                        | "source_url"
+                        | "url"
+                        | "resource_uri"
+                        | "body_hash"
+                        | "name"
+                        | "version"
+                        | "path"
+                        | "repository"
+                        | "kind"
+                        | "source_key"
+                        | "snapshot"
+                        | "view"
+                        | "parents"
+                        | "ref"
+                        | "status"
+                        | "reason"
+                        | "source"
+                        | "next_cursor"
+                        | "index"
+                        | "manifest"
+                        | "head"
+                        | "inventory"
+                        | "lane"
+                        | "artifact_capture"
+                ) && text.len() <= 16384
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b":/._@?%#=+-".contains(&byte))
+            }
+            Value::Array(values) => values
+                .iter()
+                .all(|value| natural_metadata(value, key, depth + 1)),
+            Value::Object(values) => values
+                .iter()
+                .all(|(key, value)| natural_metadata(value, key, depth + 1)),
+        }
+    }
+    fn natural_fields(row: &Value) -> bool {
+        let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
+        let version = row
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if name.is_empty()
+            || crate::npm::processing::validate_name(name).is_err()
+            || semver::Version::parse(version).is_err()
+        {
+            return false;
+        }
+        if !row.get("license").is_none_or(|value| {
+            value.is_null()
+                || value.as_str().is_some_and(|value| {
+                    matches!(
+                        value,
+                        "" | "MIT"
+                            | "Apache-2.0"
+                            | "ISC"
+                            | "BSD-2-Clause"
+                            | "BSD-3-Clause"
+                            | "CC0-1.0"
+                            | "MPL-2.0"
+                            | "Unlicense"
+                    )
+                })
+        }) {
+            return false;
+        }
+        if !row.get("engines").is_none_or(|value| {
+            value.is_null()
+                || value.as_object().is_some_and(|engines| {
+                    engines.iter().all(|(engine, value)| {
+                        matches!(
+                            engine.as_str(),
+                            "node" | "npm" | "yarn" | "pnpm" | "bun" | "deno"
+                        ) && value.as_str().is_some_and(|value| {
+                            value.len() <= 128
+                                && value.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || b".*^~<>=| -".contains(&byte)
+                                })
+                        })
+                    })
+                })
+        }) {
+            return false;
+        }
+        if !row.get("dist").is_none_or(|value| {
+            value.is_null()
+                || value.as_object().is_some_and(|dist| {
+                    dist.iter().all(|(key, value)| match key.as_str() {
+                        "tarball" => value.as_str().is_some_and(|url| {
+                            crate::npm::source::Operation::Archive {
+                                name: name.into(),
+                                version: version.into(),
+                                url: url.into(),
+                            }
+                            .url()
+                            .is_ok()
+                        }),
+                        "integrity" => value.as_str().is_some_and(|value| {
+                            value.len() <= 256
+                                && (value.starts_with("sha512-") || value.starts_with("sha256-"))
+                                && value.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || b"+/=_-".contains(&byte)
+                                })
+                        }),
+                        "shasum" => value.as_str().is_some_and(|value| {
+                            value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        }),
+                        "fileCount" | "unpackedSize" => value.as_u64().is_some(),
+                        _ => false,
+                    })
+                })
+        }) {
+            return false;
+        }
+        if !row.get("metadata_capture").is_none_or(|value| {
+            value.is_null() || value.as_str().is_some_and(devres_domain::valid_content_id)
+        }) {
+            return false;
+        }
+        true
+    }
+    if copied(output, 0) {
+        return false;
+    }
+    if matches!(tool, "npm.versions" | "crate.versions") {
+        if !output.as_object().is_some_and(|headers| {
+            headers
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "items" | "results"))
+                .all(|(key, value)| natural_metadata(value, key, 0))
+        }) {
+            return false;
+        }
+        let rows = output
+            .get("items")
+            .or_else(|| output.get("results"))
+            .and_then(Value::as_array);
+        return rows.is_some_and(|rows| {
+            rows.len() <= 100
+                && rows.iter().all(|row| {
+                    natural_fields(row)
+                        && row.as_object().is_some_and(|row| {
+                            row.keys().all(|key| {
+                                matches!(
+                                    key.as_str(),
+                                    "name"
+                                        | "version"
+                                        | "description"
+                                        | "license"
+                                        | "keywords"
+                                        | "deprecated"
+                                        | "engines"
+                                        | "dist"
+                                        | "metadata_capture"
+                                        | "yanked"
+                                        | "checksum"
+                                        | "id"
+                                        | "source_capture"
+                                )
+                            })
+                        })
+                        && row.get("keywords").is_none_or(|value| {
+                            value.is_null() || value.as_array().is_some_and(Vec::is_empty)
+                        })
+                        && row.get("deprecated").is_none_or(|value| {
+                            value.is_null() || value.is_boolean() || value.as_str() == Some("")
+                        })
+                })
+        });
+    }
+    if !(tool.ends_with(".search")
+        || tool.ends_with(".catalog_search")
+        || tool.ends_with(".content_search")
+        || tool.ends_with(".api_search")
+        || tool.ends_with(".symbol_search")
+        || tool.ends_with(".compat_search")
+        || matches!(tool, "advisory.lookup" | "npm.advisory_lookup"))
+    {
+        return false;
+    }
+    let mut collection = false;
+    for field in ["items", "results", "matches"] {
+        if let Some(value) = output.get(field) {
+            collection = true;
+            if !value.as_array().is_some_and(Vec::is_empty) {
+                return false;
+            }
+        }
+    }
+    collection
+        && output
+            .get("total")
+            .is_some_and(|total| total.as_u64() == Some(0))
+        && natural_metadata(output, "", 0)
+}
+
+fn audit_advisory_ids(output: &Value) -> Result<Vec<String>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for finding in output
+        .get("findings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let advisory = &finding["advisory"];
+        let copied = advisory.as_object().is_some_and(|fields| {
+            fields.iter().any(|(field, value)| {
+                !value.is_null()
+                    && value.as_str() != Some("")
+                    && (!matches!(
+                        field.as_str(),
+                        "id" | "aliases"
+                            | "packages"
+                            | "package"
+                            | "classification"
+                            | "matching_complete"
+                            | "license"
+                            | "attribution_url"
+                            | "url"
+                            | "rights_gap"
+                            | "published"
+                            | "modified"
+                            | "withdrawn"
+                            | "date"
+                            | "patched"
+                            | "unaffected"
+                            | "affected"
+                            | "categories"
+                            | "keywords"
+                            | "informational"
+                            | "format"
+                    ) || matches!(
+                        field.as_str(),
+                        "title" | "summary" | "description" | "details"
+                    ))
+            })
+        });
+        if !copied {
+            continue;
+        }
+        let id = advisory
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Error::unavailable("Copied advisory source identity is unavailable."))?;
+        ids.insert(id.to_owned());
+        for id in finding
+            .get("source_advisory_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = id.as_str() {
+                ids.insert(id.to_owned());
+            }
+        }
+        if ids.len() > 128 {
+            return Err(Error::capacity(
+                "Public advisory attribution selection exceeds its bound.",
+            ));
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn provider_for_tool(tool: &str) -> &str {
+    match tool.split('.').next().unwrap_or(tool) {
+        "crate" => "crates",
+        "advisory" | "audit" => "rustsec",
+        "search" => "mixed",
+        provider => provider,
+    }
+}
+fn provider_for_resource(host: &str) -> &str {
+    match host {
+        "source" => "crates",
+        "advisory" => "rustsec",
+        "npm-source" => "npm",
+        provider => provider,
+    }
+}
+fn provider_for_identifier(id: &str) -> &str {
+    match id.split(':').next().unwrap_or(id) {
+        "crate" => "crates",
+        "mdn-compat" => "mdn",
+        provider => provider,
+    }
+}
+fn resource_page(url: &url::Url) -> Result<(usize, usize)> {
+    let (mut offset, mut limit) = (0, 32768);
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in url.query_pairs() {
+        if !seen.insert(key.to_string()) {
+            return Err(Error::invalid("Duplicate resource page parameter."));
+        }
+        let parsed = value
+            .parse()
+            .map_err(|_| Error::invalid("Invalid resource page parameter."))?;
+        match key.as_ref() {
+            "offset" => offset = parsed,
+            "limit" => limit = parsed,
+            _ => return Err(Error::invalid("Unknown resource page parameter.")),
+        }
+    }
+    if limit == 0 || limit > 32768 {
+        return Err(Error::invalid("Resource limit must be 1..32768."));
+    }
+    Ok((offset, limit))
+}
+fn attach_resource_attribution(mut output: Value, attribution: Value) -> Result<Value> {
+    let contents = output
+        .get_mut("contents")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| Error::integrity("Invalid public resource representation."))?;
+    let mut metadata_attribution = attribution.clone();
+    if let Some(fields) = metadata_attribution.as_object_mut() {
+        fields.remove("readable_notice");
+        if let Some(generations) = fields.get_mut("generations").and_then(Value::as_array_mut) {
+            for generation in generations {
+                if let Some(notices) = generation.get_mut("notices").and_then(Value::as_array_mut) {
+                    for notice in notices {
+                        if let Some(notice) = notice.as_object_mut() {
+                            notice.remove("text");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for item in contents.iter_mut() {
+        let object = item
+            .as_object_mut()
+            .ok_or_else(|| Error::integrity("Invalid public resource item."))?;
+        let metadata = object.entry("_meta").or_insert_with(|| json!({}));
+        let metadata = metadata
+            .as_object_mut()
+            .ok_or_else(|| Error::integrity("Invalid public resource metadata."))?;
+        metadata.insert("attribution".into(), metadata_attribution.clone());
+    }
+    let notice = attribution
+        .get("readable_notice")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| Error::integrity("Qualified attribution notice missing."))?;
+    let uri = attribution
+        .get("resource_uri")
+        .and_then(Value::as_str)
+        .filter(|uri| uri.starts_with("devres://attribution/"))
+        .ok_or_else(|| Error::integrity("Qualified attribution reference missing."))?;
+    contents.push(json!({"uri":uri,"mimeType":"text/plain","text":notice}));
+    output["attribution"] = attribution;
+    Ok(output)
 }
 
 #[derive(Deserialize)]
@@ -848,3 +1491,123 @@ fn schemas() -> Vec<Value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyInput {}
+
+#[cfg(test)]
+mod attribution_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn only_empty_discovery_and_version_facts_bypass_content_qualification() {
+        assert!(metadata_only_discovery(
+            "npm.versions",
+            &json!({"items":[{"name":"fixture","version":"1.0.0","description":null,"license":"ISC"}],"total":1})
+        ));
+        assert!(!metadata_only_discovery(
+            "npm.versions",
+            &json!({"items":[{"name":"fixture","version":"1.0.0","description":"copied upstream prose"}],"total":1})
+        ));
+        assert!(metadata_only_discovery(
+            "advisory.lookup",
+            &json!({"items":[],"total":0,"snapshot":{"id":"public"}})
+        ));
+        assert!(!metadata_only_discovery(
+            "advisory.lookup",
+            &json!({"items":[{"summary":"copied advisory"}],"total":1})
+        ));
+        assert!(!metadata_only_discovery(
+            "mdn.get",
+            &json!({"items":[],"total":0})
+        ));
+        assert!(!metadata_only_discovery(
+            "audit.lockfile",
+            &json!({"items":[],"total":0})
+        ));
+        assert!(!metadata_only_discovery(
+            "npm.versions",
+            &json!({"items":[{"name":"fixture","version":"1","unknown_copy":"upstream content"}]})
+        ));
+        assert!(!metadata_only_discovery(
+            "advisory.lookup",
+            &json!({"items":[],"total":0,"snapshot":{"unrecognized_copy":"Original upstream prose"}})
+        ));
+        assert!(!metadata_only_discovery(
+            "npm.versions",
+            &json!({"items":[{"name":"fixture","version":"1.0.0"}],"snapshot":{"message":"Original upstream prose"}})
+        ));
+        for row in [
+            json!({"name":"fixture","version":"1.0.0","license":"Copyright original authors. Redistribution terms follow."}),
+            json!({"name":"fixture","version":"1.0.0","engines":{"notice":"copied upstream prose"}}),
+            json!({"name":"fixture","version":"1.0.0","dist":{"notice":"copied upstream prose"}}),
+        ] {
+            assert!(!metadata_only_discovery(
+                "npm.versions",
+                &json!({"items":[row]})
+            ));
+        }
+    }
+
+    #[test]
+    fn audits_reselect_only_public_advisory_ids_without_inventory_associations() {
+        let ids=audit_advisory_ids(&json!({
+            "snapshot":{"id":"public-snapshot"},
+            "findings":[{"package":"private-package-marker","version":"private-version-marker","advisory":{"id":"GHSA-public-source-id","summary":"Original public advisory summary"},"source_advisory_ids":["GHSA-other-public-id"]},
+                {"package":"private-unknown-marker","advisory":{"id":"unresolved-rights-id","summary":null}}],
+            "lockfile":"private-lockfile-marker","entry_count":27
+        })).unwrap();
+        assert_eq!(ids, vec!["GHSA-other-public-id", "GHSA-public-source-id"]);
+        let serialized = serde_json::to_string(&ids).unwrap();
+        for private in [
+            "private-package-marker",
+            "private-version-marker",
+            "private-unknown-marker",
+            "private-lockfile-marker",
+            "entry_count",
+        ] {
+            assert!(!serialized.contains(private));
+        }
+        assert!(
+            audit_advisory_ids(&json!({"findings":[],"entry_count":42}))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resource_evidence_preserves_original_identity_without_copying_page_bytes() {
+        let evidence = resource_evidence(&json!({
+            "capture":{"id":"immutable","body_hash":"digest","source_url":"https://source.invalid/exact"},
+            "license":{"notice":"original notice"},
+            "advisory":{"id":"public","license":"CC0-1.0","original":{"description":"unpaged full source body"}},
+            "page":{"text":"copied excerpt","offset":100},
+            "contents":[{"text":"copied excerpt"}]
+        }));
+        assert_eq!(evidence["capture"]["id"], "immutable");
+        assert_eq!(evidence["license"]["notice"], "original notice");
+        assert!(evidence.get("page").is_none());
+        assert!(evidence.get("contents").is_none());
+        assert!(evidence["advisory"].get("original").is_none());
+        assert_eq!(evidence["advisory"]["license"], "CC0-1.0");
+        assert!(!evidence.to_string().contains("unpaged full source body"));
+    }
+
+    #[test]
+    fn source_and_fetch_aliases_use_the_same_provider_policy() {
+        for (tool, id, provider) in [
+            ("crate.source_read", "crate:itoa@1.0.15", "crates"),
+            ("mdn.get", "mdn:Web/API", "mdn"),
+            ("rfc.get", "rfc:9000", "rfc"),
+            ("whatwg.get", "whatwg:html", "whatwg"),
+            ("w3c.get", "w3c:fixture", "w3c"),
+            ("chromium.get", "chromium:src/docs/example.md", "chromium"),
+            ("npm.document_get", "npm:fixture@1.0.0", "npm"),
+        ] {
+            assert_eq!(provider_for_tool(tool), provider);
+            assert_eq!(provider_for_identifier(id), provider);
+        }
+        assert_eq!(provider_for_resource("source"), "crates");
+        assert_eq!(provider_for_resource("npm-source"), "npm");
+        assert_eq!(provider_for_resource("advisory"), "rustsec");
+        assert_eq!(provider_for_tool("advisory.get"), "rustsec");
+        assert_eq!(provider_for_identifier("mdn-compat:api.fetch"), "mdn");
+    }
+}
