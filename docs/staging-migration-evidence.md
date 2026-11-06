@@ -203,3 +203,44 @@ A bounded lock-acquisition fix and separately reviewed second-attempt admission
 are required before another permanent migration. The incomplete continuation
 scripts remain inert; no temporary SSH authorization or sudoers capability was
 installed. The requested new release is **not yet publicly deployed**.
+
+## Second direct attempt: 2026-11-06 10:38 UTC
+
+Signed commit `1f88ffb` adds the bounded lock-acquisition wait described in the
+runbook. Only acquisition contention is retried; safety-check failures remain
+fatal and time spent waiting counts against the original absolute deadline.
+The final Python suite passed **534 tests**. Independent upgrade review included
+real short-lived and persistently held locks, safety-check failures, and deadline
+and recovery behavior. No Rust runtime or public-contract behavior changed.
+
+The new six-module operator bundle is
+`baccc7148563d0b15153edb40b711b8b4b4274baabe45702121a10af74f58c5f`.
+A separately reviewed terminal qualifier verified the actual recovered old pair,
+configuration/Secret, capacity, collector/timer intent, retained RFC bytes, failed
+pair GUIDs, clone origins and protected holds before installation. Its **16**
+fixtures included actual atomic directory exchange and interrupted-install
+preservation. The unchanged first-attempt journal was archived, the previous
+operator retained, and the complete bundle atomically exchanged. A fresh full
+six-route comparison requalified the retained pre-cutover baseline; a new R2
+baseline was not claimed.
+
+R2 uses separate plan, launch, outcome, log and service identities. It does not
+reset the first attempt's markers or adopt/edit its journal. The fixed deadline
+remains **2026-11-10 20:59 UTC**, with the same three-hour reserve. The canonical
+direct command started at approximately **10:24 UTC**. Its new old-image restore
+passed in about nine seconds; its new three-member pre-upgrade snapshot is held.
+
+Independent live checks verified the requested worker/PostgreSQL images and
+resource profiles, canonical permanent mounts, exact driver identity, stopped
+Kubernetes writers and active/enabled watchdog. The worker continued across
+multiple successful periodic guard runs. At this update, it remained in
+`running_migrate_storage` without OOM and had committed **235,520 file records**,
+beyond the earlier contention failure point. This is not a completion percentage.
+
+The v3 acceptance manifest pins the new bundle and unchanged reviewed helpers.
+The optional external continuation server/client and narrowly scoped capability
+setup/cleanup passed independent fixture review (**33/16/13/11 tests**). Capability
+installation has not executed; the existing SSH-MCP path remains available for
+the full manual candidate acceptance. New-release public acceptance, coordinated
+post-migration restore, collector restoration and ten-minute stability observation
+remain pending.
