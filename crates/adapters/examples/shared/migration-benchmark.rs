@@ -1109,4 +1109,110 @@ mod tests {
         admin.close().await;
         Ok(())
     }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL; opt-in aggregate crate publication diagnostics"]
+    async fn crate_fixture_graph_only_publication_diagnostics() -> Result<()> {
+        let artifacts = match std::env::var("DEVRES_DIAGNOSTIC_CRATE_ARTIFACTS") {
+            Ok(value) => count(Some(&value), 129, 16384)?,
+            Err(std::env::VarError::NotPresent) => 129,
+            Err(error) => return Err(error.into()),
+        };
+        let staging = if artifacts > 129 { 4096 } else { 129 };
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
+        let admin = sqlx::PgPool::connect(&base).await?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let database = format!("devres_crate_diagnostic_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
+            .execute(&admin)
+            .await?;
+        let result: Result<_> = async {
+            let mut url = url::Url::parse(&base)?;
+            url.set_path(&format!("/{database}"));
+            let temporary = tempfile::tempdir_in("/tmp")?;
+            let root = temporary.path().join("blobs");
+            prepare(
+                url.as_str(),
+                &root,
+                &[
+                    "2".into(),
+                    "1".into(),
+                    "2".into(),
+                    "1".into(),
+                    "0".into(),
+                    "1".into(),
+                    artifacts.to_string(),
+                    staging.to_string(),
+                ],
+            )
+            .await?;
+            let execution = MigrationExecution::new_with_graph_options(
+                MigrationExecutionOptions::new(8, 64 * 1024 * 1024)?,
+                MigrationGraphOptions::new(1024 * 1024 * 1024)?,
+            )?;
+            execution.enable_progress();
+            let token = CancellationToken::new();
+            let store = Arc::new(PgBlobStore::connect_for_migration(url.as_str(), &root).await?);
+            store
+                .migrate_storage_with_execution(token.clone(), &execution)
+                .await?;
+            let mut mappings = store.migration_mappings().await?;
+            let aliases = store
+                .migrate_crate_graph_with_execution(&mut mappings, token, &execution)
+                .await?;
+            aliases.ensure_healthy()?;
+            mappings.ensure_healthy()?;
+            let pool = sqlx::PgPool::connect(url.as_str()).await?;
+            let canonical: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            let active: bool =
+                sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
+                    .fetch_one(&pool)
+                    .await?;
+            let counters = execution.snapshot();
+            let report = json!({"event":"crate_publication_diagnostic", "artifacts":artifacts,
+                "staging_rows_per_inventory":staging,"workers":8,
+                "canonical_artifacts":canonical,"active":active,
+                "phase_micros":execution.phase_timings(),
+                "jobs_admitted":counters.admitted,"jobs_completed":counters.completed,
+                "jobs_active":counters.active,"jobs_high_water":counters.high_water,
+                "graph_jobs_admitted":counters.graph_admitted,
+                "graph_jobs_completed":counters.graph_completed,
+                "graph_jobs_active":counters.graph_active,
+                "graph_jobs_high_water":counters.graph_high_water,
+                "graph_memory_bytes":counters.graph_memory_bytes,
+                "graph_memory_high_water":counters.graph_memory_high_water});
+            drop(aliases);
+            drop(mappings);
+            drop(store);
+            pool.close().await;
+            Ok((canonical, active, counters, report))
+        }
+        .await;
+        // This test creates exactly one fresh database. Clean it even when an
+        // ordinary migration error occurs; never touch the caller's base database.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE {database} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await?;
+        admin.close().await;
+        let (canonical, active, counters, report) = result?;
+        assert_eq!(canonical, artifacts as i64);
+        assert!(!active, "graph-only diagnosis must not activate storage");
+        assert_eq!(counters.active, 0);
+        assert_eq!(counters.admitted, counters.completed);
+        assert_eq!(counters.graph_active, 0);
+        assert_eq!(counters.graph_admitted, counters.graph_completed);
+        assert_eq!(counters.graph_memory_bytes, 0);
+        assert!(counters.high_water <= 8 && counters.graph_high_water <= 8);
+        assert!(counters.graph_memory_high_water <= 1024 * 1024 * 1024);
+        println!("{report}");
+        Ok(())
+    }
 }

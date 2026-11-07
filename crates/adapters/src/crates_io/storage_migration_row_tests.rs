@@ -173,6 +173,12 @@ async fn crate_row_pipeline_serial_parallel_boundaries_and_occurrence_resume() {
                 .migrate_artifact_rows(&fixture.maps, &cancel, &execution)
                 .await
                 .unwrap();
+            if count == 129 && workers == 8 {
+                eprintln!(
+                    "crate publication timings (microseconds): {:?}",
+                    execution.phase_timings()
+                );
+            }
             let sizes = fixture.batch_sizes().await;
             assert_eq!(sizes.iter().sum::<i64>(), count as i64);
             assert!(sizes.iter().all(|size| *size <= 128));
@@ -891,4 +897,295 @@ async fn crate_row_pipeline_staging_long_compressible_versions_use_exclusive_adm
     assert!(snapshot.graph_memory_high_water > 1024);
     assert_eq!(snapshot.graph_memory_bytes, 0);
     fixture.close().await;
+}
+
+impl RowFixture {
+    async fn seed_canonical_artifact(&self, index: usize) -> String {
+        let old = &self.pairs[index].0;
+        let capture = self.maps.get(&format!("capture:{old}")).unwrap();
+        let row = sqlx::query("SELECT bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id=$1")
+            .bind(old).fetch_one(&self.pool).await.unwrap();
+        let bytes: i64 = row.try_get("bytes").unwrap();
+        let checked = payload_integrity::checked(
+            "devres_crate_artifacts",
+            "",
+            old,
+            payload_integrity::crate_artifact_payload(
+                bytes as u64,
+                &row.try_get::<Json<Value>, _>("provenance").unwrap().0,
+            ),
+            &row.try_get::<String, _>("provenance_integrity").unwrap(),
+        )
+        .unwrap();
+        let mut provenance = checked["provenance"].clone();
+        remap_fields(&mut provenance, &self.maps).unwrap();
+        let seal = payload_integrity::digest(
+            "devres_crate_artifacts",
+            "",
+            &capture,
+            &payload_integrity::crate_artifact_payload(bytes as u64, &provenance),
+        )
+        .unwrap();
+        sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4)")
+            .bind(&capture).bind(bytes).bind(Json(provenance)).bind(seal).execute(&self.pool).await.unwrap();
+        capture
+    }
+
+    async fn qualify_duplicate_artifacts(&mut self, contradictory: bool) {
+        assert!(self.pairs.len() >= 3);
+        // Exercise the publisher's many-to-one mapping boundary directly. The
+        // full qualification pipeline is separately covered by migration parity;
+        // these synthetic mappings deliberately make two retained sources share
+        // one requested canonical identity.
+        let shared = self.pairs[0].1.clone();
+        let mut maps = crate::MigrationMap::new();
+        for (index, (old, canonical)) in self.pairs.iter().enumerate() {
+            crate::migration_map::insert(
+                &mut maps,
+                format!("capture:{old}"),
+                if index < 2 {
+                    shared.clone()
+                } else {
+                    canonical.clone()
+                },
+            )
+            .unwrap();
+        }
+        self.maps = maps;
+        for index in 0..2 {
+            let old = &self.pairs[index].0;
+            let provenance = json!({"synthetic":true,"capture":old,
+                "retained_payload":if contradictory && index==1 {"different"} else {"same"}});
+            let bytes: i64 =
+                sqlx::query_scalar("SELECT bytes FROM devres_crate_artifacts WHERE capture_id=$1")
+                    .bind(old)
+                    .fetch_one(&self.pool)
+                    .await
+                    .unwrap();
+            let seal = payload_integrity::digest(
+                "devres_crate_artifacts",
+                "",
+                old,
+                &payload_integrity::crate_artifact_payload(bytes as u64, &provenance),
+            )
+            .unwrap();
+            sqlx::query("UPDATE devres_crate_artifacts SET provenance=$2,provenance_integrity=$3 WHERE capture_id=$1")
+                .bind(old).bind(Json(provenance)).bind(seal).execute(&self.pool).await.unwrap();
+        }
+    }
+}
+
+fn assert_artifact_preparation_drained(execution: &crate::MigrationExecution) {
+    let snapshot = execution.snapshot();
+    assert_eq!(snapshot.active, 0);
+    assert_eq!(snapshot.graph_active, 0);
+    assert_eq!(snapshot.graph_memory_bytes, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; mixed existing and fresh canonical publication"]
+async fn crate_row_pipeline_artifact_publication_mixed_resume_inserts_only_missing_targets() {
+    let fixture = RowFixture::new(9, 64, 0).await;
+    let mut retained = Vec::new();
+    for index in [0, 3, 8] {
+        retained.push(fixture.seed_canonical_artifact(index).await);
+    }
+    let before = fixture.canonical_tuples().await;
+    let before_evidence = fixture.semantic_rows().await;
+    assert!(
+        retained
+            .iter()
+            .all(|capture| valid_hash(capture) && capture.starts_with("blake3:"))
+    );
+    // A resumed target must be verified without attempting another INSERT. This
+    // trigger distinguishes prefiltered publication from ON CONFLICT row probes.
+    let protected = retained
+        .iter()
+        .map(|capture| format!("'{capture}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION fixture_refuse_resumed_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture_resumed_target_insert'; END $$; CREATE TRIGGER fixture_refuse_resumed_insert BEFORE INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id=ANY(ARRAY[{protected}]::text[])) EXECUTE FUNCTION fixture_refuse_resumed_insert();")))
+        .execute(&fixture.pool).await.unwrap();
+    fixture.transaction_log("devres_crate_artifacts").await;
+    let execution = RowFixture::execution(8, 1024 * 1024 * 1024);
+    let cancel = CancellationToken::new();
+    fixture
+        .store
+        .migrate_artifact_rows(&fixture.maps, &cancel, &execution)
+        .await
+        .unwrap();
+    let completed = fixture.canonical_tuples().await;
+    assert_eq!(completed.len(), 9);
+    assert!(
+        before.iter().all(|tuple| completed.contains(tuple)),
+        "mixed publication leaves every resumed tuple unchanged"
+    );
+    let completed_evidence = fixture.semantic_rows().await;
+    assert!(
+        before_evidence
+            .iter()
+            .all(|row| completed_evidence.contains(row))
+    );
+    assert_eq!(fixture.batch_sizes().await, vec![6]);
+    fixture
+        .store
+        .migrate_artifact_rows(&fixture.maps, &cancel, &execution)
+        .await
+        .unwrap();
+    assert_eq!(completed, fixture.canonical_tuples().await);
+    assert_eq!(completed_evidence, fixture.semantic_rows().await);
+    assert_eq!(
+        fixture.batch_sizes().await,
+        vec![6],
+        "a fully resumed page performs no row insert probes"
+    );
+    assert_artifact_preparation_drained(&execution);
+    fixture.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; equal canonical mapping duplicates retain exact evidence"]
+async fn crate_row_pipeline_artifact_publication_identical_mapping_duplicates_resume_once() {
+    for workers in [1, 8] {
+        let mut fixture = RowFixture::new(3, 0, 0).await;
+        fixture.qualify_duplicate_artifacts(false).await;
+        fixture.transaction_log("devres_crate_artifacts").await;
+        let execution = RowFixture::execution(workers, 1024 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+        fixture
+            .store
+            .migrate_artifact_rows(&fixture.maps, &cancel, &execution)
+            .await
+            .unwrap();
+        let before = fixture.canonical_tuples().await;
+        assert_eq!(
+            before.len(),
+            2,
+            "identical repeated requests publish one canonical tuple"
+        );
+        assert_eq!(fixture.batch_sizes().await, vec![2]);
+        let evidence = fixture.semantic_rows().await;
+        fixture
+            .store
+            .migrate_artifact_rows(&fixture.maps, &cancel, &execution)
+            .await
+            .unwrap();
+        assert_eq!(before, fixture.canonical_tuples().await);
+        assert_eq!(evidence, fixture.semantic_rows().await);
+        assert_eq!(fixture.batch_sizes().await, vec![2]);
+        let source_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%'",
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source_count, 3,
+            "deduplication does not discard retained source occurrences"
+        );
+        assert_artifact_preparation_drained(&execution);
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; contradictory requests fail closed before commit"]
+async fn crate_row_pipeline_artifact_publication_contradictory_mapping_duplicates_roll_back() {
+    for shared_target_exists in [false, true] {
+        let mut fixture = RowFixture::new(3, 0, 0).await;
+        fixture.qualify_duplicate_artifacts(true).await;
+        fixture
+            .seed_canonical_artifact(if shared_target_exists { 0 } else { 2 })
+            .await;
+        let before = fixture.canonical_tuples().await;
+        let evidence = fixture.semantic_rows().await;
+        let execution = RowFixture::execution(8, 1024 * 1024 * 1024);
+        let result = fixture
+            .store
+            .migrate_artifact_rows(&fixture.maps, &CancellationToken::new(), &execution)
+            .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "integrity",
+            "every repeated request is checked, including requests omitted from the physical INSERT"
+        );
+        assert_eq!(
+            before,
+            fixture.canonical_tuples().await,
+            "a contradictory duplicate rolls back every fresh row in its batch"
+        );
+        assert_eq!(
+            evidence,
+            fixture.semantic_rows().await,
+            "already committed target evidence remains unchanged"
+        );
+        assert_artifact_preparation_drained(&execution);
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; post-insert verification rolls back trigger interference"]
+async fn crate_row_pipeline_artifact_publication_trigger_changes_roll_back_entire_batch() {
+    for action in [
+        "before_skip",
+        "before_modify",
+        "after_modify_new",
+        "after_delete_new",
+        "after_modify_existing",
+        "after_delete_existing",
+    ] {
+        let fixture = RowFixture::new(4, 0, 0).await;
+        let retained = fixture.seed_canonical_artifact(0).await;
+        let fresh = &fixture.pairs[1].1;
+        assert!(valid_hash(&retained) && valid_hash(fresh));
+        let before = fixture.canonical_tuples().await;
+        let evidence = fixture.semantic_rows().await;
+        let (timing, body) = match action {
+            "before_skip" => ("BEFORE", "RETURN NULL;".to_owned()),
+            "before_modify" => ("BEFORE", "NEW.bytes=NEW.bytes+1; RETURN NEW;".to_owned()),
+            "after_modify_new" => ("AFTER", "UPDATE devres_crate_artifacts SET bytes=bytes+1 WHERE capture_id=NEW.capture_id; RETURN NEW;".to_owned()),
+            "after_delete_new" => ("AFTER", "DELETE FROM devres_crate_artifacts WHERE capture_id=NEW.capture_id; RETURN NEW;".to_owned()),
+            "after_modify_existing" => ("AFTER", format!("UPDATE devres_crate_artifacts SET bytes=bytes+1 WHERE capture_id='{retained}'; RETURN NEW;")),
+            "after_delete_existing" => ("AFTER", format!("DELETE FROM devres_crate_artifacts WHERE capture_id='{retained}'; RETURN NEW;")),
+            _ => unreachable!("closed fixture action set"),
+        };
+        // Only fixed action text and fixture-generated hash identities are
+        // interpolated; retained source values remain ordinary bind parameters.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION fixture_artifact_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} END $$; CREATE TRIGGER fixture_artifact_fault {timing} INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id='{fresh}') EXECUTE FUNCTION fixture_artifact_fault();")))
+            .execute(&fixture.pool).await.unwrap();
+        let execution = RowFixture::execution(8, 1024 * 1024 * 1024);
+        let result = fixture
+            .store
+            .migrate_artifact_rows(&fixture.maps, &CancellationToken::new(), &execution)
+            .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "integrity",
+            "post-insert comparison rejects trigger action {action}"
+        );
+        assert_eq!(
+            before,
+            fixture.canonical_tuples().await,
+            "trigger action {action} rolls back the complete batch and restores preexisting tuple identity"
+        );
+        assert_eq!(
+            evidence,
+            fixture.semantic_rows().await,
+            "trigger action {action} cannot alter previously committed evidence"
+        );
+        assert_artifact_preparation_drained(&execution);
+        sqlx::raw_sql("DROP TRIGGER fixture_artifact_fault ON devres_crate_artifacts; DROP FUNCTION fixture_artifact_fault();")
+            .execute(&fixture.pool).await.unwrap();
+        fixture
+            .store
+            .migrate_artifact_rows(&fixture.maps, &CancellationToken::new(), &execution)
+            .await
+            .unwrap();
+        let completed = fixture.canonical_tuples().await;
+        assert_eq!(completed.len(), 4);
+        assert!(before.iter().all(|tuple| completed.contains(tuple)));
+        assert_artifact_preparation_drained(&execution);
+        fixture.close().await;
+    }
 }

@@ -311,12 +311,22 @@ impl PgBlobStore {
                     self.owner.lock().await
                 };
                 let _timing = execution.timed_phase("crate_artifact_commit");
-                let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+                let mut tx = {
+                    let _begin = execution.timed_phase("crate_artifact_begin");
+                    owner.begin().await.map_err(|_| storage_error())?
+                };
                 let result = async {
-                    sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) SELECT capture,bytes,provenance,seal FROM UNNEST($1::text[],$2::bigint[],$3::jsonb[],$4::text[]) WITH ORDINALITY requested(capture,bytes,provenance,seal,ordinal) ORDER BY ordinal ON CONFLICT DO NOTHING")
+                    let insert = execution.timed_phase("crate_artifact_insert");
+                    // The exclusive owner serializes artifact writers. Skip existing
+                    // targets and choose the first occurrence before plain insertion,
+                    // avoiding speculative-insertion WAL. Every requested occurrence
+                    // still receives the full post-statement stored-target check.
+                    sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) SELECT capture,bytes,provenance,seal FROM (SELECT DISTINCT ON (capture) capture,bytes,provenance,seal,ordinal FROM UNNEST($1::text[],$2::bigint[],$3::jsonb[],$4::text[]) WITH ORDINALITY input(capture,bytes,provenance,seal,ordinal) ORDER BY capture,ordinal) requested WHERE NOT EXISTS (SELECT 1 FROM devres_crate_artifacts retained WHERE retained.capture_id=requested.capture) ORDER BY ordinal")
                         .bind(&captures).bind(&lengths).bind(&provenance).bind(&seals).execute(&mut *tx).await.map_err(|_|storage_error())?;
+                    drop(insert);
                     // Compare canonical JSON text and the freshly computed seal rather
-                    // than trusting an ON CONFLICT no-op or fetching unbounded targets.
+                    // than trusting a skipped insert or fetching unbounded targets.
+                    let _verify = execution.timed_phase("crate_artifact_target_check");
                     let verified: bool = sqlx::query_scalar("SELECT count(*)=$5 AND COALESCE(bool_and(COALESCE(retained.bytes=requested.bytes AND retained.provenance::text=requested.provenance::text AND retained.provenance_integrity=requested.seal,false)),false) FROM UNNEST($1::text[],$2::bigint[],$3::jsonb[],$4::text[]) requested(capture,bytes,provenance,seal) LEFT JOIN devres_crate_artifacts retained ON retained.capture_id=requested.capture")
                         .bind(&captures).bind(&lengths).bind(&provenance).bind(&seals).bind(batch.len() as i64).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
                     if !verified {
@@ -324,7 +334,10 @@ impl PgBlobStore {
                     }
                     Ok(())
                 }.await;
-                finish_batch(tx, result, cancel).await?;
+                {
+                    let _commit = execution.timed_phase("crate_artifact_durable_commit");
+                    finish_batch(tx, result, cancel).await?;
+                }
                 drop(owner);
                 committed += batch.len() as u64;
                 after = batch.last().ok_or_else(storage_error)?.old.clone();
