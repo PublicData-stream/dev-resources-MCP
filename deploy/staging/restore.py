@@ -71,6 +71,7 @@ DIAGNOSTIC_PHASES = frozenset({
     'file_inventory', 'files', 'complete', 'graph_rfc', 'graph_advisory',
     'graph_crate', 'graph_npm', 'graph_mdn', 'graph_whatwg', 'graph_w3c', 'graph_chromium',
     'graph_rfc_indexes', 'graph_npm_rows',
+    'graph_crate_artifacts', 'graph_crate_observations', 'graph_crate_staging',
 })
 DIAGNOSTIC_ERROR_CODES = frozenset({'invalid_input', 'unavailable', 'not_found', 'capacity', 'integrity', 'cancelled'})
 # Only exact source-authored reasons become enums. Unknown free-form messages are

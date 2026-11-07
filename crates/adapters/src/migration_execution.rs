@@ -291,6 +291,23 @@ pub struct MigrationExecution {
     graph_permits: Arc<Semaphore>,
     graph_counters: Arc<Counters>,
     graph_budget: Arc<GraphBudget>,
+    phase_timings: Arc<Mutex<std::collections::BTreeMap<&'static str, u64>>>,
+}
+
+/// Aggregate offline timings contain only fixed internal phase names and durations.
+pub(crate) struct MigrationPhaseTimer {
+    timings: Arc<Mutex<std::collections::BTreeMap<&'static str, u64>>>,
+    phase: &'static str,
+    started: Instant,
+}
+
+impl Drop for MigrationPhaseTimer {
+    fn drop(&mut self) {
+        if let Ok(mut timings) = self.timings.lock() {
+            let total = timings.entry(self.phase).or_default();
+            *total = total.saturating_add(micros(self.started.elapsed()));
+        }
+    }
 }
 
 impl Default for MigrationExecution {
@@ -346,6 +363,7 @@ impl MigrationExecution {
                 changed: Notify::new(),
                 high_water: AtomicUsize::new(0),
             }),
+            phase_timings: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             graph_options,
             options,
         }
@@ -357,6 +375,28 @@ impl MigrationExecution {
 
     pub fn graph_options(&self) -> MigrationGraphOptions {
         self.graph_options
+    }
+
+    /// Microseconds summed by fixed internal offline phase; nested timings overlap.
+    /// The values are diagnostic wall times, not source data or a completion estimate.
+    pub fn phase_timings(&self) -> std::collections::BTreeMap<String, u64> {
+        self.phase_timings
+            .lock()
+            .map(|timings| {
+                timings
+                    .iter()
+                    .map(|(phase, elapsed)| ((*phase).to_owned(), *elapsed))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn timed_phase(&self, phase: &'static str) -> MigrationPhaseTimer {
+        MigrationPhaseTimer {
+            timings: self.phase_timings.clone(),
+            phase,
+            started: Instant::now(),
+        }
     }
 
     /// Conservative decoded JSON allocation charge shared with SQL admission.

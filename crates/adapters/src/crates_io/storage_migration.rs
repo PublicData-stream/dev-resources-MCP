@@ -3,6 +3,9 @@ use super::*;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
+#[path = "storage_migration_rows.rs"]
+mod rows;
+
 fn stop(cancel: &CancellationToken) -> Result<()> {
     if cancel.is_cancelled() {
         Err(Error::new("cancelled", "Crate graph migration canceled."))
@@ -552,160 +555,8 @@ impl PgBlobStore {
         cancel: &CancellationToken,
         execution: &crate::MigrationExecution,
     ) -> Result<()> {
-        let mut committed = 0_u64;
-        let mut after = String::new();
-        loop {
-            stop(cancel)?;
-            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT capture_id,bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' AND capture_id>$1 ORDER BY capture_id LIMIT 1) source").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some((source_bytes, source_nodes)) = source_size else {
-                break;
-            };
-            let _source_reservation =
-                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-            let row=sqlx::query("SELECT capture_id,bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' AND capture_id>$1 ORDER BY capture_id LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(row) = row else {
-                break;
-            };
-            let old: String = row.try_get("capture_id").map_err(|_| storage_error())?;
-            let new = mapped(maps, "capture", &old)?;
-            let data = payload_integrity::checked(
-                "devres_crate_artifacts",
-                "",
-                &old,
-                payload_integrity::crate_artifact_payload(
-                    u64::try_from(
-                        row.try_get::<i64, _>("bytes")
-                            .map_err(|_| storage_error())?,
-                    )
-                    .map_err(|_| Error::integrity("Invalid artifact length."))?,
-                    &row.try_get::<Json<Value>, _>("provenance")
-                        .map_err(|_| storage_error())?
-                        .0,
-                ),
-                &row.try_get::<String, _>("provenance_integrity")
-                    .map_err(|_| storage_error())?,
-            )?;
-            let mut data = data["provenance"].clone();
-            remap_fields(&mut data, maps)?;
-            sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING").bind(&new).bind(row.try_get::<i64,_>("bytes").map_err(|_|storage_error())?).bind(Json(&data)).bind(payload_integrity::digest("devres_crate_artifacts","",&new,&payload_integrity::crate_artifact_payload(u64::try_from(row.try_get::<i64,_>("bytes").map_err(|_|storage_error())?).map_err(|_|Error::integrity("Invalid artifact length."))?,&data))?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
-            after = old;
-            committed += 1;
-            execution.report(
-                "graph_crate_artifacts",
-                committed,
-                committed,
-                committed,
-                _source_reservation.accounted_bytes(),
-            );
-        }
-        let mut after = 0_i64;
-        loop {
-            stop(cancel)?;
-            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE capture_id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1) source").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some((source_bytes, source_nodes)) = source_size else {
-                break;
-            };
-            let _source_reservation =
-                reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-            let row=sqlx::query("SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE capture_id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-            let Some(row) = row else {
-                break;
-            };
-            after = row.try_get("sequence").map_err(|_| storage_error())?;
-            let old: String = row.try_get("capture_id").map_err(|_| storage_error())?;
-            let capture = mapped(maps, "capture", &old)?;
-            let time: i64 = row.try_get("observed_at").map_err(|_| storage_error())?;
-            let transport: String = row.try_get("transport").map_err(|_| storage_error())?;
-            let data = payload_integrity::checked(
-                "devres_crate_observations",
-                &old,
-                &after.to_string(),
-                payload_integrity::crate_observation_payload(
-                    &old,
-                    time,
-                    &transport,
-                    &row.try_get::<Json<Value>, _>("provenance")
-                        .map_err(|_| storage_error())?
-                        .0,
-                ),
-                &row.try_get::<String, _>("provenance_integrity")
-                    .map_err(|_| storage_error())?,
-            )?;
-            let mut data = data["provenance"].clone();
-            remap_fields(&mut data, maps)?;
-            // The source occurrence sequence is retained in a durable checkpoint, so
-            // identical same-second observations remain separate and retries add none.
-            let checkpoint = format!("observation:{after}");
-            let mut owner = self.owner.lock().await;
-            let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-            let existing=sqlx::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1").bind(&checkpoint).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
-            if let Some(receipt) = existing {
-                let value = payload_integrity::checked(
-                    "devres_integrity_staged_state",
-                    "crate",
-                    &checkpoint,
-                    receipt
-                        .try_get::<Json<Value>, _>("data")
-                        .map_err(|_| storage_error())?
-                        .0,
-                    &receipt
-                        .try_get::<String, _>("data_integrity")
-                        .map_err(|_| storage_error())?,
-                )?;
-                if value["legacy_sequence"] != after || value["capture_id"] != capture {
-                    return Err(Error::integrity(
-                        "Crate observation checkpoint identity mismatch.",
-                    ));
-                }
-                let target=sqlx::query("SELECT capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE sequence=$1").bind(value["sequence"].as_i64().ok_or_else(storage_error)?).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?.ok_or_else(||Error::integrity("Checkpointed observation missing."))?;
-                let target_data = payload_integrity::checked(
-                    "devres_crate_observations",
-                    &capture,
-                    &value["sequence"]
-                        .as_i64()
-                        .ok_or_else(storage_error)?
-                        .to_string(),
-                    payload_integrity::crate_observation_payload(
-                        &capture,
-                        time,
-                        &transport,
-                        &target
-                            .try_get::<Json<Value>, _>("provenance")
-                            .map_err(|_| storage_error())?
-                            .0,
-                    ),
-                    &target
-                        .try_get::<String, _>("provenance_integrity")
-                        .map_err(|_| storage_error())?,
-                )?;
-                if target_data["provenance"] != data
-                    || target
-                        .try_get::<String, _>("capture_id")
-                        .map_err(|_| storage_error())?
-                        != capture
-                    || target
-                        .try_get::<i64, _>("observed_at")
-                        .map_err(|_| storage_error())?
-                        != time
-                    || target
-                        .try_get::<String, _>("transport")
-                        .map_err(|_| storage_error())?
-                        != transport
-                {
-                    return Err(Error::integrity(
-                        "Checkpointed observation differs from retained occurrence.",
-                    ));
-                }
-            } else {
-                let sequence =
-                    append_crate_observation(&mut tx, &capture, time, &transport, &data).await?;
-                let receipt =
-                    json!({"legacy_sequence":after,"sequence":sequence,"capture_id":capture});
-                sqlx::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES('crate',$1,$2,$3)").bind(&checkpoint).bind(Json(&receipt)).bind(payload_integrity::digest("devres_integrity_staged_state","crate",&checkpoint,&receipt)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
-            }
-            tx.commit().await.map_err(|_| storage_error())?;
-        }
-        Ok(())
+        self.migrate_artifact_rows(maps, cancel, execution).await?;
+        self.migrate_observation_rows(maps, cancel, execution).await
     }
 
     async fn migrate_crate_inventories(
@@ -740,53 +591,41 @@ impl PgBlobStore {
             let revision: String = row.try_get("revision").map_err(|_| storage_error())?;
             let new = hash(format!("crate-inventory:1:{revision}").as_bytes());
             let manifest: Option<String> = row.try_get("manifest").map_err(|_| storage_error())?;
-            let sequence:i64=sqlx::query_scalar("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at,cursor,published,manifest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id RETURNING sequence")
-                .bind(&new).bind(revision).bind(row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?).bind(row.try_get::<i64,_>("validated_at").map_err(|_|storage_error())?).bind(row.try_get::<Option<String>,_>("cursor").map_err(|_|storage_error())?).bind(row.try_get::<bool,_>("published").map_err(|_|storage_error())?).bind(manifest.as_deref().map(|id|mapped(maps,"capture",id)).transpose()?).fetch_one(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+            let created_at: i64 = row.try_get("created_at").map_err(|_| storage_error())?;
+            let validated_at: i64 = row.try_get("validated_at").map_err(|_| storage_error())?;
+            let cursor: Option<String> = row.try_get("cursor").map_err(|_| storage_error())?;
+            let published: bool = row.try_get("published").map_err(|_| storage_error())?;
+            let manifest = manifest
+                .as_deref()
+                .map(|id| mapped(maps, "capture", id))
+                .transpose()?;
+            let sequence = {
+                let mut owner = self.owner.lock().await;
+                let existing: Option<(i64, bool)> = sqlx::query_as("SELECT sequence,revision=$2 AND created_at=$3 AND validated_at=$4 AND cursor IS NOT DISTINCT FROM $5::text AND published=$6 AND manifest IS NOT DISTINCT FROM $7::text FROM devres_crate_inventories WHERE id=$1")
+                    .bind(&new).bind(&revision).bind(created_at).bind(validated_at).bind(&cursor).bind(published).bind(&manifest).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
+                if let Some((sequence, matches)) = existing {
+                    if !matches {
+                        return Err(Error::integrity(
+                            "Canonical crate inventory differs from retained source.",
+                        ));
+                    }
+                    sequence
+                } else {
+                    stop(cancel)?;
+                    sqlx::query_scalar("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at,cursor,published,manifest) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING sequence")
+                        .bind(&new).bind(&revision).bind(created_at).bind(validated_at).bind(&cursor).bind(published).bind(&manifest).fetch_one(&mut *owner).await.map_err(|_|storage_error())?
+                }
+            };
             sequences.insert(after, sequence);
             id_alias(maps, aliases, "inventories", &old, &new)?;
             sqlx::query("INSERT INTO devres_crate_inventory_gaps(inventory,name,error) SELECT $2,name,error FROM devres_crate_inventory_gaps WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             sqlx::query("INSERT INTO devres_crate_changes(inventory,name) SELECT $2,name FROM devres_crate_changes WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             drop(row);
             drop(_source_reservation);
-            let mut cursor = String::new();
-            loop {
-                let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>$2 ORDER BY name||'@'||version LIMIT 1) source").bind(&old).bind(&cursor).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-                let Some((source_bytes, source_nodes)) = source_size else {
-                    break;
-                };
-                let _source_reservation =
-                    reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-                let row=sqlx::query("SELECT * FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>$2 ORDER BY name||'@'||version LIMIT 1").bind(&old).bind(&cursor).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
-                let Some(row) = row else {
-                    break;
-                };
-                let name: String = row.try_get("name").map_err(|_| storage_error())?;
-                let version: String = row.try_get("version").map_err(|_| storage_error())?;
-                cursor = format!("{name}@{version}");
-                let record = payload_integrity::checked(
-                    "devres_crate_staging",
-                    &old,
-                    &cursor,
-                    payload_integrity::crate_staging_payload(
-                        &row.try_get::<String, _>("metadata_capture")
-                            .map_err(|_| storage_error())?,
-                        &row.try_get::<Json<Value>, _>("record")
-                            .map_err(|_| storage_error())?
-                            .0,
-                    ),
-                    &row.try_get::<String, _>("record_integrity")
-                        .map_err(|_| storage_error())?,
-                )?;
-                let record = record["record"].clone();
-                let metadata = mapped(
-                    maps,
-                    "capture",
-                    &row.try_get::<String, _>("metadata_capture")
-                        .map_err(|_| storage_error())?,
-                )?;
-                sqlx::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(&new).bind(name).bind(version).bind(mapped(maps,"capture",&row.try_get::<String,_>("metadata_capture").map_err(|_|storage_error())?)?).bind(Json(&record)).bind(payload_integrity::digest("devres_crate_staging",&new,&cursor,&payload_integrity::crate_staging_payload(&metadata,&record))?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
-            }
+            self.migrate_staging_rows(&old, &new, maps, cancel, execution)
+                .await?;
         }
+
         let mut after = (String::new(), String::new(), 0_i64);
         loop {
             stop(cancel)?;

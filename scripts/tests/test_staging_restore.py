@@ -390,7 +390,8 @@ class RestoreTests(unittest.TestCase):
         old = self.progress()
         graph = self.progress(phase='graph_rfc_indexes',
                               **{key: 1 for key in restore.DIAGNOSTIC_GRAPH_COUNTS})
-        for phase in ('graph_rfc_indexes', 'graph_npm_rows'):
+        for phase in ('graph_rfc_indexes', 'graph_npm_rows', 'graph_crate_artifacts',
+                      'graph_crate_observations', 'graph_crate_staging'):
             graph['phase'] = phase
             output = restore.diagnostic_terminal({'data': ('\n'.join(map(json.dumps, [old, graph]))).encode(),
                                                   'truncated': False, 'timed_out': False})

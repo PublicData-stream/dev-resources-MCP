@@ -429,3 +429,6 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
     .unwrap();
     admin.close().await;
 }
+
+#[path = "storage_migration_row_tests.rs"]
+mod row_pipeline;
