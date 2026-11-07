@@ -171,6 +171,25 @@ impl PgBlobStore {
     ) -> Result<Self> {
         Self::connect_inner(database_url, root, OpenMode::Activate).await
     }
+
+    /// Private maintenance verification of schema-eleven attribution only.
+    /// This does not acquire source evidence or replace full storage verification.
+    pub async fn verify_attribution_for_maintenance(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        self.fence().await?;
+        let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| storage_error())?;
+        if version != 11 {
+            return Err(Error::unavailable(
+                "Attribution maintenance requires schema eleven.",
+            ));
+        }
+        self.verify_attribution_storage(cancel).await
+    }
     async fn connect_inner(
         database_url: &str,
         root: impl AsRef<Path>,

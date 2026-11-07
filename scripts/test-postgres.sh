@@ -49,4 +49,5 @@ cargo test --locked -p devres-adapters --lib storage::corpus_storage::snapshot_b
 cargo test --locked -p devres-adapters --lib storage::acceptance -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::visibility -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib attribution_storage -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --example staging-attribution-qualify -- --ignored --test-threads=1
 echo 'Real PostgreSQL persistence checks passed'

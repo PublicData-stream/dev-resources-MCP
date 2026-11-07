@@ -1813,7 +1813,7 @@ mod tests {
             canonical.subject
         );
         store
-            .verify_attribution_storage(&CancellationToken::new())
+            .verify_attribution_for_maintenance(&CancellationToken::new())
             .await
             .unwrap();
         // Even a correctly sealed generation cannot bypass the same relation
@@ -1831,7 +1831,7 @@ mod tests {
         .unwrap();
         assert!(
             store
-                .verify_attribution_storage(&CancellationToken::new())
+                .verify_attribution_for_maintenance(&CancellationToken::new())
                 .await
                 .is_err()
         );
