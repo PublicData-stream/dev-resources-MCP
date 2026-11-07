@@ -168,6 +168,84 @@ class BenchmarkReportTests(unittest.TestCase):
         self.assertNotIn(str(binary), json.dumps(metadata))
 
 
+class CrateComparisonTests(unittest.TestCase):
+    setUp = BenchmarkReportTests.setUp
+    run_result = BenchmarkReportTests.run_result
+
+    def crate_run(self, variant, workers, repeat, seconds, artifacts=16384):
+        previous = self.root
+        self.root = previous / variant
+        try:
+            path = self.run_result(workers, repeat, seconds)
+        finally:
+            self.root = previous
+        value = json.loads((path / 'result.json').read_text())
+        value.update(fixture='pending-schema10-crates-v1', crate_artifacts=artifacts,
+                     crate_phase_micros={'graph_crate_artifacts': int(seconds * 1_000_000),
+                                        'graph_crate_observations': 30000},
+                     graph_memory_budget_mib=1024, payload_budget_mib=64,
+                     graph_jobs_high_water=workers, graph_memory_high_water=1024)
+        (path / 'result.json').write_text(json.dumps(value))
+        return path
+
+    def complete_comparison(self, baseline=12, candidate=2):
+        for repeat in range(1, 4):
+            self.crate_run('baseline', 8, repeat, baseline)
+            for workers in (1, 2, 4, 8):
+                self.crate_run('candidate', workers, repeat, candidate)
+
+    def test_compares_complete_artifact_phase_and_keeps_scaling_separate(self):
+        self.complete_comparison()
+        result = REPORT.compare(self.root, 3)
+        self.assertEqual(result['artifact_speedup_ratio'], 6)
+        self.assertTrue(result['artifact_speedup_target_met'])
+        self.assertEqual(len(result['candidate_scaling']['candidates']), 4)
+        self.assertEqual(result['full_corpus_speedup'], 'unmeasured')
+        self.assertIn('excludes observations', result['timing_boundary'])
+
+    def test_fourfold_target_is_not_relaxed_when_candidate_is_faster(self):
+        self.complete_comparison(candidate=4)
+        result = REPORT.compare(self.root, 3)
+        self.assertEqual(result['artifact_speedup_ratio'], 3)
+        self.assertFalse(result['artifact_speedup_target_met'])
+
+    def test_missing_candidate_eight_or_repeat_rejects_comparison(self):
+        self.complete_comparison()
+        path = self.root / 'candidate/workers-8/repeat-3/result.json'
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, 'complete candidate'):
+            REPORT.compare(self.root, 3)
+
+    def test_unequal_baseline_fingerprint_is_rejected(self):
+        self.complete_comparison()
+        for path in self.root.glob('baseline/workers-*/repeat-*'):
+            result = json.loads((path / 'result.json').read_text())
+            result['durable_fingerprint'] = 'b' * 64
+            (path / 'result.json').write_text(json.dumps(result))
+            (path / 'restored.json').write_text(json.dumps(
+                {'durable_fingerprint': 'b' * 64, 'restored_startup_readback': True}))
+        with self.assertRaisesRegex(ValueError, 'differs'):
+            REPORT.compare(self.root, 3)
+
+    def test_missing_phase_timing_is_rejected(self):
+        self.complete_comparison()
+        path = self.root / 'candidate/workers-8/repeat-1/result.json'
+        result = json.loads(path.read_text())
+        result['crate_phase_micros'] = {}
+        path.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, 'timing/profile'):
+            REPORT.compare(self.root, 3)
+
+    def test_different_workload_size_is_rejected(self):
+        self.complete_comparison()
+        path = self.root / 'baseline/workers-8/repeat-1/result.json'
+        result = json.loads(path.read_text())
+        result['crate_artifacts'] = 4096
+        path.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, 'differing durable'):
+            REPORT.compare(self.root, 3)
+
+
 class BenchmarkCliTests(unittest.TestCase):
     script = Path(__file__).resolve().parents[1] / 'benchmark-migration.sh'
 
@@ -200,12 +278,32 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertIn('serial reference', self.rejected('--graph-generations', '1', '--workers', '4').stderr)
         self.assertIn('serial reference', self.rejected('--graph-snapshots', '8', '--graph-generations', '8', '--workers', '4').stderr)
 
+    def test_crate_workload_and_comparison_are_checked_before_infrastructure(self):
+        self.assertIn('bounded range', self.rejected('--crate-artifacts', '16385').stderr)
+        self.assertIn('bounded range', self.rejected('--crate-staging-rows', '16385').stderr)
+        self.assertIn('cannot be mixed', self.rejected('--crate-artifacts', '1024', '--graph-snapshots', '2').stderr)
+        self.assertIn('requires crate artifacts', self.rejected('--baseline-binary', '/bin/true').stderr)
+        self.assertIn('full source revision', self.rejected('--crate-artifacts', '1024', '--baseline-binary', '/bin/true').stderr)
+        self.assertIn('fixed workers', self.rejected('--crate-artifacts', '1024', '--baseline-binary', '/bin/true', '--baseline-revision', 'a'*40, '--workers', '1 2').stderr)
+
     def test_malformed_workload_is_checked_before_infrastructure(self):
         self.assertIn('positive', self.rejected('--rows', '0').stderr)
         self.assertIn('bounded range', self.rejected('--file-mib', '33').stderr)
         self.assertIn('requires a value', self.rejected('--graph-snapshots', '-1').stderr)
         self.assertIn('bounded range', self.rejected('--graph-snapshots', '65').stderr)
         self.assertIn('positive', self.rejected('--graph-memory-budget-mib', '0').stderr)
+
+    def test_identical_comparison_binaries_are_rejected_before_infrastructure(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            copied = Path(temporary) / 'baseline'
+            copied.write_bytes(Path('/bin/true').read_bytes())
+            copied.chmod(0o700)
+            for baseline in ('/bin/true', str(copied)):
+                with self.subTest(baseline=baseline):
+                    result = self.rejected('--crate-artifacts', '1024',
+                                           '--baseline-binary', baseline,
+                                           '--baseline-revision', 'a' * 40)
+                    self.assertIn('identical baseline and candidate', result.stderr)
 
 
 if __name__ == '__main__':

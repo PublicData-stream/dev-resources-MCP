@@ -21,6 +21,9 @@ const FIXTURE_MARKER: &str = "devres:synthetic-migration-benchmark:v1";
 const MARKER_FILE: &str = ".devres-benchmark-fixture";
 const GRAPH_DOCUMENTS: usize = 32;
 
+#[path = "migration-benchmark-crates.rs"]
+mod crate_fixture;
+
 struct OfflineOnly;
 #[async_trait::async_trait]
 impl Fetcher for OfflineOnly {
@@ -286,16 +289,28 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     let file_mib = count(args.get(3), 8, 32)?;
     let graph_snapshots = args
         .get(4)
-        .map(|value| count(Some(value), 8, 64))
+        .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(0);
+    if graph_snapshots > 64 {
+        return Err("graph snapshots exceed their bounded range".into());
+    }
     let graph_generations = count(args.get(5), 1, 64)?;
     if (graph_snapshots == 0 && graph_generations != 1)
         || (graph_snapshots > 0 && graph_generations > graph_snapshots)
     {
         return Err("graph generations must fit enabled graph snapshots".into());
     }
-    if root.exists() || args.len() > 6 {
+    let crate_artifacts = args
+        .get(6)
+        .map(|value| count(Some(value), 16384, 16384))
+        .transpose()?
+        .unwrap_or(0);
+    let crate_staging_rows = count(args.get(7), 1024, 16384)?;
+    if crate_artifacts > 0 && graph_snapshots > 0 {
+        return Err("crate and RFC benchmark profiles cannot be mixed".into());
+    }
+    if root.exists() || args.len() > 8 {
         return Err("prepare requires a new fixture root and bounded arguments".into());
     }
     let pool = sqlx::PgPool::connect(url).await?;
@@ -329,6 +344,9 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     if graph_snapshots > 0 {
         seed_graphs(&store, &pool, root, graph_snapshots, graph_generations).await?;
     }
+    if crate_artifacts > 0 {
+        crate_fixture::seed(&pool, root, crate_artifacts, crate_staging_rows).await?;
+    }
     drop(store);
     // Only the harness's fresh database is converted to pending qualification.
     // Empty provider graphs still traverse the real replay/activation gates.
@@ -336,7 +354,7 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     // it only in this disposable conversion so activation installs it normally.
     sqlx::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress; ALTER TABLE devres_advisory_records ALTER COLUMN data_integrity DROP NOT NULL; ALTER TABLE devres_rfc_jobs DROP CONSTRAINT devres_rfc_capture_integrity_required;")
         .execute(&pool).await?;
-    if graph_snapshots > 0 {
+    if graph_snapshots > 0 || crate_artifacts > 0 {
         sqlx::query("DELETE FROM devres_integrity_provider_cutoffs")
             .execute(&pool)
             .await?;
@@ -373,9 +391,9 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     nix::unistd::syncfs(&directory)?;
     pool.close().await;
     Ok(
-        json!({"fixture":fixture_kind(graph_snapshots),"full_schema9_corpus":false,"durable_before_timing":true,
+        json!({"fixture":if crate_artifacts > 0 { crate_fixture::KIND } else {fixture_kind(graph_snapshots)},"full_schema9_corpus":false,"durable_before_timing":true,
         "rows":rows,"payload_kib":payload_kib,"files":files,"file_mib":file_mib,
-        "capture":capture.capture.id,"seed_outside_timing":true,"graph_snapshots":graph_snapshots,"graph_generations":graph_generations,"rfc_index_documents":if graph_snapshots>0 {GRAPH_DOCUMENTS}else{0}}),
+        "capture":capture.capture.id,"seed_outside_timing":true,"crate_artifacts":crate_artifacts,"crate_staging_rows_per_inventory":if crate_artifacts>0 {crate_staging_rows}else{0},"graph_snapshots":graph_snapshots,"graph_generations":graph_generations,"rfc_index_documents":if graph_snapshots>0 {GRAPH_DOCUMENTS}else{0}}),
     )
 }
 
@@ -487,6 +505,9 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
         "devres_integrity_provider_cutoffs",
         "devres_integrity_staged_state",
     ];
+    if crate_fixture::artifact_count(pool).await? > 0 {
+        tables.extend(crate_fixture::TABLES);
+    }
     if graph_fixture {
         tables.extend([
             "devres_rfc_datasets",
@@ -496,6 +517,13 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
             "devres_npm_evidence",
             "devres_advisory_rows",
         ]);
+    }
+    if crate_fixture::artifact_count(pool).await? > 0 {
+        let sequences: Vec<String> = sqlx::query_scalar("SELECT jsonb_build_object('name',sequencename,'last_value',last_value)::text FROM pg_sequences WHERE schemaname='public' AND starts_with(sequencename,'devres_crate_') ORDER BY sequencename").fetch_all(pool).await?;
+        digest.update(b"crate-sequence-state");
+        for sequence in sequences {
+            digest.update(sequence.as_bytes());
+        }
     }
     for table in tables {
         digest.update(table.as_bytes());
@@ -592,6 +620,7 @@ async fn readback(url: &str, root: &Path, pool: &sqlx::PgPool) -> Result<String>
     if store.capture(&id).await?.body.as_ref() != BODY {
         return Err("retained capture mismatch".into());
     }
+    crate_fixture::readback(&store, pool).await?;
     let durable = fingerprint(pool, root).await?;
     let snapshots: Vec<String> =
         sqlx::query_scalar("SELECT id FROM devres_rfc_snapshots ORDER BY published_order")
@@ -660,6 +689,7 @@ async fn run(
     let graph_generations: i64 = sqlx::query_scalar(
         "SELECT count(DISTINCT data->>'index_path') FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%'",
     ).fetch_one(&pool).await?;
+    let crate_artifacts = crate_fixture::artifact_count(&pool).await?;
     let store = Arc::new(PgBlobStore::connect_for_migration(url, root).await?);
     let mut reports = Vec::new();
     phase(
@@ -721,8 +751,9 @@ async fn run(
         return Err("benchmark returned with unfinished work".into());
     }
     Ok(
-        json!({"fixture":fixture_kind(graph_snapshots as usize),"full_schema9_corpus":false,
+        json!({"fixture":if crate_artifacts > 0 {crate_fixture::KIND}else{fixture_kind(graph_snapshots as usize)},"full_schema9_corpus":false,
         "workers":workers,"payload_budget_mib":budget_mib,"phases":reports,
+        "crate_artifacts":crate_artifacts,"crate_phase_micros":execution.phase_timings(),
         "durable_fingerprint":durable_fingerprint,"jobs_high_water":snapshot.high_water,
         "window_high_water":snapshot.window_high_water,"worker_wait_micros":snapshot.worker_wait_micros,
         "publication_micros":snapshot.publication_micros,
@@ -770,6 +801,21 @@ async fn main() -> Result<()> {
     }
     let result = match command.as_str() {
         "prepare" => prepare(&url, root, &args[2..]).await?,
+        "prepare-crates" if args.len() <= 4 => {
+            let artifacts = count(args.get(2), 16384, 16384)?;
+            let staging = count(args.get(3), 1024, 16384)?;
+            let options = [
+                "2".into(),
+                "1".into(),
+                "2".into(),
+                "1".into(),
+                "0".into(),
+                "1".into(),
+                artifacts.to_string(),
+                staging.to_string(),
+            ];
+            prepare(&url, root, &options).await?
+        }
         "run" if args.len() <= 5 => {
             run(
                 &url,
@@ -985,6 +1031,74 @@ mod tests {
                 verified,
                 "catalogue head selection is durable graph evidence"
             );
+            pool.close().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE {database} WITH (FORCE)"
+            )))
+            .execute(&admin)
+            .await?;
+        }
+        admin.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL; real retained crate replay, no provider traffic"]
+    async fn crate_fixture_has_serial_parallel_parity_and_detects_lost_receipts() -> Result<()> {
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
+        let admin = sqlx::PgPool::connect(&base).await?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let mut expected = None;
+        for workers in [1, 2] {
+            let database = format!("devres_benchmark_crate_{suffix}_{workers}");
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
+                .execute(&admin)
+                .await?;
+            let mut url = url::Url::parse(&base)?;
+            url.set_path(&format!("/{database}"));
+            let temporary = tempfile::tempdir_in("/tmp")?;
+            let root = temporary.path().join("blobs");
+            prepare(
+                url.as_str(),
+                &root,
+                &["2", "1", "2", "1", "0", "1", "129", "129"].map(String::from),
+            )
+            .await?;
+            let result = run(url.as_str(), &root, workers, 64, 1024).await?;
+            assert_eq!(result["fixture"], crate_fixture::KIND);
+            assert_eq!(result["crate_artifacts"], 129);
+            assert!(
+                result["crate_phase_micros"]["graph_crate_artifacts"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&result["durable_fingerprint"], expected);
+            } else {
+                expected = Some(result["durable_fingerprint"].clone());
+            }
+            let pool = sqlx::PgPool::connect(url.as_str()).await?;
+            assert_eq!(
+                readback(url.as_str(), &root, &pool).await?,
+                result["durable_fingerprint"]
+                    .as_str()
+                    .ok_or("missing fingerprint")?
+            );
+            let original = fingerprint(&pool, &root).await?;
+            sqlx::query("DELETE FROM devres_integrity_staged_state WHERE provider='crate' AND key=(SELECT min(key) FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'observation:%')").execute(&pool).await?;
+            assert_ne!(
+                fingerprint(&pool, &root).await?,
+                original,
+                "receipt membership is durable evidence"
+            );
+            let store = Arc::new(PgBlobStore::connect(url.as_str(), &root).await?);
+            assert!(
+                crate_fixture::readback(&store, &pool).await.is_err(),
+                "readback must reject a lost occurrence receipt"
+            );
+            drop(store);
             pool.close().await;
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP DATABASE {database} WITH (FORCE)"

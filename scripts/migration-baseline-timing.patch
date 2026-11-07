@@ -1,0 +1,51 @@
+--- a/crates/adapters/src/migration_execution.rs
++++ b/crates/adapters/src/migration_execution.rs
+@@ -293,0 +294,17 @@
++    phase_timings: Arc<Mutex<std::collections::BTreeMap<&'static str, u64>>>,
++}
++
++/// Aggregate offline timings contain only fixed internal phase names and durations.
++pub(crate) struct MigrationPhaseTimer {
++    timings: Arc<Mutex<std::collections::BTreeMap<&'static str, u64>>>,
++    phase: &'static str,
++    started: Instant,
++}
++
++impl Drop for MigrationPhaseTimer {
++    fn drop(&mut self) {
++        if let Ok(mut timings) = self.timings.lock() {
++            let total = timings.entry(self.phase).or_default();
++            *total = total.saturating_add(micros(self.started.elapsed()));
++        }
++    }
+@@ -348,0 +366 @@
++            phase_timings: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+@@ -359,0 +378,19 @@
++    }
++
++    /// Microseconds summed by fixed internal offline phase; nested timings overlap.
++    /// The values are diagnostic wall times, not source data or a completion estimate.
++    pub fn phase_timings(&self) -> std::collections::BTreeMap<String, u64> {
++        self.phase_timings
++            .lock()
++            .map(|timings| {
++                timings.iter().map(|(phase, elapsed)| ((*phase).to_owned(), *elapsed)).collect()
++            })
++            .unwrap_or_default()
++    }
++
++    pub(crate) fn timed_phase(&self, phase: &'static str) -> MigrationPhaseTimer {
++        MigrationPhaseTimer {
++            timings: self.phase_timings.clone(),
++            phase,
++            started: Instant::now(),
++        }
+--- a/crates/adapters/src/crates_io/storage_migration.rs
++++ b/crates/adapters/src/crates_io/storage_migration.rs
+@@ -554,0 +555 @@
++        let artifact_phase = execution.timed_phase("graph_crate_artifacts");
+@@ -600,0 +602,2 @@
++        drop(artifact_phase);
++        let _observation_phase = execution.timed_phase("graph_crate_observations");
+@@ -750,0 +754 @@
++            let _staging_phase = execution.timed_phase("graph_crate_staging");

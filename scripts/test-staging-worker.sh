@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Real cooperative cancellation/resume on synthetic data; no retained pairs/providers.
 set -euo pipefail
+mode=rfc
+if [[ $# == 1 && $1 == --crate-replay ]]; then
+  mode=crate
+elif (( $# != 0 )); then
+  echo 'usage: scripts/test-staging-worker.sh [--crate-replay]' >&2
+  exit 2
+fi
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 export PYTHONDONTWRITEBYTECODE=1
 export TMPDIR=/tmp
 export DOCKER_HOST="${DEVRES_DOCKER_HOST:-${DOCKER_HOST:-unix:///var/run/docker.sock}}"
 unset DOCKER_CONTEXT
 python3 - "${DEVRES_SERVER_BINARY:-/tmp/rust/target/debug/devres-server}" \
-  "${MIGRATION_BENCHMARK_BINARY:-/tmp/rust/target/debug/examples/migration-benchmark}" <<'PY'
+  "${MIGRATION_BENCHMARK_BINARY:-/tmp/rust/target/debug/examples/migration-benchmark}" "$mode" <<'PY'
 import hashlib
 import json
 import os
@@ -19,7 +26,8 @@ import sys
 import tempfile
 import time
 
-server, benchmark = (str(Path(arg).resolve(strict=True)) for arg in sys.argv[1:])
+server, benchmark = (str(Path(arg).resolve(strict=True)) for arg in sys.argv[1:3])
+mode = sys.argv[3]
 root = Path(tempfile.mkdtemp(prefix='devres-worker-fixture-', dir='/tmp'))
 root.chmod(0o700)
 name = 'devres-worker-' + root.name.rsplit('-', 1)[1]
@@ -66,8 +74,9 @@ try:
     env = dict(os.environ, DEVRES_TEST_DATABASE_URL='postgres://devres:fixture-only@127.0.0.1:'
                + port + '/devres_benchmark')
     blobs = root / 'blobs'
-    (root / 'fixture.json').write_bytes(execute([benchmark, 'prepare', str(blobs),
-                                               '128', '256', '16', '8', '16', '16'], env=env))
+    preparation = ([benchmark, 'prepare-crates', str(blobs), '257', '129'] if mode == 'crate'
+                   else [benchmark, 'prepare', str(blobs), '128', '256', '16', '8', '16', '16'])
+    (root / 'fixture.json').write_bytes(execute(preparation, env=env))
     config = root / 'backend.toml'
     template = Path('deploy/staging/backend.toml.example').read_text()
     config.write_text(template.replace('REPLACE_WITH_PRIVATE_POSTGRES_URL', env['DEVRES_TEST_DATABASE_URL'])
@@ -91,7 +100,9 @@ try:
             continue
         if event.get('event') == 'offline_storage_progress':
             progress.append(event)
-            if event.get('phase') == 'graph_rfc_indexes' and event.get('committed', 0) >= 1:
+            target_phase = 'graph_crate_artifacts' if mode == 'crate' else 'graph_rfc_indexes'
+            target_count = 128 if mode == 'crate' else 1
+            if event.get('phase') == target_phase and event.get('committed', 0) >= target_count:
                 worker.send_signal(signal.SIGTERM)
                 interrupted = True
                 break
@@ -108,6 +119,11 @@ try:
                       'FROM devres_integrity_files ORDER BY path').splitlines()
     if not checkpoints:
         raise RuntimeError('fixture_checkpoint_missing')
+    artifact_sql = ("SELECT json_build_array(capture_id,bytes,provenance_integrity,ctid::text)::text "
+                    "FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id")
+    artifacts = sql(artifact_sql).splitlines() if mode == 'crate' else []
+    if mode == 'crate' and len(artifacts) < 128:
+        raise RuntimeError('fixture_committed_artifact_batch_missing')
     for command in ('migrate-storage', 'verify-storage', 'activate-storage'):
         result = execute(offline(command))
         (root / (command + '.json')).write_bytes(result)
@@ -115,6 +131,8 @@ try:
                     'FROM devres_integrity_files ORDER BY path').splitlines())
     if not set(checkpoints).issubset(after):
         raise RuntimeError('fixture_resume_changed_committed_checkpoints')
+    if mode == 'crate' and not set(artifacts).issubset(set(sql(artifact_sql).splitlines())):
+        raise RuntimeError('fixture_resume_changed_committed_artifacts')
     if sql('SELECT active FROM devres_integrity_control WHERE singleton') != 't':
         raise RuntimeError('fixture_resume_activation_missing')
     # A separate restored database exercises the fixture's retained graph/query readback.
@@ -124,7 +142,9 @@ try:
              '-d', 'devres_benchmark_restored', '--exit-on-error'], input=dump)
     restored = dict(env, DEVRES_TEST_DATABASE_URL=env['DEVRES_TEST_DATABASE_URL'] + '_restored')
     readback = json.loads(execute([benchmark, 'check', str(blobs)], env=restored))
-    receipt = {'fixture_only': True, 'graph_snapshots': 16, 'sigterm_cancelled': True,
+    receipt = {'fixture_only': True, 'graph_snapshots': 0 if mode == 'crate' else 16,
+               'crate_artifacts': 257 if mode == 'crate' else 0,
+               'committed_artifact_tuples_preserved': len(artifacts), 'sigterm_cancelled': True,
                'same_pair_resumed': True, 'committed_checkpoints_preserved': len(checkpoints),
                'verified_and_activated': True, 'restored_query_readback': readback,
                'workers': 8, 'payload_budget_mib': 64, 'graph_memory_budget_mib': 1024,
