@@ -113,8 +113,10 @@ docker network create --label "devres.test-owner=$run_id" "$run_id" >/dev/null
 docker run -d --name "$run_id" --label "devres.test-owner=$run_id" --network "$run_id" \
   --cpus=2 --memory=1g -e POSTGRES_USER=devres -e POSTGRES_PASSWORD=fixture-only \
   -e POSTGRES_DB=postgres -p 127.0.0.1::5432 "$postgres_image" >/dev/null
+# The image bootstrap server accepts only Unix sockets and shuts down again.
+# Wait for the final TCP listener before creating any fixture database.
 for attempt in {1..60}; do
-  if docker exec "$run_id" pg_isready -U devres -d postgres >/dev/null 2>&1; then break; fi
+  if docker exec "$run_id" pg_isready -h 127.0.0.1 -U devres -d postgres >/dev/null 2>&1; then break; fi
   if (( attempt == 60 )); then echo 'benchmark PostgreSQL readiness timed out' >&2; exit 1; fi
   sleep 1
 done

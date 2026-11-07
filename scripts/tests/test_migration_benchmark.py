@@ -1,6 +1,9 @@
 """Behavior tests for benchmark parity, repeats and conservative comparison."""
 import importlib.util
 import json
+import os
+import sys
+import textwrap
 from pathlib import Path
 import tempfile
 import subprocess
@@ -292,6 +295,103 @@ class BenchmarkCliTests(unittest.TestCase):
         self.assertIn('requires a value', self.rejected('--graph-snapshots', '-1').stderr)
         self.assertIn('bounded range', self.rejected('--graph-snapshots', '65').stderr)
         self.assertIn('positive', self.rejected('--graph-memory-budget-mib', '0').stderr)
+
+    def mocked_postgres_startup(self, script_text=None):
+        """Run the real harness against a startup state machine, never Docker."""
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            root = Path(temporary)
+            scripts = root / 'harness' / 'scripts'
+            scripts.mkdir(parents=True)
+            script = scripts / 'benchmark-migration.sh'
+            script.write_text(self.script.read_text() if script_text is None else script_text)
+            report = Path(__file__).resolve().parents[1] / 'migration-benchmark-report.py'
+            (scripts / report.name).write_bytes(report.read_bytes())
+            binaries = root / 'bin'
+            binaries.mkdir()
+            scratch = root / 'tmp'
+            scratch.mkdir()
+            events = root / 'events.jsonl'
+            state = root / 'state.json'
+            state.write_text(json.dumps({'tcp_polls': 0, 'tcp_ready': False}))
+
+            def executable(name, body):
+                path = binaries / name
+                path.write_text('#!' + sys.executable + '\n' + textwrap.dedent(body))
+                path.chmod(0o700)
+                return path
+
+            executable('docker', r"""
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                args = sys.argv[1:]
+                state_path = Path(os.environ['DEVRES_MOCK_PG_STATE'])
+                state = json.loads(state_path.read_text())
+
+                def event(name):
+                    with open(os.environ['DEVRES_MOCK_PG_EVENTS'], 'a') as output:
+                        output.write(json.dumps(name) + '\n')
+
+                if args[:1] == ['exec'] and len(args) > 2:
+                    if args[2] == 'pg_isready':
+                        tcp = any(arg in ('-h', '--host') and index + 1 < len(args)
+                                  and args[index + 1] == '127.0.0.1'
+                                  for index, arg in enumerate(args))
+                        tcp = tcp or '--host=127.0.0.1' in args
+                        if not tcp:
+                            event('unix_bootstrap_ready')
+                            raise SystemExit(0)
+                        state['tcp_polls'] += 1
+                        state['tcp_ready'] = state['tcp_polls'] >= 2
+                        state_path.write_text(json.dumps(state))
+                        event('tcp_final_ready' if state['tcp_ready'] else 'tcp_not_ready')
+                        raise SystemExit(0 if state['tcp_ready'] else 1)
+                    if args[2] == 'psql' and args[-1].startswith('CREATE DATABASE '):
+                        event('create_after_final_ready' if state['tcp_ready']
+                              else 'create_during_bootstrap')
+                        raise SystemExit(0 if state['tcp_ready'] else 23)
+                if args[:1] == ['port']:
+                    print('127.0.0.1:54321')
+                elif args[:1] == ['inspect'] or args[:2] == ['network', 'inspect']:
+                    print(args[-1])
+                elif args[:1] == ['run'] or args[:2] == ['network', 'create']:
+                    pass
+                elif args[:1] == ['rm'] or args[:2] == ['network', 'rm']:
+                    pass
+                else:
+                    raise SystemExit(97)
+            """)
+            benchmark = executable('fake-benchmark', r"""
+                import json
+                import os
+                import sys
+                if len(sys.argv) > 1 and sys.argv[1] == 'prepare':
+                    with open(os.environ['DEVRES_MOCK_PG_EVENTS'], 'a') as output:
+                        output.write(json.dumps('prepare') + '\n')
+                    raise SystemExit(42)
+                raise SystemExit(96)
+            """)
+            executable('git', "print('a' * 40)\n")
+            executable('sleep', 'raise SystemExit(0)\n')
+            environment = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'],
+                               TMPDIR=str(scratch), DEVRES_TMP_STATE='1',
+                               DEVRES_DOCKER_HOST='unix://' + str(root / 'mock-docker.sock'),
+                               DEVRES_MOCK_PG_STATE=str(state),
+                               DEVRES_MOCK_PG_EVENTS=str(events), PYTHONDONTWRITEBYTECODE='1')
+            result = subprocess.run(['bash', str(script), '--binary', str(benchmark),
+                                     '--workers', '1', '--rows', '1', '--payload-kib', '1',
+                                     '--files', '1', '--file-mib', '1'], env=environment,
+                                    text=True, capture_output=True, check=False, timeout=20)
+            recorded = [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
+            return result, recorded
+
+    def test_waits_for_final_tcp_postgres_before_creating_benchmark_database(self):
+        result, events = self.mocked_postgres_startup()
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertEqual(events, ['tcp_not_ready', 'tcp_final_ready',
+                                  'create_after_final_ready', 'prepare'])
 
     def test_identical_comparison_binaries_are_rejected_before_infrastructure(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
