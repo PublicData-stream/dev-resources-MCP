@@ -1,12 +1,113 @@
-# Staging migration continuation: 2026-11-06
+# Staging migration continuation: 2026-11-07
 
-This is an operational snapshot at **2026-11-06 08:53:25 UTC**, not a completed
-public cutover or complete-corpus performance report. A later direct-cutover
-update appears below and supersedes the earlier fresh-rehearsal plan. The
-[operator runbook](../deploy/staging/README.md) owns the execution and recovery
-procedure.
+This records successive operational snapshots. The latest target is
+`0.1.0-build.78c2e9c5`, resumed on the preserved permanent pair on
+**2026-11-07 14:40 UTC**. Migration and public cutover remain incomplete. The
+[operator runbook](../deploy/staging/README.md) owns execution and recovery.
 
-## Release and implementation
+## Preserving target supersession: 2026-11-07
+
+The operator explicitly authorized retrying with
+[`0.1.0-build.78c2e9c5`](https://github.com/PublicData-stream/dev-resources-MCP/releases/tag/0.1.0-build.78c2e9c5),
+commit `78c2e9c521b68436a7d1cc23bce54ee199ad1948`. The existing outage authority,
+**2026-11-10 20:59 UTC** preserving-rollback cutoff and **23:59 UTC** operational
+and credential-expiry deadline remain unchanged. The three-hour reserve is an
+allowance, not measured recovery-duration evidence.
+
+| Artifact | Verified SHA-256 |
+| --- | --- |
+| Server image index | `b317a2c87ea6ce337f7c1a69213eb90c22fde469ac4c73d26d9d5a68e635fff5` |
+| Native amd64 server manifest | `c37b0c4db9b03025dc417fde7415083f6b5b52906f1e4f06c39a533b0c06d0aa` |
+| Probe image index | `820b235d1b267bd934f85a07d020762a234975a52745bccfe80648a69a1ff05b` |
+| Native amd64 probe manifest | `35c1afcefd16525568332430cf29519daed339ec965973563ad0d1c6e1fc3eb2` |
+| Corresponding source archive | `b597e1a7e3c80fee7fb789724de38b6800974011a27bbb165b38e7a3a5989839` |
+| Installed six-module operator bundle | `9483adc9cf45c98967d3297b24bdf2bec77ced163e2d5a4e923a13a502e140fe` |
+
+Anonymous index/child/config reads, image labels and all 373 regular archive
+members matched the signed release source or its seven generated stamps, without
+extracting or executing inspected package code. Same-SHA
+[native CI](https://github.com/PublicData-stream/dev-resources-MCP/actions/runs/42368891431)
+and [image publication](https://github.com/PublicData-stream/dev-resources-MCP/actions/runs/42374008921)
+passed; a second complete native CI run also passed. Those hosted results cover
+the published runtime, separately from local operator/helper changes.
+
+Signed commits `b9951f7` and `eb901e3` add the bounded first-party qualification
+and private readback tools, then the explicit target-supersession lifecycle.
+Both have the required Assisted-by trailer. No push or replacement image
+publication was performed. Specification, Configuration and OxiRule were unchanged.
+
+The old automatic continuation was stopped before any mutating acceptance
+attempt. Independent preflight and actual in-host admission checks passed. The
+reviewed supersession driver cooperatively stopped the old driver, migration
+worker and PostgreSQL, archived the unchanged old journal/operator/configuration
+capsule, and created a held coordinated checkpoint of the current partial pair.
+The complete operator directory was atomically exchanged and the old installation
+retained. The driver exited successfully in `upgrade_superseded_paused`.
+The original operation token, dataset GUIDs, rollback snapshot, pause policy and
+absolute deadline were preserved; no journal policy was manually widened.
+
+The canonical new operator then explicitly resumed the same permanent pair.
+At **14:40:58 UTC**, an owned migration worker was running with the new immutable
+index and published revision, with no observed OOM. It retained the 37-CPU/192-GiB
+worker profile and two-CPU/16-GiB PostgreSQL profile. The resumed worker was
+revalidating retained file checkpoints; file and SQL completion markers remained
+true and graph completion remained false. Incomplete lanes rescan their retained
+rows, so restarted counters do not imply evidence loss. The original and new
+checkpoint snapshots and their three-member holds remain protected. The existing
+token-bound watchdog remains armed.
+
+The new version's separate automatic continuation uses a freshly pinned
+manifest and attempt namespace, the same explicitly approved task key and exact
+sudo rule, unchanged source restriction and expiry, and the retained six-route
+baseline. Actual forced-command status authenticated and matched the new target.
+The coordinator was observed running in `waiting` with zero mutating attempts;
+no new public acceptance or finalization was admitted early.
+
+Before normal serving, one explicitly owned container must initialize schema
+11 and qualify only the fixed retained RFC/MDN subjects and bounded compiled
+dependencies. It has one global budget of at most twenty upstream attempts,
+no collector/sweep runtime, and cannot obtain a new budget through automatic retry.
+Its optimized binary, selectors, immutable MDN baseline and private restored-data
+reader are independently hash-pinned. An inert, network-disabled loader check
+passed in the exact published server image; real-source acquisition is still
+pending the offline migration. Pending attribution cannot satisfy acceptance.
+
+Local verification passed on the final implementation:
+
+- Formatting, workspace/all-targets Clippy with denied warnings, workspace Rust
+  tests, current advisory audit, and dependency/license/source policy checks.
+- All **573** Python tests, including **213** focused operator lifecycle tests.
+- The complete real PostgreSQL suite, including fixed queue-scope rejection before
+  claims/acquisition, bounded target/generation counts and sealed-state tampering.
+- The new restored-MDN reader's seven synthetic byte/history/complete UTF-8 notice
+  fixtures, plus 77 acceptance and 36 server/16 client continuation fixtures.
+- Pinned OxiBelt HTTP/WebTransport and isolated minikube NodePort TCP/UDP, CNI
+  isolation, PVC restart and coordinated restore. The existing verified OxiBelt
+  binary was reused. The completed minikube profile and generated state were
+  confined to `/tmp` and cleaned up; Cargo used `/tmp/rust/target`.
+- Two actual published-binary, synthetic same-pair continuation cases. One stopped
+  d373 with 139 of 1,025 canonical artifact rows, then interrupted and completed
+  78. The other stopped after 135 occurrence receipts and completed 2,050 under
+  78. Existing physical tuples, seals, aliases, checkpoints and nonempty completed
+  lanes were retained; the first missing occurrence allocated the next sequence.
+  Idempotent replay, verification, activation, startup to schema 11 and restored
+  query fingerprints passed. These cases establish bounded compatibility, not
+  whole-corpus throughput or real-source attribution qualification.
+
+Independent MCP/API, Storage and Security Boundary review closed the actual
+implementation, cross-binary evidence, final artifact/manifests and staging/gate
+activation adapters. Review is distinct from human GitHub approval. Local native
+amd64 helper checks do not establish native arm64 execution of these new tools.
+
+Remaining production gates are offline migration/verification/activation, real
+fixed-source attribution qualification, new backend/public HTTP and WebTransport
+for both revisions, retained original bytes and complete notices, isolation and
+shared routes, schema-11 coordinated restore, original collector/timer restoration,
+21 observations spanning at least ten minutes, and scoped credential cleanup.
+Other historical subjects may still need attribution repair. Full-corpus
+qualification and a completion time have not been established.
+
+## Earlier release and implementation: d373818b
 
 The requested runtime is
 [`0.1.0-build.d373818b`](https://github.com/PublicData-stream/dev-resources-MCP/releases/tag/0.1.0-build.d373818b),
