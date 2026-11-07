@@ -161,7 +161,7 @@ def compare(root, repeats):
             'all_normalized_durable_results_equal': True,
             'durable_fingerprint': baseline[0]['durable_fingerprint'],
             'full_corpus_speedup': 'unmeasured',
-            'timing_boundary': 'complete artifact-only replay, first metadata query through final publication; excludes observations',
+            'timing_boundary': 'complete artifact-only replay, first metadata query through the final empty metadata-page query after publication; excludes observations',
             'backup_restore_note': 'each pair separately backed up/restored and read back; times excluded from artifact speedup',
             'cache_mode': 'warm cache; fresh pairs; alternating baseline/candidate order; no host cache drop'}
 

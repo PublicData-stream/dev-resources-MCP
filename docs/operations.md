@@ -159,6 +159,23 @@ receiptless canonical results are assigned one-to-one in legacy order from a
 frozen preexisting candidate set; that adoption path serializes crate snapshot
 preparation while other providers can continue. Fresh crate replay stays parallel.
 
+SQL-only crate artifacts, observations and inventory staging prepare windows of
+at most 128 rows independently of the active worker count. Each window reserves
+its complete graph working memory before reading payloads and keeps that
+reservation through publication. Owner transactions publish at most 128 rows and
+8 MiB of accounted encoded SQL arguments; an individually valid oversized row is
+published alone. This publication bound is separate from SQL payload-work and
+seal-metadata limits. Observation occurrences and their existing replay receipts
+commit together in original order. A canceled or failed batch rolls back while
+previous committed batches remain available for verified resume.
+
+Inventory staging uses a disposable owner-session key catalogue to sort retained
+keys once in their original PostgreSQL concatenation order and collation. Payloads
+are fetched by exact keys after admission. Restart reconstructs the catalogue;
+ambiguous retained ordering fails explicitly. Existing canonical artifacts and
+staging rows must match the freshly verified expected payload and integrity seal
+before they count as completed work.
+
 Graph windows reserve decoded input, clones, prepared results and index-buffer
 allowances before materializing work. Results retain admission through ordered
 publication. An individually valid graph unit larger than the graph-memory budget
@@ -193,6 +210,8 @@ resolution and `/tmp/rust/target`, then run `scripts/benchmark-migration.sh` thr
 the temporary-state and isolated Docker wrappers. It creates fresh synthetic pairs,
 checks serial/parallel durable fingerprints, and measures backup/restore separately.
 See [migration measurements](migration-performance.md) for evidence and limitations.
+The [crate replay comparison](migration-crate-performance.md) measures the SQL-only
+artifact, observation and inventory-staging follow-up separately.
 A fresh complete matching database/blob clone, measured acceptance and rollback
 reserve, and a newly agreed outage window remain prerequisites to any future
 production attempt. These fixture commands do not operate on staging or production.

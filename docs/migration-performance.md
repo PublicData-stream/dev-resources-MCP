@@ -246,3 +246,10 @@ graphs or a complete schema-nine corpus.
 
 The complete-corpus cutover gate above still applies. No live rehearsal was resumed,
 and no release, registry publication or production deployment is established here.
+
+## Crate SQL replay follow-up
+
+The [crate replay comparison](migration-crate-performance.md) separately qualifies
+bounded artifact/observation/staging batches and parallel preparation. It uses an
+artifact-heavy synthetic fixture and an unchanged-algorithm baseline; these
+earlier SQL/file and RFC graph measurements remain historical evidence.
