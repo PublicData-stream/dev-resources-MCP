@@ -3,7 +3,7 @@
 
 The caller holds the source snapshots while verification runs and uses the
 maintenance lock for snapshot creation and marking only. The capacity guard stays
-active during the drill. Only retained RFC data is fetched; no provider work occurs.
+active during the drill. Only retained RFC/MDN data and attribution notices are read; no provider work occurs.
 """
 import hashlib
 import http.client
@@ -29,8 +29,12 @@ PRIVATE = Path('/etc/devres-staging')
 DATASET = 'cachepool/devres-staging'
 PG = 'postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a'
 OLD_SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:02977361122a11d7f0a9eedea97437b15f2fccc17f82d2331f859d388359179e'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10'
-PROFILES = {9: (OLD_SERVER, '0.1.0-build.27d35cd6'), 10: (SERVER, '0.1.0-build.d373818b')}
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:b317a2c87ea6ce337f7c1a69213eb90c22fde469ac4c73d26d9d5a68e635fff5'
+VERSION = '0.1.0-build.78c2e9c5'
+# Ten is an offline migration profile; qualified serving/restore is eleven.
+PROFILES = {9: (OLD_SERVER, '0.1.0-build.27d35cd6'), 10: (SERVER, VERSION), 11: (SERVER, VERSION)}
+ATTRIBUTION = Path('/usr/local/libexec/devres-staging-attribution')
+ATTRIBUTION_POLICY = 'devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices'
 SOURCE_PREFIX = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
 COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
 OWNER_KEY = 'org.publicdata:restore-owner'
@@ -111,6 +115,70 @@ class RestoreError(RuntimeError):
     """Fixed diagnostic code; provider content and command stderr stay private."""
 
 
+def attribution_assets():
+    """Read only the parent's fixed, reviewed first-party helper and selector plan."""
+    directory = ATTRIBUTION.lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700):
+        raise RestoreError('unsafe_attribution_directory')
+    def read(name, mode, limit):
+        descriptor = os.open(ATTRIBUTION / name, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(descriptor)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                    or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != mode or before.st_size > limit):
+                raise RestoreError('unsafe_attribution_asset')
+            data = os.read(descriptor, limit + 1)
+            after, linked = os.fstat(descriptor), (ATTRIBUTION / name).lstat()
+            keys = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_uid', 'st_gid', 'st_mode', 'st_nlink')
+            if len(data) != before.st_size or any(getattr(before, key) != getattr(after, key)
+                    or getattr(before, key) != getattr(linked, key) for key in keys):
+                raise RestoreError('attribution_asset_changed')
+            return data
+        finally:
+            os.close(descriptor)
+    raw = read('manifest.json', 0o600, 16384)
+    manifest = json.loads(raw)
+    if (not isinstance(manifest, dict) or set(manifest) != {'version', 'release', 'server', 'binary_sha256', 'plan_sha256', 'live_acquisition',
+                         'maximum_requests', 'retained_verifier_sha256', 'mdn_baseline_sha256'}
+            or type(manifest['version']) is not int or manifest['version'] != 1
+            or manifest['release'] != VERSION or manifest['server'] != SERVER
+            or manifest['live_acquisition'] is not True
+            or type(manifest['maximum_requests']) is not int or manifest['maximum_requests'] != 20
+            or any(not isinstance(manifest[key], str) or not HASH_RE.fullmatch(manifest[key])
+                   for key in ('binary_sha256', 'plan_sha256', 'retained_verifier_sha256', 'mdn_baseline_sha256'))):
+        raise RestoreError('attribution_manifest_invalid')
+    for name, mode, limit, key in (('repair', 0o755, 256 * 1024 * 1024, 'binary_sha256'),
+                                  ('plan.json', 0o600, 512 * 1024, 'plan_sha256'),
+                                  ('verify-retained.py', 0o600, 512 * 1024, 'retained_verifier_sha256'),
+                                  ('mdn-baseline.json', 0o600, 512 * 1024, 'mdn_baseline_sha256')):
+        data = read(name, mode, limit)
+        if hashlib.sha256(data).hexdigest() != manifest[key]:
+            raise RestoreError('attribution_asset_hash_changed')
+    return {**manifest, 'manifest_sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def attribution_receipt(value, plan_sha256):
+    fields = {'version', 'release', 'schema', 'integrity_active', 'scope', 'plan_sha256',
+              'policy_epoch', 'policy_fingerprint', 'qualified_targets', 'providers', 'request_attempts',
+              'maximum_requests', 'ready', 'notices_verified', 'attribution_storage_verified', 'target_set_digest'}
+    if (not isinstance(value, dict) or set(value) != fields
+            or type(value['version']) is not int or value['version'] != 1
+            or value['release'] != VERSION or type(value['schema']) is not int or value['schema'] != 11
+            or value['scope'] != 'fixed_retained_rfc_mdn' or value['plan_sha256'] != plan_sha256
+            or type(value['policy_epoch']) is not int or value['policy_epoch'] != 1
+            or value['policy_fingerprint'] != ATTRIBUTION_POLICY
+            or value['providers'] != ['mdn', 'rfc']
+            or type(value['qualified_targets']) is not int or not 2 <= value['qualified_targets'] <= 128
+            or type(value['request_attempts']) is not int or not 0 <= value['request_attempts'] <= 20
+            or type(value['maximum_requests']) is not int or value['maximum_requests'] != 20
+            or any(value[key] is not True for key in ('integrity_active', 'ready', 'notices_verified', 'attribution_storage_verified'))
+            or not isinstance(value['target_set_digest'], str)
+            or not re.fullmatch(r'blake3:[0-9a-f]{64}', value['target_set_digest'])):
+        raise RestoreError('attribution_qualification_receipt_invalid')
+    return value
+
+
 class OfflinePaused(RestoreError):
     """The worker is stopped; its caller must preserve and checkpoint the pair."""
 
@@ -135,14 +203,19 @@ def execute(args):
     return p.stdout.strip()
 
 
-def bounded_diagnostic_output(arguments, byte_limit):
+def bounded_diagnostic_output(arguments, byte_limit, *, timeout_seconds=None, input_data=None):
     """Bound pipe reads before buffering; never echo Docker or application text."""
-    process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    if input_data is not None and (not isinstance(input_data, bytes) or len(input_data) > 8192):
+        raise RestoreError('invalid_private_helper_input')
+    process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL if input_data is None else subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, start_new_session=True)
     captured = bytearray()
     truncated = timed_out = False
-    deadline = time.monotonic() + DIAGNOSTIC_LOG_SECONDS
+    deadline = time.monotonic() + (DIAGNOSTIC_LOG_SECONDS if timeout_seconds is None else timeout_seconds)
     try:
+        if input_data is not None:
+            process.stdin.write(input_data)
+            process.stdin.close()
         with selectors.DefaultSelector() as ready:
             ready.register(process.stdout, selectors.EVENT_READ)
             while True:
@@ -167,7 +240,79 @@ def bounded_diagnostic_output(arguments, byte_limit):
         finally:
             process.stdout.close()
     return {'data': bytes(captured[:byte_limit]),
-            'truncated': truncated, 'timed_out': timed_out}
+            'truncated': truncated, 'timed_out': timed_out, 'returncode': process.returncode}
+
+
+def verify_notice_roundtrip(attribution, read):
+    """Read complete fixed notice resources with exact identity and byte offsets."""
+    if (not isinstance(attribution, dict) or attribution.get('status') != 'ready'
+            or type(attribution.get('policy_epoch')) is not int or attribution['policy_epoch'] != 1
+            or attribution.get('policy_fingerprint') != ATTRIBUTION_POLICY):
+        raise RestoreError('restored_attribution_missing')
+    generations = attribution.get('generations')
+    uris = attribution.get('resource_uris')
+    if (not isinstance(generations, list) or not 1 <= len(generations) <= 128
+            or not isinstance(uris, list) or len(uris) != len(generations)
+            or any(not isinstance(uri, str) for uri in uris)
+            or len(set(uris)) != len(uris) or attribution.get('resource_uri') != uris[0]):
+        raise RestoreError('restored_attribution_identity_invalid')
+    complete, seen = [], set()
+    for generation, uri in zip(generations, uris):
+        if (not isinstance(generation, dict) or not isinstance(uri, str)
+                or not re.fullmatch(r'devres://attribution/blake3:[0-9a-f]{64}', uri)
+                or generation.get('id') != uri.removeprefix('devres://attribution/')
+                or not isinstance(generation.get('subject'), dict)
+                or not isinstance(generation.get('notices'), list) or not generation['notices']):
+            raise RestoreError('restored_attribution_identity_invalid')
+        expected, local_seen = [], set()
+        for notice in generation['notices']:
+            if (not isinstance(notice, dict) or not isinstance(notice.get('source_url'), str)
+                    or not isinstance(notice.get('text'), str) or not notice['text']):
+                raise RestoreError('restored_attribution_notice_invalid')
+            text = notice['source_url'] + '\n' + notice['text']
+            if text not in local_seen:
+                expected.append(text)
+                local_seen.add(text)
+            if text not in seen:
+                complete.append(text)
+                seen.add(text)
+        expected_text = '\n\n'.join(expected)
+        if len(expected_text.encode()) > 4 * 1024 * 1024:
+            raise RestoreError('restored_attribution_notice_exceeds_bound')
+        offset, chunks, total = 0, [], None
+        for _ in range(129):
+            result = read(uri + '?offset=' + str(offset) + '&limit=32768')
+            items = result.get('contents')
+            if not isinstance(items, list) or len(items) != 1:
+                raise RestoreError('restored_attribution_readback_failed')
+            item = items[0]
+            metadata = item.get('_meta', {})
+            identity = metadata.get('attribution', {})
+            text, length, next_offset = item.get('text'), metadata.get('total_bytes'), metadata.get('next_offset')
+            if (item.get('uri') != uri or item.get('mimeType') != 'text/plain'
+                    or identity.get('id') != generation['id'] or identity.get('subject') != generation['subject']
+                    or type(identity.get('policy_epoch')) is not int or identity['policy_epoch'] != 1
+                    or type(metadata.get('offset')) is not int or metadata['offset'] != offset
+                    or type(length) is not int or not 1 <= length <= 4 * 1024 * 1024
+                    or (total is not None and total != length) or not isinstance(text, str) or not text
+                    or len(text.encode()) > 32768):
+                raise RestoreError('restored_attribution_readback_failed')
+            total = length
+            end = offset + len(text.encode())
+            if end > total or (next_offset is None and end != total) or (next_offset is not None
+                    and (type(next_offset) is not int or next_offset != end or not offset < next_offset < total)):
+                raise RestoreError('restored_attribution_pagination_invalid')
+            chunks.append(text)
+            if next_offset is None:
+                if ''.join(chunks) != expected_text:
+                    raise RestoreError('restored_attribution_readback_failed')
+                break
+            offset = next_offset
+        else:
+            raise RestoreError('restored_attribution_notice_exceeds_bound')
+    if attribution.get('readable_notice') != '\n\n'.join(complete):
+        raise RestoreError('restored_attribution_readback_failed')
+    return True
 
 
 def diagnostic_container_name(name):
@@ -350,7 +495,7 @@ def open_blob(root, value):
 
 def hash_blob(root, value, *, integrity_verified=False):
     # Tagged BLAKE3 and legacy independent descriptors are verified by the exact
-    # schema-ten binary, avoiding a second cryptography implementation here.
+    # published target binary, avoiding a second cryptography implementation here.
     if value.startswith('blake3:') and not integrity_verified:
         raise RestoreError('independent_integrity_verification_required')
     fd, size = open_blob(root, value)
@@ -763,11 +908,12 @@ class Drill:
         elif not self.postgres_started:
             raise RestoreError('restore_postgres_state_invalid')
         actual = self.psql('SELECT version FROM devres_schema WHERE singleton')
-        if actual not in ('9', '10') or (self.schema is not None and str(self.schema) != actual):
+        expected = 11 if self.schema == 10 else self.schema
+        if actual not in ('9', '11') or (expected is not None and str(expected) != actual):
             raise RestoreError('restored_schema_mismatch')
         schema = int(actual)
         server, version, source = self.select_profile(schema)
-        if schema == 10:
+        if schema == 11:
             if self.psql('SELECT active FROM devres_integrity_control WHERE singleton') != 't':
                 raise RestoreError('restored_integrity_not_active')
             self.offline('verify-storage', timeout=timeout)
@@ -780,7 +926,7 @@ class Drill:
             raise RestoreError('retained_fixed_rfc_required')
         capture, body_hash = row
         blob_root = self.root / 'evidence/blobs'
-        size = hash_blob(blob_root, body_hash, integrity_verified=schema == 10)
+        size = hash_blob(blob_root, body_hash, integrity_verified=schema == 11)
         backend = self.docker_run('backend', server, self.backend_args('4g'))
         self.backend_started = True
         info = json.loads(self.run(['docker', 'inspect', backend]))[0]
@@ -808,11 +954,48 @@ class Drill:
         with os.fdopen(fd, 'rb') as stream:
             if stream.read(len(page)) != page:
                 raise RestoreError('restored_capture_page_mismatch')
+        if schema == 11:
+            attribution = resource.get('attribution', {})
+            uri = attribution.get('resource_uri')
+            verify_notice_roundtrip(attribution, lambda selected:
+                                   self.call(ip, 'resources/read', {'uri': selected}, self.private))
+            if not any(item.get('uri') == uri and item.get('text') == attribution['readable_notice'] for item in contents[1:]):
+                raise RestoreError('restored_attribution_readback_failed')
+            self.verify_retained_mdn(ip)
         return {'snapshot': self.snapshot, 'schema': schema, 'server': server,
                 'version': version, 'source_url': source, 'captures': int(count),
                 'verified_capture_id': capture,
                 'verified_body_hash': body_hash, 'verified_body_bytes': size,
                 'verified_resource_bytes': len(page)}
+
+    def verify_retained_mdn(self, ip):
+        if (self.psql('SELECT version FROM devres_schema WHERE singleton') != '11'
+                or self.psql('SELECT active FROM devres_integrity_control WHERE singleton') != 't'):
+            raise RestoreError('restored_mdn_schema_or_activation_invalid')
+        assets = attribution_assets()
+        aliases = {}
+        for namespace, legacy in (('mdn:snapshots', '10b23b616473f7534f3ba617c16453f88f5934eaa4d6e18b94b1a6a71e501f8a'),
+                                  ('mdn:projections', '45ad5da63ff8bb663ee90a03468e7803763e75c79c9bf2ee7baa76b095da1f78')):
+            value = self.psql("SELECT canonical FROM devres_content_aliases WHERE namespace='" + namespace + "' AND legacy='" + legacy + "'")
+            if not re.fullmatch('blake3:[0-9a-f]{64}', value):
+                raise RestoreError('restored_mdn_alias_unavailable')
+            aliases[namespace] = value
+        context = {'ip': ip, 'private_dir': str(self.private), 'release': VERSION,
+                   'baseline_sha256': assets['mdn_baseline_sha256'], 'mdn_aliases': aliases}
+        result = bounded_diagnostic_output(['/usr/bin/python3', '-I', '-B', str(ATTRIBUTION / 'verify-retained.py')],
+                                           16384, timeout_seconds=180,
+                                           input_data=json.dumps(context, sort_keys=True).encode())
+        if result['truncated'] or result['timed_out'] or result['returncode'] != 0:
+            raise RestoreError('restored_retained_verifier_failed')
+        value = json.loads(result['data'])
+        expected = {'version': 1, 'release': VERSION, 'schema': 11,
+                    'retained_mdn': True, 'notices_verified': True, 'no_acquisition': True,
+                    'mdn_baseline_sha256': assets['mdn_baseline_sha256']}
+        if (value != expected or type(value.get('version')) is not int or type(value.get('schema')) is not int
+                or any(value.get(key) is not True for key in ('retained_mdn', 'notices_verified', 'no_acquisition'))
+                or attribution_assets() != assets):
+            raise RestoreError('restored_retained_verifier_receipt_invalid')
+        return True
 
     def cleanup(self):
         # Stop every clone writer before unmounting/destroying its storage.

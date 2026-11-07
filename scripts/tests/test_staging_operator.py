@@ -183,6 +183,25 @@ class ServiceTests(unittest.TestCase):
             op.main()
             module.return_value.Upgrade.return_value.checkpoint_adopt.assert_called_once_with(
                 token, '/tmp/receipt', check_only=True, from_bundle_sha256=None)
+
+    def test_supersession_requires_both_explicit_targets_and_check_dispatch_is_inert(self):
+        import contextlib
+        import io
+        token, old, target = 'a' * 24, 'b' * 64, 'c' * 64
+        for arguments in (['upgrade-supersede-target'], ['upgrade-supersede-target', '--token', token],
+                          ['upgrade-status', '--token', token, '--from-version', 'old']):
+            with patch('sys.argv', ['staging.py', *arguments]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    op.main()
+        arguments = ['staging.py', 'upgrade-supersede-target', '--token', token,
+                     '--from-bundle-sha256', old, '--from-version', 'previous', '--from-server', 'previous@sha256:pin',
+                     '--target-bundle-sha256', target, '--check']
+        with patch('sys.argv', arguments), patch.object(op.os, 'geteuid', return_value=0), \
+                patch.object(op, 'upgrade_module') as module, contextlib.redirect_stdout(io.StringIO()):
+            module.return_value.Upgrade.return_value.supersede_target.return_value = {'check_passed': True}
+            op.main()
+        module.return_value.Upgrade.return_value.supersede_target.assert_called_once_with(
+            token, old, 'previous', 'previous@sha256:pin', target, check_only=True)
         with patch('sys.argv', ['staging.py', 'upgrade-retire-rehearsal', '--token', token]), \
                 patch.object(op.os, 'geteuid', return_value=0), patch.object(op, 'upgrade_module') as module, \
                 contextlib.redirect_stdout(io.StringIO()):

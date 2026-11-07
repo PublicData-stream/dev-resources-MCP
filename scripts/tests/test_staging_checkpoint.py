@@ -45,7 +45,7 @@ class Drill:
 
     def check(self, **kwargs):
         self.events.append('readback')
-        return {'schema': 10}
+        return {'schema': 11}
 
     def cleanup(self):
         self.events.append('cleanup')

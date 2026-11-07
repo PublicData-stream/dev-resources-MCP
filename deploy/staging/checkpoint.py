@@ -13,7 +13,8 @@ import time
 import tomllib
 
 COMMANDS = ('migrate-storage', 'verify-storage', 'activate-storage')
-PAUSED = {'rehearsal_paused', 'upgrade_paused'}
+SUPERSEDED = 'upgrade_superseded_paused'
+PAUSED = {'rehearsal_paused', 'upgrade_paused', SUPERSEDED}
 PRESERVED = PAUSED | {'rehearsal_preserved_failed', 'upgrade_preserved_failed'}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 TOKEN = re.compile(r'[0-9a-f]{24}\Z')
@@ -137,7 +138,9 @@ class Lifecycle:
         if command not in COMMANDS:
             raise CheckpointError('offline_checkpoint_phase_required')
         if self.permanent(record) and record.get('pause_scope', 'rehearsal') != 'all':
-            raise CheckpointError('permanent_checkpoint_not_enabled')
+            if record.get('phase') != SUPERSEDED or record.get('supersession_resume_pending') is not True:
+                raise CheckpointError('permanent_checkpoint_not_enabled')
+            self.validate_supersession(record)
         if record['phase'] not in {*(('running_' + c.replace('-', '_')) for c in COMMANDS),
                                   'rehearsal_running', *PAUSED, 'checkpoint_pausing'}:
             raise CheckpointError('offline_checkpoint_phase_required')
@@ -269,12 +272,14 @@ class Lifecycle:
             result[dataset + child] = value
         return result
 
-    def checkpoint(self, drill, command, completed=False, provenance=None):
+    def checkpoint(self, drill, command, completed=False, provenance=None, supersession=None):
         permanent = self.permanent(self.u.record)
         identity = self.u.identity()
-        if ((provenance is None and self.u.record.get('target_identity') != identity)
+        if ((provenance is None and supersession is None and self.u.record.get('target_identity') != identity)
                 or (provenance is not None and provenance.get('to_bundle_sha256') != identity['bundle_sha256'])):
             raise CheckpointError('checkpoint_target_identity_changed')
+        if supersession is not None and (not permanent or supersession.get('to_identity') != identity):
+            raise CheckpointError('supersession_checkpoint_identity_changed')
         self.u.save('checkpoint_pausing', command_completed=completed)
         if getattr(drill, 'backend_started', False):
             raise CheckpointError('public_candidate_cannot_pause')
@@ -285,7 +290,9 @@ class Lifecycle:
         self.clean_postgres(drill.root / 'postgres')
         dataset = self.u.dataset if permanent else drill.dataset
         checkpoint = self.u.snapshot_name('offline-pause')
-        with self.u.maintenance_state.locked():
+        lock = (self.u.maintenance_locked(deadline_at=self.u.record['deadline_at']) if supersession is not None
+                else self.u.maintenance_state.locked())
+        with lock:
             self.u.safe_unlocked()
             self.u.run(['zfs', 'snapshot', '-r', dataset + '@' + checkpoint])
             self.u.run(['zfs', 'hold', '-r', self.u.hold, dataset + '@' + checkpoint])
@@ -309,6 +316,8 @@ class Lifecycle:
             receipt['deadline_at'] = self.u.record['deadline_at']
         if provenance is not None:
             receipt['bundle_transition'] = provenance
+        if supersession is not None:
+            receipt['target_supersession'] = supersession
         receipt_path = capsule / 'receipt.json'
         self.u.write(receipt_path, json.dumps(receipt, sort_keys=True) + '\n')
         if self.u.identity() != identity:
@@ -318,7 +327,10 @@ class Lifecycle:
         if provenance is not None:
             updates['target_identity'] = identity
             updates['bundle_transitions'] = [*self.u.record.get('bundle_transitions', []), provenance]
-        self.u.save('upgrade_paused' if permanent else 'rehearsal_paused', **updates)
+        if supersession is not None:
+            updates.update(target_identity=identity, target_supersession=supersession,
+                           supersession_resume_pending=True)
+        self.u.save(SUPERSEDED if supersession is not None else 'upgrade_paused' if permanent else 'rehearsal_paused', **updates)
         (self.root / 'pause-request.json').unlink(missing_ok=True)
 
     def stop_postgres(self, drill):
@@ -440,10 +452,38 @@ class Lifecycle:
                 or receipt.get('timing_qualified') is not False):
             raise CheckpointError('checkpoint_receipt_identity_changed')
         self.verify_capsule(receipt_path.parent)
+        if record['phase'] == SUPERSEDED:
+            self.validate_supersession(record)
+            if receipt.get('target_supersession') != record.get('target_supersession'):
+                raise CheckpointError('supersession_receipt_changed')
         self.validate_storage(record, receipt)
         self.clean_postgres((Path('/mnt/devres-staging') if self.permanent(record)
                              else Path('/tmp') / ('devres-staging-restore-' + record['live_token'])) / 'postgres')
         return receipt
+
+    def validate_supersession(self, record):
+        value = record.get('target_supersession')
+        fields = {'version', 'source_record', 'source_record_sha256', 'source_operator',
+                  'source_operator_sha256', 'source_capsule', 'retained_operator', 'from_identity', 'to_identity'}
+        root = self.root / ('supersession-' + record['token'])
+        if (not isinstance(value, dict) or set(value) != fields or value.get('version') != 1
+                or value.get('source_record') != str(root / 'source-state.json')
+                or value.get('source_operator') != str(root / 'source-operator.json')
+                or value.get('source_capsule') != str(root / 'source-capsule')
+                or digest(root / 'source-state.json') != value.get('source_record_sha256')
+                or digest(root / 'source-operator.json') != value.get('source_operator_sha256')
+                or value.get('to_identity') != record.get('target_identity')
+                or record.get('pause_scope') != 'rehearsal' or record.get('mode') != 'direct'):
+            raise CheckpointError('supersession_provenance_changed')
+        source = read_json(root / 'source-state.json')
+        if source.get('target_identity') != value.get('from_identity'):
+            raise CheckpointError('supersession_source_identity_changed')
+        for key in ('token', 'live_token', 'snapshot', 'dataset_guids', 'live_dataset_guids',
+                    'deadline_at', 'timers', 'pause_scope', 'mode', 'old_server', 'old_version', 'resource_profile'):
+            if record.get(key) != source.get(key):
+                raise CheckpointError('supersession_original_contract_changed')
+        self.verify_capsule(root / 'source-capsule')
+        return value
 
     def validate_storage(self, record, receipt, checkpoint_required=True):
         permanent = self.permanent(record)
@@ -986,6 +1026,10 @@ class Lifecycle:
             if record['phase'] in PRESERVED - PAUSED:
                 self.qualify_failed(record)
                 record = self.u.record
+            superseded = record['phase'] == SUPERSEDED
+            if superseded:
+                provenance = self.validate_supersession(record)
+                self.u.validate_installed_supersession(provenance)
             self.eligible(record)
             permanent = self.permanent(record)
             if permanent and self.u.deadline_due(record, time.time):
@@ -1000,7 +1044,8 @@ class Lifecycle:
             self.u.record_driver()
             with control_lock(self.root):
                 self.u.save('checkpoint_resuming', resume_started_epoch=time.time(),
-                            timing_qualified=False, driver_stopped=False)
+                            timing_qualified=False, driver_stopped=False,
+                            **({'supersession_resume_pending': False} if superseded else {}))
             drill = None
             try:
                 drill = self.attach(record, receipt)
@@ -1020,6 +1065,7 @@ class Lifecycle:
                         pending.insert(0, 'verify-storage')
                     for current in pending:
                         self.offline(drill, current, self.u.wall_remaining() if permanent else None)
+                self.u.qualify_attribution(drill)
                 if permanent:
                     self.u.clean_stop(drill)
                     drill.cleanup()

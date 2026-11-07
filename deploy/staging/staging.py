@@ -28,8 +28,8 @@ CERTS = EDGE / 'lego/data/certificates'
 HOST = 'dev-resources.staged.mcp.publicdata.stream'
 NS = 'devres-staging'
 PG = 'postgres@sha256:ae6c78831cbc35fa3a4aaf4d763ddacf6183d6004774cc2dc28b3920410d1d1a'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10'
-PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:74b6e9020fe9868e7005f87ed0bc4a785dbd83a09ec9f6952b848f366d4a6512'
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:b317a2c87ea6ce337f7c1a69213eb90c22fde469ac4c73d26d9d5a68e635fff5'
+PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:820b235d1b267bd934f85a07d020762a234975a52745bccfe80648a69a1ff05b'
 SNIPPETS = ('52-upstream-devres-staging.toml', '62-route-devres-staging.toml')
 OWNER = 'devres-staging-v1'
 COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
@@ -521,17 +521,21 @@ def main():
                         'upgrade-rehearse', 'upgrade', 'upgrade-rollback', 'upgrade-finish',
                         'upgrade-expire', 'upgrade-direct', 'upgrade-abort-rehearsal', 'refresh-services',
                         'upgrade-status', 'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused',
-                        'upgrade-retire-rehearsal'])
+                        'upgrade-retire-rehearsal', 'upgrade-supersede-target'])
     parser.add_argument('--token')
     parser.add_argument('--deadline-at', type=float)
     parser.add_argument('--pause-scope', choices=('rehearsal', 'all'))
     parser.add_argument('--receipt')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--from-bundle-sha256')
+    parser.add_argument('--from-version')
+    parser.add_argument('--from-server')
+    parser.add_argument('--target-bundle-sha256')
     args = parser.parse_args()
     command = args.command
     if command in ('upgrade-expire', 'upgrade-abort-rehearsal', 'upgrade-status',
-                   'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused', 'upgrade-retire-rehearsal'):
+                   'upgrade-pause', 'upgrade-resume', 'upgrade-adopt-paused', 'upgrade-retire-rehearsal',
+                   'upgrade-supersede-target'):
         if not args.token or not re.fullmatch(r'[0-9a-f]{24}', args.token):
             parser.error('valid_upgrade_token_required')
     elif args.token is not None and command != 'refresh-services':
@@ -548,11 +552,17 @@ def main():
             parser.error('absolute_pause_receipt_required')
     elif args.receipt is not None:
         parser.error('receipt_only_for_paused_adoption')
-    if args.check and command != 'upgrade-adopt-paused':
+    if args.check and command not in ('upgrade-adopt-paused', 'upgrade-supersede-target'):
         parser.error('check_only_for_paused_adoption')
-    if args.from_bundle_sha256 is not None and (command != 'upgrade-adopt-paused'
+    if args.from_bundle_sha256 is not None and (command not in ('upgrade-adopt-paused', 'upgrade-supersede-target')
             or not re.fullmatch(r'[0-9a-f]{64}', args.from_bundle_sha256)):
         parser.error('valid_previous_bundle_digest_only_for_paused_adoption')
+    if command == 'upgrade-supersede-target':
+        if (not args.from_bundle_sha256 or not args.from_version or not args.from_server
+                or not args.target_bundle_sha256 or not re.fullmatch('[0-9a-f]{64}', args.target_bundle_sha256)):
+            parser.error('explicit_supersession_targets_required')
+    elif any(value is not None for value in (args.from_version, args.from_server, args.target_bundle_sha256)):
+        parser.error('target_identity_only_for_supersession')
     if command == 'refresh-services' and args.token is not None and not re.fullmatch(r'[0-9a-f]{24}', args.token):
         parser.error('valid_upgrade_token_required')
     if os.geteuid() != 0:
@@ -574,6 +584,9 @@ def main():
                 'upgrade-pause': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_pause(args.token), sort_keys=True)),
                 'upgrade-resume': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_resume(args.token), sort_keys=True)),
                 'upgrade-retire-rehearsal': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_retire(args.token), sort_keys=True)),
+                'upgrade-supersede-target': lambda: print(json.dumps(upgrade_module().Upgrade().supersede_target(
+                    args.token, args.from_bundle_sha256, args.from_version, args.from_server,
+                    args.target_bundle_sha256, check_only=args.check), sort_keys=True)),
                 'upgrade-adopt-paused': lambda: print(json.dumps(upgrade_module().Upgrade().checkpoint_adopt(args.token, args.receipt, check_only=args.check, from_bundle_sha256=args.from_bundle_sha256), sort_keys=True))}
     commands[command]()
 

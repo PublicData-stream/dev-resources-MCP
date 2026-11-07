@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -144,6 +145,23 @@ class RestoreTests(unittest.TestCase):
             version = restore.PROFILES[int(self.host.schema)][1]
             return {'structuredContent': {'product': 'dev-resources-MCP', 'version': version,
                                           'sourceUrl': restore.SOURCE_PREFIX + version + '/source.tar.gz'}}
+        if self.host.schema == '11':
+            uri = 'devres://attribution/blake3:' + 'e' * 64
+            subject = {'provider': 'rfc', 'namespace': 'capture', 'key': TAGGED_CAPTURE, 'fingerprint': TAGGED_DIGEST}
+            notice = 'https://fixtures.invalid/source\nQualified fixture notice'
+            if params.get('uri', '').startswith(uri):
+                offset = int(urllib.parse.parse_qs(urllib.parse.urlsplit(params['uri']).query).get('offset', ['0'])[0])
+                text = notice[offset:offset + 32768]
+                return {'contents': [{'uri': uri, 'mimeType': 'text/plain', 'text': text,
+                    '_meta': {'attribution': {'id': 'blake3:' + 'e' * 64, 'subject': subject, 'policy_epoch': 1},
+                              'offset': offset, 'total_bytes': len(notice), 'next_offset': None}}]}
+            return {'contents': [{'text': BODY.decode()}, {'uri': uri, 'text': notice}],
+                    'attribution': {'status': 'ready', 'policy_epoch': 1,
+                        'policy_fingerprint': restore.ATTRIBUTION_POLICY, 'resource_uri': uri,
+                        'readable_notice': notice, 'resource_uris': [uri],
+                        'generations': [{'id': 'blake3:' + 'e' * 64, 'subject': subject,
+                                         'notices': [{'source_url': 'https://fixtures.invalid/source',
+                                                      'text': 'Qualified fixture notice'}]}]}}
         return {'contents': [{'text': BODY.decode()}]}
 
     def read_logs(self, name):
@@ -170,7 +188,7 @@ class RestoreTests(unittest.TestCase):
                              token=TOKEN, sleep=lambda _: None, call=self.rpc, **self.diagnostic_arguments(), **kwargs)
 
     def run_verify(self, **kwargs):
-        with patch.object(restore.os, 'chown'):
+        with patch.object(restore.os, 'chown'), patch.object(restore.Drill, 'verify_retained_mdn', return_value=True):
             return restore.verify(SNAPSHOT, run=self.host.run, root=self.root, private=self.private,
                                   token=TOKEN, sleep=lambda _: None, call=self.rpc, **self.diagnostic_arguments(), **kwargs)
 
@@ -794,10 +812,10 @@ class RestoreTests(unittest.TestCase):
             self.run_verify()
         self.assertFalse(self.host.datasets)
 
-    def test_schema_ten_tagged_paths_verify_before_backend_and_cleanup(self):
-        self.host.schema = '10'
-        result = self.run_verify(schema=10, server=restore.SERVER)
-        self.assertEqual(result['schema'], 10)
+    def test_schema_eleven_tagged_paths_verify_before_backend_and_notice_readback(self):
+        self.host.schema = '11'
+        result = self.run_verify(schema=11, server=restore.SERVER)
+        self.assertEqual(result['schema'], 11)
         self.assertEqual(result['verified_capture_id'], TAGGED_CAPTURE)
         self.assertEqual(result['verified_body_hash'], TAGGED_DIGEST)
         self.assertEqual(result['server'], restore.SERVER)
@@ -815,8 +833,8 @@ class RestoreTests(unittest.TestCase):
         self.assertLess(removal, backend)
         self.assertFalse(self.host.datasets)
 
-    def test_schema_ten_corruption_rejects_before_backend(self):
-        self.host.schema = '10'
+    def test_schema_eleven_corruption_rejects_before_backend(self):
+        self.host.schema = '11'
         self.host.corrupt = True
         with self.assertRaisesRegex(restore.RestoreError, 'offline_command_failed'):
             self.run_verify()
@@ -826,9 +844,117 @@ class RestoreTests(unittest.TestCase):
     def test_pending_schema_ten_cannot_pass_restore(self):
         self.host.schema = '10'
         self.host.active = False
-        with self.assertRaisesRegex(restore.RestoreError, 'integrity_not_active'):
+        with self.assertRaisesRegex(restore.RestoreError, 'schema_mismatch'):
             self.run_verify()
         self.assertFalse(self.calls)
+
+    def test_active_schema_ten_is_offline_only_and_cannot_be_misreported_as_serving_eleven(self):
+        self.host.schema = '10'
+        self.host.active = True
+        with self.assertRaisesRegex(restore.RestoreError, 'schema_mismatch'):
+            self.run_verify(schema=10, server=restore.SERVER)
+        self.assertFalse(self.calls)
+
+    def test_schema_eleven_requires_readable_qualified_notice_and_notice_resource_readback(self):
+        self.host.schema = '11'
+        original = self.rpc
+        for kind in ('missing', 'corrupt_notice'):
+            with self.subTest(kind=kind):
+                def changed(ip, method, params, private):
+                    value = original(ip, method, params, private)
+                    if method == 'resources/read':
+                        if kind == 'missing':
+                            value.pop('attribution', None)
+                        elif params.get('uri', '').startswith('devres://attribution/'):
+                            value['contents'][0]['text'] = 'corrupt notice'
+                    return value
+                self.rpc = changed
+                with self.assertRaisesRegex(restore.RestoreError, 'attribution_missing|attribution_readback_failed|attribution_pagination_invalid'):
+                    self.run_verify(schema=11, server=restore.SERVER)
+                self.assertFalse(self.host.datasets)
+                self.calls.clear()
+        self.rpc = original
+
+    def test_complete_notice_pagination_checks_identity_offsets_total_and_full_text(self):
+        text = 'https://fixtures.invalid/source\n' + 'n' * 70000
+        uri, identifier = 'devres://attribution/blake3:' + 'e' * 64, 'blake3:' + 'e' * 64
+        subject = {'provider': 'rfc', 'namespace': 'capture', 'key': TAGGED_CAPTURE, 'fingerprint': TAGGED_DIGEST}
+        attribution = {'status': 'ready', 'policy_epoch': 1, 'policy_fingerprint': restore.ATTRIBUTION_POLICY,
+            'resource_uri': uri, 'resource_uris': [uri], 'readable_notice': text,
+            'generations': [{'id': identifier, 'subject': subject,
+                             'notices': [{'source_url': 'https://fixtures.invalid/source', 'text': 'n' * 70000}]}]}
+        calls = []
+        def read(selected):
+            offset = int(urllib.parse.parse_qs(urllib.parse.urlsplit(selected).query)['offset'][0])
+            page = text[offset:offset + 32768]
+            calls.append(offset)
+            return {'contents': [{'uri': uri, 'mimeType': 'text/plain', 'text': page,
+                '_meta': {'attribution': {'id': identifier, 'subject': subject, 'policy_epoch': 1},
+                          'offset': offset, 'total_bytes': len(text),
+                          'next_offset': offset + len(page) if offset + len(page) < len(text) else None}}]}
+        self.assertTrue(restore.verify_notice_roundtrip(attribution, read))
+        self.assertEqual(calls, [0, 32768, 65536])
+        for key, value in (('offset', 1), ('total_bytes', 1), ('next_offset', 0)):
+            def corrupt(selected):
+                result = read(selected)
+                result['contents'][0]['_meta'][key] = value
+                return result
+            with self.assertRaises(restore.RestoreError):
+                restore.verify_notice_roundtrip(attribution, corrupt)
+        def wrong_identity(selected):
+            result = read(selected)
+            result['contents'][0]['_meta']['attribution']['id'] = 'blake3:' + '0' * 64
+            return result
+        with self.assertRaisesRegex(restore.RestoreError, 'readback_failed'):
+            restore.verify_notice_roundtrip(attribution, wrong_identity)
+
+    def test_maximum_multibyte_notice_requires_and_accepts_129_complete_pages(self):
+        prefix = 'https://fixtures.invalid/source\n'
+        remaining = 4 * 1024**2 - len(prefix.encode())
+        notice = '€' * (remaining // 3) + 'x' * (remaining % 3)
+        text = prefix + notice
+        body = text.encode()
+        self.assertEqual(len(body), 4 * 1024**2)
+        uri, identifier = 'devres://attribution/blake3:' + 'e' * 64, 'blake3:' + 'e' * 64
+        subject = {'provider': 'rfc', 'namespace': 'capture', 'key': TAGGED_CAPTURE, 'fingerprint': TAGGED_DIGEST}
+        attribution = {'status': 'ready', 'policy_epoch': 1, 'policy_fingerprint': restore.ATTRIBUTION_POLICY,
+            'resource_uri': uri, 'resource_uris': [uri], 'readable_notice': text,
+            'generations': [{'id': identifier, 'subject': subject,
+                             'notices': [{'source_url': prefix.rstrip('\n'), 'text': notice}]}]}
+        calls = []
+        def read(selected):
+            offset = int(urllib.parse.parse_qs(urllib.parse.urlsplit(selected).query)['offset'][0])
+            end = min(offset + 32768, len(body))
+            while end < len(body) and body[end] & 0xc0 == 0x80:
+                end -= 1
+            calls.append(offset)
+            return {'contents': [{'uri': uri, 'mimeType': 'text/plain', 'text': body[offset:end].decode(),
+                '_meta': {'attribution': {'id': identifier, 'subject': subject, 'policy_epoch': 1},
+                          'offset': offset, 'total_bytes': len(body),
+                          'next_offset': end if end < len(body) else None}}]}
+        self.assertTrue(restore.verify_notice_roundtrip(attribution, read))
+        self.assertEqual(len(calls), 129)
+
+    def test_restored_mdn_verifier_is_pinned_bounded_and_receipt_cannot_waive_retention(self):
+        tool = self.drill()
+        assets = {'mdn_baseline_sha256': 'c' * 64}
+        expected = {'version': 1, 'release': restore.VERSION, 'schema': 11,
+                    'retained_mdn': True, 'notices_verified': True, 'no_acquisition': True,
+                    'mdn_baseline_sha256': 'c' * 64}
+        result = {'data': json.dumps(expected).encode(), 'truncated': False, 'timed_out': False, 'returncode': 0}
+        with patch.object(restore, 'attribution_assets', return_value=assets), \
+                patch.object(tool, 'psql', side_effect=lambda sql: '11' if 'SELECT version' in sql else
+                             't' if 'SELECT active' in sql else 'blake3:' + 'd' * 64), \
+                patch.object(restore, 'bounded_diagnostic_output', return_value=result) as invoked:
+            self.assertTrue(tool.verify_retained_mdn('172.28.0.2'))
+            self.assertEqual(invoked.call_args.kwargs['timeout_seconds'], 180)
+            context = json.loads(invoked.call_args.kwargs['input_data'])
+            self.assertEqual(set(context['mdn_aliases']), {'mdn:snapshots', 'mdn:projections'})
+            self.assertNotIn(str(self.private), ' '.join(invoked.call_args.args[0]))
+            expected['retained_mdn'] = False
+            result['data'] = json.dumps(expected).encode()
+            with self.assertRaisesRegex(restore.RestoreError, 'receipt_invalid'):
+                tool.verify_retained_mdn('172.28.0.2')
 
     def test_explicit_snapshot_profile_cannot_silently_change(self):
         for kwargs in ({'schema': 10}, {'server': restore.SERVER}):
@@ -886,16 +1012,16 @@ class RestoreTests(unittest.TestCase):
         self.assertTrue(any(c[:3] == ['docker', 'rm', '-f'] and '-offline-' in c[-1]
                             for c in self.host.commands))
 
-    def test_schema_ten_restore_propagates_extended_default_to_verification(self):
-        self.host.schema = '10'
+    def test_schema_eleven_restore_propagates_extended_default_to_verification(self):
+        self.host.schema = '11'
         original = restore.Drill.offline
         timeouts = []
         def record(tool, command, **kwargs):
             timeouts.append(kwargs['timeout'])
             return original(tool, command, **kwargs)
         with patch.object(restore.Drill, 'offline', record):
-            result = self.run_verify(schema=10, server=restore.SERVER)
-        self.assertEqual(result['schema'], 10)
+            result = self.run_verify(schema=11, server=restore.SERVER)
+        self.assertEqual(result['schema'], 11)
         self.assertEqual(timeouts, [604800])
 
     def test_offline_commands_require_stopped_backend_and_reviewed_arguments(self):
@@ -964,8 +1090,8 @@ class RestoreTests(unittest.TestCase):
             with self.assertRaises(restore.RestoreError):
                 self.drill(source_dataset=bad)
 
-    def test_verify_timeout_reaches_schema_ten_command_without_constructor_override(self):
-        self.host.schema = '10'
+    def test_verify_timeout_reaches_schema_eleven_command_without_constructor_override(self):
+        self.host.schema = '11'
         self.host.offline_running = True
         with self.assertRaisesRegex(restore.RestoreError, 'timed_out'):
             self.run_verify(timeout=1)

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Private, owner-scoped schema-nine to schema-ten staging upgrade.
+"""Private, owner-scoped offline BLAKE3 migration and schema-eleven cutover.
 
-No provider calls or shared-edge changes occur here. Public acceptance is a
-separate operator gate before ``finalize`` restores the original schedules.
+The opt-in pinned attribution helper may reacquire fixed RFC/MDN evidence within
+one global twenty-attempt budget. Shared-edge changes never occur here. Public
+acceptance remains a separate gate before ``finalize`` restores schedules.
 """
 import contextlib
+import ctypes
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import math
 import os
@@ -35,7 +38,7 @@ op = module('staging')
 restore = module('restore')
 m = module('maintenance')
 checkpoint = module('checkpoint')
-VERSION = '0.1.0-build.d373818b'
+VERSION = '0.1.0-build.78c2e9c5'
 OLD_VERSION = '0.1.0-build.27d35cd6'
 SOURCE = 'https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'
 TERMINAL = {'rehearsed', 'rehearsed_unqualified', 'rehearsal_failed', 'rehearsal_retired', 'complete', 'rolled_back'}
@@ -46,6 +49,13 @@ WATCHDOG = 'devres-staging-upgrade-expire@'
 BUNDLE_FILES = ('staging.py', 'restore.py', 'upgrade.py', 'maintenance.py', 'recovery.py', 'checkpoint.py')
 SAFETY_LOCK_WAIT_SECONDS = 10
 SAFETY_LOCK_POLL_SECONDS = 0.1
+PREVIOUS_VERSION = '0.1.0-build.d373818b'
+PREVIOUS_SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10'
+PREVIOUS_BUNDLE = 'baccc7148563d0b15153edb40b711b8b4b4274baabe45702121a10af74f58c5f'
+INSTALLED = Path('/usr/local/libexec/devres-staging')
+SUPERSESSION_DEADLINE = 1794344340
+STAGING_ASSETS = {*BUNDLE_FILES, '52-upstream-devres-staging.toml', '62-route-devres-staging.toml',
+                  'Apache-2.0.txt', 'README.md', 'apparmor.profile', 'backend.toml.example', 'kubernetes.yaml'}
 
 
 class UpgradeError(RuntimeError):
@@ -157,7 +167,7 @@ def process_start(pid):
     return fields[19]
 
 
-def terminate_driver(record, lock_path=None):
+def terminate_driver(record, lock_path=None, *, check_only=False, allow_kill=True):
     """Stop only the overdue direct driver's exact Linux process instance."""
     pid, born = record.get('driver_pid'), record.get('driver_start')
     if record.get('driver_boot_id') and record['driver_boot_id'] != checkpoint.boot_id():
@@ -188,13 +198,43 @@ def terminate_driver(record, lock_path=None):
                     holders.append(int(fields[4]))
             if holders != [pid]:
                 raise UpgradeError('upgrade_driver_lock_owner_changed')
+        if check_only:
+            return
         signal.pidfd_send_signal(descriptor, signal.SIGTERM)
         if not select.select([descriptor], [], [], 5)[0]:
+            if not allow_kill:
+                raise UpgradeError('upgrade_driver_cooperative_stop_unconfirmed')
             signal.pidfd_send_signal(descriptor, signal.SIGKILL)
             if not select.select([descriptor], [], [], 5)[0]:
                 raise UpgradeError('upgrade_driver_did_not_stop')
     except ProcessLookupError:
         pass
+    finally:
+        os.close(descriptor)
+
+
+def bundle_at(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise UpgradeError('unsafe_operator_bundle_directory')
+    hashes = {name: hashlib.sha256(checkpoint.read_bytes(path / name, private=False)).hexdigest()
+              for name in BUNDLE_FILES}
+    return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(), hashes
+
+
+def exchange_bundles(staged, installed):
+    """One Linux directory exchange; the old operator remains inert and intact."""
+    library = ctypes.CDLL(None, use_errno=True)
+    exchange = getattr(library, 'renameat2', None)
+    if exchange is None:
+        raise UpgradeError('atomic_bundle_exchange_unavailable')
+    exchange.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    exchange.restype = ctypes.c_int
+    if exchange(-100, os.fsencode(staged), -100, os.fsencode(installed), 2) != 0:
+        raise UpgradeError('atomic_bundle_exchange_failed')
+    descriptor = os.open(installed.parent, os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
@@ -281,7 +321,8 @@ class Upgrade:
         self.record.update(updates)
         self.state.save(self.record)
 
-    def safe(self, *, deadline_at=None):
+    @contextlib.contextmanager
+    def maintenance_locked(self, *, deadline_at=None):
         """Wait briefly for the periodic guard, then perform every safety check.
 
         Only lock acquisition contention is retryable. A failed check, metric,
@@ -316,8 +357,12 @@ class Upgrade:
                 else:
                     break
             deadline_remaining()
-            self.safe_unlocked()
+            yield
             deadline_remaining()
+
+    def safe(self, *, deadline_at=None):
+        with self.maintenance_locked(deadline_at=deadline_at):
+            self.safe_unlocked()
 
     def begin(self, phase):
         previous = read_record(self.root.parent)
@@ -424,10 +469,330 @@ class Upgrade:
         return name
 
     def clean_stop(self, drill):
+        qualifier = self.record.get('attribution_qualifier') if self.record else None
+        if qualifier and qualifier.get('container_id'):
+            info = json.loads(self.run(['docker', 'inspect', qualifier['container_id']]))[0]
+            self.owned_container(info, {'token': drill.token, 'prefix': drill.name}, drill.root)
+            self.run(['docker', 'stop', '--time=15', qualifier['container_id']])
+            self.run(['docker', 'rm', qualifier['container_id']])
+            self.save(attribution_qualifier=None)
         if getattr(drill, 'backend_started', False):
             self.run(['docker', 'stop', '--time=120', drill.name + '-backend'])
         if drill.postgres_started:
             self.run(['docker', 'stop', '--time=120', drill.name + '-postgres'])
+
+    def supersede_target(self, token, from_bundle, from_version, from_server, target_bundle, check_only=False):
+        """Preserve one old direct writer before an explicit cross-release resume."""
+        if (from_bundle, from_version, from_server) != (PREVIOUS_BUNDLE, PREVIOUS_VERSION, PREVIOUS_SERVER):
+            raise UpgradeError('supersession_previous_target_mismatch')
+        if not isinstance(target_bundle, str) or not re.fullmatch('[0-9a-f]{64}', target_bundle):
+            raise UpgradeError('supersession_target_bundle_invalid')
+        staged = INSTALLED.parent / ('devres-staging-next-' + target_bundle)
+        if HERE not in (staged, INSTALLED):
+            raise UpgradeError('supersession_staged_path_required')
+        installed_digest, old_hashes = bundle_at(INSTALLED)
+        self.record = read_record(self.root.parent)
+        record = self.record
+        if (not record or record.get('token') != token or not TOKEN.fullmatch(token)
+                or record.get('deadline_at') != SUPERSESSION_DEADLINE
+                or self.deadline_due(record, time.time)
+                or record.get('mode') != 'direct' or record.get('pause_scope') != 'rehearsal'
+                or record.get('resource_profile') != 'direct' or record.get('live_kind') != 'permanent'
+                or record.get('checkpoint_kind') != 'permanent'):
+            raise UpgradeError('supersession_direct_owner_required')
+        lifecycle = checkpoint.Lifecycle(self)
+        if record.get('phase') == 'upgrade_superseded_paused':
+            lifecycle.validate_supersession(record)
+            lifecycle.validate_paused(record)
+            if record['target_identity'] != self.identity() or self.identity()['bundle_sha256'] != target_bundle:
+                raise UpgradeError('supersession_new_target_changed')
+            if installed_digest == target_bundle:
+                return {'superseded': True, 'already_superseded': True, 'paused': True,
+                        'deadline_at': record['deadline_at']}
+            if installed_digest != from_bundle or HERE != staged:
+                raise UpgradeError('supersession_installation_changed')
+            if check_only:
+                return {'check_passed': True, 'paused': True, 'installed': False}
+            with self.state.locked():
+                if read_record(self.root.parent) != record:
+                    raise UpgradeError('supersession_record_changed')
+                exchange_bundles(staged, INSTALLED)
+                if bundle_at(INSTALLED)[0] != target_bundle or bundle_at(staged)[0] != from_bundle:
+                    raise UpgradeError('supersession_exchange_identity_changed')
+            return {'superseded': True, 'paused': True, 'deadline_at': record['deadline_at']}
+        if HERE != staged or installed_digest != from_bundle or bundle_at(staged)[0] != target_bundle:
+            raise UpgradeError('supersession_bundle_mismatch')
+        checkpoint.private_directory(staged)
+        if set(path.name for path in staged.iterdir()) != STAGING_ASSETS:
+            raise UpgradeError('supersession_complete_staged_assets_required')
+        for name in STAGING_ASSETS:
+            checkpoint.read_bytes(staged / name, private=False)
+        if getattr(ctypes.CDLL(None), 'renameat2', None) is None:
+            raise UpgradeError('atomic_bundle_exchange_unavailable')
+        identity = self.identity()
+        if (identity['bundle_sha256'] != target_bundle or record.get('target_identity', {}).get('bundle_sha256') != from_bundle
+                or record['target_identity'].get('version') != from_version
+                or record['target_identity'].get('server') != from_server
+                or record['target_identity'].get('source_url') != SOURCE + from_version + '/source.tar.gz'
+                or record.get('offline_command') != 'migrate-storage'
+                or record.get('phase') != 'running_migrate_storage'):
+            raise UpgradeError('supersession_source_state_changed')
+        if (record.get('driver_boot_id') != checkpoint.boot_id()
+                or process_start(record.get('driver_pid')) != record.get('driver_start')):
+            raise UpgradeError('supersession_driver_identity_changed')
+        terminate_driver(record, self.root / 'maintenance.lock', check_only=True, allow_kill=False)
+        original = checkpoint.read_bytes(self.root / 'original-config.toml').decode()
+        lifecycle.validate_serving_pair(record, original)
+        m.snapshot_name(record['snapshot'])
+        if lifecycle.pair_guids(self.dataset) != record.get('live_dataset_guids'):
+            raise UpgradeError('supersession_dataset_identity_changed')
+        for child in ('postgres', 'evidence'):
+            if self.run(['zfs', 'get', '-H', '-o', 'value', 'guid', self.dataset + '/' + child]).strip() != record.get('dataset_guids', {}).get(child):
+                raise UpgradeError('supersession_original_dataset_changed')
+        for suffix in ('', '/postgres', '/evidence'):
+            snapshot = self.dataset + suffix + '@' + record['snapshot']
+            if not self.run(['zfs', 'get', '-H', '-o', 'value', 'guid', snapshot]).strip().isdigit():
+                raise UpgradeError('supersession_original_snapshot_invalid')
+            if not any(len(line.split('\t')) >= 2 and line.split('\t')[1] == HOLD
+                       for line in self.run(['zfs', 'holds', '-H', snapshot]).splitlines()):
+                raise UpgradeError('supersession_original_hold_missing')
+        owner = {'token': record['live_token'], 'prefix': 'devres-staging-restore-' + record['live_token']}
+        inventory = self.owned_inventory(owner)
+        roles = list(inventory['containers'].values())
+        if len(roles) != 2 or sorted(roles) != ['offline-1', 'postgres']:
+            raise UpgradeError('supersession_exact_writer_inventory_required')
+        runtime = Path('/tmp') / owner['prefix']
+        configured = tomllib.loads(checkpoint.read_bytes(runtime / 'config/backend.toml', private=False).decode())
+        expected = tomllib.loads(restore.paused_config(original))
+        expected['source']['url'] = SOURCE + from_version + '/source.tar.gz'
+        if configured != expected:
+            raise UpgradeError('supersession_source_config_changed')
+        for name in ('backend.pem', 'backend-key.pem', 'client-ca.pem'):
+            if checkpoint.read_bytes(runtime / 'tls' / name, private=False) != checkpoint.read_bytes(self.private / name):
+                raise UpgradeError('supersession_transport_identity_changed')
+        timer = WATCHDOG + token + '.timer'
+        if (record.get('watchdog_timer') != timer or record.get('watchdog_cleanup_pending') is not False
+                or self.run(['systemctl', 'show', '-p', 'ActiveState', '--value', timer]).strip() != 'active'
+                or self.run(['systemctl', 'show', '-p', 'UnitFileState', '--value', timer]).strip() != 'enabled'):
+            raise UpgradeError('supersession_watchdog_not_armed')
+        self.safe(deadline_at=record['deadline_at'])
+        if check_only:
+            return {'check_passed': True, 'paired_progress_retained': True, 'deadline_at': record['deadline_at']}
+        # Archive only after the old driver exits and our own upgrade lock is
+        # held. Never change its policy to make the generic pause command pass.
+        terminate_driver(record, self.root / 'maintenance.lock', allow_kill=False)
+        with self.state.locked():
+            if read_record(self.root.parent) != record or self.deadline_due(record, time.time):
+                raise UpgradeError('supersession_state_changed_after_driver_stop')
+            root = self.root / ('supersession-' + token)
+            root.mkdir(mode=0o700, exist_ok=False)
+            raw = checkpoint.read_bytes(self.root / 'state.json')
+            self.write(root / 'source-state.json', raw.decode())
+            self.write(root / 'source-operator.json', json.dumps({'version': 1, 'bundle_sha256': from_bundle,
+                        'files': old_hashes, 'server': from_server, 'release': from_version}, sort_keys=True) + '\n')
+            self.record_driver()
+            self.save('target_supersession_stopping')
+            worker = next(identifier for identifier, role in inventory['containers'].items() if role == 'offline-1')
+            pg = next(identifier for identifier, role in inventory['containers'].items() if role == 'postgres')
+            runtime = Path('/tmp') / owner['prefix']
+            drill = self.live(record['snapshot'], schema=10, run=self.run, private=self.private, token=record['live_token'],
+                              config_text=checkpoint.read_bytes(runtime / 'config/backend.toml', private=False).decode(),
+                              resource_profile='direct')
+            drill.root, drill.postgres_started, drill.backend_started = runtime, True, False
+            worker_info = json.loads(self.run(['docker', 'inspect', worker]))[0]
+            self.owned_container(worker_info, owner, runtime)
+            if (worker_info.get('State', {}).get('Running') is not True
+                    and worker_info.get('State', {}).get('ExitCode') != 0):
+                raise UpgradeError('supersession_worker_failed_before_pause')
+            drill.pause_offline('migrate-storage', owner['prefix'] + '-offline-1', worker_info['State'])
+            self.wall_remaining()
+            self.run(['docker', 'rm', worker])
+            pg_info = json.loads(self.run(['docker', 'inspect', pg]))[0]
+            self.owned_container(pg_info, owner, runtime)
+            if pg_info.get('State', {}).get('Running') is True:
+                self.run(['docker', 'kill', '--signal=SIGTERM', pg])
+            started = time.monotonic()
+            for attempt in range(121):
+                self.wall_remaining()
+                pg_info = json.loads(self.run(['docker', 'inspect', pg]))[0]
+                self.owned_container(pg_info, owner, runtime)
+                if pg_info.get('State', {}).get('Running') is False:
+                    break
+                if attempt == 120 or time.monotonic() - started >= 120:
+                    raise UpgradeError('supersession_postgres_stop_unconfirmed')
+                time.sleep(1)
+            if (pg_info.get('State', {}).get('Running') is not False
+                    or pg_info['State'].get('OOMKilled') or pg_info['State'].get('Error')
+                    or pg_info['State'].get('ExitCode') != 0):
+                raise UpgradeError('supersession_postgres_not_clean')
+            drill.postgres_started = False
+            lifecycle.clean_postgres(runtime / 'postgres')
+            lifecycle.write_capsule(root / 'source-capsule', drill)
+            old_config = checkpoint.read_bytes(runtime / 'config/backend.toml', private=False).decode()
+            before = tomllib.loads(old_config)
+            if before.get('source', {}).get('url') != SOURCE + from_version + '/source.tar.gz':
+                raise UpgradeError('supersession_source_config_changed')
+            changed = old_config.replace(SOURCE + from_version + '/source.tar.gz', SOURCE + VERSION + '/source.tar.gz')
+            expected = json.loads(json.dumps(before))
+            expected['source']['url'] = SOURCE + VERSION + '/source.tar.gz'
+            if tomllib.loads(changed) != expected:
+                raise UpgradeError('supersession_config_change_invalid')
+            self.write(runtime / 'config/backend.toml', changed, mode=0o640)
+            provenance = {'version': 1, 'source_record': str(root / 'source-state.json'),
+                          'source_record_sha256': hashlib.sha256(raw).hexdigest(),
+                          'source_operator': str(root / 'source-operator.json'),
+                          'source_operator_sha256': checkpoint.digest(root / 'source-operator.json'),
+                          'source_capsule': str(root / 'source-capsule'), 'retained_operator': str(staged),
+                          'from_identity': record['target_identity'], 'to_identity': identity}
+            lifecycle.checkpoint(drill, 'migrate-storage', supersession=provenance)
+            self.wall_remaining()
+            exchange_bundles(staged, INSTALLED)
+            if bundle_at(INSTALLED)[0] != target_bundle or bundle_at(staged)[0] != from_bundle:
+                raise UpgradeError('supersession_exchange_identity_changed')
+        return {'superseded': True, 'paused': True, 'paired_progress_retained': True,
+                'deadline_at': record['deadline_at'], 'resume_automatically': False}
+
+    def validate_installed_supersession(self, provenance):
+        target = provenance['to_identity']
+        if (HERE != INSTALLED or self.identity() != target
+                or bundle_at(INSTALLED)[0] != target.get('bundle_sha256')
+                or provenance.get('retained_operator') != str(INSTALLED.parent / ('devres-staging-next-' + target['bundle_sha256']))
+                or bundle_at(Path(provenance['retained_operator']))[0] != PREVIOUS_BUNDLE
+                or provenance.get('from_identity', {}).get('bundle_sha256') != PREVIOUS_BUNDLE
+                or provenance['from_identity'].get('server') != PREVIOUS_SERVER
+                or provenance['from_identity'].get('version') != PREVIOUS_VERSION):
+            raise UpgradeError('supersession_installed_identity_changed')
+
+    def qualify_attribution(self, drill):
+        """Own the sole schema-eleven repair writer before any candidate starts."""
+        if not drill.postgres_started or getattr(drill, 'backend_started', False):
+            raise UpgradeError('attribution_writer_exclusion_required')
+        if self.record.get('mode') == 'direct':
+            self.wall_remaining()
+        else:
+            self.safe()
+        assets = restore.attribution_assets()
+        if self.record.get('attribution_receipt'):
+            previous = checkpoint.read_json(Path(self.record['attribution_receipt']))
+            if (checkpoint.digest(Path(self.record['attribution_receipt'])) != self.record.get('attribution_receipt_sha256')
+                    or previous.get('token') != self.record['token'] or previous.get('target_identity') != self.identity()
+                    or any(previous.get('descriptor', {}).get(key) != assets[key]
+                           for key in ('manifest_sha256', 'binary_sha256', 'plan_sha256'))
+                    or drill.psql('SELECT version FROM devres_schema WHERE singleton') != '11'
+                    or drill.psql('SELECT active FROM devres_integrity_control WHERE singleton') != 't'):
+                raise UpgradeError('attribution_existing_receipt_changed')
+            restore.attribution_receipt(previous.get('receipt'), assets['plan_sha256'])
+            return
+        pg = json.loads(self.run(['docker', 'inspect', drill.name + '-postgres']))[0]
+        if (pg.get('Config', {}).get('Image') != restore.PG
+                or pg.get('Config', {}).get('Labels', {}).get(restore.LABEL_KEY) != drill.token
+                or pg.get('State', {}).get('Running') is not True
+                or set(pg.get('NetworkSettings', {}).get('Networks', {})) != {drill.name}):
+            raise UpgradeError('attribution_postgres_identity_changed')
+        checkpoint.Lifecycle(self).validate_container_mounts(pg, drill.root, True,
+                                                            self.record.get('live_kind') == 'permanent')
+        address = pg['NetworkSettings']['Networks'][drill.name].get('IPAddress')
+        try:
+            ip = ipaddress.IPv4Address(address)
+        except (ValueError, TypeError):
+            raise UpgradeError('attribution_postgres_address_invalid') from None
+        if not ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+            raise UpgradeError('attribution_postgres_address_invalid')
+        plan = checkpoint.read_bytes(restore.ATTRIBUTION / 'plan.json', limit=512 * 1024)
+        if hashlib.sha256(plan).hexdigest() != assets['plan_sha256']:
+            raise UpgradeError('attribution_plan_changed')
+        copy = drill.root / 'config' / 'attribution-plan.json'
+        descriptor = {key: assets[key] for key in ('version', 'release', 'server', 'manifest_sha256',
+                                                  'binary_sha256', 'plan_sha256')}
+        name = drill.name + '-attribution'
+        descriptor.update(container_name=name, container_id=None, postgres_ip=str(ip), plan_copy=str(copy))
+        attempt = self.record.get('attribution_attempt')
+        if attempt is not None:
+            # Reconciliation cannot obtain another acquisition budget or start a
+            # previously created container. Only a stopped, completed helper can
+            # contribute an existing strict receipt below.
+            descriptor = self.record.get('attribution_qualifier')
+            if (not isinstance(descriptor, dict) or not isinstance(attempt, dict)
+                    or attempt.get('live_token') != drill.token
+                    or descriptor.get('manifest_sha256') != assets['manifest_sha256']
+                    or descriptor.get('plan_sha256') != assets['plan_sha256']
+                    or not descriptor.get('container_id')):
+                raise UpgradeError('attribution_acquisition_already_attempted')
+            identifier = descriptor['container_id']
+        else:
+            op.write(copy, plan.decode(), mode=0o640)
+            os.chown(copy, os.geteuid(), 65532)
+            self.save('qualifying_attribution', attribution_qualifier=descriptor,
+                      attribution_attempt={'version': 1, 'live_token': drill.token,
+                                           'manifest_sha256': assets['manifest_sha256'],
+                                           'plan_sha256': assets['plan_sha256']})
+        # Creation is stopped. A crash before journaling its ID leaves no writer;
+        # the receipt-bound inventory still knows its exact name and mounts.
+            self.wall_remaining() if self.record.get('mode') == 'direct' else self.safe()
+            identifier = self.run(['docker', 'create', '--name', name, '--label', restore.LABEL_KEY + '=' + drill.token,
+                               '--network', 'host', '--add-host', 'postgres:' + str(ip), '--user', '65532:65532',
+                               '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=128',
+                               '--memory=16g', '--memory-swap=16g', '--cpus=2',
+                               '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=16g',
+                               '-v', str(drill.root / 'evidence') + ':/data:rw',
+                               '-v', str(drill.root / 'config') + ':/etc/devres/config:ro',
+                               '-v', str(restore.ATTRIBUTION / 'repair') + ':/operator/repair:ro',
+                               '-v', str(copy) + ':/operator/plan.json:ro', '--entrypoint', '/operator/repair',
+                               restore.SERVER, '/etc/devres/config/backend.toml', '/operator/plan.json']).strip()
+            if not re.fullmatch(r'[0-9a-f]{64}', identifier):
+                raise UpgradeError('attribution_container_identity_invalid')
+            descriptor = {**descriptor, 'container_id': identifier}
+            self.save(attribution_qualifier=descriptor)
+        owner = {'token': drill.token, 'prefix': drill.name}
+        info = json.loads(self.run(['docker', 'inspect', identifier]))[0]
+        self.owned_container(info, owner, drill.root)
+        if info.get('State', {}).get('Running') is not False:
+            raise UpgradeError('attribution_container_not_stopped')
+        if attempt is None:
+            copied = copy.lstat()
+            if (not stat.S_ISREG(copied.st_mode) or copied.st_uid != os.geteuid() or copied.st_gid != 65532
+                    or stat.S_IMODE(copied.st_mode) != 0o640 or copied.st_nlink != 1
+                    or hashlib.sha256(checkpoint.read_bytes(copy, limit=512 * 1024, private=False)).hexdigest() != assets['plan_sha256']):
+                raise UpgradeError('attribution_plan_copy_changed')
+            self.wall_remaining() if self.record.get('mode') == 'direct' else self.safe()
+            self.run(['docker', 'start', identifier])
+        timeout = self.wall_remaining() if self.record.get('mode') == 'direct' else restore.OFFLINE_TIMEOUT_SECONDS
+        started = time.monotonic()
+        for attempt_number in range(int(timeout) + 1):
+            if self.record.get('mode') == 'direct':
+                self.wall_remaining()
+            else:
+                self.safe()
+            info = json.loads(self.run(['docker', 'inspect', identifier]))[0]
+            self.owned_container(info, owner, drill.root)
+            state = info.get('State', {})
+            if state.get('Running') is False:
+                break
+            if attempt_number >= int(timeout) or time.monotonic() - started >= timeout:
+                raise UpgradeError('attribution_qualification_timed_out')
+            time.sleep(1)
+        if state.get('ExitCode') != 0 or state.get('OOMKilled') or state.get('Error'):
+            raise UpgradeError('attribution_qualification_failed')
+        output = restore.bounded_diagnostic_output(['docker', 'logs', '--tail', '1', identifier], 16384)
+        if output['truncated'] or output['timed_out']:
+            raise UpgradeError('attribution_receipt_unavailable')
+        receipt = restore.attribution_receipt(json.loads(output['data']), assets['plan_sha256'])
+        if (drill.psql('SELECT version FROM devres_schema WHERE singleton') != '11'
+                or drill.psql('SELECT active FROM devres_integrity_control WHERE singleton') != 't'):
+            raise UpgradeError('attribution_schema_or_activation_invalid')
+        if restore.attribution_assets() != assets:
+            raise UpgradeError('attribution_assets_changed')
+        path = self.root / ('attribution-' + self.record['token'] + '.json')
+        encoded = json.dumps({'version': 1, 'token': self.record['token'], 'live_token': drill.token,
+                              'target_identity': self.identity(), 'descriptor': descriptor,
+                              'receipt': receipt}, sort_keys=True) + '\n'
+        if path.exists() and checkpoint.read_bytes(path).decode() != encoded:
+            raise UpgradeError('attribution_receipt_conflict')
+        if not path.exists():
+            self.write(path, encoded)
+        self.run(['docker', 'rm', identifier])
+        self.save(attribution_receipt=str(path), attribution_receipt_sha256=checkpoint.digest(path),
+                  attribution_qualifier=None, qualified_schema=11)
 
     def rehearsal(self, pause_scope='rehearsal'):
         self.validate_pause_scope(pause_scope)
@@ -464,6 +829,7 @@ class Upgrade:
                         phase_started = time.monotonic()
                         checkpoint.Lifecycle(self).offline(drill, command)
                         phases[command] = time.monotonic() - phase_started
+                    self.qualify_attribution(drill)
                     phase_started = time.monotonic()
                     receipt = drill.check(prepared=True)
                     phases['candidate_read'] = time.monotonic() - phase_started
@@ -481,16 +847,16 @@ class Upgrade:
                     self.run(['zfs', 'snapshot', '-r', drill.dataset + '@' + canonical_snapshot])
                     canonical_created = True
                     phase_started = time.monotonic()
-                    canonical_receipt = self.verify(canonical_snapshot, schema=10, server=restore.SERVER,
+                    canonical_receipt = self.verify(canonical_snapshot, schema=11, server=restore.SERVER,
                                                     source_dataset=drill.dataset, private=self.private,
                                                     config_text=target_config(original, paused=True))
-                    phases['schema10_restore'] = time.monotonic() - phase_started
+                    phases['schema11_restore'] = time.monotonic() - phase_started
                     # Prove the matching old pair remains independently restorable.
                     phase_started = time.monotonic()
                     rollback_receipt = self.verify(snapshot, schema=9, server=restore.OLD_SERVER,
                                                    private=self.private, config_text=original)
                     phases['rollback_restore'] = time.monotonic() - phase_started
-                    self.save(rehearsal_schema10_restore=canonical_receipt,
+                    self.save(rehearsal_schema11_restore=canonical_receipt,
                               rehearsal_rollback_restore=rollback_receipt)
                 except checkpoint.Paused:
                     raise
@@ -662,6 +1028,7 @@ class Upgrade:
                     for command in ('migrate-storage', 'verify-storage', 'activate-storage'):
                         self.save('running_' + command.replace('-', '_'))
                         checkpoint.Lifecycle(self).offline(drill, command, timeout=self.remaining())
+                    self.qualify_attribution(drill)
                 finally:
                     try:
                         if self.record.get('phase') not in checkpoint.PRESERVED:
@@ -811,18 +1178,54 @@ class Upgrade:
         role = info.get('Name', '').removeprefix('/').removeprefix(name + '-')
         config, host = info.get('Config', {}), info.get('HostConfig', {})
         if (info.get('Name') != '/' + name + '-' + role
-                or not re.fullmatch(r'postgres|backend|offline-[1-9][0-9]*', role)
+                or not re.fullmatch(r'postgres|backend|attribution|offline-[1-9][0-9]*', role)
                 or config.get('Labels', {}).get(restore.LABEL_KEY) != token
-                or host.get('NetworkMode') != name or host.get('PortBindings')):
+                or host.get('NetworkMode') != ('host' if role == 'attribution' else name) or host.get('PortBindings')):
             raise UpgradeError('upgrade_container_inventory_changed')
         server = (restore.OLD_SERVER if self.record.get('live_kind') == 'restore'
                   and self.record.get('live_schema') == 9 else restore.SERVER)
+        if (self.record.get('target_identity', {}).get('server') == PREVIOUS_SERVER
+                and self.record.get('target_identity', {}).get('version') == PREVIOUS_VERSION):
+            server = PREVIOUS_SERVER
         if config.get('Image') != (restore.PG if role == 'postgres' else server):
             raise UpgradeError('upgrade_container_image_changed')
+        if role == 'attribution':
+            qualifier = self.record.get('attribution_qualifier')
+            if (not isinstance(qualifier, dict)
+                    or qualifier.get('container_name') != name + '-attribution'
+                    or qualifier.get('server') != restore.SERVER or qualifier.get('release') != VERSION
+                    or qualifier.get('plan_copy') != str(runtime / 'config/attribution-plan.json')
+                    or any(not isinstance(qualifier.get(key), str) or not re.fullmatch('[0-9a-f]{64}', qualifier[key])
+                           for key in ('manifest_sha256', 'binary_sha256', 'plan_sha256'))
+                    or (qualifier.get('container_id') is None and info.get('State', {}).get('Running') is not False)
+                    or (qualifier.get('container_id') is not None and qualifier['container_id'] != info.get('Id'))
+                    or config.get('User') != '65532:65532'
+                    or config.get('Entrypoint') != ['/operator/repair']
+                    or config.get('Cmd') != ['/etc/devres/config/backend.toml', '/operator/plan.json']
+                    or host.get('ExtraHosts') != ['postgres:' + str(qualifier.get('postgres_ip'))]
+                    or host.get('RestartPolicy', {}).get('Name', 'no') not in ('', 'no')
+                    or host.get('Memory') != 16 * 1024**3 or host.get('MemorySwap') != 16 * 1024**3
+                    or host.get('NanoCpus') != 2 * 10**9 or host.get('PidsLimit') != 128
+                    or host.get('ReadonlyRootfs') is not True
+                    or host.get('CapDrop') != ['ALL']
+                    or 'no-new-privileges' not in host.get('SecurityOpt', [])
+                    or host.get('Tmpfs') != {'/tmp': 'rw,nosuid,nodev,noexec,size=16g'}):
+                raise UpgradeError('attribution_container_descriptor_changed')
+            try:
+                address = ipaddress.IPv4Address(qualifier.get('postgres_ip'))
+            except (TypeError, ValueError):
+                raise UpgradeError('attribution_container_address_changed') from None
+            if not address.is_private or address.is_loopback or address.is_unspecified or address.is_multicast:
+                raise UpgradeError('attribution_container_address_changed')
         expected = {'/var/lib/postgresql': (str(runtime / 'postgres'), True)} if role == 'postgres' else {
             '/data': (str(runtime / 'evidence'), True),
             '/etc/devres/config': (str(runtime / 'config'), False),
             '/etc/devres/tls': (str(runtime / 'tls'), False)}
+        if role == 'attribution':
+            expected = {'/data': (str(runtime / 'evidence'), True),
+                        '/etc/devres/config': (str(runtime / 'config'), False),
+                        '/operator/repair': (str(restore.ATTRIBUTION / 'repair'), False),
+                        '/operator/plan.json': (str(runtime / 'config/attribution-plan.json'), False)}
         actual = {}
         for mount in info.get('Mounts', []):
             if mount.get('Type') == 'tmpfs' and mount.get('Destination') == '/tmp':
@@ -1022,10 +1425,10 @@ class Upgrade:
                 self.wall_remaining()
                 snapshot = self.snapshot('post-blake3')
                 if self.record.get('mode') == 'direct':
-                    self.verify_direct(snapshot, schema=10, server=restore.SERVER,
+                    self.verify_direct(snapshot, schema=11, server=restore.SERVER,
                                        config_text=(self.private / 'backend.toml').read_text())
                 else:
-                    self.verify(snapshot, schema=10, server=restore.SERVER, private=self.private,
+                    self.verify(snapshot, schema=11, server=restore.SERVER, private=self.private,
                                 config_text=(self.private / 'backend.toml').read_text(),
                                 timeout=self.wall_remaining())
                 self.wall_remaining()
@@ -1040,7 +1443,7 @@ class Upgrade:
                 self.wall_remaining()
                 self.tool.start('backend', 1)
                 self.wall_remaining()
-                self.save('complete', verified_schema10_snapshot=snapshot)
+                self.save('complete', verified_schema11_snapshot=snapshot)
                 self.restore_timers()
                 return {'complete': True, 'version': VERSION, 'snapshot': snapshot,
                         'original_collectors_restored': True,
@@ -1089,17 +1492,17 @@ class Upgrade:
         self.run(['zfs', 'hold', '-r', HOLD, drill.dataset + '@' + name])
         config = (drill.root / 'config/backend.toml').read_text()
         started = time.monotonic()
-        canonical = self.verify(name, schema=10, server=restore.SERVER,
+        canonical = self.verify(name, schema=11, server=restore.SERVER,
                                 source_dataset=drill.dataset, private=self.private,
                                 config_text=config)
-        phases['schema10_restore'] = time.monotonic() - started
+        phases['schema11_restore'] = time.monotonic() - started
         original = (self.root / 'original-config.toml').read_text()
         started = time.monotonic()
         rollback = self.verify(self.record['snapshot'], schema=9, server=restore.OLD_SERVER,
                                private=self.private, config_text=original)
         phases['rollback_restore'] = time.monotonic() - started
         self.save('rehearsed_unqualified', timing_qualified=False, receipt=receipt,
-                  rehearsal_schema10_restore=canonical, rehearsal_rollback_restore=rollback,
+                  rehearsal_schema11_restore=canonical, rehearsal_rollback_restore=rollback,
                   retained_candidate_snapshot=name,
                   resume_phase_seconds=phases, resume_completed_epoch=time.time(),
                   completed_target_identity=self.identity())

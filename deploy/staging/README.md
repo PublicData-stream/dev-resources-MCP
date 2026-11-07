@@ -1,19 +1,19 @@
 # Staging deployment
 
 These host-specific assets target the published
-`0.1.0-build.d373818b` server image into `devres-staging` on `piqua-serve`.
+`0.1.0-build.78c2e9c5` server image into `devres-staging` on `piqua-serve`.
 The disposable [foundation](../kubernetes/foundation.yaml) remains separate.
 No package code is executed and no administrative HTTP route is added.
 
-The reviewed release commit is `d373818b211f9126117ce4ee5709c859e5318b84`.
+The reviewed release commit is `78c2e9c521b68436a7d1cc23bce54ee199ad1948`.
 Use the immutable public indexes below, including their accepted native amd64 and
 arm64 manifests. Do not retag a different build as this version.
 
 | Artifact | SHA-256 |
 | --- | --- |
-| Server image index | `4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10` |
-| Probe image index | `74b6e9020fe9868e7005f87ed0bc4a785dbd83a09ec9f6952b848f366d4a6512` |
-| Corresponding `source.tar.gz` | `2ff98ccd72e9a2dc69423ca680f4a2bedebfdc2b63abb2008f13e30800974d79` |
+| Server image index | `b317a2c87ea6ce337f7c1a69213eb90c22fde469ac4c73d26d9d5a68e635fff5` |
+| Probe image index | `820b235d1b267bd934f85a07d020762a234975a52745bccfe80648a69a1ff05b` |
+| Corresponding `source.tar.gz` | `b597e1a7e3c80fee7fb789724de38b6800974011a27bbb165b38e7a3a5989839` |
 
 The public endpoints are
 `https://dev-resources.staged.mcp.publicdata.stream/mcp` and
@@ -114,7 +114,9 @@ tool and the [operations guide](../../docs/operations.md) for backup/restore gat
 
 ### Existing schema-nine deployment
 
-The build above requires schema 10. Do not rerun `prepare` against an existing
+The offline commands complete schema 10; normal serving then upgrades to schema 11.
+The fixed retained RFC/MDN acceptance requires qualified readable attribution
+before the normal server starts. Do not rerun `prepare` against an existing
 deployment or start the new image on schema nine. Install the reviewed operator,
 upgrade and restore modules together, retaining the previous bundle privately.
 The upgrade changes only release identity and temporarily pauses collectors;
@@ -157,7 +159,7 @@ Only the main migration rehearsal clone has a finite 512 GiB parent quota. Befor
 creating its temporary runtime directory or ZFS objects, it requires at least
 704 GiB of current pool free space: 512 GiB for that clone, 64 GiB for a nested
 restore, and the existing 128 GiB pool reserve. Ordinary restores and the nested
-schema-nine/schema-ten restore checks retain their 64 GiB parent quotas. This
+schema-nine/schema-eleven restore checks retain their 64 GiB parent quotas. This
 profile changes neither the permanent datasets' quotas nor the pool's limits;
 the capacity guard remains active throughout the rehearsal.
 
@@ -312,7 +314,10 @@ snapshot, verifies old-image recovery, and runs the same offline commands on the
 permanent pair inside an internal Docker network while the Kubernetes pair is
 stopped. Exactly one new backend starts with collectors paused. The capacity
 guard remains active; other writer/maintenance entrypoints refuse an active
-upgrade. No shared-edge restart or provider smoke occurs in these commands.
+upgrade. No shared-edge restart occurs. Before the first candidate starts, the pinned
+first-party attribution helper may acquire only the fixed retained RFC/MDN
+subjects, with one global budget of at most twenty upstream request attempts.
+This is separate from optional live-provider smoke and full-corpus qualification.
 
 Before `upgrade-finish`, the operator must independently verify both MCP revisions
 (`2025-11-25`, `2026-07-28`) and both public transports, retained capture/search
@@ -321,10 +326,10 @@ Record the current upgrade journal's token and resulting booleans in root-owned 
 `/var/lib/devres-staging/upgrade/acceptance.json`:
 
 ```json
-{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.d373818b","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
+{"token":"CURRENT_UPGRADE_TOKEN","version":"0.1.0-build.78c2e9c5","http":true,"webtransport":true,"revisions":["2025-11-25","2026-07-28"],"retained":true,"isolation":true,"shared_services":true}
 ```
 
-Finish qualifies a schema-ten coordinated backup/isolated restore before
+Finish qualifies a schema-eleven coordinated backup/isolated restore before
 restoring schedules and the original backup timer. Observe ten minutes of
 readiness, restarts, provider errors, corpus status and capacity afterwards.
 Restart the shared OxiBelt container at most once only when the backend passes
@@ -409,6 +414,81 @@ Abandoned-rehearsal recovery requires the exact upgrade token, root-owned journa
 verified driver identity and disposable object ownership. It retains permanent
 snapshots/history and refuses changed ownership or unknown nested resources.
 Never recover by deleting the journal or applying a schema-ten image to schema nine.
+
+### Explicit in-progress target supersession
+
+The narrowly admitted transition is the reviewed `d373818b` direct migration to
+`78c2e9c5`, using the exact previous image and six-module bundle digest. Generic
+pause/adoption cannot change an active permanent migration's target. Stage all
+thirteen reviewed operator assets together under the directory whose suffix is
+the new executable bundle hash. Keep the canonical old installation in place for
+the inert check:
+
+```sh
+python3 /usr/local/libexec/devres-staging-next-NEW_BUNDLE_SHA256/staging.py \
+  upgrade-supersede-target --token CURRENT_UPGRADE_TOKEN \
+  --from-version 0.1.0-build.d373818b \
+  --from-server ghcr.io/publicdata-stream/dev-resources-server@sha256:4d73cb12637f737c0e09649cb8e40795e379a77408cc65410509a1c117178e10 \
+  --from-bundle-sha256 baccc7148563d0b15153edb40b711b8b4b4274baabe45702121a10af74f58c5f \
+  --target-bundle-sha256 NEW_BUNDLE_SHA256 --check
+```
+
+After checking the exact running driver, owned containers, pair GUIDs, held
+original snapshots, paused Kubernetes writers and existing watchdog, repeat the
+same command without `--check`. Disable the old automatic acceptance coordinator
+first. The command cooperatively stops the old driver, then its exact migration
+worker and PostgreSQL; it never substitutes SIGKILL for a verified clean pause.
+It archives the original journal and configuration capsule, creates a held
+coordinated checkpoint of the current partial pair and atomically exchanges the
+complete operator directories. The former installation remains intact in the
+staging directory. The resulting `upgrade_superseded_paused` phase requires an
+explicit resume through the canonical new installation:
+
+```sh
+python3 /usr/local/libexec/devres-staging/staging.py upgrade-resume \
+  --token CURRENT_UPGRADE_TOKEN
+```
+
+The original token, pause policy, absolute rollback deadline and schema-nine
+recovery snapshot remain unchanged. Incomplete graph lanes rescan and validate
+existing canonical rows and occurrence receipts; counters can restart. Completed
+lanes and committed evidence remain fixed. This is progress preservation rather
+than a cursor transfer. An uncertain stop or failed checkpoint is not a successful
+pause; do not edit the journal or policy to resume it. Preserve the stopped pair
+and check the current operation token and use canonical rollback if recovery is required. After a
+formal paused receipt, a failed directory exchange can retry installation only;
+it cannot stop writers again or create a second checkpoint.
+
+Install separately reviewed attribution assets under the protected fixed
+`/usr/local/libexec/devres-staging-attribution` directory: the first-party
+`staging-attribution-qualify` example as `repair` (root 0755), its exact fixed
+`plan.json`, [private retained reader](../../scripts/staging-retained-verify.py)
+as `verify-retained.py`, the existing immutable retained MDN baseline as
+`mdn-baseline.json`, and `manifest.json` (all root 0600; directory 0700). The
+manifest pins both binaries/scripts and both data files, the exact release and
+server image, explicit live acquisition and a maximum of twenty global attempts.
+No credential or permanent source body belongs in the operator repository.
+
+Offline migration, verification and activation complete schema ten. Before any
+normal server or attribution sweep starts, the operator journals a stopped,
+explicitly owned attribution container, then starts it as the sole storage owner.
+That one-shot helper initializes schema eleven and qualifies only the fixed
+retained RFC/MDN acceptance subjects and their bounded compiled dependencies.
+Its complete paginated readable notices and sealed attribution storage must pass;
+pending/unavailable output is a failure. An uncertain attempt cannot obtain a new
+request budget through automatic retry. The watchdog removes this writer before
+stopping PostgreSQL or swapping datasets.
+
+The new backend then starts with collectors paused. Public HTTP/WebTransport,
+both MCP revisions, original retained bytes and appended attribution resources,
+isolation and all shared edge routes remain independent acceptance gates. Finish
+also verifies a complete schema-eleven coordinated restore, fixed RFC and MDN
+bytes and full notice pagination before restoring original collection/timer intent.
+Ten-minute observation and scoped credential expiry/cleanup remain mandatory.
+Other historical subjects may still require attribution repair; this fixed
+acceptance does not establish full-corpus qualification. Schema-ten software
+rejects schema eleven: rollback always restores the original coordinated
+schema-nine database and evidence pair with its original image.
 
 ### Fresh deployment
 

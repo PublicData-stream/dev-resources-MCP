@@ -1,9 +1,13 @@
+import contextlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import select
+import secrets
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -11,6 +15,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,7 +25,7 @@ SPEC.loader.exec_module(upgrade)
 SNAPSHOT = 'devres-20261030T120000Z-pre-blake3'
 CONFIG = (ROOT / 'deploy/staging/backend.toml.example').read_text().replace(
     upgrade.VERSION, upgrade.OLD_VERSION).replace('REPLACE_WITH_PRIVATE_POSTGRES_URL',
-    'postgres://devres:' + 'a' * 64 + '@postgres:5432/devres')
+    'postgres://devres:' + 'a' * 64 + '@postgres:5432/devres').replace('0.1.0-build.d373818b', upgrade.OLD_VERSION)
 
 
 class FakeTool:
@@ -103,7 +108,7 @@ class FakeDrill:
 
     def check(self, prepared=False):
         self.events.append('check')
-        return {'schema': 10}
+        return {'schema': 11}
 
     def cleanup(self):
         self.events.append('cleanup')
@@ -130,6 +135,9 @@ class UpgradeTests(unittest.TestCase):
                                         drill=FakeDrill, live=FakeDrill, verify=lambda *a, **k: {'schema': k['schema']})
         self.tool = FakeTool()
         self.instance.tool = self.tool
+        self.qualifier = patch.object(self.instance, 'qualify_attribution')
+        self.qualifier.start()
+        self.addCleanup(self.qualifier.stop)
         self.writer = patch.object(upgrade.op, 'config_secret')
         self.writer.start()
         self.addCleanup(self.writer.stop)
@@ -439,8 +447,8 @@ os.close(fd)
         self.assertEqual(result['rehearsal_identity'], upgrade.rehearsal_identity())
         self.assertTrue(all(value >= 0 for value in result['phase_seconds'].values()))
         self.assertEqual(set(result['phase_seconds']), {'snapshot', 'old_restore', 'migrate-storage',
-                         'verify-storage', 'activate-storage', 'candidate_read', 'schema10_restore', 'rollback_restore'})
-        self.assertEqual([kwargs['schema'] for _, kwargs in calls], [9, 10, 9])
+                         'verify-storage', 'activate-storage', 'candidate_read', 'schema11_restore', 'rollback_restore'})
+        self.assertEqual([kwargs['schema'] for _, kwargs in calls], [9, 11, 9])
         self.assertEqual([kwargs.get('clone_quota') for kwargs in FakeDrill.initializations], ['512G'])
         self.assertTrue(all('clone_quota' not in kwargs for _, kwargs in calls))
         self.assertEqual(calls[1][1]['source_dataset'],
@@ -864,6 +872,17 @@ os.close(fd)
                     self.instance.apply_direct(deadline)
                 self.assertEqual(before, self.commands)
 
+    def test_attribution_failure_preserves_pair_and_rolls_back_before_candidate_start(self):
+        with patch.object(self.instance, 'qualify_attribution', side_effect=upgrade.UpgradeError('attribution_qualification_failed')), \
+                patch.object(self.instance, 'start_candidate') as candidate:
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'attribution_qualification_failed'):
+                self.direct()
+        candidate.assert_not_called()
+        record = upgrade.read_record(self.root / 'state')
+        self.assertEqual(record['phase'], 'rolled_back')
+        self.assertEqual(self.tool.counts, {'backend': 1, 'postgres': 1})
+        self.assertTrue(all(name in self.inventory for name in record['preserved'].values()))
+
     def test_direct_uses_one_fresh_frozen_pair_without_rehearsal(self):
         (self.instance.root / 'state.json').unlink()
         seen = []
@@ -1003,7 +1022,7 @@ with state.locked():
                    'isolation': True, 'shared_services': True}
         upgrade.op.write(self.instance.root / 'acceptance.json', json.dumps(receipt))
         def verify(snapshot, **kwargs):
-            self.assertEqual(kwargs['schema'], 10)
+            self.assertEqual(kwargs['schema'], 11)
             self.assertLessEqual(kwargs['timeout'], 1800)
             kwargs['on_drill'](FakeDrill())
             self.assertEqual(upgrade.read_record(self.root / 'state')['live_kind'], 'restore')
@@ -1136,6 +1155,466 @@ with state.locked():
         with self.assertRaisesRegex(upgrade.UpgradeError, 'permanent_mount_changed'):
             self.instance.cleanup_owned_resources(owner)
         self.assertFalse(any(args[:2] == ['docker', 'stop'] for args in self.commands))
+
+
+class AttributionQualifierTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = UpgradeTests()
+        self.helper.setUp()
+        self.addCleanup(self.helper.doCleanups)
+        self.helper.qualifier.stop()
+        self.u, self.root = self.helper.instance, self.helper.root
+        self.assets = self.root / 'attribution'
+        self.assets.mkdir(mode=0o700)
+        (self.assets / 'repair').write_bytes(b'first party executable fixture')
+        (self.assets / 'repair').chmod(0o755)
+        (self.assets / 'plan.json').write_text('{"fixed":"rfc-mdn"}')
+        (self.assets / 'plan.json').chmod(0o600)
+        for name in ('verify-retained.py', 'mdn-baseline.json'):
+            upgrade.op.write(self.assets / name, 'reviewed fixture ' + name)
+        self.plan_sha = upgrade.hashlib.sha256((self.assets / 'plan.json').read_bytes()).hexdigest()
+        manifest = {'version': 1, 'release': upgrade.VERSION, 'server': upgrade.restore.SERVER,
+                    'binary_sha256': upgrade.hashlib.sha256((self.assets / 'repair').read_bytes()).hexdigest(),
+                    'plan_sha256': self.plan_sha, 'live_acquisition': True, 'maximum_requests': 20,
+                    'retained_verifier_sha256': upgrade.hashlib.sha256((self.assets / 'verify-retained.py').read_bytes()).hexdigest(),
+                    'mdn_baseline_sha256': upgrade.hashlib.sha256((self.assets / 'mdn-baseline.json').read_bytes()).hexdigest()}
+        upgrade.op.write(self.assets / 'manifest.json', json.dumps(manifest))
+        item = patch.object(upgrade.restore, 'ATTRIBUTION', self.assets)
+        item.start(); self.addCleanup(item.stop)
+        self.live = secrets.token_hex(12)
+        runtime = self.root / 'runtime'
+        runtime.mkdir(mode=0o700)
+        for name in ('postgres', 'evidence', 'config'):
+            (runtime / name).mkdir(mode=0o750)
+        upgrade.op.write(runtime / 'config/backend.toml', upgrade.target_config(CONFIG, paused=True), mode=0o640)
+        self.drill = SimpleNamespace(token=self.live, name='devres-staging-restore-' + self.live,
+                                    root=runtime, postgres_started=True, backend_started=False,
+                                    psql=lambda sql: '11' if 'version' in sql else 't')
+        self.u.record = self.helper.phase_record('running_activate_storage', mode='direct',
+            resource_profile='direct', live_token=self.live, live_kind='permanent',
+            deadline_at=upgrade.SUPERSESSION_DEADLINE)
+        self.u.record['target_identity'] = self.u.identity()
+        self.u.save()
+        self.commands, self.container, self.create_failure, self.start_failure = [], None, False, False
+        self.u.run = self.host_run
+        original_lstat = Path.lstat
+        def metadata(path):
+            info = original_lstat(path)
+            if path == runtime / 'config/attribution-plan.json':
+                values = list(info)
+                values[5] = 65532  # model the successful root-only fchown in this unprivileged fixture
+                return os.stat_result(values)
+            return info
+        for item in (patch.object(upgrade.os, 'chown'), patch.object(Path, 'lstat', metadata),
+                     patch.object(upgrade.restore, 'bounded_diagnostic_output', side_effect=lambda *args:
+                        {'data': json.dumps(self.receipt()).encode(), 'truncated': False, 'timed_out': False})):
+            item.start(); self.addCleanup(item.stop)
+
+    def receipt(self, **changes):
+        return {'version': 1, 'release': upgrade.VERSION, 'schema': 11, 'integrity_active': True,
+                'scope': 'fixed_retained_rfc_mdn', 'plan_sha256': self.plan_sha, 'policy_epoch': 1,
+                'policy_fingerprint': upgrade.restore.ATTRIBUTION_POLICY, 'qualified_targets': 2,
+                'providers': ['mdn', 'rfc'], 'request_attempts': 20, 'maximum_requests': 20,
+                'ready': True, 'notices_verified': True, 'attribution_storage_verified': True,
+                'target_set_digest': 'blake3:' + 'f' * 64, **changes}
+
+    def host_run(self, argv):
+        args = [str(value) for value in argv]
+        self.commands.append(args)
+        if args[:2] == ['docker', 'create']:
+            self.assertIsNone(self.u.record['attribution_qualifier']['container_id'])
+            mounts = {'/data': (self.drill.root / 'evidence', True),
+                      '/etc/devres/config': (self.drill.root / 'config', False),
+                      '/operator/repair': (self.assets / 'repair', False),
+                      '/operator/plan.json': (self.drill.root / 'config/attribution-plan.json', False)}
+            self.container = {'Id': 'a' * 64, 'Name': '/' + self.drill.name + '-attribution',
+                'Config': {'Image': upgrade.restore.SERVER, 'Labels': {upgrade.restore.LABEL_KEY: self.live},
+                    'User': '65532:65532', 'Entrypoint': ['/operator/repair'],
+                    'Cmd': ['/etc/devres/config/backend.toml', '/operator/plan.json']},
+                'HostConfig': {'NetworkMode': 'host', 'PortBindings': {}, 'ExtraHosts': ['postgres:172.28.0.2'],
+                    'Memory': 16 * 1024**3, 'MemorySwap': 16 * 1024**3, 'NanoCpus': 2 * 10**9,
+                    'PidsLimit': 128, 'ReadonlyRootfs': True, 'CapDrop': ['ALL'],
+                    'SecurityOpt': ['no-new-privileges'], 'Tmpfs': {'/tmp': 'rw,nosuid,nodev,noexec,size=16g'}},
+                'State': {'Running': False, 'ExitCode': 0, 'OOMKilled': False, 'Error': ''},
+                'Mounts': [{'Type': 'bind', 'Source': str(source), 'Destination': target, 'RW': rw}
+                           for target, (source, rw) in mounts.items()]}
+            if self.create_failure:
+                raise upgrade.UpgradeError('create_response_lost')
+            return self.container['Id']
+        if args[:2] == ['docker', 'inspect']:
+            if args[-1].endswith('-postgres'):
+                return json.dumps([{'Id': 'b' * 64, 'Config': {'Image': upgrade.restore.PG,
+                    'Labels': {upgrade.restore.LABEL_KEY: self.live}}, 'State': {'Running': True},
+                    'NetworkSettings': {'Networks': {self.drill.name: {'IPAddress': '172.28.0.2'}}},
+                    'Mounts': [{'Type': 'bind', 'Source': str(self.drill.root / 'postgres'),
+                                'Destination': '/var/lib/postgresql', 'RW': True}]}])
+            return json.dumps([self.container])
+        if args[:2] == ['docker', 'start']:
+            self.assertEqual(self.u.record['attribution_qualifier']['container_id'], args[-1])
+            self.assertEqual(self.u.record['attribution_attempt']['plan_sha256'], self.plan_sha)
+            if self.start_failure:
+                raise upgrade.UpgradeError('start_response_lost')
+            return ''
+        if args[:2] == ['docker', 'rm']:
+            self.container = None
+            return ''
+        raise AssertionError(args)
+
+    def test_single_stopped_owned_writer_records_id_before_start_and_reuses_verified_receipt(self):
+        self.u.qualify_attribution(self.drill)
+        state = upgrade.read_record(self.u.root.parent)
+        self.assertEqual(state['qualified_schema'], 11)
+        self.assertIsNone(state['attribution_qualifier'])
+        self.assertIsNone(self.container)
+        count = len(self.commands)
+        self.u.qualify_attribution(self.drill)
+        self.assertEqual(len(self.commands), count)
+        creates = [args for args in self.commands if args[:2] == ['docker', 'create']]
+        self.assertEqual(len(creates), 1)
+        self.assertIn('--network', creates[0])
+        self.assertNotIn('/etc/devres/tls', ' '.join(creates[0]))
+
+    def test_create_response_loss_cannot_restart_or_issue_a_new_request_budget(self):
+        self.create_failure = True
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'create_response_lost'):
+            self.u.qualify_attribution(self.drill)
+        self.assertFalse(self.container['State']['Running'])
+        self.assertIsNone(self.u.record['attribution_qualifier']['container_id'])
+        self.create_failure = False
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'already_attempted'):
+            self.u.qualify_attribution(self.drill)
+        self.assertEqual(len([a for a in self.commands if a[:2] == ['docker', 'create']]), 1)
+        self.assertFalse(any(a[:2] == ['docker', 'start'] for a in self.commands))
+        self.u.owned_container(self.container, {'token': self.live, 'prefix': self.drill.name}, self.drill.root)
+
+    def test_start_response_loss_can_only_reconcile_stopped_strict_receipt_not_start_again(self):
+        self.start_failure = True
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'start_response_lost'):
+            self.u.qualify_attribution(self.drill)
+        self.start_failure = False
+        self.u.qualify_attribution(self.drill)
+        self.assertEqual(len([a for a in self.commands if a[:2] == ['docker', 'start']]), 1)
+
+    def test_receipt_budget_policy_and_unknown_fields_are_strict(self):
+        for changed in ({'request_attempts': 21}, {'ready': False}, {'schema': 10},
+                        {'plan_sha256': '0' * 64}, {'untrusted': 'private'}, {'qualified_targets': True}):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(upgrade.restore.RestoreError, 'receipt_invalid'):
+                    upgrade.restore.attribution_receipt(self.receipt(**changed), self.plan_sha)
+
+    def test_opt_in_manifest_and_asset_hashes_fail_before_any_container_creation(self):
+        path = self.assets / 'manifest.json'
+        original = path.read_text()
+        for changes in ({'live_acquisition': False}, {'maximum_requests': 21},
+                        {'server': upgrade.PREVIOUS_SERVER}, {'extra': 'untrusted'}):
+            value = json.loads(original)
+            value.update(changes)
+            upgrade.op.write(path, json.dumps(value))
+            with self.assertRaisesRegex(upgrade.restore.RestoreError, 'manifest_invalid'):
+                self.u.qualify_attribution(self.drill)
+        upgrade.op.write(path, original)
+        (self.assets / 'repair').write_bytes(b'changed binary')
+        with self.assertRaisesRegex(upgrade.restore.RestoreError, 'asset_hash_changed'):
+            self.u.qualify_attribution(self.drill)
+        self.assertFalse(self.commands)
+
+    def test_hostnetwork_or_extra_mounts_are_not_general_worker_permissions(self):
+        self.start_failure = True
+        with self.assertRaises(upgrade.UpgradeError):
+            self.u.qualify_attribution(self.drill)
+        owner = {'token': self.live, 'prefix': self.drill.name}
+        self.container['HostConfig']['ExtraHosts'] = ['postgres:1.1.1.1']
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'descriptor_changed'):
+            self.u.owned_container(self.container, owner, self.drill.root)
+        self.container['HostConfig']['ExtraHosts'] = ['postgres:172.28.0.2']
+        self.container['Mounts'].append({'Type': 'bind', 'Source': '/private', 'Destination': '/extra', 'RW': True})
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'mount_changed'):
+            self.u.owned_container(self.container, owner, self.drill.root)
+
+
+class SupersessionTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = UpgradeTests()
+        self.helper.setUp()
+        self.addCleanup(self.helper.doCleanups)
+        self.u, self.root = self.helper.instance, self.helper.root
+        (self.u.private / 'backend.toml').chmod(0o600)
+        self.u.live = upgrade.LiveDrill
+        self.original_run = self.u.run
+        self.u.run = self.host_run
+        self.installed = self.root / 'devres-staging'
+        self.installed.mkdir(mode=0o700)
+        for name in upgrade.BUNDLE_FILES:
+            shutil.copyfile(ROOT / 'deploy/staging' / name, self.installed / name)
+            (self.installed / name).chmod(0o600)
+            with (self.installed / name).open('a') as stream:
+                stream.write('\n# Inert previous operator fixture.\n')
+        self.old_bundle = upgrade.bundle_at(self.installed)[0]
+        temporary = self.root / 'next'
+        temporary.mkdir(mode=0o700)
+        for name in upgrade.STAGING_ASSETS:
+            shutil.copyfile(ROOT / 'deploy/staging' / name, temporary / name)
+            (temporary / name).chmod(0o600)
+        self.new_bundle = upgrade.bundle_at(temporary)[0]
+        self.stage = self.root / ('devres-staging-next-' + self.new_bundle)
+        temporary.rename(self.stage)
+        for name, value in (('INSTALLED', self.installed), ('HERE', self.stage), ('PREVIOUS_BUNDLE', self.old_bundle)):
+            item = patch.object(upgrade, name, value)
+            item.start()
+            self.addCleanup(item.stop)
+        self.token, self.live = secrets.token_hex(12), secrets.token_hex(12)
+        self.runtime = Path('/tmp') / ('devres-staging-restore-' + self.live)
+        self.runtime.mkdir(mode=0o700)
+        self.addCleanup(shutil.rmtree, self.runtime, True)
+        for name in ('config', 'tls'):
+            (self.runtime / name).mkdir(mode=0o750)
+        for child in ('postgres', 'evidence'):
+            (self.runtime / child).symlink_to('/mnt/devres-staging/' + child)
+        upgrade.op.write(self.runtime / 'owner', self.live)
+        upgrade.op.write(self.u.root / 'original-config.toml', CONFIG)
+        upgrade.op.write(self.runtime / 'config/backend.toml', upgrade.target_config(CONFIG, paused=True).replace(
+            upgrade.VERSION, upgrade.PREVIOUS_VERSION), mode=0o640)
+        for name in ('backend.pem', 'backend-key.pem', 'client-ca.pem'):
+            upgrade.op.write(self.runtime / 'tls' / name, 'fixture tls', mode=0o640)
+            upgrade.op.write(self.u.private / name, 'fixture tls')
+        self.helper.tool.counts = {'backend': 0, 'postgres': 0}
+        self.helper.guids[upgrade.m.DATASET] = '3'
+        old = self.u.identity()
+        old.update(version=upgrade.PREVIOUS_VERSION, server=upgrade.PREVIOUS_SERVER,
+                   source_url=upgrade.SOURCE + upgrade.PREVIOUS_VERSION + '/source.tar.gz', bundle_sha256=self.old_bundle)
+        self.helper.phase_record('running_migrate_storage', token=self.token, live_token=self.live,
+            live_kind='permanent', checkpoint_kind='permanent', mode='direct', pause_scope='rehearsal',
+            resource_profile='direct', offline_command='migrate-storage', snapshot=SNAPSHOT,
+            deadline_at=upgrade.SUPERSESSION_DEADLINE,
+            dataset_guids={'postgres': '1', 'evidence': '2'},
+            live_dataset_guids={upgrade.m.DATASET: '3', upgrade.m.DATASET + '/postgres': '1', upgrade.m.DATASET + '/evidence': '2'},
+            target_identity=old, old_server=upgrade.restore.OLD_SERVER, old_version=upgrade.OLD_VERSION,
+            watchdog_timer=upgrade.WATCHDOG + self.token + '.timer', watchdog_cleanup_pending=False)
+        self.helper.watch_timers[upgrade.WATCHDOG + self.token + '.timer'] = True
+        self.containers = {}
+        for role, identifier, image in (('offline-1', 'a' * 64, upgrade.PREVIOUS_SERVER),
+                                        ('postgres', 'b' * 64, upgrade.restore.PG)):
+            mounts = {'/var/lib/postgresql': ('postgres', True)} if role == 'postgres' else {
+                '/data': ('evidence', True), '/etc/devres/config': ('config', False), '/etc/devres/tls': ('tls', False)}
+            self.containers[identifier] = {'Id': identifier, 'Name': '/' + self.runtime.name + '-' + role,
+                'Config': {'Image': image, 'Labels': {upgrade.restore.LABEL_KEY: self.live}},
+                'HostConfig': {'NetworkMode': self.runtime.name, 'PortBindings': {}, 'RestartPolicy': {'Name': 'no'}},
+                'State': {'Running': True, 'ExitCode': 0, 'OOMKilled': False, 'Error': ''},
+                'Mounts': [{'Type': 'bind', 'Destination': target, 'Source': str(self.runtime / source), 'RW': rw}
+                           for target, (source, rw) in mounts.items()],
+                'NetworkSettings': {'Networks': {self.runtime.name: {'IPAddress': '172.28.0.2'}}, 'Ports': {}}}
+        self.calls, self.ignore_worker, self.dirty_pg = [], False, False
+        self.network_exists = True
+        script = r'''import fcntl,json,os,pathlib,signal,sys
+root=pathlib.Path(sys.argv[1]);fd=os.open(root/'maintenance.lock',os.O_CREAT|os.O_RDWR,0o600)
+fcntl.flock(fd,fcntl.LOCK_EX)
+path=root/'state.json';value=json.loads(path.read_text())
+value.update(driver_pid=os.getpid(),driver_start=pathlib.Path('/proc/self/stat').read_text().rsplit(') ',1)[1].split()[19],driver_boot_id=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+path.write_text(json.dumps(value,sort_keys=True)+'\n');print('locked',flush=True);signal.pause()
+'''
+        self.driver = subprocess.Popen([sys.executable, '-I', '-B', '-c', script, str(self.u.root)], stdout=subprocess.PIPE)
+        def cleanup():
+            if self.driver.poll() is None:
+                self.driver.kill()
+            self.driver.wait(timeout=5)
+            self.driver.stdout.close()
+        self.addCleanup(cleanup)
+        self.assertTrue(select.select([self.driver.stdout], [], [], 10)[0])
+        self.assertEqual(self.driver.stdout.readline().strip(), b'locked')
+        self.before = (self.u.root / 'state.json').read_bytes()
+
+    def host_run(self, arguments):
+        args = [str(value) for value in arguments]
+        self.calls.append(args)
+        if args[:2] == ['zfs', 'get'] and args[-2] == 'guid':
+            return self.helper.guids.get(args[-1].split('@')[0], '3') + ('0' if '@' in args[-1] else '')
+        if args[:2] == ['zfs', 'holds']:
+            return args[-1] + '\t' + upgrade.HOLD + '\tfixture'
+        if args == ['zfs', 'list', '-H', '-o', 'name']:
+            return '\n'.join(sorted(self.helper.inventory))
+        if args[:2] == ['zfs', 'list']:
+            rows = []
+            for suffix, guid in (('', '3'), ('/postgres', '1'), ('/evidence', '2')):
+                fields = [upgrade.m.DATASET + suffix, guid, '-', '/mnt/devres-staging' + suffix if suffix else 'none',
+                          'on' if suffix else 'off']
+                if any('quota,' in value for value in args):
+                    fields.append('0')
+                fields.append('devres-staging-v1')
+                rows.append('\t'.join(fields))
+            return '\n'.join(rows)
+        if args[:2] == ['docker', 'ps']:
+            return '\n'.join(self.containers) if '--no-trunc' in args else '\n'.join(
+                value['Name'][1:] for value in self.containers.values())
+        if args[:3] == ['docker', 'network', 'ls']:
+            return self.runtime.name if self.network_exists else ''
+        if args[:3] == ['docker', 'network', 'rm']:
+            self.network_exists = False
+            return ''
+        if args[:3] == ['docker', 'network', 'inspect']:
+            return json.dumps([{'Id': 'c' * 64, 'Name': self.runtime.name, 'Internal': True, 'EnableIPv6': False,
+                'Labels': {upgrade.restore.LABEL_KEY: self.live}, 'Containers': {key: {} for key in self.containers}}])
+        if args[:2] == ['docker', 'inspect']:
+            selected = next(value for key, value in self.containers.items()
+                            if args[-1] in (key, value['Name'][1:]))
+            return json.dumps(selected['State']) if '--format' in args else json.dumps([selected])
+        if args[:3] == ['docker', 'kill', '--signal=SIGTERM']:
+            value = self.containers[args[-1]]
+            if self.ignore_worker and value['Name'].endswith('offline-1'):
+                return ''
+            value['State'].update(Running=False, ExitCode=0 if value['Name'].endswith('postgres') else 1)
+            return ''
+        if args[:2] == ['docker', 'stop']:
+            self.containers[args[-1]]['State'].update(Running=False, ExitCode=0)
+            return ''
+        if args[:2] == ['docker', 'rm']:
+            self.containers.pop(args[-1])
+            return ''
+        if 'pg_controldata' in args and self.dirty_pg:
+            return 'Database cluster state: in production'
+        return self.original_run(args)
+
+    def supersede(self, **kwargs):
+        return self.u.supersede_target(self.token, self.old_bundle, upgrade.PREVIOUS_VERSION,
+                                      upgrade.PREVIOUS_SERVER, self.new_bundle, **kwargs)
+
+    def test_preflight_is_inert_and_full_transition_archives_then_exchanges_without_resume(self):
+        self.assertTrue(self.supersede(check_only=True)['check_passed'])
+        self.assertIsNone(self.driver.poll())
+        self.assertEqual((self.u.root / 'state.json').read_bytes(), self.before)
+        self.assertFalse(any(call[:2] in (['docker', 'kill'], ['docker', 'rm'], ['zfs', 'snapshot']) for call in self.calls))
+        result = self.supersede()
+        self.assertTrue(result['paired_progress_retained'])
+        self.assertEqual(self.driver.wait(timeout=5), -signal.SIGTERM)
+        record = upgrade.read_record(self.u.root.parent)
+        self.assertEqual(record['phase'], upgrade.checkpoint.SUPERSEDED)
+        self.assertEqual(record['pause_scope'], 'rehearsal')
+        self.assertEqual(record['deadline_at'], upgrade.SUPERSESSION_DEADLINE)
+        self.assertEqual(record['target_identity']['bundle_sha256'], self.new_bundle)
+        self.assertEqual((self.u.root / ('supersession-' + self.token) / 'source-state.json').read_bytes(), self.before)
+        self.assertEqual(upgrade.bundle_at(self.installed)[0], self.new_bundle)
+        self.assertEqual(upgrade.bundle_at(self.stage)[0], self.old_bundle)
+        self.assertNotIn('a' * 64, self.containers)
+        self.assertFalse(self.containers['b' * 64]['State']['Running'])
+        self.assertFalse(any(call[:2] == ['zfs', 'destroy'] or '-f' in call for call in self.calls))
+        self.assertTrue(self.helper.watch_timers[upgrade.WATCHDOG + self.token + '.timer'])
+        with patch.object(upgrade, 'HERE', self.installed):
+            self.u.validate_installed_supersession(record['target_supersession'])
+            self.assertTrue(self.supersede(check_only=True)['already_superseded'])
+
+    def test_wrong_tuple_or_staged_bundle_refuses_before_driver_or_worker_signal(self):
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'previous_target_mismatch'):
+            self.u.supersede_target(self.token, '0' * 64, upgrade.PREVIOUS_VERSION,
+                                    upgrade.PREVIOUS_SERVER, self.new_bundle)
+        (self.stage / 'upgrade.py').write_text('changed')
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'bundle_mismatch'):
+            self.supersede()
+        self.assertIsNone(self.driver.poll())
+        self.assertFalse(any(call[:2] == ['docker', 'kill'] for call in self.calls))
+
+    def test_clean_pg_failure_keeps_old_bundle_snapshot_and_archive_and_never_starts_new_writer(self):
+        self.dirty_pg = True
+        with self.assertRaisesRegex(upgrade.checkpoint.CheckpointError, 'postgres_not_clean'):
+            self.supersede()
+        self.assertEqual(upgrade.bundle_at(self.installed)[0], self.old_bundle)
+        self.assertTrue((self.u.root / ('supersession-' + self.token) / 'source-state.json').exists())
+        self.assertFalse(any(call[:2] in (['docker', 'start'], ['zfs', 'destroy']) for call in self.calls))
+        self.assertEqual(upgrade.read_record(self.u.root.parent)['phase'], 'target_supersession_stopping')
+
+    def test_snapshot_boundary_waits_for_real_short_guard_lock_and_runs_body_once(self):
+        original = self.u.maintenance_locked
+        entered = []
+        @contextlib.contextmanager
+        def contended(**kwargs):
+            entered.append(kwargs)
+            child = self.helper.hold_maintenance_lock()
+            self.helper.release_maintenance_lock(child)
+            with original(**kwargs):
+                yield
+        with patch.object(self.u, 'safe'), patch.object(self.u, 'maintenance_locked', side_effect=contended), \
+                patch.object(self.u, 'safe_unlocked', wraps=self.u.safe_unlocked) as check:
+            self.assertTrue(self.supersede()['paired_progress_retained'])
+        self.assertEqual(entered, [{'deadline_at': upgrade.SUPERSESSION_DEADLINE}])
+        self.assertEqual(check.call_count, 1)
+        self.assertEqual(len([call for call in self.calls if call[:2] == ['zfs', 'snapshot']]), 1)
+
+    def test_preformal_handoff_failure_can_canonically_rollback_preserving_failed_pair(self):
+        self.dirty_pg = True
+        with self.assertRaisesRegex(upgrade.checkpoint.CheckpointError, 'postgres_not_clean'):
+            self.supersede()
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'supersession_source_state_changed'):
+            self.supersede()
+        with patch.object(self.helper.tool, 'postgres_shut_down',
+                          side_effect=upgrade.m.MaintenanceError('postgres_not_clean')):
+            result = self.u.rollback()
+        record = upgrade.read_record(self.u.root.parent)
+        self.assertTrue(result['rolled_back'])
+        self.assertEqual(record['phase'], 'rolled_back')
+        self.assertFalse(record['failed_pair_clean_shutdown'])
+        for child, guid in (('postgres', '1'), ('evidence', '2')):
+            kept = result['preserved'][child]
+            self.assertIn(kept, self.helper.inventory)
+            self.assertEqual(self.helper.guids[kept], guid)
+            self.assertEqual(self.helper.origins[upgrade.m.DATASET + '/' + child], kept + '@' + SNAPSHOT)
+        self.assertEqual((self.u.root / ('supersession-' + self.token) / 'source-state.json').read_bytes(), self.before)
+        self.assertEqual(upgrade.bundle_at(self.installed)[0], self.old_bundle)
+        self.assertFalse(any(call[:2] in (['docker', 'start'], ['zfs', 'destroy']) for call in self.calls))
+        self.assertEqual(self.helper.tool.counts, {'backend': 1, 'postgres': 1})
+
+    def test_exchange_failure_leaves_formal_paused_pair_and_can_retry_only_install(self):
+        with patch.object(upgrade, 'exchange_bundles', side_effect=upgrade.UpgradeError('atomic_bundle_exchange_failed')):
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'atomic_bundle_exchange_failed'):
+                self.supersede()
+        record = upgrade.read_record(self.u.root.parent)
+        self.assertEqual(record['phase'], upgrade.checkpoint.SUPERSEDED)
+        before = len([call for call in self.calls if call[:2] == ['zfs', 'snapshot']])
+        self.assertTrue(self.supersede()['superseded'])
+        self.assertEqual(before, len([call for call in self.calls if call[:2] == ['zfs', 'snapshot']]))
+
+    def test_permanent_pause_policy_remains_rehearsal_only_except_exact_sealed_resume(self):
+        self.supersede()
+        record = upgrade.read_record(self.u.root.parent)
+        lifecycle = upgrade.checkpoint.Lifecycle(self.u)
+        lifecycle.eligible(record)
+        for changed in ({'phase': 'running_migrate_storage'}, {'supersession_resume_pending': False}):
+            with self.assertRaisesRegex(upgrade.checkpoint.CheckpointError, 'not_enabled'):
+                lifecycle.eligible({**record, **changed})
+        archived = Path(record['target_supersession']['source_record'])
+        archived.write_text('{}')
+        with self.assertRaisesRegex(upgrade.checkpoint.CheckpointError, 'provenance_changed'):
+            lifecycle.eligible(record)
+
+    def test_expiry_and_wrong_image_fail_before_any_driver_or_container_signal(self):
+        with patch.object(upgrade.time, 'time', return_value=upgrade.SUPERSESSION_DEADLINE):
+            with self.assertRaisesRegex(upgrade.UpgradeError, 'direct_owner_required'):
+                self.supersede()
+        self.containers['a' * 64]['Config']['Image'] = 'unreviewed:image'
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'container_image_changed'):
+            self.supersede()
+        self.assertIsNone(self.driver.poll())
+        self.assertFalse(any(call[:2] == ['docker', 'kill'] for call in self.calls))
+
+    def test_runtime_source_and_transport_drift_are_rejected_by_read_only_preflight(self):
+        path = self.runtime / 'config/backend.toml'
+        original = path.read_text()
+        upgrade.op.write(path, original.replace(upgrade.PREVIOUS_VERSION, '0.1.0-build.unreviewed'), mode=0o640)
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'source_config_changed'):
+            self.supersede(check_only=True)
+        upgrade.op.write(path, original, mode=0o640)
+        upgrade.op.write(self.runtime / 'tls/backend.pem', 'drift', mode=0o640)
+        with self.assertRaisesRegex(upgrade.UpgradeError, 'transport_identity_changed'):
+            self.supersede(check_only=True)
+        self.assertIsNone(self.driver.poll())
+        self.assertEqual((self.u.root / 'state.json').read_bytes(), self.before)
+
+    def test_unresponsive_worker_is_not_force_killed_or_claimed_clean(self):
+        self.ignore_worker = True
+        with patch.object(upgrade.restore, 'OFFLINE_STOP_SECONDS', 0):
+            with self.assertRaisesRegex(upgrade.restore.RestoreError, 'cooperative_stop_unconfirmed'):
+                self.supersede()
+        self.assertTrue(self.containers['a' * 64]['State']['Running'])
+        self.assertTrue(self.containers['b' * 64]['State']['Running'])
+        self.assertFalse(any('SIGKILL' in call or '-f' in call or call[:2] == ['zfs', 'snapshot'] for call in self.calls))
+        self.assertEqual(upgrade.bundle_at(self.installed)[0], self.old_bundle)
 
 
 if __name__ == '__main__':
