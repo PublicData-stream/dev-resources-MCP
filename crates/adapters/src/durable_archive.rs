@@ -663,6 +663,7 @@ mod namespace_acceptance {
             std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
         let mut config: S3Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         config.prefix.push_str("/provider-namespace-acceptance");
+        config.cache_max_bytes = 64 * 1024 * 1024;
         let admin = sqlx::PgPool::connect(&base).await.unwrap();
         sqlx::query("CREATE DATABASE devres_s3_namespace_fixture")
             .execute(&admin)
@@ -678,6 +679,40 @@ mod namespace_acceptance {
         )
         .await
         .unwrap();
+        // Commit-order buffers charge physical writes rather than enqueueing bytes.
+        // A sparse, unretained stage fills the cache without creating remote evidence.
+        let filler = root.path().join("quota-fixture.stage");
+        let filler_file = std::fs::File::create(&filler).unwrap();
+        with_write_budget(&filler, config.cache_max_bytes - 3, || {
+            filler_file.set_len(config.cache_max_bytes - 3)
+        })
+        .unwrap();
+        let stage = root.path().join("commit-order.stage");
+        let mut writer =
+            BudgetedStageWriter::new(stage.clone(), std::fs::File::create(&stage).unwrap());
+        writer.write_all(b"a\n").unwrap();
+        assert_eq!(std::fs::metadata(&stage).unwrap().len(), 0);
+        writer.finish().unwrap();
+        assert_eq!(std::fs::read(&stage).unwrap(), b"a\n");
+        writer.write_all(b"four").unwrap();
+        assert!(
+            writer.finish().is_err(),
+            "buffer flush bypassed cache capacity"
+        );
+        drop(writer);
+        assert_eq!(std::fs::read(&stage).unwrap(), b"a\n");
+        let archive = select(&stage).unwrap().unwrap();
+        assert_eq!(
+            lock_cache(&archive).unwrap().used_bytes,
+            config.cache_max_bytes - 1
+        );
+        std::fs::remove_file(&stage).unwrap();
+        forget_local(&stage).unwrap();
+        drop(filler_file);
+        std::fs::remove_file(&filler).unwrap();
+        forget_local(&filler).unwrap();
+        assert_eq!(lock_cache(&archive).unwrap().used_bytes, 0);
+        drop(archive);
         // These inert bytes exercise permanent file classes through the shared
         // publication boundary; they do not establish provider/Git acquisition.
         let namespaces = [
@@ -1485,6 +1520,49 @@ pub fn with_write_budget<T>(
         result
     } else {
         write()
+    }
+}
+
+/// Buffer small commit-order records while charging each actual filesystem write.
+pub(crate) struct BudgetedStageWriter(std::io::BufWriter<BudgetedStageFile>);
+struct BudgetedStageFile {
+    path: PathBuf,
+    file: std::fs::File,
+}
+fn blocking_stage_io<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
+    }
+}
+impl std::io::Write for BudgetedStageFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        blocking_stage_io(|| {
+            with_write_budget(&self.path, bytes.len() as u64, || {
+                std::io::Write::write(&mut self.file, bytes)
+            })
+        })
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl BudgetedStageWriter {
+    pub(crate) fn new(path: PathBuf, file: std::fs::File) -> Self {
+        Self(std::io::BufWriter::with_capacity(
+            64 * 1024,
+            BudgetedStageFile { path, file },
+        ))
+    }
+    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        std::io::Write::write_all(&mut self.0, bytes)
+    }
+    pub(crate) fn finish(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)?;
+        blocking_stage_io(|| self.0.get_ref().file.sync_all())
     }
 }
 

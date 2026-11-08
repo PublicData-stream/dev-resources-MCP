@@ -144,6 +144,7 @@ struct Stage(PathBuf);
 impl Drop for Stage {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = crate::durable_archive::forget_local(&self.0);
     }
 }
 impl MdnGit {
@@ -540,17 +541,21 @@ impl MdnGit {
                 tokio::fs::remove_file(&stage)
                     .await
                     .map_err(|_| failure())?;
+                crate::durable_archive::forget_local(&stage)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => return Err(Error::integrity("Invalid MDN commit-order stage.")),
         }
         let _guard = Stage(stage.clone());
-        let mut file = tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&stage)
             .await
-            .map_err(|_| failure())?;
+            .map_err(|_| failure())?
+            .into_std()
+            .await;
+        let mut file = crate::durable_archive::BudgetedStageWriter::new(stage.clone(), file);
         let mut command = self.command();
         command
             .args([
@@ -596,8 +601,8 @@ impl MdnGit {
                         "MDN commit enumeration exceeds its budget.",
                     ));
                 }
-                file.write_all(&line).await.map_err(|_| failure())?;
-                file.write_all(b"\n").await.map_err(|_| failure())?;
+                file.write_all(&line).map_err(|_| failure())?;
+                file.write_all(b"\n").map_err(|_| failure())?;
             }
             let status = bulk::bounded(cancel, deadline, async {
                 child.child.wait().await.map_err(|_| failure())
@@ -607,7 +612,7 @@ impl MdnGit {
             if !status.success() {
                 return Err(failure());
             }
-            file.sync_all().await.map_err(|_| failure())?;
+            file.finish().map_err(|_| failure())?;
             Ok(count)
         }
         .await;
