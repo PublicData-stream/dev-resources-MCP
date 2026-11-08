@@ -782,6 +782,17 @@ class RestoreTests(unittest.TestCase):
             before[name]['enabled'] = False
         self.assertEqual(after, before)
 
+    def test_s3_restore_is_rejected_before_host_mutations(self):
+        text = (self.private / 'backend.toml').read_text().replace('[storage]', '[storage]\nbackend = "s3"')
+        with self.assertRaisesRegex(restore.RestoreError, 'does_not_support_s3'):
+            restore.paused_config(text)
+        tool = self.drill(config_text=text)
+        self.host.commands.clear()
+        with self.assertRaisesRegex(restore.RestoreError, 'does_not_support_s3'):
+            tool.prepare()
+        self.assertEqual(self.host.commands, [])
+        self.assertFalse(self.root.exists())
+
     def test_missing_explicit_collector_is_rejected(self):
         text = (self.private / 'backend.toml').read_text().replace('[rfc]\nenabled = false\n', '')
         with self.assertRaisesRegex(restore.RestoreError, 'explicit_collector'):

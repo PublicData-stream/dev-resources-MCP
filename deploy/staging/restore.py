@@ -442,6 +442,8 @@ def validate_snapshot(value):
 def paused_config(text):
     """Change only the eight scheduling booleans; retain all runtime identity."""
     before = tomllib.loads(text)
+    if before.get('storage', {}).get('backend', 'filesystem') != 'filesystem' or 's3' in before.get('storage', {}):
+        raise RestoreError('filesystem_restore_does_not_support_s3')
     if any(not isinstance(before.get(c, {}).get('enabled'), bool) for c in COLLECTORS):
         raise RestoreError('explicit_collector_configuration_required')
     changed = text
@@ -620,6 +622,11 @@ class Drill:
             raise RestoreError('restore_dataset_ownership_changed')
 
     def prepare(self):
+        # Validate the backend before creating any clone, network or directory.
+        selected = self.config_text if self.config_text is not None else (self.private / 'backend.toml').read_text()
+        parsed = tomllib.loads(selected)
+        if parsed.get('storage', {}).get('backend', 'filesystem') != 'filesystem' or 's3' in parsed.get('storage', {}):
+            raise RestoreError('filesystem_restore_does_not_support_s3')
         if self.clone_quota == '512G':
             # This finite profile belongs only to the main migration rehearsal.
             # Leave room for its ordinary nested restore and the existing pool

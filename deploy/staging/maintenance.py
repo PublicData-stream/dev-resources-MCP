@@ -3,10 +3,13 @@
 
 Run as root on the deployment host. State and lock live outside the snapshotted
 datasets. Only an explicit ``resume`` may clear an interrupted operation or a
-capacity fence. No database credentials or caller data are read by this tool.
+capacity fence. Operator configuration is inspected only to reject unsupported storage backends;
+credentials and caller data are never emitted.
 """
 
 import argparse
+import base64
+import binascii
 import contextlib
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -20,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 
 NAMESPACE = "devres-staging"
@@ -51,6 +55,30 @@ def require_no_upgrade():
     module = upgrade_module()
     if module is not None and module.active(STATE_ROOT):
         raise MaintenanceError('upgrade_in_progress')
+
+
+def require_filesystem_archive(run):
+    # Inspect the mounted configuration's canonical Secret, rather than a host
+    # copy which may be absent or stale. Never echo encoded or decoded content.
+    try:
+        encoded = run(["k3s", "kubectl", "--request-timeout=30s", "-n", NAMESPACE,
+                       "get", "secret", "devres-config", "-o",
+                       r"jsonpath={.data.backend\.toml}"])
+    except MaintenanceError as error:
+        raise MaintenanceError('storage_configuration_unavailable') from error
+    try:
+        if not encoded or len(encoded) > 87384:
+            raise ValueError()
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 64 * 1024:
+            raise ValueError()
+        storage = tomllib.loads(decoded.decode()).get('storage', {})
+        if not isinstance(storage, dict):
+            raise ValueError()
+    except (ValueError, UnicodeError, binascii.Error) as error:
+        raise MaintenanceError('storage_configuration_invalid') from error
+    if storage.get('backend', 'filesystem') != 'filesystem' or 's3' in storage:
+        raise MaintenanceError('filesystem_snapshot_does_not_support_s3')
 
 
 class MaintenanceError(RuntimeError):
@@ -301,6 +329,7 @@ class Maintenance:
     def snapshot(self, label=None, *, upgrade=False):
         if not upgrade:
             require_no_upgrade()
+        require_filesystem_archive(self.run)
         if label is not None and not LABEL_RE.fullmatch(label):
             raise MaintenanceError("invalid_snapshot_label")
         value = self.state.load()

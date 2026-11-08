@@ -110,7 +110,7 @@ print("1.2.3")
         ])
 
     def test_release_consumer_validates_without_tag_check_or_stamp(self):
-        for scenario, platform in (("docker", "linux/amd64"), ("minikube", "linux/arm64")):
+        for scenario, platform in (("docker", "linux/amd64"), ("minikube", "linux/arm64"), ("minikube-s3", "linux/amd64")):
             with self.subTest(scenario=scenario):
                 self.log.unlink(missing_ok=True)
                 result, calls = self.run_driver("test", scenario, platform, "artifact", RELEASE_TAG="1.2.3")

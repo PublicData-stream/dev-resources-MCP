@@ -23,6 +23,7 @@ JOB_NAMES = (
     "e2e-build (amd64)", "e2e-build (arm64)",
     "e2e (docker, amd64)", "e2e (docker, arm64)",
     "e2e (minikube, amd64)", "e2e (minikube, arm64)",
+    "e2e (minikube-s3, amd64)", "e2e (minikube-s3, arm64)",
 )
 
 

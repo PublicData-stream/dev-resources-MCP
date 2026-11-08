@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
 
@@ -89,6 +90,8 @@ k() { minikube "$@"; }
                     source = source[:source.index(stop)]
                     harness = root / 'scripts' / 'harness.sh'
                     harness.write_text(source)
+                    harness.chmod(0o755)
+                    shutil.copy2(SCRIPTS / 'with-tmp-state.sh', root / 'scripts' / 'with-tmp-state.sh')
                     for name in ('make-fixture.sh', 'build-harness.sh'):
                         file = root / 'scripts' / name
                         file.write_text('#!/bin/bash\nprintf "%s\\n" "' + name + ' $*" >> "$CALLS"\n')
@@ -101,7 +104,9 @@ k() { minikube "$@"; }
                         file.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\nif [[ $1 == profile ]]; then echo \'{"valid":[]}\'; fi\n'
                                         'if [[ ${3:-} == "${FAIL_PHASE:-unused}" ]]; then exit 43; fi\n')
                         file.chmod(0o755)
-                    env = dict(os.environ, CALLS=str(root / 'calls'), PATH=str(root / 'bin') + ':' + os.environ['PATH'])
+                    env = dict(os.environ, CALLS=str(root / 'calls'),
+                               DEVRES_TMP_ROOT=str(root / 'state'), DEVRES_DOCKER_HOST='fixture://docker',
+                               PATH=str(root / 'bin') + ':' + os.environ['PATH'])
                     env.pop('DEVRES_KUBERNETES_VERSION', None)
                     env.pop('DEVRES_E2E_DIAGNOSTICS_DIR', None)
                     env['FAIL_PHASE'] = failure or 'unused'

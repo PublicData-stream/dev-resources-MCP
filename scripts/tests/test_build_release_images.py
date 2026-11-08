@@ -37,7 +37,7 @@ if "{kind}" == "stamp":
     print("1.2.3")
 if "{kind}" == "image":
     Path(sys.argv[sys.argv.index("--oci-output") + 1]).mkdir()
-    if os.environ["TMPDIR"] != "/tmp" or os.environ["CARGO_TARGET_DIR"] != "/buildcache/rust/target":
+    if os.environ["TMPDIR"] != "/tmp" or os.environ["CARGO_TARGET_DIR"] != "/tmp/rust/target":
         sys.exit(42)
 ''')
             path.chmod(0o755)

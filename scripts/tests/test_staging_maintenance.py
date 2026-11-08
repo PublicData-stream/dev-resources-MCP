@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import os
@@ -5,6 +6,7 @@ from pathlib import Path
 import tempfile
 from datetime import datetime, timezone
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,9 +30,50 @@ class MemoryState:
         self.saved.append(self.load())
 
 
+class StorageBackendGuardTests(unittest.TestCase):
+    def assert_snapshot_rejected(self, configuration, code):
+        host, state = FakeHost(), MemoryState()
+        host.storage_configuration = configuration
+        tool = maintenance.Maintenance(state, host.run)
+        with self.assertRaisesRegex(maintenance.MaintenanceError, code):
+            tool.snapshot()
+        self.assertEqual(len(host.commands), 1)
+        self.assertEqual(host.commands[0][5:8], ('get', 'secret', 'devres-config'))
+        self.assertFalse(state.saved)
+
+    def test_active_object_archive_is_rejected_before_snapshot_commands(self):
+        self.assert_snapshot_rejected(base64.b64encode(b'[storage]\nbackend="s3"\n').decode(),
+                                      'does_not_support_s3')
+
+    def test_missing_secret_stops_snapshot_before_mutation(self):
+        host, state = FakeHost(), MemoryState()
+        host.fail = lambda args: args[5:8] == ['get', 'secret', 'devres-config']
+        with self.assertRaisesRegex(maintenance.MaintenanceError, 'storage_configuration_unavailable'):
+            maintenance.Maintenance(state, host.run).snapshot()
+        self.assertEqual(len(host.commands), 1)
+        self.assertFalse(state.saved)
+
+    def test_missing_config_key_stops_snapshot_before_mutation(self):
+        self.assert_snapshot_rejected('', 'storage_configuration_invalid')
+
+    def test_explicit_and_omitted_filesystem_backend_are_accepted(self):
+        for configuration in ('[storage]\n', '[storage]\nbackend="filesystem"\n'):
+            host = FakeHost()
+            host.storage_configuration = base64.b64encode(configuration.encode()).decode()
+            maintenance.require_filesystem_archive(host.run)
+
+    def test_invalid_and_oversized_config_is_rejected_before_mutation(self):
+        for encoded in ('invalid base64', base64.b64encode(b'[storage').decode(),
+                        base64.b64encode(b'storage=[]').decode(),
+                        base64.b64encode(b'#' * (64 * 1024 + 1)).decode()):
+            with self.subTest(encoded_length=len(encoded)):
+                self.assert_snapshot_rejected(encoded, 'storage_configuration_invalid')
+
+
 class FakeHost:
     def __init__(self):
         self.commands = []
+        self.storage_configuration = base64.b64encode(b'[storage]\nbackend="filesystem"\n').decode()
         self.replicas = {"backend": 1, "postgres": 1}
         self.snapshots = {}
         self.used = 12 * maintenance.GIB
@@ -73,6 +116,8 @@ class FakeHost:
         if args[:2] == ["k3s", "kubectl"]:
             assert args[3:5] == ["-n", "devres-staging"]
             command = args[5:]
+            if command[:3] == ["get", "secret", "devres-config"]:
+                return self.storage_configuration
             if command[:2] == ["get", "deployment"]:
                 return str(self.replicas[command[2]])
             if command[0] == "scale":

@@ -4,12 +4,12 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
 if [[ ${1:-} != --inside-state ]]; then
-  case "${1:-}:$#" in build:3|test:4) ;; *) echo 'usage: ci-e2e.sh build PLATFORM DIRECTORY | test docker|minikube PLATFORM DIRECTORY' >&2; exit 2 ;; esac
+  case "${1:-}:$#" in build:3|test:4) ;; *) echo 'usage: ci-e2e.sh build PLATFORM DIRECTORY | test docker|minikube|minikube-s3 PLATFORM DIRECTORY' >&2; exit 2 ;; esac
   export DEVRES_TMP_ROOT
   DEVRES_TMP_ROOT=$(mktemp -d /tmp/devres-ci-e2e.XXXXXX)
   umask 022
-  exec scripts/with-tmp-state.sh env CARGO_TARGET_DIR=/buildcache/rust/target \
-    OXIBELT_TARGET_DIR=/buildcache/rust/target "$0" --inside-state "$@"
+  exec scripts/with-tmp-state.sh env CARGO_TARGET_DIR=/tmp/rust/target \
+    OXIBELT_TARGET_DIR=/tmp/rust/target "$0" --inside-state "$@"
 fi
 shift
 mode=$1
@@ -23,7 +23,7 @@ case "$platform" in
   linux/arm64) arch=arm64; checksum=202f331cb677761c5aec81c58472d16d65707358b9f66226210be3fe3275b1c3 ;;
   *) echo 'Unsupported native platform' >&2; exit 2 ;;
 esac
-case "$mode:$scenario" in build:|test:docker|test:minikube) ;; *) echo 'Unsupported CI scenario' >&2; exit 2 ;; esac
+case "$mode:$scenario" in build:|test:docker|test:minikube|test:minikube-s3) ;; *) echo 'Unsupported CI scenario' >&2; exit 2 ;; esac
 # Resolve paths before changing subprocess environments; artifact storage is runner-owned.
 artifact=$(realpath -m -- "$artifact")
 commit=${GITHUB_SHA:-$(git rev-parse HEAD)}
@@ -39,12 +39,12 @@ fi
 sudo -n apt-get update
 sudo -n apt-get install -y build-essential clang cmake libclang-dev perl pkg-config \
   libssl-dev openssl curl ca-certificates git python3 iproute2 iptables conntrack
-sudo -n mkdir -p /buildcache/rust/target
-sudo -n chown "$(id -u):$(id -g)" /buildcache/rust/target
+sudo -n mkdir -p /tmp/rust/target
+sudo -n chown "$(id -u):$(id -g)" /tmp/rust/target
 rustup toolchain install 1.99.1 --profile minimal
 export RUSTUP_TOOLCHAIN=1.99.1
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
-if [[ $scenario == minikube ]]; then
+if [[ $scenario == minikube || $scenario == minikube-s3 ]]; then
   mkdir -p "$DEVRES_TMP_ROOT/bin"
   curl --fail --location --silent --show-error \
     "https://github.com/kubernetes/minikube/releases/download/v1.39.0/minikube-linux-$arch" \
@@ -75,6 +75,7 @@ exec scripts/with-local-docker.sh bash -euo pipefail -c '
     case "$7" in
       docker) scripts/test-oxibelt.sh --image "$image" ;;
       minikube) scripts/test-minikube.sh --image "$image" ;;
+      minikube-s3) scripts/test-minikube.sh --image "$image" --s3 ;;
     esac
   fi
 ' ci-e2e "$platform" "$mode" "$artifact" "$version" "$commit" "$arch" "$scenario"

@@ -17,7 +17,7 @@ env:
   RELEASE_TAG: ${{ inputs.release-tag || '' }}
   TMPDIR: /tmp
   PYTHONDONTWRITEBYTECODE: '1'
-  CARGO_TARGET_DIR: /buildcache/rust/target
+  CARGO_TARGET_DIR: /tmp/rust/target
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -48,7 +48,7 @@ jobs:
       - name: Isolate pinned toolchain
         run: |
           echo "RUSTUP_HOME=/tmp/devres-rustup" >> "$GITHUB_ENV"
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /buildcache/rust/target
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /tmp/rust/target
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       - name: Verify native architecture
         env:
@@ -61,6 +61,8 @@ jobs:
       - run: git diff --check
       - name: PostgreSQL persistence
         run: scripts/test-postgres.sh
+      - name: S3-compatible archive persistence
+        run: scripts/test-s3.sh
       - name: Build and smoke native runtime image
         env:
           PLATFORM: linux/${{ matrix.arch }}
@@ -113,7 +115,7 @@ jobs:
       - name: Isolate pinned toolchain
         run: |
           echo "RUSTUP_HOME=/tmp/devres-rustup" >> "$GITHUB_ENV"
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /buildcache/rust/target
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /tmp/rust/target
       - run: rustup toolchain install 1.99.1 --profile minimal
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo install cargo-deny --version 0.20.2 --locked
@@ -152,7 +154,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [docker, minikube]
+        scenario: [docker, minikube, minikube-s3]
         include:
           - arch: amd64
             runner: ubuntu-26.04

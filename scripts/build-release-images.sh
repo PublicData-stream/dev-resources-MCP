@@ -25,7 +25,7 @@ PY
 scripts/check-native-platform.sh "$platform"
 scripts/verify-release-tag.sh "$tag" "$commit"
 version=$(python3 scripts/release_contract.py stamp --tag "$tag" --commit "$commit")
-export TMPDIR=/tmp CARGO_TARGET_DIR=/buildcache/rust/target
+export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target
 mkdir -p -- "$(dirname -- "$output")"
 mkdir -- "$output"
 for target in server probe audit-worker; do

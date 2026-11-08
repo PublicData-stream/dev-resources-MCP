@@ -1,0 +1,93 @@
+# Disposable S3 acceptance fixture only. The harness creates devres-s3-credentials
+# and kubelet resolves the pinned image in its uniquely owned minikube profile.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devres-s3-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: objectstore
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: objectstore}
+  template:
+    metadata:
+      labels: {app: objectstore}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: objectstore
+          image: rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
+          # Keep the immutable multi-platform index reference. Containerd's
+          # Docker-archive import can omit its digest alias, so let kubelet
+          # resolve this pinned reference when it is not already present.
+          imagePullPolicy: IfNotPresent
+          args: [/data]
+          env:
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: {name: devres-s3-credentials, key: access-key}
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef: {name: devres-s3-credentials, key: secret-key}
+            - {name: RUSTFS_CONSOLE_ENABLE, value: 'false'}
+            - {name: RUSTFS_OBS_LOG_DIRECTORY, value: /data/logs}
+          ports:
+            - {name: s3, containerPort: 9000}
+          readinessProbe:
+            httpGet: {path: /health, port: s3}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: '1', memory: 1Gi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: devres-s3-data}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: objectstore
+spec:
+  selector: {app: objectstore}
+  ports:
+    - {name: s3, port: 9000, targetPort: s3}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: objectstore-backend-only
+spec:
+  podSelector:
+    matchLabels: {app: objectstore}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: backend}
+      ports:
+        - {port: 9000, protocol: TCP}
