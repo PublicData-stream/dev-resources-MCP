@@ -22,6 +22,26 @@ impl Fetcher for NoFetcher {
     }
 }
 
+fn assert_same_resource(actual: &Value, expected: &Value) {
+    let immutable_evidence = |resource: &Value| {
+        let mut resource = resource.clone();
+        let capture = resource
+            .pointer_mut("/contents/0/_meta/source_evidence/capture")
+            .and_then(Value::as_object_mut)
+            .expect("Capture evidence must be an object");
+        // Freshness is observed at read time; the cited content and provenance stay fixed.
+        assert!(
+            capture
+                .remove("stale")
+                .expect("Capture evidence must include stale")
+                .is_boolean(),
+            "Capture stale must be a boolean"
+        );
+        resource
+    };
+    assert_eq!(immutable_evidence(actual), immutable_evidence(expected));
+}
+
 fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut writer = GzEncoder::new(Vec::new(), Compression::default());
     writer.write_all(bytes).unwrap();
@@ -668,9 +688,9 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     );
     let historical = research.call("crate.document_get",json!({"name":"example","version":VERSIONS[0],"kind":"rustdoc","path":"renamed_library/index.html","target":DEFAULT_TARGET,"snapshot":captured.id})).await.unwrap();
     assert_eq!(historical["page"], old_document["page"]);
-    assert_eq!(
-        research.read_resource(&old_uri).await.unwrap(),
-        old_resource
+    assert_same_resource(
+        &research.read_resource(&old_uri).await.unwrap(),
+        &old_resource,
     );
     assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
     assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
@@ -702,9 +722,9 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
         .await
         .unwrap()
         .with_crate_corpus(corpus.clone());
-    assert_eq!(
-        research.read_resource(&old_uri).await.unwrap(),
-        old_resource
+    assert_same_resource(
+        &research.read_resource(&old_uri).await.unwrap(),
+        &old_resource,
     );
     assert_eq!(
         research

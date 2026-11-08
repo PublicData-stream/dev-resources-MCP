@@ -167,6 +167,44 @@ fn capture_fixture() -> StoredCapture {
         body: b"abcdef".to_vec().into(),
     }
 }
+#[tokio::test]
+async fn capture_resource_reports_current_freshness_without_rewriting_evidence() {
+    // Both states are independent of test duration and wall-clock second boundaries.
+    for (validated_at, stale) in [(0, true), (i64::MAX, false)] {
+        let mut captured = capture_fixture();
+        captured.capture.validated_at = validated_at;
+        let capture = captured.capture.clone();
+        let research = Research::new(Arc::new(Retrieval::new(
+            Arc::new(PublicFixture(captured)),
+            Arc::new(NoNetwork),
+        )))
+        .await
+        .unwrap();
+        let uri = format!("devres://capture/{}", capture.id);
+        assert_eq!(
+            research.read_resource(&uri).await.unwrap(),
+            json!({"contents":[{
+                "uri":uri,
+                "mimeType":capture.media_type,
+                "text":"abcdef",
+                "_meta":{"source_evidence":{
+                    "capture":{
+                        "id":capture.id,
+                        "body_hash":capture.body_hash,
+                        "source_url":capture.source_url,
+                        "retrieved_at":capture.retrieved_at,
+                        "validated_at":capture.validated_at,
+                        "stale":stale,
+                        "resource_uri":uri
+                    },
+                    "source_key":capture.key,
+                    "media_type":capture.media_type
+                }}
+            }]})
+        );
+    }
+}
+
 async fn gated_research(deny: bool) -> (Research, Arc<FixtureGate>) {
     let gate = Arc::new(FixtureGate {
         deny,
