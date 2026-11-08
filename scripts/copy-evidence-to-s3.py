@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import signal
 import sqlite3
@@ -364,10 +365,27 @@ def missing(error):
 
 
 def make_client(plan):
-    args = ['sudo', '-u', 'codex', '-H', '--', 'scw', '-p', 'newprofile', '-o', 'json',
+    try:
+        account = pwd.getpwnam('codex')
+    except KeyError:
+        raise CopyError('credential_account_invalid') from None
+    if (account.pw_name != 'codex' or type(account.pw_uid) is not int or account.pw_uid <= 0
+            or type(account.pw_gid) is not int or account.pw_gid <= 0
+            or not isinstance(account.pw_dir, str) or not Path(account.pw_dir).is_absolute()
+            or '..' in Path(account.pw_dir).parts):
+        raise CopyError('credential_account_invalid')
+    args = ['/usr/local/bin/scw', '-p', 'newprofile', '-o', 'json',
             'config', 'get', 'access-key', 'secret-key', 'default-region']
-    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, check=False,
-                            env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C'})
+    # Root drops only this child's identity. No sudo/elevation or supplementary
+    # groups are needed, including under the service's NoNewPrivileges fence.
+    try:
+        result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=30, check=False,
+            user=account.pw_uid, group=account.pw_gid, extra_groups=[],
+            env={'HOME': account.pw_dir, 'USER': 'codex', 'LOGNAME': 'codex',
+                 'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C'})
+    except (OSError, subprocess.SubprocessError):
+        raise CopyError('credential_selection_failed') from None
     if result.returncode or len(result.stdout) > 65536:
         raise CopyError('credential_selection_failed')
     keys = json.loads(result.stdout)

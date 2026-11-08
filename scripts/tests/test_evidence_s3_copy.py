@@ -339,10 +339,18 @@ class CopyTests(unittest.TestCase):
         config=MagicMock()
         modules={'boto3':sdk,'botocore':SimpleNamespace(),'botocore.config':SimpleNamespace(Config=config)}
         result=SimpleNamespace(returncode=0,stdout=json.dumps(['ACCESS','SECRET',copy.REGION]).encode())
-        with patch.dict('sys.modules',modules),patch.object(copy.subprocess,'run',return_value=result) as run:
+        account=SimpleNamespace(pw_name='codex',pw_uid=1001,pw_gid=1001,pw_dir='/home/codex')
+        with patch.dict('sys.modules',modules),patch.object(copy.pwd,'getpwnam',return_value=account) as lookup, \
+                patch.object(copy.subprocess,'run',return_value=result) as run:
             self.assertIs(copy.make_client(self.plan),client)
-            self.assertEqual(run.call_args.args[0],['sudo','-u','codex','-H','--','scw','-p','newprofile','-o','json',
+            self.assertEqual(run.call_args.args[0],['/usr/local/bin/scw','-p','newprofile','-o','json',
                              'config','get','access-key','secret-key','default-region'])
+            lookup.assert_called_once_with('codex')
+            self.assertEqual({k:run.call_args.kwargs[k] for k in ('user','group','extra_groups')},
+                             {'user':1001,'group':1001,'extra_groups':[]})
+            self.assertEqual(run.call_args.kwargs['env'],{'HOME':'/home/codex','USER':'codex','LOGNAME':'codex',
+                             'PATH':'/usr/local/bin:/usr/bin:/bin','LANG':'C'})
+            self.assertIs(run.call_args.kwargs['stdin'],copy.subprocess.DEVNULL)
             sdk.Session.assert_called_once_with(aws_access_key_id='ACCESS',aws_secret_access_key='SECRET',region_name=copy.REGION)
             self.assertEqual(config.call_args.kwargs['retries']['total_max_attempts'],1)
             self.assertIs(session.client.call_args.kwargs['verify'],True)
@@ -351,8 +359,23 @@ class CopyTests(unittest.TestCase):
             with self.assertRaisesRegex(copy.CopyError,'unexpected_s3_destination'):
                 callback(SimpleNamespace(url='https://other.invalid/bucket'))
         bad=SimpleNamespace(returncode=0,stdout=b'"wrong profile shape"')
-        with patch.object(copy.subprocess,'run',return_value=bad):
+        with patch.object(copy.pwd,'getpwnam',return_value=account),patch.object(copy.subprocess,'run',return_value=bad):
             with self.assertRaisesRegex(copy.CopyError,'credential_profile_invalid'): copy.make_client(self.plan)
+
+
+    def test_credential_child_rejects_root_missing_account_or_failed_privilege_drop(self):
+        account={'pw_name':'codex','pw_uid':1001,'pw_gid':1001,'pw_dir':'/home/codex'}
+        for changed in ({'pw_uid':0},{'pw_gid':0},{'pw_name':'root'},{'pw_dir':'relative'}):
+            with patch.object(copy.pwd,'getpwnam',return_value=SimpleNamespace(**{**account,**changed})), \
+                    patch.object(copy.subprocess,'run') as run:
+                with self.assertRaisesRegex(copy.CopyError,'credential_account_invalid'): copy.make_client(self.plan)
+                run.assert_not_called()
+        with patch.object(copy.pwd,'getpwnam',side_effect=KeyError('codex')),patch.object(copy.subprocess,'run') as run:
+            with self.assertRaisesRegex(copy.CopyError,'credential_account_invalid'): copy.make_client(self.plan)
+            run.assert_not_called()
+        with patch.object(copy.pwd,'getpwnam',return_value=SimpleNamespace(**account)), \
+                patch.object(copy.subprocess,'run',side_effect=PermissionError('private error must stay hidden')):
+            with self.assertRaisesRegex(copy.CopyError,'^credential_selection_failed$'): copy.make_client(self.plan)
 
 
 if __name__=='__main__': unittest.main()
