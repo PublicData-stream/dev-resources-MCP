@@ -23,6 +23,96 @@ async fn main() -> Result<(), ServerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::new("devres_server=info"))
         .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("migrate-object-storage" | "verify-object-storage" | "activate-object-storage")
+    ) {
+        if args.len() != 2 {
+            return Err("usage: devres-server migrate-object-storage|verify-object-storage|activate-object-storage CONFIG.toml".into());
+        }
+        let config = Config::load(Path::new(&args[1])).await?;
+        let s3 = config
+            .storage
+            .s3
+            .clone()
+            .ok_or("object archive configuration required")?;
+        let store = Arc::new(
+            devres_adapters::PgBlobStore::connect_for_object_transfer(
+                &config.storage.database_url,
+                &config.storage.blob_dir,
+                s3,
+            )
+            .await?,
+        );
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let task = tokio::spawn(async move {
+            shutdown_signal().await;
+            signal.cancel();
+        });
+        let result = store.transfer_object_archive(&args[0], cancel).await;
+        task.abort();
+        let _ = task.await;
+        println!("{}", result?);
+        return Ok(());
+    }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("backup-object-storage" | "restore-object-storage")
+    ) {
+        if args.len() != 3 {
+            return Err("usage: devres-server backup-object-storage|restore-object-storage CONFIG.toml BACKUP-S3.toml".into());
+        }
+        let config = Config::load(Path::new(&args[1])).await?;
+        let archive = config
+            .storage
+            .s3
+            .clone()
+            .ok_or("object archive configuration required")?;
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        tokio::fs::File::open(&args[2])
+            .await?
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > 64 * 1024 {
+            return Err("object archive configuration exceeds its bound".into());
+        }
+        let backup: devres_adapters::object_storage::S3Config = toml::from_str(
+            std::str::from_utf8(&bytes).map_err(|_| "invalid object archive configuration")?,
+        )
+        .map_err(|_| "invalid object archive configuration")?;
+        let cancel = CancellationToken::new();
+        let stopping = cancel.clone();
+        let task = tokio::spawn(async move {
+            shutdown_signal().await;
+            stopping.cancel();
+        });
+        let result = if args[0] == "backup-object-storage" {
+            devres_adapters::object_archive_backup::backup(
+                &config.storage.database_url,
+                &config.storage.blob_dir,
+                archive,
+                backup,
+                cancel,
+            )
+            .await
+        } else {
+            devres_adapters::object_archive_backup::restore(
+                &config.storage.database_url,
+                &config.storage.blob_dir,
+                archive,
+                backup,
+                cancel,
+            )
+            .await
+        };
+        task.abort();
+        let _ = task.await;
+        println!("{}", result?);
+        return Ok(());
+    }
     // Offline storage commands branch before constructing any provider/collector.
     if matches!(
         args.first().map(String::as_str),
@@ -37,6 +127,9 @@ async fn main() -> Result<(), ServerError> {
         )?;
         execution.enable_progress();
         let config = Config::load(Path::new(path)).await?;
+        if config.storage.s3.is_some() {
+            return Err("Use verify-object-storage for S3 archives; existing integrity migration must precede S3 activation.".into());
+        }
         let store = Arc::new(match command {
             "migrate-storage" => {
                 devres_adapters::PgBlobStore::connect_for_migration(
@@ -110,9 +203,10 @@ async fn main() -> Result<(), ServerError> {
     };
     let config = Config::load(Path::new(config_path)).await?;
     let store = Arc::new(
-        devres_adapters::PgBlobStore::connect(
+        devres_adapters::PgBlobStore::connect_archive(
             &config.storage.database_url,
             &config.storage.blob_dir,
+            config.storage.s3.clone(),
         )
         .await?,
     );
@@ -423,7 +517,11 @@ async fn main() -> Result<(), ServerError> {
                 } => {
                     if !matches!(result, Ok(Ok(()))) {
                         monitor_ready.store(false, Ordering::Release);
-                        return Err("storage ownership or connectivity lost; restart required".into());
+                        if !store.has_object_archive() || store.check_ownership().await.is_err() {
+                            return Err("storage ownership or connectivity lost; restart required".into());
+                        }
+                    } else {
+                        monitor_ready.store(true, Ordering::Release);
                     }
                 }
             }

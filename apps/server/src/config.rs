@@ -307,6 +307,17 @@ pub struct SourceConfig {
 pub struct StorageConfig {
     pub database_url: String,
     pub blob_dir: PathBuf,
+    #[serde(default)]
+    pub backend: StorageBackend,
+    pub s3: Option<devres_adapters::object_storage::S3Config>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackend {
+    #[default]
+    Filesystem,
+    S3,
 }
 
 #[derive(Clone, Deserialize)]
@@ -371,6 +382,11 @@ impl Config {
         }
         if self.storage.database_url.is_empty() || self.storage.blob_dir.as_os_str().is_empty() {
             return Err("storage paths and database URL must be nonempty".into());
+        }
+        match (&self.storage.backend, &self.storage.s3) {
+            (StorageBackend::Filesystem, None) => (),
+            (StorageBackend::S3, Some(config)) => config.validate()?,
+            _ => return Err("storage backend and S3 configuration disagree".into()),
         }
         Ok(())
     }
