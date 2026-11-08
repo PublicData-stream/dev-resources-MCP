@@ -1066,6 +1066,8 @@ The helper is deliberately scoped to this operation and refuses other destinatio
 ```sh
 python3 -I -B scripts/copy-evidence-to-s3.py --plan COPY_PLAN.json --check
 python3 -I -B scripts/copy-evidence-to-s3.py --plan COPY_PLAN.json
+# Explicitly authorized throughput mode:
+python3 -I -B scripts/copy-evidence-to-s3.py --plan COPY_PLAN.json --max-speed
 ```
 
 `--check` performs read-only source inventory and bucket admission. The first copy
@@ -1089,10 +1091,20 @@ The private state directory holds `copy.sqlite3`, `manifest.jsonl`, and
 Inventory commits bounded 256-entry batches, with its completion flag committed
 with the final batch before remote admission. Fresh small files use conditional
 PUT followed by full GET verification; resumed files and large multipart objects
-retain their initial remote check. A shared 16-MiB/s budget covers source reads,
-upload-body reads and verification GETs. Run with low CPU/I/O priority and retain sufficient snapshot-COW headroom
-for the original migration. Every completed object is read back and SHA-256
-verified. `_devres-copy/COMPLETE.json` is published last, after the full file set
-and destination key inventory pass. This marker proves the frozen file copy;
+retain their initial remote check. The default mode shares a 16-MiB/s budget
+between source reads, upload-body reads and verification GETs, and is intended
+for low CPU/I/O priority. Explicit `--max-speed` removes that byte budget and
+uses 16 hashing workers (32 outstanding), 128 small-object workers (256
+outstanding), and 16 multipart workers (32 outstanding), with a 160-connection
+client pool. Multipart readers use independent file offsets, and parts are sorted
+before completion. SQLite checkpoint writes remain on the main thread. Worker
+failures cancel queued work and drain running work before multipart cleanup or
+database closure. The mode retains the same source, conditional-publication and
+full-verification requirements. Provision the service with sufficient connection,
+task and memory headroom, and remove any external
+CPU quota or idle-I/O scheduling that would defeat the selected mode. Retain
+sufficient snapshot-COW headroom for the original migration. Every completed
+object is read back and SHA-256 verified. `_devres-copy/COMPLETE.json` is published
+last, after the full file set and destination key inventory pass. This marker proves the frozen file copy;
 a matching PostgreSQL backup and the separate application restore/acceptance
 procedure remain necessary for a server migration.

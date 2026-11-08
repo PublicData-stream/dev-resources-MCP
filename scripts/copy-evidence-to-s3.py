@@ -8,6 +8,7 @@ Only this job's journaled incomplete multipart upload may be aborted.
 import argparse
 import base64
 import contextlib
+import concurrent.futures
 import fcntl
 import hashlib
 import io
@@ -22,6 +23,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -41,6 +43,10 @@ CHUNK = 1024 * 1024
 RATE = 16 * CHUNK
 MIN_PART = 16 * CHUNK
 INVENTORY_BATCH = 256
+HASH_WORKERS, HASH_PENDING = 16, 32
+COPY_WORKERS, COPY_PENDING = 128, 256
+PART_WORKERS, PART_PENDING = 16, 32
+MAX_CONNECTIONS = 160
 MAX_PART = 5_000_000_000
 MAX_OBJECT = MAX_PART * 1000
 PHASES = {'running_migrate_storage', 'running_verify_storage', 'running_activate_storage',
@@ -161,8 +167,24 @@ class Guard:
         self.plan, self.path, self.hash, self.run, self.clock = plan, Path(plan_path), plan_hash, run, clock
         self.last = -math.inf
         self.device = None
+        self.lock = threading.Lock()
+        self.failure = None
 
     def check(self, force=False):
+        with self.lock:
+            if self.failure is not None:
+                raise CopyError(self.failure)
+            try:
+                self._check(force)
+                if STOPPED:
+                    raise CopyError('copy_interrupted')
+                if self.clock() >= self.plan['deadline_at']:
+                    raise CopyError('copy_deadline_exceeded')
+            except Exception as error:
+                self.failure = str(error) if isinstance(error, CopyError) else 'source_guard_failed'
+                raise
+
+    def _check(self, force=False):
         if STOPPED:
             raise CopyError('copy_interrupted')
         if self.clock() >= self.plan['deadline_at']:
@@ -217,22 +239,89 @@ class Guard:
 
 
 class Limiter:
-    """One aggregate budget covers snapshot reads, upload reads, and GET bytes."""
-    def __init__(self, guard, rate=RATE):
+    """One thread-safe counter and optional aggregate bandwidth budget."""
+    def __init__(self, guard, rate=RATE, cancelled=None):
         self.guard, self.rate, self.next = guard, rate, time.monotonic()
-        self.bytes = 0
+        self.lock, self._bytes = threading.Lock(), 0
+        self.cancelled = cancelled
+
+    @property
+    def bytes(self):
+        with self.lock:
+            return self._bytes
+
+    def check(self):
+        if self.cancelled is not None and self.cancelled.is_set():
+            raise CopyError('copy_worker_cancelled')
+        self.guard.check()
 
     def consume(self, amount):
-        self.guard.check()
-        self.bytes += amount
-        now = time.monotonic()
-        self.next = max(self.next, now) + amount / self.rate
+        self.check()
+        with self.lock:
+            self._bytes += amount
+            if self.rate is None:
+                return
+            self.next = max(self.next, time.monotonic()) + amount / self.rate
+            target = self.next
         while True:
-            self.guard.check()
-            delay = self.next - time.monotonic()
+            self.check()
+            delay = target - time.monotonic()
             if delay <= 0:
                 break
             time.sleep(min(0.2, delay))
+
+
+@contextlib.contextmanager
+def parallel_results(function, items, workers, outstanding, cancelled, check):
+    """Bound submissions, preserve the first failure, and drain before returning.
+
+    The consumer alone touches SQLite. Running jobs observe cancellation at their
+    next source/network boundary; pending jobs are cancelled and no pool outlives
+    the database, source descriptor, or multipart-upload owner.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    pending, failures, failure_lock = set(), [], threading.Lock()
+    def fail(error):
+        with failure_lock:
+            if not failures:
+                failures.append(error)
+        cancelled.set()
+    def invoke(item):
+        try:
+            check()
+            return function(item)
+        except BaseException as error:
+            fail(error)
+            raise
+    def results():
+        iterator, exhausted = iter(items), False
+        while pending or not exhausted:
+            while not exhausted and len(pending) < outstanding:
+                check()
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                check()
+                pending.add(pool.submit(invoke, item))
+            if not pending:
+                break
+            done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                pending.remove(future)
+                yield future.result()
+    try:
+        yield results()
+    except BaseException as error:
+        fail(error)
+        for future in pending:
+            future.cancel()
+        # Shutdown waits for every running reader/writer before abort/DB close.
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise failures[0]
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def identity(st):
@@ -333,8 +422,9 @@ def part_size(size):
 
 class PartBody(io.RawIOBase):
     """Seekable bounded view; no part-sized allocation, including very large files."""
-    def __init__(self, stream, start, length, limiter):
+    def __init__(self, stream, start, length, limiter, independent=False):
         self.stream, self.start, self.length, self.limiter = stream, start, length, limiter
+        self.independent = independent
         self.position = 0
         self.seek(0)
     def readable(self): return True
@@ -344,14 +434,16 @@ class PartBody(io.RawIOBase):
         at = offset if whence == 0 else self.position + offset if whence == 1 else self.length + offset
         if at < 0 or at > self.length:
             raise CopyError('invalid_part_seek')
-        self.stream.seek(self.start + at)
+        if not self.independent:
+            self.stream.seek(self.start + at)
         self.position = at
         return at
     def read(self, size=-1):
         count = min(CHUNK, self.length - self.position, size if size >= 0 else CHUNK)
         if count <= 0:
             return b''
-        data = self.stream.read(count)
+        data = (os.pread(self.stream.fileno(), count, self.start + self.position)
+                if self.independent else self.stream.read(count))
         if len(data) != count:
             raise CopyError('source_short_read')
         self.limiter.consume(len(data))
@@ -368,7 +460,7 @@ def missing(error):
     return error_code(error) in ('404', 'NoSuchKey', 'NotFound')
 
 
-def make_client(plan):
+def make_client(plan, max_speed=False):
     try:
         account = pwd.getpwnam('codex')
     except KeyError:
@@ -404,7 +496,7 @@ def make_client(plan):
     session._session.set_config_variable('profile', None)
     client = session.client('s3', endpoint_url=ENDPOINT, region_name=REGION, verify=True,
         config=Config(signature_version='s3v4', connect_timeout=10, read_timeout=30,
-                      retries={'mode': 'standard', 'total_max_attempts': 1}, max_pool_connections=2,
+                      retries={'mode': 'standard', 'total_max_attempts': 1}, max_pool_connections=MAX_CONNECTIONS if max_speed else 2,
                       s3={'addressing_style': 'path'}, proxies={'http': None, 'https': None},
                       request_checksum_calculation='when_required', response_checksum_validation='when_required'))
     for operation in ('PutObject', 'CompleteMultipartUpload'):
@@ -419,18 +511,26 @@ def make_client(plan):
 
 
 class Copier:
-    def __init__(self, plan, plan_hash, guard, client, limiter=None):
+    def __init__(self, plan, plan_hash, guard, client, limiter=None, *, max_speed=False):
         self.p, self.plan_hash, self.guard, self.s3 = plan, plan_hash, guard, client
         self.state = Path(plan['state_dir'])
-        self.limiter = limiter or Limiter(guard)
+        self.max_speed, self.cancelled = max_speed, threading.Event()
+        self.limiter = limiter or Limiter(guard, rate=None if max_speed else RATE, cancelled=self.cancelled)
         self.db = None
         self.epoch = uuid.uuid4().hex
         self.last_progress = 0
         self.manifest_hash = None
         self.fresh_root = False
 
-    def call(self, method, **kwargs):
+    def check_active(self):
+        if self.cancelled.is_set():
+            raise CopyError('copy_worker_cancelled')
         self.guard.check()
+        if self.cancelled.is_set():
+            raise CopyError('copy_worker_cancelled')
+
+    def call(self, method, **kwargs):
+        self.check_active()
         try:
             return getattr(self.s3, method)(Bucket=BUCKET, **kwargs)
         except CopyError:
@@ -464,7 +564,7 @@ class Copier:
                 raise CopyError('object_owner_metadata_collision')
             hasher, length, output = hashlib.sha256(), 0, bytearray()
             while True:
-                self.guard.check()
+                self.check_active()
                 chunk = body.read(CHUNK)
                 if not chunk: break
                 self.limiter.consume(len(chunk))
@@ -534,31 +634,40 @@ class Copier:
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink != 1:
             raise CopyError('unsafe_checkpoint_database')
 
+    def inventory_entry(self, entry):
+        raw, kind, st = entry
+        self.check_active()
+        sha, key = None, None
+        if kind == 'file':
+            part_size(st.st_size)
+            with open_source(self.p['source_root'], raw, identity(st)) as stream:
+                sha, size = hash_stream(stream, self.limiter)
+            if size != st.st_size:
+                raise CopyError('source_short_read')
+            key = object_key(raw)
+        self.check_active()
+        return raw, kind, json.dumps(identity(st)), sha, key
+
     def inventory(self):
         complete = self.db.execute("SELECT value FROM metadata WHERE key='inventory_complete'").fetchone()
         if not complete:
-            # Before remote writes, an interrupted inventory is rebuilt from the
-            # same immutable snapshot; already finished remote data is untouched.
             self.db.execute('DELETE FROM entries')
             self.db.commit()
+            entries = walk(self.p['source_root'], self.guard)
+            work = (parallel_results(self.inventory_entry, entries, HASH_WORKERS, HASH_PENDING,
+                                     self.cancelled, self.check_active) if self.max_speed else
+                    contextlib.nullcontext(map(self.inventory_entry, entries)))
             pending = 0
-            for raw, kind, st in walk(self.p['source_root'], self.guard):
-                sha, key = None, None
-                if kind == 'file':
-                    part_size(st.st_size)
-                    with open_source(self.p['source_root'], raw, identity(st)) as stream:
-                        sha, size = hash_stream(stream, self.limiter)
-                    if size != st.st_size: raise CopyError('source_short_read')
-                    key = object_key(raw)
-                self.db.execute('INSERT INTO entries VALUES (?,?,?,?,?,NULL)',
-                                (raw, kind, json.dumps(identity(st)), sha, key))
-                pending += 1
-                if pending == INVENTORY_BATCH:
-                    self.db.commit()
-                    pending = 0
-                self.progress('inventory')
-            # Publish completion in the same durable transaction as the last
-            # partial batch. A crash before this rebuilds the immutable inventory.
+            with contextlib.closing(entries), work as results:
+                for entry in results:
+                    self.db.execute('INSERT INTO entries VALUES (?,?,?,?,?,NULL)', entry)
+                    pending += 1
+                    if pending == INVENTORY_BATCH:
+                        self.db.commit()
+                        pending = 0
+                    self.progress('inventory')
+            # All hash workers have joined before final rows/completion become
+            # durable and before any manifest or remote owner can be published.
             self.db.execute("INSERT OR REPLACE INTO metadata VALUES ('inventory_complete','true')")
             self.db.commit()
         manifest = self.state / 'manifest.jsonl'
@@ -648,19 +757,78 @@ class Copier:
         self.db.execute('UPDATE multipart SET upload_id=? WHERE singleton=1', (upload_id,))
         self.db.commit()
         parts, width = [], part_size(size)
-        for number, start in enumerate(range(0, size, width), 1):
+        def part(item):
+            number, start = item
+            length = min(width, size-start)
             result = self.call('upload_part', Key=key, UploadId=upload_id, PartNumber=number,
-                               Body=PartBody(stream, start, min(width, size-start), self.limiter),
-                               ContentLength=min(width, size-start))
+                               Body=PartBody(stream, start, length, self.limiter, independent=self.max_speed),
+                               ContentLength=length)
             etag = result.get('ETag')
-            if not isinstance(etag, str) or not etag: raise CopyError('invalid_multipart_part')
-            parts.append({'PartNumber': number, 'ETag': etag})
+            if not isinstance(etag, str) or not etag:
+                raise CopyError('invalid_multipart_part')
+            return {'PartNumber': number, 'ETag': etag}
+        items = enumerate(range(0, size, width), 1)
+        work = (parallel_results(part, items, PART_WORKERS, PART_PENDING, self.cancelled, self.check_active)
+                if self.max_speed else contextlib.nullcontext(map(part, items)))
+        with work as results:
+            parts.extend(results)
+        parts.sort(key=lambda value: value['PartNumber'])
         try:
             self.call('complete_multipart_upload', Key=key, UploadId=upload_id,
                       MultipartUpload={'Parts': parts}, IfNoneMatch='*')
         except Exception as error:
             if error_code(error) not in ('PreconditionFailed', '412'): raise
         self.abort_pending()
+
+    def copy_file(self, entry):
+        raw, ident, sha, key = entry
+        st = json.loads(ident)
+        fresh_small = self.fresh_root and st[2] <= MIN_PART
+        if fresh_small or self.existing(key, self.control_metadata(sha), sha, st[2]) is None:
+            with open_source(self.p['source_root'], raw, st) as stream:
+                self.upload(key, stream, st[2], sha)
+            self.existing(key, self.control_metadata(sha), sha, st[2]) or self.fail('uploaded_object_missing')
+        return raw
+
+    def copy_files(self):
+        rows = iter(self.db.execute("SELECT path,identity,sha,object_key FROM entries WHERE kind='file' ORDER BY path"))
+        try:
+            pending = 0
+            def verified(raw):
+                nonlocal pending
+                self.db.execute('UPDATE entries SET verified=? WHERE path=?', (self.epoch, raw))
+                pending += 1
+                if not self.max_speed or pending == INVENTORY_BATCH:
+                    self.db.commit()
+                    pending = 0
+                self.progress('copying')
+            if not self.max_speed:
+                for row in rows:
+                    verified(self.copy_file(row))
+                return
+            # Each small-file segment is streamed through a bounded pool. A large
+            # file is a barrier: drain small jobs, then let the main thread own one
+            # MPU journal and its bounded part pool before admitting more files.
+            while True:
+                boundary = []
+                def segment():
+                    for row in rows:
+                        if json.loads(row[1])[2] > MIN_PART:
+                            boundary.append(row)
+                            return
+                        yield row
+                with parallel_results(self.copy_file, segment(), COPY_WORKERS, COPY_PENDING,
+                                      self.cancelled, self.check_active) as results:
+                    for raw in results:
+                        verified(raw)
+                self.db.commit()
+                pending = 0
+                if not boundary:
+                    break
+                verified(self.copy_file(boundary[0]))
+            self.db.commit()
+        finally:
+            rows.close()
 
     def progress(self, phase, force=False):
         if not force and time.monotonic() - self.last_progress < 30: return
@@ -685,18 +853,7 @@ class Copier:
                     self.upload(CONTROL + 'manifest.jsonl', stream, self.manifest_size, self.manifest_hash)
                     self.existing(CONTROL + 'manifest.jsonl', self.control_metadata(self.manifest_hash),
                                   self.manifest_hash, self.manifest_size) or self.fail('manifest_missing')
-            for raw, ident, sha, key in self.db.execute("SELECT path,identity,sha,object_key FROM entries WHERE kind='file' ORDER BY path"):
-                st = json.loads(ident)
-                # A freshly claimed empty root has no prior small-file data to
-                # reuse. Conditional PUT still arbitrates races, and every path
-                # (including a 412) must pass the full GET below.
-                fresh_small = self.fresh_root and st[2] <= MIN_PART
-                if fresh_small or self.existing(key, self.control_metadata(sha), sha, st[2]) is None:
-                    with open_source(self.p['source_root'], raw, st) as stream:
-                        self.upload(key, stream, st[2], sha)
-                    self.existing(key, self.control_metadata(sha), sha, st[2]) or self.fail('uploaded_object_missing')
-                self.db.execute('UPDATE entries SET verified=? WHERE path=?', (self.epoch, raw)); self.db.commit()
-                self.progress('copying')
+            self.copy_files()
             if self.db.execute("SELECT COUNT(*) FROM entries WHERE kind='file' AND (verified IS NULL OR verified!=?)", (self.epoch,)).fetchone()[0]:
                 raise CopyError('incomplete_verification')
             self.guard.check(force=True)
@@ -748,6 +905,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', required=True)
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--max-speed', action='store_true', help='unthrottled bounded parallel hashing and transfers')
     args = parser.parse_args(argv)
     if os.geteuid() != 0: raise CopyError('root_required')
     os.umask(0o077)
@@ -758,8 +916,8 @@ def main(argv=None):
         global STOPPED
         STOPPED = True
     for number in (signal.SIGTERM, signal.SIGINT): signal.signal(number, stop)
-    client = make_client(plan)
-    copier = Copier(plan, plan_hash, guard, client)
+    client = make_client(plan, max_speed=args.max_speed)
+    copier = Copier(plan, plan_hash, guard, client, max_speed=args.max_speed)
     if args.check:
         result = copier.check()
     else:

@@ -7,6 +7,8 @@ from pathlib import Path
 import sqlite3
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -410,7 +412,7 @@ class CopyTests(unittest.TestCase):
             return value
         with patch.object(copy,'hash_stream',side_effect=fault):
             with self.assertRaisesRegex(copy.CopyError,'inventory_test_interrupted'): self.copier().run()
-        with sqlite3.connect(self.state/'copy.sqlite3') as db:
+        with copy.contextlib.closing(sqlite3.connect(self.state/'copy.sqlite3')) as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM entries').fetchone()[0],256)
             self.assertIsNone(db.execute("SELECT value FROM metadata WHERE key='inventory_complete'").fetchone())
         self.assertFalse((self.state/'manifest.jsonl').exists())
@@ -470,6 +472,333 @@ class CopyTests(unittest.TestCase):
         with patch.object(copy,'MIN_PART',8),patch.object(copy,'part_size',return_value=16):
             value=self.copier(); self.assertTrue(value.run()['complete']); self.assertTrue(value.fresh_root)
         self.assertEqual([kind for kind,key in events if key=='blobs/first'],['get','create','get'])
+
+
+    def max_copier(self):
+        return copy.Copier(self.plan,self.plan_hash,self.guard,self.s3,max_speed=True)
+
+    def test_max_speed_hash_and_small_transfers_overlap_sqlite_stays_coordinator_only(self):
+        for number in range(90):
+            (self.source/'blobs'/('parallel-%03d'%number)).write_bytes(bytes([number])*4096)
+        lock=threading.Lock(); counts={'hash':0,'hash_high':0,'put':0,'put_high':0}
+        original_hash=copy.hash_stream; original_put=self.s3.put_object; connect=sqlite3.connect
+        sql_threads=[]; coordinator=threading.get_ident()
+        def hash_work(*args):
+            with lock:
+                counts['hash']+=1; counts['hash_high']=max(counts['hash_high'],counts['hash'])
+            try:
+                time.sleep(.004)
+                return original_hash(*args)
+            finally:
+                with lock: counts['hash']-=1
+        def put(**kwargs):
+            with lock:
+                self.assertEqual(counts['hash'],0)
+                counts['put']+=1; counts['put_high']=max(counts['put_high'],counts['put'])
+            try:
+                if kwargs['Key']==copy.CONTROL+'owner.json':
+                    with copy.contextlib.closing(connect(self.state/'copy.sqlite3')) as observer:
+                        self.assertEqual(observer.execute("SELECT value FROM metadata WHERE key='inventory_complete'").fetchone(),('true',))
+                        self.assertEqual(observer.execute("SELECT COUNT(*) FROM entries WHERE kind='file'").fetchone()[0],93)
+                time.sleep(.004)
+                return original_put(**kwargs)
+            finally:
+                with lock: counts['put']-=1
+        def tracked_connect(*args,**kwargs):
+            db=connect(*args,**kwargs); db.set_trace_callback(lambda _sql:sql_threads.append(threading.get_ident())); return db
+        self.s3.put_object=put
+        with patch.object(copy,'hash_stream',side_effect=hash_work),patch.object(copy.sqlite3,'connect',side_effect=tracked_connect):
+            result=self.max_copier().run()
+        self.assertTrue(result['complete']); self.assertEqual(result['files'],93)
+        self.assertGreater(counts['hash_high'],1); self.assertLessEqual(counts['hash_high'],copy.HASH_WORKERS)
+        self.assertGreater(counts['put_high'],1); self.assertLessEqual(counts['put_high'],copy.COPY_WORKERS)
+        self.assertEqual(set(sql_threads),{coordinator})
+        self.assertEqual(counts['hash'],0); self.assertEqual(counts['put'],0)
+        puts=[c for c in self.s3.calls if c[0]=='put']
+        self.assertEqual(puts[-1][1],copy.CONTROL+'COMPLETE.json')
+        events=len(puts); self.assertTrue(self.max_copier().run()['complete'])
+        self.assertEqual(events,len([c for c in self.s3.calls if c[0]=='put']))
+
+    def test_parallel_window_does_not_consume_unbounded_input(self):
+        release=threading.Event(); entered=threading.Event(); lock=threading.Lock()
+        counts={'produced':0,'active':0,'high':0}; results=[]; errors=[]
+        def items():
+            for number in range(20):
+                with lock: counts['produced']+=1
+                yield number
+        def work(number):
+            with lock:
+                counts['active']+=1; counts['high']=max(counts['high'],counts['active'])
+                if counts['active']==2: entered.set()
+            try:
+                if not release.wait(5): raise AssertionError('test release missing')
+                return number
+            finally:
+                with lock: counts['active']-=1
+        def coordinator():
+            try:
+                with copy.parallel_results(work,items(),2,4,threading.Event(),lambda:None) as output:
+                    results.extend(output)
+            except BaseException as error: errors.append(error)
+        thread=threading.Thread(target=coordinator); thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            limit=time.monotonic()+5
+            while counts['produced']<4 and time.monotonic()<limit: time.sleep(.001)
+            self.assertEqual(counts['produced'],4)
+            self.assertEqual(counts['high'],2)
+        finally:
+            release.set(); thread.join(10)
+        self.assertFalse(thread.is_alive()); self.assertEqual(errors,[])
+        self.assertEqual(sorted(results),list(range(20))); self.assertEqual(counts['active'],0)
+
+    def test_parallel_small_failure_drains_before_return_and_preserves_resume(self):
+        for number in range(20): (self.source/'blobs'/('queued-%02d'%number)).write_bytes(b'queue')
+        release=threading.Event(); entered=threading.Event(); failed=threading.Event(); lock=threading.Lock()
+        counts={'started':0,'active':0}; errors=[]; original=self.s3.put_object
+        def put(**kwargs):
+            if not kwargs['Key'].startswith('blobs/'): return original(**kwargs)
+            with lock: counts['started']+=1; rank=counts['started']; counts['active']+=1
+            try:
+                if rank==1:
+                    entered.set()
+                    if not release.wait(5): raise AssertionError('test release missing')
+                if rank==2:
+                    if not entered.wait(5): raise AssertionError('first request missing')
+                    failed.set(); raise S3Error('ServerFailure')
+                return original(**kwargs)
+            finally:
+                with lock: counts['active']-=1
+        self.s3.put_object=put
+        def run():
+            try: self.max_copier().run()
+            except BaseException as error: errors.append(error)
+        with patch.object(copy,'COPY_WORKERS',2),patch.object(copy,'COPY_PENDING',4):
+            thread=threading.Thread(target=run); thread.start()
+            try:
+                self.assertTrue(failed.wait(5)); self.assertTrue(thread.is_alive())
+                self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+            finally: release.set(); thread.join(10)
+        self.assertFalse(thread.is_alive()); self.assertEqual(counts['active'],0)
+        self.assertEqual(str(errors[0]),'s3_request_failed')
+        self.assertLessEqual(counts['started'],2)
+        self.s3.put_object=original
+        self.assertTrue(self.max_copier().run()['complete'])
+
+    def test_parallel_multipart_uses_independent_offsets_sorted_etags_and_no_active_parts_at_complete(self):
+        body=bytes(range(251))*1700
+        (self.source/'blobs'/'large').write_bytes(body)
+        original=self.s3.upload_part; complete=self.s3.complete_multipart_upload
+        lock=threading.Lock(); counts={'active':0,'high':0}
+        def part(**kwargs):
+            with lock: counts['active']+=1; counts['high']=max(counts['high'],counts['active'])
+            try:
+                self.assertTrue(kwargs['Body'].independent)
+                kwargs['Body'].stream.seek(11)
+                kwargs['Body'].read(3); kwargs['Body'].seek(0)
+                time.sleep(.002*(4-kwargs['PartNumber']%4))
+                return original(**kwargs)
+            finally:
+                with lock: counts['active']-=1
+        def finished(**kwargs):
+            self.assertEqual(counts['active'],0)
+            numbers=[p['PartNumber'] for p in kwargs['MultipartUpload']['Parts']]
+            self.assertEqual(numbers,sorted(numbers))
+            return complete(**kwargs)
+        self.s3.upload_part=part; self.s3.complete_multipart_upload=finished
+        with patch.object(copy,'MIN_PART',8),patch.object(copy,'part_size',return_value=32768):
+            self.assertTrue(self.max_copier().run()['complete'])
+        self.assertEqual(self.s3.objects['blobs/large'][0],body)
+        self.assertGreater(counts['high'],1); self.assertLessEqual(counts['high'],copy.PART_WORKERS)
+        self.assertEqual(self.s3.uploads,{})
+
+    def test_parallel_part_failure_drains_before_aborting_exact_owned_id(self):
+        (self.source/'blobs'/'large').write_bytes(b'part-evidence'*20000)
+        release=threading.Event(); entered=threading.Event(); failed=threading.Event(); lock=threading.Lock()
+        counts={'active':0}; errors=[]; original=self.s3.upload_part; abort=self.s3.abort_multipart_upload
+        self.s3.uploads['foreign']={'key':'foreign','metadata':{},'parts':{}}
+        def part(**kwargs):
+            if kwargs['Key']!='blobs/large': return original(**kwargs)
+            with lock: counts['active']+=1
+            try:
+                if kwargs['PartNumber']==1:
+                    entered.set()
+                    if not release.wait(5): raise AssertionError('test release missing')
+                if kwargs['PartNumber']==2:
+                    if not entered.wait(5): raise AssertionError('first request missing')
+                    failed.set(); raise S3Error('ServerFailure')
+                return original(**kwargs)
+            finally:
+                with lock: counts['active']-=1
+        def abort_owned(**kwargs):
+            if kwargs['Key']=='blobs/large': self.assertEqual(counts['active'],0)
+            self.assertNotEqual(kwargs['UploadId'],'foreign')
+            return abort(**kwargs)
+        self.s3.upload_part=part; self.s3.abort_multipart_upload=abort_owned
+        def run():
+            try: self.max_copier().run()
+            except BaseException as error: errors.append(error)
+        with patch.object(copy,'MIN_PART',8),patch.object(copy,'part_size',return_value=32768):
+            thread=threading.Thread(target=run); thread.start()
+            try:
+                self.assertTrue(failed.wait(5)); self.assertTrue(thread.is_alive())
+                self.assertFalse(any(c[0]=='abort' and c[1]=='blobs/large' for c in self.s3.calls))
+            finally: release.set(); thread.join(10)
+        self.assertFalse(thread.is_alive()); self.assertEqual(counts['active'],0)
+        self.assertEqual(str(errors[0]),'s3_request_failed')
+        self.assertEqual(set(self.s3.uploads),{'foreign'})
+        self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+
+    def test_max_speed_limiter_counts_atomically_without_sleep(self):
+        limiter=copy.Limiter(self.guard,rate=None)
+        with patch.object(copy.time,'sleep',side_effect=AssertionError('unthrottled mode slept')):
+            with copy.concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+                list(pool.map(lambda _: [limiter.consume(1) for _ in range(1000)],range(16)))
+        self.assertEqual(limiter.bytes,16000)
+        value=self.max_copier(); self.assertIsNone(value.limiter.rate)
+        self.assertEqual(copy.Copier(self.plan,self.plan_hash,self.guard,self.s3).limiter.rate,copy.RATE)
+
+
+    def test_parallel_hash_failure_drains_and_cannot_publish_inventory_or_remote_owner(self):
+        release=threading.Event(); entered=threading.Event(); failed=threading.Event(); lock=threading.Lock()
+        counts={'rank':0,'active':0}; errors=[]; original=copy.hash_stream
+        def hashed(*args):
+            with lock: counts['rank']+=1; rank=counts['rank']; counts['active']+=1
+            try:
+                if rank==1:
+                    entered.set()
+                    if not release.wait(5): raise AssertionError('test release missing')
+                if rank==2:
+                    if not entered.wait(5): raise AssertionError('first hash missing')
+                    failed.set(); raise copy.CopyError('source_file_changed')
+                return original(*args)
+            finally:
+                with lock: counts['active']-=1
+        def run():
+            try: self.max_copier().run()
+            except BaseException as error: errors.append(error)
+        with patch.object(copy,'HASH_WORKERS',2),patch.object(copy,'HASH_PENDING',4),patch.object(copy,'hash_stream',side_effect=hashed):
+            thread=threading.Thread(target=run); thread.start()
+            try:
+                self.assertTrue(failed.wait(5)); self.assertTrue(thread.is_alive())
+                self.assertEqual(self.s3.objects,{})
+            finally: release.set(); thread.join(10)
+        self.assertFalse(thread.is_alive()); self.assertEqual(counts['active'],0)
+        self.assertEqual(str(errors[0]),'source_file_changed')
+        with copy.contextlib.closing(sqlite3.connect(self.state/'copy.sqlite3')) as db:
+            self.assertIsNone(db.execute("SELECT value FROM metadata WHERE key='inventory_complete'").fetchone())
+        self.assertEqual(self.s3.objects,{})
+        self.assertTrue(self.max_copier().run()['complete'])
+
+    def test_guard_serializes_source_probes_and_rechecks_cache_after_lock(self):
+        mountpoint=self.root/'thread-mount'; snapshot=mountpoint/'.zfs'/'snapshot'/'copy-fixed'
+        snapshot.mkdir(parents=True)
+        token='e'*24; plan={**self.plan,'source_root':str(snapshot),
+            'migration_proof_id':copy.digest(b'devres-nodeport-proof-v1\0'+token.encode())}
+        self.plan_file.write_bytes(copy.canonical(plan)); plan_hash=copy.digest(self.plan_file.read_bytes())
+        journal=self.root/'thread-journal.json'
+        journal.write_bytes(copy.canonical({'token':token,'phase':'running_migrate_storage','mode':'direct','deadline_at':copy.DEADLINE}))
+        journal.chmod(0o600); probes=[]
+        def run(args):
+            probes.append(args); time.sleep(.002)
+            if args[:2]==['zfs','holds']: return plan['source_snapshot']+'\t'+plan['hold']+'\tdate'
+            if args[:2]==['zfs','list']: return copy.DATASET
+            if args[-2]=='mountpoint': return str(mountpoint)
+            return '456' if '@' in args[-1] else '123'
+        guard=copy.Guard(plan,self.plan_file,plan_hash,run=run,clock=lambda:copy.DEADLINE-1000)
+        barrier=threading.Barrier(8)
+        def check(_): barrier.wait(timeout=5); guard.check()
+        with patch.object(copy,'JOURNAL',journal),patch.object(copy.os,'statvfs',return_value=SimpleNamespace(f_flag=os.ST_RDONLY)), \
+                patch.object(copy,'mount_paths',return_value=[]):
+            with copy.concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool: list(pool.map(check,range(8)))
+            self.assertEqual(len(probes),5)
+            guard.run=lambda _args:'wrong-guid'
+            with self.assertRaisesRegex(copy.CopyError,'source_identity_changed'): guard.check(force=True)
+            guard.run=run
+            def stopped(_):
+                with self.assertRaisesRegex(copy.CopyError,'source_identity_changed'): guard.check()
+            with copy.concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool: list(pool.map(stopped,range(8)))
+            self.assertEqual(len(probes),5)
+            def stop_during_probe(args):
+                copy.STOPPED=True
+                return run(args)
+            with patch.object(copy,'STOPPED',False):
+                interrupted=copy.Guard(plan,self.plan_file,plan_hash,run=stop_during_probe,clock=lambda:copy.DEADLINE-1000)
+                with self.assertRaisesRegex(copy.CopyError,'copy_interrupted'): interrupted.check(force=True)
+
+    def test_cli_max_speed_passes_fixed_mode_and_sdk_pool_is_sufficient(self):
+        result=SimpleNamespace(returncode=0,stdout=json.dumps(['ACCESS','SECRET',copy.REGION]).encode())
+        account=SimpleNamespace(pw_name='codex',pw_uid=1001,pw_gid=1001,pw_dir='/home/codex')
+        sdk=MagicMock(); config=MagicMock(); client=sdk.Session.return_value.client.return_value
+        client.meta.service_model.operation_model.return_value.input_shape.members={'IfNoneMatch':object()}
+        modules={'boto3':sdk,'botocore':SimpleNamespace(),'botocore.config':SimpleNamespace(Config=config)}
+        with patch.dict('sys.modules',modules),patch.object(copy.pwd,'getpwnam',return_value=account), \
+                patch.object(copy.subprocess,'run',return_value=result): copy.make_client(self.plan,max_speed=True)
+        self.assertEqual(config.call_args.kwargs['max_pool_connections'],copy.MAX_CONNECTIONS)
+        self.assertGreaterEqual(copy.MAX_CONNECTIONS,max(copy.COPY_WORKERS,copy.PART_WORKERS))
+        with patch.object(copy.os,'geteuid',return_value=0),patch.object(copy,'read_plan',return_value=(self.plan,self.plan_hash)), \
+                patch.object(copy,'Guard'),patch.object(copy,'make_client') as make,patch.object(copy,'Copier') as copier, \
+                patch.object(copy.os,'umask'),patch.object(copy.signal,'signal'),patch('sys.stdout',new=io.StringIO()):
+            copier.return_value.check.return_value={'check_passed':True}
+            copy.main(['--plan',str(self.plan_file),'--check','--max-speed'])
+        self.assertTrue(make.call_args.kwargs['max_speed'])
+        self.assertTrue(copier.call_args.kwargs['max_speed'])
+        copier.return_value.check.assert_called_once()
+
+
+    def test_parallel_sqlite_consumer_failure_drains_and_releases_cursor_for_resume(self):
+        for number in range(12): (self.source/'blobs'/('sql-%02d'%number)).write_bytes(b'checkpoint evidence')
+        value=self.max_copier(); database=value.database; original=self.s3.put_object
+        release=threading.Event(); checkpoint_failed=threading.Event(); entered=threading.Event()
+        lock=threading.Lock(); counts={'active':0,'rank':0}; errors=[]
+        def opened():
+            database()
+            value.db.execute("CREATE TEMP TRIGGER reject_checkpoint BEFORE UPDATE OF verified ON entries BEGIN SELECT RAISE(FAIL,'fixture_checkpoint_failure'); END")
+            value.db.set_trace_callback(lambda sql:checkpoint_failed.set() if sql.startswith('UPDATE entries SET verified') else None)
+        def put(**kwargs):
+            if not kwargs['Key'].startswith('blobs/'): return original(**kwargs)
+            with lock: counts['active']+=1; counts['rank']+=1; rank=counts['rank']
+            try:
+                if rank==1:
+                    entered.set()
+                    if not release.wait(5): raise AssertionError('test release missing')
+                return original(**kwargs)
+            finally:
+                with lock: counts['active']-=1
+        def run():
+            try: value.run()
+            except BaseException as error: errors.append(error)
+        value.database=opened; self.s3.put_object=put
+        with patch.object(copy,'COPY_WORKERS',2),patch.object(copy,'COPY_PENDING',4):
+            thread=threading.Thread(target=run); thread.start()
+            try:
+                self.assertTrue(entered.wait(5)); self.assertTrue(checkpoint_failed.wait(5))
+                self.assertTrue(thread.is_alive()); self.assertIsNotNone(value.db)
+                self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+            finally: release.set(); thread.join(10)
+        self.assertFalse(thread.is_alive()); self.assertEqual(counts['active'],0); self.assertIsNone(value.db)
+        self.assertIsInstance(errors[0],sqlite3.IntegrityError)
+        self.s3.put_object=original
+        self.assertTrue(self.max_copier().run()['complete'])
+
+    def test_default_and_parallel_hash_order_produce_identical_manifest(self):
+        for number in range(30): (self.source/'blobs'/('same-%02d'%number)).write_bytes(bytes([number])*1024)
+        self.copier().run()
+        expected=self.s3.objects[copy.CONTROL+'manifest.jsonl'][0]
+        self.s3=S3(); self.state=self.root/'parallel-state'; self.state.mkdir(mode=0o700)
+        self.plan={**self.plan,'state_dir':str(self.state)}
+        self.plan_hash=copy.digest(copy.canonical(self.plan))
+        self.assertTrue(self.max_copier().run()['complete'])
+        self.assertEqual(self.s3.objects[copy.CONTROL+'manifest.jsonl'][0],expected)
+        self.assertTrue(self.copier().run()['complete'])
+
+    def test_worker_cancellation_during_guard_cannot_start_another_request(self):
+        value=self.max_copier()
+        with patch.object(self.guard,'check',side_effect=lambda **_kwargs:value.cancelled.set()), \
+                patch.object(self.s3,'get_object') as get:
+            with self.assertRaisesRegex(copy.CopyError,'copy_worker_cancelled'):
+                value.call('get_object',Key='blobs/first')
+        get.assert_not_called()
 
 
 if __name__=='__main__': unittest.main()
