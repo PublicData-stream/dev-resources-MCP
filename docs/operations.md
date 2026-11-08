@@ -1047,3 +1047,49 @@ required. RustFS/local architecture evidence is separate from AWS/other provider
 hosted native architecture CI, edge/CNI acceptance and production deployment.
 The [local S3 acceptance record](s3-storage-evidence.md) lists the checks actually
 performed and their scope.
+
+### Frozen evidence-only copy to Scaleway
+
+The scoped first-party helper `scripts/copy-evidence-to-s3.py` copies a held,
+read-only snapshot of `cachepool/devres-staging/evidence` to the
+`dev-resources-mcp` bucket in `fr-par`. This is a point-in-time filesystem copy
+while the existing filesystem migration continues. It does not activate the S3
+backend, alter database/schema state, or constitute a coordinated database backup.
+In-progress derived staging files can be present in the frozen tree.
+
+The root-owned, mode-0600 plan pins dataset/snapshot GUIDs, the snapshot hold,
+source root, original migration proof and deadline, and the owner-only destination.
+Authentication uses only the remote `codex` account's selected `newprofile` through
+captured CLI output; secret values are neither arguments nor persisted copy state.
+The helper is deliberately scoped to this operation and refuses other destinations.
+
+```sh
+python3 -I -B scripts/copy-evidence-to-s3.py --plan COPY_PLAN.json --check
+python3 -I -B scripts/copy-evidence-to-s3.py --plan COPY_PLAN.json
+```
+
+`--check` performs read-only source inventory and bucket admission. The first copy
+requires an empty bucket root. Native relative paths, including `blobs/...` and
+hidden integrity files, are preserved. Unrepresentable or overlong object keys
+are mapped through the manifest's base64 filesystem paths. Directories and file
+ownership/modes/timestamps are recorded; each hardlink pathname receives its own
+verified bytes. Symlinks, special files and uncaptured child filesystems fail
+explicitly rather than disappearing from the copy.
+
+Control objects live under `_devres-copy/`. Conditional creation prevents
+unconditional overwrite, and resume requires the exact owner/plan/manifest.
+Large files use adaptive multipart sizes within Scaleway's 1,000-part limit.
+Only a durably recorded unfinished upload may be aborted. An uncertain creation
+with no recorded upload ID requires reconciliation and cannot silently create a
+new upload. Completed objects and source snapshots are retained on interruption.
+
+The private state directory holds `copy.sqlite3`, `manifest.jsonl`, and
+`progress.json`. Source hashing completes before the first object publication;
+`inventory` progress therefore does not mean remote bytes have been copied.
+A shared 16-MiB/s budget covers source reads, upload-body reads and verification
+GETs. Run with low CPU/I/O priority and retain sufficient snapshot-COW headroom
+for the original migration. Every completed object is read back and SHA-256
+verified. `_devres-copy/COMPLETE.json` is published last, after the full file set
+and destination key inventory pass. This marker proves the frozen file copy;
+a matching PostgreSQL backup and the separate application restore/acceptance
+procedure remain necessary for a server migration.
