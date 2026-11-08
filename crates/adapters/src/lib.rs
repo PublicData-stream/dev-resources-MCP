@@ -4,6 +4,7 @@ mod attribution;
 pub mod attribution_providers;
 pub use attribution::AttributionAdapter;
 pub mod bulk;
+pub mod object_storage;
 pub(crate) mod immutable_index;
 pub mod integrity;
 mod migration_execution;

@@ -1,5 +1,49 @@
 # Dependency admission
 
+## S3-compatible archive transport
+
+`aws-sdk-s3 1.157.0` and `aws-sdk-sts 1.124.0` are pinned to the maintained
+[AWS Rust SDK](https://github.com/awslabs/aws-sdk-rust). Both require Rust 1.94.1,
+below the pinned workspace toolchain. S3 owns SigV4, conditional single-object and
+multipart completion, streaming response decoding and bounded retry classification;
+STS owns the standard OIDC token exchange. A handwritten signer or S3/XML protocol
+implementation would duplicate security-sensitive work. A general `object_store`
+abstraction was considered, but this adapter needs explicit conditional multipart
+completion, ambiguous-response reconciliation and narrowly selected credential
+origins rather than automatic cloud-provider configuration.
+
+Defaults are disabled. S3 enables only `rt-tokio` and `http-1x`; STS enables only
+`rt-tokio`. SigV4a, an additional HTTPS implementation, SSO, login, shell credential
+processes, profile discovery and instance-metadata credential fallback are not
+enabled by this integration. `aws-config` is unnecessary: an explicit
+`ProvideCredentials` implementation selects mounted secret files, configured STS,
+or a configured container-credential endpoint. Expiring workload credentials retain
+the SDK identity-cache refresh contract. The SDK transport uses the existing
+reqwest/rustls client through a destination-checked Smithy HTTP bridge; redirects
+and reqwest retries are disabled, and the SDK is the single retry owner.
+
+`aws-credential-types`, `aws-smithy-runtime-api`, and `aws-smithy-types` are direct
+support dependencies because the adapter implements credential and HTTP ports.
+The existing resolved `http`, `http-body`, and `http-body-util` packages become
+direct dependencies for streaming that bridge without buffering whole artifacts.
+Existing `percent-encoding` becomes direct for transferring SQLx's canonical
+database password to libpq runtime variables without changing encoded characters
+or placing credentials in subprocess arguments.
+Its existing locked version 2.3.2 is MIT OR Apache-2.0, uses default `std`/`alloc`
+features, and has no build script or native code. Reusing the URL stack's decoder
+avoids a handwritten codec; it adds no resolved package/version or network path.
+Tokio's existing `rt-multi-thread` capability also supports the private blocking
+archive bridge; it introduces no new executable or network destination.
+
+AWS/Smithy packages are Apache-2.0. Their transitive graph adds maintained protocol,
+checksum, cryptographic and encoding support recorded exactly in Cargo.lock. These
+features add no new native TLS backend or build-time download mechanism; existing
+cryptography build scripts remain part of workspace dependency admission. Preserve
+all resolved package license/notice files in generated image notices. SDK source
+and build tooling never execute inspected packages. Current advisory, license and
+source checks remain mandatory on the integrated locked graph; compilation and
+fixture tests alone do not establish passing dependency admission.
+
 Attribution supervision makes the existing locked `tokio-util` cancellation token a
 direct application dependency with only `rt` enabled. It adds no package/version,
 build script, network destination or executable capability. The existing runtime
