@@ -40,6 +40,7 @@ PLAN_FIELDS = {'version', 'source_dataset', 'source_dataset_guid', 'source_snaps
 CHUNK = 1024 * 1024
 RATE = 16 * CHUNK
 MIN_PART = 16 * CHUNK
+INVENTORY_BATCH = 256
 MAX_PART = 5_000_000_000
 MAX_OBJECT = MAX_PART * 1000
 PHASES = {'running_migrate_storage', 'running_verify_storage', 'running_activate_storage',
@@ -426,6 +427,7 @@ class Copier:
         self.epoch = uuid.uuid4().hex
         self.last_progress = 0
         self.manifest_hash = None
+        self.fresh_root = False
 
     def call(self, method, **kwargs):
         self.guard.check()
@@ -495,12 +497,15 @@ class Copier:
         existing = self.existing(key, metadata, sha, len(data), maximum=max(len(data), 1))
         if existing is not None:
             if existing != data: raise CopyError('control_collision')
-            return
+            return False
+        created = False
         try:
             self.call('put_object', Key=key, Body=data, ContentLength=len(data), Metadata=metadata, IfNoneMatch='*')
+            created = True
         except Exception as error:
             if error_code(error) not in ('PreconditionFailed', '412'): raise
         self.existing(key, metadata, sha, len(data)) or self.fail('conditional_object_missing')
+        return created
 
     @staticmethod
     def fail(code):
@@ -536,6 +541,7 @@ class Copier:
             # same immutable snapshot; already finished remote data is untouched.
             self.db.execute('DELETE FROM entries')
             self.db.commit()
+            pending = 0
             for raw, kind, st in walk(self.p['source_root'], self.guard):
                 sha, key = None, None
                 if kind == 'file':
@@ -546,8 +552,13 @@ class Copier:
                     key = object_key(raw)
                 self.db.execute('INSERT INTO entries VALUES (?,?,?,?,?,NULL)',
                                 (raw, kind, json.dumps(identity(st)), sha, key))
-                self.db.commit()
+                pending += 1
+                if pending == INVENTORY_BATCH:
+                    self.db.commit()
+                    pending = 0
                 self.progress('inventory')
+            # Publish completion in the same durable transaction as the last
+            # partial batch. A crash before this rebuilds the immutable inventory.
             self.db.execute("INSERT OR REPLACE INTO metadata VALUES ('inventory_complete','true')")
             self.db.commit()
         manifest = self.state / 'manifest.jsonl'
@@ -597,8 +608,9 @@ class Copier:
                 raise CopyError('bucket_root_not_empty')
         elif existing != expected:
             raise CopyError('bucket_root_owner_collision')
-        self.conditional_bytes(CONTROL + 'owner.json', expected)
+        created = self.conditional_bytes(CONTROL + 'owner.json', expected)
         self.verify_bucket_keys()
+        self.fresh_root = existing is None and created
 
     def abort_pending(self):
         row = self.db.execute('SELECT object_key,upload_id,metadata FROM multipart WHERE singleton=1').fetchone()
@@ -675,7 +687,11 @@ class Copier:
                                   self.manifest_hash, self.manifest_size) or self.fail('manifest_missing')
             for raw, ident, sha, key in self.db.execute("SELECT path,identity,sha,object_key FROM entries WHERE kind='file' ORDER BY path"):
                 st = json.loads(ident)
-                if self.existing(key, self.control_metadata(sha), sha, st[2]) is None:
+                # A freshly claimed empty root has no prior small-file data to
+                # reuse. Conditional PUT still arbitrates races, and every path
+                # (including a 412) must pass the full GET below.
+                fresh_small = self.fresh_root and st[2] <= MIN_PART
+                if fresh_small or self.existing(key, self.control_metadata(sha), sha, st[2]) is None:
                     with open_source(self.p['source_root'], raw, st) as stream:
                         self.upload(key, stream, st[2], sha)
                     self.existing(key, self.control_metadata(sha), sha, st[2]) or self.fail('uploaded_object_missing')

@@ -400,4 +400,76 @@ class CopyTests(unittest.TestCase):
             with self.assertRaisesRegex(copy.CopyError,'^credential_selection_failed$'): copy.make_client(self.plan)
 
 
+    def test_inventory_partial_batch_fault_keeps_only_durable_prefix_then_rebuilds_before_s3(self):
+        for number in range(330):
+            (self.source/'blobs'/('batch-%04d'%number)).write_bytes(('evidence-%d'%number).encode())
+        original=copy.hash_stream; calls=[]
+        def fault(stream,limiter):
+            value=original(stream,limiter); calls.append(value)
+            if len(calls)==300: raise copy.CopyError('inventory_test_interrupted')
+            return value
+        with patch.object(copy,'hash_stream',side_effect=fault):
+            with self.assertRaisesRegex(copy.CopyError,'inventory_test_interrupted'): self.copier().run()
+        with sqlite3.connect(self.state/'copy.sqlite3') as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM entries').fetchone()[0],256)
+            self.assertIsNone(db.execute("SELECT value FROM metadata WHERE key='inventory_complete'").fetchone())
+        self.assertFalse((self.state/'manifest.jsonl').exists())
+        self.assertEqual(self.s3.objects,{})
+        self.assertFalse(any(call[0] in ('put','create','complete_mpu') for call in self.s3.calls))
+        with patch.object(copy,'hash_stream',wraps=original) as hashes:
+            result=self.copier().run()
+        self.assertEqual(hashes.call_count,333)
+        self.assertEqual(result['files'],333)
+        self.assertTrue(result['complete'])
+        self.assertEqual(len([r for r in self.manifest() if r['kind']=='file']),333)
+
+    def trace_s3_file_order(self):
+        events=[]; get=self.s3.get_object; put=self.s3.put_object; create=self.s3.create_multipart_upload
+        def get_traced(**kwargs): events.append(('get',kwargs['Key'])); return get(**kwargs)
+        def put_traced(**kwargs): events.append(('put',kwargs['Key'])); return put(**kwargs)
+        def create_traced(**kwargs): events.append(('create',kwargs['Key'])); return create(**kwargs)
+        self.s3.get_object=get_traced; self.s3.put_object=put_traced; self.s3.create_multipart_upload=create_traced
+        return events
+
+    def test_fresh_small_file_put_then_full_get_but_resume_gets_without_put(self):
+        events=self.trace_s3_file_order()
+        value=self.copier(); self.assertTrue(value.run()['complete']); self.assertTrue(value.fresh_root)
+        self.assertEqual([kind for kind,key in events if key=='blobs/first'],['put','get'])
+        events.clear()
+        resumed=self.copier(); self.assertTrue(resumed.run()['complete']); self.assertFalse(resumed.fresh_root)
+        self.assertEqual([kind for kind,key in events if key=='blobs/first'],['get'])
+
+    def test_fresh_small_412_accepts_only_matching_object_after_full_get(self):
+        put=self.s3.put_object
+        def race(**kwargs):
+            if kwargs['Key']=='blobs/first' and kwargs['Key'] not in self.s3.objects:
+                self.s3.objects[kwargs['Key']]=(S3.consume(kwargs['Body']),kwargs['Metadata'])
+                raise S3Error('PreconditionFailed')
+            return put(**kwargs)
+        self.s3.put_object=race
+        events=self.trace_s3_file_order()
+        value=self.copier(); self.assertTrue(value.run()['complete']); self.assertTrue(value.fresh_root)
+        self.assertEqual([kind for kind,key in events if key=='blobs/first'],['put','get'])
+        self.assertEqual(self.s3.objects['blobs/first'][0],(self.source/'blobs'/'first').read_bytes())
+
+    def test_owner_412_race_is_conservative_resume_and_large_mpu_keeps_pre_get(self):
+        put=self.s3.put_object
+        def race(**kwargs):
+            if kwargs['Key']==copy.CONTROL+'owner.json' and kwargs['Key'] not in self.s3.objects:
+                self.s3.objects[kwargs['Key']]=(S3.consume(kwargs['Body']),kwargs['Metadata'])
+                raise S3Error('PreconditionFailed')
+            return put(**kwargs)
+        self.s3.put_object=race
+        events=self.trace_s3_file_order()
+        value=self.copier(); self.assertTrue(value.run()['complete']); self.assertFalse(value.fresh_root)
+        self.assertEqual([kind for kind,key in events if key=='blobs/first'],['get','put','get'])
+        # An independently fresh bucket still checks before a large multipart upload.
+        self.s3=S3(); self.state=self.root/'large-state'; self.state.mkdir(mode=0o700)
+        self.plan={**self.plan,'state_dir':str(self.state)}
+        events=self.trace_s3_file_order()
+        with patch.object(copy,'MIN_PART',8),patch.object(copy,'part_size',return_value=16):
+            value=self.copier(); self.assertTrue(value.run()['complete']); self.assertTrue(value.fresh_root)
+        self.assertEqual([kind for kind,key in events if key=='blobs/first'],['get','create','get'])
+
+
 if __name__=='__main__': unittest.main()

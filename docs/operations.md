@@ -1086,8 +1086,11 @@ new upload. Completed objects and source snapshots are retained on interruption.
 The private state directory holds `copy.sqlite3`, `manifest.jsonl`, and
 `progress.json`. Source hashing completes before the first object publication;
 `inventory` progress therefore does not mean remote bytes have been copied.
-A shared 16-MiB/s budget covers source reads, upload-body reads and verification
-GETs. Run with low CPU/I/O priority and retain sufficient snapshot-COW headroom
+Inventory commits bounded 256-entry batches, with its completion flag committed
+with the final batch before remote admission. Fresh small files use conditional
+PUT followed by full GET verification; resumed files and large multipart objects
+retain their initial remote check. A shared 16-MiB/s budget covers source reads,
+upload-body reads and verification GETs. Run with low CPU/I/O priority and retain sufficient snapshot-COW headroom
 for the original migration. Every completed object is read back and SHA-256
 verified. `_devres-copy/COMPLETE.json` is published last, after the full file set
 and destination key inventory pass. This marker proves the frozen file copy;
