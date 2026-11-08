@@ -332,7 +332,7 @@ nonzero console status marks unavailable or partial counters. Artifact write fai
 never replace the scenario's exit status. No host software or shared caches are pruned.
 
 The driver enters owned `/tmp` state through `with-tmp-state.sh`, then overrides
-Cargo and OxiBelt targets to `/buildcache/rust/target`. It installs Rust 1.99.1
+Cargo and OxiBelt targets to `/tmp/rust/target`. It installs Rust 1.99.1
 before checking native host/compiler/daemon agreement inside an isolated rootful
 `with-local-docker.sh` daemon. Minikube 1.39.0 downloads are checked against pinned
 architecture-specific SHA-256 values and use Kubernetes 1.37.0. These disposable
@@ -975,3 +975,75 @@ private mTLS and health boundaries, and coordinated ZFS snapshot/clone recovery.
 Its permanent public corpus is separate from the disposable foundation and tests.
 Staging acceptance covers deployment and supervised collection bootstrap; full
 provider coverage, full-corpus capacity and native ChatGPT UI remain separate gates.
+
+
+## S3 transfer and recovery
+
+Use an existing, private bucket and an exclusive instance prefix. Provision only
+the required read, conditional write, multipart and prefix-list/abort permissions;
+the application does not create buckets or delete permanent objects. Allow the
+configured storage/identity destinations explicitly without changing public source
+allowlists or OxiBelt routes. Keep credentials in operator-mounted files. Review
+bucket durability, encryption, replication and retention separately.
+
+For an initialized filesystem store, stop serving/collectors, retain a coordinated
+PostgreSQL/filesystem backup, and finish existing BLAKE3/attribution activation to
+schema 11. Use an S3-enabled server configuration whose `blob_dir` still names the
+original archive:
+
+```sh
+devres-server migrate-object-storage /etc/devres/server.toml
+devres-server verify-object-storage /etc/devres/server.toml
+devres-server activate-object-storage /etc/devres/server.toml
+```
+
+The first command freezes the inventory and resumes after interruption. Any source
+change, missing evidence, conflicting destination or incomplete transfer blocks
+activation. There is no provider acquisition. Keep writers stopped between these
+commands. Activation commits the backend binding and receipt together. Retain the
+source files; serving must subsequently use a separate local working directory sized
+for its configured cache and provider workspaces. Changing only a configuration
+file never migrates populated storage automatically.
+
+For S3 backup, stop writers and use a separate, initially empty backup prefix.
+`BACKUP-S3.toml` contains the standalone contents of an S3 configuration table,
+including its selected credential table, without the `storage.s3` wrapper.
+
+```sh
+devres-server backup-object-storage /etc/devres/server.toml /etc/devres/backup-s3.toml
+```
+
+The command holds exclusive ownership, verifies the archive, creates a bounded
+PostgreSQL custom dump, copies and verifies permanent objects, and publishes the
+backup receipt last. It needs fixed PostgreSQL 18 `pg_dump`/`pg_restore` client
+tools; these are included in the server image. It never accepts package SQL.
+A receipt requires sufficient local scratch capacity; failure is explicit.
+Retain backups independently of ordinary archive credentials/lifecycle rules.
+
+Restore into an empty PostgreSQL database, a fresh S3 prefix and an owned local
+working directory using the target server configuration:
+
+```sh
+devres-server restore-object-storage /etc/devres/restore-target.toml /etc/devres/backup-s3.toml
+```
+
+Restoration verifies the dump/object inventory, explicitly rebinds the target, and
+verifies the restored corpus before lifting its serving fence. A failed restore
+remains fenced; preserve diagnostics and use a fresh target for another attempt.
+Legacy filesystem/ZFS recovery does not establish an S3 backup or restore.
+The staging snapshot tool checks the active `devres-config` Secret before changing
+workloads; an unavailable/invalid selected configuration or an S3 backend blocks
+that filesystem-only operation.
+After S3 accepts newer publications, the original filesystem tree is only a
+pre-cutover recovery source: rollback requires its matching database backup or a
+verified reverse transfer, never merely changing `storage.backend`.
+
+Run disposable acceptance with `scripts/with-tmp-state.sh scripts/test-s3.sh` and
+`scripts/with-tmp-state.sh env CARGO_TARGET_DIR=/tmp/rust/target OXIBELT_TARGET_DIR=/tmp/rust/target scripts/test-minikube.sh --s3`.
+The harness uses a pinned RustFS image, private synthetic credentials and disabled
+collectors. All generated state, including minikube profiles and Cargo targets,
+stays under `/tmp`; configured clusters are not reused. Filesystem scenarios remain
+required. RustFS/local architecture evidence is separate from AWS/other providers,
+hosted native architecture CI, edge/CNI acceptance and production deployment.
+The [local S3 acceptance record](s3-storage-evidence.md) lists the checks actually
+performed and their scope.

@@ -434,3 +434,47 @@ Verified immutable projection memberships can be shared across requests, with
 bounded entries, bytes and identifiers. Active readers retain budget accounting
 after eviction. Default selection and freshness are checked through owner-fenced
 storage for every request; verification handles bypass the cache.
+
+
+## Optional S3 archive and schema 12
+
+Filesystem publication retains the existing fsync/hardlink contract. Opting into
+S3 expands schema 11 to schema 12; filesystem-only stores keep their existing
+schema/defaults. The adapter-owned durable archive mediates permanent file
+publication and leased local materialization; application/domain ports remain free
+of transport-specific types. PostgreSQL remains authoritative for metadata,
+ordering, ownership and immutable logical file bindings. A process-local root
+registry is installed only after explicit backend admission; expired S3 handles
+fail closed.
+
+Remote BLAKE3 byte objects and path-bound integrity evidence precede owner-fenced
+SQL publication. Frozen index members publish before their existing final
+manifests and database pointers. Each upload has a durable intent; uncertain
+completion retains accounting until remote verification resolves it. Restart
+reconciles complete bytes/bindings and aborts only owned unfinished multipart
+uploads. Completed orphan objects remain permanent.
+
+Backend epochs and an exclusive database/prefix claim prevent accidental reuse
+and stale publication. Byte deduplication does not collapse quota identities:
+independent equal-byte files remain separate groups; aliases retain their original
+group. Fresh groups use monotonic durable identities rather than reusable cache
+inode numbers. Local inode mappings establish equivalence only while an alias
+still exists. Eviction never releases permanent quota.
+
+Parsers and Tantivy read fully verified local files through leases. Active readers
+pin their members; writable staging directories use separate budgeted handles.
+The cache is disposable and bounded, and a fresh cache can reconstruct historical
+reads from PostgreSQL and S3. Current/supplied package contents remain inert.
+No inspected package code, caller lockfile, inventory or audit report enters S3.
+
+Offline transfer verifies the filesystem closure, freezes the exact inventory,
+copies/verifies each permanent file, and atomically activates the backend and
+transfer receipt. Original files remain intact. Backup receipts bind PostgreSQL,
+object bindings, and verified copies at a separate prefix. A failed restore keeps
+a database marker that blocks serving until verification succeeds.
+
+Temporary S3 unavailability pauses durable corpus workers through cancellable
+supervision. Replacement attempts retain the same provider budgets and checkpoints.
+Crate groups fully drain their owned tasks before owner-fenced interrupted-claim
+recovery; fatal processing errors still stop supervision. The independent database
+ownership monitor remains authoritative for required process restart.

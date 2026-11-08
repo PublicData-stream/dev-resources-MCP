@@ -20,7 +20,8 @@ and certificate paths appropriate to the harness; supply your own for hosting.
 | `webtransport.allowed_hosts`, `webtransport.allowed_origins` | Independent authority/origin allowlists |
 | `health.bind` | Private plaintext health/metrics socket |
 | `storage.database_url` | PostgreSQL connection string; treat as a secret |
-| `storage.blob_dir` | Persistent, exclusively owned archive directory |
+| `storage.blob_dir` | Exclusively owned archive directory; disposable local working/cache directory when S3 is selected |
+| `storage.backend` | `filesystem` by default; optional `s3` backend |
 | `edge_mtls.client_ca_file` | CA for authenticated backend edge clients |
 | `edge_mtls.required_client_dns_san` | Exact DNS SAN required on the edge client certificate |
 
@@ -418,3 +419,83 @@ least 64 MiB and a supplied quota must be at least the reserve. Limits pause new
 work without removing retained evidence. The artifact quota excludes PostgreSQL
 and derived indexes. Schema 9 and processing/privacy limits are described in
 [npm](npm.md).
+
+
+## Optional S3 archive
+
+Existing configurations retain filesystem storage. To store all permanent bodies,
+bulk artifacts, retained Git evidence, integrity descriptors, and frozen search
+files remotely, select `storage.backend = "s3"` and supply `[storage.s3]`.
+PostgreSQL remains required. The server still has one owner/replica and uses
+Recreate updates. Public tool schemas, capture identities, freshness, source
+budgets, licensing, and request-only audit privacy are unchanged.
+
+```toml
+[storage]
+database_url = "postgres://USER:PASSWORD@postgres/devres"
+blob_dir = "/data/blobs"
+backend = "s3"
+
+[storage.s3]
+endpoint = "https://objects.example.org"
+bucket = "devres-archive"
+region = "us-east-1"
+prefix = "instance-a"
+path_style = true
+allow_http = false
+cache_max_bytes = 68719476736
+# ca_file = "/run/secrets/storage-ca.pem"
+
+[storage.s3.credentials]
+mode = "files"
+access_key_file = "/run/secrets/s3-access-key"
+secret_key_file = "/run/secrets/s3-secret-key"
+# session_token_file = "/run/secrets/s3-session-token"
+```
+
+Endpoint, bucket, region, prefix, cache capacity, and credential mode are required.
+The prefix is exclusive to this database; accidental rebinding fails closed.
+Path-style addressing defaults to true, plain HTTP defaults to false, and cache
+capacity must be at least 64 MiB. Production endpoints should use TLS; a custom
+CA file adds trust without disabling verification. Plain HTTP requires an explicit
+opt-in for the individual controlled private endpoint. URLs reject userinfo,
+queries, fragments and redirects. Endpoints and secret paths are operator-only
+settings, never public request parameters. Unknown fields fail configuration.
+
+Choose exactly one credential mode. `files` uses the paths above. `oidc` uses
+`token_file`, `role_arn`, `session_name`, and `sts_endpoint` to exchange a projected
+service-account token. `container` uses `endpoint` and optional
+`authorization_token_file`. Both identity modes support their own optional
+`ca_file` and `allow_http` settings. Temporary credentials refresh; failures never
+fall through to profiles, instance metadata, external credential commands, or
+another identity source. Keep secret values out of TOML and process arguments.
+
+The local cache must fit pinned search generations, admitted downloads, and
+managed staging. Eviction removes only disposable, unleased materializations.
+An oversized working set fails explicitly; public reads retain existing deadlines
+and limits. Mutable Git working repositories keep their separate provider byte
+limits and free-space reserves. Remote storage has no portable free-space API:
+archive quotas retain existing accounting groups and survive cache loss; remote
+service quota failures reject new work without deleting history. Operator billing
+bytes can differ from these admission quotas because of content deduplication.
+
+S3 requires conditional single-object and multipart-completion writes, streamed
+verified reads, and multipart inspection/abort for interrupted application-owned
+uploads. No unconditional overwrite fallback or permanent-object deletion is
+used. Bucket encryption, replication, object lock, and retention are operator
+policies. Storage/credential outages fail closed even with a warm cache and set
+readiness false; recovery restores readiness. Losing database ownership requires
+restart. See [offline transfer and recovery](operations.md#s3-transfer-and-recovery).
+
+The local materialization registry admits at most 262,144 resident paths. Its
+startup reconciliation caps the local walk at 1,048,576 entries, depth 128 and
+30 seconds. Explicit S3 artifact quotas admit at most 1,000,000 accounting objects
+per shared quota; exceeding these bookkeeping bounds returns capacity errors.
+Omitting an optional archive quota does not impose that accounting-object limit
+on permanent retention. These bounds are separate from measured process RSS.
+
+Automatic S3 initialization is restricted to a newly initialized database. An
+existing filesystem database requires explicit offline transfer even if its
+capture table or the selected local directory is empty; selecting a new directory
+cannot bypass retained provider data. After cutover, use a separate disposable
+cache directory; the migrated source directory is protected from cache eviction.
