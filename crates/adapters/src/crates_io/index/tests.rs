@@ -100,6 +100,9 @@ impl CrateCorpusStore for FixtureStore {
     async fn schedule(&self, _: &[CollectionJob], _: i64) -> Result<()> {
         unused()
     }
+    async fn recover_interrupted_jobs(&self) -> Result<()> {
+        Ok(())
+    }
     async fn claim(&self, _: i64, _: &str) -> Result<Option<CollectionJob>> {
         unused()
     }

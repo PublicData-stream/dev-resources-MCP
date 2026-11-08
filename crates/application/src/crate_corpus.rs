@@ -143,6 +143,9 @@ pub trait CrateCorpusStore: Send + Sync {
         now: i64,
     ) -> Result<Capture>;
     async fn schedule(&self, jobs: &[CollectionJob], due_at: i64) -> Result<()>;
+    /// Requeue interrupted claims before starting the sole collector group, under its owner fence.
+    /// Callers must first cancel and fully drain their previous group. Retry evidence is retained.
+    async fn recover_interrupted_jobs(&self) -> Result<()>;
     async fn claim(&self, now: i64, kind: &str) -> Result<Option<CollectionJob>>;
     async fn finish(
         &self,

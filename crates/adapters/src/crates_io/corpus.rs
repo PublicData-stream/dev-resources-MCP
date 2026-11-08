@@ -5,6 +5,9 @@ mod dump_compat_tests;
 #[cfg(test)]
 #[path = "corpus/tests.rs"]
 mod pipeline_tests;
+#[cfg(test)]
+#[path = "corpus/recovery_tests.rs"]
+mod recovery_tests;
 use crate::{
     archive,
     bulk::{
@@ -121,6 +124,7 @@ pub struct CrateCorpus {
     config: CrateConfig,
     state: Mutex<Value>,
     publication: Mutex<()>,
+    running: Mutex<()>,
     last_publication: AtomicI64,
     parsers: Arc<Semaphore>,
     cursor: AtomicUsize,
@@ -154,6 +158,7 @@ impl CrateCorpus {
             config,
             state: Mutex::new(json!({})),
             publication: Mutex::new(()),
+            running: Mutex::new(()),
             last_publication: AtomicI64::new(0),
             parsers: Arc::new(Semaphore::new(processing_workers)),
             cursor: AtomicUsize::new(0),
@@ -199,11 +204,21 @@ impl CrateCorpus {
                 tokio::fs::remove_file(entry.path())
                     .await
                     .map_err(|_| Error::unavailable("Corpus staging unavailable."))?;
+                crate::durable_archive::forget_local(&entry.path())?;
             }
         }
         Ok(())
     }
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) -> Result<()> {
+        // A restarted group must not reset claims until every previous worker has drained.
+        let _running = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            guard = self.running.lock() => guard,
+        };
+        if self.config.enabled {
+            self.store.recover_interrupted_jobs().await?;
+        }
         if let Some(snapshot) = self.store.snapshot(None).await?
             && !snapshot.index_manifest.is_null()
         {
@@ -229,23 +244,20 @@ impl CrateCorpus {
         }
         // Independent loops prevent long inventory transfers from starving archive/doc work.
         let mut workers = tokio::task::JoinSet::new();
+        let group_stop = shutdown.child_token();
+        let _cancel_on_drop = group_stop.clone().drop_guard();
         let this = self.clone();
-        let stop = shutdown.child_token();
+        let stop = group_stop.child_token();
         workers.spawn(async move { this.inventory_loop(stop).await });
         let this = self.clone();
-        let stop = shutdown.child_token();
+        let stop = group_stop.child_token();
         workers.spawn(async move { this.dump_loop(stop).await });
         for _ in 0..self.config.max_bulk_transfers {
             let this = self.clone();
-            let stop = shutdown.child_token();
+            let stop = group_stop.child_token();
             workers.spawn(async move { this.jobs_loop(stop).await });
         }
-        tokio::select! {biased;_=shutdown.cancelled()=>{},result=workers.join_next()=>{if let Some(result)=result{result.map_err(|_|Error::unavailable("Crate collector worker failed."))??;}return Err(Error::unavailable("Crate collector stopped unexpectedly."));}}
-        // Cancellation is propagated to every owned network/parser/process operation.
-        while let Some(result) = workers.join_next().await {
-            result.map_err(|_| Error::unavailable("Crate collector shutdown failed."))??;
-        }
-        Ok(())
+        supervise_workers(workers, group_stop).await
     }
     async fn inventory_loop(&self, stop: CancellationToken) -> Result<()> {
         loop {
@@ -838,38 +850,58 @@ impl CrateCorpus {
             )
         });
         let mut batch = Vec::with_capacity(100);
-        while let Some(row) = receive.recv().await {
-            if stop.is_cancelled() {
-                return Err(Error::unavailable("Crate projection canceled."));
+        let staged: Result<()> = async {
+            while let Some(row) = receive.recv().await {
+                if stop.is_cancelled() {
+                    return Err(Error::unavailable("Crate projection canceled."));
+                }
+                let key = format!(
+                    "cargo:derived:{}:{}:{}:{}:{}",
+                    job.name, job.version, artifact.capture.id, row.target, row.path
+                );
+                let capture = self
+                    .store
+                    .save_text(
+                        &key,
+                        &artifact.capture.source_url,
+                        &row.text,
+                        json!({
+                            "source_capture": artifact.capture.id,
+                            "metadata_capture": job.metadata_capture,
+                            "kind": row.kind,
+                            "target": row.target,
+                            "path": row.path,
+                            "processor_version": 1,
+                        }),
+                        unix_now(),
+                    )
+                    .await?;
+                let id = digest(
+                    format!("{}\0{}\0{}\0{}", capture.id, row.kind, row.target, row.path)
+                        .as_bytes(),
+                );
+                batch.push(ContentRecord {
+                    id,
+                    name: job.name.clone(),
+                    version: job.version.clone(),
+                    target: row.target,
+                    path: row.path,
+                    kind: row.kind,
+                    capture: capture.id,
+                    metadata_capture: job.metadata_capture.clone(),
+                    archive_capture: artifact.capture.id.clone(),
+                    attributes: row.attributes,
+                });
+                if batch.len() == 100 {
+                    self.store.stage_content(&generation, &batch).await?;
+                    batch.clear();
+                }
             }
-            let key = format!(
-                "cargo:derived:{}:{}:{}:{}:{}",
-                job.name, job.version, artifact.capture.id, row.target, row.path
-            );
-            let capture=self.store.save_text(&key,&artifact.capture.source_url,&row.text,json!({"source_capture":artifact.capture.id,"metadata_capture":job.metadata_capture,"kind":row.kind,"target":row.target,"path":row.path,"processor_version":1}),unix_now()).await?;
-            let id = digest(
-                format!("{}\0{}\0{}\0{}", capture.id, row.kind, row.target, row.path).as_bytes(),
-            );
-            batch.push(ContentRecord {
-                id,
-                name: job.name.clone(),
-                version: job.version.clone(),
-                target: row.target,
-                path: row.path,
-                kind: row.kind,
-                capture: capture.id,
-                metadata_capture: job.metadata_capture.clone(),
-                archive_capture: artifact.capture.id.clone(),
-                attributes: row.attributes,
-            });
-            if batch.len() == 100 {
-                self.store.stage_content(&generation, &batch).await?;
-                batch.clear();
-            }
+            Ok(())
         }
-        let mut summary = work
-            .await
-            .map_err(|_| Error::unavailable("Crate projection worker failed."))??;
+        .await;
+        drop(receive);
+        let mut summary = finish_parser(staged, work, &cancel.0).await?;
         summary["job_key"] = json!(job.key);
         summary["name"] = json!(job.name);
         summary["version"] = json!(job.version);
@@ -923,6 +955,7 @@ struct Stage(PathBuf);
 impl Drop for Stage {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = crate::durable_archive::forget_local(&self.0);
     }
 }
 fn digest(bytes: &[u8]) -> String {
@@ -1135,9 +1168,10 @@ fn process_capture(
                 {
                     return Err(Error::capacity("Insufficient JSON processing space."));
                 }
-                output
-                    .write_all(&chunk[..count])
-                    .map_err(|_| Error::unavailable("JSON processing stage failed."))?;
+                crate::durable_archive::with_write_budget(&stage.0, count as u64, || {
+                    output.write_all(&chunk[..count])
+                })
+                .map_err(|_| Error::capacity("JSON processing stage capacity unavailable."))?;
             }
             drop(output);
             let summary = crate_docs::parse_rustdoc_json(
@@ -1173,5 +1207,62 @@ fn process_capture(
             serde_json::to_value(summary).map_err(|_| Error::integrity("API summary failed."))
         }
         _ => Err(Error::invalid("Unsupported projection kind.")),
+    }
+}
+
+/// Cancel siblings after any worker exits and drain all work; fatal errors outrank outages.
+async fn supervise_workers(
+    mut workers: tokio::task::JoinSet<Result<()>>,
+    stop: CancellationToken,
+) -> Result<()> {
+    let mut failure = tokio::select! {
+        biased;
+        _ = stop.cancelled() => None,
+        result = workers.join_next() => Some(match result {
+            Some(Ok(Err(error))) => error,
+            _ => Error::integrity("Crate collector stopped unexpectedly."),
+        }),
+    };
+    stop.cancel();
+    while let Some(result) = workers.join_next().await {
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(Error::integrity("Crate collector shutdown failed.")),
+        };
+        if let Some(error) = error
+            && (failure.is_none()
+                || failure
+                    .as_ref()
+                    .is_some_and(|prior| prior.code == "unavailable")
+                    && error.code != "unavailable")
+        {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// Join every parser before its owning worker may release claims or start another group.
+/// The channel receiver must be dropped first so blocked sends can observe cancellation.
+pub(super) async fn finish_parser<T>(
+    consumer: Result<()>,
+    worker: tokio::task::JoinHandle<Result<T>>,
+    cancel: &CancellationToken,
+) -> Result<T> {
+    if consumer.is_err() {
+        cancel.cancel();
+    }
+    let parsed = worker
+        .await
+        .map_err(|_| Error::integrity("Crate parser worker failed."))?;
+    match (consumer, parsed) {
+        (Ok(()), parsed) => parsed,
+        (Err(error), Err(parser))
+            if error.code == "unavailable" && parser.code != "unavailable" =>
+        {
+            Err(parser)
+        }
+        (Err(error), _) => Err(error),
     }
 }

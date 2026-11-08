@@ -531,6 +531,18 @@ impl CrateCorpusStore for PgBlobStore {
         }
         tx.commit().await.map_err(|_| storage_error())
     }
+    async fn recover_interrupted_jobs(&self) -> Result<()> {
+        // Recovery needs PostgreSQL ownership, not a healthy archive endpoint. It must also
+        // finish before the replacement collector can claim anything.
+        self.check_ownership().await?;
+        let mut owner = self.owner.lock().await;
+        owner.ping().await.map_err(|_| storage_error())?;
+        sqlx::query("UPDATE devres_crate_jobs SET state='pending' WHERE state='running'")
+            .execute(&mut *owner)
+            .await
+            .map_err(|_| storage_error())?;
+        Ok(())
+    }
     async fn claim(&self, now: i64, kind: &str) -> Result<Option<CollectionJob>> {
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;

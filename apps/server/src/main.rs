@@ -1,4 +1,5 @@
 mod offline_cli;
+mod storage_worker;
 use devres_server::{
     ServerBuilder, ServerError,
     config::{AccessPolicy, Config},
@@ -423,67 +424,109 @@ async fn main() -> Result<(), ServerError> {
     let mut registry = server_info_registry(config.source.url.clone())?;
     registry.register_research(research)?;
     let mut server = ServerBuilder::new(registry, config.limits, config.source.url);
+    let recover_archive_worker = store.has_object_archive();
     server.register_worker("attribution-repair", move |shutdown| async move {
-        attribution.run(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            attribution.run(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("rfc-collector", move |shutdown| async move {
-        corpus.run(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            corpus.run(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("crate-collector", move |shutdown| async move {
-        crate_corpus.run(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            crate_corpus.clone().run(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("npm-collector", move |shutdown| async move {
-        npm_corpus.run(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            npm_corpus.run(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     let current = advisory_corpus.clone();
     server.register_worker("rustsec-current", move |shutdown| async move {
-        current.run_current(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            current.run_current(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("rustsec-history", move |shutdown| async move {
-        advisory_corpus
-            .run_history(shutdown)
-            .await
-            .map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            advisory_corpus.run_history(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     let mdn_current = mdn_corpus.clone();
     server.register_worker("mdn-current", move |shutdown| async move {
-        mdn_current.run_current(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            mdn_current.run_current(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("mdn-history", move |shutdown| async move {
-        mdn_corpus.run_history(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            mdn_corpus.run_history(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     let whatwg_current = whatwg_corpus.clone();
     server.register_worker("whatwg-current", move |shutdown| async move {
-        whatwg_current
-            .run_current(shutdown)
-            .await
-            .map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            whatwg_current.run_current(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("whatwg-history", move |shutdown| async move {
-        whatwg_corpus
-            .run_history(shutdown)
-            .await
-            .map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            whatwg_corpus.run_history(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     let chromium_current = chromium_corpus.clone();
     server.register_worker("chromium-current", move |shutdown| async move {
-        chromium_current
-            .run_current(shutdown)
-            .await
-            .map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            chromium_current.run_current(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("chromium-history", move |shutdown| async move {
-        chromium_corpus
-            .run_history(shutdown)
-            .await
-            .map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            chromium_corpus.run_history(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     let w3c_current = w3c_corpus.clone();
     server.register_worker("w3c-current", move |shutdown| async move {
-        w3c_current.run_current(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            w3c_current.run_current(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_worker("w3c-history", move |shutdown| async move {
-        w3c_corpus.run_history(shutdown).await.map_err(Into::into)
+        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+            w3c_corpus.run_history(shutdown)
+        })
+        .await
+        .map_err(Into::into)
     })?;
     server.register_endpoint(HttpEndpoint {
         bind: config.http.bind,

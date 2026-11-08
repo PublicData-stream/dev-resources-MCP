@@ -615,20 +615,23 @@ pub async fn import_dump(
         )?;
         process(path, &worker_artifact, &budget, &sender)
     });
-    while let Some(batch) = receiver.recv().await {
-        if shutdown.is_cancelled() {
-            return Err(Error::new(
-                "cancelled",
-                "Database dump import was canceled.",
-            ));
+    let staged: Result<()> = async {
+        while let Some(batch) = receiver.recv().await {
+            if shutdown.is_cancelled() {
+                return Err(Error::new(
+                    "cancelled",
+                    "Database dump import was canceled.",
+                ));
+            }
+            store
+                .put_enrichment(&artifact, &batch.kind, &batch.rows)
+                .await?;
         }
-        store
-            .put_enrichment(&artifact, &batch.kind, &batch.rows)
-            .await?;
+        Ok(())
     }
-    let summary = worker
-        .await
-        .map_err(|_| Error::unavailable("Database dump worker failed."))??;
+    .await;
+    drop(receiver);
+    let summary = super::corpus::finish_parser(staged, worker, &cancel).await?;
     if shutdown.is_cancelled() {
         return Err(Error::new(
             "cancelled",
@@ -919,6 +922,9 @@ mod publication_tests {
         }
         async fn schedule(&self, _: &[CollectionJob], _: i64) -> Result<()> {
             Err(unused())
+        }
+        async fn recover_interrupted_jobs(&self) -> Result<()> {
+            Ok(())
         }
         async fn claim(&self, _: i64, _: &str) -> Result<Option<CollectionJob>> {
             Err(unused())

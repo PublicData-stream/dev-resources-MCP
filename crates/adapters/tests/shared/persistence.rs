@@ -1533,3 +1533,105 @@ async fn permanent_history_revalidation_and_integrity() {
         b"second"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+async fn crate_jobs_resume_in_same_owner_after_interrupted_worker_group() {
+    use devres_application::crate_corpus::{CollectionJob, CrateCorpusStore};
+    use serde_json::json;
+    use sqlx::Row;
+
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let name = "devres_crate_worker_recovery_fixture";
+    sqlx::query("CREATE DATABASE devres_crate_worker_recovery_fixture")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut database = url::Url::parse(&base).unwrap();
+    database.set_path(&format!("/{name}"));
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let store = PgBlobStore::connect(database.as_str(), root.path())
+        .await
+        .unwrap();
+    let observer = sqlx::PgPool::connect(database.as_str()).await.unwrap();
+    let artifact = store
+        .save_text(
+            "cargo:derived:recovery-fixture",
+            "https://docs.rs/example/1.0.0/",
+            "retained public evidence",
+            json!({"fixture":true}),
+            1,
+        )
+        .await
+        .unwrap();
+    let job = |key: &str| CollectionJob {
+        key: key.into(),
+        kind: "html".into(),
+        name: "example".into(),
+        version: "1.0.0".into(),
+        target: String::new(),
+        checksum: String::new(),
+        metadata_capture: artifact.id.clone(),
+        attempts: 0,
+        artifact: None,
+    };
+    store
+        .schedule(&[job("interrupted"), job("scheduled")], 100)
+        .await
+        .unwrap();
+    let first = store.claim(100, "html").await.unwrap().unwrap();
+    assert_eq!(first.key, "interrupted");
+    store
+        .finish(&first.key, Some(&artifact.id), Some("unavailable"), 200)
+        .await
+        .unwrap();
+    let scheduled = store.claim(100, "html").await.unwrap().unwrap();
+    assert_eq!(scheduled.key, "scheduled");
+    store
+        .finish(&scheduled.key, None, None, 1000)
+        .await
+        .unwrap();
+    let interrupted = store.claim(200, "html").await.unwrap().unwrap();
+    assert_eq!(interrupted.attempts, 2);
+    assert!(store.claim(200, "html").await.unwrap().is_none());
+
+    // No reconnect: this is exactly the lifecycle retry used after a transient S3 outage.
+    store.recover_interrupted_jobs().await.unwrap();
+    let row = sqlx::query("SELECT state,attempts,artifact,last_error,due_at FROM devres_crate_jobs WHERE source_key='interrupted'")
+        .fetch_one(&observer).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert_eq!(row.get::<i64, _>("attempts"), 2);
+    assert_eq!(row.get::<String, _>("artifact"), artifact.id);
+    assert_eq!(row.get::<String, _>("last_error"), "unavailable");
+    assert_eq!(row.get::<i64, _>("due_at"), 200);
+    assert!(store.claim(199, "html").await.unwrap().is_none());
+    let resumed = store.claim(200, "html").await.unwrap().unwrap();
+    assert_eq!(resumed.key, interrupted.key);
+    assert_eq!(resumed.attempts, 3);
+    assert_eq!(resumed.artifact.as_deref(), Some(artifact.id.as_str()));
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM devres_crate_jobs WHERE source_key='scheduled'")
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+    assert_eq!(state, "captured");
+
+    // The reset must not succeed after the dedicated owner connection loses its fence.
+    let killed: Vec<bool> = sqlx::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND granted AND pid<>pg_backend_pid()")
+        .fetch_all(&observer).await.unwrap();
+    assert!(!killed.is_empty());
+    assert!(store.recover_interrupted_jobs().await.is_err());
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM devres_crate_jobs WHERE source_key='interrupted'")
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+    assert_eq!(state, "running");
+    drop(store);
+    observer.close().await;
+    sqlx::query("DROP DATABASE devres_crate_worker_recovery_fixture WITH(FORCE)")
+        .execute(&admin)
+        .await
+        .unwrap();
+}
