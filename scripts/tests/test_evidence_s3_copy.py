@@ -115,6 +115,15 @@ class CopyTests(unittest.TestCase):
         return copy.Copier(self.plan, self.plan_hash, self.guard, self.s3, Limiter(self.guard))
     def manifest(self):
         return [json.loads(v) for v in self.s3.objects[copy.CONTROL + 'manifest.jsonl'][0].splitlines()]
+    def test_scaleway_empty_unversioned_status_keeps_bucket_guards(self):
+        for response in ({}, {'Status': ''}, {'Status': 'Suspended'}):
+            with self.subTest(response=response), patch.object(self.s3, 'get_bucket_versioning', return_value=response):
+                self.copier().bucket_check()
+        for status in ('Enabled', 'unknown', False):
+            with self.subTest(status=status), patch.object(self.s3, 'get_bucket_versioning', return_value={'Status': status}):
+                with self.assertRaisesRegex(copy.CopyError, 'unexpected_bucket_versioning'):
+                    self.copier().bucket_check()
+        self.assertEqual(self.s3.objects, {})
     def test_whole_tree_native_root_hidden_empty_directory_and_hardlinks_verified(self):
         value = self.copier().run()
         self.assertTrue(value['complete']); self.assertEqual(value['files'], 3)

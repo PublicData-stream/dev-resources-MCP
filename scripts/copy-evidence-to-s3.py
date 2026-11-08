@@ -437,7 +437,8 @@ class Copier:
 
     def bucket_check(self):
         versioning = self.call('get_bucket_versioning')
-        if versioning.get('Status') not in (None, 'Suspended'):
+        # Scaleway returns an empty Status for a never-versioned bucket.
+        if versioning.get('Status') not in (None, '', 'Suspended'):
             raise CopyError('unexpected_bucket_versioning')
         acl = self.call('get_bucket_acl')
         owner = acl.get('Owner', {}).get('ID')
