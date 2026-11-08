@@ -32,7 +32,7 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn capture(store: &PgBlobStore, id: &str) -> Result<Capture> {
+async fn capture(store: &PgBlobStore, id: &str, cancel: &CancellationToken) -> Result<Capture> {
     let row=sqlx::query("SELECT id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity FROM devres_captures WHERE id=$1").bind(id).fetch_optional(&store.pool).await.map_err(|_|storage_error())?.ok_or_else(invalid)?;
     let capture = Capture {
         id: row.try_get("id").map_err(|_| invalid())?,
@@ -61,6 +61,7 @@ async fn capture(store: &PgBlobStore, id: &str) -> Result<Capture> {
     let path = store
         .root
         .join(crate::integrity::relative_path(&capture.body_hash)?);
+    let _lease = store.retained_file_lease(&path, cancel).await?;
     if !tokio::fs::symlink_metadata(path)
         .await
         .map_err(|_| invalid())?
@@ -70,8 +71,12 @@ async fn capture(store: &PgBlobStore, id: &str) -> Result<Capture> {
     }
     Ok(capture)
 }
-async fn capture_matches(store: &PgBlobStore, expected: &Capture) -> Result<()> {
-    let found = capture(store, &expected.id).await?;
+async fn capture_matches(
+    store: &PgBlobStore,
+    expected: &Capture,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let found = capture(store, &expected.id, cancel).await?;
     if found.id != expected.id
         || found.key != expected.key
         || found.source_url != expected.source_url
@@ -83,10 +88,14 @@ async fn capture_matches(store: &PgBlobStore, expected: &Capture) -> Result<()> 
     }
     Ok(())
 }
-async fn snapshot_capture_fields(store: &PgBlobStore, value: &Value) -> Result<()> {
+async fn snapshot_capture_fields(
+    store: &PgBlobStore,
+    value: &Value,
+    cancel: &CancellationToken,
+) -> Result<()> {
     for field in ["capture", "metadata_capture", "archive_capture"] {
         if let Some(id) = value[field].as_str() {
-            capture(store, id).await?;
+            capture(store, id, cancel).await?;
         }
     }
     Ok(())
@@ -113,7 +122,7 @@ impl PgBlobStore {
             if value.capture.id != key {
                 return Err(invalid());
             }
-            capture_matches(self, &value.capture).await?;
+            capture_matches(self, &value.capture, cancel).await?;
             after = (kind, key);
         }
         let mut after = String::new();
@@ -135,14 +144,14 @@ impl PgBlobStore {
                 ("errata", value.errata_capture.as_ref()),
             ] {
                 if let Some(id) = id {
-                    capture(self, id).await?;
+                    capture(self, id, cancel).await?;
                     let dataset=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(id).fetch_optional(&self.pool).await.map_err(|_|storage_error())?.ok_or_else(invalid)?;
                     payload_integrity::row("devres_rfc_datasets", &dataset)?;
                 }
             }
             let mut selected = BTreeSet::new();
             for document in &value.documents {
-                capture_matches(self, &document.capture).await?;
+                capture_matches(self, &document.capture, cancel).await?;
             }
             let retained = value
                 .documents
@@ -167,7 +176,7 @@ impl PgBlobStore {
                 {
                     return Err(invalid());
                 }
-                capture_matches(self, &document.capture).await?;
+                capture_matches(self, &document.capture, cancel).await?;
             }
             if let Some(path) = value.index_path {
                 let root = self.root.clone();
@@ -221,7 +230,7 @@ impl PgBlobStore {
                 return Err(invalid());
             }
             for referenced in &snapshot.captures {
-                capture_matches(self, referenced).await?;
+                capture_matches(self, referenced, cancel).await?;
             }
             if let Some(observation) = snapshot.coverage["git_observation"].as_str() {
                 let value = payload_integrity::load(
@@ -276,7 +285,7 @@ impl PgBlobStore {
                 return Err(invalid());
             }
             if let Some(enrichment) = &snapshot.enrichment {
-                capture(self, enrichment).await?;
+                capture(self, enrichment, cancel).await?;
                 let exists: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM devres_crate_artifacts WHERE capture_id=$1)",
                 )
@@ -304,7 +313,7 @@ impl PgBlobStore {
                 }
                 for row in rows {
                     for id in [&row.capture, &row.metadata_capture, &row.archive_capture] {
-                        capture(self, id).await?;
+                        capture(self, id, cancel).await?;
                     }
                     crate::integrity::verify(
                         &row.id,
@@ -342,9 +351,9 @@ impl PgBlobStore {
                         .await?;
                     reader = next_reader;
                     for (payload, _) in rows {
-                        snapshot_capture_fields(self, &payload["record"]).await?;
+                        snapshot_capture_fields(self, &payload["record"], cancel).await?;
                         if let Some(id) = payload["enrichment"]["artifact"].as_str() {
-                            capture(self, id).await?;
+                            capture(self, id, cancel).await?;
                         }
                         if payload["class"] == "content" {
                             let record = &payload["record"];

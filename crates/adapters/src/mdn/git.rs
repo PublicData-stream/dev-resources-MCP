@@ -726,25 +726,19 @@ impl MdnGit {
             if !valid_pack_name(&pack.name) || !names.insert(&pack.name) {
                 return Err(Error::integrity("Invalid MDN retained pack name."));
             }
-            if self
+            let materialized = self
                 .artifacts
-                .verify(
+                .materialize(
                     &pack.artifact.body_hash,
                     bulk::MAX_ARTIFACT_BYTES,
                     cancel.clone(),
                 )
-                .await?
-                != pack.artifact
-            {
+                .await?;
+            if materialized.artifact != pack.artifact {
                 return Err(Error::integrity("MDN retained pack metadata mismatch."));
             }
             let target = root.join(&pack.name);
-            match tokio::fs::hard_link(
-                self.artifacts.root().join(&pack.artifact.relative_path),
-                &target,
-            )
-            .await
-            {
+            match tokio::fs::hard_link(&materialized.path, &target).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let actual = self

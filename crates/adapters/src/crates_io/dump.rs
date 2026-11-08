@@ -607,6 +607,12 @@ pub async fn import_dump(
             cancel: worker_cancel,
             deadline: Instant::now() + Duration::from_secs(24 * 3600),
         };
+        let _archive_lease = crate::durable_archive::materialize_file(
+            &path,
+            crate::bulk::MAX_ARTIFACT_BYTES,
+            budget.deadline,
+            &budget.cancel,
+        )?;
         process(path, &worker_artifact, &budget, &sender)
     });
     while let Some(batch) = receiver.recv().await {

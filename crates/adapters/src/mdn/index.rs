@@ -341,7 +341,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(path)
         .map_err(|_| failure())?;
-    f.write_all(bytes)
+    crate::durable_archive::with_write_budget(path, bytes.len() as u64, || f.write_all(bytes))
         .and_then(|()| f.sync_all())
         .map_err(|_| failure())
 }
@@ -767,6 +767,7 @@ impl MdnIndex {
         }
         let deadline = Instant::now() + Duration::from_secs(3600);
         check(cancel, deadline)?;
+        crate::durable_archive::admit_write(&self.root, 0)?;
         if let Some(reference) = &previous {
             self.open(reference, cancel, deadline)?;
         }
@@ -796,7 +797,14 @@ impl MdnIndex {
             }
             let id = format!("blake3:{}", input_hash.finalize().to_hex());
             let final_path = base.join("shards").join(index_suffix(&id)?);
-            if final_path.exists() {
+            if crate::durable_archive::retained(&final_path)? {
+                let _archive_lease = crate::durable_archive::materialize_directory(
+                    &final_path,
+                    MAX_BYTES + MAX_MANIFEST as u64,
+                    10_001,
+                    deadline,
+                    cancel,
+                )?;
                 let descriptor = final_path.join("descriptor.json");
                 let metadata = fs::symlink_metadata(&descriptor).map_err(|_| failure())?;
                 if !metadata.is_file()
@@ -821,7 +829,8 @@ impl MdnIndex {
                 ));
                 fs::create_dir(&stage).map_err(|_| failure())?;
                 let _guard = StageGuard(stage.clone());
-                let index = Index::create_in_dir(&stage, schema()).map_err(|_| failure())?;
+                let index = crate::immutable_index::create_staging(&stage, schema())
+                    .map_err(|_| failure())?;
                 register(&index)?;
                 let options = IndexWriterOptions::builder()
                     .num_worker_threads(1)
@@ -915,6 +924,7 @@ impl MdnIndex {
                     .and_then(|f| f.sync_all())
                     .map_err(|_| failure())?;
                 fs::rename(&stage, &final_path).map_err(|_| failure())?;
+                crate::durable_archive::relocate_local_tree(&stage, &final_path)?;
                 File::open(final_path.parent().ok_or_else(integrity)?)
                     .and_then(|f| f.sync_all())
                     .map_err(|_| failure())?;
@@ -960,7 +970,9 @@ impl MdnIndex {
             ));
             write_new(&temporary, &bytes)?;
             fs::hard_link(&temporary, &final_path).map_err(|_| failure())?;
-            fs::remove_file(temporary).map_err(|_| failure())?;
+            crate::durable_archive::observe_local(&final_path)?;
+            fs::remove_file(&temporary).map_err(|_| failure())?;
+            crate::durable_archive::forget_local(&temporary)?;
             File::open(final_path.parent().ok_or_else(integrity)?)
                 .and_then(|f| f.sync_all())
                 .map_err(|_| failure())?;
@@ -975,7 +987,7 @@ impl MdnIndex {
         shard: &Shard,
         cancel: &CancellationToken,
         deadline: Instant,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, crate::durable_archive::ArchiveLease)> {
         if !valid_hash(&shard.id) || shard.documents > MAX_DOCS || shard.files.len() > 10_000 {
             return Err(integrity());
         }
@@ -983,6 +995,13 @@ impl MdnIndex {
             .root
             .join("mdn-indexes/shards")
             .join(index_suffix(&shard.id)?);
+        let lease = crate::durable_archive::materialize_directory(
+            &path,
+            MAX_BYTES + MAX_MANIFEST as u64,
+            10_001,
+            deadline,
+            cancel,
+        )?;
         real_directory(&path)?;
         let mut total = 0u64;
         for (name, expected) in &shard.files {
@@ -1006,7 +1025,7 @@ impl MdnIndex {
                 return Err(capacity());
             }
         }
-        Ok(path)
+        Ok((path, lease))
     }
     fn open(
         &self,
@@ -1014,6 +1033,7 @@ impl MdnIndex {
         cancel: &CancellationToken,
         deadline: Instant,
     ) -> Result<Arc<Opened>> {
+        crate::durable_archive::check_available_with_deadline(&self.root, deadline, cancel)?;
         let expected = reference_digest(reference)?;
         if reference["path"] != manifest_relative(expected)? {
             return Err(integrity());
@@ -1028,6 +1048,7 @@ impl MdnIndex {
         {
             return Ok(found);
         }
+        let mut archive_leases = Vec::new();
         let mut current = Some(reference.clone());
         let mut manifests = BTreeSet::new();
         let mut shard_ids = BTreeSet::new();
@@ -1042,6 +1063,12 @@ impl MdnIndex {
                 return Err(integrity());
             }
             let path = self.root.join(manifest_relative(id)?);
+            archive_leases.push(crate::durable_archive::materialize_file(
+                &path,
+                MAX_MANIFEST as u64,
+                deadline,
+                cancel,
+            )?);
             let meta = fs::symlink_metadata(&path).map_err(|_| failure())?;
             if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_MANIFEST as u64
             {
@@ -1086,7 +1113,7 @@ impl MdnIndex {
                 let opened = if let Some(opened) = retained {
                     opened
                 } else {
-                    let path = self.verify_shard(&shard, cancel, deadline)?;
+                    let (path, archive_lease) = self.verify_shard(&shard, cancel, deadline)?;
                     let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
                     if index.schema() != schema() {
                         return Err(integrity());
@@ -1102,6 +1129,7 @@ impl MdnIndex {
                         return Err(integrity());
                     }
                     let opened = Arc::new(OpenedShard {
+                        _archive_lease: archive_lease,
                         _reader: reader,
                         searcher,
                     });
@@ -1118,7 +1146,10 @@ impl MdnIndex {
             }
             current = m.parent;
         }
-        let opened = Arc::new(Opened { shards });
+        let opened = Arc::new(Opened {
+            _archive_leases: archive_leases,
+            shards,
+        });
         if self.verification_only {
             return Ok(opened);
         }
@@ -1236,6 +1267,7 @@ impl MdnIndex {
         // All shards were verified and counted above. A shard with no selected
         // members contributes neither hits nor selected document frequencies.
         let opened = Opened {
+            _archive_leases: opened._archive_leases.clone(),
             shards: selected_shards,
         };
         let statistics = SelectedStatistics {
@@ -1420,9 +1452,11 @@ impl MdnIndex {
 struct OpenedShard {
     _reader: IndexReader,
     searcher: Searcher,
+    _archive_lease: crate::durable_archive::ArchiveLease,
 }
 struct Opened {
     shards: Vec<Arc<OpenedShard>>,
+    _archive_leases: Vec<crate::durable_archive::ArchiveLease>,
 }
 
 /// Retain verified immutable readers for exactly one forward traversal.
@@ -2060,7 +2094,9 @@ mod tests {
             state: Some(FrozenDocumentState {
                 _permit: Some(permit),
                 opened: Arc::new(Opened {
+                    _archive_leases: Vec::new(),
                     shards: vec![Arc::new(OpenedShard {
+                        _archive_lease: crate::durable_archive::ArchiveLease::default(),
                         _reader: reader,
                         searcher,
                     })],
@@ -2376,6 +2412,131 @@ mod tests {
             metadata: json!({"status":["experimental"]}),
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
+    async fn s3_shared_standards_index_cold_cache_preserves_parent_generations() {
+        let _gate = TEST_GATE.lock().await;
+        let base =
+            std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
+        let path =
+            std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
+        let mut config: crate::object_storage::S3Config =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        config.prefix.push_str("/shared-standards-index-acceptance");
+        let cache_limit = config.cache_max_bytes;
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        sqlx::query("CREATE DATABASE devres_s3_standards_index_fixture")
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut database = url::Url::parse(&base).unwrap();
+        database.set_path("/devres_s3_standards_index_fixture");
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = crate::PgBlobStore::connect_archive(
+            database.as_str(),
+            root.path(),
+            Some(config.clone()),
+        )
+        .await
+        .unwrap();
+        let index = MdnIndex::new(root.path()).unwrap();
+        let first_document = doc("s3-first", "First", "retained transport history");
+        let second_document = doc("s3-second", "Second", "current transport evidence");
+        let members = [first_document.id.clone(), second_document.id.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let first = index
+            .publish(None, vec![first_document], CancellationToken::new())
+            .await
+            .unwrap();
+        let reference = index
+            .publish(
+                Some(&first),
+                vec![second_document],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let spec = SearchSpec {
+            query: Some("transport".into()),
+            ..Default::default()
+        };
+        let expected = index
+            .search(
+                &reference,
+                members.clone(),
+                spec.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expected["total"], 2);
+        let opened = index
+            .open(
+                &reference,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(15),
+            )
+            .unwrap();
+        assert_eq!(opened.shards.len(), 2);
+        assert!(
+            crate::durable_archive::admit_write(
+                &root.path().join(".standards-index-pressure"),
+                cache_limit
+            )
+            .is_err()
+        );
+        assert_eq!(
+            opened
+                .shards
+                .iter()
+                .map(|shard| shard.searcher.num_docs())
+                .sum::<u64>(),
+            2
+        );
+        drop(opened);
+        let prefix = format!("{}:", root.path().display());
+        let clear_readers = || {
+            CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retain(|key, _| !key.starts_with(&prefix));
+            SHARD_CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retain(|key, _| !key.starts_with(&prefix));
+        };
+        clear_readers();
+        drop(index);
+        drop(store);
+        std::fs::remove_dir_all(root.path()).unwrap();
+        let store =
+            crate::PgBlobStore::connect_archive(database.as_str(), root.path(), Some(config))
+                .await
+                .unwrap();
+        let index = MdnIndex::new(root.path()).unwrap();
+        assert!(
+            !root
+                .path()
+                .join(reference["path"].as_str().unwrap())
+                .exists()
+        );
+        let restored = index
+            .search(&reference, members, spec, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(restored, expected);
+        assert!(root.path().join(first["path"].as_str().unwrap()).is_file());
+        clear_readers();
+        drop(index);
+        drop(store);
+    }
+
     #[tokio::test]
     async fn frozen_posting_export_pages_exact_original_membership() {
         let _gate = TEST_GATE.lock().await;

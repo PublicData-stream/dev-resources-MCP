@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
@@ -872,6 +872,72 @@ pub struct BulkArtifact {
     pub bytes: u64,
     pub relative_path: String,
 }
+
+/// A verified local artifact whose cache residency remains reserved until drop.
+/// The serialized artifact descriptor deliberately stays independent of this lease.
+pub struct MaterializedArtifact {
+    pub artifact: BulkArtifact,
+    pub path: PathBuf,
+    _lease: crate::durable_archive::ArchiveLease,
+}
+
+/// An open artifact retains its materialization lease through all asynchronous I/O.
+pub struct LeasedArtifactFile {
+    file: tokio::fs::File,
+    _materialized: MaterializedArtifact,
+}
+
+impl tokio::io::AsyncRead for LeasedArtifactFile {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncSeek for LeasedArtifactFile {
+    fn start_seek(self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        Pin::new(&mut self.get_mut().file).start_seek(position)
+    }
+
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<u64>> {
+        Pin::new(&mut self.get_mut().file).poll_complete(context)
+    }
+}
+
+impl LeasedArtifactFile {
+    /// Callers transferring to blocking parsers must keep the returned residency
+    /// guard alive until the standard file and parser have both been dropped.
+    pub async fn into_std(self) -> (std::fs::File, MaterializedArtifact) {
+        (self.file.into_std().await, self._materialized)
+    }
+}
+
+/// Materialize a retained path without replacing its caller-owned read/proof
+/// policy. Byte-page consumers retain their existing per-block verification.
+pub(crate) async fn lease_path(
+    path: &Path,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+    cancel: CancellationToken,
+) -> Result<crate::durable_archive::ArchiveLease> {
+    let path = path.to_owned();
+    // Dropping an RPC waiter must stop its owned blocking download as well.
+    // A child token leaves the caller's shared collection token untouched.
+    let cancel = cancel.child_token();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    tokio::task::spawn_blocking(move || {
+        crate::durable_archive::materialize_file(&path, max_bytes, deadline, &cancel)
+    })
+    .await
+    .map_err(|_| storage_error())?
+}
+
 pub struct BulkArtifactStore {
     root: PathBuf,
     verification_only: bool,
@@ -918,10 +984,18 @@ impl ArtifactReservation {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err(Error::integrity("Invalid retained artifact."));
             }
-            objects
-                .lock()
-                .map_err(|_| storage_error())?
-                .insert((metadata.dev(), metadata.ino()));
+            let selected = crate::durable_archive::accounting_identity(path)?;
+            let identity = selected.unwrap_or((metadata.dev(), metadata.ino()));
+            let mut objects = objects.lock().map_err(|_| storage_error())?;
+            if selected.is_some()
+                && objects.len() >= crate::durable_archive::MAX_ACCOUNTING_OBJECTS
+                && !objects.contains(&identity)
+            {
+                return Err(Error::capacity(
+                    "Archive quota object accounting exceeds its bound.",
+                ));
+            }
+            objects.insert(identity);
         }
         Ok(())
     }
@@ -939,6 +1013,7 @@ struct Stage(PathBuf);
 impl Drop for Stage {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = crate::durable_archive::forget_local(&self.0);
     }
 }
 pub(crate) fn valid_hash(hash: &str) -> bool {
@@ -950,6 +1025,15 @@ impl BulkArtifactStore {
     pub fn new(root: impl AsRef<Path>, min_free_bytes: u64) -> Result<Self> {
         if min_free_bytes < 64 * 1024 * 1024 {
             return Err(Error::invalid("Invalid bulk storage headroom."));
+        }
+        // A cold object-backed cache need not retain empty archive directories.
+        // Recreate only a directory whose permanent children are already bound;
+        // an absent ordinary filesystem store remains an explicit error.
+        if root.as_ref().is_absolute()
+            && !root.as_ref().exists()
+            && crate::durable_archive::retained(root.as_ref())?
+        {
+            crate::integrity::ensure_directory_durable(root.as_ref())?;
         }
         let metadata = std::fs::symlink_metadata(root.as_ref()).map_err(|_| storage_error())?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -1023,6 +1107,14 @@ impl BulkArtifactStore {
             if !roots.contains(&self.root) {
                 let mut objects = quota.objects.lock().map_err(|_| storage_error())?;
                 let (bytes, additions) = retained_bytes(&self.root, &objects)?;
+                if crate::durable_archive::is_object_archive(&self.root)?
+                    && objects.len().saturating_add(additions.len())
+                        > crate::durable_archive::MAX_ACCOUNTING_OBJECTS
+                {
+                    return Err(Error::capacity(
+                        "Archive quota object accounting exceeds its bound.",
+                    ));
+                }
                 quota
                     .used
                     .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -1176,13 +1268,15 @@ impl BulkArtifactStore {
             std::process::id(),
             STAGE.fetch_add(1, Ordering::Relaxed)
         ));
-        let stage = Stage(path.clone());
+        let mut stage = Stage(path.clone());
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .await
-            .map_err(|_| storage_error())?;
+            .map_err(|_| storage_error())?
+            .into_std()
+            .await;
         let mut upstream_hash = Sha256::new();
         let mut hash = blake3::Hasher::new();
         let mut bytes = 0_u64;
@@ -1211,22 +1305,51 @@ impl BulkArtifactStore {
                 chunk.len() as u64,
                 self.quota.as_ref().map_or(u64::MAX, |quota| quota.limit),
             )?;
-            tokio::select! { biased; _ = shutdown.cancelled() => return Err(Error::unavailable("Bulk artifact publication canceled.")), result = file.write_all(&chunk) => result.map_err(|_| storage_error())? }
             upstream_hash.update(&chunk);
             hash.update(&chunk);
+            let selected = path.clone();
+            let write = tokio::task::spawn_blocking(move || {
+                crate::durable_archive::with_write_budget(&selected, chunk.len() as u64, || {
+                    std::io::Write::write_all(&mut file, &chunk)
+                })
+                .map_err(|_| storage_error())?;
+                Ok::<_, Error>((file, stage))
+            });
+            (file, stage) = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return Err(Error::unavailable("Bulk artifact publication canceled.")),
+                result = write => result.map_err(|_| storage_error())??,
+            };
         }
         let body_hash = format!("blake3:{}", hash.finalize().to_hex());
         let upstream_hash = hex::encode(upstream_hash.finalize());
         if expected_hash.is_some_and(|expected| expected != upstream_hash) {
             return Err(Error::integrity("Bulk artifact checksum mismatch."));
         }
-        file.sync_all().await.map_err(|_| storage_error())?;
-        drop(file);
+        stage = tokio::task::spawn_blocking(move || {
+            file.sync_all().map_err(|_| storage_error())?;
+            drop(file);
+            Ok::<_, Error>(stage)
+        })
+        .await
+        .map_err(|_| storage_error())??;
         if shutdown.is_cancelled() {
             return Err(Error::unavailable("Bulk artifact publication canceled."));
         }
         let relative_path = crate::integrity::relative_path(&body_hash)?;
         let destination = self.root.join(&relative_path);
+        let retained_path = destination.clone();
+        let retained_cancel = shutdown.clone();
+        let _retained = tokio::task::spawn_blocking(move || {
+            crate::durable_archive::materialize_if_retained(
+                &retained_path,
+                max_bytes,
+                std::time::Instant::now() + Duration::from_secs(24 * 60 * 60),
+                &retained_cancel,
+            )
+        })
+        .await
+        .map_err(|_| storage_error())??;
         let destination_directory = destination.parent().ok_or_else(storage_error)?.to_owned();
         crate::integrity::ensure_directory(&destination_directory).await?;
         // The filesystem operation and quota ownership transition must have one
@@ -1237,7 +1360,12 @@ impl BulkArtifactStore {
                 .await
                 .map_err(|_| storage_error())??;
         if !created {
-            let existing = self.verify(&body_hash, max_bytes, shutdown.clone()).await?;
+            // A previous failed upload may have left an unreferenced local
+            // object. Verify its bytes before retrying durable publication;
+            // ordinary reads still require an established archive binding.
+            let existing = self
+                .verify_resident(&body_hash, max_bytes, shutdown.clone())
+                .await?;
             if existing.bytes != bytes {
                 return Err(Error::integrity("Immutable artifact length mismatch."));
             }
@@ -1263,9 +1391,39 @@ impl BulkArtifactStore {
         max_bytes: u64,
         shutdown: CancellationToken,
     ) -> Result<BulkArtifact> {
+        Ok(self.materialize(hash, max_bytes, shutdown).await?.artifact)
+    }
+
+    /// Verify and pin an artifact for consumers that need its filesystem path.
+    /// Keeping this handle alive closes the verification-to-open eviction race.
+    pub async fn materialize(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+        shutdown: CancellationToken,
+    ) -> Result<MaterializedArtifact> {
         if !valid_hash(hash) {
             return Err(Error::invalid("Invalid artifact hash."));
         }
+        let path = self.root.join(crate::integrity::relative_path(hash)?);
+        // Bulk callers impose their own shorter operation deadlines. The outer
+        // bound also covers private imports, which already admit up to 24 hours.
+        let deadline = std::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+        let lease = lease_path(&path, max_bytes, deadline, shutdown.clone()).await?;
+        let artifact = self.verify_resident(hash, max_bytes, shutdown).await?;
+        Ok(MaterializedArtifact {
+            artifact,
+            path,
+            _lease: lease,
+        })
+    }
+
+    async fn verify_resident(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+        shutdown: CancellationToken,
+    ) -> Result<BulkArtifact> {
         if self.verification_only {
             let metadata = tokio::fs::symlink_metadata(&self.root)
                 .await
@@ -1281,7 +1439,7 @@ impl BulkArtifactStore {
         if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > max_bytes {
             return Err(Error::integrity("Invalid retained artifact."));
         }
-        let mut file = tokio::fs::File::open(path)
+        let mut file = tokio::fs::File::open(&path)
             .await
             .map_err(|_| storage_error())?;
         let mut legacy_digest = Sha256::new();
@@ -1325,14 +1483,31 @@ impl BulkArtifactStore {
         hash: &str,
         max_bytes: u64,
         shutdown: CancellationToken,
-    ) -> Result<tokio::fs::File> {
-        self.verify(hash, max_bytes, shutdown).await?;
-        tokio::fs::File::open(self.root.join(crate::integrity::relative_path(hash)?))
+    ) -> Result<LeasedArtifactFile> {
+        let materialized = self.materialize(hash, max_bytes, shutdown).await?;
+        let file = tokio::fs::File::open(&materialized.path)
             .await
-            .map_err(|_| storage_error())
+            .map_err(|_| storage_error())?;
+        Ok(LeasedArtifactFile {
+            file,
+            _materialized: materialized,
+        })
     }
 }
 fn retained_bytes(root: &Path, known: &PhysicalObjects) -> Result<(u64, PhysicalObjects)> {
+    if let Some(retained) = crate::durable_archive::retained_accounting(root)? {
+        let mut additions = PhysicalObjects::new();
+        let mut bytes = 0_u64;
+        for (device, inode, length) in retained {
+            let identity = (device, inode);
+            if !known.contains(&identity) && additions.insert(identity) {
+                bytes = bytes
+                    .checked_add(length)
+                    .ok_or_else(|| Error::capacity("Artifact quota accounting overflow."))?;
+            }
+        }
+        return Ok((bytes, additions));
+    }
     fn scan(
         root: &Path,
         canonical: bool,
@@ -1388,6 +1563,7 @@ fn retain_link(
     match std::fs::hard_link(stage, &destination) {
         Ok(()) => {
             reservation.retain_at(&destination)?;
+            crate::durable_archive::observe_local(&destination)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -1415,6 +1591,110 @@ fn stage_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
+    async fn s3_bulk_cold_cache_quota_and_active_reader_acceptance() {
+        let base =
+            std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
+        let config_path =
+            std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
+        let mut config: crate::object_storage::S3Config =
+            toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        config.prefix.push_str("/bulk-acceptance");
+        let cache_limit = config.cache_max_bytes;
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        sqlx::query("CREATE DATABASE devres_s3_bulk_fixture")
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut database = url::Url::parse(&base).unwrap();
+        database.set_path("/devres_s3_bulk_fixture");
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::PgBlobStore::connect_archive(
+            database.as_str(),
+            root.path(),
+            Some(config.clone()),
+        )
+        .await
+        .unwrap();
+        let first_root = root.path().join("first");
+        let second_root = root.path().join("second");
+        for directory in [&first_root, &second_root] {
+            crate::integrity::ensure_directory(directory).await.unwrap();
+        }
+        let first = BulkArtifactStore::new(&first_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(256))
+            .unwrap();
+        let body = vec![37; 64];
+        let artifact = first
+            .capture_bytes(body.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(first.accounted_bytes(), Some(64));
+        // An evicted byte object remains retained and must not be charged again.
+        std::fs::remove_file(first_root.join(&artifact.relative_path)).unwrap();
+        assert_eq!(
+            first
+                .capture_bytes(body.clone(), CancellationToken::new())
+                .await
+                .unwrap(),
+            artifact,
+        );
+        assert_eq!(first.accounted_bytes(), Some(64));
+        let second = BulkArtifactStore::new(&second_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&first)
+            .unwrap();
+        second
+            .capture_bytes(body.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        // Separate published files retain separate accounting identities even
+        // when their remote content-addressed bytes are deduplicated.
+        assert_eq!(first.accounted_bytes(), Some(128));
+        let mut reader = first
+            .open(&artifact.body_hash, 128, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            crate::durable_archive::admit_write(
+                &root.path().join(".bulk-stage-pin-fixture"),
+                cache_limit,
+            )
+            .is_err()
+        );
+        assert!(first_root.join(&artifact.relative_path).exists());
+        let mut observed = Vec::new();
+        reader.read_to_end(&mut observed).await.unwrap();
+        assert_eq!(observed, body);
+        drop((reader, second, first, store));
+        // Neither byte objects, descriptors nor private local state are required
+        // to survive a restart in an object-backed deployment.
+        std::fs::remove_dir_all(root.path()).unwrap();
+        let store =
+            crate::PgBlobStore::connect_archive(database.as_str(), root.path(), Some(config))
+                .await
+                .unwrap();
+        let first = BulkArtifactStore::new(&first_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_quota(Some(256))
+            .unwrap();
+        let second = BulkArtifactStore::new(&second_root, 64 * 1024 * 1024)
+            .unwrap()
+            .with_shared_budget(&first)
+            .unwrap();
+        assert_eq!(second.accounted_bytes(), Some(128));
+        let mut reader = second
+            .open(&artifact.body_hash, 128, CancellationToken::new())
+            .await
+            .unwrap();
+        let mut observed = Vec::new();
+        reader.read_to_end(&mut observed).await.unwrap();
+        assert_eq!(observed, body);
+        store.check_health().await.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn npm_foreground_and_bulk_share_one_transfer_and_attempt_clock() {

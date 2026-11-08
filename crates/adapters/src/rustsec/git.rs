@@ -732,26 +732,21 @@ impl AdvisoryHistory {
             if !valid_pack_name(&pack.name) {
                 return Err(Error::integrity("Invalid RustSec retained pack name."));
             }
-            let actual = self
+            let materialized = self
                 .artifacts
-                .verify(
+                .materialize(
                     &pack.artifact.body_hash,
                     bulk::MAX_ARTIFACT_BYTES,
                     shutdown.clone(),
                 )
                 .await?;
-            if actual != pack.artifact {
+            if materialized.artifact != pack.artifact {
                 return Err(Error::integrity(
                     "RustSec pack metadata differs from evidence.",
                 ));
             }
             let target = root.join(&pack.name);
-            match tokio::fs::hard_link(
-                self.artifacts.root().join(&pack.artifact.relative_path),
-                &target,
-            )
-            .await
-            {
+            match tokio::fs::hard_link(&materialized.path, &target).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let actual = self

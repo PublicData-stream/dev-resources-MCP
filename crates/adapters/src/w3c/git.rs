@@ -956,25 +956,19 @@ impl W3cGit {
             if !valid_pack_name(&pack.name) || !names.insert(&pack.name) {
                 return Err(Error::integrity("Invalid W3C retained pack name."));
             }
-            if self
+            let materialized = self
                 .artifacts
-                .verify(
+                .materialize(
                     &pack.artifact.body_hash,
                     bulk::MAX_ARTIFACT_BYTES,
                     cancel.clone(),
                 )
-                .await?
-                != pack.artifact
-            {
+                .await?;
+            if materialized.artifact != pack.artifact {
                 return Err(Error::integrity("W3C retained pack metadata mismatch."));
             }
             let target = root.join(&pack.name);
-            match tokio::fs::hard_link(
-                self.artifacts.root().join(&pack.artifact.relative_path),
-                &target,
-            )
-            .await
-            {
+            match tokio::fs::hard_link(&materialized.path, &target).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let actual = self
@@ -1567,10 +1561,20 @@ impl W3cGit {
             .map(|p| &p.artifact)
             .chain([&manifest.commits, &observation.manifest])
         {
-            let path = source.artifacts.root().join(&artifact.relative_path);
+            let materialized = source
+                .artifacts
+                .materialize(
+                    &artifact.body_hash,
+                    bulk::MAX_ARTIFACT_BYTES,
+                    cancel.clone(),
+                )
+                .await?;
+            if materialized.artifact != *artifact {
+                return Err(Error::integrity("W3C qualified Git source mismatch."));
+            }
             let captured = self
                 .artifacts
-                .ingest_file(&path, bulk::MAX_ARTIFACT_BYTES, cancel.clone())
+                .ingest_file(&materialized.path, bulk::MAX_ARTIFACT_BYTES, cancel.clone())
                 .await?;
             if captured.body_hash != artifact.body_hash || captured.bytes != artifact.bytes {
                 return Err(Error::integrity("W3C qualified Git transfer mismatch."));

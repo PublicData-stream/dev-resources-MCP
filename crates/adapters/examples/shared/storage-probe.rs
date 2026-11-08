@@ -912,7 +912,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let database = std::env::var("DATABASE_URL")?;
     let root = std::env::var("BLOB_DIR")?;
-    let store = std::sync::Arc::new(PgBlobStore::connect(&database, &root).await?);
+    let archive = match std::env::var("DEVRES_TEST_S3_CONFIG") {
+        Ok(path) => {
+            let bytes = std::fs::read(path)?;
+            if bytes.len() > 64 * 1024 {
+                return Err("S3 fixture configuration exceeds its bound".into());
+            }
+            Some(toml::from_str(std::str::from_utf8(&bytes)?)?)
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let store = std::sync::Arc::new(PgBlobStore::connect_archive(&database, &root, archive).await?);
     let request = FetchRequest {
         key: "rfc:fixture-storage-probe".into(),
         url: "https://fixtures.invalid/devres/storage-probe".into(),

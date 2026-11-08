@@ -445,16 +445,16 @@ impl GitRegistry {
                 return Err(Error::integrity("Invalid registry Git pack membership."));
             }
             let verified = artifacts
-                .verify(
+                .materialize(
                     &entry.artifact.body_hash,
                     bulk::MAX_ARTIFACT_BYTES,
                     shutdown.clone(),
                 )
                 .await?;
-            if verified != entry.artifact {
+            if verified.artifact != entry.artifact {
                 return Err(Error::integrity("Registry Git artifact metadata mismatch."));
             }
-            let source = artifacts.root().join(&entry.artifact.relative_path);
+            let source = &verified.path;
             let destination = pack_root.join(&entry.name);
             match tokio::fs::hard_link(source, &destination).await {
                 Ok(()) => {}

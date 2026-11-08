@@ -366,6 +366,7 @@ impl Builder {
         cancel: CancellationToken,
         permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Self> {
+        crate::durable_archive::admit_write(root, 128 * 1024 * 1024)?;
         let canonical = fs::canonicalize(root).map_err(|_| unavailable())?;
         real_directory(&canonical)?;
         let base = canonical.join("crate-indexes");
@@ -420,7 +421,8 @@ impl Builder {
         }
         let directory = self.stage.join(format!("shard-{:04}", self.shards.len()));
         fs::create_dir(&directory).map_err(|_| unavailable())?;
-        let index = Index::create_in_dir(&directory, schema()).map_err(|_| unavailable())?;
+        let index = crate::immutable_index::create_staging(&directory, schema())
+            .map_err(|_| unavailable())?;
         register(&index)?;
         let options = IndexWriterOptions::builder()
             .num_worker_threads(1)
@@ -451,7 +453,12 @@ impl Builder {
             .append(true)
             .open(self.stage.join("gaps.ndjson"))
             .map_err(|_| unavailable())?;
-        output.write_all(&bytes).map_err(|_| unavailable())?;
+        crate::durable_archive::with_write_budget(
+            &self.stage.join("gaps.ndjson"),
+            bytes.len() as u64,
+            || output.write_all(&bytes),
+        )
+        .map_err(|_| unavailable())?;
         self.gaps += 1;
         if self.gap_samples.len() < 20 {
             self.gap_samples.push(gap);
@@ -459,6 +466,7 @@ impl Builder {
         Ok(false)
     }
     fn add(&mut self, input: IndexDocument) -> Result<bool> {
+        crate::durable_archive::admit_write(&self.storage_root, input.text.len() as u64)?;
         check(&self.cancel, Instant::now() + Duration::from_secs(15))?;
         if input.text.len() > MAX_TEXT {
             return self.skip(&input.identity, "document_text_exceeds_4MiB");
@@ -596,14 +604,18 @@ impl Builder {
         }
         let mut output =
             File::create(self.stage.join("manifest.json")).map_err(|_| unavailable())?;
-        output
-            .write_all(&bytes)
-            .and_then(|()| output.sync_all())
-            .map_err(|_| unavailable())?;
+        crate::durable_archive::with_write_budget(
+            &self.stage.join("manifest.json"),
+            bytes.len() as u64,
+            || output.write_all(&bytes),
+        )
+        .and_then(|()| output.sync_all())
+        .map_err(|_| unavailable())?;
         File::open(&self.stage)
             .and_then(|f| f.sync_all())
             .map_err(|_| unavailable())?;
         fs::rename(&self.stage, &self.destination).map_err(|_| unavailable())?;
+        crate::durable_archive::relocate_local_tree(&self.stage, &self.destination)?;
         File::open(self.destination.parent().ok_or_else(integrity)?)
             .and_then(|f| f.sync_all())
             .map_err(|_| unavailable())?;
@@ -809,6 +821,7 @@ struct Opened {
     _readers: Vec<IndexReader>,
     searchers: Vec<Searcher>,
     gaps: u64,
+    _archive_leases: Vec<crate::durable_archive::ArchiveLease>,
 }
 impl Bm25StatisticsProvider for Opened {
     fn total_num_tokens(&self, field: Field) -> tantivy::Result<u64> {
@@ -868,6 +881,7 @@ fn cache_key(root: &Path, reference: &Value) -> Result<String> {
 }
 /// Pin only after the database atomically publishes this prepared snapshot.
 pub fn activate(root: &Path, reference: &Value) -> Result<()> {
+    crate::durable_archive::check_available(root)?;
     let key = cache_key(root, reference)?;
     let mut cache = CACHE
         .get_or_init(|| Mutex::new(ReaderCache::default()))
@@ -908,6 +922,7 @@ fn open_inner(
     verification_only: bool,
 ) -> Result<Arc<Opened>> {
     check(cancel, deadline)?;
+    crate::durable_archive::check_available_with_deadline(root, deadline, cancel)?;
     let path = reference["path"].as_str().ok_or_else(unavailable)?;
     let expected = reference_digest(reference)?;
     let id = path
@@ -917,9 +932,7 @@ fn open_inner(
     let base = fs::canonicalize(root)
         .map_err(|_| unavailable())?
         .join("crate-indexes");
-    real_directory(&base)?;
     let directory = base.join(id);
-    real_directory(&directory)?;
     #[cfg(test)]
     {
         let mut counts = OPEN_COUNTS.lock().map_err(|_| unavailable())?;
@@ -936,6 +949,14 @@ fn open_inner(
         counts.entry(directory.clone()).or_default().1 += 1;
     }
     let path = directory.join("manifest.json");
+    let mut archive_leases = vec![crate::durable_archive::materialize_file(
+        &path,
+        MAX_MANIFEST as u64,
+        deadline,
+        cancel,
+    )?];
+    real_directory(&base)?;
+    real_directory(&directory)?;
     let meta = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
     if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_MANIFEST as u64 {
         return Err(integrity());
@@ -964,6 +985,9 @@ fn open_inner(
             return Err(integrity());
         }
         let path = directory.join(&shard.name);
+        archive_leases.push(crate::durable_archive::materialize_directory(
+            &path, MAX_SHARD, MAX_FILES, deadline, cancel,
+        )?);
         real_directory(&path)?;
         if files(&path)? != shard.files.keys().cloned().collect::<Vec<_>>() {
             return Err(integrity());
@@ -1007,6 +1031,12 @@ fn open_inner(
         searchers.push(searcher);
     }
     if let Some(expected) = &manifest.gap_artifact {
+        archive_leases.push(crate::durable_archive::materialize_file(
+            &directory.join("gaps.ndjson"),
+            MAX_SHARD,
+            deadline,
+            cancel,
+        )?);
         if manifest.version == 2 && !expected.digest.starts_with("blake3:") {
             return Err(integrity());
         }
@@ -1026,6 +1056,7 @@ fn open_inner(
         return Err(integrity());
     }
     let opened = Arc::new(Opened {
+        _archive_leases: archive_leases,
         _readers: readers,
         searchers,
         gaps: manifest.gaps,
@@ -1412,7 +1443,12 @@ fn rebuild_frozen_sync(
                 .checked_add(encoded.len() as u64)
                 .filter(|n| *n <= MAX_SHARD)
                 .ok_or_else(capacity)?;
-            output.write_all(&encoded).map_err(|_| unavailable())?;
+            crate::durable_archive::with_write_budget(
+                &builder.stage.join("gaps.ndjson"),
+                encoded.len() as u64,
+                || output.write_all(&encoded),
+            )
+            .map_err(|_| unavailable())?;
             builder.gaps = builder.gaps.checked_add(1).ok_or_else(capacity)?;
         }
         output.sync_all().map_err(|_| unavailable())?;

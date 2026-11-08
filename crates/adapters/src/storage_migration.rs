@@ -797,7 +797,20 @@ impl PgBlobStore {
             }
         }
         execution.report("file_inventory", 0, 0, 0, 0);
-        let inventoried = self.verify_file_inventory(&cancel, execution).await?;
+        let remote_active: bool = if self.archive.get().is_some() {
+            sqlx::query_scalar("SELECT backend='s3' FROM devres_archive_control WHERE singleton")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| storage_error())?
+        } else {
+            false
+        };
+        let inventoried = if remote_active {
+            let count:i64=sqlx::query_scalar("SELECT count(*) FROM devres_archive_file WHERE complete AND NOT starts_with(path,'.devres-integrity/')").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+            u64::try_from(count).map_err(|_| storage_error())?
+        } else {
+            self.verify_file_inventory(&cancel, execution).await?
+        };
         if files > inventoried {
             return Err(Error::integrity("Retained file inventory is incomplete."));
         }
@@ -844,6 +857,24 @@ impl PgBlobStore {
                 let path = self
                     .root
                     .join(integrity::relative_path(&capture.body_hash)?);
+                let _archive_lease = if self.archive.get().is_some() {
+                    let selected = path.clone();
+                    let stopping = cancel.clone();
+                    Some(
+                        tokio::task::spawn_blocking(move || {
+                            crate::durable_archive::materialize_file(
+                                &selected,
+                                crate::bulk::MAX_ARTIFACT_BYTES,
+                                Instant::now() + Duration::from_secs(3600),
+                                &stopping,
+                            )
+                        })
+                        .await
+                        .map_err(|_| storage_error())??,
+                    )
+                } else {
+                    None
+                };
                 let metadata = tokio::fs::symlink_metadata(path)
                     .await
                     .map_err(|_| Error::integrity("Retained capture body missing."))?;

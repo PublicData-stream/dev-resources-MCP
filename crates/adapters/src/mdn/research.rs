@@ -791,6 +791,13 @@ impl MdnResearch {
             return Err(integrity());
         }
         let path = self.root.join(relative);
+        let _archive_lease = crate::bulk::lease_path(
+            &path,
+            crate::bulk::MAX_ARTIFACT_BYTES,
+            std::time::Instant::now() + Duration::from_secs(15),
+            CancellationToken::new(),
+        )
+        .await?;
         if !expected.starts_with("blake3:") {
             let legacy_path = path.clone();
             tokio::task::spawn_blocking(move || {

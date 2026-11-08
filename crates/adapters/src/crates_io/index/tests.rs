@@ -381,6 +381,90 @@ fn make_index(root: &Path, store: Arc<FixtureStore>, per_shard: usize) -> Value 
     }
     builder.finish(&snapshot).unwrap()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
+async fn s3_crate_index_cold_cache_preserves_shards_and_ranking() {
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
+    let path =
+        std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
+    let mut config: crate::object_storage::S3Config =
+        toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    config.prefix.push_str("/crate-index-acceptance");
+    let cache_limit = config.cache_max_bytes;
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    sqlx::query("CREATE DATABASE devres_s3_crate_index_fixture")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut database = url::Url::parse(&base).unwrap();
+    database.set_path("/devres_s3_crate_index_fixture");
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let store =
+        crate::PgBlobStore::connect_archive(database.as_str(), root.path(), Some(config.clone()))
+            .await
+            .unwrap();
+    let reference = make_index(root.path(), fixture(), 2);
+    assert_eq!(reference["shards"], 2);
+    let spec = SearchSpec {
+        query: Some("transport".into()),
+        class: Some("version".into()),
+        limit: 20,
+        ..Default::default()
+    };
+    let expected = search_sync(
+        root.path(),
+        &reference,
+        spec.clone(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(expected["items"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        expected["items"][0]["document"]["record"]["version"],
+        "1.10.0"
+    );
+    let selected = root.path().join(reference["path"].as_str().unwrap());
+    let pinned = open(
+        root.path(),
+        &reference,
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_secs(15),
+    )
+    .unwrap();
+    assert!(
+        crate::durable_archive::admit_write(
+            &root.path().join(".crate-index-pressure"),
+            cache_limit
+        )
+        .is_err()
+    );
+    assert!(selected.join("shard-0000/meta.json").is_file());
+    assert_eq!(
+        pinned.searchers.iter().map(Searcher::num_docs).sum::<u64>(),
+        3
+    );
+    drop(pinned);
+    let key = cache_key(root.path(), &reference).unwrap();
+    {
+        let mut cache = CACHE.get().unwrap().lock().unwrap();
+        cache.active = None;
+        cache.prepared = None;
+        cache.historical.remove(&key);
+    }
+    drop(store);
+    std::fs::remove_dir_all(root.path()).unwrap();
+    let store = crate::PgBlobStore::connect_archive(database.as_str(), root.path(), Some(config))
+        .await
+        .unwrap();
+    assert!(!selected.join("manifest.json").exists());
+    let restored = search_sync(root.path(), &reference, spec, CancellationToken::new()).unwrap();
+    assert_eq!(restored, expected);
+    assert!(selected.join("shard-0000/meta.json").is_file());
+    CACHE.get().unwrap().lock().unwrap().historical.remove(&key);
+    drop(store);
+}
+
 #[test]
 fn global_bm25_and_semver_ties_are_identical_across_shard_boundaries() {
     let root = tempfile::tempdir().unwrap();

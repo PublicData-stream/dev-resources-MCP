@@ -330,6 +330,13 @@ impl WhatwgCorpus {
             .raw
             .root()
             .join(crate::integrity::relative_path(&artifact.body_hash)?);
+        let _archive_lease = bulk::lease_path(
+            &path,
+            bulk::MAX_ARTIFACT_BYTES,
+            std::time::Instant::now() + Duration::from_secs(15),
+            CancellationToken::new(),
+        )
+        .await?;
         if !artifact.body_hash.starts_with("blake3:") {
             let legacy_path = path.clone();
             tokio::task::spawn_blocking(move || {

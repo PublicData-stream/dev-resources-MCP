@@ -127,7 +127,12 @@ fn directory(root: &Path) -> Result<PathBuf> {
     Ok(indexes)
 }
 
-fn selected_directory(root: &Path, relative: &str) -> Result<PathBuf> {
+fn selected_directory(
+    root: &Path,
+    relative: &str,
+    deadline: Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(PathBuf, crate::durable_archive::ArchiveLease)> {
     let id = relative
         .strip_prefix("rfc-indexes/")
         .filter(|id| path_id(id).is_ok())
@@ -135,10 +140,17 @@ fn selected_directory(root: &Path, relative: &str) -> Result<PathBuf> {
     let base = fs::canonicalize(root)
         .map_err(|_| unavailable())?
         .join("rfc-indexes");
-    real_directory(&base)?;
     let selected = base.join(id);
+    let lease = crate::durable_archive::materialize_directory(
+        &selected,
+        MAX_INDEX_BYTES + MAX_MANIFEST,
+        MAX_FILES + 1,
+        deadline,
+        cancel,
+    )?;
+    real_directory(&base)?;
     real_directory(&selected)?;
-    Ok(selected)
+    Ok((selected, lease))
 }
 
 fn technical_analyzer() -> TextAnalyzer {
@@ -401,13 +413,14 @@ impl IndexBuilder {
                     .map_err(|_| Error::capacity("RFC index writer is busy."))?,
             )
         };
+        crate::durable_archive::admit_write(root, INDEX_MEMORY as u64)?;
         let directory = directory(root)?;
         let suffix = index_suffix(id)?;
         let final_path = directory.join(&suffix);
         let parent = final_path.parent().ok_or_else(integrity)?;
         crate::integrity::ensure_directory_durable(parent)?;
         real_directory(parent)?;
-        if fs::symlink_metadata(&final_path).is_ok() {
+        if crate::durable_archive::retained(&final_path)? {
             return Err(Error::integrity("RFC search snapshot already exists."));
         }
         if fs2::available_space(&directory).map_err(|_| unavailable())? < INDEX_MEMORY as u64 {
@@ -425,7 +438,12 @@ impl IndexBuilder {
             let mut base_generation = None;
             let index = match base {
                 Some(relative) => {
-                    let source = selected_directory(root, relative)?;
+                    let (source, _archive_lease) = selected_directory(
+                        root,
+                        relative,
+                        Instant::now() + Duration::from_secs(15),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )?;
                     base_generation = Some(verify_generation(
                         &source,
                         Instant::now() + Duration::from_secs(15),
@@ -434,14 +452,22 @@ impl IndexBuilder {
                         let from = source.join(&name);
                         let to = stage.join(&name);
                         if name == "meta.json" || name == ".managed.json" {
-                            fs::copy(from, to).map_err(|_| unavailable())?;
+                            let bytes = fs::symlink_metadata(&from)
+                                .map_err(|_| unavailable())?
+                                .len();
+                            crate::durable_archive::with_write_budget(&to, bytes, || {
+                                fs::copy(from, &to)
+                            })
+                            .map_err(|_| unavailable())?;
                         } else {
-                            fs::hard_link(from, to).map_err(|_| unavailable())?;
+                            fs::hard_link(from, &to).map_err(|_| unavailable())?;
+                            crate::durable_archive::observe_local(&to)?;
                         }
                     }
-                    Index::open_in_dir(&stage).map_err(|_| integrity())?
+                    crate::immutable_index::open_staging(&stage).map_err(|_| integrity())?
                 }
-                None => Index::create_in_dir(&stage, schema()).map_err(|_| unavailable())?,
+                None => crate::immutable_index::create_staging(&stage, schema())
+                    .map_err(|_| unavailable())?,
             };
             if index.schema() != schema() {
                 return Err(integrity());
@@ -501,6 +527,7 @@ impl IndexBuilder {
     }
 
     pub(crate) fn add_document(&mut self, document: IndexDocument) -> Result<()> {
+        crate::durable_archive::admit_write(&self.storage_root, document.text.len() as u64)?;
         if document.number == 0 || document.number > 999999 {
             return Err(Error::invalid("Invalid RFC index document number."));
         }
@@ -573,9 +600,11 @@ impl IndexBuilder {
     }
 
     pub(crate) fn finish(mut self) -> Result<String> {
+        crate::durable_archive::admit_write(&self.storage_root, 0)?;
         let mut writer = self.writer.take().ok_or_else(unavailable)?;
         writer.commit().map_err(|_| unavailable())?;
         writer.wait_merging_threads().map_err(|_| unavailable())?;
+        crate::durable_archive::admit_write(&self.storage_root, 0)?;
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut files = BTreeMap::new();
         let mut total = 0_u64;
@@ -601,9 +630,13 @@ impl IndexBuilder {
             .create_new(true)
             .open(self.stage.join(MANIFEST))
             .map_err(|_| unavailable())?;
-        file.write_all(&manifest)
-            .and_then(|()| file.sync_all())
-            .map_err(|_| unavailable())?;
+        crate::durable_archive::with_write_budget(
+            &self.stage.join(MANIFEST),
+            manifest.len() as u64,
+            || file.write_all(&manifest),
+        )
+        .and_then(|()| file.sync_all())
+        .map_err(|_| unavailable())?;
         File::open(&self.stage)
             .and_then(|file| file.sync_all())
             .map_err(|_| unavailable())?;
@@ -611,6 +644,7 @@ impl IndexBuilder {
             return Err(Error::integrity("RFC search snapshot already exists."));
         }
         fs::rename(&self.stage, &self.final_path).map_err(|_| unavailable())?;
+        crate::durable_archive::relocate_local_tree(&self.stage, &self.final_path)?;
         // After rename, never remove this directory, even if fsync or DB publication fails.
         self.published = true;
         let parent = self.final_path.parent().ok_or_else(integrity)?;
@@ -993,7 +1027,7 @@ fn rebuild_frozen_sync(
     // independent legacy evidence and SHA, before considering a cache hit.
     let mut original = FrozenDocuments::open_admitted(&root, &relative, &stop, offline)?;
     let source = original.generation.fingerprint;
-    if root.join(&target).exists() {
+    if crate::durable_archive::retained(&root.join(&target))? {
         let original_membership = frozen_membership(&mut original)?;
         drop(original);
         let mut retained = FrozenDocuments::open_admitted(&root, &target, &stop, offline)?;
@@ -1119,6 +1153,7 @@ pub(crate) struct FrozenDocuments {
     _permit: Option<SemaphorePermit<'static>>,
     #[cfg(test)]
     visited_documents: usize,
+    _archive_lease: crate::durable_archive::ArchiveLease,
 }
 
 impl FrozenDocuments {
@@ -1147,7 +1182,7 @@ impl FrozenDocuments {
             )
         };
         let deadline = Instant::now() + Duration::from_secs(15);
-        let path = selected_directory(root, relative)?;
+        let (path, archive_lease) = selected_directory(root, relative, deadline, cancel)?;
         let generation = verify_generation(&path, deadline)?;
         migration_cancel(cancel)?;
         let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
@@ -1164,6 +1199,7 @@ impl FrozenDocuments {
         let number_field = index_schema.get_field(NUMBER).map_err(|_| integrity())?;
         check_deadline(deadline)?;
         Ok(Self {
+            _archive_lease: archive_lease,
             _reader: reader,
             generation,
             searcher,
@@ -1299,7 +1335,12 @@ pub(crate) fn search(
         .try_acquire()
         .map_err(|_| Error::capacity("RFC search reader capacity exhausted."))?;
     let deadline = Instant::now() + Duration::from_secs(15);
-    let path = selected_directory(root, relative)?;
+    let (path, _archive_lease) = selected_directory(
+        root,
+        relative,
+        deadline,
+        &tokio_util::sync::CancellationToken::new(),
+    )?;
     verify(&path, deadline)?;
     let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
     if index.schema() != schema() {
@@ -1369,6 +1410,68 @@ pub(crate) fn search(
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
+    async fn s3_rfc_index_cold_cache_and_reader_pinning_acceptance() {
+        let base =
+            std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
+        let config_path =
+            std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
+        let mut config: crate::object_storage::S3Config =
+            toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        config.prefix.push_str("/rfc-index-acceptance");
+        let cache_limit = config.cache_max_bytes;
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        sqlx::query("CREATE DATABASE devres_s3_rfc_index_fixture")
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut database = url::Url::parse(&base).unwrap();
+        database.set_path("/devres_s3_rfc_index_fixture");
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = crate::PgBlobStore::connect_archive(
+            database.as_str(),
+            root.path(),
+            Some(config.clone()),
+        )
+        .await
+        .unwrap();
+        let id = crate::integrity::hash(b"rfc object archive acceptance");
+        let relative = build(
+            root.path(),
+            &id,
+            documents(&[
+                (100, "immutable transport evidence"),
+                (101, "retained transport history"),
+            ]),
+        )
+        .unwrap();
+        let expected =
+            search(root.path(), &relative, "transport", TECHNICAL, 0, 100, None).unwrap();
+        assert_eq!(expected["total"], 2);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut pinned = FrozenDocuments::open(root.path(), &relative, &stop).unwrap();
+        assert!(
+            crate::durable_archive::admit_write(&root.path().join(".index-pressure"), cache_limit)
+                .is_err()
+        );
+        assert!(root.path().join(&relative).join("meta.json").is_file());
+        assert_eq!(pinned.next_page(100).unwrap().len(), 2);
+        drop(pinned);
+        drop(store);
+        std::fs::remove_dir_all(root.path()).unwrap();
+        let store =
+            crate::PgBlobStore::connect_archive(database.as_str(), root.path(), Some(config))
+                .await
+                .unwrap();
+        assert!(!root.path().join(&relative).join("meta.json").exists());
+        let restored =
+            search(root.path(), &relative, "transport", TECHNICAL, 0, 100, None).unwrap();
+        assert_eq!(restored, expected);
+        assert!(root.path().join(&relative).join("meta.json").is_file());
+        drop(store);
+    }
+
     fn documents(values: &[(u32, &str)]) -> Vec<IndexDocument> {
         values
             .iter()
@@ -1411,7 +1514,13 @@ mod tests {
     }
 
     fn verification_count(root: &Path, relative: &str) -> u64 {
-        let path = selected_directory(root, relative).unwrap();
+        let (path, _archive_lease) = selected_directory(
+            root,
+            relative,
+            Instant::now() + Duration::from_secs(15),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
         VERIFY_COUNTS
             .lock()
             .unwrap()

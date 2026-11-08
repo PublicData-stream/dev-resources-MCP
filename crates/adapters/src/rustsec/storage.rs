@@ -659,13 +659,13 @@ impl PgBlobStore {
             ));
         }
         let verified = store
-            .verify(&source.body_hash, 4 * 1024 * 1024, cancel.child_token())
+            .materialize(&source.body_hash, 4 * 1024 * 1024, cancel.child_token())
             .await?;
-        if verified != source {
+        if verified.artifact != source {
             return Err(Error::integrity("Advisory manifest metadata mismatch."));
         }
         use tokio::io::AsyncReadExt;
-        let file = tokio::fs::File::open(root.join(&source.relative_path))
+        let file = tokio::fs::File::open(&verified.path)
             .await
             .map_err(|_| storage_error())?;
         let mut bytes = Vec::with_capacity(source.bytes as usize);

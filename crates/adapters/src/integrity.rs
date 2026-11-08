@@ -27,6 +27,17 @@ pub fn file_digest_with_cancel(
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Result<(String, u64)> {
+    let _lease =
+        crate::durable_archive::materialize_if_retained(path, max_bytes, deadline, cancel)?;
+    file_digest_local(path, max_bytes, deadline, cancel)
+}
+
+pub(crate) fn file_digest_local(
+    path: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<(String, u64)> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|_| Error::integrity("Retained file unavailable."))?;
     if !metadata.is_file() || metadata.len() > max_bytes {
@@ -79,6 +90,12 @@ pub fn evidence_path(root: &Path, path: &Path) -> Result<PathBuf> {
 }
 
 fn legacy_evidence(path: &Path) -> Result<FileEvidence> {
+    let _lease = crate::durable_archive::materialize_if_retained(
+        path,
+        u64::MAX,
+        Instant::now() + std::time::Duration::from_secs(15),
+        &CancellationToken::new(),
+    )?;
     const MAX_EVIDENCE_BYTES: u64 = 16 * 1024;
     if !path.is_absolute()
         || path.components().any(|part| {
@@ -117,6 +134,12 @@ fn legacy_evidence(path: &Path) -> Result<FileEvidence> {
             return Err(Error::integrity("Invalid integrity directory."));
         }
         let descriptor = evidence_path(ancestor, path)?;
+        let _descriptor_lease = crate::durable_archive::materialize_file(
+            &descriptor,
+            MAX_EVIDENCE_BYTES,
+            Instant::now() + std::time::Duration::from_secs(15),
+            &CancellationToken::new(),
+        )?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
@@ -249,9 +272,11 @@ pub fn record_file(root: &Path, path: &Path, digest: &str, bytes: u64) -> Result
         owned.ok_or_else(|| Error::capacity("File evidence staging slots exhausted."))?
     };
     use std::io::Write;
-    file.write_all(&encoded)
-        .and_then(|()| file.sync_all())
-        .map_err(|_| Error::unavailable("File evidence write failed."))?;
+    crate::durable_archive::with_write_budget(&guard.0, encoded.len() as u64, || {
+        file.write_all(&encoded)
+    })
+    .and_then(|()| file.sync_all())
+    .map_err(|_| Error::unavailable("File evidence write failed."))?;
     drop(file);
     match std::fs::hard_link(&guard.0, &target) {
         Ok(()) => (),
@@ -278,9 +303,12 @@ pub fn record_file(root: &Path, path: &Path, digest: &str, bytes: u64) -> Result
         }
         Err(_) => return Err(Error::unavailable("File evidence publication failed.")),
     }
+    crate::durable_archive::observe_local(&target)?;
     std::fs::File::open(parent)
         .and_then(|file| file.sync_all())
         .map_err(|_| Error::unavailable("File evidence directory sync failed."))?;
+    crate::durable_archive::publish_file(path, digest, bytes)?;
+    crate::durable_archive::publish_file(&target, &hash(&encoded), encoded.len() as u64)?;
     Ok(())
 }
 

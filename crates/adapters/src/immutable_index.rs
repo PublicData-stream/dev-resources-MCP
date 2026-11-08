@@ -1,18 +1,19 @@
 //! Tantivy access to verified, permanently immutable published index directories.
 //!
-//! Readers need no filesystem lock: published shards are never rewritten or
-//! garbage-collected. Callers must verify their retained file descriptors before
-//! opening them, and must never use this directory for a writable staging index.
+//! Readers need no filesystem lock: published shards are never rewritten.
+//! Callers verify their retained file descriptors and retain the archive cache
+//! lease for the complete reader lifetime, preventing local eviction. Writable
+//! staging indexes use a separate directory with physical-write admission.
 use std::{
-    io,
-    path::{Component, Path},
+    io::{self, BufWriter, Write},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 use tantivy::{
-    Index,
+    Index, IndexSettings,
     directory::{
-        Directory, DirectoryLock, FileHandle, Lock, META_LOCK, MmapDirectory, WatchCallback,
-        WatchHandle, WritePtr,
+        AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, META_LOCK, MmapDirectory,
+        TerminatingWrite, WatchCallback, WatchHandle, WritePtr,
         error::{DeleteError, LockError, OpenReadError, OpenWriteError},
     },
 };
@@ -80,6 +81,92 @@ pub(crate) fn open(path: &Path) -> tantivy::Result<Index> {
     Index::open(ImmutableDirectory {
         inner: MmapDirectory::open(path)?,
     })
+}
+
+/// Writable staging directories use the same archive-wide disk admission as
+/// uploads/downloads. Every physical write is checked while holding that budget,
+/// including Tantivy's background writer threads and atomic metadata updates.
+#[derive(Clone, Debug)]
+struct BudgetedDirectory {
+    inner: MmapDirectory,
+    path: PathBuf,
+}
+struct BudgetedWriter {
+    inner: Box<dyn TerminatingWrite + Send + Sync>,
+    path: PathBuf,
+}
+impl Write for BudgetedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        crate::durable_archive::with_write_budget(&self.path, bytes.len() as u64, || {
+            self.inner.write(bytes)
+        })
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl TerminatingWrite for BudgetedWriter {
+    fn terminate_ref(&mut self, token: AntiCallToken) -> io::Result<()> {
+        self.inner.terminate_ref(token)
+    }
+}
+impl Directory for BudgetedDirectory {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        checked_path(path)?;
+        self.inner.get_file_handle(path)
+    }
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        checked_path(path)?;
+        self.inner.exists(path)
+    }
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        checked_path(path)?;
+        self.inner.atomic_read(path)
+    }
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        self.inner.delete(path)
+    }
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        let inner = self.inner.open_write(path)?.into_inner().map_err(|_| {
+            OpenWriteError::wrap_io_error(
+                io::Error::other("Index writer initialization failed."),
+                path.to_owned(),
+            )
+        })?;
+        Ok(BufWriter::new(Box::new(BudgetedWriter {
+            inner,
+            path: self.path.join(path),
+        })))
+    }
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        crate::durable_archive::with_write_budget(&self.path.join(path), data.len() as u64, || {
+            self.inner.atomic_write(path, data)
+        })
+    }
+    fn sync_directory(&self) -> io::Result<()> {
+        self.inner.sync_directory()
+    }
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        self.inner.acquire_lock(lock)
+    }
+    fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.inner.watch(callback)
+    }
+}
+fn writable(path: &Path) -> tantivy::Result<BudgetedDirectory> {
+    Ok(BudgetedDirectory {
+        inner: MmapDirectory::open(path)?,
+        path: path.to_owned(),
+    })
+}
+pub(crate) fn create_staging(
+    path: &Path,
+    schema: tantivy::schema::Schema,
+) -> tantivy::Result<Index> {
+    Index::create(writable(path)?, schema, IndexSettings::default())
+}
+pub(crate) fn open_staging(path: &Path) -> tantivy::Result<Index> {
+    Index::open(writable(path)?)
 }
 
 #[cfg(test)]

@@ -849,7 +849,7 @@ impl NpmCorpus {
         };
         let artifact: BulkArtifact =
             serde_json::from_value(job["artifact"].clone()).map_err(|_| failure())?;
-        let file = self
+        let (file, materialized) = self
             .raw
             .open(
                 &artifact.body_hash,
@@ -863,8 +863,10 @@ impl NpmCorpus {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
         let stop = cancel.clone();
         let expanded = job["expanded"].as_u64().unwrap_or(0);
-        let worker =
-            tokio::task::spawn_blocking(move || scan_export(file, next, expanded, sender, &stop));
+        let worker = tokio::task::spawn_blocking(move || {
+            let _materialized = materialized;
+            scan_export(file, next, expanded, sender, &stop)
+        });
         let snapshot = job["snapshot"].as_str().ok_or_else(failure)?.to_owned();
         while let Some((position, expanded, result)) = receiver.recv().await {
             job["expanded"] = json!(expanded);

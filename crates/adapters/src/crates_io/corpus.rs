@@ -588,10 +588,12 @@ impl CrateCorpus {
                         "Documentation platform metadata exceeds 1 MiB.",
                     ));
                 }
-                let file = std::fs::File::open(self.root.join(crate::integrity::relative_path(
-                    &captured.capture.body_hash,
-                )?))
-                .map_err(|_| Error::unavailable("Platform capture unavailable."))?;
+                let materialized = self
+                    .artifacts
+                    .materialize(&captured.capture.body_hash, 1024 * 1024, stop.child_token())
+                    .await?;
+                let file = std::fs::File::open(&materialized.path)
+                    .map_err(|_| Error::unavailable("Platform capture unavailable."))?;
                 let targets =
                     crate_docs::parse_platforms(file, &ProcessingBudget::new(stop.child_token()))?;
                 let mut jobs = Vec::new();
@@ -749,8 +751,9 @@ impl CrateCorpus {
         canonical_name: &str,
         stop: CancellationToken,
     ) -> Result<()> {
-        self.artifacts
-            .verify(
+        let materialized = self
+            .artifacts
+            .materialize(
                 &artifact.capture.body_hash,
                 MAX_ARTIFACT_BYTES,
                 stop.child_token(),
@@ -782,8 +785,9 @@ impl CrateCorpus {
                 ))
                 .await?
                 .ok_or_else(|| Error::unavailable("Documentation targets are not captured."))?;
-            self.artifacts
-                .verify(
+            let platforms_materialized = self
+                .artifacts
+                .materialize(
                     &platforms.capture.body_hash,
                     MAX_ARTIFACT_BYTES,
                     token.child_token(),
@@ -791,10 +795,8 @@ impl CrateCorpus {
                 .await?;
             platform_capture = Some(platforms.capture.id.clone());
             let targets = crate_docs::parse_platforms(
-                std::fs::File::open(self.root.join(crate::integrity::relative_path(
-                    &platforms.capture.body_hash,
-                )?))
-                .map_err(|_| Error::unavailable("Platform capture unavailable."))?,
+                std::fs::File::open(&platforms_materialized.path)
+                    .map_err(|_| Error::unavailable("Platform capture unavailable."))?,
                 &ProcessingBudget::new(token.child_token()),
             )?;
             targets
@@ -818,6 +820,7 @@ impl CrateCorpus {
         );
         let work = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _materialized = materialized;
             process_capture(
                 ProjectionContext {
                     job: &processing_job,

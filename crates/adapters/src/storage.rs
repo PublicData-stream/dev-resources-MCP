@@ -13,7 +13,7 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     sync::{Mutex, Semaphore},
 };
 
@@ -42,6 +42,9 @@ mod migration;
 mod migration_npm;
 #[path = "npm/storage.rs"]
 mod npm_storage;
+#[cfg(test)]
+#[path = "object_archive_tests.rs"]
+mod object_archive_tests;
 #[path = "storage_integrity.rs"]
 mod payload_integrity;
 /// Shared conservative JSON residency accounting for private offline jobs.
@@ -99,6 +102,7 @@ struct StageGuard(PathBuf);
 impl Drop for StageGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = crate::durable_archive::forget_local(&self.0);
     }
 }
 fn stage_name(name: &str) -> bool {
@@ -113,13 +117,14 @@ fn stage_name(name: &str) -> bool {
 }
 
 pub struct PgBlobStore {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
     active: AtomicBool,
     visibility: tokio::sync::OnceCell<visibility::VisibilityRegistry>,
     root: PathBuf,
     read_budget: Arc<Semaphore>,
     // A dedicated non-reconnecting connection holds the single-server fence.
-    owner: Mutex<PgConnection>,
+    pub(crate) owner: Arc<Mutex<PgConnection>>,
+    archive: std::sync::OnceLock<Arc<crate::durable_archive::Archive>>,
     owner_pid: i32,
     owner_started: String,
     artifact_budget: std::sync::OnceLock<Arc<crate::bulk::BulkArtifactStore>>,
@@ -149,27 +154,77 @@ enum OpenMode {
     Migrate,
     Inspect,
     Activate,
+    Transfer,
+    RestoreCheck,
 }
 
 impl PgBlobStore {
     pub async fn connect(database_url: &str, root: impl AsRef<Path>) -> Result<Self> {
-        Self::connect_inner(database_url, root, OpenMode::Serve).await
+        Self::connect_inner(database_url, root, OpenMode::Serve, None).await
     }
+    /// Open the optional operator-configured immutable object archive.
+    pub async fn connect_archive(
+        database_url: &str,
+        root: impl AsRef<Path>,
+        config: Option<crate::object_storage::S3Config>,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Serve, config).await
+    }
+
+    pub async fn connect_for_object_transfer(
+        database_url: &str,
+        root: impl AsRef<Path>,
+        config: crate::object_storage::S3Config,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Transfer, Some(config)).await
+    }
+    pub(crate) async fn connect_for_restore_verification(
+        database_url: &str,
+        root: impl AsRef<Path>,
+        config: crate::object_storage::S3Config,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::RestoreCheck, Some(config)).await
+    }
+    pub async fn transfer_object_archive(
+        self: &Arc<Self>,
+        action: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<serde_json::Value> {
+        let backend: String =
+            sqlx::query_scalar("SELECT backend FROM devres_archive_control WHERE singleton")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| storage_error())?;
+        if backend == "filesystem" {
+            self.verify_storage(cancel.clone()).await?;
+        }
+        let receipt = self
+            .archive
+            .get()
+            .ok_or_else(storage_error)?
+            .transfer(action, cancel.clone())
+            .await?;
+        if backend == "s3" {
+            self.verify_storage(cancel).await?;
+        }
+        Ok(receipt)
+    }
+
     /// Private operator maintenance; never starts collectors or listeners.
     pub async fn connect_for_migration(database_url: &str, root: impl AsRef<Path>) -> Result<Self> {
-        Self::connect_inner(database_url, root, OpenMode::Migrate).await
+        Self::connect_inner(database_url, root, OpenMode::Migrate, None).await
     }
     pub async fn connect_for_verification(
         database_url: &str,
         root: impl AsRef<Path>,
     ) -> Result<Self> {
-        Self::connect_inner(database_url, root, OpenMode::Inspect).await
+        Self::connect_inner(database_url, root, OpenMode::Inspect, None).await
     }
     pub async fn connect_for_activation(
         database_url: &str,
         root: impl AsRef<Path>,
     ) -> Result<Self> {
-        Self::connect_inner(database_url, root, OpenMode::Activate).await
+        Self::connect_inner(database_url, root, OpenMode::Activate, None).await
     }
 
     /// Private maintenance verification of schema-eleven attribution only.
@@ -183,7 +238,7 @@ impl PgBlobStore {
             .fetch_one(&self.pool)
             .await
             .map_err(|_| storage_error())?;
-        if version != 11 {
+        if !matches!(version, 11 | 12) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
             ));
@@ -194,7 +249,11 @@ impl PgBlobStore {
         database_url: &str,
         root: impl AsRef<Path>,
         mode: OpenMode,
+        s3: Option<crate::object_storage::S3Config>,
     ) -> Result<Self> {
+        if let Some(config) = &s3 {
+            config.validate()?;
+        }
         let maintenance = mode != OpenMode::Serve;
         let allow_migration = mode == OpenMode::Migrate;
         let read_only = mode == OpenMode::Inspect;
@@ -208,6 +267,17 @@ impl PgBlobStore {
         if !acquired {
             return Err(Error::capacity(
                 "Only one serving instance may own this database",
+            ));
+        }
+        let restore_pending: bool = sqlx::query_scalar(
+            "SELECT to_regclass('public.devres_archive_restore_pending') IS NOT NULL",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .map_err(|_| storage_error())?;
+        if restore_pending && mode != OpenMode::RestoreCheck {
+            return Err(Error::unavailable(
+                "Object archive restore is pending verification.",
             ));
         }
         let identity=sqlx::query("SELECT pid,EXTRACT(EPOCH FROM backend_start)::text AS started FROM pg_stat_activity WHERE pid=pg_backend_pid()")
@@ -277,7 +347,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if !(2..=11).contains(&version) {
+        } else if !(2..=12).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -366,11 +436,38 @@ impl PgBlobStore {
         if !maintenance && version <= 10 {
             attribution_storage::prepare(&mut tx).await?;
         }
-        if version == 11 {
+        if version >= 11 {
             if !maintenance {
                 attribution_storage::promote_control(&mut tx).await?;
             } else {
                 attribution_storage::verify_supported_control(&mut tx).await?;
+            }
+        }
+        if mode == OpenMode::Transfer && version < 11 {
+            return Err(Error::unavailable(
+                "Activate schema eleven before object archive migration.",
+            ));
+        }
+        if s3.is_some() {
+            sqlx::raw_sql(crate::durable_archive::SCHEMA)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            if !existed && mode == OpenMode::Serve {
+                let binding =
+                    crate::durable_archive::config_binding(s3.as_ref().ok_or_else(storage_error)?)?;
+                // Namespace authority and fresh origin commit with the schema,
+                // before any fallible filesystem/transport initialization.
+                sqlx::query("UPDATE devres_archive_control SET initializing_s3=true,pending_binding=$1,epoch=epoch+1 WHERE singleton").bind(binding).execute(&mut *tx).await.map_err(|_|storage_error())?;
+            }
+            sqlx::query("UPDATE devres_schema SET version=12 WHERE singleton")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        } else if version == 12 {
+            let remote: bool = sqlx::query_scalar("SELECT backend='s3' OR pending_binding IS NOT NULL FROM devres_archive_control WHERE singleton").fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
+            if remote {
+                return Err(Error::unavailable("Object archive configuration required."));
             }
         }
         if !maintenance {
@@ -437,15 +534,56 @@ impl PgBlobStore {
             pool,
             root,
             read_budget: Arc::new(Semaphore::new(128)),
-            owner: Mutex::new(owner),
+            owner: Arc::new(Mutex::new(owner)),
+            archive: std::sync::OnceLock::new(),
             owner_pid,
             owner_started,
             artifact_budget: std::sync::OnceLock::new(),
         };
+        if let Some(config) = s3 {
+            let archive = crate::durable_archive::Archive::attach(
+                store.root.clone(),
+                config,
+                store.pool.clone(),
+                store.owner.clone(),
+                store.owner_pid,
+                store.owner_started.clone(),
+                if matches!(mode, OpenMode::Transfer | OpenMode::RestoreCheck) {
+                    crate::durable_archive::ArchiveAdmission::Transfer
+                } else if !existed {
+                    crate::durable_archive::ArchiveAdmission::Fresh
+                } else {
+                    crate::durable_archive::ArchiveAdmission::Existing
+                },
+            )
+            .await?;
+            store.archive.set(archive).map_err(|_| storage_error())?;
+        }
         if active {
             store.verify_visibility_registry().await?;
         }
         Ok(store)
+    }
+    pub(crate) async fn retained_file_lease(
+        &self,
+        path: &Path,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::durable_archive::ArchiveLease> {
+        if self.archive.get().is_none() {
+            return Ok(crate::durable_archive::ArchiveLease::default());
+        }
+        let selected = path.to_owned();
+        let stopping = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::durable_archive::materialize_file(
+                &selected,
+                crate::bulk::MAX_ARTIFACT_BYTES,
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                &stopping,
+            )
+        })
+        .await
+        .map_err(|_| storage_error())?
     }
     pub(crate) fn root_path(&self) -> &Path {
         &self.root
@@ -462,8 +600,21 @@ impl PgBlobStore {
     pub async fn check_health(&self) -> Result<()> {
         self.fence().await
     }
+    pub async fn check_ownership(&self) -> Result<()> {
+        self.owner_fence().await
+    }
+    pub fn has_object_archive(&self) -> bool {
+        self.archive.get().is_some()
+    }
 
     async fn fence(&self) -> Result<()> {
+        self.owner_fence().await?;
+        if let Some(archive) = self.archive.get() {
+            archive.health().await?;
+        }
+        Ok(())
+    }
+    async fn owner_fence(&self) -> Result<()> {
         // Reads and supervision must not wait behind a bulk publication on the owner
         // connection. Verify its exact live backend and advisory lock independently;
         // backend_start also prevents PID reuse from impersonating a lost owner.
@@ -483,6 +634,18 @@ impl PgBlobStore {
         let path = self
             .root
             .join(crate::integrity::relative_path(content_hash)?);
+        let selected = path.clone();
+        let cache_lease = tokio::task::spawn_blocking(move || {
+            crate::durable_archive::materialize_file(
+                &selected,
+                MAX_BLOB as u64,
+                std::time::Instant::now() + std::time::Duration::from_secs(15),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+        })
+        .await
+        .map_err(|_| storage_error())??;
+        let _cache_lease = cache_lease;
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|_| storage_error())?;
@@ -524,6 +687,26 @@ impl PgBlobStore {
         }
         Ok(Body::with_lease(body, lease))
     }
+    async fn verify_resident_publication(&self, content_hash: &str, bytes: u64) -> Result<()> {
+        let path = self
+            .root
+            .join(crate::integrity::relative_path(content_hash)?);
+        let expected = content_hash.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let (digest, length) = crate::integrity::file_digest_local(
+                &path,
+                MAX_BLOB as u64,
+                std::time::Instant::now() + std::time::Duration::from_secs(15),
+                &tokio_util::sync::CancellationToken::new(),
+            )?;
+            if digest != expected || length != bytes {
+                return Err(Error::integrity("Immutable publication bytes mismatch."));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| storage_error())?
+    }
     async fn write_blob(&self, content_hash: &str, body: &[u8]) -> Result<()> {
         if !content_hash.starts_with(crate::integrity::BLAKE3_PREFIX) {
             return Err(Error::integrity("New immutable objects require BLAKE3."));
@@ -535,6 +718,19 @@ impl PgBlobStore {
         let final_path = self
             .root
             .join(crate::integrity::relative_path(content_hash)?);
+        let selected = final_path.clone();
+        let retained_lease = tokio::task::spawn_blocking(move || {
+            crate::durable_archive::materialize_if_retained(
+                &selected,
+                MAX_BLOB as u64,
+                std::time::Instant::now() + std::time::Duration::from_secs(15),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+        })
+        .await
+        .map_err(|_| storage_error())??;
+        let _retained_lease = retained_lease;
+        crate::durable_archive::admit_write(&final_path, 0)?;
         let parent = final_path.parent().ok_or_else(storage_error)?;
         crate::integrity::ensure_directory(parent).await?;
         let directory = self.root.clone();
@@ -546,7 +742,8 @@ impl PgBlobStore {
             .await
             .map_err(|_| storage_error())?
         {
-            self.blob(content_hash).await?;
+            self.verify_resident_publication(content_hash, body.len() as u64)
+                .await?;
             let root = self.root.clone();
             let path = final_path.clone();
             let digest = content_hash.to_owned();
@@ -575,16 +772,25 @@ impl PgBlobStore {
             .map(|budget| budget.reserve_bytes(body.len() as u64))
             .transpose()?;
         let result = async {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&stage)
-                .await
+            let owned_stage = stage.clone();
+            let bytes = body.to_vec();
+            let stage_guard = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let guard = StageGuard(owned_stage.clone());
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&owned_stage)
+                    .map_err(|_| storage_error())?;
+                crate::durable_archive::with_write_budget(&owned_stage, bytes.len() as u64, || {
+                    file.write_all(&bytes)
+                })
                 .map_err(|_| storage_error())?;
-            let stage_guard = StageGuard(stage.clone());
-            file.write_all(body).await.map_err(|_| storage_error())?;
-            file.sync_all().await.map_err(|_| storage_error())?;
-            drop(file);
+                file.sync_all().map_err(|_| storage_error())?;
+                Ok::<_, Error>(guard)
+            })
+            .await
+            .map_err(|_| storage_error())??;
             // hard_link atomically publishes without replacing an existing immutable object.
             let target = final_path.clone();
             let reservation = reservation.take();
@@ -593,6 +799,7 @@ impl PgBlobStore {
                 let stage_guard = stage_guard;
                 match std::fs::hard_link(&stage_guard.0, &target) {
                     Ok(()) => {
+                        crate::durable_archive::observe_local(&target)?;
                         if let Some(reservation) = reservation {
                             reservation.retain_at(&target)?;
                         }
@@ -605,7 +812,8 @@ impl PgBlobStore {
             .await
             .map_err(|_| storage_error())??;
             if !published {
-                self.blob(content_hash).await?;
+                self.verify_resident_publication(content_hash, body.len() as u64)
+                    .await?;
             }
             let dir = final_path.parent().ok_or_else(storage_error)?.to_path_buf();
             tokio::task::spawn_blocking(move || std::fs::File::open(dir)?.sync_all())

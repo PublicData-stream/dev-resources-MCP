@@ -148,7 +148,7 @@ impl PgBlobStore {
         Ok(())
     }
 
-    async fn npm_body(&self, value: &Value) -> Result<()> {
+    async fn npm_body(&self, value: &Value, cancel: &CancellationToken) -> Result<()> {
         if value.is_null() {
             return Ok(());
         }
@@ -166,6 +166,7 @@ impl PgBlobStore {
         let relative =
             std::path::Path::new("npm/raw-artifacts").join(integrity::relative_path(hash)?);
         let path = self.root.join(&relative);
+        let _lease = self.retained_file_lease(&path, cancel).await?;
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|_| missing())?;
@@ -207,12 +208,12 @@ impl PgBlobStore {
                         | "artifacts"
                         | "metadata-captures" => {
                             if data.get("artifact").is_some() {
-                                self.npm_body(&data["artifact"]).await?;
+                                self.npm_body(&data["artifact"], cancel).await?;
                             }
                         }
-                        "versions" => self.npm_body(&data["metadata"]).await?,
+                        "versions" => self.npm_body(&data["metadata"], cancel).await?,
                         "documents" | "projections" => {
-                            self.npm_body(&data["artifact"]).await?;
+                            self.npm_body(&data["artifact"], cancel).await?;
                             self.npm_edge("versions", &data["release"]).await?;
                             if let Some(ids) = data["documents"].as_array() {
                                 for id in ids {
@@ -221,7 +222,7 @@ impl PgBlobStore {
                             }
                         }
                         "advisory-raw" => {
-                            self.npm_body(&data["artifact"]).await?;
+                            self.npm_body(&data["artifact"], cancel).await?;
                             self.npm_edge("advisories", &data["record"]).await?;
                         }
                         "members" => {
@@ -250,10 +251,10 @@ impl PgBlobStore {
                                 }
                             }
                             if data.get("artifact").is_some() {
-                                self.npm_body(&data["artifact"]).await?;
+                                self.npm_body(&data["artifact"], cancel).await?;
                             }
                             if data.get("metadata").is_some() {
-                                self.npm_body(&data["metadata"]).await?;
+                                self.npm_body(&data["metadata"], cancel).await?;
                             }
                             if let Some(packages) = data["packages"].as_object() {
                                 for id in packages.values() {
@@ -267,10 +268,10 @@ impl PgBlobStore {
                         }
                         "gaps" => {
                             if let Some(body) = data.get("artifact") {
-                                self.npm_body(body).await?;
+                                self.npm_body(body, cancel).await?;
                             }
                             if let Some(body) = data.get("metadata") {
-                                self.npm_body(body).await?;
+                                self.npm_body(body, cancel).await?;
                             }
                             if let Some(id) = data.get("document") {
                                 self.npm_edge("documents", id).await?;

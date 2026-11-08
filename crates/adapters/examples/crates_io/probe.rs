@@ -61,7 +61,7 @@ async fn expand_json(
         .write(true)
         .open(&stage.0)
         .map_err(|_| Error::unavailable("Probe stage unavailable."))?;
-    let file = store
+    let (file, _materialized) = store
         .open(&artifact.body_hash, 32 * 1024 * 1024, stop.child_token())
         .await?
         .into_std()
@@ -131,7 +131,7 @@ async fn probe(root: &Path, stop: CancellationToken) -> Result<Value> {
     )
     .await?
     .ok_or_else(|| Error::not_found("Fixed documentation platform record is absent."))?;
-    let file = store
+    let (file, _materialized) = store
         .open(&platforms.body_hash, 1024 * 1024, stop.child_token())
         .await?
         .into_std()
@@ -153,7 +153,7 @@ async fn probe(root: &Path, stop: CancellationToken) -> Result<Value> {
     )
     .await?
     .ok_or_else(|| Error::not_found("Fixed documentation bundle is absent."))?;
-    let file = store
+    let (file, _materialized) = store
         .open(&html.body_hash, 32 * 1024 * 1024, stop.child_token())
         .await?
         .into_std()

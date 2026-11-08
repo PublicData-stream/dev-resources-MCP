@@ -291,14 +291,17 @@ async fn inspect_observations(
         return Err(integrity());
     }
     let artifact = verified(raw, export, MAX_EXPORT, cancel).await?;
-    let file = raw
+    let (file, materialized) = raw
         .open(&artifact.body_hash, MAX_EXPORT, cancel.clone())
         .await?
         .into_std()
         .await;
-    let bytes = tokio::task::spawn_blocking(move || advisory_member(file))
-        .await
-        .map_err(|_| unavailable())??;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _materialized = materialized;
+        advisory_member(file)
+    })
+    .await
+    .map_err(|_| unavailable())??;
     let advisory = npm_audit::parse_advisory(&bytes)?;
     if advisory["id"] != ADVISORY {
         return Err(integrity());
