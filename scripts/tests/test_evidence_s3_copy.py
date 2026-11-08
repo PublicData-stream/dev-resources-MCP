@@ -115,6 +115,19 @@ class CopyTests(unittest.TestCase):
         return copy.Copier(self.plan, self.plan_hash, self.guard, self.s3, Limiter(self.guard))
     def manifest(self):
         return [json.loads(v) for v in self.s3.objects[copy.CONTROL + 'manifest.jsonl'][0].splitlines()]
+    def test_rate_limiter_guard_can_advance_past_scheduled_sleep(self):
+        clock = SimpleNamespace(now=0.0)
+        guard = MagicMock()
+        def check():
+            if guard.check.call_count >= 2:
+                clock.now = 2.0
+        guard.check.side_effect = check
+        with patch.object(copy.time, 'monotonic', side_effect=lambda: clock.now), \
+                patch.object(copy.time, 'sleep') as sleep:
+            limiter = copy.Limiter(guard, rate=1024)
+            limiter.consume(1024)
+        sleep.assert_not_called()
+        self.assertEqual(limiter.bytes, 1024)
     def test_scaleway_empty_unversioned_status_keeps_bucket_guards(self):
         for response in ({}, {'Status': ''}, {'Status': 'Suspended'}):
             with self.subTest(response=response), patch.object(self.s3, 'get_bucket_versioning', return_value=response):

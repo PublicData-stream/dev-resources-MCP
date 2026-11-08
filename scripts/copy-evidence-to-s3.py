@@ -226,9 +226,12 @@ class Limiter:
         self.bytes += amount
         now = time.monotonic()
         self.next = max(self.next, now) + amount / self.rate
-        while self.next - time.monotonic() > 0:
+        while True:
             self.guard.check()
-            time.sleep(min(0.2, self.next - time.monotonic()))
+            delay = self.next - time.monotonic()
+            if delay <= 0:
+                break
+            time.sleep(min(0.2, delay))
 
 
 def identity(st):
