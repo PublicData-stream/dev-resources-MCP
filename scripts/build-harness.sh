@@ -22,14 +22,18 @@ if docker image inspect "$image" >/dev/null 2>&1; then
 fi
 cp "${SERVER_BINARY:-$target_dir/debug/devres-server}" "$scratch/build/bin/devres-server"
 cp "${PROBE_BINARY:-$target_dir/debug/devres-probe}" "$scratch/build/bin/devres-probe"
+cp "$target_dir/debug/devres-credential-broker" "$scratch/build/bin/devres-credential-broker"
 cp "$target_dir/debug/examples/storage-probe" "$scratch/build/bin/storage-probe"
 cp "$target_dir/debug/devres-audit-worker" "$scratch/build/bin/devres-audit-worker"
 cp "$target_dir/debug/devres-pdf-worker" "$scratch/build/bin/devres-pdf-worker"
 cp "$edge_binary" "$scratch/build/bin/oxibelt"
 # Remove debug information only from disposable copies, preserving shared builds.
-for binary in devres-server devres-probe storage-probe devres-audit-worker devres-pdf-worker oxibelt; do
+for binary in devres-server devres-probe devres-credential-broker storage-probe devres-audit-worker devres-pdf-worker oxibelt; do
   strip --strip-debug "$scratch/build/bin/$binary"
 done
 cp scripts/mcp_smoke.py "$scratch/build/scripts/"
+cp scripts/kube-identity-fixture.py "$scratch/build/scripts/"
+cp scripts/scaleway-iam-fixture.py scripts/credential-broker-fixture.py scripts/credential-broker-probe.py "$scratch/build/scripts/"
+cp scripts/broker-pod-probe.py "$scratch/build/scripts/"
 cp deploy/oxibelt/Dockerfile.harness "$scratch/build/Dockerfile"
 docker build --label "devres.test-owner=$image" -t "$image" "$scratch/build"

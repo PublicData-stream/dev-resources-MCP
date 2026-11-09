@@ -22,7 +22,7 @@ collect_diagnostics() {
   [[ -n ${DEVRES_E2E_DIAGNOSTICS_DIR:-} ]] || return 0
   local diagnostics="$DEVRES_E2E_DIAGNOSTICS_DIR/$run_id"
   mkdir -p -- "$diagnostics" || return 0
-  for component in backend edge postgres; do
+  for component in backend writer edge postgres identity; do
     if [[ $(timeout 15s docker inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$run_id-$component" 2>/dev/null) == "$run_id" ]]; then
       diag_capture "$component.log" docker logs --tail 100 "$run_id-$component"
       diag_capture "$component-state.txt" docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$run_id-$component"
@@ -36,7 +36,7 @@ cleanup() {
     timeout 15s docker logs --tail 100 "$run_id-backend" >&2 2>/dev/null || true
     timeout 15s docker logs --tail 100 "$run_id-edge" >&2 2>/dev/null || true
   fi
-  for name in "$run_id-edge" "$run_id-backend" "$run_id-postgres"; do
+  for name in "$run_id-edge" "$run_id-backend" "$run_id-writer" "$run_id-identity" "$run_id-postgres"; do
     if [[ $(docker inspect --format '{{index .Config.Labels "devres.test-owner"}}' "$name" 2>/dev/null) == "$run_id" ]]; then
       docker rm -fv "$name" >/dev/null 2>&1 || true
     fi
@@ -59,6 +59,8 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 scripts/make-fixture.sh "$scratch"
+python3 scripts/kube-identity-fixture.py prepare "$scratch"
+python3 scripts/split-runtime-fixture.py "$scratch" docker
 if [[ -z $supplied_image ]]; then
   scripts/build-harness.sh "$scratch" "$image"
 else
@@ -83,10 +85,24 @@ for attempt in {1..60}; do
   if (( attempt == 60 )); then exit 1; fi
   sleep 1
 done
+docker exec -i "$run_id-postgres" psql -v ON_ERROR_STOP=1 -U devres -d devres < "$scratch/reader-role.sql" >/dev/null
+docker run -d --name "$run_id-identity" --label "devres.test-owner=$run_id" --network "$run_id" --network-alias identity-fixture \
+  --read-only --cap-drop ALL -v "$run_id-fixture:/fixture:ro" --entrypoint python3 "$image" \
+  /harness/kube-identity-fixture.py serve /fixture/identity >/dev/null
+writer() {
+  docker run -d --name "$run_id-writer" --label "devres.test-owner=$run_id" --network "$run_id" --network-alias writer \
+    --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m -v "$run_id-fixture:/fixture:ro" \
+    -v "$run_id-data:/data" "$image" collect /fixture/writer.toml >/dev/null
+  for attempt in {1..60}; do
+    if probe curl --fail --silent --connect-timeout 2 --max-time 3 http://writer:9090/ready -o /dev/null; then return; fi
+    if (( attempt == 60 )); then echo 'Writer readiness timed out' >&2; return 1; fi
+    sleep 1
+  done
+}
 backend() {
   docker run -d --name "$run_id-backend" --label "devres.test-owner=$run_id" --network "$run_id" --network-alias backend \
     --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m -v "$run_id-fixture:/fixture:ro" \
-    -v "$run_id-data:/data" "$image" >/dev/null
+    -v "$run_id-data:/data:ro" --tmpfs /reader-cache:rw,nosuid,size=1g "$image" >/dev/null
 }
 edge() {
   probe oxibelt --config /fixture/config/oxibelt.toml --check
@@ -103,6 +119,7 @@ assert_upstream_rejected() {
     --output /dev/null --write-out '%{http_code}' https://edge:8443/mcp)
   [[ $status == 502 || $status == 503 ]] || { echo 'Edge did not establish a bounded upstream failure' >&2; exit 1; }
 }
+writer
 backend
 probe oxibelt --config /fixture/config/oxibelt.toml --check
 edge
@@ -143,8 +160,11 @@ fixture_storage() { docker run --rm --network "$run_id" -v "$run_id-data:/data" 
   --entrypoint storage-probe "$image" "$1"; }
 docker stop --time 15 "$run_id-backend" >/dev/null
 docker rm "$run_id-backend" >/dev/null
+docker stop --time 15 "$run_id-writer" >/dev/null
+docker rm "$run_id-writer" >/dev/null
 before=$(fixture_storage write)
 capture=${before%% *}
+writer
 backend
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --wait-ready 30
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
@@ -157,7 +177,10 @@ for revision in 2026-07-28 2025-11-25; do
 done
 docker stop --time 15 "$run_id-backend" >/dev/null
 docker rm "$run_id-backend" >/dev/null
+docker stop --time 15 "$run_id-writer" >/dev/null
+docker rm "$run_id-writer" >/dev/null
 test "$(fixture_storage read)" = "$before"
+writer
 backend
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --wait-ready 30
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"

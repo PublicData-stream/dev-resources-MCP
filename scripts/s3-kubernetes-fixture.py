@@ -50,7 +50,7 @@ def prepare(scratch):
 def foundation(path):
     file = Path(path)
     text = file.read_text()
-    text, count = re.subn(r'(name: backend\nspec:\n  replicas:) 1\n', r'\1 0\n', text)
+    text, count = re.subn(r'(name: backend\nspec:\n  replicas:) [01]\n', r'\1 0\n', text)
     if count != 1:
         raise ValueError('Expected one backend deployment')
     mount = '- {name: config, mountPath: /fixture/backend.toml, subPath: backend.toml, readOnly: true}'
@@ -60,6 +60,16 @@ def foundation(path):
     volume = 'secret: {secretName: devres-config}'
     if text.count(volume) != 1:
         raise ValueError('Expected one backend configuration volume')
+    text = text.replace(volume, volume + '\n        - name: s3\n          secret: {secretName: devres-s3-credentials, defaultMode: 0440}')
+    file.write_text(text)
+
+
+def writer(path):
+    file = Path(path)
+    text = file.read_text()
+    mount = '- {name: data, mountPath: /data}'
+    text = text.replace(mount, mount + '\n            - {name: s3, mountPath: /fixture/s3, readOnly: true}')
+    volume = 'secret: {secretName: devres-writer-config}'
     text = text.replace(volume, volume + '\n        - name: s3\n          secret: {secretName: devres-s3-credentials, defaultMode: 0440}')
     file.write_text(text)
 
@@ -75,10 +85,13 @@ def initializer(image):
                                          'fsGroup': 65532, 'runAsNonRoot': True},
                      'containers': [{'name': 'initialize', 'image': image,
                                      'imagePullPolicy': 'Never',
-                                     # DNS convergence is a prerequisite; the authenticated PUT runs once.
+                                     # DNS and Service health share one deadline; authenticated PUT runs once.
                                      'command': ['sh', '-ec',
-                                         'attempt=0; until getent ahostsv4 objectstore >/dev/null; do '
-                                         'attempt=$((attempt+1)); test "$attempt" -lt 60 || exit 1; '
+                                         'deadline=$(($(date +%s)+60)); '
+                                         'until getent ahostsv4 objectstore >/dev/null && '
+                                         'curl --connect-timeout 1 --max-time 2 --fail --silent '
+                                         '--output /dev/null http://objectstore:9000/health; do '
+                                         'test "$(date +%s)" -lt "$deadline" || exit 1; '
                                          'sleep 1; done; '
                                          'exec curl --connect-timeout 5 --max-time 15 '
                                          '--config /fixture/s3/create-bucket.curl'],
@@ -94,12 +107,14 @@ def initializer(image):
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
-        raise SystemExit('usage: s3-kubernetes-fixture.py prepare|foundation|initializer ARG')
+        raise SystemExit('usage: s3-kubernetes-fixture.py prepare|foundation|writer|initializer ARG')
     action, value = sys.argv[1:]
     if action == 'prepare':
         prepare(value)
     elif action == 'foundation':
         foundation(value)
+    elif action == 'writer':
+        writer(value)
     elif action == 'initializer':
         print(json.dumps(initializer(value)))
     else:

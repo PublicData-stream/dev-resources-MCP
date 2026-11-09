@@ -2,9 +2,11 @@
 
 ## Automatic attribution upgrade (schema 11)
 
-Normal startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
+Writer startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
 without corpus rewrite or provider acquisition. Existing offline schemas 1–9 to 10
 migration and activation remain required; inspection never bootstraps attribution.
+The same normal writer startup records schema 13 for the required runtime split;
+see [split upgrade](#credential-broker-and-split-runtime-upgrade).
 
 A supervised worker enumerates public history in bounded pages and prioritizes
 requested records. Old qualification withholds copied content until exact evidence
@@ -594,9 +596,10 @@ ZIPs are never extracted. JSON expansion uses an owned bounded staging file and
 removes it on completion/cancellation. Preserve original licensing in exported
 captures and keep any quota accounting consistent across restart.
 
-Deploy one serving replica with Recreate updates. PostgreSQL 18 and the blob
-filesystem are one logical backup unit. Provision both before starting the service.
-Stop the server and any maintenance writers before taking a PostgreSQL dump and
+Deploy serving separately from the single writer replica, using Recreate writer
+updates. PostgreSQL 18 and the blob filesystem are one logical backup unit.
+Provision both before starting the writer, then serving. Stop all serving readers,
+collection writers and maintenance before taking a PostgreSQL dump and
 blob-directory archive; retain them together with schema and build identity.
 Restore both into an isolated environment and verify capture reads before resuming.
 Database snapshots alone cannot recover missing archive bodies.
@@ -606,9 +609,9 @@ while exclusive ownership is held. Hash-named permanent objects are never delete
 by maintenance. Canceled stage writes have a cleanup guard; a crash can leave
 recoverable stages or unreferenced immutable blobs. Investigate archive integrity
 failures and storage exhaustion; do not discard permanent history as a shortcut.
-Loss of the dedicated serving-owner database connection fails health supervision
-and stops serving until restart. Do not run private refresh maintenance alongside
-an active server because it requires the same single-owner storage fence.
+Loss of a dedicated reader lifecycle or writer-owner database session fails health
+supervision until restart. Do not run private refresh maintenance alongside either
+role: its exclusive lifecycle fence requires all readers and the writer stopped.
 
 Production operators supply hostnames, certificates, credentials, an exact
 corresponding-source offer, storage sizing, coordinated backups, and monitoring.
@@ -1133,3 +1136,63 @@ object is read back and SHA-256 verified. `_devres-copy/COMPLETE.json` is publis
 last, after the full file set and destination key inventory pass. This marker proves the frozen file copy;
 a matching PostgreSQL backup and the separate application restore/acceptance
 procedure remain necessary for a server migration.
+
+
+## Credential broker and split runtime upgrade
+
+This is a full-stop configuration/topology upgrade for filesystem and S3. Existing
+public tool behavior is preserved; old combined deployment configuration is not
+sufficient. The old config-only invocation now aliases serving only. Start separate
+`devres-server serve SERVING.toml` and `devres-server collect WRITER.toml` workloads.
+There is one writer owner and Recreate writer updates. See the
+[configuration and policy examples](../deploy/examples/scaleway-credential-broker/README.md)
+and [broker Kubernetes template](../deploy/kubernetes/credential-broker.yaml.example).
+The [explicit-context runtime control helper](../scripts/split-runtime-control.py)
+preflights split workloads and orders stop/start; it does not grant deployment
+authority or provision their prerequisites.
+
+1. Stop all serving readers, collectors, and maintenance processes. Take a
+   coordinated corpus PostgreSQL/permanent-archive backup and preserve the matching
+   old executable and config. Confirm no retained evidence is being rewritten.
+2. Provision a separate broker PostgreSQL database/login, native encrypted Kubernetes
+   Secrets, TLS, explicit projected tokens/RBAC, and private network policy. Run the
+   documented Scaleway issuer-confinement, expiry, quota, RO/CRUD, multipart and
+   prefix acceptance against disposable objects. Prepare the exact operator receipt.
+   A fixture run or a receipt template cannot replace this provider gate.
+3. Preserve existing backend/bucket/prefix and database binding. Supply writer
+   database authority and either a writable filesystem archive or RW broker profile.
+   Give serving SELECT-only PostgreSQL and either a read-only filesystem mount plus
+   separate writable scratch, or an RO broker profile and its own S3 cache.
+4. Start the broker, then the sole writer. Its bounded additive startup commits
+   schema 13 and retains the archive format/history; earlier pending BLAKE3 migration
+   still requires the existing offline procedure. Start serving after the committed
+   backend is available. No role split silently transfers filesystem data to S3.
+5. Verify historical capture/resource identities and pagination; a foreground cold
+   request must delegate to writer and publish before returning. Confirm RO serving
+   rejects SQL/object writes, another writer is refused, and private services are
+   unreachable from the edge. Test token rotation, pod replacement, key refresh,
+   broker restart, provider outage/recovery and maintenance exclusion with readers
+   alive. Report fixture, provider, local cluster, hosted native architectures and
+   production acceptance separately.
+
+Schema 13 blocks reopening with older combined binaries. Roll back only by stopping
+both roles and restoring the coordinated pre-upgrade database/archive backup with
+its matching binary/config; never decrement the schema number or overwrite/delete
+new permanent evidence to make an older executable start. Preserve post-upgrade
+history separately before any operator-authorized rollback.
+
+All offline maintenance and coordinated corpus backup/restore require readers and
+writer stopped. Shared lifecycle locks exclude maintenance even when only a reader
+remains. Dedicated session loss requires process restart; reconnecting the pool
+does not renew ownership. S3 credential/storage failures still withhold warm-cache
+reads and readiness. A writer failure does not grant serving write authority.
+
+Keep broker journals and encryption/issuer material outside the corpus database
+and public archive backup path. Restore broker state only as private operational
+state with the matching pinned cluster UID, keyring and current profiles/receipt;
+a different cluster or a nonempty unbound journal is rejected rather than
+rebound automatically. Reconcile expired,
+revoked, dead-pod and uncertain keys before issuance resumes. Do not remove journal
+records to recover quota. Rotate native cluster encryption and broker envelope keys
+using their separate recovery procedures. The example One Zone option applies only
+to new objects; converting retained objects remains a distinct authorized operation.

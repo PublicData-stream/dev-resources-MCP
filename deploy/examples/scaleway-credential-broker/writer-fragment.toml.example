@@ -1,0 +1,35 @@
+# Merge with the ordinary server source/health/provider settings.
+[storage]
+database_url = "postgres://devres_writer:REPLACE_PASSWORD@postgres/devres"
+blob_dir = "/data/cache"
+backend = "s3"
+
+[storage.s3]
+endpoint = "https://s3.fr-par.scw.cloud"
+bucket = "devres-archive"
+region = "fr-par"
+prefix = "production"
+path_style = true
+cache_max_bytes = 68719476736
+# Explicit opt-in affects only newly created objects. Omit for provider default.
+storage_class = "ONEZONE_IA"
+
+[storage.s3.credentials]
+mode = "container"
+endpoint = "https://credential-broker.devres.svc:9444/v1/credentials"
+# Broker-audience projection: expirationSeconds = 3600 for 900-second leases.
+authorization_token_file = "/run/devres-broker-identity/token"
+ca_file = "/run/devres-broker-trust/ca.crt"
+refresh_before_secs = 300
+
+[writer_listener]
+bind = "0.0.0.0:9443"
+certificate = "/run/devres-writer-tls/tls.crt"
+private_key = "/run/devres-writer-tls/tls.key"
+allowed_clients = [{namespace = "devres", service_account = "devres-serving"}]
+
+[writer_listener.auth]
+kube_api_url = "https://kubernetes.default.svc"
+kube_token_file = "/run/devres-kube/token"
+kube_ca_file = "/run/devres-kube/ca.crt"
+audience = "devres-writer"

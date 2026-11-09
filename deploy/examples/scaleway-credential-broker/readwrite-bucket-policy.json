@@ -1,0 +1,51 @@
+{
+  "Version": "2023-04-17",
+  "Statement": [
+    {
+      "Sid": "readwriteObjects",
+      "Effect": "Allow",
+      "Principal": {
+        "SCW": "application_id:00000000-0000-0000-0000-000000000003"
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "devres-archive/production/*"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "true"
+        }
+      }
+    },
+    {
+      "Sid": "readwriteListing",
+      "Effect": "Allow",
+      "Principal": {
+        "SCW": "application_id:00000000-0000-0000-0000-000000000003"
+      },
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": [
+        "devres-archive"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "true"
+        },
+        "StringLike": {
+          "s3:prefix": [
+            "production/*"
+          ]
+        }
+      }
+    }
+  ]
+}

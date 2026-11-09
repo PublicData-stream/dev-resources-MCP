@@ -14,6 +14,7 @@ RUN --mount=type=cache,id=devres-registry,target=/tmp/cargo/registry,sharing=loc
     cargo build --workspace --bins --release --locked --jobs 2 \
     && mkdir -p /tmp/build-output \
     && cp /tmp/rust/target/release/devres-server /tmp/rust/target/release/devres-probe \
+          /tmp/rust/target/release/devres-credential-broker \
           /tmp/rust/target/release/devres-audit-worker /tmp/rust/target/release/devres-pdf-worker /tmp/build-output/ \
     && python3 scripts/collect-notices.py /notices
 
@@ -35,6 +36,11 @@ ENTRYPOINT ["/usr/local/bin/devres-probe"]
 FROM runtime-base AS audit-worker
 COPY --from=build /tmp/build-output/devres-audit-worker /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/devres-audit-worker"]
+
+FROM runtime-base AS credential-broker
+COPY --from=build /tmp/build-output/devres-credential-broker /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/devres-credential-broker"]
+CMD ["/etc/devres/credential-broker.toml"]
 
 FROM runtime-base AS server
 USER root

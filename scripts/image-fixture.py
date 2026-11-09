@@ -56,9 +56,13 @@ def check_worker(mode, stdout, stderr):
 def check_startup(target, stdout, stderr):
     if stdout:
         raise ValueError("Startup failure unexpectedly wrote stdout")
+    if target == 'credential-broker':
+        if stderr != b'Error: Unavailable\n':
+            raise ValueError('Broker did not return its fixed missing-configuration error')
+        return
     expected = b"usage: devres-probe" if target == "probe" else b"/missing.toml"
     # std::fs errors may omit the path, but must report the config/I/O failure.
-    if expected not in stderr and not (target == "server" and b"No such file or directory" in stderr):
+    if expected not in stderr and not (target in ("server", "credential-broker") and (b"No such file or directory" in stderr or b"configuration unavailable" in stderr.lower())):
         raise ValueError("Executable did not return the expected startup error")
 
 
@@ -69,10 +73,12 @@ def inspect_image(records, platform, target):
     config = image["Config"]
     if f'{image["Os"]}/{image["Architecture"]}' != platform or config["User"] != "65532:65532":
         raise ValueError("Image platform or non-root identity differs")
-    binary = {"runtime": "server", "server": "server", "probe": "probe", "audit-worker": "audit-worker"}[target]
+    binary = {"runtime": "server", "server": "server", "probe": "probe", "audit-worker": "audit-worker", "credential-broker": "credential-broker"}[target]
     if config.get("Entrypoint") != [f"/usr/local/bin/devres-{binary}"]:
         raise ValueError("Image entrypoint differs from selected target")
     expected_cmd = ["/etc/devres/server.toml"] if binary == "server" else None
+    if binary == "credential-broker":
+        expected_cmd = ["/etc/devres/credential-broker.toml"]
     if config.get("Cmd") not in (expected_cmd, [] if expected_cmd is None else expected_cmd):
         raise ValueError("Image default arguments differ from selected target")
     if not DIGEST.fullmatch(image["Id"]):

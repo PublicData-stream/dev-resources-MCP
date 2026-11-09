@@ -59,8 +59,8 @@ if "{kind}" == "image":
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(calls[:3], [["native", "linux/" + arch], ["tag", "1.2.3", COMMIT],
                                              ["stamp", "stamp", "--tag", "1.2.3", "--commit", COMMIT]])
-                self.assertEqual([call[0] for call in calls[3:]], ["image", "verify"] * 3)
-                for index, target in enumerate(("server", "probe", "audit-worker")):
+                self.assertEqual([call[0] for call in calls[3:]], ["image", "verify"] * 4)
+                for index, target in enumerate(("server", "probe", "audit-worker", "credential-broker")):
                     self.assertEqual(calls[3 + index * 2], ["image", "--platform", "linux/" + arch,
                                       "--target", target, "--revision", COMMIT, "--version", "1.2.3",
                                       "--oci-output", str(output / target)])

@@ -95,17 +95,17 @@ class RegistryAcceptanceTests(unittest.TestCase):
         target = acceptance.FAMILIES[index]
         (self.digests / (target + ".json")).write_bytes(encoded(self.records[index]))
 
-    def test_all_nine_attestations_and_six_full_downloads_precede_accepted_output(self):
+    def test_all_attestations_and_full_downloads_precede_accepted_output(self):
         with patch.object(acceptance, "command", side_effect=self.command):
             result = self.accept()
         self.assertEqual(result, json.loads(self.output.read_text()))
         self.assertEqual(result, {"tag": self.tag, "version": self.tag, "commit": self.commit, "images": self.records})
-        self.assertEqual(sum(args[:2] == ["skopeo", "inspect"] for args, _ in self.calls), 3)
-        self.assertEqual(sum(args[:2] == ["skopeo", "copy"] for args, _ in self.calls), 6)
-        self.assertEqual(sum(args[:3] == ["gh", "attestation", "verify"] for args, _ in self.calls), 9)
+        self.assertEqual(sum(args[:2] == ["skopeo", "inspect"] for args, _ in self.calls), len(acceptance.FAMILIES))
+        self.assertEqual(sum(args[:2] == ["skopeo", "copy"] for args, _ in self.calls), 2 * len(acceptance.FAMILIES))
+        self.assertEqual(sum(args[:3] == ["gh", "attestation", "verify"] for args, _ in self.calls), 3 * len(acceptance.FAMILIES))
         destinations = [Path(args[-1].removeprefix("oci:").removesuffix(":accepted"))
                         for args, _ in self.calls if args[:2] == ["skopeo", "copy"]]
-        self.assertEqual(len(set(destinations)), 6)
+        self.assertEqual(len(set(destinations)), 2 * len(acceptance.FAMILIES))
         self.assertTrue(all(not destination.exists() for destination in destinations))
 
     def test_ambient_auth_is_replaced_by_isolated_empty_client_files(self):

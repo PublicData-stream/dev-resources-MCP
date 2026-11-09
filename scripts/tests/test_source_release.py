@@ -97,7 +97,7 @@ class SourceReleaseTests(unittest.TestCase):
             path = Path(arguments[3])
             self.remote["assets"].append({"name": path.name, "digest": "sha256:" + release.checksum(path)})
         elif arguments[:2] == ("release", "edit"):
-            self.assertEqual(len(self.remote["assets"]), 6)
+            self.assertEqual(len(self.remote["assets"]), 7)
             self.remote["draft"] = False
         elif arguments[:2] == ("release", "download"):
             path = arguments[arguments.index("--pattern") + 1]
@@ -116,7 +116,7 @@ class SourceReleaseTests(unittest.TestCase):
     def test_exact_source_and_all_image_families_required(self):
         paths = release.assets(self.source, self.digests, self.tag, self.commit)
         self.assertEqual({path.name for path in paths}, {"source.tar.gz", "source.tar.gz.sha256",
-                         "release.json", "server.json", "probe.json", "audit-worker.json"})
+                         "release.json", "server.json", "probe.json", "audit-worker.json", "credential-broker.json"})
         for target in release.FAMILIES:
             path = self.digests / f"{target}.json"
             original = path.read_bytes()
@@ -154,12 +154,12 @@ class SourceReleaseTests(unittest.TestCase):
 
     def test_published_release_appends_assets_and_preserves_human_metadata(self):
         self.publish()
-        self.assertEqual(len(self.calls), 6)
+        self.assertEqual(len(self.calls), 7)
         self.assertTrue(all(call[:2] == ("release", "upload") for call in self.calls))
         self.assertEqual(self.remote["body"], "Human release notes")
         self.assertEqual(self.remote["name"], "Human title")
         self.assertEqual(self.remote["target_commitish"], "main")
-        self.assertEqual(len(self.fences), 8)
+        self.assertEqual(len(self.fences), 5 + len(release.FAMILIES))
 
     def test_fresh_build_remains_draft_until_all_assets_uploaded(self):
         self.build()
@@ -167,7 +167,7 @@ class SourceReleaseTests(unittest.TestCase):
         self.publish()
         self.assertEqual(self.calls[0][:2], CREATE)
         self.assertEqual(self.calls[-1][:2], ("release", "edit"))
-        self.assertEqual(len(self.remote["assets"]), 6)
+        self.assertEqual(len(self.remote["assets"]), 7)
         self.assertFalse(self.remote["draft"])
 
     def test_failed_immediate_tag_fence_prevents_creation(self):
@@ -368,9 +368,9 @@ class SourceReleaseTests(unittest.TestCase):
 
                 with patch.object(release, "fetch_release", side_effect=observe):
                     self.publish()
-                self.assertEqual(reads, 7)
+                self.assertEqual(reads, 4 + len(release.FAMILIES))
                 self.assertEqual([call[:2] for call in self.calls],
-                                 [("release", "upload")] * 6 + [("release", "edit")])
+                                 [("release", "upload")] * (3 + len(release.FAMILIES)) + [("release", "edit")])
 
     def test_invalid_recheck_stops_remaining_uploads_and_publication(self):
         self.build()
@@ -461,7 +461,7 @@ class SourceReleaseTests(unittest.TestCase):
                         self.publish()
                     mutations = [call[:2] for call in self.calls]
                     self.assertEqual(mutations, ([CREATE] if fresh else [])
-                                     + [("release", "upload")] * 6 + [("release", "edit")])
+                                     + [("release", "upload")] * (3 + len(release.FAMILIES)) + [("release", "edit")])
                     self.assertFalse(self.remote["draft"])
                     self.assertEqual(sum("--paginate" in read for read in self.api_reads), 1)
                     self.assertTrue(any(read[0].endswith("/releases/42") for read in self.api_reads))
@@ -473,7 +473,7 @@ class SourceReleaseTests(unittest.TestCase):
             self.publish()
         self.assertEqual(sum("--paginate" in read for read in self.api_reads), 1)
         self.assertEqual([call[:2] for call in self.calls],
-                         [CREATE] + [("release", "upload")] * 6 + [("release", "edit")])
+                         [CREATE] + [("release", "upload")] * (3 + len(release.FAMILIES)) + [("release", "edit")])
         self.assertFalse(self.remote["draft"])
 
     def test_disappearing_draft_stops_without_recreation_or_publication(self):

@@ -81,7 +81,7 @@ kind: Deployment
 metadata:
   name: backend
 spec:
-  replicas: 1
+  replicas: 0
   strategy:
     type: Recreate
   selector:
@@ -97,6 +97,7 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
         seccompProfile: {type: RuntimeDefault}
+      serviceAccountName: devres-serving
       containers:
         - name: backend
           image: DEVRES_HARNESS_IMAGE
@@ -121,8 +122,10 @@ spec:
           volumeMounts:
             - {name: config, mountPath: /fixture/backend.toml, subPath: backend.toml, readOnly: true}
             - {name: tls, mountPath: /fixture/cert, readOnly: true}
-            - {name: data, mountPath: /data}
+            - {name: data, mountPath: /data, readOnly: true}
             - {name: tmp, mountPath: /tmp}
+            - {name: writer-identity, mountPath: /run/devres-writer-identity, readOnly: true}
+            - {name: reader-cache, mountPath: /reader-cache}
       volumes:
         - name: config
           secret: {secretName: devres-config}
@@ -131,7 +134,17 @@ spec:
         - name: data
           persistentVolumeClaim: {claimName: devres-data}
         - name: tmp
-          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+          emptyDir: {sizeLimit: 1Gi}
+        - name: reader-cache
+          emptyDir: {sizeLimit: 2Gi}
+        - name: writer-identity
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: devres-writer
+                  expirationSeconds: 600
 ---
 apiVersion: v1
 kind: Service
@@ -255,5 +268,9 @@ spec:
     - from:
         - podSelector:
             matchLabels: {app: backend}
+        - podSelector:
+            matchLabels: {app: writer}
+        - podSelector:
+            matchLabels: {app: credential-broker}
       ports:
         - {port: 5432, protocol: TCP}

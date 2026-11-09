@@ -96,6 +96,8 @@ k() { minikube "$@"; }
                         file = root / 'scripts' / name
                         file.write_text('#!/bin/bash\nprintf "%s\\n" "' + name + ' $*" >> "$CALLS"\n')
                         file.chmod(0o755)
+                    for name in ('split-runtime-fixture.py', 'kube-identity-fixture.py', 'secrets-encryption-fixture.py'):
+                        (root / 'scripts' / name).write_text('import sys\n')
                     diagnostic = root / 'scripts' / 'e2e-storage.sh'
                     diagnostic.write_text('#!/bin/bash\nprintf "storage %s\\n" "$1" >> "$CALLS"\nexit 97\n')
                     diagnostic.chmod(0o755)

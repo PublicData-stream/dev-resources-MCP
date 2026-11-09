@@ -11,7 +11,7 @@ for ca in ca client-ca wrong-ca; do
     -subj "/CN=devres-test-$ca" -keyout "$scratch/$ca-key.pem" \
     -out "$scratch/fixture/cert/$ca.pem" >/dev/null 2>&1
 done
-for name in edge backend wrong-backend edge-client wrong-client; do
+for name in edge backend writer credential-broker wrong-backend edge-client wrong-client; do
   role=serverAuth
   ca=ca
   if [[ $name == *client ]]; then role=clientAuth; ca=client-ca; fi

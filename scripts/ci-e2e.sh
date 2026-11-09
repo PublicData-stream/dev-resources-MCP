@@ -73,9 +73,9 @@ exec scripts/with-local-docker.sh bash -euo pipefail -c '
     }
     scripts/e2e-storage.sh after-artifact-load "$image" "$3" || true
     case "$7" in
-      docker) scripts/test-oxibelt.sh --image "$image" ;;
+      docker) scripts/test-oxibelt.sh --image "$image"; scripts/test-credential-broker.sh --image "$image" ;;
       minikube) scripts/test-minikube.sh --image "$image" ;;
-      minikube-s3) scripts/test-minikube.sh --image "$image" --s3 ;;
+      minikube-s3) scripts/test-minikube.sh --image "$image" --s3 --credential-broker ;;
     esac
   fi
 ' ci-e2e "$platform" "$mode" "$artifact" "$version" "$commit" "$arch" "$scenario"

@@ -89,5 +89,7 @@ spec:
     - from:
         - podSelector:
             matchLabels: {app: backend}
+        - podSelector:
+            matchLabels: {app: writer}
       ports:
         - {port: 9000, protocol: TCP}

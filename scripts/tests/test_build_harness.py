@@ -11,7 +11,7 @@ import unittest
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-BINARIES = ("devres-server", "devres-probe", "storage-probe",
+BINARIES = ("devres-server", "devres-probe", "devres-credential-broker", "storage-probe",
             "devres-audit-worker", "devres-pdf-worker", "oxibelt")
 DEBUG = b"\n# fixture debug information\n"
 
@@ -27,6 +27,9 @@ class BuildHarnessTests(unittest.TestCase):
         scripts.mkdir()
         shutil.copy2(SCRIPTS / "build-harness.sh", scripts / "build-harness.sh")
         (scripts / "mcp_smoke.py").write_text("# smoke fixture\n")
+        (scripts / "kube-identity-fixture.py").write_text("# identity fixture\n")
+        for name in ('scaleway-iam-fixture.py', 'credential-broker-fixture.py', 'credential-broker-probe.py', 'broker-pod-probe.py'):
+            (scripts / name).write_text('# broker fixture\n')
         deploy = self.root / "deploy" / "oxibelt"
         deploy.mkdir(parents=True)
         (deploy / "Dockerfile.harness").write_text("FROM fixture\n")
@@ -115,7 +118,7 @@ with open(os.environ["TEST_LOG"], "a") as output:
         self.assertEqual(result.returncode, 42, result.stderr)
         self.assertFalse(any(call[:2] == ["docker", "build"] for call in calls))
         self.assertEqual([Path(call[2]).name for call in calls if call[0] == "strip"],
-                         list(BINARIES[:3]))
+                     list(BINARIES[:4]))
 
     def test_missing_strip_fails_before_compilation(self):
         (self.bin / "strip").unlink()

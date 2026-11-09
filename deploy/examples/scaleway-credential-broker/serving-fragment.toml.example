@@ -1,0 +1,28 @@
+# Merge with the ordinary server source/listener/provider settings.
+# database_url is supplied in a mounted private config, never CLI arguments.
+[storage]
+database_url = "postgres://devres_reader:REPLACE_PASSWORD@postgres/devres"
+blob_dir = "/data/cache"
+scratch_dir = "/data/scratch"
+backend = "s3"
+
+[storage.s3]
+endpoint = "https://s3.fr-par.scw.cloud"
+bucket = "devres-archive"
+region = "fr-par"
+prefix = "production"
+path_style = true
+cache_max_bytes = 68719476736
+
+[storage.s3.credentials]
+mode = "container"
+endpoint = "https://credential-broker.devres.svc:9444/v1/credentials"
+# Broker-audience projection: expirationSeconds = 3600 for 900-second leases.
+authorization_token_file = "/run/devres-broker-identity/token"
+ca_file = "/run/devres-broker-trust/ca.crt"
+refresh_before_secs = 300
+
+[writer_client]
+endpoint = "https://writer.devres.svc:9443/v1/acquire"
+token_file = "/run/devres-writer-identity/token"
+ca_file = "/run/devres-writer-trust/ca.crt"

@@ -79,7 +79,7 @@ jobs:
           if [[ -n $RELEASE_TAG ]]; then
             version=$(python3 scripts/release_contract.py verify-stamped --tag "$RELEASE_TAG" --commit "$GITHUB_SHA")
           fi
-          for target in server probe audit-worker; do
+          for target in server probe audit-worker credential-broker; do
             scripts/test-image.sh --platform "$PLATFORM" --target "$target" \
               --revision "$GITHUB_SHA" --version "$version" \
               --oci-output "/tmp/devres-ci-oci-images/$target"

@@ -1,0 +1,42 @@
+# Operator template: replace UUIDs/fingerprints and mount secret files before use.
+bind = "0.0.0.0:9444"
+tls_certificate_file = "/run/devres-broker/tls.crt"
+tls_private_key_file = "/run/devres-broker/tls.key"
+database_url_file = "/run/devres-broker/database-url"
+keyring_file = "/run/devres-broker/keyring.json"
+issuer_key_file = "/run/devres-broker/issuer-secret-key"
+issuer_access_key = "REPLACE_ISSUER_ACCESS_KEY_ID"
+issuer_application_id = "00000000-0000-0000-0000-000000000001"
+acceptance_receipt_file = "/run/devres-broker/acceptance-receipt.json"
+fixture_mode = false
+ttl_secs = 900
+refresh_before_secs = 300
+max_pods = 16
+max_issued_keys = 32
+quota_reserve = 8
+
+[authentication]
+kube_api_url = "https://kubernetes.default.svc"
+kube_token_file = "/run/devres-kube/token"
+kube_ca_file = "/run/devres-kube/ca.crt"
+audience = "devres-credential-broker"
+
+[[profiles]]
+namespace = "devres"
+service_account = "devres-serving"
+application_id = "00000000-0000-0000-0000-000000000002"
+default_project_id = "00000000-0000-0000-0000-000000000004"
+bucket = "devres-archive"
+prefix = "production"
+role = "readonly"
+policy_fingerprint = "REPLACE_WITH_64_HEX_POLICY_DIGEST"
+
+[[profiles]]
+namespace = "devres"
+service_account = "devres-writer"
+application_id = "00000000-0000-0000-0000-000000000003"
+default_project_id = "00000000-0000-0000-0000-000000000004"
+bucket = "devres-archive"
+prefix = "production"
+role = "readwrite"
+policy_fingerprint = "REPLACE_WITH_64_HEX_POLICY_DIGEST"

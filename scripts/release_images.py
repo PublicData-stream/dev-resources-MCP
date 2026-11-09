@@ -13,7 +13,7 @@ import sys
 
 from release_contract import validate as release_version
 
-FAMILIES = ("server", "probe", "audit-worker")
+FAMILIES = ("server", "probe", "audit-worker", "credential-broker")
 ARCHES = ("amd64", "arm64")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 REGISTRY = "ghcr.io/publicdata-stream/dev-resources-"

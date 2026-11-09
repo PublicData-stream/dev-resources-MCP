@@ -1,0 +1,46 @@
+{
+  "Version": "2023-04-17",
+  "Statement": [
+    {
+      "Sid": "readonlyObjects",
+      "Effect": "Allow",
+      "Principal": {
+        "SCW": "application_id:00000000-0000-0000-0000-000000000002"
+      },
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "devres-archive/production/*"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "true"
+        }
+      }
+    },
+    {
+      "Sid": "readonlyListing",
+      "Effect": "Allow",
+      "Principal": {
+        "SCW": "application_id:00000000-0000-0000-0000-000000000002"
+      },
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "devres-archive"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "true"
+        },
+        "StringLike": {
+          "s3:prefix": [
+            "production/*"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -5,6 +5,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 requested_args=("$@")
 live=0
 s3=0
+credential_broker=0
 live_rfc_args=()
 supplied_image=
 while (( $# )); do
@@ -12,12 +13,14 @@ while (( $# )); do
     --image) [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo '--image requires an image' >&2; exit 2; }; supplied_image=$2; shift 2 ;;
     --live) live=1; shift ;;
     --s3) s3=1; shift ;;
+    --credential-broker) credential_broker=1; shift ;;
     --rfc-text-only) live_rfc_args=(--rfc-text-only); shift ;;
-    *) echo 'usage: scripts/test-minikube.sh [--image IMAGE] [--s3] [--live [--rfc-text-only]]' >&2; exit 2 ;;
+    *) echo 'usage: scripts/test-minikube.sh [--image IMAGE] [--s3 [--credential-broker]] [--live [--rfc-text-only]]' >&2; exit 2 ;;
   esac
 done
 if (( ! live && ${#live_rfc_args[@]} )); then echo '--rfc-text-only requires --live' >&2; exit 2; fi
 if (( s3 && live )); then echo '--s3 is an isolated fixture scenario and does not accept --live' >&2; exit 2; fi
+if (( credential_broker && ! s3 )); then echo '--credential-broker requires --s3' >&2; exit 2; fi
 if [[ ${DEVRES_TMP_STATE:-} != 1 ]]; then
   docker_endpoint=${DEVRES_DOCKER_HOST:-${DOCKER_HOST:-}}
   if [[ -z $docker_endpoint ]]; then
@@ -53,6 +56,25 @@ collect_diagnostics() {
   [[ -n ${DEVRES_E2E_DIAGNOSTICS_DIR:-} ]] || return 0
   local diagnostics="$DEVRES_E2E_DIAGNOSTICS_DIR/$run_id"
   mkdir -p -- "$diagnostics" || return 0
+  # Explicitly validate this metadata allowlist before retaining it. Credential
+  # responses and arbitrary fixture files must never enter diagnostics.
+  python3 - "$scratch" "$diagnostics" <<'PYBROKERDIAG' || true
+import json, math, pathlib, sys
+for name in ('reader-key-metadata.json', 'recovered-reader-key-metadata.json'):
+    try:
+        with (pathlib.Path(sys.argv[1]) / name).open('rb') as source:
+            raw = source.read(4097)
+        assert len(raw) <= 4096
+        value = json.loads(raw)
+        assert set(value) == {'key_hash', 'expires_at', 'observed_at'}
+        assert isinstance(value['key_hash'], str) and len(value['key_hash']) == 64
+        assert all(char in '0123456789abcdef' for char in value['key_hash'])
+        assert all(isinstance(value[key], (int, float)) and math.isfinite(value[key])
+                   for key in ('expires_at', 'observed_at'))
+        (pathlib.Path(sys.argv[2]) / name).write_text(json.dumps(value) + '\n')
+    except (OSError, ValueError, TypeError, AssertionError):
+        pass
+PYBROKERDIAG
   if (( created )); then
     diag_capture pods.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get pods -o wide
     diag_capture pvc.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get pvc -o 'custom-columns=NAME:.metadata.name,PHASE:.status.phase,VOLUME:.spec.volumeName,CAPACITY:.status.capacity.storage'
@@ -60,7 +82,7 @@ collect_diagnostics() {
     diag_capture backend-memory.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" exec deployment/backend -- sh -c 'for file in /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.events; do if test -r "$file"; then echo "$file"; cat "$file"; fi; done'
     diag_capture events.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get events --field-selector type=Warning --sort-by=.lastTimestamp
     diag_capture backend-previous.log minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" logs deploy/backend --previous --tail=100 --limit-bytes=65536
-    for component in backend edge postgres; do
+  for component in backend writer credential-broker edge postgres; do
       diag_capture "$component.log" minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" logs "deploy/$component" --tail=100 --limit-bytes=65536
     done
   fi
@@ -89,16 +111,29 @@ if minikube profile list -o json | python3 -c 'import json,sys; p=json.load(sys.
 fi
 scripts/make-fixture.sh "$scratch"
 if (( s3 )); then python3 scripts/s3-kubernetes-fixture.py prepare "$scratch"; fi
+if (( credential_broker )); then python3 scripts/credential-broker-fixture.py prepare "$scratch" kubernetes; fi
+python3 scripts/split-runtime-fixture.py "$scratch" kubernetes
+if (( credential_broker )); then python3 scripts/broker-kubernetes-fixture.py configure "$scratch"; fi
+python3 scripts/secrets-encryption-fixture.py prepare "$MINIKUBE_HOME"
 if [[ -z $supplied_image ]]; then
   scripts/build-harness.sh "$scratch" "$image"
 else
   docker image inspect "$image" >/dev/null
+fi
+if (( credential_broker )); then
+  for command in profile-fingerprints issuer-fingerprint; do
+    docker run --rm --network none --read-only --user "$(id -u):$(id -g)" --cap-drop ALL \
+      -v "$scratch/fixture:/fixture:ro" --entrypoint devres-credential-broker "$image" \
+      "$command" /fixture/broker/broker.toml > "$scratch/fixture/broker/$command"
+  done
+  python3 scripts/credential-broker-fixture.py receipt "$scratch/fixture/broker" "$scratch/fixture/broker/profile-fingerprints"
 fi
 # Set the cleanup fence before startup so partially created task-owned profiles go away.
 created=1
 scripts/e2e-storage.sh before-minikube-start "$image" "$scratch" || true
 minikube -p "$profile" start --driver=docker --container-runtime=containerd --cni=calico \
   --kubernetes-version="${DEVRES_KUBERNETES_VERSION:-v1.37.0}" \
+  --extra-config=apiserver.encryption-provider-config=/var/lib/minikube/certs/devres-encryption.json \
   --cpus=4 --memory=6144 --subnet=10.223.254.0/24 --keep-context || {
     status=$?
     scripts/e2e-storage.sh minikube-start-failed "$image" "$scratch" || true
@@ -112,16 +147,57 @@ minikube -p "$profile" image load "$image" || {
 }
 scripts/e2e-storage.sh after-minikube-import "$image" "$scratch" || true
 k create namespace "$namespace" --dry-run=client -o yaml | k apply -f -
+k create secret generic devres-encryption-canary --from-literal=value=devres-synthetic-encryption-canary
+etcd_pod=$(k -n kube-system get pods -l component=etcd -o jsonpath='{.items[0].metadata.name}')
+k -n kube-system get pod "$etcd_pod" -o json > "$scratch/etcd-pod.json"
+python3 - "$scratch/etcd-pod.json" > "$scratch/etcd-paths" <<'PYETCD'
+import json, sys
+pod = json.load(open(sys.argv[1]))
+arguments = pod['spec']['containers'][0]['command']
+for flag in ('--trusted-ca-file=', '--cert-file=', '--key-file='):
+    values = [value[len(flag):] for value in arguments if value.startswith(flag)]
+    if len(values) != 1 or not values[0].startswith('/'):
+        raise SystemExit('Expected explicit etcd TLS identity paths')
+    print(values[0])
+PYETCD
+mapfile -t etcd_paths < "$scratch/etcd-paths"
+k -n kube-system exec "$etcd_pod" -- etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert="${etcd_paths[0]}" --cert="${etcd_paths[1]}" --key="${etcd_paths[2]}" \
+  get "/registry/secrets/$namespace/devres-encryption-canary" --print-value-only > "$scratch/encrypted-secret"
+python3 scripts/secrets-encryption-fixture.py verify "$scratch/encrypted-secret"
+k delete secret devres-encryption-canary
 if (( s3 )); then
   k create secret generic devres-s3-credentials --from-file="$scratch/fixture/s3/"
 fi
 k create secret generic devres-config --from-file=backend.toml="$scratch/fixture/backend.toml" \
   --from-literal=postgres-password=fixture-only
+k create secret generic devres-writer-config --from-file=writer.toml="$scratch/fixture/writer.toml"
+if (( credential_broker )); then
+  broker_files=()
+  for name in broker.toml database-url keyring.json issuer-key receipt.json; do
+    broker_files+=(--from-file="$name=$scratch/fixture/broker/$name")
+  done
+  k create secret generic devres-broker-private "${broker_files[@]}"
+  k create secret generic devres-iam-fixture --from-file=iam-fixture.json="$scratch/fixture/broker/iam-fixture.json"
+fi
 k create secret generic devres-tls --from-file="$scratch/fixture/cert/"
 k create configmap devres-edge-config --from-file=oxibelt.toml="$scratch/fixture/config/oxibelt.toml"
 sed "s|DEVRES_HARNESS_IMAGE|$image|g" deploy/kubernetes/foundation.yaml > "$scratch/foundation.yaml"
 if (( s3 )); then python3 scripts/s3-kubernetes-fixture.py foundation "$scratch/foundation.yaml"; fi
+if (( credential_broker )); then python3 scripts/broker-kubernetes-fixture.py workloads "$scratch/foundation.yaml"; fi
 k apply -f "$scratch/foundation.yaml"
+sed -e "s|DEVRES_HARNESS_IMAGE|$image|g" -e "s|DEVRES_AUTH_REVIEWER|$run_id-reviewer|g" \
+  deploy/kubernetes/split-runtime.yaml > "$scratch/split-runtime.yaml"
+if (( s3 )); then python3 scripts/s3-kubernetes-fixture.py writer "$scratch/split-runtime.yaml"; fi
+if (( credential_broker )); then python3 scripts/broker-kubernetes-fixture.py workloads "$scratch/split-runtime.yaml"; fi
+k apply -f "$scratch/split-runtime.yaml"
+k rollout status deployment/postgres --timeout=180s
+k exec -i deployment/postgres -- psql -v ON_ERROR_STOP=1 -U devres -d devres < "$scratch/reader-role.sql" >/dev/null
+if (( credential_broker )); then
+  k exec -i deployment/postgres -- psql -v ON_ERROR_STOP=1 -U devres -d postgres < "$scratch/fixture/broker/database-init.sql" >/dev/null
+  python3 scripts/broker-kubernetes-fixture.py manifests "$image" "$run_id-reviewer" > "$scratch/broker.json"
+  k apply -f "$scratch/broker.json"
+fi
 if (( s3 )); then
   k apply -f deploy/kubernetes/s3-fixture.yaml
   k -n kube-system rollout status deployment/coredns --timeout=120s
@@ -130,9 +206,96 @@ if (( s3 )); then
   k apply -f "$scratch/objectstore-init.json"
   k wait --for=condition=Complete job/objectstore-init --timeout=120s
   k delete job/objectstore-init --wait=true
-  k scale deployment/backend --replicas=1
+  if (( credential_broker )); then
+    k rollout status deployment/iam-fixture --timeout=180s
+    k rollout status deployment/credential-broker --timeout=180s
+  fi
 fi
-for deployment in postgres backend edge; do k rollout status deployment/"$deployment" --timeout=180s; done
+k scale deployment/writer --replicas=1
+k rollout status deployment/writer --timeout=180s
+k scale deployment/backend --replicas=1
+for deployment in postgres writer backend edge; do k rollout status deployment/"$deployment" --timeout=180s; done
+if (( credential_broker )); then
+  wait_broker_service() {
+    # Pod readiness precedes Service endpoint convergence. Check the same DNS,
+    # CA and HTTPS path the serving workload will use, without sending a token.
+    k exec -i deployment/backend -- python3 -I -B - <<'PYBROKERREADY'
+import ssl, time, urllib.error, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+    urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile='/fixture/cert/ca.pem')))
+deadline = time.monotonic() + 20
+while True:
+    try:
+        with opener.open('https://credential-broker:8444/healthz', timeout=2) as response:
+            if response.status == 204:
+                break
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SystemExit('CA-validated broker Service health did not become ready within 20 seconds')
+    time.sleep(min(0.2, remaining))
+PYBROKERREADY
+  }
+  # Run the actual S3 authorization probe and retain only public identifier hashes
+  # and expiry metadata. A 60-second fixture lease can enter its refresh window
+  # during a slow broker rollout; renewal then must not be mistaken for data loss.
+  broker_reader_probe() {
+    k exec -i deployment/backend -- python3 -I -B - <<'PYBROKERPROBE'
+import datetime, json, pathlib, runpy, time, traceback, types
+probe = runpy.run_path('/harness/broker-pod-probe.py')['check']
+expiration = []
+def decode(value):
+    credential = json.loads(value)
+    expiration.append((datetime.datetime.fromisoformat(
+        credential['Expiration'].replace('Z', '+00:00')).timestamp(), time.time()))
+    return credential
+probe.__globals__['json'] = types.SimpleNamespace(loads=decode)
+try:
+    key_hash = probe('readonly')
+    assert len(expiration) == 1
+    assert expiration[0][0] > time.time(), 'Probe credential expired'
+    print(json.dumps({'key_hash': key_hash, 'expires_at': expiration[0][0],
+                      'observed_at': expiration[0][1]}))
+except Exception as error:
+    location = traceback.extract_tb(error.__traceback__)[-1]
+    detail = f'{type(error).__name__} at {pathlib.Path(location.filename).name}:{location.lineno}'
+    status = getattr(error, 'code', None)
+    if isinstance(status, int):
+        detail += f' HTTP {status}'
+    if isinstance(error, AssertionError) and str(error) in (
+            'prefix read', 'prefix listing', 'outside prefix denied', 'administration denied',
+            'reader write denied', 'reader delete denied', 'Probe credential expired'):
+        detail += ': ' + str(error)
+    raise SystemExit('Workload credential role acceptance failed: ' + detail) from None
+PYBROKERPROBE
+  }
+  wait_broker_service
+  k exec deployment/writer -- python3 -I -B /harness/broker-pod-probe.py readwrite > "$scratch/writer-key-id"
+  broker_reader_probe > "$scratch/reader-key-metadata.json"
+  python3 - "$scratch/reader-key-metadata.json" "$scratch/writer-key-id" <<'PYBROKERIDENTITY'
+import json, pathlib, sys
+reader = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert reader['key_hash'] != pathlib.Path(sys.argv[2]).read_text().strip(), 'Distinct pod identities received the same key'
+PYBROKERIDENTITY
+  k rollout restart deployment/credential-broker
+  k rollout status deployment/credential-broker --timeout=180s
+  wait_broker_service
+  broker_reader_probe > "$scratch/recovered-reader-key-metadata.json"
+  python3 - "$scratch/reader-key-metadata.json" "$scratch/recovered-reader-key-metadata.json" <<'PYBROKERRECOVERY'
+import json, pathlib, sys
+before, after = (json.loads(pathlib.Path(path).read_text()) for path in sys.argv[1:])
+assert after['expires_at'] > after['observed_at'], 'Recovered credentials already expired'
+if before['key_hash'] == after['key_hash']:
+    assert before['expires_at'] == after['expires_at'], 'Recovery changed an existing lease expiry'
+    print('Encrypted broker restart reused the unexpired pod credential; S3 role enforcement verified')
+else:
+    assert after['observed_at'] >= before['expires_at'] - 10, 'Broker lost a credential before its refresh window'
+    assert after['expires_at'] > before['expires_at'], 'Renewal did not extend the lease'
+    print('Broker restart crossed the fixture refresh window; valid distinct renewal and S3 role enforcement verified')
+PYBROKERRECOVERY
+  echo 'Real pod identities and distinct S3 role enforcement verified'
+fi
 node_ip=$(minikube -p "$profile" ip)
 docker_network=$(docker inspect --format '{{range $name, $value := .NetworkSettings.Networks}}{{$name}}{{end}}' "$profile")
 external() {
@@ -194,6 +357,8 @@ fi
 stop_backend() {
   k scale deployment/backend --replicas=0
   k wait --for=delete pod -l app=backend --timeout=120s
+  k scale deployment/writer --replicas=0
+  k wait --for=delete pod -l app=writer --timeout=120s
 }
 maintenance_start() {
   python3 - "$image" "$s3" > "$scratch/maintenance.yaml" <<'PY'
@@ -214,6 +379,8 @@ PY
 }
 maintenance_stop() { k delete pod/storage-maintenance --wait=true; }
 start_backend() {
+  k scale deployment/writer --replicas=1
+  k rollout status deployment/writer --timeout=120s
   k scale deployment/backend --replicas=1
   k rollout status deployment/backend --timeout=120s
   wait_edge
@@ -314,7 +481,7 @@ if (( s3 )); then
   # separate-prefix backup/restore is covered by the object archive acceptance.
   k exec storage-maintenance -- sh -c 'find /data/blobs -mindepth 1 -delete'
   k exec deployment/postgres -- psql -U devres -d postgres -c 'DROP DATABASE devres WITH (FORCE)'
-  k exec deployment/postgres -- psql -U devres -d postgres -c 'CREATE DATABASE devres OWNER devres'
+  k exec deployment/postgres -- psql -U devres -d postgres -c 'CREATE DATABASE devres OWNER devres_writer'
   k exec -i deployment/postgres -- pg_restore -U devres -d devres < "$scratch/postgres.dump"
   test "$(k exec storage-maintenance -- storage-probe read)" = "$before"
   k exec storage-maintenance -- sh -c 'find /data/blobs -mindepth 1 -delete'
@@ -329,7 +496,7 @@ k exec storage-maintenance -- tar -C /data -cf - blobs > "$scratch/blobs.tar"
 # Destructive restore is confined to this newly created, task-owned profile.
 k exec storage-maintenance -- sh -c 'find /data/blobs -type f -delete'
 k exec deployment/postgres -- psql -U devres -d postgres -c 'DROP DATABASE devres WITH (FORCE)'
-k exec deployment/postgres -- psql -U devres -d postgres -c 'CREATE DATABASE devres OWNER devres'
+k exec deployment/postgres -- psql -U devres -d postgres -c 'CREATE DATABASE devres OWNER devres_writer'
 k exec -i deployment/postgres -- pg_restore -U devres -d devres < "$scratch/postgres.dump"
 k exec -i storage-maintenance -- tar -C /data -xf - < "$scratch/blobs.tar"
 test "$(k exec storage-maintenance -- storage-probe read)" = "$before"

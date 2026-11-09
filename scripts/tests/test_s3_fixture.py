@@ -47,7 +47,7 @@ class S3FixtureTests(unittest.TestCase):
         self.assertTrue(container['volumeMounts'][0]['readOnly'])
         self.assertNotIn('env', container)
 
-    def run_initializer_dns_fixture(self, ready_after):
+    def run_initializer_dns_fixture(self, ready_after, health_ready_after=1):
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
             root = Path(temporary)
             scripts = {
@@ -55,7 +55,13 @@ class S3FixtureTests(unittest.TestCase):
                           'n=$((n+1)); echo "$n" > "$DNS_PROBE_COUNT"\n'
                           'test "$n" -ge "$DNS_READY_AFTER"\n',
                 'sleep': '#!/bin/sh\nexit 0\n',
-                'curl': '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DNS_AUTH_REQUESTS"\n',
+                'date': '#!/bin/sh\nn=$(cat "$CLOCK_COUNT" 2>/dev/null || echo 0)\n'
+                        'n=$((n+1)); echo "$n" > "$CLOCK_COUNT"; echo "$n"\n',
+                'curl': '#!/bin/sh\ncase "$*" in *--config*) '
+                        'printf "%s\\n" "$*" >> "$DNS_AUTH_REQUESTS";; *) '
+                        'n=$(cat "$HEALTH_COUNT" 2>/dev/null || echo 0); '
+                        'n=$((n+1)); echo "$n" > "$HEALTH_COUNT"; '
+                        'test "$n" -ge "$HEALTH_READY_AFTER";; esac\n',
             }
             for name, source in scripts.items():
                 path = root / name
@@ -64,7 +70,8 @@ class S3FixtureTests(unittest.TestCase):
             command = fixture.initializer('fixture-image:local')['spec']['template']['spec']['containers'][0]['command']
             environment = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                                DNS_PROBE_COUNT=str(root / 'count'), DNS_READY_AFTER=str(ready_after),
-                               DNS_AUTH_REQUESTS=str(root / 'requests'))
+                               DNS_AUTH_REQUESTS=str(root / 'requests'), CLOCK_COUNT=str(root / 'clock'),
+                               HEALTH_COUNT=str(root / 'health'), HEALTH_READY_AFTER=str(health_ready_after))
             result = subprocess.run(command, env=environment, capture_output=True, timeout=5)
             requests = (root / 'requests').read_text().splitlines() if (root / 'requests').exists() else []
             return result.returncode, int((root / 'count').read_text()), requests
@@ -77,6 +84,18 @@ class S3FixtureTests(unittest.TestCase):
 
     def test_initializer_dns_failure_is_bounded_and_never_authenticates(self):
         code, attempts, requests = self.run_initializer_dns_fixture(100)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(attempts, 60)
+        self.assertEqual(requests, [])
+
+    def test_initializer_waits_for_service_health_before_single_authenticated_put(self):
+        code, attempts, requests = self.run_initializer_dns_fixture(1, health_ready_after=4)
+        self.assertEqual(code, 0)
+        self.assertEqual(attempts, 4)
+        self.assertEqual(requests, ['--connect-timeout 5 --max-time 15 --config /fixture/s3/create-bucket.curl'])
+
+    def test_initializer_service_failure_is_bounded_and_never_authenticates(self):
+        code, attempts, requests = self.run_initializer_dns_fixture(1, health_ready_after=100)
         self.assertNotEqual(code, 0)
         self.assertEqual(attempts, 60)
         self.assertEqual(requests, [])

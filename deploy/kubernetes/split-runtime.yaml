@@ -1,0 +1,119 @@
+# Private runtime coordination. Operator examples use the same identities and
+# separate credentials; this manifest is consumed by the disposable harness.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: devres-serving}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: devres-writer}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: DEVRES_AUTH_REVIEWER}
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: DEVRES_AUTH_REVIEWER}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: DEVRES_AUTH_REVIEWER}
+subjects:
+  - {kind: ServiceAccount, name: devres-writer, namespace: devres-acceptance}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: devres-live-identities}
+rules:
+  - apiGroups: ['']
+    resources: [pods, serviceaccounts]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: devres-writer-identities}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: devres-live-identities}
+subjects:
+  - {kind: ServiceAccount, name: devres-writer}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: writer}
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: writer}}
+  template:
+    metadata: {labels: {app: writer}}
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: devres-writer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: writer
+          image: DEVRES_HARNESS_IMAGE
+          imagePullPolicy: Never
+          command: [devres-server, collect, /fixture/writer.toml]
+          ports:
+            - {name: coordination, containerPort: 9443}
+            - {name: health, containerPort: 9090}
+          readinessProbe: {httpGet: {path: /ready, port: health}}
+          livenessProbe:
+            httpGet: {path: /live, port: health}
+            initialDelaySeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: '1', memory: 1Gi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /fixture/writer.toml, subPath: writer.toml, readOnly: true}
+            - {name: tls, mountPath: /fixture/cert, readOnly: true}
+            - {name: kube, mountPath: /run/devres-kube, readOnly: true}
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          secret: {secretName: devres-writer-config}
+        - name: tls
+          secret: {secretName: devres-tls, defaultMode: 0440}
+        - name: data
+          persistentVolumeClaim: {claimName: devres-data}
+        - name: tmp
+          emptyDir: {sizeLimit: 1Gi}
+        - name: kube
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken: {path: token, expirationSeconds: 3600}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{key: ca.crt, path: ca.crt}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: writer}
+spec:
+  selector: {app: writer}
+  ports: [{name: coordination, port: 9443, targetPort: coordination}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: writer-serving-only}
+spec:
+  podSelector: {matchLabels: {app: writer}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: backend}}}]
+      ports: [{port: 9443, protocol: TCP}]

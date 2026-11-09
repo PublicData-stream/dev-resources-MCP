@@ -144,7 +144,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [server, probe, audit-worker]
+        target: [server, probe, audit-worker, credential-broker]
         include:
           - arch: amd64
             runner: ubuntu-26.04
@@ -219,7 +219,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [server, probe, audit-worker]
+        target: [server, probe, audit-worker, credential-broker]
     permissions:
       contents: read
       packages: write

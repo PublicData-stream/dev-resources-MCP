@@ -8,7 +8,7 @@ oci_output=
 revision=
 version=0.0.0
 usage() {
-  echo 'usage: scripts/test-image.sh [--platform linux/amd64|linux/arm64] [--target runtime|server|probe|audit-worker] [--image IMAGE] [--oci-output ABS_DIRECTORY] [--revision SHA] [--version VERSION]' >&2
+  echo 'usage: scripts/test-image.sh [--platform linux/amd64|linux/arm64] [--target runtime|server|probe|audit-worker|credential-broker] [--image IMAGE] [--oci-output ABS_DIRECTORY] [--revision SHA] [--version VERSION]' >&2
   exit 2
 }
 while (( $# )); do
@@ -24,7 +24,7 @@ while (( $# )); do
   esac
   shift 2
 done
-case "$target" in runtime|server|probe|audit-worker) ;; *) usage ;; esac
+case "$target" in runtime|server|probe|audit-worker|credential-broker) ;; *) usage ;; esac
 if [[ -z $revision && -z $external_image ]]; then revision=$(git rev-parse HEAD); fi
 if [[ -n $revision ]]; then [[ $revision =~ ^[0-9a-f]{40}$ ]] || usage; fi
 [[ -n $version && $version != *$'\n'* && $version != *$'\r'* ]] || usage
@@ -97,7 +97,13 @@ if [[ $target == runtime || $target == probe ]]; then
   test "$status" = 1 || { echo 'Probe did not reject missing arguments' >&2; exit 1; }
   python3 scripts/image-fixture.py startup probe "$scratch/stdout" "$scratch/stderr"
 fi
-if [[ $target != probe ]]; then
+if [[ $target == credential-broker ]]; then
+  status=0
+  run_binary devres-credential-broker /missing.toml </dev/null || status=$?
+  test "$status" = 1 || { echo 'Broker did not reject missing configuration' >&2; exit 1; }
+  python3 scripts/image-fixture.py startup credential-broker "$scratch/stdout" "$scratch/stderr"
+fi
+if [[ $target != probe && $target != credential-broker ]]; then
   for mode in valid invalid npm-valid npm-invalid; do
     python3 scripts/image-fixture.py input "$mode" > "$scratch/input.json"
     run_binary devres-audit-worker < "$scratch/input.json"

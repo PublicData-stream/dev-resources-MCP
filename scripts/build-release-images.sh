@@ -28,7 +28,7 @@ version=$(python3 scripts/release_contract.py stamp --tag "$tag" --commit "$comm
 export TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/rust/target
 mkdir -p -- "$(dirname -- "$output")"
 mkdir -- "$output"
-for target in server probe audit-worker; do
+for target in server probe audit-worker credential-broker; do
   scripts/test-image.sh --platform "$platform" --target "$target" \
     --revision "$commit" --version "$version" --oci-output "$output/$target"
   python3 scripts/release_images.py verify --directory "$output/$target" \
