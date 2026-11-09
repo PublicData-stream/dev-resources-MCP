@@ -536,6 +536,14 @@ digest. Scaleway mode issues expiring IAM API keys, rather than an AWS STS sessi
 The existing `container` source consumes their key pair and expiry. No broker
 identity or credential API is a public MCP tool or edge route.
 
+Broker configuration requires an explicit `organization_id` UUID in every mode,
+including fixtures and offline fingerprint commands. It scopes Scaleway API-key
+listing and is separate from each profile's `default_project_id`; no organization
+lookup is performed. Missing or malformed values fail before network access.
+Changing this startup identity during reload fails closed and requires a restart.
+The receipt and journal formats are unchanged; they do not add a persistent
+organization binding across restarts.
+
 Defaults are `ttl_secs=900`, `refresh_before_secs=300`, `max_pods=16`,
 `max_issued_keys=32`, and `quota_reserve=8`. The config names only mounted secret
 paths for issuer secret, encryption keyring, and a dedicated per-cluster broker

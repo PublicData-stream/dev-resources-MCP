@@ -36,6 +36,7 @@ pub(crate) struct Issuer {
     receipt_file: std::path::PathBuf,
     issuer_access_key: String,
     issuer_application_id: String,
+    organization_id: String,
     fixture_mode: bool,
 }
 impl Issuer {
@@ -48,6 +49,7 @@ impl Issuer {
             receipt_file: config.acceptance_receipt_file.clone(),
             issuer_access_key: config.issuer_access_key.clone(),
             issuer_application_id: config.issuer_application_id.clone(),
+            organization_id: config.organization_id.clone(),
             fixture_mode: config.fixture_mode,
         })
     }
@@ -127,6 +129,7 @@ impl Issuer {
         let mut url =
             url::Url::parse("https://fixture.invalid/").map_err(|_| BrokerError::Invalid)?;
         url.query_pairs_mut().extend_pairs([
+            ("organization_id", self.organization_id.as_str()),
             ("bearer_id", application_id),
             ("description", description),
             ("page_size", "100"),
@@ -189,6 +192,117 @@ impl Issuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn organization_scoped_find_preserves_encoding_and_response_bounds() {
+        use axum::{
+            Json, Router,
+            extract::{Query, State},
+            routing::get,
+        };
+        use std::{
+            collections::BTreeMap,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        const ORGANIZATION: &str = "55555555-5555-4555-8555-555555555555";
+        const APPLICATION: &str = "11111111-1111-4111-8111-111111111111";
+        const DESCRIPTION: &str = "owned & description=/한글?";
+        async fn list(
+            State(mode): State<Arc<AtomicUsize>>,
+            Query(query): Query<Vec<(String, String)>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(query.len(), 5);
+            let query: BTreeMap<_, _> = query.into_iter().collect();
+            assert_eq!(
+                query,
+                BTreeMap::from([
+                    ("organization_id".into(), ORGANIZATION.into()),
+                    ("bearer_id".into(), APPLICATION.into()),
+                    ("description".into(), DESCRIPTION.into()),
+                    ("page_size".into(), "100".into()),
+                    ("page".into(), "1".into()),
+                ])
+            );
+            let key = serde_json::json!({"access_key":"owned-key", "application_id":APPLICATION,
+                "description":DESCRIPTION, "expires_at":"2026-11-09T12:00:00Z"});
+            let (keys, count) = match mode.load(Ordering::Relaxed) {
+                0 => (vec![key], 1),
+                1 => (vec![key.clone(), key], 2),
+                2 => (vec![], 101),
+                3 => (vec![key; 101], 100),
+                _ => (vec![], 0),
+            };
+            Json(serde_json::json!({"api_keys":keys,"total_count":count}))
+        }
+        let temp = tempfile::tempdir_in("/tmp").expect("test directory");
+        let mode = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/iam/v1alpha1/api-keys", get(list))
+            .with_state(mode.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let mut config = super::super::config::tests::configuration();
+        config.organization_id = ORGANIZATION.into();
+        config.iam_endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        config.fixture_mode = true;
+        config.issuer_key_file = temp.path().join("issuer");
+        config.acceptance_receipt_file = temp.path().join("receipt");
+        tokio::fs::write(&config.issuer_key_file, "synthetic-issuer-secret")
+            .await
+            .expect("secret file");
+        let now = super::super::now().expect("time");
+        let receipt = serde_json::json!({
+            "issuer_access_key":config.issuer_access_key,
+            "issuer_application_id":config.issuer_application_id,
+            "issuer_secret_fingerprint":config.issuer_secret_fingerprint().await.expect("fingerprint"),
+            "profile_fingerprints":{}, "confined_application_ids":[],
+            "verified_at":format_timestamp(now).expect("timestamp"),
+            "expires_at":format_timestamp(now+3600).expect("timestamp"),
+            "broker_key_budget":40,"ttl_secs":900,
+            "unrelated_application_denied":true,"policy_management_denied":true,
+            "expiry_accepted":true,"fixture":true,
+        });
+        tokio::fs::write(
+            &config.acceptance_receipt_file,
+            serde_json::to_vec(&receipt).expect("receipt"),
+        )
+        .await
+        .expect("receipt file");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let issuer = Issuer::new(&config).expect("issuer");
+        assert_eq!(
+            issuer
+                .find(APPLICATION, DESCRIPTION)
+                .await
+                .expect("matching key")
+                .expect("key")
+                .access_key,
+            "owned-key"
+        );
+        for (value, expected) in [
+            (1, BrokerError::Integrity),
+            (2, BrokerError::Capacity),
+            (3, BrokerError::Capacity),
+        ] {
+            mode.store(value, Ordering::Relaxed);
+            assert!(
+                matches!(issuer.find(APPLICATION, DESCRIPTION).await, Err(error) if error == expected)
+            );
+        }
+        mode.store(4, Ordering::Relaxed);
+        assert!(
+            issuer
+                .find(APPLICATION, DESCRIPTION)
+                .await
+                .expect("empty list")
+                .is_none()
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn credential_deadline_comparison_does_not_round_away_excess_lifetime() {
         let key = RemoteKey {

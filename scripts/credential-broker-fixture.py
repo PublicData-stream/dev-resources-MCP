@@ -14,6 +14,7 @@ READONLY = '11111111-1111-4111-8111-111111111111'
 READWRITE = '22222222-2222-4222-8222-222222222222'
 ISSUER = '33333333-3333-4333-8333-333333333333'
 PROJECT = '44444444-4444-4444-8444-444444444444'
+ORGANIZATION = '55555555-5555-4555-8555-555555555555'
 
 
 def private(path, text):
@@ -54,7 +55,8 @@ def prepare(root, mode):
     private(directory / 'database-init.sql', sql)
     private(directory / 'iam-fixture.json', json.dumps({'endpoint': 'http://objectstore:9000',
             'access_key': root_access, 'secret_key': root_secret, 'issuer_secret': issuer_secret,
-            'issuer_access_key': 'fixture-issuer', 'bucket': 'devres-fixture', 'prefix': 'acceptance',
+            'issuer_access_key': 'fixture-issuer', 'organization_id': ORGANIZATION,
+            'bucket': 'devres-fixture', 'prefix': 'acceptance',
             'parent_secrets': {READONLY: secrets.token_hex(32), READWRITE: secrets.token_hex(32)},
             'state_file': '/fixture/broker/iam-state.json'}))
     kube_url = 'http://identity-fixture:8000' if mode == 'docker' else 'https://kubernetes.default.svc'
@@ -68,6 +70,7 @@ def prepare(root, mode):
             'issuer_key_file = "/fixture/broker/issuer-key"\n'
             'issuer_access_key = "fixture-issuer"\n'
             f'issuer_application_id = "{ISSUER}"\n'
+            f'organization_id = "{ORGANIZATION}"\n'
             'acceptance_receipt_file = "/fixture/broker/receipt.json"\n'
             'iam_endpoint = "http://iam-fixture:8001"\nfixture_mode = true\n'
             'ttl_secs = 60\nrefresh_before_secs = 10\nmax_pods = 4\nmax_issued_keys = 16\nquota_reserve = 4\n'

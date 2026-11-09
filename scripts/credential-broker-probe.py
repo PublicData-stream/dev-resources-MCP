@@ -15,7 +15,7 @@ import sys
 import time
 import traceback
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit, unquote, urlencode
 from urllib.request import Request, build_opener, ProxyHandler, HTTPSHandler
 
 SPEC = importlib.util.spec_from_file_location('scaleway_iam_fixture', Path(__file__).with_name('scaleway-iam-fixture.py'))
@@ -94,11 +94,35 @@ def provider_ready():
             request = Request('http://iam-fixture:8001/iam/v1alpha1/api-keys/fixture-issuer', headers={'X-Auth-Token': key})
             with opener.open(request, timeout=2) as response:
                 if response.status == 200:
-                    return
+                    break
         except (URLError, TimeoutError, ConnectionError):
             pass
         time.sleep(1)
-    raise AssertionError('IAM fixture startup deadline')
+    else:
+        raise AssertionError('IAM fixture startup deadline')
+    organization = json.loads((DIRECTORY / 'iam-fixture.json').read_text())['organization_id']
+    query = {'bearer_id': MODULE.READONLY, 'description': 'organization-query-probe', 'page_size': '100', 'page': '1'}
+    for supplied in (None, '', '66666666-6666-4666-8666-666666666666', organization):
+        parameters = dict(query)
+        if supplied is not None:
+            parameters['organization_id'] = supplied
+        request = Request('http://iam-fixture:8001/iam/v1alpha1/api-keys?' + urlencode(parameters),
+                          headers={'X-Auth-Token': key})
+        try:
+            with opener.open(request, timeout=2) as response:
+                assert supplied == organization and response.status == 200, 'organization list admission'
+                value = json.loads(response.read(65537))
+                assert value == {'api_keys': [], 'total_count': 0}, 'organization list response'
+        except HTTPError as error:
+            try:
+                assert supplied != organization and error.code == 400, 'organization list validation'
+                value = json.loads(error.read(65537))
+                assert value == {'type': 'invalid_arguments', 'details': [{
+                    'argument_name': 'organization_id', 'help_message': '',
+                    'reason': 'required' if supplied in (None, '') else 'invalid'}]}, 'organization list error category'
+            finally:
+                error.close()
+    print('IAM fixture rejected missing or incorrect organization and accepted the configured organization')
 
 
 def wait_ready():

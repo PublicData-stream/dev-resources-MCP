@@ -91,6 +91,7 @@ impl Broker {
         if config.iam_endpoint != baseline.iam_endpoint
             || config.issuer_access_key != baseline.issuer_access_key
             || config.issuer_application_id != baseline.issuer_application_id
+            || config.organization_id != baseline.organization_id
             || config.issuer_key_file != baseline.issuer_key_file
             || config.database_url_file != baseline.database_url_file
             || config.keyring_file != baseline.keyring_file

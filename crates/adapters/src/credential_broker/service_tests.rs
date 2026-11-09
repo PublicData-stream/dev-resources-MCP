@@ -15,6 +15,7 @@ const ISSUER: &str = "33333333-3333-4333-8333-333333333333";
 const KEYRING:&[u8]=br#"{"active_key_id":"one","keys":{"one":"0101010101010101010101010101010101010101010101010101010101010101"}}"#;
 #[derive(Default)]
 struct Fixture {
+    requests: AtomicUsize,
     deleted: Mutex<BTreeSet<String>>,
     mode: AtomicUsize,
     created: AtomicUsize,
@@ -53,7 +54,13 @@ async fn create_key(
     }
     axum::Json(value)
 }
-async fn hidden_list() -> axum::Json<serde_json::Value> {
+async fn hidden_list(
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> axum::Json<serde_json::Value> {
+    assert_eq!(
+        query.get("organization_id").map(String::as_str),
+        Some("55555555-5555-4555-8555-555555555555")
+    );
     axum::Json(serde_json::json!({"api_keys":[],"total_count":0}))
 }
 async fn pod(Path(name): Path<String>) -> Response {
@@ -99,6 +106,13 @@ async fn credential_broker_maintenance_checks_last_row_and_revokes_malformed_pro
         )
         .route("/apis/authentication.k8s.io/v1/tokenreviews", post(review))
         .with_state(fixture.clone());
+    let observed = fixture.clone();
+    let app = app.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            observed.requests.fetch_add(1, Ordering::Relaxed);
+            async move { next.run(request).await }
+        },
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fixture listener");
@@ -126,6 +140,7 @@ async fn credential_broker_maintenance_checks_last_row_and_revokes_malformed_pro
         issuer_key_file: root.join("issuer"),
         issuer_access_key: "fixture-issuer".into(),
         issuer_application_id: ISSUER.into(),
+        organization_id: "55555555-5555-4555-8555-555555555555".into(),
         acceptance_receipt_file: root.join("receipt"),
         authentication: AuthConfig {
             kube_api_url: endpoint.clone(),
@@ -225,6 +240,38 @@ async fn credential_broker_maintenance_checks_last_row_and_revokes_malformed_pro
         BTreeSet::from(["key-9".into()]),
         "every maintenance cycle must include rows after the eighth"
     );
+    let requests = fixture.requests.load(Ordering::Relaxed);
+    let mut changed = config.clone();
+    changed.organization_id = "66666666-6666-4666-8666-666666666666".into();
+    tokio::fs::write(
+        &config_path,
+        toml::to_string(&changed).expect("changed config"),
+    )
+    .await
+    .expect("replace organization");
+    assert!(matches!(
+        broker.credentials("unused-token").await,
+        Err(BrokerError::Invalid)
+    ));
+    assert!(!broker.ready());
+    assert!(matches!(broker.maintain().await, Err(BrokerError::Invalid)));
+    assert!(!broker.ready());
+    assert_eq!(
+        fixture.requests.load(Ordering::Relaxed),
+        requests,
+        "reload must fail before network I/O"
+    );
+    tokio::fs::write(
+        &config_path,
+        toml::to_string(&config).expect("original config"),
+    )
+    .await
+    .expect("restore organization");
+    broker
+        .maintain()
+        .await
+        .expect("original organization remains usable");
+    assert!(broker.ready());
     tokio::fs::write(&config.issuer_key_file, "swapped-broad-issuer-secret")
         .await
         .expect("replace issuer");

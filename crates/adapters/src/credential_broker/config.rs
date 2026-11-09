@@ -61,6 +61,7 @@ pub struct BrokerConfig {
     pub issuer_key_file: PathBuf,
     pub issuer_access_key: String,
     pub issuer_application_id: String,
+    pub organization_id: String,
     pub acceptance_receipt_file: PathBuf,
     pub authentication: AuthConfig,
     #[serde(default = "iam")]
@@ -164,6 +165,7 @@ impl BrokerConfig {
             || self.profiles.len() > 128
             || !id(&self.issuer_access_key)
             || !uuid(&self.issuer_application_id)
+            || !uuid(&self.organization_id)
         {
             return Err(BrokerError::Invalid);
         }
@@ -272,5 +274,87 @@ impl BrokerConfig {
             return Err(BrokerError::Forbidden);
         }
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    pub(crate) fn configuration() -> BrokerConfig {
+        toml::from_str(
+            &include_str!(
+                "../../../../deploy/examples/scaleway-credential-broker/broker.toml.example"
+            )
+            .replace("REPLACE_WITH_64_HEX_POLICY_DIGEST", &"a".repeat(64)),
+        )
+        .expect("operator example configuration")
+    }
+
+    #[tokio::test]
+    async fn organization_is_required_and_validated_before_startup_io_in_every_mode() {
+        let temp = tempfile::tempdir_in("/tmp").expect("test directory");
+        let path = temp.path().join("broker.toml");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = axum::Router::new().fallback(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        for fixture_mode in [false, true] {
+            let mut config = configuration();
+            if fixture_mode {
+                config.fixture_mode = true;
+                config.iam_endpoint = endpoint.clone();
+                for profile in &mut config.profiles {
+                    profile.namespace = "devres-test-organization".into();
+                }
+            }
+            // A reachable Kubernetes endpoint would record the first startup I/O.
+            config.authentication.kube_api_url = endpoint.clone();
+            config.authentication.allow_http = fixture_mode;
+            config.acceptance_receipt_file = temp.path().join("missing-receipt");
+            config.validate().expect("valid organization");
+            let valid = toml::to_string(&config).expect("serialize configuration");
+            tokio::fs::write(&path, &valid).await.expect("config file");
+            BrokerConfig::read(&path)
+                .await
+                .expect("valid configuration");
+            for organization in [
+                None,
+                Some(""),
+                Some("not-a-uuid"),
+                Some("55555555-5555-4555-8555-55555555555g"),
+            ] {
+                let mut value: toml::Value = toml::from_str(&valid).expect("configuration value");
+                let table = value.as_table_mut().expect("configuration table");
+                match organization {
+                    None => {
+                        table.remove("organization_id");
+                    }
+                    Some(value) => {
+                        table.insert("organization_id".into(), value.into());
+                    }
+                }
+                tokio::fs::write(
+                    &path,
+                    toml::to_string(&value).expect("serialize invalid config"),
+                )
+                .await
+                .expect("invalid config file");
+                assert!(matches!(
+                    super::super::Broker::open(path.clone()).await,
+                    Err(BrokerError::Invalid)
+                ));
+                assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+        }
+        server.abort();
+        let _ = server.await;
     }
 }

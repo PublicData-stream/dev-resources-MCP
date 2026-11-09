@@ -215,9 +215,14 @@ def serve(config_file):
                                        'secret_key': None, 'expires_at': None, 'description': 'fixture issuer'})
             with lock:
                 if url.path == '/iam/v1alpha1/api-keys':
+                    query = parse_qs(url.query, keep_blank_values=True)
+                    organization = query.get('organization_id')
+                    if organization != [config['organization_id']]:
+                        reason = 'required' if organization in (None, ['']) else 'invalid'
+                        return self.reply(400, {'type': 'invalid_arguments', 'details': [
+                            {'argument_name': 'organization_id', 'help_message': '', 'reason': reason}]})
                     counters['list'] += 1
                     persist()
-                    query = parse_qs(url.query)
                     values = [row for row in entries.values()
                               if row['application_id'] == query.get('bearer_id', [''])[0]
                               and row['description'] == query.get('description', [''])[0]]
@@ -251,10 +256,13 @@ def serve(config_file):
 
 
 def self_test():
-    """Bounded regression for a successful native delete whose reply was lost."""
+    """Bounded regressions for delete recovery and organization-scoped listing."""
     import contextlib
     import io
+    import queue
+    import tempfile
     import unittest
+    from unittest import mock
 
     class DeleteRecovery(unittest.TestCase):
         def run_case(self, replies, expected, calls):
@@ -309,7 +317,73 @@ def self_test():
             self.assertIsNone(native_error_code(b'{"Code":"private"}'))
             self.assertIsNone(native_error_code(b'not structured'))
 
-    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(DeleteRecovery))
+    class OrganizationListing(unittest.TestCase):
+        def test_http_list_requires_exact_organization(self):
+            organization = '55555555-5555-4555-8555-555555555555'
+            servers = queue.Queue()
+
+            class Provider:
+                def __init__(self, _):
+                    pass
+
+                def call(self, *_):
+                    return 200, {}
+
+            class Server(ThreadingHTTPServer):
+                def __init__(self, _, handler):
+                    super().__init__(('127.0.0.1', 0), handler)
+                    servers.put(self)
+
+            with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                root = Path(directory)
+                config_file = root / 'config.json'
+                config_file.write_text(json.dumps({'organization_id': organization,
+                    'issuer_access_key': 'fixture-issuer', 'issuer_secret': 'synthetic-private-secret',
+                    'bucket': 'fixture-bucket', 'prefix': 'acceptance', 'state_file': str(root / 'state.json')}))
+                config_file.chmod(0o600)
+                with mock.patch.object(sys.modules[__name__], 'RustFS', Provider), \
+                     mock.patch.object(sys.modules[__name__], 'ThreadingHTTPServer', Server):
+                    worker = threading.Thread(target=serve, args=(config_file,), daemon=True)
+                    worker.start()
+                    server = servers.get(timeout=5)
+                    try:
+                        opener = build_opener(ProxyHandler({}))
+                        base = f'http://127.0.0.1:{server.server_port}/iam/v1alpha1/api-keys?'
+                        cases = ((None, 'required'), ([''], 'required'),
+                                 (['66666666-6666-4666-8666-666666666666'], 'invalid'),
+                                 ([organization, organization], 'invalid'), ([organization], None))
+                        for supplied, reason in cases:
+                            with self.subTest(reason=reason, supplied=supplied):
+                                query = {'bearer_id': READONLY, 'description': 'owned', 'page_size': '100', 'page': '1'}
+                                if supplied is not None:
+                                    query['organization_id'] = supplied
+                                request = Request(base + urlencode(query, doseq=True),
+                                                  headers={'X-Auth-Token': 'synthetic-private-secret'})
+                                if reason is None:
+                                    with opener.open(request, timeout=2) as response:
+                                        self.assertEqual(response.status, 200)
+                                        self.assertEqual(json.loads(response.read(65537)), {'api_keys': [], 'total_count': 0})
+                                else:
+                                    with self.assertRaises(HTTPError) as caught:
+                                        opener.open(request, timeout=2)
+                                    error = caught.exception
+                                    try:
+                                        self.assertEqual(error.code, 400)
+                                        self.assertEqual(json.loads(error.read(65537)), {'type': 'invalid_arguments', 'details': [
+                                            {'argument_name': 'organization_id', 'help_message': '', 'reason': reason}]})
+                                    finally:
+                                        error.close()
+                        state = json.loads((root / 'state.json').read_text())
+                        self.assertEqual(state['counters'], {'create': 0, 'delete': 0, 'list': 1})
+                    finally:
+                        server.shutdown()
+                        server.server_close()
+                        worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive())
+
+    suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
+                               for case in (DeleteRecovery, OrganizationListing))
+    result = unittest.TextTestRunner().run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)
 
 

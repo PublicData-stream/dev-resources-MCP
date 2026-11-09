@@ -1,8 +1,9 @@
 # Scaleway credential broker operator templates
 
 These templates are inputs for an independently authorized deployment, not evidence
-of Scaleway acceptance. Replace every placeholder, use real application/project
-UUIDs, and merge server fragments with the normal listener/source/provider config.
+of Scaleway acceptance. Replace every placeholder, use real organization,
+application, and project UUIDs, and merge server fragments with the normal
+listener/source/provider config.
 Run `devres-server serve SERVING.toml`, `devres-server collect WRITER.toml`, and
 `devres-credential-broker BROKER.toml` as separate workloads. The old single-config
 invocation aliases serving only and requires the serving additions.
@@ -18,6 +19,15 @@ Use one dedicated Scaleway application per permission profile: serving readonly,
 writer readwrite, and a third application for issuer administration. Both archive
 profiles bind the same bucket and archive prefix. Each pod gets a distinct issued
 key; a caller cannot select a profile, application, bucket, prefix, or policy.
+
+Set the broker's required `organization_id` to the Organization UUID used for
+[Scaleway API-key listing](https://www.scaleway.com/en/developers/api/iam/api-keys#list-api-keys).
+It is separate from a profile's `default_project_id` and is never discovered by an
+additional API call. All configurations, including fixtures and the offline
+fingerprint commands below, require a valid UUID before network access. An
+organization change during reload fails closed and requires a controlled restart.
+Receipt and journal formats remain unchanged; this setting adds no persistent
+organization binding across restarts.
 
 The JSON bucket-policy templates use Scaleway's native application principals and
 resource syntax. They grant scoped object access plus prefix-restricted listing.
@@ -68,8 +78,8 @@ attestation. Changing application/project, prefix, role, policy digest, or TTL
 requires corresponding receipt renewal. Issuer-secret rotation also requires a
 new receipt that binds the accepted replacement secret; the binding is checked
 again immediately before each provider request. Profile and receipt files reload at
-requests and maintenance; changes to identity endpoints or secret-file locations
-require restart.
+requests and maintenance; changes to organization, identity endpoints, or
+secret-file locations require restart.
 
 ## Kubernetes prerequisites
 

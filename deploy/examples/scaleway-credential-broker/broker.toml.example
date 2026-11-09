@@ -7,6 +7,7 @@ keyring_file = "/run/devres-broker/keyring.json"
 issuer_key_file = "/run/devres-broker/issuer-secret-key"
 issuer_access_key = "REPLACE_ISSUER_ACCESS_KEY_ID"
 issuer_application_id = "00000000-0000-0000-0000-000000000001"
+organization_id = "00000000-0000-0000-0000-000000000005"
 acceptance_receipt_file = "/run/devres-broker/acceptance-receipt.json"
 fixture_mode = false
 ttl_secs = 900
