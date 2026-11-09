@@ -15,7 +15,8 @@ use devres_domain::{Error, FetchRequest, FetchResponse, Result, Validators, attr
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx_core::row::Row;
+use sqlx_postgres::{PgPool, PgPoolOptions};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -203,7 +204,7 @@ async fn selections(
             == Some("https://www.rfc-editor.org/rfc/rfc9000.txt"),
     )?;
     collect("rfc", &resource, &mut targets)?;
-    let canonical_rfc: Option<String> = sqlx::query_scalar(
+    let canonical_rfc: Option<String> = sqlx_core::query_scalar::query_scalar(
         "SELECT canonical FROM devres_content_aliases WHERE namespace='capture' AND legacy=$1",
     )
     .bind(&plan.rfc_capture)
@@ -232,7 +233,7 @@ async fn selections(
         &mut targets,
     )
     .await?;
-    let canonical_mdn: String = sqlx::query_scalar("SELECT canonical FROM devres_content_aliases WHERE namespace='mdn:snapshots' AND legacy=$1")
+    let canonical_mdn: String = sqlx_core::query_scalar::query_scalar("SELECT canonical FROM devres_content_aliases WHERE namespace='mdn:snapshots' AND legacy=$1")
         .bind(&plan.mdn_snapshot).fetch_one(pool).await.map_err(|_| invalid())?;
     require(canonical_mdn.strip_prefix("blake3:").is_some_and(hash64))?;
     for snapshot in [&plan.mdn_snapshot, &canonical_mdn] {
@@ -278,12 +279,14 @@ async fn queue_guard(
 ) -> Result<()> {
     // Reject an unrelated serving/sweep database before the sealed verifier can
     // traverse its history. Every subsequent walk is bounded to this fixed set.
-    let swept: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_attribution_sweeps)")
-        .fetch_one(pool)
-        .await
-        .map_err(|_| invalid())?;
+    let swept: bool = sqlx_core::query_scalar::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM devres_attribution_sweeps)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| invalid())?;
     require(!swept)?;
-    let rows = sqlx::query(
+    let rows = sqlx_core::query::query(
         "SELECT id,provider,status FROM devres_attribution_targets ORDER BY id LIMIT 129",
     )
     .fetch_all(pool)
@@ -302,17 +305,18 @@ async fn queue_guard(
                 && (status == "ready" || roots.contains_key(&identity)),
         )?;
     }
-    let generations =
-        sqlx::query("SELECT id FROM devres_attribution_generations ORDER BY id LIMIT 129")
-            .fetch_all(pool)
-            .await
-            .map_err(|_| invalid())?;
+    let generations = sqlx_core::query::query(
+        "SELECT id FROM devres_attribution_generations ORDER BY id LIMIT 129",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| invalid())?;
     if generations.len() > MAX_TARGETS {
         return Err(bounded());
     }
     for row in generations {
         let generation_id: String = row.try_get("id").map_err(|_| invalid())?;
-        let subject: Value = sqlx::query_scalar("SELECT data->'subject' FROM devres_attribution_generations WHERE id=$1 AND octet_length(data::text)<=8388608")
+        let subject: Value = sqlx_core::query_scalar::query_scalar("SELECT data->'subject' FROM devres_attribution_generations WHERE id=$1 AND octet_length(data::text)<=8388608")
             .bind(generation_id).fetch_one(pool).await.map_err(|_| invalid())?;
         require(
             allowed.values().any(|target| {
@@ -445,18 +449,20 @@ async fn run(
     // initializes schema11, and composes no background worker or network task.
     let store = Arc::new(PgBlobStore::connect(database, root).await?);
     let pool = PgPoolOptions::new().max_connections(1).after_connect(|connection, _| Box::pin(async move {
-        sqlx::raw_sql("SET default_transaction_read_only=on; SET statement_timeout='10s'; SET lock_timeout='200ms'")
+        sqlx_core::raw_sql::raw_sql("SET default_transaction_read_only=on; SET statement_timeout='10s'; SET lock_timeout='200ms'")
             .execute(connection).await?; Ok(())
     })).connect(database).await.map_err(|_| invalid())?;
-    let schema: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-        .fetch_one(&pool)
-        .await
-        .map_err(|_| invalid())?;
-    let active: bool =
-        sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
+    let schema: i32 =
+        sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton")
             .fetch_one(&pool)
             .await
             .map_err(|_| invalid())?;
+    let active: bool = sqlx_core::query_scalar::query_scalar(
+        "SELECT active FROM devres_integrity_control WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|_| invalid())?;
     require(schema == 11 && active)?;
     let broker = Arc::new(BulkBroker::new(BulkConfig::default())?.with_attempt_budget(REQUESTS)?);
     let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
@@ -664,10 +670,12 @@ mod tests {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
         let admin = PgPool::connect(&base).await.unwrap();
         let name = format!("devres_fixed_qualification_{}", std::process::id());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {name}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
         let mut url = url::Url::parse(&base).unwrap();
         url.set_path(&format!("/{name}"));
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -703,19 +711,19 @@ mod tests {
                 .code,
             "integrity"
         );
-        let running: i64 = sqlx::query_scalar(
+        let running: i64 = sqlx_core::query_scalar::query_scalar(
             "SELECT count(*) FROM devres_attribution_targets WHERE status='running'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(running, 0); // The scope guard never claims unrelated jobs.
-        sqlx::query("DELETE FROM devres_attribution_targets WHERE id=$1")
+        sqlx_core::query::query("DELETE FROM devres_attribution_targets WHERE id=$1")
             .bind(id(&other).unwrap())
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE devres_attribution_targets SET priority=0 WHERE id=$1")
+        sqlx_core::query::query("UPDATE devres_attribution_targets SET priority=0 WHERE id=$1")
             .bind(id(&fixed).unwrap())
             .execute(&pool)
             .await
@@ -725,7 +733,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        sqlx::query("UPDATE devres_attribution_targets SET priority=1 WHERE id=$1")
+        sqlx_core::query::query("UPDATE devres_attribution_targets SET priority=1 WHERE id=$1")
             .bind(id(&fixed).unwrap())
             .execute(&pool)
             .await
@@ -749,14 +757,14 @@ mod tests {
                 .code,
             "capacity"
         );
-        sqlx::query("DELETE FROM devres_attribution_targets WHERE id<>$1")
+        sqlx_core::query::query("DELETE FROM devres_attribution_targets WHERE id<>$1")
             .bind(id(&fixed).unwrap())
             .execute(&pool)
             .await
             .unwrap();
         for number in 0..129 {
-            sqlx::query("INSERT INTO devres_attribution_generations(id,data,data_integrity) VALUES($1,$2,'fixture-only-invalid-seal')")
-                .bind(format!("fixture-{number:03}")).bind(sqlx::types::Json(json!({"subject":fixed.subject}))).execute(&pool).await.unwrap();
+            sqlx_core::query::query("INSERT INTO devres_attribution_generations(id,data,data_integrity) VALUES($1,$2,'fixture-only-invalid-seal')")
+                .bind(format!("fixture-{number:03}")).bind(sqlx_core::types::Json(json!({"subject":fixed.subject}))).execute(&pool).await.unwrap();
         }
         assert_eq!(
             queue_guard(&store, &pool, &roots, &roots, &cancelled)
@@ -767,7 +775,7 @@ mod tests {
         );
         pool.close().await;
         drop(store);
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {name} WITH (FORCE)"
         )))
         .execute(&admin)

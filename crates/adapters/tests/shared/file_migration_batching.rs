@@ -24,19 +24,21 @@ fn assert_no_stages(root: &Path) {
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume() {
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let database = format!("devres_file_batching_{suffix}");
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-        .execute(&admin)
-        .await
-        .unwrap();
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
     let mut url = url::Url::parse(&base).unwrap();
     url.set_path(&format!("/{database}"));
-    let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+    let pool = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let store = Arc::new(
         PgBlobStore::connect(url.as_str(), root.path())
@@ -44,7 +46,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
             .unwrap(),
     );
     // Convert only this owned empty fixture to pending offline qualification.
-    sqlx::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress;")
+    sqlx_core::raw_sql::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress;")
         .execute(&pool).await.unwrap();
     drop(store);
     let store = Arc::new(
@@ -69,12 +71,14 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
     // All three source files fit one batch. A pre-existing conflicting row must
     // roll back every newly inserted checkpoint and alias in that transaction.
     let wrong = integrity::hash(b"different public source");
-    sqlx::query("INSERT INTO devres_integrity_files(path,digest,bytes) VALUES('first.txt',$1,$2)")
-        .bind(&wrong)
-        .bind(first.len() as i64)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx_core::query::query(
+        "INSERT INTO devres_integrity_files(path,digest,bytes) VALUES('first.txt',$1,$2)",
+    )
+    .bind(&wrong)
+    .bind(first.len() as i64)
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         store
             .migrate_storage(CancellationToken::new())
@@ -83,22 +87,25 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
             .code,
         "integrity"
     );
-    let checkpoints: Vec<(String, String)> =
-        sqlx::query_as("SELECT path,digest FROM devres_integrity_files ORDER BY path")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+    let checkpoints: Vec<(String, String)> = sqlx_core::query_as::query_as(
+        "SELECT path,digest FROM devres_integrity_files ORDER BY path",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert_eq!(checkpoints, vec![("first.txt".into(), wrong.clone())]);
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM devres_content_aliases")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
+        sqlx_core::query_scalar::query_scalar::<_, i64>(
+            "SELECT count(*) FROM devres_content_aliases"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         0,
         "checkpoint conflict committed no alias"
     );
     assert_no_stages(root.path());
-    sqlx::query("DELETE FROM devres_integrity_files WHERE path='first.txt'")
+    sqlx_core::query::query("DELETE FROM devres_integrity_files WHERE path='first.txt'")
         .execute(&pool)
         .await
         .unwrap();
@@ -113,7 +120,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
         "payload": {"namespace": "body", "legacy": legacy, "canonical": wrong}
     }))
     .unwrap();
-    sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES('body',$1,$2,$3)")
+    sqlx_core::query::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES('body',$1,$2,$3)")
         .bind(&legacy).bind(&wrong).bind(mapping_seal).execute(&pool).await.unwrap();
     assert_eq!(
         store
@@ -124,15 +131,17 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
         "integrity"
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM devres_integrity_files")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
+        sqlx_core::query_scalar::query_scalar::<_, i64>(
+            "SELECT count(*) FROM devres_integrity_files"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         0,
         "alias conflict committed no file checkpoint"
     );
     assert_eq!(
-        sqlx::query_scalar::<_, String>(
+        sqlx_core::query_scalar::query_scalar::<_, String>(
             "SELECT canonical FROM devres_content_aliases WHERE namespace='body' AND legacy=$1"
         )
         .bind(&legacy)
@@ -142,20 +151,22 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
         wrong
     );
     assert_no_stages(root.path());
-    sqlx::query("DELETE FROM devres_content_aliases WHERE namespace='body' AND legacy=$1")
-        .bind(&legacy)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx_core::query::query(
+        "DELETE FROM devres_content_aliases WHERE namespace='body' AND legacy=$1",
+    )
+    .bind(&legacy)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Pause checkpoint INSERT after both filesystem barriers, request
     // cancellation, then let PostgreSQL continue. No part of this page commits.
     let mut blocker = pool.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(802171102,1)")
+    sqlx_core::query::query("SELECT pg_advisory_lock(802171102,1)")
         .execute(&mut *blocker)
         .await
         .unwrap();
-    sqlx::raw_sql("CREATE FUNCTION devres_file_batch_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(802171102,1); RETURN NULL; END $$; CREATE TRIGGER devres_file_batch_pause BEFORE INSERT ON devres_integrity_files FOR EACH STATEMENT EXECUTE FUNCTION devres_file_batch_pause();")
+    sqlx_core::raw_sql::raw_sql("CREATE FUNCTION devres_file_batch_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(802171102,1); RETURN NULL; END $$; CREATE TRIGGER devres_file_batch_pause BEFORE INSERT ON devres_integrity_files FOR EACH STATEMENT EXECUTE FUNCTION devres_file_batch_pause();")
         .execute(&pool).await.unwrap();
     let cancel = CancellationToken::new();
     let task_store = store.clone();
@@ -163,7 +174,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
     let task = tokio::spawn(async move { task_store.migrate_storage(task_cancel).await });
     let waiting = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND classid=802171102 AND objid=1 AND NOT granted)")
+            let waiting: bool = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND classid=802171102 AND objid=1 AND NOT granted)")
                 .fetch_one(&pool).await.unwrap();
             if waiting {
                 break;
@@ -173,7 +184,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
     })
     .await;
     cancel.cancel();
-    sqlx::query("SELECT pg_advisory_unlock(802171102,1)")
+    sqlx_core::query::query("SELECT pg_advisory_unlock(802171102,1)")
         .execute(&mut *blocker)
         .await
         .unwrap();
@@ -187,11 +198,11 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
             .code,
         "cancelled"
     );
-    let committed: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM devres_integrity_files),(SELECT count(*) FROM devres_content_aliases)")
+    let committed: (i64, i64) = sqlx_core::query_as::query_as("SELECT (SELECT count(*) FROM devres_integrity_files),(SELECT count(*) FROM devres_content_aliases)")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(committed, (0, 0));
     assert_no_stages(root.path());
-    sqlx::raw_sql("DROP TRIGGER devres_file_batch_pause ON devres_integrity_files; DROP FUNCTION devres_file_batch_pause();")
+    sqlx_core::raw_sql::raw_sql("DROP TRIGGER devres_file_batch_pause ON devres_integrity_files; DROP FUNCTION devres_file_batch_pause();")
         .execute(&pool).await.unwrap();
 
     store
@@ -200,12 +211,13 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
         .unwrap();
     for (path, body) in files {
         assert_eq!(std::fs::read(root.path().join(path)).unwrap(), body);
-        let expected: (String, i64) =
-            sqlx::query_as("SELECT digest,bytes FROM devres_integrity_files WHERE path=$1")
-                .bind(path)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let expected: (String, i64) = sqlx_core::query_as::query_as(
+            "SELECT digest,bytes FROM devres_integrity_files WHERE path=$1",
+        )
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(expected, (integrity::hash(body), body.len() as i64));
         let descriptor = integrity::evidence_path(root.path(), &root.path().join(path)).unwrap();
         let evidence: integrity::FileEvidence =
@@ -222,7 +234,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
         .unwrap(),
         legacy_body
     );
-    let alias: (String, bool) = sqlx::query_as("SELECT canonical,mapping_integrity IS NOT NULL FROM devres_content_aliases WHERE namespace='body' AND legacy=$1")
+    let alias: (String, bool) = sqlx_core::query_as::query_as("SELECT canonical,mapping_integrity IS NOT NULL FROM devres_content_aliases WHERE namespace='body' AND legacy=$1")
         .bind(&legacy).fetch_one(&pool).await.unwrap();
     assert_eq!(alias, (canonical, true));
     // A second pass inventories any newly created canonical link. Repeating
@@ -231,7 +243,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
         .migrate_storage(CancellationToken::new())
         .await
         .unwrap();
-    let before: Vec<(String, String, i64, String)> = sqlx::query_as(
+    let before: Vec<(String, String, i64, String)> = sqlx_core::query_as::query_as(
         "SELECT path,digest,bytes,ctid::text FROM devres_integrity_files ORDER BY path",
     )
     .fetch_all(&pool)
@@ -241,7 +253,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
         .migrate_storage(CancellationToken::new())
         .await
         .unwrap();
-    let after: Vec<(String, String, i64, String)> = sqlx::query_as(
+    let after: Vec<(String, String, i64, String)> = sqlx_core::query_as::query_as(
         "SELECT path,digest,bytes,ctid::text FROM devres_integrity_files ORDER BY path",
     )
     .fetch_all(&pool)
@@ -256,7 +268,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
     drop(store);
     drop(blocker);
     pool.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "DROP DATABASE {database} WITH (FORCE)"
     )))
     .execute(&admin)
@@ -269,7 +281,7 @@ async fn file_checkpoint_batches_reject_conflicts_cancel_atomically_and_resume()
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn worker_counts_preserve_completed_file_inventory_and_descriptors() {
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -277,18 +289,20 @@ async fn worker_counts_preserve_completed_file_inventory_and_descriptors() {
     let mut reference = None;
     for workers in [1, 2, 64] {
         let database = format!("devres_file_workers_{suffix}_{workers}");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
         let mut url = url::Url::parse(&base).unwrap();
         url.set_path(&format!("/{database}"));
-        let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+        let pool = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let store = PgBlobStore::connect(url.as_str(), root.path())
             .await
             .unwrap();
-        sqlx::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress;")
+        sqlx_core::raw_sql::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress;")
             .execute(&pool).await.unwrap();
         drop(store);
         let store = Arc::new(
@@ -324,7 +338,7 @@ async fn worker_counts_preserve_completed_file_inventory_and_descriptors() {
                 .await
                 .unwrap();
         }
-        let before: Vec<(String, String, i64, String)> = sqlx::query_as(
+        let before: Vec<(String, String, i64, String)> = sqlx_core::query_as::query_as(
             "SELECT path,digest,bytes,ctid::text FROM devres_integrity_files ORDER BY path",
         )
         .fetch_all(&pool)
@@ -334,7 +348,7 @@ async fn worker_counts_preserve_completed_file_inventory_and_descriptors() {
             .migrate_storage_with_execution(CancellationToken::new(), &execution)
             .await
             .unwrap();
-        let after: Vec<(String, String, i64, String)> = sqlx::query_as(
+        let after: Vec<(String, String, i64, String)> = sqlx_core::query_as::query_as(
             "SELECT path,digest,bytes,ctid::text FROM devres_integrity_files ORDER BY path",
         )
         .fetch_all(&pool)
@@ -355,7 +369,7 @@ async fn worker_counts_preserve_completed_file_inventory_and_descriptors() {
             })
             .collect();
         assert_eq!(inventory.len(), 262);
-        let aliases: Vec<(String, String, String)> = sqlx::query_as("SELECT namespace,legacy,canonical FROM devres_content_aliases ORDER BY namespace,legacy")
+        let aliases: Vec<(String, String, String)> = sqlx_core::query_as::query_as("SELECT namespace,legacy,canonical FROM devres_content_aliases ORDER BY namespace,legacy")
             .fetch_all(&pool).await.unwrap();
         let completed = (inventory, aliases);
         if let Some(reference) = &reference {
@@ -371,7 +385,7 @@ async fn worker_counts_preserve_completed_file_inventory_and_descriptors() {
         assert_no_stages(root.path());
         drop(store);
         pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"
         )))
         .execute(&admin)

@@ -2,7 +2,7 @@
 use super::*;
 use devres_application::Store;
 use devres_domain::{FetchRequest, FetchResponse, Validators};
-use sqlx::PgPool;
+use sqlx_postgres::PgPool;
 
 async fn published(
     store: &PgBlobStore,
@@ -48,7 +48,7 @@ fn manifest(catalogue: &Capture, documents: &[Document], seed: &str) -> Snapshot
 }
 
 async fn head_state(pool: &PgPool) -> Value {
-    sqlx::query_scalar("SELECT COALESCE(jsonb_agg(to_jsonb(head) ORDER BY source_key),'[]'::jsonb) FROM devres_heads AS head")
+    sqlx_core::query_scalar::query_scalar("SELECT COALESCE(jsonb_agg(to_jsonb(head) ORDER BY source_key),'[]'::jsonb) FROM devres_heads AS head")
         .fetch_one(pool)
         .await
         .unwrap()
@@ -67,10 +67,12 @@ async fn assert_unpublished(
     assert_eq!(error.code, expected.code);
     assert_eq!(error.message, expected.message);
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM devres_rfc_snapshots")
-            .fetch_one(pool)
-            .await
-            .unwrap(),
+        sqlx_core::query_scalar::query_scalar::<_, i64>(
+            "SELECT count(*) FROM devres_rfc_snapshots"
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
         expected_count,
         "failed validation must not publish even a partial snapshot"
     );
@@ -83,7 +85,10 @@ async fn assert_unpublished(
     assert_eq!(&head_state(pool).await, heads, "capture heads stay exact");
 }
 
-async fn scalar_result(connection: &mut sqlx::PgConnection, captures: &[&Capture]) -> Result<()> {
+async fn scalar_result(
+    connection: &mut sqlx_postgres::PgConnection,
+    captures: &[&Capture],
+) -> Result<()> {
     for capture in captures {
         check_capture(connection, capture).await?;
     }
@@ -113,10 +118,12 @@ async fn snapshot_capture_batches_preserve_scalar_identity_nulls_boundaries_and_
         .unwrap()
         .as_nanos();
     let database = format!("devres_rfc_snapshot_batches_{suffix}");
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-        .execute(&admin)
-        .await
-        .unwrap();
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
     let mut url = url::Url::parse(&base).unwrap();
     url.set_path(&format!("/{database}"));
     let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -178,10 +185,11 @@ async fn snapshot_capture_batches_preserve_scalar_identity_nulls_boundaries_and_
     // Replaying an identical snapshot and repeated capture inputs retain the
     // previous scalar check's occurrence semantics.
     store.save_snapshot(&previous).await.unwrap();
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_rfc_snapshots")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 =
+        sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_rfc_snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let heads = head_state(&pool).await;
     let first = &documents[0].capture;
     let mut revalidated = first.clone();
@@ -299,13 +307,13 @@ async fn snapshot_capture_batches_preserve_scalar_identity_nulls_boundaries_and_
         "media_type",
         "retrieved_at",
     ] {
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!(
             "ALTER TABLE devres_captures ALTER COLUMN {column} DROP NOT NULL"
         )))
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "UPDATE devres_captures SET {column}=NULL WHERE id=$1"
         )))
         .bind(&documents[100].capture.id)
@@ -325,11 +333,11 @@ async fn snapshot_capture_batches_preserve_scalar_identity_nulls_boundaries_and_
         )
         .await;
         let capture = &documents[100].capture;
-        sqlx::query("UPDATE devres_captures SET source_key=$2,source_url=$3,body_hash=$4,media_type=$5,retrieved_at=$6 WHERE id=$1")
+        sqlx_core::query::query("UPDATE devres_captures SET source_key=$2,source_url=$3,body_hash=$4,media_type=$5,retrieved_at=$6 WHERE id=$1")
             .bind(&capture.id).bind(&capture.key).bind(&capture.source_url)
             .bind(&capture.body_hash).bind(&capture.media_type).bind(capture.retrieved_at)
             .execute(&pool).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!(
             "ALTER TABLE devres_captures ALTER COLUMN {column} SET NOT NULL"
         )))
         .execute(&pool)
@@ -341,7 +349,7 @@ async fn snapshot_capture_batches_preserve_scalar_identity_nulls_boundaries_and_
     assert_eq!(store.snapshot(None).await.unwrap().unwrap().id, previous.id);
     drop(store);
     pool.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "DROP DATABASE {database} WITH (FORCE)"
     )))
     .execute(&admin)

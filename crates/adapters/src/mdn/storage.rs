@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use devres_application::mdn::{MdnRow, MdnStore, MdnWrite, Snapshot, View, validate_mdn_writes};
 use devres_domain::{Error, Result};
 use serde_json::Value;
-use sqlx::{Connection, Row, types::Json};
+use sqlx_core::{connection::Connection, row::Row, types::Json};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn checked(kind: &str, key: &str) -> Result<()> {
@@ -26,7 +26,7 @@ fn bounded(data: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn row(row: sqlx::postgres::PgRow) -> Result<MdnRow> {
+fn row(row: sqlx_postgres::PgRow) -> Result<MdnRow> {
     Ok(MdnRow {
         sequence: row.try_get("sequence").map_err(|_| storage_error())?,
         key: row.try_get("key").map_err(|_| storage_error())?,
@@ -78,7 +78,7 @@ impl MdnStore for PgBlobStore {
         }
         self.fence().await?;
         let excluded = self.visibility_aliases("mdn", kind, Some(cutoff)).await?;
-        let positions: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        let positions: Vec<(i64, String, i64, i64)> = sqlx_core::query_as::query_as(
             "SELECT r.sequence,r.key,(octet_length(r.data::text)::bigint+COALESCE(octet_length(s.data::text),0)+COALESCE(octet_length(c.data::text),0))::bigint,(jsonb_array_length(jsonb_path_query_array(r.data,'strict $.**.type()'))::bigint+COALESCE(jsonb_array_length(jsonb_path_query_array(s.data,'strict $.**.type()')),0)+COALESCE(jsonb_array_length(jsonb_path_query_array(c.data,'strict $.**.type()')),0))::bigint FROM devres_mdn_evidence r LEFT JOIN devres_mdn_state s ON s.key=(CASE WHEN $1='observations' THEN r.data->>'repo'||'-observation' WHEN $1='snapshots' THEN 'rebuild-alias:'||(r.data->>'repository')||':'||(r.data->>'revision')||':'||(r.data->>'processor_version') ELSE NULL END) LEFT JOIN devres_mdn_evidence c ON $1='snapshots' AND c.kind='snapshot-keys' AND c.key=((r.data->>'repository')||':'||(r.data->>'revision')||':'||(r.data->>'processor_version')) WHERE r.kind=$1 AND r.sequence>$2 AND r.sequence<=$3 AND NOT(r.key=ANY($5::text[])) ORDER BY r.sequence LIMIT $4"
         ).bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(excluded.as_ref())
             .fetch_all(&self.pool).await.map_err(|_| storage_error())?;
@@ -101,7 +101,7 @@ impl MdnStore for PgBlobStore {
     async fn mdn_migration_state_bytes(&self, key: &str) -> Result<Option<(usize, usize)>> {
         checked("state", key)?;
         self.fence().await?;
-        let bytes: Option<(i64, i64)> = sqlx::query_as(
+        let bytes: Option<(i64, i64)> = sqlx_core::query_as::query_as(
             "SELECT octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_mdn_state WHERE key=$1"
         ).bind(key).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
         bytes
@@ -123,10 +123,12 @@ impl MdnStore for PgBlobStore {
         if let Some(cutoff) = self.migration_cutoff("mdn").await? {
             return Ok(cutoff);
         }
-        sqlx::query_scalar("SELECT COALESCE(max(sequence),0) FROM devres_mdn_evidence")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| storage_error())
+        sqlx_core::query_scalar::query_scalar(
+            "SELECT COALESCE(max(sequence),0) FROM devres_mdn_evidence",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error())
     }
     async fn mdn_get_many(&self, kind: &str, keys: &[String]) -> Result<Vec<MdnRow>> {
         if keys.len() > 1000 {
@@ -143,11 +145,11 @@ impl MdnStore for PgBlobStore {
         }
         let keys = &resolved;
 
-        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(octet_length(data::text)),0)::bigint FROM devres_mdn_evidence JOIN UNNEST($2::text[]) AS requested(key) ON requested.key=devres_mdn_evidence.key WHERE kind=$1").bind(kind).bind(keys).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let bytes:i64=sqlx_core::query_scalar::query_scalar("SELECT COALESCE(sum(octet_length(data::text)),0)::bigint FROM devres_mdn_evidence JOIN UNNEST($2::text[]) AS requested(key) ON requested.key=devres_mdn_evidence.key WHERE kind=$1").bind(kind).bind(keys).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if bytes > 64 * 1024 * 1024 {
             return Err(Error::capacity("MDN batch read memory bound exceeded."));
         }
-        let rows = sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND key=ANY($2::text[])").bind(kind).bind(keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let rows = sqlx_core::query::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND key=ANY($2::text[])").bind(kind).bind(keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         remap_batch(rows.into_iter().map(row), original_keys, &resolved)
     }
     async fn mdn_migration_rows(
@@ -163,17 +165,17 @@ impl MdnStore for PgBlobStore {
             ));
         }
         self.fence().await?;
-        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM(SELECT octet_length(data::text) AS n FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 ORDER BY sequence LIMIT $3) page").bind(kind).bind(after).bind(limit as i64).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let bytes:i64=sqlx_core::query_scalar::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM(SELECT octet_length(data::text) AS n FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 ORDER BY sequence LIMIT $3) page").bind(kind).bind(after).bind(limit as i64).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if bytes > 64 * 1024 * 1024 {
             return Err(Error::capacity(
                 "Retained evidence verification page exceeds memory budget.",
             ));
         }
-        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 ORDER BY sequence LIMIT $3").bind(kind).bind(after).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
+        sqlx_core::query::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 ORDER BY sequence LIMIT $3").bind(kind).bind(after).bind(limit as i64).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
     }
     async fn mdn_migration_kinds(&self) -> Result<Vec<String>> {
         self.fence().await?;
-        let kinds: Vec<String> = sqlx::query_scalar(
+        let kinds: Vec<String> = sqlx_core::query_scalar::query_scalar(
             "SELECT DISTINCT kind FROM devres_mdn_evidence ORDER BY kind LIMIT 257",
         )
         .fetch_all(&self.pool)
@@ -191,18 +193,20 @@ impl MdnStore for PgBlobStore {
             return Err(Error::invalid("Invalid migration state page."));
         }
         self.fence().await?;
-        sqlx::query_scalar("SELECT key FROM devres_mdn_state WHERE key>$1 ORDER BY key LIMIT $2")
-            .bind(after)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|_| storage_error())
+        sqlx_core::query_scalar::query_scalar(
+            "SELECT key FROM devres_mdn_state WHERE key>$1 ORDER BY key LIMIT $2",
+        )
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error())
     }
     async fn mdn_get(&self, kind: &str, key: &str) -> Result<Option<MdnRow>> {
         checked(kind, key)?;
         self.fence().await?;
         let resolved = payload_integrity::natural_key(&self.pool, "mdn", kind, key).await?;
-        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND key=$2")
+        sqlx_core::query::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND key=$2")
             .bind(kind)
             .bind(&resolved)
             .fetch_optional(&self.pool)
@@ -227,12 +231,12 @@ impl MdnStore for PgBlobStore {
             return Ok(sequence);
         }
         let allocated = sequence_integrity::reserve_one(&mut owner, "devres_mdn_evidence").await?;
-        let inserted:Option<i64>=sqlx::query_scalar("INSERT INTO devres_mdn_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING RETURNING sequence").bind(kind).bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_mdn_evidence",kind,key,data)?).bind(allocated).bind(sequence_integrity::digest("devres_mdn_evidence",kind,key,allocated)?).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
+        let inserted:Option<i64>=sqlx_core::query_scalar::query_scalar("INSERT INTO devres_mdn_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING RETURNING sequence").bind(kind).bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_mdn_evidence",kind,key,data)?).bind(allocated).bind(sequence_integrity::digest("devres_mdn_evidence",kind,key,allocated)?).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
         if let Some(sequence) = inserted {
             return Ok(sequence);
         }
         let retained =
-            sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity,data=$3::jsonb AS identical FROM devres_mdn_evidence WHERE kind=$1 AND key=$2")
+            sqlx_core::query::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity,data=$3::jsonb AS identical FROM devres_mdn_evidence WHERE kind=$1 AND key=$2")
                 .bind(kind)
                 .bind(key)
                 .bind(Json(data))
@@ -298,9 +302,9 @@ impl MdnStore for PgBlobStore {
                 sequence_integrity::digest("devres_mdn_evidence", &row.kind, &row.key, *sequence)
             })
             .collect::<Result<Vec<_>>>()?;
-        sqlx::query("INSERT INTO devres_mdn_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) SELECT * FROM UNNEST($1::text[],$2::text[],$3::jsonb[],$4::text[],$5::bigint[],$6::text[]) ON CONFLICT DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_mdn_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) SELECT * FROM UNNEST($1::text[],$2::text[],$3::jsonb[],$4::text[],$5::bigint[],$6::text[]) ON CONFLICT DO NOTHING")
             .bind(&kinds).bind(&keys).bind(&values).bind(&digests).bind(&sequences).bind(&sequence_digests).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        let matched:i64=sqlx::query_scalar("SELECT count(*)::bigint FROM UNNEST($1::text[],$2::text[],$3::jsonb[],$4::text[]) AS expected(kind,key,data,data_integrity) JOIN devres_mdn_evidence AS retained ON retained.kind=expected.kind AND retained.key=expected.key AND retained.data=expected.data AND retained.data_integrity=expected.data_integrity")
+        let matched:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*)::bigint FROM UNNEST($1::text[],$2::text[],$3::jsonb[],$4::text[]) AS expected(kind,key,data,data_integrity) JOIN devres_mdn_evidence AS retained ON retained.kind=expected.kind AND retained.key=expected.key AND retained.data=expected.data AND retained.data_integrity=expected.data_integrity")
             .bind(&kinds).bind(&keys).bind(&values).bind(&digests).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         if matched != rows.len() as i64 {
             return Err(Error::integrity(
@@ -323,11 +327,11 @@ impl MdnStore for PgBlobStore {
         }
         self.fence().await?;
         let excluded = self.visibility_aliases("mdn", kind, cutoff).await?;
-        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM (SELECT octet_length(data::text) AS n FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4) page").bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(excluded.as_ref()).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let bytes:i64=sqlx_core::query_scalar::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM (SELECT octet_length(data::text) AS n FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4) page").bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(excluded.as_ref()).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if bytes > 64 * 1024 * 1024 {
             return Err(Error::capacity("MDN evidence page memory bound exceeded."));
         }
-        sqlx::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4")
+        sqlx_core::query::query("SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM devres_mdn_evidence WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4")
             .bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(excluded.as_ref()).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
     }
     async fn mdn_state(&self, key: &str) -> Result<Option<Value>> {
@@ -345,7 +349,7 @@ impl MdnStore for PgBlobStore {
         bounded(data)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_mdn_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_mdn_state","",key,data)?).execute(&mut *owner).await.map_err(|_|storage_error())?;
+        sqlx_core::query::query("INSERT INTO devres_mdn_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_mdn_state","",key,data)?).execute(&mut *owner).await.map_err(|_|storage_error())?;
         Ok(())
     }
     async fn mdn_publish_view(&self, view: &View) -> Result<()> {
@@ -403,7 +407,7 @@ impl MdnStore for PgBlobStore {
         let data = serde_json::to_value(view).map_err(|_| storage_error())?;
         sequence_integrity::admit(&mut tx, "devres_mdn_evidence", "views", &view.id, &data).await?;
         let allocated = sequence_integrity::reserve_one(&mut tx, "devres_mdn_evidence").await?;
-        sqlx::query("INSERT INTO devres_mdn_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) VALUES('views',$1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(&view.id).bind(Json(&data)).bind(payload_integrity::digest("devres_mdn_evidence","views",&view.id,&data)?).bind(allocated).bind(sequence_integrity::digest("devres_mdn_evidence","views",&view.id,allocated)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx_core::query::query("INSERT INTO devres_mdn_evidence(kind,key,data,data_integrity,sequence,sequence_integrity) VALUES('views',$1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(&view.id).bind(Json(&data)).bind(payload_integrity::digest("devres_mdn_evidence","views",&view.id,&data)?).bind(allocated).bind(sequence_integrity::digest("devres_mdn_evidence","views",&view.id,allocated)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
         sequence_integrity::verify_keys(
             &mut tx,
             "devres_mdn_evidence",
@@ -418,7 +422,7 @@ impl MdnStore for PgBlobStore {
         if retained.0 != data {
             return Err(Error::integrity("MDN view identity collision."));
         }
-        sqlx::query("INSERT INTO devres_mdn_state(key,data,data_integrity) VALUES('default-view',$1,$2) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(Json(serde_json::json!(view.id))).bind(payload_integrity::digest("devres_mdn_state","","default-view",&serde_json::json!(view.id))?).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx_core::query::query("INSERT INTO devres_mdn_state(key,data,data_integrity) VALUES('default-view',$1,$2) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(Json(serde_json::json!(view.id))).bind(payload_integrity::digest("devres_mdn_state","","default-view",&serde_json::json!(view.id))?).execute(&mut *tx).await.map_err(|_|storage_error())?;
         tx.commit().await.map_err(|_| storage_error())
     }
 }

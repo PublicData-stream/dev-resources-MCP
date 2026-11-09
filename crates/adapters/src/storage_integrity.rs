@@ -6,7 +6,10 @@ mod specialized_closure;
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
 use serde_json::{Value, json};
-use sqlx::{Column, Connection, Executor, Postgres, Row, postgres::PgRow, types::Json};
+use sqlx_core::{
+    column::Column, connection::Connection, executor::Executor, row::Row, types::Json,
+};
+use sqlx_postgres::{PgRow, Postgres};
 use tokio_util::sync::CancellationToken;
 
 fn failure() -> Error {
@@ -99,7 +102,7 @@ impl SealBatch {
         let mut owner = store.owner.lock().await;
         let mut tx = owner.begin().await.map_err(|_| failure())?;
         let result: Result<()> = async {
-            let changed = sqlx::query(sqlx::AssertSqlSafe(sql))
+            let changed = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql))
                 .bind(&self.locators)
                 .bind(&self.kinds)
                 .bind(&self.keys)
@@ -278,7 +281,7 @@ where
             "SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM {table} WHERE kind=$1 AND key=$2"
         )
     };
-    let found = sqlx::query(sqlx::AssertSqlSafe(query))
+    let found = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(query))
         .bind(kind)
         .bind(key)
         .fetch_optional(executor)
@@ -378,7 +381,8 @@ pub(super) async fn backfill_specialized(
             "SELECT ctid::text AS locator,{kind_expr} AS kind,{key_expr} AS key,{} AS data,{column}_integrity AS expected FROM {table} WHERE {predicate}",
             specialized_payload_expression(table, column)
         );
-        let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&store.pool);
+        let mut rows =
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql)).fetch(&store.pool);
         let mut batch = SealBatch::with_execution(execution);
         let mut window = SealWindow::new(execution, verify_only);
         let target = SealTarget {
@@ -432,12 +436,12 @@ pub(super) async fn stage(
 ) -> Result<()> {
     let expected = digest("devres_integrity_staged_state", provider, key, data)?;
     let mut owner = store.owner.lock().await;
-    let mut tx = sqlx::Connection::begin(&mut *owner)
+    let mut tx = sqlx_core::connection::Connection::begin(&mut *owner)
         .await
         .map_err(|_| failure())?;
-    sqlx::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+    sqlx_core::query::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
         .bind(provider).bind(key).bind(Json(data)).bind(&expected).execute(&mut *tx).await.map_err(|_|failure())?;
-    let retained=sqlx::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider=$1 AND key=$2")
+    let retained=sqlx_core::query::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider=$1 AND key=$2")
         .bind(provider).bind(key).fetch_one(&mut *tx).await.map_err(|_|failure())?;
     let value: Json<Value> = retained.try_get("data").map_err(|_| failure())?;
     let checksum: String = retained.try_get("data_integrity").map_err(|_| failure())?;
@@ -455,7 +459,7 @@ pub(super) async fn stage(
 }
 
 pub(super) async fn natural_key(
-    pool: &sqlx::PgPool,
+    pool: &sqlx_postgres::PgPool,
     provider: &str,
     kind: &str,
     key: &str,
@@ -545,7 +549,7 @@ pub(super) async fn natural_key(
         return Ok(key.into());
     }
     let namespace = format!("{provider}:{kind}");
-    let canonical=sqlx::query("SELECT canonical,mapping_integrity FROM devres_content_aliases WHERE namespace=$1 AND legacy=$2").bind(&namespace).bind(key).fetch_optional(pool).await.map_err(|_|failure())?;
+    let canonical=sqlx_core::query::query("SELECT canonical,mapping_integrity FROM devres_content_aliases WHERE namespace=$1 AND legacy=$2").bind(&namespace).bind(key).fetch_optional(pool).await.map_err(|_|failure())?;
     if let Some(row) = canonical {
         let canonical: String = row.try_get("canonical").map_err(|_| failure())?;
         let expected: String = row.try_get("mapping_integrity").map_err(|_| failure())?;
@@ -666,8 +670,8 @@ mod tests {
         };
         use devres_application::mdn::{MdnStore, MdnWrite};
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_sql_integrity_fixture")
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        sqlx_core::query::query("CREATE DATABASE devres_sql_integrity_fixture")
             .execute(&admin)
             .await
             .unwrap();
@@ -708,7 +712,7 @@ mod tests {
             store.mdn_state("fixture").await.unwrap(),
             Some(json!(["scalar", 1]))
         );
-        sqlx::query("UPDATE devres_mdn_evidence SET data='{\"value\":999}'::jsonb WHERE kind='projections' AND key=$1").bind(&one).execute(&store.pool).await.unwrap();
+        sqlx_core::query::query("UPDATE devres_mdn_evidence SET data='{\"value\":999}'::jsonb WHERE kind='projections' AND key=$1").bind(&one).execute(&store.pool).await.unwrap();
         assert_eq!(
             store.mdn_get("projections", &one).await.unwrap_err().code,
             "integrity"
@@ -737,10 +741,12 @@ mod tests {
                 .code,
             "integrity"
         );
-        sqlx::query("UPDATE devres_mdn_state SET data='false'::jsonb WHERE key='fixture'")
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "UPDATE devres_mdn_state SET data='false'::jsonb WHERE key='fixture'",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(
             store.mdn_state("fixture").await.unwrap_err().code,
             "integrity"
@@ -783,7 +789,7 @@ mod tests {
             .commit_content(&generation, json!({"job_key":"fixture"}))
             .await
             .unwrap();
-        let cutoff: i64 = sqlx::query_scalar(
+        let cutoff: i64 = sqlx_core::query_scalar::query_scalar(
             "SELECT published_sequence FROM devres_crate_generations WHERE id=$1",
         )
         .bind(&generation)
@@ -804,19 +810,21 @@ mod tests {
             .commit_content(&standalone, json!({"job_key":"unreferenced"}))
             .await
             .unwrap();
-        let standalone_sequence: i64 = sqlx::query_scalar(
+        let standalone_sequence: i64 = sqlx_core::query_scalar::query_scalar(
             "SELECT published_sequence FROM devres_crate_generations WHERE id=$1",
         )
         .bind(&standalone)
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE devres_crate_generations SET published_sequence=$2 WHERE id=$1")
-            .bind(&standalone)
-            .bind(standalone_sequence + 100_000)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "UPDATE devres_crate_generations SET published_sequence=$2 WHERE id=$1",
+        )
+        .bind(&standalone)
+        .bind(standalone_sequence + 100_000)
+        .execute(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(
             store
                 .commit_content(&standalone, json!({"job_key":"unreferenced"}))
@@ -839,20 +847,24 @@ mod tests {
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            sqlx::query("UPDATE devres_crate_generations SET published_sequence=$2 WHERE id=$1")
-                .bind(&standalone)
-                .bind(standalone_sequence)
-                .execute(&store.pool),
+            sqlx_core::query::query(
+                "UPDATE devres_crate_generations SET published_sequence=$2 WHERE id=$1",
+            )
+            .bind(&standalone)
+            .bind(standalone_sequence)
+            .execute(&store.pool),
         )
         .await
         .expect("rejected publication must release its row lock before returning")
         .unwrap();
-        sqlx::query("UPDATE devres_crate_content SET metadata_capture=$2 WHERE generation=$1")
-            .bind(&generation)
-            .bind(&second.id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "UPDATE devres_crate_content SET metadata_capture=$2 WHERE generation=$1",
+        )
+        .bind(&generation)
+        .bind(&second.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(
             store
                 .contents(cutoff, &ContentFilter::default(), None, 10)
@@ -899,12 +911,14 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        sqlx::query("UPDATE devres_crate_versions SET metadata_capture=$2 WHERE valid_from=$1")
-            .bind(before.sequence)
-            .bind(&second.id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "UPDATE devres_crate_versions SET metadata_capture=$2 WHERE valid_from=$1",
+        )
+        .bind(before.sequence)
+        .bind(&second.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(
             store
                 .version(&before.id, "example", "1.0.0")

@@ -6,7 +6,7 @@ use devres_application::{
 };
 use devres_domain::{Capture, Error, Result};
 use serde_json::Value;
-use sqlx::Row;
+use sqlx_core::row::Row;
 use std::collections::BTreeSet;
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +33,7 @@ impl Drop for CancelOnDrop {
 }
 
 async fn capture(store: &PgBlobStore, id: &str, cancel: &CancellationToken) -> Result<Capture> {
-    let row=sqlx::query("SELECT id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity FROM devres_captures WHERE id=$1").bind(id).fetch_optional(&store.pool).await.map_err(|_|storage_error())?.ok_or_else(invalid)?;
+    let row=sqlx_core::query::query("SELECT id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity FROM devres_captures WHERE id=$1").bind(id).fetch_optional(&store.pool).await.map_err(|_|storage_error())?.ok_or_else(invalid)?;
     let capture = Capture {
         id: row.try_get("id").map_err(|_| invalid())?,
         key: row.try_get("source_key").map_err(|_| invalid())?,
@@ -110,7 +110,7 @@ impl PgBlobStore {
         let mut after = (String::new(), String::new());
         loop {
             stop(cancel)?;
-            let found=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE (kind,capture_id)>($1,$2) ORDER BY kind,capture_id LIMIT 1").bind(&after.0).bind(&after.1).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let found=sqlx_core::query::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE (kind,capture_id)>($1,$2) ORDER BY kind,capture_id LIMIT 1").bind(&after.0).bind(&after.1).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(found) = found else {
                 break;
             };
@@ -128,7 +128,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             stop(cancel)?;
-            let found=sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id>$1 ORDER BY id LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let found=sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id>$1 ORDER BY id LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(found) = found else {
                 break;
             };
@@ -145,7 +145,7 @@ impl PgBlobStore {
             ] {
                 if let Some(id) = id {
                     capture(self, id, cancel).await?;
-                    let dataset=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(id).fetch_optional(&self.pool).await.map_err(|_|storage_error())?.ok_or_else(invalid)?;
+                    let dataset=sqlx_core::query::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(id).fetch_optional(&self.pool).await.map_err(|_|storage_error())?.ok_or_else(invalid)?;
                     payload_integrity::row("devres_rfc_datasets", &dataset)?;
                 }
             }
@@ -212,7 +212,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             stop(cancel)?;
-            let found: Option<(String, String)> = sqlx::query_as(
+            let found: Option<(String, String)> = sqlx_core::query_as::query_as(
                 "SELECT id,format FROM devres_advisory_snapshots WHERE id>$1 ORDER BY id LIMIT 1",
             )
             .bind(&after)
@@ -250,7 +250,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             stop(cancel)?;
-            let found=sqlx::query("SELECT sequence,inventory,content_sequence,''::text AS kind,id AS key,data,data_integrity FROM devres_crate_snapshots WHERE id>$1 ORDER BY id LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let found=sqlx_core::query::query("SELECT sequence,inventory,content_sequence,''::text AS kind,id AS key,data,data_integrity FROM devres_crate_snapshots WHERE id>$1 ORDER BY id LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(found) = found else {
                 break;
             };
@@ -261,7 +261,7 @@ impl PgBlobStore {
             if snapshot.id != key {
                 return Err(invalid());
             }
-            let inventory = sqlx::query(
+            let inventory = sqlx_core::query::query(
                 "SELECT id,sequence,revision,created_at FROM devres_crate_inventories WHERE id=$1",
             )
             .bind(&snapshot.inventory.id)
@@ -286,7 +286,7 @@ impl PgBlobStore {
             }
             if let Some(enrichment) = &snapshot.enrichment {
                 capture(self, enrichment, cancel).await?;
-                let exists: bool = sqlx::query_scalar(
+                let exists: bool = sqlx_core::query_scalar::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM devres_crate_artifacts WHERE capture_id=$1)",
                 )
                 .bind(enrichment)
@@ -358,7 +358,7 @@ impl PgBlobStore {
                         if payload["class"] == "content" {
                             let record = &payload["record"];
                             let id = record["id"].as_str().ok_or_else(invalid)?;
-                            let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_content c JOIN devres_crate_generations g ON g.id=c.generation WHERE c.id=$1 AND g.published_sequence<=$2)").bind(id).bind(snapshot.content_sequence).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+                            let exists:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_content c JOIN devres_crate_generations g ON g.id=c.generation WHERE c.id=$1 AND g.published_sequence<=$2)").bind(id).bind(snapshot.content_sequence).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
                             if !exists {
                                 return Err(invalid());
                             }

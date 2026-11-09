@@ -51,16 +51,18 @@ async fn prepare(
 async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication() {
     let _index_gate = crate::crates_io::index::TEST_BUILD.lock().await;
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let database = format!("devres_crate_resume_{suffix}");
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-        .execute(&admin)
-        .await
-        .unwrap();
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
     let mut url = url::Url::parse(&base).unwrap();
     url.set_path(&format!("/{database}"));
     let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -136,16 +138,18 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
     .unwrap();
     let expected = serde_json::to_value(&first).unwrap();
     let checkpoint = format!("snapshot-prepared:{old}");
-    let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+    let pool = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM devres_crate_snapshots")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
+        sqlx_core::query_scalar::query_scalar::<_, i64>(
+            "SELECT count(*) FROM devres_crate_snapshots"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         0,
         "preparation receipt precedes snapshot publication"
     );
-    sqlx::query("UPDATE devres_integrity_control SET active=false WHERE singleton")
+    sqlx_core::query::query("UPDATE devres_integrity_control SET active=false WHERE singleton")
         .execute(&pool)
         .await
         .unwrap();
@@ -176,7 +180,7 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
         "fresh replay freezes its empty candidate set before publication"
     );
     let published = store.commit_prepared_crate_snapshot(resumed).await.unwrap();
-    let before:(String,i64,i64)=sqlx::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_snapshots_sequence_seq) FROM devres_crate_snapshots WHERE id=$1").bind(&published.id).fetch_one(&pool).await.unwrap();
+    let before:(String,i64,i64)=sqlx_core::query_as::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_snapshots_sequence_seq) FROM devres_crate_snapshots WHERE id=$1").bind(&published.id).fetch_one(&pool).await.unwrap();
     drop(store);
     let store = Arc::new(
         PgBlobStore::connect_for_migration(url.as_str(), root.path())
@@ -202,17 +206,19 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
             .id,
         published.id
     );
-    let after:(String,i64,i64)=sqlx::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_snapshots_sequence_seq) FROM devres_crate_snapshots WHERE id=$1").bind(&published.id).fetch_one(&pool).await.unwrap();
+    let after:(String,i64,i64)=sqlx_core::query_as::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_snapshots_sequence_seq) FROM devres_crate_snapshots WHERE id=$1").bind(&published.id).fetch_one(&pool).await.unwrap();
     assert_eq!(
         before, after,
         "replay neither rewrites a committed tuple nor consumes a new sequence"
     );
     // Receiptless canonical rows are the interruption shape of the old binary.
-    sqlx::query("DELETE FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1")
-        .bind(&checkpoint)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx_core::query::query(
+        "DELETE FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1",
+    )
+    .bind(&checkpoint)
+    .execute(&pool)
+    .await
+    .unwrap();
     let adopted = prepare(
         &store,
         &original,
@@ -227,10 +233,12 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
     assert_eq!(adopted.id, published.id);
     assert_eq!(adopted.index_manifest, published.index_manifest);
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM devres_crate_snapshots")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
+        sqlx_core::query_scalar::query_scalar::<_, i64>(
+            "SELECT count(*) FROM devres_crate_snapshots"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         1
     );
     assert_eq!(
@@ -303,7 +311,7 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
         snapshot_base(&published).unwrap(),
         snapshot_base(&second_published).unwrap()
     );
-    let before_pair: Vec<(String, String, i64)> = sqlx::query_as(
+    let before_pair: Vec<(String, String, i64)> = sqlx_core::query_as::query_as(
         "SELECT id,ctid::text,sequence FROM devres_crate_snapshots ORDER BY sequence",
     )
     .fetch_all(&pool)
@@ -312,7 +320,7 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
     assert_eq!(before_pair.len(), 2);
     // Reproduce an older binary that committed both generations before writing
     // either legacy ownership receipt. Adoption follows retained legacy order.
-    sqlx::query("DELETE FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'snapshot-prepared:%'")
+    sqlx_core::query::query("DELETE FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'snapshot-prepared:%'")
         .execute(&pool).await.unwrap();
     let mut adoption = store
         .crate_snapshot_adoption(&maps, &token, &execution)
@@ -373,7 +381,7 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
         aliased.get(&format!("crate:snapshots:{old}")),
         aliased.get(&format!("crate:snapshots:{second_old}"))
     );
-    let after_pair: Vec<(String, String, i64)> = sqlx::query_as(
+    let after_pair: Vec<(String, String, i64)> = sqlx_core::query_as::query_as(
         "SELECT id,ctid::text,sequence FROM devres_crate_snapshots ORDER BY sequence",
     )
     .fetch_all(&pool)
@@ -421,7 +429,7 @@ async fn crate_snapshot_preparation_receipts_resume_before_and_after_publication
     assert_eq!(execution.snapshot().graph_memory_bytes, 0);
     drop(store);
     pool.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "DROP DATABASE {database} WITH (FORCE)"
     )))
     .execute(&admin)

@@ -4,7 +4,8 @@ use devres_adapters::{PgBlobStore, integrity};
 use devres_application::crate_corpus::CrateCorpusStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, QueryBuilder, Row, types::Json};
+use sqlx_core::{query_builder::QueryBuilder, row::Row, types::Json};
+use sqlx_postgres::Postgres;
 use std::{path::Path, sync::Arc};
 
 pub(super) const KIND: &str = "pending-schema10-crates-v1";
@@ -25,8 +26,8 @@ pub(super) const TABLES: [&str; 13] = [
 ];
 const INVENTORIES: usize = 3;
 
-pub(super) async fn artifact_count(pool: &sqlx::PgPool) -> Result<i64> {
-    Ok(sqlx::query_scalar(
+pub(super) async fn artifact_count(pool: &sqlx_postgres::PgPool) -> Result<i64> {
+    Ok(sqlx_core::query_scalar::query_scalar(
         "SELECT count(*) FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%'",
     )
     .fetch_one(pool)
@@ -47,7 +48,7 @@ fn provenance(ordinal: usize, capture: &str) -> Value {
 }
 
 pub(super) async fn seed(
-    pool: &sqlx::PgPool,
+    pool: &sqlx_postgres::PgPool,
     root: &Path,
     artifacts: usize,
     staging: usize,
@@ -107,7 +108,7 @@ pub(super) async fn seed(
         });
         query.build().execute(&mut *tx).await?;
         // Same-second, byte-identical observations must remain distinct occurrences.
-        let sequences: Vec<i64> = sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('devres_crate_observations','sequence')) FROM generate_series(1,$1::bigint)").bind((artifact_rows.len()*2) as i64).fetch_all(&mut *tx).await?;
+        let sequences: Vec<i64> = sqlx_core::query_scalar::query_scalar("SELECT nextval(pg_get_serial_sequence('devres_crate_observations','sequence')) FROM generate_series(1,$1::bigint)").bind((artifact_rows.len()*2) as i64).fetch_all(&mut *tx).await?;
         let mut observations = Vec::new();
         for ((id, provenance, _), sequences) in
             artifact_rows.iter().zip(sequences.as_chunks::<2>().0)
@@ -150,8 +151,8 @@ pub(super) async fn seed(
     for inventory in 0..INVENTORIES {
         let revision = format!("{inventory:040x}");
         let id = hex::encode(Sha256::digest(format!("crate-inventory:1:{revision}")));
-        sqlx::query("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at,cursor,published,manifest) VALUES($1,$2,1700000000,1700000001,'fixture-complete',true,$3)").bind(&id).bind(&revision).bind(manifest).execute(pool).await?;
-        sqlx::query("INSERT INTO devres_crate_inventory_gaps(inventory,name,error) VALUES($1,'missing-synthetic-crate','unavailable')").bind(&id).execute(pool).await?;
+        sqlx_core::query::query("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at,cursor,published,manifest) VALUES($1,$2,1700000000,1700000001,'fixture-complete',true,$3)").bind(&id).bind(&revision).bind(manifest).execute(pool).await?;
+        sqlx_core::query::query("INSERT INTO devres_crate_inventory_gaps(inventory,name,error) VALUES($1,'missing-synthetic-crate','unavailable')").bind(&id).execute(pool).await?;
         for start in (0..staging).step_by(128) {
             let mut rows = Vec::new();
             for ordinal in start..(start + 128).min(staging) {
@@ -190,17 +191,17 @@ pub(super) async fn seed(
     Ok(())
 }
 
-pub(super) async fn readback(store: &Arc<PgBlobStore>, pool: &sqlx::PgPool) -> Result<()> {
+pub(super) async fn readback(store: &Arc<PgBlobStore>, pool: &sqlx_postgres::PgPool) -> Result<()> {
     let count = artifact_count(pool).await?;
     if count == 0 {
         return Ok(());
     }
-    let canonical: i64 = sqlx::query_scalar(
+    let canonical: i64 = sqlx_core::query_scalar::query_scalar(
         "SELECT count(*) FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%'",
     )
     .fetch_one(pool)
     .await?;
-    let observations: i64 = sqlx::query_scalar(
+    let observations: i64 = sqlx_core::query_scalar::query_scalar(
         "SELECT count(*) FROM devres_crate_observations WHERE capture_id LIKE 'blake3:%'",
     )
     .fetch_one(pool)
@@ -208,11 +209,11 @@ pub(super) async fn readback(store: &Arc<PgBlobStore>, pool: &sqlx::PgPool) -> R
     if canonical != count || observations != count * 2 {
         return Err("crate replay lost artifacts or duplicate observations".into());
     }
-    let missing: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_observations o WHERE o.capture_id NOT LIKE 'blake3:%' AND NOT EXISTS(SELECT 1 FROM devres_integrity_staged_state s WHERE s.provider='crate' AND s.key='observation:'||o.sequence::text))").fetch_one(pool).await?;
+    let missing: bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_observations o WHERE o.capture_id NOT LIKE 'blake3:%' AND NOT EXISTS(SELECT 1 FROM devres_integrity_staged_state s WHERE s.provider='crate' AND s.key='observation:'||o.sequence::text))").fetch_one(pool).await?;
     if missing {
         return Err("crate replay lost an occurrence receipt".into());
     }
-    let ids: Vec<String>=sqlx::query_scalar("(SELECT capture_id FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id LIMIT 1) UNION (SELECT capture_id FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id DESC LIMIT 1)").fetch_all(pool).await?;
+    let ids: Vec<String>=sqlx_core::query_scalar::query_scalar("(SELECT capture_id FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id LIMIT 1) UNION (SELECT capture_id FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id DESC LIMIT 1)").fetch_all(pool).await?;
     for id in ids {
         let artifact = store
             .artifact(&id)
@@ -224,7 +225,7 @@ pub(super) async fn readback(store: &Arc<PgBlobStore>, pool: &sqlx::PgPool) -> R
             return Err("canonical artifact readback length changed".into());
         }
     }
-    let rows=sqlx::query("SELECT (SELECT count(*) FROM devres_crate_staging s JOIN devres_crate_inventories i ON i.id=s.inventory WHERE i.id NOT LIKE 'blake3:%') AS legacy,(SELECT count(*) FROM devres_crate_staging s JOIN devres_crate_inventories i ON i.id=s.inventory WHERE i.id LIKE 'blake3:%') AS canonical").fetch_one(pool).await?;
+    let rows=sqlx_core::query::query("SELECT (SELECT count(*) FROM devres_crate_staging s JOIN devres_crate_inventories i ON i.id=s.inventory WHERE i.id NOT LIKE 'blake3:%') AS legacy,(SELECT count(*) FROM devres_crate_staging s JOIN devres_crate_inventories i ON i.id=s.inventory WHERE i.id LIKE 'blake3:%') AS canonical").fetch_one(pool).await?;
     if rows.try_get::<i64, _>("legacy")? != rows.try_get::<i64, _>("canonical")? {
         return Err("canonical staging readback membership changed".into());
     }

@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use sqlx::Connection;
+use sqlx_core::connection::Connection;
 use std::sync::{Mutex, atomic::AtomicUsize};
 
 const APP: &str = "11111111-1111-4111-8111-111111111111";

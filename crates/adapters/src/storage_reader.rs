@@ -11,25 +11,28 @@ impl PgBlobStore {
         owner_started: String,
     ) -> Result<Self> {
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| storage_error())?;
+        let version: i32 = sqlx_core::query_scalar::query_scalar(
+            "SELECT version FROM devres_schema WHERE singleton",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?;
         if version != 13 {
             return Err(Error::unavailable(
                 "Concurrent serving requires storage schema thirteen.",
             ));
         }
-        let active: bool =
-            sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
+        let active: bool = sqlx_core::query_scalar::query_scalar(
+            "SELECT active FROM devres_integrity_control WHERE singleton",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?;
         if !active {
             return Err(Error::unavailable("Storage activation is incomplete."));
         }
         attribution_storage::verify_supported_control(&mut tx).await?;
-        let valid: bool = sqlx::query_scalar("SELECT backend=$1 AND pending_binding IS NULL AND NOT initializing_s3 FROM devres_archive_control WHERE singleton")
+        let valid: bool = sqlx_core::query_scalar::query_scalar("SELECT backend=$1 AND pending_binding IS NULL AND NOT initializing_s3 FROM devres_archive_control WHERE singleton")
             .bind(if s3.is_some() { "s3" } else { "filesystem" })
             .fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
         if !valid {
@@ -79,7 +82,7 @@ impl PgBlobStore {
 
     pub(super) async fn lifecycle_fence(&self) -> Result<()> {
         // A pool reconnect must never replace the dedicated session holding this lock.
-        let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid=2 AND l.objsubid=2 AND l.granted AND l.mode=$3 AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)")
+        let held: bool = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid=2 AND l.objsubid=2 AND l.granted AND l.mode=$3 AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)")
             .bind(self.owner_pid).bind(&self.owner_started)
             .bind(if self.lifecycle_shared { "ShareLock" } else { "ExclusiveLock" })
             .fetch_one(&self.pool).await.map_err(|_| storage_error())?;
@@ -89,7 +92,7 @@ impl PgBlobStore {
             ));
         }
         if self.reader {
-            let supported: bool = sqlx::query_scalar("SELECT version=13 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
+            let supported: bool = sqlx_core::query_scalar::query_scalar("SELECT version=13 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
                 .fetch_one(&self.pool).await.map_err(|_| storage_error())?;
             if !supported {
                 return Err(Error::unavailable(
@@ -97,7 +100,7 @@ impl PgBlobStore {
                 ));
             }
             if self.archive.get().is_none() {
-                let local: bool = sqlx::query_scalar("SELECT backend='filesystem' AND pending_binding IS NULL AND NOT initializing_s3 FROM devres_archive_control WHERE singleton")
+                let local: bool = sqlx_core::query_scalar::query_scalar("SELECT backend='filesystem' AND pending_binding IS NULL AND NOT initializing_s3 FROM devres_archive_control WHERE singleton")
                     .fetch_one(&self.pool).await.map_err(|_| storage_error())?;
                 if !local {
                     return Err(Error::unavailable(
@@ -119,7 +122,7 @@ mod tests {
     async fn concurrent_filesystem_reader_has_no_publication_or_maintenance_authority() {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
         let admin = PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_reader_fixture")
+        sqlx_core::query::query("CREATE DATABASE devres_reader_fixture")
             .execute(&admin)
             .await
             .unwrap();
@@ -129,9 +132,9 @@ mod tests {
         let writer = PgBlobStore::connect(writer_url.as_str(), root.path())
             .await
             .unwrap();
-        sqlx::raw_sql("CREATE ROLE devres_reader_fixture LOGIN PASSWORD 'disposable-reader'; GRANT CONNECT ON DATABASE devres_reader_fixture TO devres_reader_fixture;")
+        sqlx_core::raw_sql::raw_sql("CREATE ROLE devres_reader_fixture LOGIN PASSWORD 'disposable-reader'; GRANT CONNECT ON DATABASE devres_reader_fixture TO devres_reader_fixture;")
             .execute(&admin).await.unwrap();
-        sqlx::raw_sql("GRANT USAGE ON SCHEMA public TO devres_reader_fixture; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_reader_fixture;")
+        sqlx_core::raw_sql::raw_sql("GRANT USAGE ON SCHEMA public TO devres_reader_fixture; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_reader_fixture;")
             .execute(&writer.pool).await.unwrap();
         let mut reader_url = writer_url.clone();
         reader_url.set_username("devres_reader_fixture").unwrap();
@@ -142,7 +145,7 @@ mod tests {
         assert!(reader.is_reader());
         assert!(!writer.is_reader());
         assert!(
-            sqlx::query("UPDATE devres_schema SET version=12")
+            sqlx_core::query::query("UPDATE devres_schema SET version=12")
                 .execute(&reader.pool)
                 .await
                 .is_err()
@@ -195,7 +198,7 @@ mod tests {
             .await
             .unwrap();
         let pid = reader.owner_pid;
-        sqlx::query("SELECT pg_terminate_backend($1)")
+        sqlx_core::query::query("SELECT pg_terminate_backend($1)")
             .bind(pid)
             .execute(&admin)
             .await
@@ -205,7 +208,7 @@ mod tests {
         assert!(writer.check_health().await.is_ok());
         drop(reader);
         let writer_pid = writer.owner_pid;
-        sqlx::query("SELECT pg_terminate_backend($1)")
+        sqlx_core::query::query("SELECT pg_terminate_backend($1)")
             .bind(writer_pid)
             .execute(&admin)
             .await
@@ -242,7 +245,7 @@ mod tests {
     async fn reader_refuses_legacy_schema_and_pending_restore() {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
         let admin = PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_reader_admission_fixture")
+        sqlx_core::query::query("CREATE DATABASE devres_reader_admission_fixture")
             .execute(&admin)
             .await
             .unwrap();
@@ -252,7 +255,7 @@ mod tests {
         let writer = PgBlobStore::connect(url.as_str(), root.path())
             .await
             .unwrap();
-        sqlx::query("UPDATE devres_schema SET version=12 WHERE singleton")
+        sqlx_core::query::query("UPDATE devres_schema SET version=12 WHERE singleton")
             .execute(&writer.pool)
             .await
             .unwrap();
@@ -261,11 +264,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        sqlx::query("UPDATE devres_schema SET version=13 WHERE singleton")
+        sqlx_core::query::query("UPDATE devres_schema SET version=13 WHERE singleton")
             .execute(&writer.pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE devres_archive_restore_pending(singleton boolean)")
+        sqlx_core::query::query("CREATE TABLE devres_archive_restore_pending(singleton boolean)")
             .execute(&writer.pool)
             .await
             .unwrap();
@@ -285,7 +288,7 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(configured).unwrap()).unwrap();
         config.prefix.push_str("/committed-reopen");
         let admin = PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_reopen_fixture")
+        sqlx_core::query::query("CREATE DATABASE devres_s3_reopen_fixture")
             .execute(&admin)
             .await
             .unwrap();
@@ -314,7 +317,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let committed: (i64, String) = sqlx::query_as(
+        let committed: (i64, String) = sqlx_core::query_as::query_as(
             "SELECT epoch,binding FROM devres_archive_control WHERE singleton AND backend='s3' AND pending_binding IS NULL AND NOT initializing_s3",
         ).fetch_one(&writer.pool).await.unwrap();
         drop(writer);
@@ -334,7 +337,7 @@ mod tests {
                     .await
                     .unwrap()
             };
-            let control: (i64, String) = sqlx::query_as(
+            let control: (i64, String) = sqlx_core::query_as::query_as(
                 "SELECT epoch,binding FROM devres_archive_control WHERE singleton AND pending_binding IS NULL AND NOT initializing_s3",
             ).fetch_one(&writer.pool).await.unwrap();
             assert_eq!(control, committed);
@@ -375,13 +378,13 @@ mod tests {
         drop(reader);
         // An ambiguous preexisting transition is never committed by reopening.
         for initializing in [false, true] {
-            sqlx::query("UPDATE devres_archive_control SET pending_binding=binding,initializing_s3=$1 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_archive_control SET pending_binding=binding,initializing_s3=$1 WHERE singleton")
                 .bind(initializing).execute(&pool).await.unwrap();
             let writer =
                 PgBlobStore::connect_archive(url.as_str(), root.path(), Some(config.clone()))
                     .await
                     .unwrap();
-            let pending: (Option<String>, bool) = sqlx::query_as(
+            let pending: (Option<String>, bool) = sqlx_core::query_as::query_as(
                 "SELECT pending_binding,initializing_s3 FROM devres_archive_control WHERE singleton",
             ).fetch_one(&pool).await.unwrap();
             assert_eq!(pending, (Some(committed.1.clone()), initializing));
@@ -405,7 +408,7 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
         config.prefix.push_str("/reader-isolation");
         let admin = PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_reader_fixture")
+        sqlx_core::query::query("CREATE DATABASE devres_s3_reader_fixture")
             .execute(&admin)
             .await
             .unwrap();
@@ -419,11 +422,13 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("CREATE ROLE devres_s3_reader_fixture LOGIN PASSWORD 'disposable-reader'")
-            .execute(&admin)
-            .await
-            .unwrap();
-        sqlx::raw_sql("GRANT CONNECT ON DATABASE devres_s3_reader_fixture TO devres_s3_reader_fixture; GRANT USAGE ON SCHEMA public TO devres_s3_reader_fixture; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_s3_reader_fixture;")
+        sqlx_core::query::query(
+            "CREATE ROLE devres_s3_reader_fixture LOGIN PASSWORD 'disposable-reader'",
+        )
+        .execute(&admin)
+        .await
+        .unwrap();
+        sqlx_core::raw_sql::raw_sql("GRANT CONNECT ON DATABASE devres_s3_reader_fixture TO devres_s3_reader_fixture; GRANT USAGE ON SCHEMA public TO devres_s3_reader_fixture; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_s3_reader_fixture;")
             .execute(&writer.pool).await.unwrap();
         let mut reader_url = writer_url.clone();
         reader_url.set_username("devres_s3_reader_fixture").unwrap();

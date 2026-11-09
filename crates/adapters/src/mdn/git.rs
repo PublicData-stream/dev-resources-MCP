@@ -1950,14 +1950,14 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
     async fn s3_readonly_cold_raw_git_pages_materialize_verified_packs_without_archive_writes() {
-        use sqlx::{Connection, Row};
+        use sqlx_core::{connection::Connection, row::Row};
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
         let configured = std::env::var("DEVRES_TEST_S3_CONFIG").unwrap();
         let mut config: crate::object_storage::S3Config =
             toml::from_str(&std::fs::read_to_string(configured).unwrap()).unwrap();
         config.prefix.push_str("/readonly-raw-git");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_raw_git_reader")
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        sqlx_core::query::query("CREATE DATABASE devres_s3_raw_git_reader")
             .execute(&admin)
             .await
             .unwrap();
@@ -1974,19 +1974,22 @@ pub(crate) mod tests {
         .await
         .unwrap();
         let fixture = retained_fixture(writer_root.path()).await;
-        let mut writer_db = sqlx::PgConnection::connect(database.as_str())
+        let mut writer_db = sqlx_postgres::PgConnection::connect(database.as_str())
             .await
             .unwrap();
-        sqlx::query("CREATE ROLE devres_s3_raw_git_reader LOGIN PASSWORD 'disposable-reader'")
-            .execute(&admin)
-            .await
-            .unwrap();
-        sqlx::raw_sql("GRANT CONNECT ON DATABASE devres_s3_raw_git_reader TO devres_s3_raw_git_reader; GRANT USAGE ON SCHEMA public TO devres_s3_raw_git_reader; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_s3_raw_git_reader;").execute(&mut writer_db).await.unwrap();
-        let before = sqlx::query("SELECT count(*)::bigint AS files FROM devres_archive_file")
-            .fetch_one(&mut writer_db)
-            .await
-            .unwrap()
-            .get::<i64, _>("files");
+        sqlx_core::query::query(
+            "CREATE ROLE devres_s3_raw_git_reader LOGIN PASSWORD 'disposable-reader'",
+        )
+        .execute(&admin)
+        .await
+        .unwrap();
+        sqlx_core::raw_sql::raw_sql("GRANT CONNECT ON DATABASE devres_s3_raw_git_reader TO devres_s3_raw_git_reader; GRANT USAGE ON SCHEMA public TO devres_s3_raw_git_reader; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_s3_raw_git_reader;").execute(&mut writer_db).await.unwrap();
+        let before =
+            sqlx_core::query::query("SELECT count(*)::bigint AS files FROM devres_archive_file")
+                .fetch_one(&mut writer_db)
+                .await
+                .unwrap()
+                .get::<i64, _>("files");
         let mut reader_database = database.clone();
         reader_database
             .set_username("devres_s3_raw_git_reader")
@@ -2003,11 +2006,12 @@ pub(crate) mod tests {
         .unwrap();
         assert!(!cache.path().join("mdn/content").exists());
         verify_retained_readers(cache.path(), scratch.path(), &fixture).await;
-        let after = sqlx::query("SELECT count(*)::bigint AS files FROM devres_archive_file")
-            .fetch_one(&mut writer_db)
-            .await
-            .unwrap()
-            .get::<i64, _>("files");
+        let after =
+            sqlx_core::query::query("SELECT count(*)::bigint AS files FROM devres_archive_file")
+                .fetch_one(&mut writer_db)
+                .await
+                .unwrap()
+                .get::<i64, _>("files");
         assert_eq!(after, before, "readers must not publish archive bindings");
         assert!(reader.is_reader());
         assert!(!writer.is_reader());
@@ -2299,9 +2303,9 @@ pub(crate) mod tests {
         use serde_json::json;
         let base =
             std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL URL required");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
         let database = "devres_mdn_git_fixture";
-        sqlx::query("CREATE DATABASE devres_mdn_git_fixture")
+        sqlx_core::query::query("CREATE DATABASE devres_mdn_git_fixture")
             .execute(&admin)
             .await
             .unwrap();
@@ -2630,7 +2634,7 @@ pub(crate) mod tests {
         );
         drop(restored);
         drop(reopened);
-        sqlx::query("DROP DATABASE devres_mdn_git_fixture WITH (FORCE)")
+        sqlx_core::query::query("DROP DATABASE devres_mdn_git_fixture WITH (FORCE)")
             .execute(&admin)
             .await
             .unwrap();

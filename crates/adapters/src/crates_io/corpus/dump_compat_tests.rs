@@ -11,8 +11,8 @@ use axum::{
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn crate_corpus_captured_inventory_acquisition_research_and_restart_legacy_dump() {
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
-    sqlx::query("CREATE DATABASE devres_dump_compat_fixture")
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+    sqlx_core::query::query("CREATE DATABASE devres_dump_compat_fixture")
         .execute(&admin)
         .await
         .unwrap();
@@ -142,7 +142,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart_legacy
     server.abort();
     drop(corpus);
     drop(store);
-    sqlx::query("DROP DATABASE devres_dump_compat_fixture WITH(FORCE)")
+    sqlx_core::query::query("DROP DATABASE devres_dump_compat_fixture WITH(FORCE)")
         .execute(&admin)
         .await
         .unwrap();

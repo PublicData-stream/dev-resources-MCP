@@ -3,7 +3,7 @@ use super::{PgBlobStore, events};
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
 use serde_json::json;
-use sqlx::Row;
+use sqlx_core::row::Row;
 #[path = "storage_visibility_spill.rs"]
 mod spill;
 pub(super) use spill::VisibilityValues;
@@ -113,20 +113,20 @@ fn verify_cutoff(provider: &str, cutoff: i64, expected: &str) -> Result<()> {
 }
 
 impl VisibilityRegistry {
-    async fn load(pool: &sqlx::PgPool, active: bool) -> Result<Self> {
+    async fn load(pool: &sqlx_postgres::PgPool, active: bool) -> Result<Self> {
         Self::load_inner(pool, active, true).await
     }
-    async fn load_inner(pool: &sqlx::PgPool, active: bool, freeze: bool) -> Result<Self> {
+    async fn load_inner(pool: &sqlx_postgres::PgPool, active: bool, freeze: bool) -> Result<Self> {
         // Admission and loading share one database snapshot: a concurrent pending
         // migration cannot grow the result between its byte check and allocation.
         let mut tx = pool.begin().await.map_err(|_| invalid())?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        sqlx_core::query::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx)
             .await
             .map_err(|_| invalid())?;
         // Check a single record's transient encodings before loading it. Total
         // historical bytes are never a resident admission criterion.
-        let largest: i64 = sqlx::query_scalar("SELECT COALESCE(max(bytes),0)::bigint FROM (SELECT octet_length(namespace)::bigint+octet_length(legacy)+octet_length(canonical)+COALESCE(octet_length(mapping_integrity),0) AS bytes FROM devres_content_aliases UNION ALL SELECT octet_length(provider)::bigint+COALESCE(octet_length(cutoff_integrity),0) FROM devres_integrity_provider_cutoffs UNION ALL SELECT octet_length(provider)::bigint+COALESCE(octet_length(aliases_digest),0)+COALESCE(octet_length(progress_integrity),0) FROM devres_integrity_graph_progress) registry")
+        let largest: i64 = sqlx_core::query_scalar::query_scalar("SELECT COALESCE(max(bytes),0)::bigint FROM (SELECT octet_length(namespace)::bigint+octet_length(legacy)+octet_length(canonical)+COALESCE(octet_length(mapping_integrity),0) AS bytes FROM devres_content_aliases UNION ALL SELECT octet_length(provider)::bigint+COALESCE(octet_length(cutoff_integrity),0) FROM devres_integrity_provider_cutoffs UNION ALL SELECT octet_length(provider)::bigint+COALESCE(octet_length(aliases_digest),0)+COALESCE(octet_length(progress_integrity),0) FROM devres_integrity_graph_progress) registry")
             .fetch_one(&mut *tx).await.map_err(|_| invalid())?;
         let transient = usize::try_from(largest)
             .ok()
@@ -140,7 +140,7 @@ impl VisibilityRegistry {
             None
         };
         let mut cutoffs = BTreeMap::new();
-        for row in sqlx::query("SELECT provider,legacy_cutoff,cutoff_integrity FROM devres_integrity_provider_cutoffs ORDER BY provider LIMIT 10")
+        for row in sqlx_core::query::query("SELECT provider,legacy_cutoff,cutoff_integrity FROM devres_integrity_provider_cutoffs ORDER BY provider LIMIT 10")
             .fetch_all(&mut *tx).await.map_err(|_| invalid())? {
             let provider: String = row.try_get("provider").map_err(|_| invalid())?;
             let cutoff: i64 = row.try_get("legacy_cutoff").map_err(|_| invalid())?;
@@ -163,7 +163,7 @@ impl VisibilityRegistry {
         let mut pending_namespace = String::new();
         let mut pending_aliases = Vec::new();
         let mut pending_bytes = 0_usize;
-        let mut rows = sqlx::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace COLLATE \"C\",legacy COLLATE \"C\"")
+        let mut rows = sqlx_core::query::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace COLLATE \"C\",legacy COLLATE \"C\"")
             .fetch(&mut *tx);
         while let Some(row) = rows.try_next().await.map_err(|_| invalid())? {
             let namespace: String = row.try_get("namespace").map_err(|_| invalid())?;
@@ -235,7 +235,7 @@ impl VisibilityRegistry {
             .collect::<BTreeMap<_, _>>();
         let verified_memberships = actual.clone();
         let mut progress = BTreeMap::new();
-        for row in sqlx::query("SELECT provider,complete,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress ORDER BY provider LIMIT 11")
+        for row in sqlx_core::query::query("SELECT provider,complete,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress ORDER BY provider LIMIT 11")
             .fetch_all(&mut *tx).await.map_err(|_|invalid())? {
             let provider:String=row.try_get("provider").map_err(|_|invalid())?;
             let complete:bool=row.try_get("complete").map_err(|_|invalid())?;
@@ -306,7 +306,7 @@ impl PgBlobStore {
         if self.active.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let row = sqlx::query("SELECT legacy_cutoff,cutoff_integrity FROM devres_integrity_provider_cutoffs WHERE provider=$1")
+        let row = sqlx_core::query::query("SELECT legacy_cutoff,cutoff_integrity FROM devres_integrity_provider_cutoffs WHERE provider=$1")
             .bind(provider).fetch_optional(&self.pool).await.map_err(|_| invalid())?;
         row.map(|row| {
             let cutoff: i64 = row.try_get("legacy_cutoff").map_err(|_| invalid())?;
@@ -488,7 +488,7 @@ mod tests {
     async fn sql_visibility_registry_preserves_generations_and_detects_metadata_corruption() {
         use devres_application::mdn::MdnStore;
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -496,7 +496,7 @@ mod tests {
         let database = format!("devres_visibility_fixture_{suffix}");
         // A locale whose punctuation ordering differs from Rust byte ordering
         // exercises the explicit C collation used by the compatibility receipts.
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database} TEMPLATE template0 LOCALE_PROVIDER libc LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'")))
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!("CREATE DATABASE {database} TEMPLATE template0 LOCALE_PROVIDER libc LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'")))
             .execute(&admin)
             .await
             .unwrap();
@@ -507,7 +507,7 @@ mod tests {
             .await
             .unwrap();
         store.active.store(false, Ordering::Release);
-        sqlx::query("DELETE FROM devres_integrity_graph_progress WHERE provider='mdn'")
+        sqlx_core::query::query("DELETE FROM devres_integrity_graph_progress WHERE provider='mdn'")
             .execute(&store.pool)
             .await
             .unwrap();
@@ -518,22 +518,24 @@ mod tests {
             &json!({"provider":"mdn","legacy_cutoff":cutoff}),
         )
         .unwrap();
-        sqlx::query("INSERT INTO devres_integrity_provider_cutoffs(provider,legacy_cutoff,cutoff_integrity) VALUES('mdn',$1,$2) ON CONFLICT(provider) DO UPDATE SET legacy_cutoff=EXCLUDED.legacy_cutoff,cutoff_integrity=EXCLUDED.cutoff_integrity")
+        sqlx_core::query::query("INSERT INTO devres_integrity_provider_cutoffs(provider,legacy_cutoff,cutoff_integrity) VALUES('mdn',$1,$2) ON CONFLICT(provider) DO UPDATE SET legacy_cutoff=EXCLUDED.legacy_cutoff,cutoff_integrity=EXCLUDED.cutoff_integrity")
             .bind(cutoff).bind(&seal).execute(&store.pool).await.unwrap();
         let old = crate::integrity::legacy_hash(b"original");
         let canonical = crate::integrity::hash(b"canonical");
         let original = json!({"fixture":"original"});
         let new = json!({"fixture":"canonical"});
-        sqlx::query("INSERT INTO devres_mdn_evidence(sequence,kind,key,data,data_integrity,sequence_integrity) VALUES(1,'projections',$1,$2,$3,$4)")
-            .bind(&old).bind(sqlx::types::Json(&original))
+        sqlx_core::query::query("INSERT INTO devres_mdn_evidence(sequence,kind,key,data,data_integrity,sequence_integrity) VALUES(1,'projections',$1,$2,$3,$4)")
+            .bind(&old).bind(sqlx_core::types::Json(&original))
             .bind(super::super::payload_integrity::digest("devres_mdn_evidence","projections",&old,&original).unwrap())
             .bind(super::super::sequence_integrity::digest("devres_mdn_evidence","projections",&old,1).unwrap())
             .execute(&store.pool).await.unwrap();
         // Reserve the canonical occurrence after the original frozen watermark.
-        sqlx::query("SELECT setval(pg_get_serial_sequence('devres_mdn_evidence','sequence'),11)")
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "SELECT setval(pg_get_serial_sequence('devres_mdn_evidence','sequence'),11)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
         store
             .mdn_put("projections", &canonical, &new)
             .await
@@ -545,7 +547,7 @@ mod tests {
                 &json!({"namespace":namespace,"legacy":old,"canonical":canonical}),
             )
             .unwrap();
-            sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES($1,$2,$3,$4)")
+            sqlx_core::query::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES($1,$2,$3,$4)")
                 .bind(namespace).bind(&old).bind(&canonical).bind(&alias_seal).execute(&store.pool).await.unwrap();
         }
         assert_eq!(
@@ -569,20 +571,20 @@ mod tests {
                 .data,
             original
         );
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_integrity_provider_cutoffs SET legacy_cutoff=11 WHERE provider='mdn'",
         )
         .execute(&store.pool)
         .await
         .unwrap();
         assert_eq!(store.mdn_cutoff().await.unwrap_err().code, "integrity");
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_integrity_provider_cutoffs SET legacy_cutoff=10 WHERE provider='mdn'",
         )
         .execute(&store.pool)
         .await
         .unwrap();
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_content_aliases SET legacy='unsealed' WHERE namespace='mdn:projections'",
         )
         .execute(&store.pool)
@@ -596,7 +598,7 @@ mod tests {
                 .code,
             "integrity"
         );
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_content_aliases SET legacy=$1 WHERE namespace='mdn:projections'",
         )
         .bind(&old)
@@ -612,21 +614,21 @@ mod tests {
             .unwrap();
         let (count, digest) = membership.finish();
         let receipt=events::event_digest("devres_integrity_graph_progress","mdn",&json!({"provider":"mdn","complete":true,"aliases_count":count,"aliases_digest":digest})).unwrap();
-        sqlx::query("INSERT INTO devres_integrity_graph_progress(provider,complete,aliases_count,aliases_digest,progress_integrity) VALUES('mdn',true,$1,$2,$3)")
+        sqlx_core::query::query("INSERT INTO devres_integrity_graph_progress(provider,complete,aliases_count,aliases_digest,progress_integrity) VALUES('mdn',true,$1,$2,$3)")
             .bind(count).bind(&digest).bind(receipt).execute(&store.pool).await.unwrap();
         // Pending verification still accepts incomplete known work, but checks its
         // seal and refuses unknown control families. Activation demands all receipts.
         store.verify_complete_visibility_registry().await.unwrap();
         let incomplete = events::event_digest("devres_integrity_graph_progress","mdn",
             &json!({"provider":"mdn","complete":false,"aliases_count":count,"aliases_digest":digest})).unwrap();
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_integrity_graph_progress SET complete=false WHERE provider='mdn'",
         )
         .execute(&store.pool)
         .await
         .unwrap();
         assert!(VisibilityRegistry::load(&store.pool, false).await.is_err());
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_integrity_graph_progress SET progress_integrity=$1 WHERE provider='mdn'",
         )
         .bind(&incomplete)
@@ -637,54 +639,64 @@ mod tests {
         assert!(store.verify_complete_visibility_registry().await.is_err());
         let receipt = events::event_digest("devres_integrity_graph_progress","mdn",
             &json!({"provider":"mdn","complete":true,"aliases_count":count,"aliases_digest":digest})).unwrap();
-        sqlx::query("UPDATE devres_integrity_graph_progress SET complete=true,progress_integrity=$1 WHERE provider='mdn'")
+        sqlx_core::query::query("UPDATE devres_integrity_graph_progress SET complete=true,progress_integrity=$1 WHERE provider='mdn'")
             .bind(&receipt).execute(&store.pool).await.unwrap();
-        sqlx::query("INSERT INTO devres_integrity_graph_progress SELECT 'unknown',false,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress WHERE provider='mdn'")
+        sqlx_core::query::query("INSERT INTO devres_integrity_graph_progress SELECT 'unknown',false,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress WHERE provider='mdn'")
             .execute(&store.pool).await.unwrap();
         assert!(VisibilityRegistry::load(&store.pool, false).await.is_err());
-        sqlx::query("DELETE FROM devres_integrity_graph_progress WHERE provider='unknown'")
-            .execute(&store.pool)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TEMP TABLE retained_cutoff AS SELECT * FROM devres_integrity_provider_cutoffs WHERE provider='npm'")
+        sqlx_core::query::query(
+            "DELETE FROM devres_integrity_graph_progress WHERE provider='unknown'",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx_core::query::query("CREATE TEMP TABLE retained_cutoff AS SELECT * FROM devres_integrity_provider_cutoffs WHERE provider='npm'")
             .execute(&mut *store.owner.lock().await).await.unwrap();
-        sqlx::query("DELETE FROM devres_integrity_provider_cutoffs WHERE provider='npm'")
+        sqlx_core::query::query(
+            "DELETE FROM devres_integrity_provider_cutoffs WHERE provider='npm'",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.verify_complete_visibility_registry().await.is_err());
+        sqlx_core::query::query(
+            "INSERT INTO devres_integrity_provider_cutoffs SELECT * FROM retained_cutoff",
+        )
+        .execute(&mut *store.owner.lock().await)
+        .await
+        .unwrap();
+        sqlx_core::query::query("CREATE TEMP TABLE retained_receipt AS SELECT * FROM devres_integrity_graph_progress WHERE provider='npm'")
+            .execute(&mut *store.owner.lock().await).await.unwrap();
+        sqlx_core::query::query("DELETE FROM devres_integrity_graph_progress WHERE provider='npm'")
             .execute(&store.pool)
             .await
             .unwrap();
         assert!(store.verify_complete_visibility_registry().await.is_err());
-        sqlx::query("INSERT INTO devres_integrity_provider_cutoffs SELECT * FROM retained_cutoff")
-            .execute(&mut *store.owner.lock().await)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TEMP TABLE retained_receipt AS SELECT * FROM devres_integrity_graph_progress WHERE provider='npm'")
-            .execute(&mut *store.owner.lock().await).await.unwrap();
-        sqlx::query("DELETE FROM devres_integrity_graph_progress WHERE provider='npm'")
-            .execute(&store.pool)
-            .await
-            .unwrap();
-        assert!(store.verify_complete_visibility_registry().await.is_err());
-        sqlx::query("INSERT INTO devres_integrity_graph_progress SELECT * FROM retained_receipt")
-            .execute(&mut *store.owner.lock().await)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "INSERT INTO devres_integrity_graph_progress SELECT * FROM retained_receipt",
+        )
+        .execute(&mut *store.owner.lock().await)
+        .await
+        .unwrap();
         store.verify_complete_visibility_registry().await.unwrap();
         store.active.store(true, Ordering::Release);
         assert_eq!(
             store.mdn_rows("projections", 0, 100, None).await.unwrap()[0].key,
             canonical
         );
-        sqlx::query("DELETE FROM devres_content_aliases WHERE namespace='mdn:projections'")
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "DELETE FROM devres_content_aliases WHERE namespace='mdn:projections'",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
         assert!(VisibilityRegistry::load(&store.pool, true).await.is_err());
         // The active compatibility generation is immutable for serving readers.
         assert_eq!(
             store.mdn_rows("projections", 0, 100, None).await.unwrap()[0].key,
             canonical
         );
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_integrity_provider_cutoffs SET legacy_cutoff=11 WHERE provider='mdn'",
         )
         .execute(&store.pool)
@@ -692,7 +704,7 @@ mod tests {
         .unwrap();
         assert!(store.verify_visibility_registry().await.is_err());
         drop(store);
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"
         )))
         .execute(&admin)

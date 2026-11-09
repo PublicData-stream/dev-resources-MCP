@@ -3,7 +3,8 @@
 use crate::object_storage::{S3Archive, S3Config};
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, PgConnection, PgPool, Row};
+use sqlx_core::{connection::Connection, row::Row};
+use sqlx_postgres::{PgConnection, PgPool};
 use std::os::unix::fs::MetadataExt;
 use std::{
     collections::BTreeMap,
@@ -359,7 +360,7 @@ impl Cache {
                         .ok_or_else(integrity)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let completed: Vec<String> = sqlx::query_scalar(
+            let completed: Vec<String> = sqlx_core::query_scalar::query_scalar(
                 "SELECT path FROM devres_archive_file WHERE complete AND path=ANY($1)",
             )
             .bind(&relative)
@@ -664,8 +665,8 @@ mod namespace_acceptance {
         let mut config: S3Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         config.prefix.push_str("/provider-namespace-acceptance");
         config.cache_max_bytes = 64 * 1024 * 1024;
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_namespace_fixture")
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        sqlx_core::query::query("CREATE DATABASE devres_s3_namespace_fixture")
             .execute(&admin)
             .await
             .unwrap();
@@ -874,7 +875,7 @@ impl Archive {
     ) -> Result<Arc<Self>> {
         let remote = S3Archive::new(config).await?;
         let binding = config_binding(remote.config())?;
-        let row = sqlx::query("SELECT epoch,store_id FROM devres_archive_control WHERE singleton AND backend='s3' AND binding=$1 AND pending_binding IS NULL AND NOT initializing_s3")
+        let row = sqlx_core::query::query("SELECT epoch,store_id FROM devres_archive_control WHERE singleton AND backend='s3' AND binding=$1 AND pending_binding IS NULL AND NOT initializing_s3")
             .bind(&binding).fetch_optional(&pool).await.map_err(|_| unavailable())?.ok_or_else(integrity)?;
         let epoch: i64 = row.try_get("epoch").map_err(|_| integrity())?;
         let store_id: String = row.try_get("store_id").map_err(|_| integrity())?;
@@ -884,7 +885,7 @@ impl Archive {
         {
             return Err(integrity());
         }
-        let original: Option<String> = sqlx::query_scalar(
+        let original: Option<String> = sqlx_core::query_scalar::query_scalar(
             "SELECT source_root FROM devres_archive_transfer WHERE singleton AND source_protected",
         )
         .fetch_optional(&pool)
@@ -941,7 +942,7 @@ impl Archive {
         let binding = config_binding(remote.config())?;
         let mut connection = owner.lock().await;
         let mut tx = connection.begin().await.map_err(|_| unavailable())?;
-        let row=sqlx::query("SELECT epoch,backend,binding,pending_binding,store_id,initializing_s3 FROM devres_archive_control WHERE singleton FOR UPDATE").fetch_one(&mut *tx).await.map_err(|_|unavailable())?;
+        let row=sqlx_core::query::query("SELECT epoch,backend,binding,pending_binding,store_id,initializing_s3 FROM devres_archive_control WHERE singleton FOR UPDATE").fetch_one(&mut *tx).await.map_err(|_|unavailable())?;
         let previous_epoch: i64 = row.try_get("epoch").map_err(|_| integrity())?;
         let backend: String = row.try_get("backend").map_err(|_| integrity())?;
         let bound: Option<String> = row.try_get("binding").map_err(|_| integrity())?;
@@ -959,7 +960,7 @@ impl Archive {
             return Err(integrity());
         }
         if backend == "s3" {
-            let original:Option<String>=sqlx::query_scalar("SELECT source_root FROM devres_archive_transfer WHERE singleton AND source_protected").fetch_optional(&mut *tx).await.map_err(|_|unavailable())?;
+            let original:Option<String>=sqlx_core::query_scalar::query_scalar("SELECT source_root FROM devres_archive_transfer WHERE singleton AND source_protected").fetch_optional(&mut *tx).await.map_err(|_|unavailable())?;
             if let Some(original) = original {
                 let original = Path::new(&original);
                 if !original.is_absolute() {
@@ -973,10 +974,11 @@ impl Archive {
             }
         }
         if backend == "filesystem" && !transfer {
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_captures")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| unavailable())?;
+            let count: i64 =
+                sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_captures")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| unavailable())?;
             // A populated filesystem store must use explicit verified migration.
             let populated = has_evidence(&root)?;
             let admitted_fresh = admission == ArchiveAdmission::Fresh
@@ -994,7 +996,7 @@ impl Archive {
         if !committed {
             // Fix the target before remote I/O; a different database cannot claim
             // the prefix, and readers remain stopped while a transfer is pending.
-            sqlx::query("UPDATE devres_archive_control SET pending_binding=$1,epoch=$2,initializing_s3=initializing_s3 OR $3 WHERE singleton AND (binding IS NULL OR binding=$1)").bind(&binding).bind(epoch).bind(admission==ArchiveAdmission::Fresh).execute(&mut *tx).await.map_err(|_|unavailable())?;
+            sqlx_core::query::query("UPDATE devres_archive_control SET pending_binding=$1,epoch=$2,initializing_s3=initializing_s3 OR $3 WHERE singleton AND (binding IS NULL OR binding=$1)").bind(&binding).bind(epoch).bind(admission==ArchiveAdmission::Fresh).execute(&mut *tx).await.map_err(|_|unavailable())?;
         }
         tx.commit().await.map_err(|_| unavailable())?;
         drop(connection);
@@ -1044,8 +1046,8 @@ impl Archive {
     }
     async fn fence(&self) -> Result<()> {
         let _owner = self.owner.upgrade().ok_or_else(unavailable)?;
-        let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid::bigint=$3 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)").bind(self.owner_pid).bind(&self.owner_started).bind(if self.reader { 2_i64 } else { 1_i64 }).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
-        let matches:bool=sqlx::query_scalar("SELECT epoch=$1 AND COALESCE(binding,pending_binding)=$2 AND (NOT $3 OR (backend='s3' AND pending_binding IS NULL AND NOT initializing_s3)) FROM devres_archive_control WHERE singleton").bind(self.epoch).bind(&self.binding).bind(self.reader).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
+        let owned:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid::bigint=$3 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)").bind(self.owner_pid).bind(&self.owner_started).bind(if self.reader { 2_i64 } else { 1_i64 }).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
+        let matches:bool=sqlx_core::query_scalar::query_scalar("SELECT epoch=$1 AND COALESCE(binding,pending_binding)=$2 AND (NOT $3 OR (backend='s3' AND pending_binding IS NULL AND NOT initializing_s3)) FROM devres_archive_control WHERE singleton").bind(self.epoch).bind(&self.binding).bind(self.reader).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
         if !owned || !matches {
             return Err(Error::unavailable(
                 "Storage ownership lost; restart required",
@@ -1065,7 +1067,7 @@ impl Archive {
         let mut after = String::new();
         loop {
             self.fence().await?;
-            let row:Option<(String,String)>=sqlx::query_as("SELECT path,evidence FROM devres_archive_file WHERE NOT complete AND path>$1 ORDER BY path LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|unavailable())?;
+            let row:Option<(String,String)>=sqlx_core::query_as::query_as("SELECT path,evidence FROM devres_archive_file WHERE NOT complete AND path>$1 ORDER BY path LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|unavailable())?;
             let Some((path, encoded)) = row else {
                 break;
             };
@@ -1089,7 +1091,7 @@ impl Archive {
                     .await?;
                 let owner = self.owner.upgrade().ok_or_else(unavailable)?;
                 let mut owner = owner.lock().await;
-                sqlx::query("UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3").bind(&path).bind(&encoded).bind(self.epoch).execute(&mut *owner).await.map_err(|_|unavailable())?;
+                sqlx_core::query::query("UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3").bind(&path).bind(&encoded).bind(self.epoch).execute(&mut *owner).await.map_err(|_|unavailable())?;
             } else {
                 self.remote.abort_incomplete(&key).await?;
                 // Retain the reservation: no corpus reference may be published
@@ -1101,11 +1103,12 @@ impl Archive {
     }
     async fn activate(&self) -> Result<()> {
         self.fence().await?;
-        let pending: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM devres_archive_file WHERE NOT complete")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| unavailable())?;
+        let pending: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT count(*) FROM devres_archive_file WHERE NOT complete",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| unavailable())?;
         if pending != 0 {
             return Err(Error::integrity(
                 "Incomplete archive uploads block activation.",
@@ -1114,14 +1117,16 @@ impl Archive {
         let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
         let mut owner = owner_handle.lock().await;
         let mut tx = owner.begin().await.map_err(|_| unavailable())?;
-        let changed=sqlx::query("UPDATE devres_archive_control SET backend='s3',binding=$1,pending_binding=NULL,initializing_s3=false WHERE singleton AND epoch=$2 AND pending_binding=$1").bind(&self.binding).bind(self.epoch).execute(&mut *tx).await.map_err(|_|unavailable())?.rows_affected();
+        let changed=sqlx_core::query::query("UPDATE devres_archive_control SET backend='s3',binding=$1,pending_binding=NULL,initializing_s3=false WHERE singleton AND epoch=$2 AND pending_binding=$1").bind(&self.binding).bind(self.epoch).execute(&mut *tx).await.map_err(|_|unavailable())?.rows_affected();
         if changed != 1 {
             return Err(integrity());
         }
-        sqlx::query("UPDATE devres_archive_transfer SET completed=true WHERE singleton")
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| unavailable())?;
+        sqlx_core::query::query(
+            "UPDATE devres_archive_transfer SET completed=true WHERE singleton",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| unavailable())?;
         tx.commit().await.map_err(|_| unavailable())?;
         Ok(())
     }
@@ -1138,7 +1143,7 @@ impl Archive {
         Ok(p)
     }
     async fn binding_for(&self, path: &str, complete: bool) -> Result<Option<Binding>> {
-        let value: Option<String> = sqlx::query_scalar(
+        let value: Option<String> = sqlx_core::query_scalar::query_scalar(
             "SELECT evidence FROM devres_archive_file WHERE path=$1 AND (NOT $2 OR complete)",
         )
         .bind(path)
@@ -1203,7 +1208,7 @@ impl Archive {
         {
             let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
             let mut owner = owner_handle.lock().await;
-            sqlx::query("INSERT INTO devres_archive_file(path,digest,bytes,device,inode,epoch,evidence) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(path) DO NOTHING").bind(&relative).bind(digest).bind(i64::try_from(bytes).map_err(|_|capacity())?).bind(binding.device.to_string()).bind(binding.inode.to_string()).bind(self.epoch).bind(&encoded).execute(&mut *owner).await.map_err(|_|unavailable())?;
+            sqlx_core::query::query("INSERT INTO devres_archive_file(path,digest,bytes,device,inode,epoch,evidence) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(path) DO NOTHING").bind(&relative).bind(digest).bind(i64::try_from(bytes).map_err(|_|capacity())?).bind(binding.device.to_string()).bind(binding.inode.to_string()).bind(self.epoch).bind(&encoded).execute(&mut *owner).await.map_err(|_|unavailable())?;
         }
         // Intent remains durable on cancellation or an ambiguous network failure.
         self.remote
@@ -1227,7 +1232,7 @@ impl Archive {
         self.fence().await?;
         let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
         let mut owner = owner_handle.lock().await;
-        let changed=sqlx::query("UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3").bind(&relative).bind(&encoded).bind(self.epoch).execute(&mut *owner).await.map_err(|_|unavailable())?.rows_affected();
+        let changed=sqlx_core::query::query("UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3").bind(&relative).bind(&encoded).bind(self.epoch).execute(&mut *owner).await.map_err(|_|unavailable())?.rows_affected();
         if changed != 1 {
             return Err(integrity());
         }
@@ -1327,7 +1332,7 @@ impl Archive {
     }
     async fn children(&self, path: &str, max_files: usize) -> Result<Vec<Binding>> {
         let prefix = format!("{path}/");
-        let rows:Vec<String>=sqlx::query_scalar("SELECT evidence FROM devres_archive_file WHERE complete AND starts_with(path,$1) ORDER BY path LIMIT $2").bind(prefix).bind(i64::try_from(max_files.saturating_add(1)).map_err(|_|capacity())?).fetch_all(&self.pool).await.map_err(|_|unavailable())?;
+        let rows:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT evidence FROM devres_archive_file WHERE complete AND starts_with(path,$1) ORDER BY path LIMIT $2").bind(prefix).bind(i64::try_from(max_files.saturating_add(1)).map_err(|_|capacity())?).fetch_all(&self.pool).await.map_err(|_|unavailable())?;
         if rows.len() > max_files {
             return Err(capacity());
         }
@@ -1369,10 +1374,12 @@ impl Archive {
             Some(value) => value,
             None => {
                 let id: i64 = run(async {
-                    sqlx::query_scalar("SELECT nextval('devres_archive_accounting_seq')")
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(|_| unavailable())
+                    sqlx_core::query_scalar::query_scalar(
+                        "SELECT nextval('devres_archive_accounting_seq')",
+                    )
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|_| unavailable())
                 })?;
                 (u64::MAX, u64::try_from(id).map_err(|_| integrity())?)
             }
@@ -1412,7 +1419,7 @@ pub fn retained(path: &Path) -> Result<bool> {
         run_bounded(deadline, &cancel, archive.health())?;
         let relative = archive.relative(path)?;
         run_bounded(deadline, &cancel, async {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_archive_file WHERE complete AND (path=$1 OR starts_with(path,$2)))").bind(&relative).bind(format!("{relative}/")).fetch_one(&archive.pool).await.map_err(|_|unavailable())
+            sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_archive_file WHERE complete AND (path=$1 OR starts_with(path,$2)))").bind(&relative).bind(format!("{relative}/")).fetch_one(&archive.pool).await.map_err(|_|unavailable())
         })
     } else {
         Ok(path.exists())
@@ -1659,7 +1666,7 @@ pub fn retained_accounting(root: &Path) -> Result<Option<Vec<(u64, u64, u64)>>> 
     };
     run(async {
         use futures::TryStreamExt;
-        let mut rows = sqlx::query(
+        let mut rows = sqlx_core::query::query(
             "SELECT path,device,inode,bytes FROM devres_archive_file WHERE starts_with(path,$1) AND substring(path from char_length($1)+1) ~ '^(blake3/)?[0-9a-f]{64}$' LIMIT 1000001",
         )
         .bind(&prefix)
@@ -1719,11 +1726,12 @@ impl Archive {
             return Err(Error::invalid("Unknown object archive transfer action."));
         }
         self.health().await?;
-        let backend: String =
-            sqlx::query_scalar("SELECT backend FROM devres_archive_control WHERE singleton")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| unavailable())?;
+        let backend: String = sqlx_core::query_scalar::query_scalar(
+            "SELECT backend FROM devres_archive_control WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| unavailable())?;
         if backend == "s3" && action != "verify-object-storage" {
             return Err(Error::invalid("Object archive already activated."));
         }
@@ -1738,7 +1746,7 @@ impl Archive {
                 if cancel.is_cancelled() {
                     return Err(Error::capacity("Object archive transfer canceled."));
                 }
-                let row:Option<(String,String)>=sqlx::query_as("SELECT path,evidence FROM devres_archive_scan WHERE path>$1 ORDER BY path LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|unavailable())?;
+                let row:Option<(String,String)>=sqlx_core::query_as::query_as("SELECT path,evidence FROM devres_archive_scan WHERE path>$1 ORDER BY path LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|unavailable())?;
                 let Some((path, evidence)) = row else {
                     break;
                 };
@@ -1774,7 +1782,7 @@ impl Archive {
         }
         self.verify_remote(&cancel).await?;
         if backend == "filesystem" {
-            let missing:i64=sqlx::query_scalar("SELECT count(*) FROM devres_archive_scan s LEFT JOIN devres_archive_file f ON f.path=s.path AND f.evidence=s.evidence AND f.complete WHERE f.path IS NULL").fetch_one(&self.pool).await.map_err(|_|unavailable())?;
+            let missing:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_archive_scan s LEFT JOIN devres_archive_file f ON f.path=s.path AND f.evidence=s.evidence AND f.complete WHERE f.path IS NULL").fetch_one(&self.pool).await.map_err(|_|unavailable())?;
             if missing != 0 {
                 return Err(Error::integrity("Object archive transfer is incomplete."));
             }
@@ -1782,11 +1790,12 @@ impl Archive {
         if action == "activate-object-storage" {
             self.activate().await?;
         }
-        let files: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM devres_archive_file WHERE complete")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| unavailable())?;
+        let files: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT count(*) FROM devres_archive_file WHERE complete",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| unavailable())?;
         Ok(
             serde_json::json!({"version":1,"backend":"s3","action":action,"files":files,"inventory":inventory,"verified":true,"activated":action=="activate-object-storage"||backend=="s3"}),
         )
@@ -1795,7 +1804,7 @@ impl Archive {
         {
             let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
             let mut owner = owner_handle.lock().await;
-            sqlx::raw_sql("CREATE TABLE IF NOT EXISTS devres_archive_scan(path text PRIMARY KEY,evidence text NOT NULL); DELETE FROM devres_archive_scan;").execute(&mut *owner).await.map_err(|_|unavailable())?;
+            sqlx_core::raw_sql::raw_sql("CREATE TABLE IF NOT EXISTS devres_archive_scan(path text PRIMARY KEY,evidence text NOT NULL); DELETE FROM devres_archive_scan;").execute(&mut *owner).await.map_err(|_|unavailable())?;
         }
         let descriptors = self.root.join(".devres-integrity/files");
         let mut entries = tokio::fs::read_dir(&descriptors)
@@ -1880,7 +1889,7 @@ impl Archive {
         }
         use futures::TryStreamExt;
         let mut hasher = blake3::Hasher::new();
-        let mut rows = sqlx::query_scalar::<_, String>(
+        let mut rows = sqlx_core::query_scalar::query_scalar::<_, String>(
             "SELECT evidence FROM devres_archive_scan ORDER BY path",
         )
         .fetch(&self.pool);
@@ -1893,8 +1902,8 @@ impl Archive {
         let source_root = self.root.to_str().ok_or_else(integrity)?;
         let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
         let mut owner = owner_handle.lock().await;
-        sqlx::query("INSERT INTO devres_archive_transfer(singleton,source_root,inventory) VALUES(true,$1,$2) ON CONFLICT DO NOTHING").bind(source_root).bind(&inventory).execute(&mut *owner).await.map_err(|_|unavailable())?;
-        let matches:bool=sqlx::query_scalar("SELECT source_root=$1 AND inventory=$2 AND NOT completed FROM devres_archive_transfer WHERE singleton").bind(source_root).bind(&inventory).fetch_one(&mut *owner).await.map_err(|_|unavailable())?;
+        sqlx_core::query::query("INSERT INTO devres_archive_transfer(singleton,source_root,inventory) VALUES(true,$1,$2) ON CONFLICT DO NOTHING").bind(source_root).bind(&inventory).execute(&mut *owner).await.map_err(|_|unavailable())?;
+        let matches:bool=sqlx_core::query_scalar::query_scalar("SELECT source_root=$1 AND inventory=$2 AND NOT completed FROM devres_archive_transfer WHERE singleton").bind(source_root).bind(&inventory).fetch_one(&mut *owner).await.map_err(|_|unavailable())?;
         if !matches {
             return Err(Error::integrity(
                 "Transfer source changed; coordinated recovery required.",
@@ -1905,7 +1914,7 @@ impl Archive {
     async fn scan_row(&self, binding: &Binding) -> Result<()> {
         let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
         let mut owner = owner_handle.lock().await;
-        let rows=sqlx::query("INSERT INTO devres_archive_scan(path,evidence) VALUES($1,$2) ON CONFLICT(path) DO UPDATE SET evidence=EXCLUDED.evidence WHERE devres_archive_scan.evidence=EXCLUDED.evidence").bind(&binding.path).bind(binding.encoded()?).execute(&mut *owner).await.map_err(|_|unavailable())?.rows_affected();
+        let rows=sqlx_core::query::query("INSERT INTO devres_archive_scan(path,evidence) VALUES($1,$2) ON CONFLICT(path) DO UPDATE SET evidence=EXCLUDED.evidence WHERE devres_archive_scan.evidence=EXCLUDED.evidence").bind(&binding.path).bind(binding.encoded()?).execute(&mut *owner).await.map_err(|_|unavailable())?.rows_affected();
         if rows != 1 {
             return Err(integrity());
         }
@@ -1918,7 +1927,7 @@ impl Archive {
             if cancel.is_cancelled() {
                 return Err(Error::capacity("Object archive verification canceled."));
             }
-            let row: Option<(String, String)> = sqlx::query_as(
+            let row: Option<(String, String)> = sqlx_core::query_as::query_as(
                 "SELECT path,evidence FROM devres_archive_file WHERE path>$1 ORDER BY path LIMIT 1",
             )
             .bind(&after)
@@ -1949,7 +1958,7 @@ impl Archive {
                 .await?;
             let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
             let mut owner = owner_handle.lock().await;
-            sqlx::query("UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3").bind(&path).bind(&evidence).bind(self.epoch).execute(&mut *owner).await.map_err(|_|unavailable())?;
+            sqlx_core::query::query("UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3").bind(&path).bind(&evidence).bind(self.epoch).execute(&mut *owner).await.map_err(|_|unavailable())?;
             after = path;
         }
         Ok(())

@@ -181,7 +181,7 @@ impl PgBlobStore {
                 if cancel.is_cancelled() {
                     return Err(Error::new("cancelled", "npm migration canceled."));
                 }
-                let shape: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_npm_evidence WHERE kind=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT 1")
+                let shape: Option<(i64,i64)> = sqlx_core::query_as::query_as("SELECT octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_npm_evidence WHERE kind=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT 1")
                     .bind(kind).bind(after).bind(cutoff).fetch_optional(&self.pool).await.map_err(|_|super::storage_error())?;
                 let Some((bytes, nodes)) = shape else {
                     break;
@@ -276,7 +276,7 @@ impl PgBlobStore {
                 if cancel.is_cancelled() {
                     return Err(Error::new("cancelled", "npm migration canceled."));
                 }
-                let positions: Vec<(i64, String, i64, i64, bool)> = sqlx::query_as(
+                let positions: Vec<(i64, String, i64, i64, bool)> = sqlx_core::query_as::query_as(
                     "SELECT sequence,key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint,(data->'index' IS NOT NULL AND data->'index' <> 'null'::jsonb) FROM devres_npm_evidence WHERE kind=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT $4"
                 ).bind(kind).bind(after).bind(cutoff).bind(execution.options().workers as i64)
                     .fetch_all(&self.pool).await.map_err(|_| super::storage_error())?;

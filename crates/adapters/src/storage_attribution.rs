@@ -5,7 +5,8 @@ use devres_application::attribution::AttributionStore;
 use devres_domain::{Capture, Error, Result, attribution::*};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Connection, PgConnection, Row, postgres::PgRow, types::Json};
+use sqlx_core::{connection::Connection, row::Row, types::Json};
+use sqlx_postgres::{PgConnection, PgRow};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
@@ -113,17 +114,19 @@ fn supported_control(
     Ok(epoch)
 }
 
-pub(super) async fn prepare(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
-    sqlx::query("SET LOCAL lock_timeout='2s'")
+pub(super) async fn prepare(
+    tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+) -> Result<()> {
+    sqlx_core::query::query("SET LOCAL lock_timeout='2s'")
         .execute(&mut **tx)
         .await
         .map_err(|_| storage_error())?;
-    sqlx::raw_sql(SCHEMA)
+    sqlx_core::raw_sql::raw_sql(SCHEMA)
         .execute(&mut **tx)
         .await
         .map_err(|_| storage_error())?;
     let data = control();
-    sqlx::query("INSERT INTO devres_attribution_control VALUES(true,$1,$2)")
+    sqlx_core::query::query("INSERT INTO devres_attribution_control VALUES(true,$1,$2)")
         .bind(Json(&data))
         .bind(payload_integrity::digest(
             "devres_attribution_control",
@@ -134,14 +137,16 @@ pub(super) async fn prepare(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> R
         .execute(&mut **tx)
         .await
         .map_err(|_| storage_error())?;
-    sqlx::query("UPDATE devres_schema SET version=11 WHERE singleton AND version=10")
+    sqlx_core::query::query("UPDATE devres_schema SET version=11 WHERE singleton AND version=10")
         .execute(&mut **tx)
         .await
         .map_err(|_| storage_error())?;
     Ok(())
 }
 
-pub(super) async fn promote_control(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+pub(super) async fn promote_control(
+    tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+) -> Result<()> {
     promote_control_for(
         tx,
         ATTRIBUTION_REQUIRED_POLICY,
@@ -150,14 +155,14 @@ pub(super) async fn promote_control(tx: &mut sqlx::Transaction<'_, sqlx::Postgre
     .await
 }
 async fn promote_control_for(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
     required: AttributionPolicyManifest,
     registry: &[AttributionPolicyManifest],
 ) -> Result<()> {
     if !known_policy(required.epoch, required.fingerprint, registry) {
         return Err(invalid());
     }
-    let row = sqlx::query(
+    let row = sqlx_core::query::query(
         "SELECT data,data_integrity FROM devres_attribution_control WHERE singleton FOR UPDATE",
     )
     .fetch_one(&mut **tx)
@@ -168,7 +173,7 @@ async fn promote_control_for(
     if epoch == required.epoch {
         return Ok(());
     }
-    let rows=sqlx::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 9").fetch_all(&mut **tx).await.map_err(|_|invalid())?;
+    let rows=sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 9").fetch_all(&mut **tx).await.map_err(|_|invalid())?;
     for row in rows {
         let p: String = row.try_get("provider").map_err(|_| invalid())?;
         provider(&p)?;
@@ -177,30 +182,33 @@ async fn promote_control_for(
     }
     // Only eight small sweep checkpoints reset; retained generations and old jobs
     // remain sealed and addressable. No corpus backfill occurs in startup.
-    sqlx::query("DELETE FROM devres_attribution_sweeps")
+    sqlx_core::query::query("DELETE FROM devres_attribution_sweeps")
         .execute(&mut **tx)
         .await
         .map_err(|_| storage_error())?;
     let data = control_for(required);
-    sqlx::query("UPDATE devres_attribution_control SET data=$1,data_integrity=$2 WHERE singleton")
-        .bind(Json(&data))
-        .bind(payload_integrity::digest(
-            "devres_attribution_control",
-            "",
-            "singleton",
-            &data,
-        )?)
-        .execute(&mut **tx)
-        .await
-        .map_err(|_| storage_error())?;
+    sqlx_core::query::query(
+        "UPDATE devres_attribution_control SET data=$1,data_integrity=$2 WHERE singleton",
+    )
+    .bind(Json(&data))
+    .bind(payload_integrity::digest(
+        "devres_attribution_control",
+        "",
+        "singleton",
+        &data,
+    )?)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| storage_error())?;
     Ok(())
 }
 pub(super) async fn verify_supported_control(conn: &mut PgConnection) -> Result<()> {
-    let row =
-        sqlx::query("SELECT data,data_integrity FROM devres_attribution_control WHERE singleton")
-            .fetch_one(conn)
-            .await
-            .map_err(|_| invalid())?;
+    let row = sqlx_core::query::query(
+        "SELECT data,data_integrity FROM devres_attribution_control WHERE singleton",
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(|_| invalid())?;
     let data = checked("devres_attribution_control", "singleton", &row)?;
     supported_control(
         &data,
@@ -210,11 +218,12 @@ pub(super) async fn verify_supported_control(conn: &mut PgConnection) -> Result<
     Ok(())
 }
 pub(super) async fn verify_control(conn: &mut PgConnection) -> Result<()> {
-    let row =
-        sqlx::query("SELECT data,data_integrity FROM devres_attribution_control WHERE singleton")
-            .fetch_one(conn)
-            .await
-            .map_err(|_| invalid())?;
+    let row = sqlx_core::query::query(
+        "SELECT data,data_integrity FROM devres_attribution_control WHERE singleton",
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(|_| invalid())?;
     let data = checked("devres_attribution_control", "singleton", &row)?;
     if data != control() {
         return Err(Error::unavailable(
@@ -293,7 +302,7 @@ fn state(row: &PgRow) -> Result<State> {
 async fn save(conn: &mut PgConnection, value: &State) -> Result<()> {
     let id = target_id_at(&value.target.subject, value.policy_epoch)?;
     let data = bounded(value)?;
-    sqlx::query("INSERT INTO devres_attribution_targets(id,provider,status,priority,retry_at,data,data_integrity,policy_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,status=EXCLUDED.status,priority=EXCLUDED.priority,retry_at=EXCLUDED.retry_at,data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity,policy_epoch=EXCLUDED.policy_epoch")
+    sqlx_core::query::query("INSERT INTO devres_attribution_targets(id,provider,status,priority,retry_at,data,data_integrity,policy_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET provider=EXCLUDED.provider,status=EXCLUDED.status,priority=EXCLUDED.priority,retry_at=EXCLUDED.retry_at,data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity,policy_epoch=EXCLUDED.policy_epoch")
         .bind(&id).bind(&value.target.subject.provider).bind(&value.status).bind(i32::from(value.priority)).bind(value.retry_at)
         .bind(Json(&data)).bind(payload_integrity::digest(TABLE_TARGETS,"",&id,&data)?)
         .bind(i32::try_from(value.policy_epoch).map_err(|_|invalid())?)
@@ -304,11 +313,12 @@ async fn enqueue(conn: &mut PgConnection, target: &AttributionTarget, priority: 
     let priority = priority.min(1);
     let id = target_id(&target.subject)?;
     checked_target(target)?;
-    let old = sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE")
-        .bind(&id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|_| storage_error())?;
+    let old =
+        sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|_| storage_error())?;
     let value = if let Some(row) = old {
         let mut old = state(&row)?;
         if old.target != *target {
@@ -583,14 +593,15 @@ async fn publish_generation(
 ) -> Result<String> {
     let data = generation(value)?;
     let id = crate::integrity::canonical_hash(&data)?;
-    sqlx::query("INSERT INTO devres_attribution_generations(id,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
+    sqlx_core::query::query("INSERT INTO devres_attribution_generations(id,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
         .bind(&id).bind(Json(&data)).bind(payload_integrity::digest(TABLE_GENERATIONS,"",&id,&data)?)
         .execute(&mut *conn).await.map_err(|_|storage_error())?;
-    let retained = sqlx::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
-        .bind(&id)
-        .fetch_one(conn)
-        .await
-        .map_err(|_| invalid())?;
+    let retained =
+        sqlx_core::query::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
+            .bind(&id)
+            .fetch_one(conn)
+            .await
+            .map_err(|_| invalid())?;
     if qualified(&retained)?.generation != *value {
         return Err(invalid());
     }
@@ -641,7 +652,7 @@ impl AttributionStore for PgBlobStore {
         self.fence().await?;
         self.check_attribution_control().await?;
         let id = target_id(v)?;
-        let row = sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
+        let row = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -677,14 +688,14 @@ impl AttributionStore for PgBlobStore {
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         let result:Result<Option<AttributionJob>>=async {
-            sqlx::query("SET LOCAL lock_timeout='250ms'").execute(&mut *tx).await.map_err(source_error)?;
-            sqlx::query("SET LOCAL statement_timeout='2s'").execute(&mut *tx).await.map_err(source_error)?;
+            sqlx_core::query::query("SET LOCAL lock_timeout='250ms'").execute(&mut *tx).await.map_err(source_error)?;
+            sqlx_core::query::query("SET LOCAL statement_timeout='2s'").execute(&mut *tx).await.map_err(source_error)?;
             let fair=ADMISSIONS.fetch_add(1,Ordering::Relaxed)%5==4;
             let mut head:Option<(u8,i64,String)>=None;
             for p in enabled {for status in ["pending","retry","running"] {for priority in [0i32,1] {
                 // Each equality prefix and ordered due range is one bounded seek
                 // into the existing pending index. Never sort the whole queue.
-                let found:Option<(String,i64)>=sqlx::query_as("SELECT id,retry_at FROM devres_attribution_targets WHERE policy_epoch=$1 AND provider=$2 AND status=$3 AND priority=$4 AND retry_at<=$5 ORDER BY retry_at,id LIMIT 1")
+                let found:Option<(String,i64)>=sqlx_core::query_as::query_as("SELECT id,retry_at FROM devres_attribution_targets WHERE policy_epoch=$1 AND provider=$2 AND status=$3 AND priority=$4 AND retry_at<=$5 ORDER BY retry_at,id LIMIT 1")
                     .bind(ATTRIBUTION_POLICY_EPOCH as i32).bind(p).bind(status).bind(priority).bind(now).fetch_optional(&mut *tx).await.map_err(source_error)?;
                 if let Some((id,retry_at))=found {
                     let rank=if fair{0}else{1-priority as u8};
@@ -693,7 +704,7 @@ impl AttributionStore for PgBlobStore {
                 }
             }}}
             let Some((_,_,id))=head else{return Ok(None)};
-            let row=sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await.map_err(source_error)?;
+            let row=sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await.map_err(source_error)?;
             let mut value=state(&row)?;
             if value.policy_epoch!=ATTRIBUTION_POLICY_EPOCH||!enabled.contains(&value.target.subject.provider)||!matches!(value.status.as_str(),"pending"|"retry"|"running")||value.retry_at>now{return Err(invalid());}
             let claim=crate::integrity::canonical_hash(&json!({"subject":value.target.subject,"policy_epoch":value.policy_epoch,"pid":self.owner_pid,"started":self.owner_started,"counter":CLAIM.fetch_add(1,Ordering::Relaxed),"now":now}))?;
@@ -727,22 +738,24 @@ impl AttributionStore for PgBlobStore {
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         let result: Result<()> = async {
-            let row =
-                sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE")
-                    .bind(target_id(&job.target.subject)?)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|_| invalid())?;
+            let row = sqlx_core::query::query(
+                "SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE",
+            )
+            .bind(target_id(&job.target.subject)?)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| invalid())?;
             let root = state(&row)?;
             check_claim(&root, job, true)?;
             let entries = publication_entries(&root.target, value, ATTRIBUTION_POLICY_MANIFESTS)?;
             for (target, generation) in entries {
-                let row =
-                    sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE")
-                        .bind(target_id(&target.subject)?)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|_| storage_error())?;
+                let row = sqlx_core::query::query(
+                    "SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE",
+                )
+                .bind(target_id(&target.subject)?)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
                 let mut current = if let Some(row) = row {
                     state(&row)?
                 } else {
@@ -793,11 +806,13 @@ impl AttributionStore for PgBlobStore {
         let mut owner = self.owner.lock().await;
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let row = sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE")
-            .bind(target_id(&job.target.subject)?)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| invalid())?;
+        let row = sqlx_core::query::query(
+            "SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE",
+        )
+        .bind(target_id(&job.target.subject)?)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| invalid())?;
         let mut value = state(&row)?;
         if let Err(error) = check_claim(&value, job, false) {
             tx.rollback().await.map_err(|_| storage_error())?;
@@ -822,24 +837,25 @@ impl AttributionStore for PgBlobStore {
         }
         self.fence().await?;
         self.check_attribution_control().await?;
-        let row = sqlx::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| storage_error())?
-            .ok_or_else(|| Error::not_found("Attribution generation is absent."))?;
+        let row =
+            sqlx_core::query::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| storage_error())?
+                .ok_or_else(|| Error::not_found("Attribution generation is absent."))?;
         qualified(&row)
     }
     async fn attribution_status(&self) -> Result<Value> {
         self.fence().await?;
         self.check_attribution_control().await?;
-        let rows=sqlx::query("SELECT provider,status,count(*)::bigint AS count FROM devres_attribution_targets WHERE policy_epoch=$1 GROUP BY provider,status ORDER BY provider,status LIMIT 64")
+        let rows=sqlx_core::query::query("SELECT provider,status,count(*)::bigint AS count FROM devres_attribution_targets WHERE policy_epoch=$1 GROUP BY provider,status ORDER BY provider,status LIMIT 64")
             .bind(ATTRIBUTION_POLICY_EPOCH as i32).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         let mut counts = Vec::new();
         for r in rows {
             counts.push(json!({"provider":r.try_get::<String,_>("provider").map_err(|_|invalid())?,"status":r.try_get::<String,_>("status").map_err(|_|invalid())?,"count":r.try_get::<i64,_>("count").map_err(|_|invalid())?}));
         }
-        let rows=sqlx::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 9").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let rows=sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 9").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         let mut sweeps = Vec::new();
         for row in rows {
             let name: String = row.try_get("provider").map_err(|_| invalid())?;
@@ -965,7 +981,7 @@ impl Cursor {
         }
     }
 }
-fn source_error(error: sqlx::Error) -> Error {
+fn source_error(error: sqlx_core::error::Error) -> Error {
     if error
         .as_database_error()
         .and_then(|v| v.code())
@@ -1246,16 +1262,17 @@ fn candidate(name: &str, table: &str, row: &PgRow, oversized: bool) -> Result<At
 }
 impl PgBlobStore {
     async fn historical_attribution_bundle(&self, id: &str) -> Result<QualifiedAttribution> {
-        let row = sqlx::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| storage_error())?
-            .ok_or_else(invalid)?;
+        let row =
+            sqlx_core::query::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| storage_error())?
+                .ok_or_else(invalid)?;
         qualified(&row)
     }
     async fn check_attribution_control(&self) -> Result<()> {
-        let row = sqlx::query(
+        let row = sqlx_core::query::query(
             "SELECT data,data_integrity FROM devres_attribution_control WHERE singleton",
         )
         .fetch_one(&self.pool)
@@ -1276,9 +1293,9 @@ impl PgBlobStore {
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         let result:Result<Vec<AttributionTarget>>=async {
-            sqlx::query("SET LOCAL lock_timeout='250ms'").execute(&mut *tx).await.map_err(source_error)?;
-            sqlx::query("SET LOCAL statement_timeout='2s'").execute(&mut *tx).await.map_err(source_error)?;
-            let existing=sqlx::query("SELECT data,data_integrity FROM devres_attribution_sweeps WHERE provider=$1 FOR UPDATE").bind(name).fetch_optional(&mut *tx).await.map_err(source_error)?;
+            sqlx_core::query::query("SET LOCAL lock_timeout='250ms'").execute(&mut *tx).await.map_err(source_error)?;
+            sqlx_core::query::query("SET LOCAL statement_timeout='2s'").execute(&mut *tx).await.map_err(source_error)?;
+            let existing=sqlx_core::query::query("SELECT data,data_integrity FROM devres_attribution_sweeps WHERE provider=$1 FOR UPDATE").bind(name).fetch_optional(&mut *tx).await.map_err(source_error)?;
             let mut sweep=if let Some(row)=existing{serde_json::from_value::<Sweep>(checked("devres_attribution_sweeps",name,&row)?).map_err(|_|invalid())?}else{Sweep{source:0,after:String::new(),cutoff:None,passes:0,complete:false}};
             if sweep.source>=sources.len(){return Err(invalid());}
             let source=&sources[sweep.source];let cursor=source.cursor();
@@ -1286,22 +1303,22 @@ impl PgBlobStore {
             if sweep.cutoff.is_none(){
                 sweep.after=cursor.initial();
                 let sql=format!("SELECT {} FROM ({base}) s ORDER BY {} LIMIT 1",cursor.position(),cursor.order(true));
-                sweep.cutoff=Some(sqlx::query_scalar::<_,String>(sqlx::AssertSqlSafe(sql)).fetch_optional(&mut *tx).await.map_err(source_error)?.unwrap_or_else(||cursor.initial()));
+                sweep.cutoff=Some(sqlx_core::query_scalar::query_scalar::<_,String>(sqlx_core::sql_str::AssertSqlSafe(sql)).fetch_optional(&mut *tx).await.map_err(source_error)?.unwrap_or_else(||cursor.initial()));
             }
             let sql=format!("SELECT {} AS position FROM ({base}) s WHERE {} AND {} ORDER BY {} LIMIT {PAGE}",cursor.position(),cursor.comparison(">",1),cursor.comparison("<=",2),cursor.order(false));
-            let positions=sqlx::query_scalar::<_,String>(sqlx::AssertSqlSafe(sql)).bind(&sweep.after).bind(&sweep.cutoff).fetch_all(&mut *tx).await.map_err(source_error)?;
+            let positions=sqlx_core::query_scalar::query_scalar::<_,String>(sqlx_core::sql_str::AssertSqlSafe(sql)).bind(&sweep.after).bind(&sweep.cutoff).fetch_all(&mut *tx).await.map_err(source_error)?;
             let mut output=Vec::new();let mut bytes=0usize;
             let page_started=std::time::Instant::now();
             for position in &positions {
                 if !output.is_empty()&&page_started.elapsed()>=std::time::Duration::from_secs(1){break;}
                 let exact=cursor.comparison("=",1);
                 let sql=format!("SELECT octet_length(to_jsonb(s)::text)::bigint FROM ({base}) s WHERE {exact}");
-                let charge=usize::try_from(sqlx::query_scalar::<_,i64>(sqlx::AssertSqlSafe(sql)).bind(position).fetch_one(&mut *tx).await.map_err(source_error)?).map_err(|_|invalid())?;
+                let charge=usize::try_from(sqlx_core::query_scalar::query_scalar::<_,i64>(sqlx_core::sql_str::AssertSqlSafe(sql)).bind(position).fetch_one(&mut *tx).await.map_err(source_error)?).map_err(|_|invalid())?;
                 if charge>64*1024*1024{return Err(Error::capacity("Retained source exceeds the supported decoder bound."));}
                 if bytes.saturating_add(charge)>MAX_VALUE&&!output.is_empty(){break;}
                 let oversized=charge>MAX_VALUE;
                 let sql=format!("SELECT * FROM ({base}) s WHERE {exact}");
-                let row=sqlx::query(sqlx::AssertSqlSafe(sql)).bind(position).fetch_one(&mut *tx).await.map_err(source_error)?;
+                let row=sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql)).bind(position).fetch_one(&mut *tx).await.map_err(source_error)?;
                 let target=candidate(name,source.table,&row,oversized)?;
                 enqueue(&mut tx,&target,0).await?;
                 if oversized{let mut blocked=State::new(target.clone(),0);blocked.status="blocked".into();blocked.failure=Some("oversized_evidence".into());save(&mut tx,&blocked).await?;}
@@ -1309,7 +1326,7 @@ impl PgBlobStore {
             }
             if positions.is_empty(){sweep.source+=1;sweep.after.clear();sweep.cutoff=None;if sweep.source==sources.len(){sweep.source=0;sweep.passes=sweep.passes.saturating_add(1);sweep.complete=true;}}else{sweep.complete=false;}
             let data=bounded(&sweep)?;
-            sqlx::query("INSERT INTO devres_attribution_sweeps(provider,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(provider) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(name).bind(Json(&data)).bind(payload_integrity::digest("devres_attribution_sweeps","",name,&data)?).execute(&mut *tx).await.map_err(source_error)?;
+            sqlx_core::query::query("INSERT INTO devres_attribution_sweeps(provider,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(provider) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(name).bind(Json(&data)).bind(payload_integrity::digest("devres_attribution_sweeps","",name,&data)?).execute(&mut *tx).await.map_err(source_error)?;
             self.fence().await?;Ok(output)
         }.await;
         match result {
@@ -1327,10 +1344,12 @@ impl PgBlobStore {
         &self,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| storage_error())?;
+        let version: i32 = sqlx_core::query_scalar::query_scalar(
+            "SELECT version FROM devres_schema WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         if version < 11 {
             return Ok(());
         }
@@ -1356,7 +1375,7 @@ impl PgBlobStore {
                 let sql = format!(
                     "SELECT {key} AS cursor,octet_length(data::text)::bigint AS bytes FROM {table} WHERE {key}>$1 ORDER BY {key} LIMIT {PAGE}"
                 );
-                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                let rows = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql))
                     .bind(&after)
                     .fetch_all(&self.pool)
                     .await
@@ -1370,7 +1389,7 @@ impl PgBlobStore {
                         return Err(invalid());
                     }
                     let sql = format!("SELECT * FROM {table} WHERE {key}=$1");
-                    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    let row = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql))
                         .bind(&cursor)
                         .fetch_one(&self.pool)
                         .await
@@ -1389,16 +1408,17 @@ impl PgBlobStore {
                         }
                         TABLE_GENERATIONS => {
                             let qualified = qualified(&row)?;
-                            let target_row =
-                                sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
-                                    .bind(target_id_at(
-                                        &qualified.generation.subject,
-                                        qualified.generation.policy_epoch,
-                                    )?)
-                                    .fetch_optional(&self.pool)
-                                    .await
-                                    .map_err(|_| storage_error())?
-                                    .ok_or_else(invalid)?;
+                            let target_row = sqlx_core::query::query(
+                                "SELECT * FROM devres_attribution_targets WHERE id=$1",
+                            )
+                            .bind(target_id_at(
+                                &qualified.generation.subject,
+                                qualified.generation.policy_epoch,
+                            )?)
+                            .fetch_optional(&self.pool)
+                            .await
+                            .map_err(|_| storage_error())?
+                            .ok_or_else(invalid)?;
                             let target = state(&target_row)?.target;
                             for (_, generation) in publication_entries(
                                 &target,
@@ -1624,12 +1644,14 @@ mod tests {
     #[ignore = "requires disposable DEVRES_TEST_DATABASE_URL PostgreSQL"]
     async fn attribution_storage_upgrade_claims_sweep_restart_and_integrity() {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
         let name = format!("devres_attribution_{}", std::process::id());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {name}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
         let mut url = url::Url::parse(&base).unwrap();
         url.set_path(&format!("/{name}"));
         let root = tempfile::tempdir().unwrap();
@@ -1638,10 +1660,12 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
+        let version: i32 = sqlx_core::query_scalar::query_scalar(
+            "SELECT version FROM devres_schema WHERE singleton",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(version, 13);
         let request = FetchRequest {
             key: "rfc:9000".into(),
@@ -1665,11 +1689,11 @@ mod tests {
         // With sequential scans disabled, every scan/cutoff uses an existing
         // native index. No expression index or whole-corpus startup backfill.
         let mut planner = store.pool.acquire().await.unwrap();
-        sqlx::query("SET enable_seqscan=off")
+        sqlx_core::query::query("SET enable_seqscan=off")
             .execute(&mut *planner)
             .await
             .unwrap();
-        sqlx::query("SET enable_bitmapscan=off")
+        sqlx_core::query::query("SET enable_bitmapscan=off")
             .execute(&mut *planner)
             .await
             .unwrap();
@@ -1700,10 +1724,11 @@ mod tests {
                     cursor.position(),
                     cursor.order(true)
                 );
-                let plan: Json<Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-                    .fetch_one(&mut *planner)
-                    .await
-                    .unwrap();
+                let plan: Json<Value> =
+                    sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(sql))
+                        .fetch_one(&mut *planner)
+                        .await
+                        .unwrap();
                 assert!(
                     !unbounded_plan(&plan.0),
                     "unindexed cutoff {}: {}",
@@ -1723,12 +1748,13 @@ mod tests {
                     cursor.comparison("<=", 2),
                     cursor.order(false)
                 );
-                let plan: Json<Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-                    .bind(cursor.initial())
-                    .bind(high)
-                    .fetch_one(&mut *planner)
-                    .await
-                    .unwrap();
+                let plan: Json<Value> =
+                    sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(sql))
+                        .bind(cursor.initial())
+                        .bind(high)
+                        .fetch_one(&mut *planner)
+                        .await
+                        .unwrap();
                 assert!(
                     !unbounded_plan(&plan.0),
                     "unindexed page {}: {}",
@@ -1737,13 +1763,13 @@ mod tests {
                 );
             }
         }
-        let plan:Json<Value>=sqlx::query_scalar("EXPLAIN (FORMAT JSON) SELECT id,retry_at FROM devres_attribution_targets WHERE policy_epoch=1 AND provider='rfc' AND status='pending' AND priority=1 AND retry_at<=100 ORDER BY retry_at,id LIMIT 1").fetch_one(&mut *planner).await.unwrap();
+        let plan:Json<Value>=sqlx_core::query_scalar::query_scalar("EXPLAIN (FORMAT JSON) SELECT id,retry_at FROM devres_attribution_targets WHERE policy_epoch=1 AND provider='rfc' AND status='pending' AND priority=1 AND retry_at<=100 ORDER BY retry_at,id LIMIT 1").fetch_one(&mut *planner).await.unwrap();
         assert!(!unbounded_plan(&plan.0), "unindexed queue head: {}", plan.0);
-        sqlx::query("RESET enable_bitmapscan")
+        sqlx_core::query::query("RESET enable_bitmapscan")
             .execute(&mut *planner)
             .await
             .unwrap();
-        sqlx::query("RESET enable_seqscan")
+        sqlx_core::query::query("RESET enable_seqscan")
             .execute(&mut *planner)
             .await
             .unwrap();
@@ -1751,10 +1777,12 @@ mod tests {
         let page = store.attribution_sweep_page("rfc").await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].evidence["data"]["id"], capture.capture.id);
-        let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_attribution_targets")
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
+        let queued: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT count(*) FROM devres_attribution_targets",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(queued, 1);
         // Bind an actual sealed capture sweep occurrence to its exact compiler
         // result; unrelated valid same-provider evidence cannot qualify it.
@@ -1826,7 +1854,7 @@ mod tests {
         // check during read-only historical verification.
         let wrong_data = generation(&wrong_binding).unwrap();
         let wrong_id = crate::integrity::canonical_hash(&wrong_data).unwrap();
-        sqlx::query(
+        sqlx_core::query::query(
             "INSERT INTO devres_attribution_generations(id,data,data_integrity) VALUES($1,$2,$3)",
         )
         .bind(&wrong_id)
@@ -1841,7 +1869,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        sqlx::query("DELETE FROM devres_attribution_generations WHERE id=$1")
+        sqlx_core::query::query("DELETE FROM devres_attribution_generations WHERE id=$1")
             .bind(&wrong_id)
             .execute(&store.pool)
             .await
@@ -1980,7 +2008,7 @@ mod tests {
         let oversized = oversized.unwrap();
         assert_eq!(oversized.evidence["gap"], "oversized_evidence");
         assert!(oversized.evidence.get("data").is_none());
-        let row = sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
+        let row = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
             .bind(target_id(&oversized.subject).unwrap())
             .fetch_one(&store.pool)
             .await
@@ -2066,10 +2094,10 @@ mod tests {
                 .is_some()
         );
         // The bootstrap is additive and preserves capture identities and bytes.
-        sqlx::raw_sql("DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control;UPDATE devres_schema SET version=10 WHERE singleton").execute(&store.pool).await.unwrap();
+        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control;UPDATE devres_schema SET version=10 WHERE singleton").execute(&store.pool).await.unwrap();
         drop(store);
-        let direct = sqlx::PgPool::connect(url.as_str()).await.unwrap();
-        sqlx::query("UPDATE devres_integrity_control SET active=false WHERE singleton")
+        let direct = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
+        sqlx_core::query::query("UPDATE devres_integrity_control SET active=false WHERE singleton")
             .execute(&direct)
             .await
             .unwrap();
@@ -2079,14 +2107,15 @@ mod tests {
                 .await
                 .is_err()
         );
-        let direct = sqlx::PgPool::connect(url.as_str()).await.unwrap();
-        let absent: bool =
-            sqlx::query_scalar("SELECT to_regclass('devres_attribution_control') IS NULL")
-                .fetch_one(&direct)
-                .await
-                .unwrap();
+        let direct = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
+        let absent: bool = sqlx_core::query_scalar::query_scalar(
+            "SELECT to_regclass('devres_attribution_control') IS NULL",
+        )
+        .fetch_one(&direct)
+        .await
+        .unwrap();
         assert!(absent);
-        sqlx::query("UPDATE devres_integrity_control SET active=true WHERE singleton")
+        sqlx_core::query::query("UPDATE devres_integrity_control SET active=true WHERE singleton")
             .execute(&direct)
             .await
             .unwrap();
@@ -2105,10 +2134,12 @@ mod tests {
                 .as_ref(),
             b"Synthetic RFC attribution fixture"
         );
-        let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
+        let version: i32 = sqlx_core::query_scalar::query_scalar(
+            "SELECT version FROM devres_schema WHERE singleton",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(version, 13);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
@@ -2138,7 +2169,7 @@ mod tests {
                 .unwrap(),
         );
         let future = json!({"format_version":1,"required_policy_epoch":ATTRIBUTION_POLICY_EPOCH+1,"required_policy_fingerprint":"future-policy"});
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_attribution_control SET data=$1,data_integrity=$2 WHERE singleton",
         )
         .bind(Json(&future))
@@ -2153,7 +2184,7 @@ mod tests {
         assert!(store.attribution_ready(&first.subject).await.is_err());
         assert!(store.attribution_bundle(&qualified.id).await.is_err());
         let original = control();
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_attribution_control SET data=$1,data_integrity=$2 WHERE singleton",
         )
         .bind(Json(&original))
@@ -2165,7 +2196,7 @@ mod tests {
         .await
         .unwrap();
         // SQL index corruption cannot redirect or hide ready evidence from validation.
-        sqlx::query("UPDATE devres_attribution_targets SET provider='npm'")
+        sqlx_core::query::query("UPDATE devres_attribution_targets SET provider='npm'")
             .execute(&store.pool)
             .await
             .unwrap();
@@ -2176,7 +2207,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        sqlx::query(
+        sqlx_core::query::query(
             "UPDATE devres_attribution_targets SET provider=data#>>'{target,subject,provider}'",
         )
         .execute(&store.pool)
@@ -2187,11 +2218,12 @@ mod tests {
             fingerprint: "fixture-only-policy-v2",
         };
         let registry = [ATTRIBUTION_REQUIRED_POLICY, next];
-        let prior_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM devres_attribution_generations")
-                .fetch_one(&store.pool)
-                .await
-                .unwrap();
+        let prior_count: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT count(*) FROM devres_attribution_generations",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
         let mut owner = store.owner.lock().await;
         let mut upgrade = owner.begin().await.unwrap();
         promote_control_for(&mut upgrade, next, &registry)
@@ -2199,16 +2231,17 @@ mod tests {
             .unwrap();
         upgrade.commit().await.unwrap();
         drop(owner);
-        let prior = sqlx::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
-            .bind(&qualified.id)
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
+        let prior =
+            sqlx_core::query::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
+                .bind(&qualified.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
         assert_eq!(
             qualified_for_registry(&prior, &registry).unwrap(),
             qualified
         );
-        let old = sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
+        let old = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
             .bind(target_id(&first.subject).unwrap())
             .fetch_one(&store.pool)
             .await
@@ -2219,7 +2252,7 @@ mod tests {
         let mut owner = store.owner.lock().await;
         save(&mut owner, &new_state).await.unwrap();
         drop(owner);
-        let later = sqlx::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
+        let later = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
             .bind(target_id_at(&first.subject, 2).unwrap())
             .fetch_one(&store.pool)
             .await
@@ -2228,20 +2261,22 @@ mod tests {
             state_for_registry(&later, &registry).unwrap().status,
             "pending"
         );
-        let preserved: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM devres_attribution_generations")
+        let preserved: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT count(*) FROM devres_attribution_generations",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved, prior_count);
+        let sweeps: i64 =
+            sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_attribution_sweeps")
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
-        assert_eq!(preserved, prior_count);
-        let sweeps: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_attribution_sweeps")
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
         assert_eq!(sweeps, 0);
         assert!(store.attribution_ready(&first.subject).await.is_err());
         drop(store);
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {name} WITH (FORCE)"
         )))
         .execute(&admin)

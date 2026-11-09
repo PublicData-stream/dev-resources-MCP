@@ -13,7 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL URL");
-    let admin = sqlx::PgPool::connect(&base).await.expect("fixture admin");
+    let admin = sqlx_postgres::PgPool::connect(&base)
+        .await
+        .expect("fixture admin");
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -24,14 +26,16 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     );
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-        .execute(&admin)
-        .await
-        .expect("owned fixture database");
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .expect("owned fixture database");
     let mut url = url::Url::parse(&base).expect("fixture URL");
     url.set_path(&format!("/{database}"));
     let root = tempfile::tempdir_in("/tmp").expect("owned blobs");
-    let inspection = sqlx::PgPool::connect(url.as_str())
+    let inspection = sqlx_postgres::PgPool::connect(url.as_str())
         .await
         .expect("inspection");
     let store = PgBlobStore::connect(url.as_str(), root.path())
@@ -65,7 +69,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         .capture;
     drop(store);
     wait_owner_release(&inspection).await;
-    let count:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM devres_chromium_evidence)+(SELECT count(*) FROM devres_chromium_state)+(SELECT count(*) FROM devres_chromium_statistics)").fetch_one(&inspection).await.unwrap();
+    let count:i64=sqlx_core::query_scalar::query_scalar("SELECT (SELECT count(*) FROM devres_chromium_evidence)+(SELECT count(*) FROM devres_chromium_state)+(SELECT count(*) FROM devres_chromium_statistics)").fetch_one(&inspection).await.unwrap();
     assert_eq!(count, 0, "new tables are empty before isolated downgrade");
     remove_integrity_schema(&inspection).await;
     let capture = seed_legacy_capture(
@@ -75,7 +79,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         b"Synthetic retained public evidence",
     )
     .await;
-    sqlx::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
+    sqlx_core::raw_sql::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
         .execute(&inspection).await.expect("prepare owned schema-seven fixture");
     assert!(
         PgBlobStore::connect(url.as_str(), root.path())
@@ -113,10 +117,12 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         .await
         .expect("serve fully migrated schema eleven");
     assert_eq!(
-        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&inspection)
-            .await
-            .unwrap(),
+        sqlx_core::query_scalar::query_scalar::<_, i32>(
+            "SELECT version FROM devres_schema WHERE singleton"
+        )
+        .fetch_one(&inspection)
+        .await
+        .unwrap(),
         13
     );
     assert_eq!(
@@ -202,9 +208,9 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
             .is_err()
     );
 
-    let owner:i32=sqlx::query_scalar("SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&inspection).await.unwrap();
+    let owner:i32=sqlx_core::query_scalar::query_scalar("SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&inspection).await.unwrap();
     assert!(
-        sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+        sqlx_core::query_scalar::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
             .bind(owner)
             .fetch_one(&inspection)
             .await
@@ -258,7 +264,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     );
     drop(restarted);
     inspection.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "DROP DATABASE {database} WITH (FORCE)"
     )))
     .execute(&admin)
@@ -267,9 +273,9 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
     admin.close().await;
 }
 
-async fn wait_owner_release(pool: &sqlx::PgPool) {
+async fn wait_owner_release(pool: &sqlx_postgres::PgPool) {
     for _ in 0..50 {
-        let count:i64=sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(pool).await.unwrap();
+        let count:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(pool).await.unwrap();
         if count == 0 {
             return;
         }
@@ -280,8 +286,8 @@ async fn wait_owner_release(pool: &sqlx::PgPool) {
 
 // Remove only schema-ten metadata in this task-owned fixture database. Retained
 // captures, source rows, and permanent filesystem evidence remain untouched.
-async fn remove_integrity_schema(pool: &sqlx::PgPool) {
-    sqlx::raw_sql(
+async fn remove_integrity_schema(pool: &sqlx_postgres::PgPool) {
+    sqlx_core::raw_sql::raw_sql(
         r#"
 DO $fixture$
 DECLARE retained_column record;
@@ -313,7 +319,7 @@ DROP TABLE devres_integrity_control;
 // Simulate the original SHA-only capture representation after removing schema-ten
 // seals. Keep the already retained BLAKE3 body file as permanent source evidence.
 async fn seed_legacy_capture(
-    pool: &sqlx::PgPool,
+    pool: &sqlx_postgres::PgPool,
     root: &std::path::Path,
     current: &devres_domain::Capture,
     bytes: &[u8],
@@ -340,7 +346,7 @@ async fn seed_legacy_capture(
         .await
         .expect("retain legacy SHA body path");
     let mut tx = pool.begin().await.expect("fixture capture conversion");
-    let inserted = sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at) SELECT $1,source_key,source_url,$2,media_type,retrieved_at FROM devres_captures WHERE id=$3")
+    let inserted = sqlx_core::query::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at) SELECT $1,source_key,source_url,$2,media_type,retrieved_at FROM devres_captures WHERE id=$3")
         .bind(&id).bind(&body_hash).bind(&current.id)
         .execute(&mut *tx).await.expect("seed original SHA capture metadata");
     assert_eq!(inserted.rows_affected(), 1);
@@ -349,14 +355,14 @@ async fn seed_legacy_capture(
         "UPDATE devres_observations SET capture_id=$1 WHERE capture_id=$2",
         "UPDATE devres_rfc_import_observations SET capture_id=$1 WHERE capture_id=$2",
     ] {
-        sqlx::query(statement)
+        sqlx_core::query::query(statement)
             .bind(&id)
             .bind(&current.id)
             .execute(&mut *tx)
             .await
             .expect("preserve retained capture observations");
     }
-    let removed = sqlx::query("DELETE FROM devres_captures WHERE id=$1")
+    let removed = sqlx_core::query::query("DELETE FROM devres_captures WHERE id=$1")
         .bind(&current.id)
         .execute(&mut *tx)
         .await

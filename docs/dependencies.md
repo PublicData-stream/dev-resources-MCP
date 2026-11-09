@@ -51,7 +51,7 @@ was preferred over a second cancellation/retry implementation; source I/O stays 
 adapters and request-only audit data stays outside this supervision path.
 
 The committed Cargo.lock is the exact bootstrap graph. Rust is pinned to 1.99.1,
-rmcp to 3.7.0, wtransport to 0.7.2, sqlx to 0.9.0, and rustsec to 0.33.0.
+rmcp to 3.9.0, wtransport to 0.7.2, sqlx-core/sqlx-postgres to 0.9.0, and rustsec to 0.33.0.
 Manifest semver ranges for support libraries remain bounded by the committed lock;
 CI uses locked resolution. No Git dependencies or alternative registries are allowed.
 
@@ -61,7 +61,7 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | wtransport, tokio-rustls, x509-parser | Custom reliable QUIC binding, TLS, exact edge SAN verification. Reuse the reference transport contract instead of inventing framing. wtransport uses ring; rustls provider is selected explicitly where required. |
 | serde/json, jsonschema, TOML, URL | Typed schemas, strict configuration, source decoding, and canonical URL construction. Remote schema resolution is disabled. These parsers handle untrusted data under application limits. |
 | reqwest | Bounded fixed-source HTTPS with no redirects, gzip auto-expansion, or arbitrary caller URLs. A separate retry owner avoids amplification. rustls+stream plus bounded query encoding, no default features. |
-| sqlx | PostgreSQL transactions and explicit bound queries; no runtime SQL from callers, no compile-time database access or macros. Memory-only storage would not meet retention requirements. |
+| sqlx-core, sqlx-postgres | PostgreSQL transactions and explicit bound queries; no runtime SQL from callers, no compile-time database access or macros. Memory-only storage would not meet retention requirements. |
 | BLAKE3, SHA-2/SHA-1, hex, fs2 | BLAKE3 addresses and verifies service-owned durable content. SHA-2/SHA-1 retain upstream registry/Git checksums, legacy evidence verification, and stable operational lookup names. fs2 provides safe filesystem-space calls rather than adding unsafe local FFI. |
 | quick-xml, tar, flate2 | Streaming official RFC metadata and bounded crate/advisory archives. Neither tar extraction nor link following is used. XML general entities and mixed text need parser tests. |
 | html5ever | Streaming HTML tokenization without a DOM, scripting, network or rendering. Direct tokenization avoids CSS dependencies and checks budgets between feeds. Raw captures remain unchanged; fixtures cover entities and active content. |
@@ -102,6 +102,56 @@ are generated from locked metadata, preserving packaged license and notice files
 the pinned toolchain standard-library copyright inventory and license texts are
 included as well. Operating-system packages retain their image-provided copyright
 information.
+
+## MCP SDK advisory admission
+
+`rmcp 3.9.0` is the minimum fixed release for
+[RUSTSEC-2026-0462](https://github.com/RustSec/advisory-db/blob/main/crates/rmcp/RUSTSEC-2026-0462.md),
+which concerns unbounded response buffering in its HTTP clients. This service
+keeps defaults disabled and enables only `server` and
+`transport-streamable-http-server`; the affected clients remain disabled, but
+the pinned package must still pass whole-lockfile admission. Upgrading the
+maintained SDK avoids an advisory exception or a transport fork. The Apache-2.0
+package requires Rust 1.88, below the pinned workspace toolchain.
+
+The upgrade retains the explicit supported protocol revisions and tools/resources
+capabilities. The SDK also corrects HTTP media-type matching, honors zero Accept
+weights, and rejects invalid parameter headers. Valid protocol requests retain
+their existing contract; malformed media types and headers may now be rejected.
+The optional Skills capability is not advertised. SDK digest support reuses the
+already locked SHA-2 package without enabling client, authentication, command
+execution or new outbound destinations. The existing upstream build script only
+configures Git hooks when its upstream workspace directories are present; it is
+inactive in the normal registry source layout. Packaged notices remain required,
+and protocol/transport fixtures and current dependency admission are separate gates.
+
+## PostgreSQL-only SQLx components
+
+`sqlx-core` and `sqlx-postgres` are both pinned exactly to `0.9.0`. They replace
+the `sqlx` umbrella without changing the compiled driver version or PostgreSQL
+type identities. The umbrella retained unused SQLite, MySQL and macro packages
+in Cargo.lock even with defaults disabled. Its optional SQLite driver requires
+`libsqlite3-sys <0.38.0`, excluding the `>=0.39.0` fix for
+[RUSTSEC-2026-0459](https://github.com/RustSec/advisory-db/blob/main/crates/libsqlite3-sys/RUSTSEC-2026-0459.md).
+SQLite was absent from the active build graph, but the whole lockfile still
+requires advisory admission. Removing the unused dependency path avoids an
+advisory suppression or a locally maintained upstream fork; no compatible newer
+stable SQLx release was available when this change was reviewed.
+
+Upstream treats the component APIs as semver-exempt, so upgrades must keep their
+exact versions aligned and review callers and feature forwarding together.
+Core explicitly retains `_rt-tokio`, `_tls-rustls-ring-native-roots`, `json` and
+the umbrella's implicit `migrate` feature. PostgreSQL retains `json`; defaults
+are disabled for both components. The existing Tokio runtime, ring TLS provider,
+native certificate roots, JSON encoding and transaction behavior remain intact.
+No SQLite/native build, compile-time query macro, new network destination or
+inspected-package execution is introduced.
+
+These maintained upstream components are MIT OR Apache-2.0 and have no build
+scripts of their own. Existing resolved cryptography build scripts remain;
+preserve the components' packaged license/notice texts in generated inventories.
+Current advisory, license and source checks must cover the resulting locked
+graph, independently of compilation and PostgreSQL fixture acceptance.
 
 ## BLAKE3 storage integrity
 

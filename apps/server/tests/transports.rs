@@ -295,6 +295,215 @@ async fn dotted_tools_are_discovered_and_legacy_names_rejected_in_both_http_revi
 }
 
 #[tokio::test]
+async fn http_media_and_optional_extensions_preserve_both_protocol_contracts() {
+    let source = SourceOffer::new("https://source.test/revision").unwrap();
+    let mut registry = server_info_registry(source.clone()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    registry
+        .register(
+            json!({
+                "name":"fixture.header",
+                "description":"Synthetic routing-header validation.",
+                "inputSchema":{
+                    "type":"object",
+                    "properties":{"region":{"type":"string","x-mcp-header":"Region"}},
+                    "additionalProperties":false
+                },
+                "annotations":{"readOnlyHint":true}
+            }),
+            move |_, _| {
+                seen.fetch_add(1, Ordering::Relaxed);
+                async { Ok(json!({"ok":true})) }
+            },
+        )
+        .unwrap();
+    // Resources alone must not opt the server into the skills extension.
+    registry.with_resource_reader(|_, _| async { Ok(json!({"contents":[]})) });
+    let mut builder = ServerBuilder::new(registry, Limits::default(), source);
+    builder
+        .register_endpoint(HttpEndpoint {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            access: AccessPolicy {
+                allowed_hosts: vec!["backend".into()],
+                allowed_origins: vec![],
+            },
+            tls: None,
+            edge_mtls: None,
+        })
+        .unwrap();
+    let server = builder.bind().await.unwrap();
+    let http = server.addresses()[0].1[0];
+    let shutdown = CancellationToken::new();
+    let signal = shutdown.clone();
+    let task = tokio::spawn(async move { server.run(signal).await });
+    let client = reqwest::Client::new();
+    for revision in ["2026-07-28", "2025-11-25"] {
+        let request = |method: &str, mut params: Value, accept: &[&str], content_type: &str| {
+            let mut request = client
+                .post(format!("http://{http}/mcp"))
+                .header("host", "backend")
+                .header("content-type", content_type)
+                .header("mcp-protocol-version", revision);
+            for value in accept {
+                request = request.header("accept", *value);
+            }
+            if revision == "2026-07-28" {
+                params["_meta"] = meta();
+                request = request.header("mcp-method", method);
+                if let Some(name) = params["name"].as_str() {
+                    request = request.header("mcp-name", name);
+                }
+            }
+            request.body(
+                serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
+                )
+                .unwrap(),
+            )
+        };
+        let accept = ["application/json, text/event-stream"];
+        let (method, params) = if revision == "2026-07-28" {
+            ("server/discover", json!({}))
+        } else {
+            (
+                "initialize",
+                json!({"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"upgrade-fixture","version":"1"}}),
+            )
+        };
+        let opened = request(method, params, &accept, "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert!(opened.status().is_success());
+        assert!(opened.headers().get("mcp-session-id").is_none());
+        let opened = response_json(opened).await;
+        if revision == "2026-07-28" {
+            assert_eq!(
+                opened["result"]["supportedVersions"],
+                json!(["2026-07-28", "2025-11-25"])
+            );
+        } else {
+            assert_eq!(opened["result"]["protocolVersion"], revision);
+        }
+        assert_eq!(opened["result"]["capabilities"]["tools"], json!({}));
+        assert_eq!(opened["result"]["capabilities"]["resources"], json!({}));
+        assert!(opened["result"]["capabilities"].get("extensions").is_none());
+        for (method, params) in [
+            ("skills/list", json!({})),
+            (
+                "skills/get",
+                json!({"uri":"devres://skills/fixture/SKILL.md"}),
+            ),
+            (
+                "resources/directory/read",
+                json!({"uri":"devres://skills/fixture/"}),
+            ),
+        ] {
+            let rejected = request(method, params, &accept, "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response_json(rejected).await["error"]["code"],
+                -32601,
+                "{revision} {method}"
+            );
+        }
+        for (accept, content_type, expected) in [
+            (
+                vec!["application/json, text/event-stream"],
+                "application/json",
+                200,
+            ),
+            (
+                vec!["APPLICATION/JSON, TEXT/EVENT-STREAM"],
+                "APPLICATION/JSON; charset=utf-8",
+                200,
+            ),
+            (
+                vec!["application/json", "text/event-stream"],
+                "application/json",
+                200,
+            ),
+            (
+                vec!["application/json;q=0, text/event-stream"],
+                "application/json",
+                406,
+            ),
+            (
+                vec!["application/json, text/event-stream;q=0.000"],
+                "application/json",
+                406,
+            ),
+            (
+                vec!["application/jsonp, text/event-stream"],
+                "application/json",
+                406,
+            ),
+            (
+                vec!["application/json, text/event-stream"],
+                "application/json-seq",
+                415,
+            ),
+        ] {
+            let response = request("tools/list", json!({}), &accept, content_type)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status().as_u16(),
+                expected,
+                "{revision} {accept:?} {content_type}"
+            );
+            if expected == 200 {
+                let listed = response_json(response).await;
+                assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 2);
+            }
+        }
+        if revision == "2026-07-28" {
+            let valid = request(
+                "tools/call",
+                json!({"name":"fixture.header","arguments":{"region":"eu"}}),
+                &accept,
+                "application/json",
+            )
+            .header("mcp-param-region", "eu")
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(
+                response_json(valid).await["result"]["structuredContent"]["ok"],
+                true
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            let rejected = request(
+                "tools/call",
+                json!({"name":"fixture.header","arguments":{}}),
+                &accept,
+                "application/json",
+            )
+            .header(
+                "mcp-param-region",
+                reqwest::header::HeaderValue::from_bytes(&[0xff]).unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(rejected.status(), 400);
+            assert!(response_json(rejected).await.get("error").is_some());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn native_webtransport_probe_both_revisions_and_origin_rejection() {
     let temp = tempfile::tempdir().unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();

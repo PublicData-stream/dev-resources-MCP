@@ -5,7 +5,7 @@ use crate::integrity::{self, FileEvidence};
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
 use serde_json::{Value, json};
-use sqlx::{Connection, Row, types::Json};
+use sqlx_core::{connection::Connection, row::Row, types::Json};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -38,10 +38,10 @@ const JSON_TABLES: &[(&str, &str)] = &[
 ];
 
 pub(super) async fn prepare(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
     fresh: bool,
 ) -> Result<()> {
-    sqlx::raw_sql(r#"
+    sqlx_core::raw_sql::raw_sql(r#"
 CREATE TABLE devres_integrity_control(singleton boolean PRIMARY KEY CHECK(singleton),active boolean NOT NULL,files_complete boolean NOT NULL DEFAULT false,sql_complete boolean NOT NULL DEFAULT false,graph_complete boolean NOT NULL DEFAULT false);
 CREATE TABLE devres_content_aliases(namespace text NOT NULL,legacy text NOT NULL,canonical text NOT NULL CHECK(canonical ~ '^blake3:[0-9a-f]{64}$'),mapping_integrity text CHECK(mapping_integrity IS NULL OR mapping_integrity ~ '^blake3:[0-9a-f]{64}$'),PRIMARY KEY(namespace,legacy),UNIQUE(namespace,canonical,legacy));
 CREATE TABLE devres_integrity_files(path text PRIMARY KEY,digest text NOT NULL CHECK(digest ~ '^blake3:[0-9a-f]{64}$'),bytes bigint NOT NULL CHECK(bytes>=0));
@@ -60,7 +60,7 @@ ALTER TABLE devres_rfc_snapshots DROP CONSTRAINT IF EXISTS devres_rfc_snapshots_
 ALTER TABLE devres_crate_inventories DROP CONSTRAINT IF EXISTS devres_crate_inventories_revision_key;
 ALTER TABLE devres_rfc_snapshots ADD CHECK(id ~ '^(blake3:)?[0-9a-f]{64}$');
 "#).execute(&mut **tx).await.map_err(|_| storage_error())?;
-    sqlx::query("INSERT INTO devres_integrity_control(singleton,active,files_complete,sql_complete,graph_complete) VALUES(true,$1,$1,$1,$1)")
+    sqlx_core::query::query("INSERT INTO devres_integrity_control(singleton,active,files_complete,sql_complete,graph_complete) VALUES(true,$1,$1,$1,$1)")
         .bind(fresh).execute(&mut **tx).await.map_err(|_| storage_error())?;
     for provider in PROVIDERS {
         for suffix in ["evidence", "state"] {
@@ -80,7 +80,7 @@ ALTER TABLE devres_rfc_snapshots ADD CHECK(id ~ '^(blake3:)?[0-9a-f]{64}$');
         let query = format!(
             "ALTER TABLE {table} ADD COLUMN sequence_integrity text CHECK(sequence_integrity IS NULL OR sequence_integrity ~ '^blake3:[0-9a-f]{{64}}$')"
         );
-        sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(query))
             .execute(&mut **tx)
             .await
             .map_err(|_| storage_error())?;
@@ -102,7 +102,7 @@ ALTER TABLE devres_rfc_snapshots ADD CHECK(id ~ '^(blake3:)?[0-9a-f]{64}$');
                 provider,
                 &json!({"provider":provider,"legacy_cutoff":0}),
             )?;
-            sqlx::query("INSERT INTO devres_integrity_provider_cutoffs(provider,legacy_cutoff,cutoff_integrity) VALUES($1,0,$2)").bind(provider).bind(proof).execute(&mut **tx).await.map_err(|_|storage_error())?;
+            sqlx_core::query::query("INSERT INTO devres_integrity_provider_cutoffs(provider,legacy_cutoff,cutoff_integrity) VALUES($1,0,$2)").bind(provider).bind(proof).execute(&mut **tx).await.map_err(|_|storage_error())?;
         }
         for provider in [
             "body", "capture", "rfc", "advisory", "crate", "npm", "mdn", "whatwg", "w3c",
@@ -114,25 +114,27 @@ ALTER TABLE devres_rfc_snapshots ADD CHECK(id ~ '^(blake3:)?[0-9a-f]{64}$');
                 provider,
                 &json!({"provider":provider,"complete":true,"aliases_count":count,"aliases_digest":digest}),
             )?;
-            sqlx::query("INSERT INTO devres_integrity_graph_progress(provider,complete,aliases_count,aliases_digest,progress_integrity) VALUES($1,true,$2,$3,$4)")
+            sqlx_core::query::query("INSERT INTO devres_integrity_graph_progress(provider,complete,aliases_count,aliases_digest,progress_integrity) VALUES($1,true,$2,$3,$4)")
                 .bind(provider).bind(count).bind(digest).bind(proof).execute(&mut **tx).await.map_err(|_|storage_error())?;
         }
         enforce_constraints(tx).await?;
     }
-    sqlx::query("UPDATE devres_schema SET version=10 WHERE singleton")
+    sqlx_core::query::query("UPDATE devres_schema SET version=10 WHERE singleton")
         .execute(&mut **tx)
         .await
         .map_err(|_| storage_error())?;
     Ok(())
 }
 
-async fn enforce_constraints(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+async fn enforce_constraints(
+    tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+) -> Result<()> {
     for provider in PROVIDERS {
         for suffix in ["evidence", "state"] {
             let query = format!(
                 "ALTER TABLE devres_{provider}_{suffix} ALTER COLUMN data_integrity SET NOT NULL"
             );
-            sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+            sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(query))
                 .execute(&mut **tx)
                 .await
                 .map_err(|_| storage_error())?;
@@ -146,7 +148,7 @@ async fn enforce_constraints(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> 
         } else {
             format!("ALTER TABLE {table} ALTER COLUMN {column}_integrity SET NOT NULL")
         };
-        sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(query))
             .execute(&mut **tx)
             .await
             .map_err(|_| storage_error())?;
@@ -158,18 +160,18 @@ async fn enforce_constraints(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> 
             format!("devres_{provider}_evidence")
         };
         let query = format!("ALTER TABLE {table} ALTER COLUMN sequence_integrity SET NOT NULL");
-        sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(query))
             .execute(&mut **tx)
             .await
             .map_err(|_| storage_error())?;
     }
-    sqlx::raw_sql("ALTER TABLE devres_captures ALTER COLUMN metadata_integrity SET NOT NULL; ALTER TABLE devres_observations ALTER COLUMN event_integrity SET NOT NULL; ALTER TABLE devres_rfc_import_observations ALTER COLUMN event_integrity SET NOT NULL; ALTER TABLE devres_heads ALTER COLUMN head_integrity SET NOT NULL; ALTER TABLE devres_content_aliases ALTER COLUMN mapping_integrity SET NOT NULL")
+    sqlx_core::raw_sql::raw_sql("ALTER TABLE devres_captures ALTER COLUMN metadata_integrity SET NOT NULL; ALTER TABLE devres_observations ALTER COLUMN event_integrity SET NOT NULL; ALTER TABLE devres_rfc_import_observations ALTER COLUMN event_integrity SET NOT NULL; ALTER TABLE devres_heads ALTER COLUMN head_integrity SET NOT NULL; ALTER TABLE devres_content_aliases ALTER COLUMN mapping_integrity SET NOT NULL")
         .execute(&mut **tx).await.map_err(|_|storage_error())?;
     Ok(())
 }
 
 async fn add_column(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
     table: &str,
     column: &str,
 ) -> Result<()> {
@@ -177,7 +179,7 @@ async fn add_column(
     let query = format!(
         "ALTER TABLE {table} ADD COLUMN {column}_integrity text CHECK({column}_integrity IS NULL OR {column}_integrity ~ '^blake3:[0-9a-f]{{64}}$')"
     );
-    sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+    sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(query))
         .execute(&mut **tx)
         .await
         .map_err(|_| storage_error())?;
@@ -205,11 +207,12 @@ impl PgBlobStore {
         execution: &MigrationExecution,
     ) -> Result<Value> {
         self.fence().await?;
-        let active: bool =
-            sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| storage_error())?;
+        let active: bool = sqlx_core::query_scalar::query_scalar(
+            "SELECT active FROM devres_integrity_control WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         if active {
             return Err(Error::invalid(
                 "Storage is already BLAKE3 active; use verify-storage.",
@@ -218,7 +221,7 @@ impl PgBlobStore {
         // Resume stores created by an earlier schema-ten binary without changing
         // their format. Verification stays read-only; this private lookup index
         // is created only while the migration owns the writer fence.
-        sqlx::raw_sql("CREATE INDEX IF NOT EXISTS devres_integrity_files_digest_idx ON devres_integrity_files(digest)")
+        sqlx_core::raw_sql::raw_sql("CREATE INDEX IF NOT EXISTS devres_integrity_files_digest_idx ON devres_integrity_files(digest)")
             .execute(&mut *self.owner.lock().await).await.map_err(|_| storage_error())?;
         self.verify_visibility_registry().await?;
         self.prepare_graph_cutoffs().await?;
@@ -231,7 +234,7 @@ impl PgBlobStore {
         self.backfill_events(&cancel, false, execution).await?;
         execution.report("capture_replay", 0, 0, 0, 0);
         self.canonicalize_captures(&cancel).await?;
-        sqlx::query("UPDATE devres_integrity_control SET files_complete=true,sql_complete=true WHERE singleton")
+        sqlx_core::query::query("UPDATE devres_integrity_control SET files_complete=true,sql_complete=true WHERE singleton")
             .execute(&mut *self.owner.lock().await).await.map_err(|_| storage_error())?;
         Ok(json!({"format":1,"algorithm":"blake3","phase":"qualified","active":false}))
     }
@@ -312,9 +315,9 @@ impl PgBlobStore {
             let parent = path.parent().ok_or_else(storage_error)?;
             publish_link(path, &parent.join(integrity::relative_path(&digest)?)).await?;
             let namespace = "body";
-            sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+            sqlx_core::query::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                 .bind(namespace).bind(name).bind(&digest).bind(mapping_digest(namespace,name,&digest)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
-            let matches: bool = sqlx::query_scalar(
+            let matches: bool = sqlx_core::query_scalar::query_scalar(
                 "SELECT canonical=$3 FROM devres_content_aliases WHERE namespace=$1 AND legacy=$2",
             )
             .bind(namespace)
@@ -327,11 +330,13 @@ impl PgBlobStore {
                 return Err(Error::integrity("Conflicting retained content mapping."));
             }
         }
-        let prior = sqlx::query("SELECT digest,bytes FROM devres_integrity_files WHERE path=$1")
-            .bind(&relative)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| storage_error())?;
+        let prior = sqlx_core::query::query(
+            "SELECT digest,bytes FROM devres_integrity_files WHERE path=$1",
+        )
+        .bind(&relative)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         if let Some(prior) = prior {
             let old: String = prior.try_get("digest").map_err(|_| storage_error())?;
             let old_bytes: i64 = prior.try_get("bytes").map_err(|_| storage_error())?;
@@ -348,7 +353,7 @@ impl PgBlobStore {
         let target = integrity::evidence_path(&self.root, path)?;
         let encoded = serde_json::to_vec(&evidence).map_err(|_| storage_error())?;
         publish_metadata(&target, &encoded).await?;
-        sqlx::query("INSERT INTO devres_integrity_files(path,digest,bytes) VALUES($1,$2,$3) ON CONFLICT(path) DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_integrity_files(path,digest,bytes) VALUES($1,$2,$3) ON CONFLICT(path) DO NOTHING")
             .bind(&relative).bind(&digest).bind(bytes as i64).execute(&mut *self.owner.lock().await).await.map_err(|_| storage_error())?;
         Ok(())
     }
@@ -381,7 +386,8 @@ impl PgBlobStore {
                 let query = format!(
                     "SELECT ctid::text AS locator,{kind_expr} AS kind,key,data,data_integrity FROM {table}"
                 );
-                let mut rows = sqlx::query(sqlx::AssertSqlSafe(query)).fetch(&self.pool);
+                let mut rows = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(query))
+                    .fetch(&self.pool);
                 let mut batch = payload_integrity::SealBatch::with_execution(execution);
                 use payload_integrity::pipeline::{SealData, SealRecord, SealWindow};
                 let mut window = SealWindow::new(execution, verify_only);
@@ -426,7 +432,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             canceled(cancel)?;
-            let rows = sqlx::query("SELECT c.*,f.digest AS qualified_body_digest FROM devres_captures c LEFT JOIN devres_integrity_files f ON f.path=CASE WHEN c.body_hash LIKE 'blake3:%' THEN 'blake3/'||substring(c.body_hash FROM 8) ELSE c.body_hash END WHERE c.id>$1 AND c.id NOT LIKE 'blake3:%' ORDER BY c.id LIMIT 100")
+            let rows = sqlx_core::query::query("SELECT c.*,f.digest AS qualified_body_digest FROM devres_captures c LEFT JOIN devres_integrity_files f ON f.path=CASE WHEN c.body_hash LIKE 'blake3:%' THEN 'blake3/'||substring(c.body_hash FROM 8) ELSE c.body_hash END WHERE c.id>$1 AND c.id NOT LIKE 'blake3:%' ORDER BY c.id LIMIT 100")
                 .bind(&after).fetch_all(&self.pool).await.map_err(|_| storage_error())?;
             if rows.is_empty() {
                 break;
@@ -463,7 +469,7 @@ impl PgBlobStore {
                     if prior.as_ref().is_some_and(|v| v != &legacy_metadata) {
                         return Err(Error::integrity("Legacy capture metadata changed."));
                     }
-                    sqlx::query("UPDATE devres_captures SET metadata_integrity=$2 WHERE id=$1 AND metadata_integrity IS NULL")
+                    sqlx_core::query::query("UPDATE devres_captures SET metadata_integrity=$2 WHERE id=$1 AND metadata_integrity IS NULL")
                         .bind(&id).bind(&legacy_metadata).execute(&mut *tx).await.map_err(|_| storage_error())?;
                     let source = self.root.join(integrity::relative_path(&body_hash)?);
                     let digest: Option<String> = row
@@ -486,17 +492,17 @@ impl PgBlobStore {
                         body_hash: digest.clone(),
                         ..legacy_capture
                     })?;
-                    sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
+                    sqlx_core::query::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
                         .bind(&canonical).bind(&key).bind(&url).bind(&digest).bind(&media).bind(time).bind(&metadata_digest).execute(&mut *tx).await.map_err(|_| storage_error())?;
-                    sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
+                    sqlx_core::query::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
                         .bind(&id).bind(&canonical).bind(mapping_digest("capture",&id,&canonical)?).execute(&mut *tx).await.map_err(|_| storage_error())?;
-                    let matches: bool = sqlx::query_scalar("SELECT canonical=$2 FROM devres_content_aliases WHERE namespace='capture' AND legacy=$1")
+                    let matches: bool = sqlx_core::query_scalar::query_scalar("SELECT canonical=$2 FROM devres_content_aliases WHERE namespace='capture' AND legacy=$1")
                         .bind(&id).bind(&canonical).fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
                     if !matches {
                         return Err(Error::integrity("Conflicting capture migration mapping."));
                     }
                     // Legacy observations remain exact; canonical reads consult their alias.
-                    let head=sqlx::query("SELECT source_key,validated_at,etag,last_modified FROM devres_heads WHERE capture_id=$1").bind(&id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+                    let head=sqlx_core::query::query("SELECT source_key,validated_at,etag,last_modified FROM devres_heads WHERE capture_id=$1").bind(&id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
                     if let Some(head) = head {
                         let key: String = head.try_get("source_key").map_err(|_| storage_error())?;
                         let data = json!({"source_key":key,"capture_id":canonical,"validated_at":head.try_get::<i64,_>("validated_at").map_err(|_|storage_error())?,"etag":head.try_get::<Option<String>,_>("etag").map_err(|_|storage_error())?,"last_modified":head.try_get::<Option<String>,_>("last_modified").map_err(|_|storage_error())?});
@@ -507,7 +513,7 @@ impl PgBlobStore {
                             &stage,
                             &data,
                         )?;
-                        sqlx::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
+                        sqlx_core::query::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES('capture',$1,$2,$3) ON CONFLICT DO NOTHING")
                             .bind(stage).bind(Json(&data)).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
                     }
                     after = id;
@@ -537,7 +543,7 @@ impl PgBlobStore {
         // Stream verified rows directly into the compact, capacity-accounted
         // working set. Holding an intermediate Vec of every SQL row would
         // duplicate the advertised memory budget before admission.
-        let mut rows = sqlx::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace,legacy")
+        let mut rows = sqlx_core::query::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases ORDER BY namespace,legacy")
             .fetch(&self.pool);
         let mut mappings = crate::MigrationMap::new();
         while let Some(row) = rows.try_next().await.map_err(|_| storage_error())? {
@@ -577,16 +583,17 @@ impl PgBlobStore {
                 _ => (format!("devres_{provider}_evidence"), "sequence"),
             };
             let query = format!("SELECT COALESCE(max({column}),0)::bigint FROM {table}");
-            let value: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| storage_error())?;
+            let value: i64 =
+                sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(query))
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|_| storage_error())?;
             let digest = super::events::event_digest(
                 "devres_integrity_provider_cutoffs",
                 provider,
                 &json!({"provider":provider,"legacy_cutoff":value}),
             )?;
-            sqlx::query("INSERT INTO devres_integrity_provider_cutoffs(provider,legacy_cutoff,cutoff_integrity) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
+            sqlx_core::query::query("INSERT INTO devres_integrity_provider_cutoffs(provider,legacy_cutoff,cutoff_integrity) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
                 .bind(provider).bind(value).bind(digest).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
         }
         Ok(())
@@ -594,7 +601,7 @@ impl PgBlobStore {
 
     pub async fn migration_graph_done(&self, provider: &str) -> Result<bool> {
         self.fence().await?;
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_integrity_graph_progress WHERE provider=$1 AND complete)").bind(provider)
+        sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_integrity_graph_progress WHERE provider=$1 AND complete)").bind(provider)
             .fetch_one(&self.pool).await.map_err(|_|storage_error())
     }
 
@@ -611,7 +618,7 @@ impl PgBlobStore {
         cancel: CancellationToken,
         execution: &MigrationExecution,
     ) -> Result<Value> {
-        let ready:bool=sqlx::query_scalar("SELECT count(*)=8 FROM devres_integrity_graph_progress WHERE complete AND provider IN ('mdn','whatwg','w3c','chromium','npm','advisory','rfc','crate')")
+        let ready:bool=sqlx_core::query_scalar::query_scalar("SELECT count(*)=8 FROM devres_integrity_graph_progress WHERE complete AND provider IN ('mdn','whatwg','w3c','chromium','npm','advisory','rfc','crate')")
             .fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if !ready {
             return Err(Error::integrity("Provider graph migration is incomplete."));
@@ -625,7 +632,7 @@ impl PgBlobStore {
             .await?;
         canceled(&cancel)?;
         self.fence().await?;
-        sqlx::query("UPDATE devres_integrity_control SET graph_complete=true WHERE singleton AND NOT active")
+        sqlx_core::query::query("UPDATE devres_integrity_control SET graph_complete=true WHERE singleton AND NOT active")
             .execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
         Ok(json!({"phase":"ready_for_activation","active":false,"verification":receipt}))
     }
@@ -657,9 +664,9 @@ impl PgBlobStore {
                     return Err(Error::integrity("Invalid migration mapping."));
                 }
                 let namespace = format!("{provider}:{kind}");
-                sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+                sqlx_core::query::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                     .bind(&namespace).bind(old).bind(new).bind(mapping_digest(&namespace,old,new)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
-                let matches: bool = sqlx::query_scalar("SELECT canonical=$3 FROM devres_content_aliases WHERE namespace=$1 AND legacy=$2")
+                let matches: bool = sqlx_core::query_scalar::query_scalar("SELECT canonical=$3 FROM devres_content_aliases WHERE namespace=$1 AND legacy=$2")
                     .bind(&namespace).bind(old).bind(new).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
                 if !matches {
                     return Err(Error::integrity("Conflicting migration mapping."));
@@ -681,7 +688,7 @@ impl PgBlobStore {
 
     async fn seal_alias_membership(&self, provider: &str) -> Result<()> {
         use futures::TryStreamExt;
-        let mut stream=sqlx::query("SELECT namespace,legacy,canonical FROM devres_content_aliases WHERE namespace=$1 OR namespace LIKE $1||':%' ORDER BY namespace COLLATE \"C\",legacy COLLATE \"C\"").bind(provider).fetch(&self.pool);
+        let mut stream=sqlx_core::query::query("SELECT namespace,legacy,canonical FROM devres_content_aliases WHERE namespace=$1 OR namespace LIKE $1||':%' ORDER BY namespace COLLATE \"C\",legacy COLLATE \"C\"").bind(provider).fetch(&self.pool);
         let mut manifest = super::visibility::AliasMembership::new(provider)?;
         while let Some(row) = stream.try_next().await.map_err(|_| storage_error())? {
             manifest.push(
@@ -699,7 +706,7 @@ impl PgBlobStore {
         let proof =
             super::events::event_digest("devres_integrity_graph_progress", provider, &data)?;
         let mut owner = self.owner.lock().await;
-        let existing=sqlx::query("SELECT complete,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress WHERE provider=$1").bind(provider).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
+        let existing=sqlx_core::query::query("SELECT complete,aliases_count,aliases_digest,progress_integrity FROM devres_integrity_graph_progress WHERE provider=$1").bind(provider).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
         if let Some(existing) = existing {
             let complete: bool = existing.try_get("complete").map_err(|_| storage_error())?;
             let old_count: i64 = existing
@@ -715,7 +722,7 @@ impl PgBlobStore {
                 return Err(Error::integrity("Completed alias membership changed."));
             }
         } else {
-            sqlx::query("INSERT INTO devres_integrity_graph_progress(provider,complete,aliases_count,aliases_digest,progress_integrity) VALUES($1,true,$2,$3,$4)")
+            sqlx_core::query::query("INSERT INTO devres_integrity_graph_progress(provider,complete,aliases_count,aliases_digest,progress_integrity) VALUES($1,true,$2,$3,$4)")
                 .bind(provider).bind(count).bind(digest).bind(proof).execute(&mut *owner).await.map_err(|_|storage_error())?;
         }
         Ok(())
@@ -756,7 +763,7 @@ impl PgBlobStore {
         let mut files = 0_u64;
         loop {
             canceled(&cancel)?;
-            let rows = sqlx::query("SELECT path,digest,bytes FROM devres_integrity_files WHERE path>$1 ORDER BY path LIMIT 100")
+            let rows = sqlx_core::query::query("SELECT path,digest,bytes FROM devres_integrity_files WHERE path>$1 ORDER BY path LIMIT 100")
                 .bind(&after).fetch_all(&self.pool).await.map_err(|_| storage_error())?;
             if rows.is_empty() {
                 break;
@@ -798,15 +805,17 @@ impl PgBlobStore {
         }
         execution.report("file_inventory", 0, 0, 0, 0);
         let remote_active: bool = if self.archive.get().is_some() {
-            sqlx::query_scalar("SELECT backend='s3' FROM devres_archive_control WHERE singleton")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| storage_error())?
+            sqlx_core::query_scalar::query_scalar(
+                "SELECT backend='s3' FROM devres_archive_control WHERE singleton",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| storage_error())?
         } else {
             false
         };
         let inventoried = if remote_active {
-            let count:i64=sqlx::query_scalar("SELECT count(*) FROM devres_archive_file WHERE complete AND NOT starts_with(path,'.devres-integrity/')").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+            let count:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_archive_file WHERE complete AND NOT starts_with(path,'.devres-integrity/')").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
             u64::try_from(count).map_err(|_| storage_error())?
         } else {
             self.verify_file_inventory(&cancel, execution).await?
@@ -821,12 +830,13 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             canceled(cancel)?;
-            let rows =
-                sqlx::query("SELECT * FROM devres_captures WHERE id>$1 ORDER BY id LIMIT 100")
-                    .bind(&after)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|_| storage_error())?;
+            let rows = sqlx_core::query::query(
+                "SELECT * FROM devres_captures WHERE id>$1 ORDER BY id LIMIT 100",
+            )
+            .bind(&after)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| storage_error())?;
             if rows.is_empty() {
                 break;
             }
@@ -967,7 +977,7 @@ impl PgBlobStore {
 
     async fn apply_staged_activation(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
     ) -> Result<()> {
         for provider in PROVIDERS {
             let table = format!("devres_{provider}_state");
@@ -976,7 +986,7 @@ impl PgBlobStore {
                 let query = format!(
                     "SELECT key,data,data_integrity FROM {table} WHERE key LIKE 'storage-migration:%' AND key>$1 ORDER BY key LIMIT 1"
                 );
-                let found = sqlx::query(sqlx::AssertSqlSafe(query))
+                let found = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(query))
                     .bind(&after)
                     .fetch_optional(&mut **tx)
                     .await
@@ -1000,7 +1010,7 @@ impl PgBlobStore {
                 let update = format!(
                     "INSERT INTO {table}(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity"
                 );
-                sqlx::query(sqlx::AssertSqlSafe(update))
+                sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(update))
                     .bind(&key)
                     .bind(Json(&data))
                     .bind(digest)
@@ -1011,7 +1021,7 @@ impl PgBlobStore {
         }
         let mut after = String::new();
         loop {
-            let found=sqlx::query("SELECT provider,key,data,data_integrity,provider||chr(1)||key AS page_key FROM devres_integrity_staged_state WHERE provider||chr(1)||key>$1 ORDER BY provider||chr(1)||key LIMIT 1")
+            let found=sqlx_core::query::query("SELECT provider,key,data,data_integrity,provider||chr(1)||key AS page_key FROM devres_integrity_staged_state WHERE provider||chr(1)||key>$1 ORDER BY provider||chr(1)||key LIMIT 1")
                 .bind(&after).fetch_optional(&mut **tx).await.map_err(|_|storage_error())?;
             let Some(row) = found else {
                 break;
@@ -1035,7 +1045,7 @@ impl PgBlobStore {
             if provider == "capture" && key.starts_with("head:") {
                 let source = text("source_key")?;
                 let proof = super::events::event_digest("devres_heads", source, &data)?;
-                sqlx::query("UPDATE devres_heads SET capture_id=$2,validated_at=$3,etag=$4,last_modified=$5,head_integrity=$6 WHERE source_key=$1")
+                sqlx_core::query::query("UPDATE devres_heads SET capture_id=$2,validated_at=$3,etag=$4,last_modified=$5,head_integrity=$6 WHERE source_key=$1")
                     .bind(source).bind(text("capture_id")?).bind(data["validated_at"].as_i64().ok_or_else(storage_error)?).bind(data["etag"].as_str()).bind(data["last_modified"].as_str()).bind(proof).execute(&mut **tx).await.map_err(|_|storage_error())?;
             } else if provider == "rfc" && key.starts_with("job:") {
                 let source = text("source_key")?;
@@ -1046,27 +1056,31 @@ impl PgBlobStore {
                     source,
                     &metadata,
                 )?;
-                sqlx::query("UPDATE devres_rfc_jobs SET capture_id=$2,capture_metadata=$3,capture_metadata_integrity=$4 WHERE source_key=$1")
+                sqlx_core::query::query("UPDATE devres_rfc_jobs SET capture_id=$2,capture_metadata=$3,capture_metadata_integrity=$4 WHERE source_key=$1")
                     .bind(source).bind(text("capture_id")?).bind(Json(metadata)).bind(digest).execute(&mut **tx).await.map_err(|_|storage_error())?;
             } else if provider == "rfc" && key.starts_with("dataset-head:") {
-                sqlx::query("UPDATE devres_rfc_dataset_heads SET capture_id=$2 WHERE kind=$1")
-                    .bind(text("kind")?)
-                    .bind(text("capture_id")?)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(|_| storage_error())?;
+                sqlx_core::query::query(
+                    "UPDATE devres_rfc_dataset_heads SET capture_id=$2 WHERE kind=$1",
+                )
+                .bind(text("kind")?)
+                .bind(text("capture_id")?)
+                .execute(&mut **tx)
+                .await
+                .map_err(|_| storage_error())?;
             } else if provider == "advisory" && key.starts_with("default:") {
-                sqlx::query("UPDATE devres_advisory_defaults SET snapshot=$2 WHERE format=$1")
-                    .bind(text("format")?)
-                    .bind(text("snapshot")?)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(|_| storage_error())?;
+                sqlx_core::query::query(
+                    "UPDATE devres_advisory_defaults SET snapshot=$2 WHERE format=$1",
+                )
+                .bind(text("format")?)
+                .bind(text("snapshot")?)
+                .execute(&mut **tx)
+                .await
+                .map_err(|_| storage_error())?;
             } else if provider == "advisory" && key.starts_with("state:") {
                 let key = text("key")?;
                 let payload = &data["data"];
                 let digest = payload_integrity::digest("devres_advisory_state", "", key, payload)?;
-                sqlx::query(
+                sqlx_core::query::query(
                     "UPDATE devres_advisory_state SET data=$2,data_integrity=$3 WHERE key=$1",
                 )
                 .bind(key)
@@ -1076,7 +1090,7 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
             } else if provider == "crate" && key.starts_with("job:") {
-                sqlx::query("UPDATE devres_crate_jobs SET metadata_capture=$2,artifact=$3 WHERE source_key=$1")
+                sqlx_core::query::query("UPDATE devres_crate_jobs SET metadata_capture=$2,artifact=$3 WHERE source_key=$1")
                     .bind(text("source_key")?).bind(text("metadata_capture")?).bind(data["artifact"].as_str()).execute(&mut **tx).await.map_err(|_|storage_error())?;
             } else if provider == "crate"
                 && (key.starts_with("observation:") || key.starts_with("snapshot-prepared:"))
@@ -1104,11 +1118,12 @@ impl PgBlobStore {
         cancel: CancellationToken,
         execution: &MigrationExecution,
     ) -> Result<Value> {
-        let active: bool =
-            sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| storage_error())?;
+        let active: bool = sqlx_core::query_scalar::query_scalar(
+            "SELECT active FROM devres_integrity_control WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         if active {
             return Err(Error::invalid("Storage is already BLAKE3 active."));
         }
@@ -1120,7 +1135,7 @@ impl PgBlobStore {
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         let result: Result<()> = async {
         canceled(&cancel)?;
-        let ready: bool = sqlx::query_scalar("SELECT files_complete AND sql_complete AND graph_complete FROM devres_integrity_control WHERE singleton FOR UPDATE")
+        let ready: bool = sqlx_core::query_scalar::query_scalar("SELECT files_complete AND sql_complete AND graph_complete FROM devres_integrity_control WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
         if !ready {
             return Err(Error::integrity(
@@ -1130,21 +1145,21 @@ impl PgBlobStore {
         self.apply_staged_activation(&mut tx).await?;
         for provider in ["whatwg", "w3c", "chromium"] {
             let clear = format!("DELETE FROM devres_{provider}_statistics");
-            sqlx::query(sqlx::AssertSqlSafe(clear))
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(clear))
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
             let query = format!(
                 "INSERT INTO devres_{provider}_statistics(kind,rows,projection_gaps,index_gaps) SELECT kind,count(*)::bigint,COALESCE(sum(CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{{coverage,projection_gaps}}')::bigint,0) ELSE 0 END),0)::bigint,COALESCE(sum(CASE WHEN kind='snapshots' THEN COALESCE((data#>>'{{coverage,index_gaps}}')::bigint,0) ELSE 0 END),0)::bigint FROM devres_{provider}_evidence e WHERE NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace=$1||':'||e.kind AND a.legacy=e.key) GROUP BY kind"
             );
-            sqlx::query(sqlx::AssertSqlSafe(query))
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(query))
                 .bind(provider)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         enforce_constraints(&mut tx).await?;
-        sqlx::query("UPDATE devres_integrity_control SET active=true WHERE singleton")
+        sqlx_core::query::query("UPDATE devres_integrity_control SET active=true WHERE singleton")
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;

@@ -4,7 +4,7 @@ use crate::{integrity, npm::index::NpmIndex};
 use devres_application::npm::NpmStore;
 use devres_domain::{Error, Result};
 use serde_json::Value;
-use sqlx::Row;
+use sqlx_core::row::Row;
 use tokio_util::sync::CancellationToken;
 
 fn missing() -> Error {
@@ -31,10 +31,10 @@ impl PgBlobStore {
             // Use the existing composite primary key instead of repeatedly
             // sorting the entire alias table by a concatenated expression.
             let rows = if let Some((namespace, legacy)) = &after {
-                sqlx::query("SELECT namespace,legacy,canonical FROM devres_content_aliases WHERE (namespace,legacy)>($1,$2) ORDER BY namespace,legacy LIMIT 100")
+                sqlx_core::query::query("SELECT namespace,legacy,canonical FROM devres_content_aliases WHERE (namespace,legacy)>($1,$2) ORDER BY namespace,legacy LIMIT 100")
                     .bind(namespace).bind(legacy).fetch_all(&self.pool).await.map_err(|_| storage_error())?
             } else {
-                sqlx::query("SELECT namespace,legacy,canonical FROM devres_content_aliases ORDER BY namespace,legacy LIMIT 100")
+                sqlx_core::query::query("SELECT namespace,legacy,canonical FROM devres_content_aliases ORDER BY namespace,legacy LIMIT 100")
                     .fetch_all(&self.pool).await.map_err(|_| storage_error())?
             };
             if rows.is_empty() {
@@ -44,14 +44,14 @@ impl PgBlobStore {
                 let namespace: String = row.try_get("namespace").map_err(|_| storage_error())?;
                 let target: String = row.try_get("canonical").map_err(|_| storage_error())?;
                 let exists: bool = match namespace.as_str() {
-                    "body" => sqlx::query_scalar(
+                    "body" => sqlx_core::query_scalar::query_scalar(
                         "SELECT EXISTS(SELECT 1 FROM devres_integrity_files WHERE digest=$1)",
                     )
                     .bind(&target)
                     .fetch_one(&self.pool)
                     .await
                     .map_err(|_| storage_error())?,
-                    "capture" => sqlx::query_scalar(
+                    "capture" => sqlx_core::query_scalar::query_scalar(
                         "SELECT EXISTS(SELECT 1 FROM devres_captures WHERE id=$1)",
                     )
                     .bind(&target)
@@ -61,12 +61,12 @@ impl PgBlobStore {
                     _ => {
                         let (provider, kind) = namespace.split_once(':').ok_or_else(missing)?;
                         if kind == "manifest" {
-                            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_integrity_files WHERE digest=$1)").bind(&target).fetch_one(&self.pool).await.map_err(|_|storage_error())?
+                            sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_integrity_files WHERE digest=$1)").bind(&target).fetch_one(&self.pool).await.map_err(|_|storage_error())?
                         } else if provider == "rfc" {
                             if let Some(kind) = kind.strip_prefix("dataset-") {
-                                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2)").bind(kind).bind(&target).fetch_one(&self.pool).await.map_err(|_|storage_error())?
+                                sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2)").bind(kind).bind(&target).fetch_one(&self.pool).await.map_err(|_|storage_error())?
                             } else if kind == "snapshots" {
-                                sqlx::query_scalar(
+                                sqlx_core::query_scalar::query_scalar(
                                     "SELECT EXISTS(SELECT 1 FROM devres_rfc_snapshots WHERE id=$1)",
                                 )
                                 .bind(&target)
@@ -85,11 +85,13 @@ impl PgBlobStore {
                                 _ => return Err(missing()),
                             };
                             let query = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=$1)");
-                            sqlx::query_scalar(sqlx::AssertSqlSafe(query))
-                                .bind(&target)
-                                .fetch_one(&self.pool)
-                                .await
-                                .map_err(|_| storage_error())?
+                            sqlx_core::query_scalar::query_scalar(
+                                sqlx_core::sql_str::AssertSqlSafe(query),
+                            )
+                            .bind(&target)
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(|_| storage_error())?
                         } else if provider == "advisory" && matches!(kind, "records" | "snapshots")
                         {
                             let table = if kind == "records" {
@@ -98,11 +100,13 @@ impl PgBlobStore {
                                 "devres_advisory_snapshots"
                             };
                             let query = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=$1)");
-                            sqlx::query_scalar(sqlx::AssertSqlSafe(query))
-                                .bind(&target)
-                                .fetch_one(&self.pool)
-                                .await
-                                .map_err(|_| storage_error())?
+                            sqlx_core::query_scalar::query_scalar(
+                                sqlx_core::sql_str::AssertSqlSafe(query),
+                            )
+                            .bind(&target)
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(|_| storage_error())?
                         } else {
                             let table = match provider {
                                 "mdn" => "devres_mdn_evidence",
@@ -116,12 +120,14 @@ impl PgBlobStore {
                             let query = format!(
                                 "SELECT EXISTS(SELECT 1 FROM {table} WHERE kind=$1 AND key=$2)"
                             );
-                            sqlx::query_scalar(sqlx::AssertSqlSafe(query))
-                                .bind(kind)
-                                .bind(&target)
-                                .fetch_one(&self.pool)
-                                .await
-                                .map_err(|_| storage_error())?
+                            sqlx_core::query_scalar::query_scalar(
+                                sqlx_core::sql_str::AssertSqlSafe(query),
+                            )
+                            .bind(kind)
+                            .bind(&target)
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(|_| storage_error())?
                         }
                     }
                 };
@@ -176,12 +182,14 @@ impl PgBlobStore {
         let digest = if hash.starts_with("blake3:") {
             hash.to_owned()
         } else {
-            sqlx::query_scalar("SELECT digest FROM devres_integrity_files WHERE path=$1")
-                .bind(relative.to_string_lossy().as_ref())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|_| storage_error())?
-                .ok_or_else(missing)?
+            sqlx_core::query_scalar::query_scalar(
+                "SELECT digest FROM devres_integrity_files WHERE path=$1",
+            )
+            .bind(relative.to_string_lossy().as_ref())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| storage_error())?
+            .ok_or_else(missing)?
         };
         // The full physical inventory subsequently recomputes these digests once
         // per file; reference traversal checks the frozen descriptor and length.

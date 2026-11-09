@@ -2428,8 +2428,8 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         config.prefix.push_str("/shared-standards-index-acceptance");
         let cache_limit = config.cache_max_bytes;
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_standards_index_fixture")
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        sqlx_core::query::query("CREATE DATABASE devres_s3_standards_index_fixture")
             .execute(&admin)
             .await
             .unwrap();

@@ -2,7 +2,8 @@
 //! the existing owner connection; blocking envelope work uses command admission.
 use super::*;
 use crate::{GraphPrepared, MigrationExecution, MigrationMap};
-use sqlx::{Postgres, Transaction, postgres::PgRow};
+use sqlx_core::transaction::Transaction;
+use sqlx_postgres::{PgRow, Postgres};
 use std::ops::Range;
 
 const ROWS: usize = 128;
@@ -261,7 +262,7 @@ impl PgBlobStore {
             stop(cancel)?;
             let metadata = {
                 let _timing = execution.timed_phase("crate_artifact_metadata");
-                sqlx::query_as::<_, (String, i64, i64)>(
+                sqlx_core::query_as::query_as::<_, (String, i64, i64)>(
                     "SELECT capture_id,octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT capture_id,bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' AND capture_id>$1 ORDER BY capture_id LIMIT 128) source ORDER BY capture_id",
                 ).bind(&after).fetch_all(&self.pool).await.map_err(|_|storage_error())?
             };
@@ -272,7 +273,7 @@ impl PgBlobStore {
             let reservation = execution.graph_reserve(charge, cancel).await?;
             let rows = {
                 let _timing = execution.timed_phase("crate_artifact_payload");
-                sqlx::query("SELECT capture_id,bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id=ANY($1::text[]) ORDER BY capture_id")
+                sqlx_core::query::query("SELECT capture_id,bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id=ANY($1::text[]) ORDER BY capture_id")
                     .bind(&keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?
             };
             if rows.len() != keys.len()
@@ -321,13 +322,13 @@ impl PgBlobStore {
                     // targets and choose the first occurrence before plain insertion,
                     // avoiding speculative-insertion WAL. Every requested occurrence
                     // still receives the full post-statement stored-target check.
-                    sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) SELECT capture,bytes,provenance,seal FROM (SELECT DISTINCT ON (capture) capture,bytes,provenance,seal,ordinal FROM UNNEST($1::text[],$2::bigint[],$3::jsonb[],$4::text[]) WITH ORDINALITY input(capture,bytes,provenance,seal,ordinal) ORDER BY capture,ordinal) requested WHERE NOT EXISTS (SELECT 1 FROM devres_crate_artifacts retained WHERE retained.capture_id=requested.capture) ORDER BY ordinal")
+                    sqlx_core::query::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) SELECT capture,bytes,provenance,seal FROM (SELECT DISTINCT ON (capture) capture,bytes,provenance,seal,ordinal FROM UNNEST($1::text[],$2::bigint[],$3::jsonb[],$4::text[]) WITH ORDINALITY input(capture,bytes,provenance,seal,ordinal) ORDER BY capture,ordinal) requested WHERE NOT EXISTS (SELECT 1 FROM devres_crate_artifacts retained WHERE retained.capture_id=requested.capture) ORDER BY ordinal")
                         .bind(&captures).bind(&lengths).bind(&provenance).bind(&seals).execute(&mut *tx).await.map_err(|_|storage_error())?;
                     drop(insert);
                     // Compare canonical JSON text and the freshly computed seal rather
                     // than trusting a skipped insert or fetching unbounded targets.
                     let _verify = execution.timed_phase("crate_artifact_target_check");
-                    let verified: bool = sqlx::query_scalar("SELECT count(*)=$5 AND COALESCE(bool_and(COALESCE(retained.bytes=requested.bytes AND retained.provenance::text=requested.provenance::text AND retained.provenance_integrity=requested.seal,false)),false) FROM UNNEST($1::text[],$2::bigint[],$3::jsonb[],$4::text[]) requested(capture,bytes,provenance,seal) LEFT JOIN devres_crate_artifacts retained ON retained.capture_id=requested.capture")
+                    let verified: bool = sqlx_core::query_scalar::query_scalar("SELECT count(*)=$5 AND COALESCE(bool_and(COALESCE(retained.bytes=requested.bytes AND retained.provenance::text=requested.provenance::text AND retained.provenance_integrity=requested.seal,false)),false) FROM UNNEST($1::text[],$2::bigint[],$3::jsonb[],$4::text[]) requested(capture,bytes,provenance,seal) LEFT JOIN devres_crate_artifacts retained ON retained.capture_id=requested.capture")
                         .bind(&captures).bind(&lengths).bind(&provenance).bind(&seals).bind(batch.len() as i64).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
                     if !verified {
                         return Err(Error::integrity("Canonical crate artifact differs from retained source."));
@@ -364,14 +365,14 @@ impl PgBlobStore {
         let mut committed = 0_u64;
         loop {
             stop(cancel)?;
-            let metadata = sqlx::query_as::<_, (i64, i64, i64)>("SELECT sequence,octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE capture_id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 128) source ORDER BY sequence")
+            let metadata = sqlx_core::query_as::query_as::<_, (i64, i64, i64)>("SELECT sequence,octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE capture_id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 128) source ORDER BY sequence")
                 .bind(after).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
             let (keys, charge) = metadata_window(metadata, execution)?;
             if keys.is_empty() {
                 break;
             }
             let reservation = execution.graph_reserve(charge, cancel).await?;
-            let rows = sqlx::query("SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE sequence=ANY($1::bigint[]) ORDER BY sequence")
+            let rows = sqlx_core::query::query("SELECT sequence,capture_id,observed_at,transport,provenance,provenance_integrity FROM devres_crate_observations WHERE sequence=ANY($1::bigint[]) ORDER BY sequence")
                 .bind(&keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
             if rows.len() != keys.len()
                 || rows
@@ -438,13 +439,13 @@ impl PgBlobStore {
         let result = async {
             {
                 let mut owner=self.owner.lock().await;
-                sqlx::query("DROP TABLE IF EXISTS pg_temp.devres_crate_migration_keys").execute(&mut *owner).await.map_err(|_|storage_error())?;
-                sqlx::query("CREATE TEMP TABLE devres_crate_migration_keys(ordinal bigint PRIMARY KEY,name text NOT NULL,version text NOT NULL) ON COMMIT PRESERVE ROWS").execute(&mut *owner).await.map_err(|_|storage_error())?;
-                let ambiguous:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>'' GROUP BY name||'@'||version HAVING count(*)>1)").bind(old).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
+                sqlx_core::query::query("DROP TABLE IF EXISTS pg_temp.devres_crate_migration_keys").execute(&mut *owner).await.map_err(|_|storage_error())?;
+                sqlx_core::query::query("CREATE TEMP TABLE devres_crate_migration_keys(ordinal bigint PRIMARY KEY,name text NOT NULL,version text NOT NULL) ON COMMIT PRESERVE ROWS").execute(&mut *owner).await.map_err(|_|storage_error())?;
+                let ambiguous:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>'' GROUP BY name||'@'||version HAVING count(*)>1)").bind(old).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
                 if ambiguous {return Err(Error::integrity("Ambiguous retained crate staging order."));}
                 stop(cancel)?;
                 // Await the owner query even if cancellation arrives while it runs.
-                sqlx::query("INSERT INTO pg_temp.devres_crate_migration_keys SELECT row_number() OVER(ORDER BY name||'@'||version),name,version FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>''").bind(old).execute(&mut *owner).await.map_err(|_|storage_error())?;
+                sqlx_core::query::query("INSERT INTO pg_temp.devres_crate_migration_keys SELECT row_number() OVER(ORDER BY name||'@'||version),name,version FROM devres_crate_staging WHERE inventory=$1 AND name||'@'||version>''").bind(old).execute(&mut *owner).await.map_err(|_|storage_error())?;
             }
             let mut after=0_i64;
             let mut committed=0_u64;
@@ -452,7 +453,7 @@ impl PgBlobStore {
                 stop(cancel)?;
                 let positions:Vec<(i64,i64,i64)>={
                     let mut owner=self.owner.lock().await;
-                    sqlx::query_as("SELECT keys.ordinal,octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM pg_temp.devres_crate_migration_keys keys JOIN devres_crate_staging source ON source.inventory=$1 AND source.name=keys.name AND source.version=keys.version WHERE keys.ordinal>$2 ORDER BY keys.ordinal LIMIT 128")
+                    sqlx_core::query_as::query_as("SELECT keys.ordinal,octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM pg_temp.devres_crate_migration_keys keys JOIN devres_crate_staging source ON source.inventory=$1 AND source.name=keys.name AND source.version=keys.version WHERE keys.ordinal>$2 ORDER BY keys.ordinal LIMIT 128")
                         .bind(old).bind(after).fetch_all(&mut *owner).await.map_err(|_|storage_error())?
                 };
                 let (ordinals,charge)=metadata_window(positions,execution)?;
@@ -462,7 +463,7 @@ impl PgBlobStore {
                 // Materialize them only after the complete input is charged.
                 let keys:Vec<(i64,String,String)>={
                     let mut owner=self.owner.lock().await;
-                    sqlx::query_as("SELECT ordinal,name,version FROM pg_temp.devres_crate_migration_keys WHERE ordinal=ANY($1::bigint[]) ORDER BY ordinal")
+                    sqlx_core::query_as::query_as("SELECT ordinal,name,version FROM pg_temp.devres_crate_migration_keys WHERE ordinal=ANY($1::bigint[]) ORDER BY ordinal")
                         .bind(&ordinals).fetch_all(&mut *owner).await.map_err(|_|storage_error())?
                 };
                 if keys.len()!=ordinals.len() || keys.iter().zip(&ordinals).any(|((ordinal,_,_),expected)|ordinal!=expected){
@@ -470,7 +471,7 @@ impl PgBlobStore {
                 }
                 let names:Vec<&str>=keys.iter().map(|(_,name,_)|name.as_str()).collect();
                 let versions:Vec<&str>=keys.iter().map(|(_,_,version)|version.as_str()).collect();
-                let rows=sqlx::query("SELECT source.* FROM UNNEST($2::text[],$3::text[]) WITH ORDINALITY requested(name,version,ordinal) JOIN devres_crate_staging source ON source.inventory=$1 AND source.name=requested.name AND source.version=requested.version ORDER BY requested.ordinal")
+                let rows=sqlx_core::query::query("SELECT source.* FROM UNNEST($2::text[],$3::text[]) WITH ORDINALITY requested(name,version,ordinal) JOIN devres_crate_staging source ON source.inventory=$1 AND source.name=requested.name AND source.version=requested.version ORDER BY requested.ordinal")
                     .bind(old).bind(&names).bind(&versions).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
                 if rows.len()!=keys.len() || rows.iter().zip(&keys).any(|(row,(_,name,version))| row.try_get::<String,_>("name").ok().as_ref()!=Some(name)||row.try_get::<String,_>("version").ok().as_ref()!=Some(version)){
                     return Err(Error::integrity("Crate staging source window changed."));
@@ -490,9 +491,9 @@ impl PgBlobStore {
                     let mut owner=self.owner.lock().await;
                     let mut tx=owner.begin().await.map_err(|_|storage_error())?;
                     let result=async{
-                        sqlx::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) SELECT $1,name,version,metadata,record,seal FROM UNNEST($2::text[],$3::text[],$4::text[],$5::jsonb[],$6::text[]) WITH ORDINALITY requested(name,version,metadata,record,seal,ordinal) ORDER BY ordinal ON CONFLICT DO NOTHING")
+                        sqlx_core::query::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) SELECT $1,name,version,metadata,record,seal FROM UNNEST($2::text[],$3::text[],$4::text[],$5::jsonb[],$6::text[]) WITH ORDINALITY requested(name,version,metadata,record,seal,ordinal) ORDER BY ordinal ON CONFLICT DO NOTHING")
                             .bind(new).bind(&names).bind(&versions).bind(&metadata).bind(&records).bind(&seals).execute(&mut *tx).await.map_err(|_|storage_error())?;
-                        let verified:bool=sqlx::query_scalar("SELECT count(*)=$7 AND COALESCE(bool_and(COALESCE(retained.metadata_capture=requested.metadata AND retained.record::text=requested.record::text AND retained.record_integrity=requested.seal,false)),false) FROM UNNEST($2::text[],$3::text[],$4::text[],$5::jsonb[],$6::text[]) requested(name,version,metadata,record,seal) LEFT JOIN devres_crate_staging retained ON retained.inventory=$1 AND retained.name=requested.name AND retained.version=requested.version")
+                        let verified:bool=sqlx_core::query_scalar::query_scalar("SELECT count(*)=$7 AND COALESCE(bool_and(COALESCE(retained.metadata_capture=requested.metadata AND retained.record::text=requested.record::text AND retained.record_integrity=requested.seal,false)),false) FROM UNNEST($2::text[],$3::text[],$4::text[],$5::jsonb[],$6::text[]) requested(name,version,metadata,record,seal) LEFT JOIN devres_crate_staging retained ON retained.inventory=$1 AND retained.name=requested.name AND retained.version=requested.version")
                             .bind(new).bind(&names).bind(&versions).bind(&metadata).bind(&records).bind(&seals).bind(batch.len() as i64).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
                         if !verified{return Err(Error::integrity("Canonical crate staging differs from retained source."));}
                         Ok(())
@@ -508,10 +509,11 @@ impl PgBlobStore {
         }.await;
         // Clean the catalogue on both success and cooperative failure. Its session
         // also drops it if owner loss makes cleanup impossible.
-        let cleanup = sqlx::query("DROP TABLE IF EXISTS pg_temp.devres_crate_migration_keys")
-            .execute(&mut *self.owner.lock().await)
-            .await
-            .map_err(|_| storage_error());
+        let cleanup =
+            sqlx_core::query::query("DROP TABLE IF EXISTS pg_temp.devres_crate_migration_keys")
+                .execute(&mut *self.owner.lock().await)
+                .await
+                .map_err(|_| storage_error());
         match result {
             Err(error) => Err(error),
             Ok(()) => cleanup.map(|_| ()),
@@ -519,9 +521,12 @@ impl PgBlobStore {
     }
 }
 
-async fn replay_observation(tx: &mut sqlx::PgConnection, row: &ObservationRow) -> Result<()> {
+async fn replay_observation(
+    tx: &mut sqlx_postgres::PgConnection,
+    row: &ObservationRow,
+) -> Result<()> {
     let checkpoint = format!("observation:{}", row.legacy_sequence);
-    let existing=sqlx::query("SELECT CASE WHEN octet_length(data::text)<=4096 THEN data ELSE NULL END AS data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1").bind(&checkpoint).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
+    let existing=sqlx_core::query::query("SELECT CASE WHEN octet_length(data::text)<=4096 THEN data ELSE NULL END AS data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1").bind(&checkpoint).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
     if let Some(receipt) = existing {
         let value = payload_integrity::checked(
             "devres_integrity_staged_state",
@@ -553,7 +558,7 @@ async fn replay_observation(tx: &mut sqlx::PgConnection, row: &ObservationRow) -
                 &row.provenance,
             ),
         )?;
-        let target: Option<bool> = sqlx::query_scalar("SELECT capture_id=$3 AND observed_at=$4 AND transport=$5 AND provenance_integrity=$6 AND provenance::text=$2::jsonb::text FROM devres_crate_observations WHERE sequence=$1")
+        let target: Option<bool> = sqlx_core::query_scalar::query_scalar("SELECT capture_id=$3 AND observed_at=$4 AND transport=$5 AND provenance_integrity=$6 AND provenance::text=$2::jsonb::text FROM devres_crate_observations WHERE sequence=$1")
             .bind(sequence).bind(Json(&row.provenance)).bind(&row.capture).bind(row.time).bind(&row.transport).bind(&expected_seal)
             .fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
         let matches =
@@ -568,7 +573,7 @@ async fn replay_observation(tx: &mut sqlx::PgConnection, row: &ObservationRow) -
             append_crate_observation(tx, &row.capture, row.time, &row.transport, &row.provenance)
                 .await?;
         let receipt = json!({"legacy_sequence":row.legacy_sequence,"sequence":sequence,"capture_id":row.capture});
-        sqlx::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES('crate',$1,$2,$3)").bind(&checkpoint).bind(Json(&receipt)).bind(payload_integrity::digest("devres_integrity_staged_state","crate",&checkpoint,&receipt)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx_core::query::query("INSERT INTO devres_integrity_staged_state(provider,key,data,data_integrity) VALUES('crate',$1,$2,$3)").bind(&checkpoint).bind(Json(&receipt)).bind(payload_integrity::digest("devres_integrity_staged_state","crate",&checkpoint,&receipt)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
     }
     Ok(())
 }

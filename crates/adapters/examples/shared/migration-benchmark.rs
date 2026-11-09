@@ -10,7 +10,7 @@ use devres_application::{
 };
 use devres_domain::{FetchRequest, FetchResponse, Validators};
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx_core::row::Row;
 use std::{collections::BTreeMap, error::Error, path::Path, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -60,7 +60,7 @@ fn payload_seal(
 /// Build a real retained index through public offline maintenance; no provider is called.
 async fn seed_graphs(
     store: &Arc<PgBlobStore>,
-    pool: &sqlx::PgPool,
+    pool: &sqlx_postgres::PgPool,
     root: &Path,
     snapshots: usize,
     generations: usize,
@@ -174,7 +174,7 @@ async fn seed_graphs(
         frozen.push(snapshot);
     }
     // Only disposable fixture state is converted into retained legacy evidence.
-    sqlx::query("DELETE FROM devres_rfc_snapshots")
+    sqlx_core::query::query("DELETE FROM devres_rfc_snapshots")
         .execute(pool)
         .await?;
     for ordinal in 0..snapshots {
@@ -184,15 +184,15 @@ async fn seed_graphs(
         snapshot.created_at = 1_700_000_000 + ordinal as i64;
         snapshot.complete = false;
         snapshot.coverage = json!({"synthetic":true,"documents":GRAPH_DOCUMENTS,"ordinal":ordinal});
-        let order: i64 = sqlx::query_scalar(
+        let order: i64 = sqlx_core::query_scalar::query_scalar(
             "SELECT nextval(pg_get_serial_sequence('devres_rfc_snapshots','published_order'))",
         )
         .fetch_one(pool)
         .await?;
         let data = serde_json::to_value(&snapshot)?;
         let payload = json!({"published_order":order,"catalogue_capture":snapshot.catalogue_capture,"errata_capture":snapshot.errata_capture,"created_at":snapshot.created_at,"complete":snapshot.complete,"data":data});
-        sqlx::query("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,data,created_at,complete,published_order,data_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
-            .bind(&snapshot.id).bind(&snapshot.catalogue_capture).bind(&snapshot.errata_capture).bind(sqlx::types::Json(&data))
+        sqlx_core::query::query("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,data,created_at,complete,published_order,data_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+            .bind(&snapshot.id).bind(&snapshot.catalogue_capture).bind(&snapshot.errata_capture).bind(sqlx_core::types::Json(&data))
             .bind(snapshot.created_at).bind(snapshot.complete).bind(order).bind(payload_seal("devres_rfc_snapshots","",&snapshot.id,&payload)?).execute(pool).await?;
     }
     // Independent provider lanes with retained evidence exercise cross-provider scheduling.
@@ -203,30 +203,31 @@ async fn seed_graphs(
         for ordinal in 0..snapshots * 4 {
             let key = format!("fixture-graph-{ordinal:08}");
             let data = json!({"synthetic":true,"ordinal":ordinal,"payload":"public graph work ".repeat(4096)});
-            let sequence: i64 =
-                sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence($1,'sequence'))")
-                    .bind(table)
-                    .fetch_one(pool)
-                    .await?;
+            let sequence: i64 = sqlx_core::query_scalar::query_scalar(
+                "SELECT nextval(pg_get_serial_sequence($1,'sequence'))",
+            )
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
             let sequence_seal = devres_adapters::integrity::canonical_hash(
                 &json!({"version":1,"namespace":table,"kind":kind,"key":key,"sequence":sequence}),
             )?;
-            sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO {table}(sequence,kind,key,data,data_integrity,sequence_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6)")))
-                .bind(sequence).bind(kind).bind(&key).bind(sqlx::types::Json(&data)).bind(payload_seal(table,kind,&key,&data)?).bind(sequence_seal).execute(pool).await?;
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!("INSERT INTO {table}(sequence,kind,key,data,data_integrity,sequence_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6)")))
+                .bind(sequence).bind(kind).bind(&key).bind(sqlx_core::types::Json(&data)).bind(payload_seal(table,kind,&key,&data)?).bind(sequence_seal).execute(pool).await?;
         }
     }
     Ok(())
 }
 
-async fn require_empty_database(pool: &sqlx::PgPool) -> Result<()> {
+async fn require_empty_database(pool: &sqlx_postgres::PgPool) -> Result<()> {
     // Inspect only PostgreSQL catalogs, in a read-only transaction, before any
     // schema initialization or fixture-root creation. Never reinterpret an
     // existing application database as disposable benchmark state.
     let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION READ ONLY")
+    sqlx_core::query::query("SET TRANSACTION READ ONLY")
         .execute(&mut *tx)
         .await?;
-    let empty: bool = sqlx::query_scalar(
+    let empty: bool = sqlx_core::query_scalar::query_scalar(
         "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace WHERE NOT starts_with(nspname,'pg_') AND nspname NOT IN ('public','information_schema')) \
          AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public') \
          AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public') \
@@ -242,7 +243,7 @@ async fn require_empty_database(pool: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn require_fixture(pool: &sqlx::PgPool, root: &Path) -> Result<()> {
+async fn require_fixture(pool: &sqlx_postgres::PgPool, root: &Path) -> Result<()> {
     let marker = root.join(MARKER_FILE);
     let metadata = std::fs::symlink_metadata(&marker)?;
     if !metadata.is_file()
@@ -252,21 +253,23 @@ async fn require_fixture(pool: &sqlx::PgPool, root: &Path) -> Result<()> {
         return Err("benchmark fixture-root marker mismatch".into());
     }
     let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION READ ONLY")
+    sqlx_core::query::query("SET TRANSACTION READ ONLY")
         .execute(&mut *tx)
         .await?;
-    let exists: bool =
-        sqlx::query_scalar("SELECT to_regclass('public.devres_benchmark_fixture') IS NOT NULL")
-            .fetch_one(&mut *tx)
-            .await?;
+    let exists: bool = sqlx_core::query_scalar::query_scalar(
+        "SELECT to_regclass('public.devres_benchmark_fixture') IS NOT NULL",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     if !exists {
         tx.rollback().await?;
         return Err("benchmark database fixture marker missing".into());
     }
-    let markers: Vec<String> =
-        sqlx::query_scalar("SELECT identity FROM public.devres_benchmark_fixture")
-            .fetch_all(&mut *tx)
-            .await?;
+    let markers: Vec<String> = sqlx_core::query_scalar::query_scalar(
+        "SELECT identity FROM public.devres_benchmark_fixture",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
     tx.rollback().await?;
     if markers != [FIXTURE_MARKER] {
         return Err("benchmark database fixture marker mismatch".into());
@@ -313,13 +316,13 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     if root.exists() || args.len() > 8 {
         return Err("prepare requires a new fixture root and bounded arguments".into());
     }
-    let pool = sqlx::PgPool::connect(url).await?;
+    let pool = sqlx_postgres::PgPool::connect(url).await?;
     require_empty_database(&pool).await?;
     std::fs::create_dir(root)?;
     let store = Arc::new(PgBlobStore::connect(url, root).await?);
-    sqlx::raw_sql("CREATE TABLE public.devres_benchmark_fixture(singleton boolean PRIMARY KEY CHECK(singleton),identity text NOT NULL)")
+    sqlx_core::raw_sql::raw_sql("CREATE TABLE public.devres_benchmark_fixture(singleton boolean PRIMARY KEY CHECK(singleton),identity text NOT NULL)")
         .execute(&pool).await?;
-    sqlx::query("INSERT INTO public.devres_benchmark_fixture VALUES(true,$1)")
+    sqlx_core::query::query("INSERT INTO public.devres_benchmark_fixture VALUES(true,$1)")
         .bind(FIXTURE_MARKER)
         .execute(&pool)
         .await?;
@@ -352,10 +355,10 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     // Empty provider graphs still traverse the real replay/activation gates.
     // Fresh initialization installed the final RFC constraint already; remove
     // it only in this disposable conversion so activation installs it normally.
-    sqlx::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress; ALTER TABLE devres_advisory_records ALTER COLUMN data_integrity DROP NOT NULL; ALTER TABLE devres_rfc_jobs DROP CONSTRAINT devres_rfc_capture_integrity_required;")
+    sqlx_core::raw_sql::raw_sql("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false; DELETE FROM devres_integrity_graph_progress; ALTER TABLE devres_advisory_records ALTER COLUMN data_integrity DROP NOT NULL; ALTER TABLE devres_rfc_jobs DROP CONSTRAINT devres_rfc_capture_integrity_required;")
         .execute(&pool).await?;
     if graph_snapshots > 0 || crate_artifacts > 0 {
-        sqlx::query("DELETE FROM devres_integrity_provider_cutoffs")
+        sqlx_core::query::query("DELETE FROM devres_integrity_provider_cutoffs")
             .execute(&pool)
             .await?;
     }
@@ -363,9 +366,9 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     for ordinal in 0..rows {
         let data = json!({"synthetic":true,"ordinal":ordinal,"payload":payload,
             "exact_number":serde_json::from_str::<Value>("12345678901234567890.123450000")?});
-        sqlx::query("INSERT INTO devres_advisory_records(id,data) VALUES($1,$2)")
+        sqlx_core::query::query("INSERT INTO devres_advisory_records(id,data) VALUES($1,$2)")
             .bind(format!("fixture-{ordinal:08}"))
-            .bind(sqlx::types::Json(data))
+            .bind(sqlx_core::types::Json(data))
             .execute(&pool)
             .await?;
     }
@@ -387,7 +390,7 @@ async fn prepare(url: &str, root: &Path, args: &[String]) -> Result<Value> {
     }
     let directory = std::fs::File::open(root)?;
     directory.sync_all()?;
-    sqlx::query("CHECKPOINT").execute(&pool).await?;
+    sqlx_core::query::query("CHECKPOINT").execute(&pool).await?;
     nix::unistd::syncfs(&directory)?;
     pool.close().await;
     Ok(
@@ -408,7 +411,7 @@ fn proc_values(path: &str) -> BTreeMap<String, u64> {
         .collect()
 }
 
-async fn metrics(pool: &sqlx::PgPool) -> Result<Value> {
+async fn metrics(pool: &sqlx_postgres::PgPool) -> Result<Value> {
     let stat = std::fs::read_to_string("/proc/self/stat")?;
     let fields: Vec<_> = stat
         .rsplit_once(')')
@@ -422,10 +425,11 @@ async fn metrics(pool: &sqlx::PgPool) -> Result<Value> {
             .ok_or("missing process counter")?
             .parse()?)
     };
-    let wal: String =
-        sqlx::query_scalar("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')::text")
-            .fetch_one(pool)
-            .await?;
+    let wal: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')::text",
+    )
+    .fetch_one(pool)
+    .await?;
     let io = proc_values("/proc/self/io");
     let status = proc_values("/proc/self/status");
     Ok(json!({"user_ticks":ticks(11)?,"system_ticks":ticks(12)?,
@@ -444,7 +448,7 @@ fn open_file_descriptors() -> Result<usize> {
 
 async fn phase<F, T>(
     name: &str,
-    pool: &sqlx::PgPool,
+    pool: &sqlx_postgres::PgPool,
     work: F,
     reports: &mut Vec<Value>,
 ) -> Result<T>
@@ -482,10 +486,10 @@ where
     Ok(result)
 }
 
-async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
+async fn fingerprint(pool: &sqlx_postgres::PgPool, root: &Path) -> Result<String> {
     use futures::TryStreamExt;
     let graph_fixture: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_snapshots)")
+        sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_snapshots)")
             .fetch_one(pool)
             .await?;
     let mut digest = blake3::Hasher::new();
@@ -519,7 +523,7 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
         ]);
     }
     if crate_fixture::artifact_count(pool).await? > 0 {
-        let sequences: Vec<String> = sqlx::query_scalar("SELECT jsonb_build_object('name',sequencename,'last_value',last_value)::text FROM pg_sequences WHERE schemaname='public' AND starts_with(sequencename,'devres_crate_') ORDER BY sequencename").fetch_all(pool).await?;
+        let sequences: Vec<String> = sqlx_core::query_scalar::query_scalar("SELECT jsonb_build_object('name',sequencename,'last_value',last_value)::text FROM pg_sequences WHERE schemaname='public' AND starts_with(sequencename,'devres_crate_') ORDER BY sequencename").fetch_all(pool).await?;
         digest.update(b"crate-sequence-state");
         for sequence in sequences {
             digest.update(sequence.as_bytes());
@@ -537,7 +541,8 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
         } else {
             format!("SELECT to_jsonb(t)::text AS data FROM {table} t ORDER BY to_jsonb(t)::text")
         };
-        let mut rows = sqlx::query(sqlx::AssertSqlSafe(query)).fetch(pool);
+        let mut rows =
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(query)).fetch(pool);
         while let Some(row) = rows.try_next().await? {
             let data: String = row.try_get("data")?;
             digest.update(&(data.len() as u64).to_le_bytes());
@@ -609,23 +614,26 @@ async fn fingerprint(pool: &sqlx::PgPool, root: &Path) -> Result<String> {
     Ok(digest.finalize().to_hex().to_string())
 }
 
-async fn readback(url: &str, root: &Path, pool: &sqlx::PgPool) -> Result<String> {
+async fn readback(url: &str, root: &Path, pool: &sqlx_postgres::PgPool) -> Result<String> {
     require_fixture(pool, root).await?;
     let store = Arc::new(PgBlobStore::connect(url, root).await?);
     store.check_health().await?;
-    let id: String = sqlx::query_scalar("SELECT capture_id FROM devres_heads WHERE source_key=$1")
-        .bind(KEY)
-        .fetch_one(pool)
-        .await?;
+    let id: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT capture_id FROM devres_heads WHERE source_key=$1",
+    )
+    .bind(KEY)
+    .fetch_one(pool)
+    .await?;
     if store.capture(&id).await?.body.as_ref() != BODY {
         return Err("retained capture mismatch".into());
     }
     crate_fixture::readback(&store, pool).await?;
     let durable = fingerprint(pool, root).await?;
-    let snapshots: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM devres_rfc_snapshots ORDER BY published_order")
-            .fetch_all(pool)
-            .await?;
+    let snapshots: Vec<String> = sqlx_core::query_scalar::query_scalar(
+        "SELECT id FROM devres_rfc_snapshots ORDER BY published_order",
+    )
+    .fetch_all(pool)
+    .await?;
     if snapshots.is_empty() {
         return Ok(durable);
     }
@@ -679,14 +687,14 @@ async fn run(
         )?,
     )?;
     execution.enable_progress();
-    let pool = sqlx::PgPool::connect(url).await?;
+    let pool = sqlx_postgres::PgPool::connect(url).await?;
     require_fixture(&pool, root).await?;
-    let graph_snapshots: i64 = sqlx::query_scalar(
+    let graph_snapshots: i64 = sqlx_core::query_scalar::query_scalar(
         "SELECT count(*) FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%'",
     )
     .fetch_one(&pool)
     .await?;
-    let graph_generations: i64 = sqlx::query_scalar(
+    let graph_generations: i64 = sqlx_core::query_scalar::query_scalar(
         "SELECT count(DISTINCT data->>'index_path') FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%'",
     ).fetch_one(&pool).await?;
     let crate_artifacts = crate_fixture::artifact_count(&pool).await?;
@@ -827,7 +835,7 @@ async fn main() -> Result<()> {
             .await?
         }
         "check" if args.len() == 2 => {
-            let pool = sqlx::PgPool::connect(&url).await?;
+            let pool = sqlx_postgres::PgPool::connect(&url).await?;
             let digest = readback(&url, root, &pool).await?;
             pool.close().await;
             json!({"durable_fingerprint":digest,"restored_startup_readback":true})
@@ -846,29 +854,31 @@ mod tests {
     #[ignore = "requires disposable PostgreSQL; never use a retained database"]
     async fn populated_database_is_rejected_without_root_creation_or_sql_changes() -> Result<()> {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
-        let admin = sqlx::PgPool::connect(&base).await?;
+        let admin = sqlx_postgres::PgPool::connect(&base).await?;
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let database = format!("devres_benchmark_guard_{suffix}");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await?;
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await?;
         let mut url = url::Url::parse(&base)?;
         url.set_path(&format!("/{database}"));
-        let pool = sqlx::PgPool::connect(url.as_str()).await?;
-        sqlx::raw_sql("CREATE TABLE sentinel(value text NOT NULL); INSERT INTO sentinel VALUES('must remain unchanged')")
+        let pool = sqlx_postgres::PgPool::connect(url.as_str()).await?;
+        sqlx_core::raw_sql::raw_sql("CREATE TABLE sentinel(value text NOT NULL); INSERT INTO sentinel VALUES('must remain unchanged')")
             .execute(&pool).await?;
         let temporary = tempfile::tempdir_in("/tmp")?;
         let root = temporary.path().join("uncreated");
         let result = prepare(url.as_str(), &root, &[]).await;
         assert!(result.is_err());
         assert!(!root.exists(), "rejection precedes root creation");
-        let sentinel: String = sqlx::query_scalar("SELECT value FROM sentinel")
+        let sentinel: String = sqlx_core::query_scalar::query_scalar("SELECT value FROM sentinel")
             .fetch_one(&pool)
             .await?;
         assert_eq!(sentinel, "must remain unchanged");
-        let relations: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'")
+        let relations: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'")
             .fetch_one(&pool).await?;
         assert_eq!(relations, 1, "no application schema was initialized");
         assert!(require_fixture(&pool, temporary.path()).await.is_err());
@@ -877,14 +887,14 @@ mod tests {
             require_fixture(&pool, temporary.path()).await.is_err(),
             "file marker alone cannot authorize a database"
         );
-        sqlx::raw_sql("DROP TABLE sentinel; CREATE TABLE devres_benchmark_fixture(identity text); INSERT INTO devres_benchmark_fixture VALUES('wrong fixture')")
+        sqlx_core::raw_sql::raw_sql("DROP TABLE sentinel; CREATE TABLE devres_benchmark_fixture(identity text); INSERT INTO devres_benchmark_fixture VALUES('wrong fixture')")
             .execute(&pool).await?;
         assert!(
             require_fixture(&pool, temporary.path()).await.is_err(),
             "mismatched SQL marker is rejected"
         );
         pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"
         )))
         .execute(&admin)
@@ -897,14 +907,16 @@ mod tests {
     #[ignore = "requires disposable PostgreSQL; never use a retained database"]
     async fn prepared_fixture_migrates_verifies_activates_and_reopens() -> Result<()> {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
-        let admin = sqlx::PgPool::connect(&base).await?;
+        let admin = sqlx_postgres::PgPool::connect(&base).await?;
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let database = format!("devres_benchmark_happy_{suffix}");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await?;
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await?;
         let mut url = url::Url::parse(&base)?;
         url.set_path(&format!("/{database}"));
         let temporary = tempfile::tempdir_in("/tmp")?;
@@ -920,13 +932,14 @@ mod tests {
             4,
             "migration, verify, activation and startup all completed"
         );
-        let pool = sqlx::PgPool::connect(url.as_str()).await?;
-        let active: bool =
-            sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
-                .fetch_one(&pool)
-                .await?;
+        let pool = sqlx_postgres::PgPool::connect(url.as_str()).await?;
+        let active: bool = sqlx_core::query_scalar::query_scalar(
+            "SELECT active FROM devres_integrity_control WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await?;
         assert!(active);
-        let required_constraints: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_constraint WHERE conrelid='devres_rfc_jobs'::regclass AND conname='devres_rfc_capture_integrity_required'")
+        let required_constraints: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM pg_constraint WHERE conrelid='devres_rfc_jobs'::regclass AND conname='devres_rfc_capture_integrity_required'")
             .fetch_one(&pool).await?;
         assert_eq!(
             required_constraints, 1,
@@ -938,7 +951,7 @@ mod tests {
             Some(reopened.as_str())
         );
         pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"
         )))
         .execute(&admin)
@@ -951,16 +964,18 @@ mod tests {
     #[ignore = "requires disposable PostgreSQL; real frozen-index replay, no provider traffic"]
     async fn graph_fixture_has_serial_parallel_semantic_parity_and_bounded_work() -> Result<()> {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
-        let admin = sqlx::PgPool::connect(&base).await?;
+        let admin = sqlx_postgres::PgPool::connect(&base).await?;
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let mut baseline = None;
         for workers in [1, 2] {
             let database = format!("devres_benchmark_graph_{suffix}_{workers}");
-            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-                .execute(&admin)
-                .await?;
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+                "CREATE DATABASE {database}"
+            )))
+            .execute(&admin)
+            .await?;
             let mut url = url::Url::parse(&base)?;
             url.set_path(&format!("/{database}"));
             let temporary = tempfile::tempdir_in("/tmp")?;
@@ -1006,9 +1021,9 @@ mod tests {
             } else {
                 baseline = Some(report["durable_fingerprint"].clone());
             }
-            let pool = sqlx::PgPool::connect(url.as_str()).await?;
+            let pool = sqlx_postgres::PgPool::connect(url.as_str()).await?;
             let verified = fingerprint(&pool, &root).await?;
-            let body: String = sqlx::query_scalar("SELECT c.body_hash FROM devres_captures c JOIN devres_heads h ON h.capture_id=c.id WHERE h.source_key='rfc:text:1'")
+            let body: String = sqlx_core::query_scalar::query_scalar("SELECT c.body_hash FROM devres_captures c JOIN devres_heads h ON h.capture_id=c.id WHERE h.source_key='rfc:text:1'")
                 .fetch_one(&pool).await?;
             let descriptor = devres_adapters::integrity::evidence_path(
                 &root,
@@ -1023,7 +1038,7 @@ mod tests {
             );
             std::fs::write(&descriptor, original)?;
             assert_eq!(fingerprint(&pool, &root).await?, verified);
-            sqlx::query("DELETE FROM devres_rfc_dataset_heads WHERE kind='catalogue'")
+            sqlx_core::query::query("DELETE FROM devres_rfc_dataset_heads WHERE kind='catalogue'")
                 .execute(&pool)
                 .await?;
             assert_ne!(
@@ -1032,7 +1047,7 @@ mod tests {
                 "catalogue head selection is durable graph evidence"
             );
             pool.close().await;
-            sqlx::query(sqlx::AssertSqlSafe(format!(
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
                 "DROP DATABASE {database} WITH (FORCE)"
             )))
             .execute(&admin)
@@ -1046,16 +1061,18 @@ mod tests {
     #[ignore = "requires disposable PostgreSQL; real retained crate replay, no provider traffic"]
     async fn crate_fixture_has_serial_parallel_parity_and_detects_lost_receipts() -> Result<()> {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
-        let admin = sqlx::PgPool::connect(&base).await?;
+        let admin = sqlx_postgres::PgPool::connect(&base).await?;
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let mut expected = None;
         for workers in [1, 2] {
             let database = format!("devres_benchmark_crate_{suffix}_{workers}");
-            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-                .execute(&admin)
-                .await?;
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+                "CREATE DATABASE {database}"
+            )))
+            .execute(&admin)
+            .await?;
             let mut url = url::Url::parse(&base)?;
             url.set_path(&format!("/{database}"));
             let temporary = tempfile::tempdir_in("/tmp")?;
@@ -1079,7 +1096,7 @@ mod tests {
             } else {
                 expected = Some(result["durable_fingerprint"].clone());
             }
-            let pool = sqlx::PgPool::connect(url.as_str()).await?;
+            let pool = sqlx_postgres::PgPool::connect(url.as_str()).await?;
             assert_eq!(
                 readback(url.as_str(), &root, &pool).await?,
                 result["durable_fingerprint"]
@@ -1087,7 +1104,7 @@ mod tests {
                     .ok_or("missing fingerprint")?
             );
             let original = fingerprint(&pool, &root).await?;
-            sqlx::query("DELETE FROM devres_integrity_staged_state WHERE provider='crate' AND key=(SELECT min(key) FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'observation:%')").execute(&pool).await?;
+            sqlx_core::query::query("DELETE FROM devres_integrity_staged_state WHERE provider='crate' AND key=(SELECT min(key) FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'observation:%')").execute(&pool).await?;
             assert_ne!(
                 fingerprint(&pool, &root).await?,
                 original,
@@ -1100,7 +1117,7 @@ mod tests {
             );
             drop(store);
             pool.close().await;
-            sqlx::query(sqlx::AssertSqlSafe(format!(
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
                 "DROP DATABASE {database} WITH (FORCE)"
             )))
             .execute(&admin)
@@ -1120,14 +1137,16 @@ mod tests {
         };
         let staging = if artifacts > 129 { 4096 } else { 129 };
         let base = std::env::var("DEVRES_TEST_DATABASE_URL")?;
-        let admin = sqlx::PgPool::connect(&base).await?;
+        let admin = sqlx_postgres::PgPool::connect(&base).await?;
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let database = format!("devres_crate_diagnostic_{suffix}");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await?;
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await?;
         let result: Result<_> = async {
             let mut url = url::Url::parse(&base)?;
             url.set_path(&format!("/{database}"));
@@ -1164,16 +1183,17 @@ mod tests {
                 .await?;
             aliases.ensure_healthy()?;
             mappings.ensure_healthy()?;
-            let pool = sqlx::PgPool::connect(url.as_str()).await?;
-            let canonical: i64 = sqlx::query_scalar(
+            let pool = sqlx_postgres::PgPool::connect(url.as_str()).await?;
+            let canonical: i64 = sqlx_core::query_scalar::query_scalar(
                 "SELECT count(*) FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%'",
             )
             .fetch_one(&pool)
             .await?;
-            let active: bool =
-                sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
-                    .fetch_one(&pool)
-                    .await?;
+            let active: bool = sqlx_core::query_scalar::query_scalar(
+                "SELECT active FROM devres_integrity_control WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await?;
             let counters = execution.snapshot();
             let report = json!({"event":"crate_publication_diagnostic", "artifacts":artifacts,
                 "staging_rows_per_inventory":staging,"workers":8,
@@ -1196,7 +1216,7 @@ mod tests {
         .await;
         // This test creates exactly one fresh database. Clean it even when an
         // ordinary migration error occurs; never touch the caller's base database.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"
         )))
         .execute(&admin)

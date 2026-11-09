@@ -439,16 +439,18 @@ async fn explicit_expired_history_is_readable_without_complete_assessment() {
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn npm_schema_publication_restart_immutability_and_owner_fence() {
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let database = format!("devres_npm_fixture_{}_{nonce}", std::process::id());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-        .execute(&admin)
-        .await
-        .unwrap();
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
     let mut url = url::Url::parse(&base).unwrap();
     url.set_path(&format!("/{database}"));
     let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -457,12 +459,14 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
             .await
             .unwrap(),
     );
-    let inspection = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+    let inspection = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&inspection)
-            .await
-            .unwrap(),
+        sqlx_core::query_scalar::query_scalar::<_, i32>(
+            "SELECT version FROM devres_schema WHERE singleton"
+        )
+        .fetch_one(&inspection)
+        .await
+        .unwrap(),
         13
     );
     assert!(
@@ -507,11 +511,13 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
         ids.iter()
             .all(|id| id.starts_with("blake3:") && devres_domain::valid_content_id(id))
     );
-    sqlx::query("DELETE FROM devres_npm_evidence WHERE kind='indexed' AND key=ANY($1::text[])")
-        .bind(&ids)
-        .execute(&inspection)
-        .await
-        .unwrap();
+    sqlx_core::query::query(
+        "DELETE FROM devres_npm_evidence WHERE kind='indexed' AND key=ANY($1::text[])",
+    )
+    .bind(&ids)
+    .execute(&inspection)
+    .await
+    .unwrap();
     assert_eq!(
         store
             .verify_storage(CancellationToken::new())
@@ -524,7 +530,7 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
         "CREATE FUNCTION npm_fixture_interrupt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind='indexed' AND NEW.key='{}' THEN RAISE EXCEPTION 'fixture interrupt'; END IF; RETURN NEW; END $$; CREATE TRIGGER npm_fixture_interrupt BEFORE INSERT ON devres_npm_evidence FOR EACH ROW EXECUTE FUNCTION npm_fixture_interrupt();",
         ids[1]
     );
-    sqlx::raw_sql(sqlx::AssertSqlSafe(ddl))
+    sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(ddl))
         .execute(&inspection)
         .await
         .unwrap();
@@ -541,7 +547,7 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
             "partial markers roll back with the pointer"
         );
     }
-    sqlx::raw_sql("DROP TRIGGER npm_fixture_interrupt ON devres_npm_evidence; DROP FUNCTION npm_fixture_interrupt()").execute(&inspection).await.unwrap();
+    sqlx_core::raw_sql::raw_sql("DROP TRIGGER npm_fixture_interrupt ON devres_npm_evidence; DROP FUNCTION npm_fixture_interrupt()").execute(&inspection).await.unwrap();
     store.npm_commit_index(&old_index, &ids).await.unwrap();
     for id in &ids {
         assert!(store.npm_get("indexed", id).await.unwrap().is_some());
@@ -580,7 +586,7 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
     drop(corpus);
     drop(store);
     for _ in 0..100 {
-        let count:i64=sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&inspection).await.unwrap();
+        let count:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&inspection).await.unwrap();
         if count == 0 {
             break;
         }
@@ -605,7 +611,7 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
     drop(corpus);
     drop(store);
     inspection.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "DROP DATABASE {database} WITH (FORCE)"
     )))
     .execute(&admin)

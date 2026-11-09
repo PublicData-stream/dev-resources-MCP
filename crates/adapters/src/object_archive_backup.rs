@@ -7,7 +7,8 @@ use crate::{
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Connection, PgConnection, Row};
+use sqlx_core::{connection::Connection, row::Row};
+use sqlx_postgres::PgConnection;
 use std::{
     path::Path,
     process::Stdio,
@@ -179,7 +180,7 @@ struct DatabaseEnvironment(Vec<(String, String)>);
 impl DatabaseEnvironment {
     fn new(database_url: &str) -> Result<Self> {
         let original = url::Url::parse(database_url).map_err(|_| unavailable())?;
-        let options: sqlx::postgres::PgConnectOptions =
+        let options: sqlx_postgres::PgConnectOptions =
             database_url.parse().map_err(|_| unavailable())?;
         let host = match options.get_socket() {
             Some(socket) => socket.to_str().ok_or_else(unavailable)?.to_owned(),
@@ -190,12 +191,12 @@ impl DatabaseEnvironment {
                 .to_owned(),
         };
         let mode = match options.get_ssl_mode() {
-            sqlx::postgres::PgSslMode::Disable => "disable",
-            sqlx::postgres::PgSslMode::Allow => "allow",
-            sqlx::postgres::PgSslMode::Prefer => "prefer",
-            sqlx::postgres::PgSslMode::Require => "require",
-            sqlx::postgres::PgSslMode::VerifyCa => "verify-ca",
-            sqlx::postgres::PgSslMode::VerifyFull => "verify-full",
+            sqlx_postgres::PgSslMode::Disable => "disable",
+            sqlx_postgres::PgSslMode::Allow => "allow",
+            sqlx_postgres::PgSslMode::Prefer => "prefer",
+            sqlx_postgres::PgSslMode::Require => "require",
+            sqlx_postgres::PgSslMode::VerifyCa => "verify-ca",
+            sqlx_postgres::PgSslMode::VerifyFull => "verify-full",
         };
         let mut values = vec![
             ("PGHOST".into(), host),
@@ -252,7 +253,7 @@ impl DatabaseEnvironment {
         }
         if matches!(
             options.get_ssl_mode(),
-            sqlx::postgres::PgSslMode::VerifyCa | sqlx::postgres::PgSslMode::VerifyFull
+            sqlx_postgres::PgSslMode::VerifyCa | sqlx_postgres::PgSslMode::VerifyFull
         ) && !values.iter().any(|(key, _)| key == "PGSSLROOTCERT")
         {
             let root = std::env::var_os("SSL_CERT_FILE")
@@ -435,11 +436,12 @@ pub async fn backup(
     let store = Arc::new(
         PgBlobStore::connect_for_object_transfer(database_url, root, source.clone()).await?,
     );
-    let active: String =
-        sqlx::query_scalar("SELECT backend FROM devres_archive_control WHERE singleton")
-            .fetch_one(&store.pool)
-            .await
-            .map_err(|_| unavailable())?;
+    let active: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT backend FROM devres_archive_control WHERE singleton",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .map_err(|_| unavailable())?;
     if active != "s3" {
         return Err(Error::invalid("Backup requires an activated S3 archive."));
     }
@@ -453,11 +455,12 @@ pub async fn backup(
             "Backup requires an empty destination prefix.",
         ));
     }
-    let store_id: String =
-        sqlx::query_scalar("SELECT store_id FROM devres_archive_control WHERE singleton")
-            .fetch_one(&store.pool)
-            .await
-            .map_err(|_| unavailable())?;
+    let store_id: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT store_id FROM devres_archive_control WHERE singleton",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .map_err(|_| unavailable())?;
     let claim = source
         .get_bytes_with_cancel("store.json", 16 * 1024, &cancel)
         .await?;
@@ -487,7 +490,7 @@ pub async fn backup(
     let mut manifest_bytes = 0_u64;
     loop {
         stopping(&cancel)?;
-        let row:Option<(String,String)>=sqlx::query_as(r#"SELECT path,evidence FROM devres_archive_file WHERE complete AND path COLLATE "C">$1 COLLATE "C" ORDER BY path COLLATE "C" LIMIT 1"#).bind(&after).fetch_optional(&store.pool).await.map_err(|_|unavailable())?;
+        let row:Option<(String,String)>=sqlx_core::query_as::query_as(r#"SELECT path,evidence FROM devres_archive_file WHERE complete AND path COLLATE "C">$1 COLLATE "C" ORDER BY path COLLATE "C" LIMIT 1"#).bind(&after).fetch_optional(&store.pool).await.map_err(|_|unavailable())?;
         let Some((path, encoded)) = row else {
             break;
         };
@@ -543,10 +546,11 @@ pub async fn backup(
             &cancel,
         )
         .await?;
-    let schema: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-        .fetch_one(&store.pool)
-        .await
-        .map_err(|_| unavailable())?;
+    let schema: i32 =
+        sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton")
+            .fetch_one(&store.pool)
+            .await
+            .map_err(|_| unavailable())?;
     let receipt = BackupReceipt {
         version: 1,
         kind: "devres-object-archive-backup".into(),
@@ -660,25 +664,27 @@ pub async fn restore(
     let mut owner = PgConnection::connect(database_url)
         .await
         .map_err(|_| unavailable())?;
-    let lifecycle: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(1835365490,2)")
-        .fetch_one(&mut owner)
-        .await
-        .map_err(|_| unavailable())?;
+    let lifecycle: bool =
+        sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490,2)")
+            .fetch_one(&mut owner)
+            .await
+            .map_err(|_| unavailable())?;
     if !lifecycle {
         return Err(Error::capacity(
             "Restore requires all readers and writers to stop.",
         ));
     }
-    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(1835365490,1)")
-        .fetch_one(&mut owner)
-        .await
-        .map_err(|_| unavailable())?;
+    let acquired: bool =
+        sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490,1)")
+            .fetch_one(&mut owner)
+            .await
+            .map_err(|_| unavailable())?;
     if !acquired {
         return Err(Error::capacity(
             "Only one serving instance may own this database",
         ));
     }
-    let present:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','m','v','S')").fetch_one(&mut owner).await.map_err(|_|unavailable())?;
+    let present:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','m','v','S')").fetch_one(&mut owner).await.map_err(|_|unavailable())?;
     if present != 0 {
         return Err(Error::invalid(
             "Restore requires an empty PostgreSQL database.",
@@ -689,13 +695,15 @@ pub async fn restore(
             "Restore requires an empty destination prefix.",
         ));
     }
-    sqlx::query("CREATE TABLE devres_archive_restore_pending(receipt text NOT NULL,destination text NOT NULL)").execute(&mut owner).await.map_err(|_|unavailable())?;
-    sqlx::query("INSERT INTO devres_archive_restore_pending(receipt,destination) VALUES($1,$2)")
-        .bind(crate::integrity::hash(&encoded))
-        .bind(&target_binding)
-        .execute(&mut owner)
-        .await
-        .map_err(|_| unavailable())?;
+    sqlx_core::query::query("CREATE TABLE devres_archive_restore_pending(receipt text NOT NULL,destination text NOT NULL)").execute(&mut owner).await.map_err(|_|unavailable())?;
+    sqlx_core::query::query(
+        "INSERT INTO devres_archive_restore_pending(receipt,destination) VALUES($1,$2)",
+    )
+    .bind(crate::integrity::hash(&encoded))
+    .bind(&target_binding)
+    .execute(&mut owner)
+    .await
+    .map_err(|_| unavailable())?;
     target
         .put_bytes_immutable_with_cancel("store.json", &claim, &cancel)
         .await?;
@@ -742,11 +750,12 @@ pub async fn restore(
         return Err(integrity());
     }
     restore_database(database_url, &dump, &cancel).await?;
-    let control =
-        sqlx::query("SELECT store_id,binding,epoch FROM devres_archive_control WHERE singleton")
-            .fetch_one(&mut owner)
-            .await
-            .map_err(|_| unavailable())?;
+    let control = sqlx_core::query::query(
+        "SELECT store_id,binding,epoch FROM devres_archive_control WHERE singleton",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .map_err(|_| unavailable())?;
     let store_id: String = control.try_get("store_id").map_err(|_| integrity())?;
     let old_binding: Option<String> = control.try_get("binding").map_err(|_| integrity())?;
     let epoch: i64 = control
@@ -761,13 +770,13 @@ pub async fn restore(
     // This restored target does not own the original host's retained filesystem
     // source. Preserve its migration receipt while releasing that local-path
     // reservation for a fresh empty cache on the restore host.
-    sqlx::query("ALTER TABLE devres_archive_transfer ADD COLUMN IF NOT EXISTS source_protected boolean NOT NULL DEFAULT true").execute(&mut *tx).await.map_err(|_|unavailable())?;
-    sqlx::query("UPDATE devres_archive_transfer SET source_protected=false")
+    sqlx_core::query::query("ALTER TABLE devres_archive_transfer ADD COLUMN IF NOT EXISTS source_protected boolean NOT NULL DEFAULT true").execute(&mut *tx).await.map_err(|_|unavailable())?;
+    sqlx_core::query::query("UPDATE devres_archive_transfer SET source_protected=false")
         .execute(&mut *tx)
         .await
         .map_err(|_| unavailable())?;
-    sqlx::query("UPDATE devres_archive_control SET backend='s3',binding=$1,pending_binding=NULL,epoch=$2 WHERE singleton").bind(&target_binding).bind(epoch).execute(&mut *tx).await.map_err(|_|unavailable())?;
-    sqlx::query("UPDATE devres_archive_file SET epoch=$1")
+    sqlx_core::query::query("UPDATE devres_archive_control SET backend='s3',binding=$1,pending_binding=NULL,epoch=$2 WHERE singleton").bind(&target_binding).bind(epoch).execute(&mut *tx).await.map_err(|_|unavailable())?;
+    sqlx_core::query::query("UPDATE devres_archive_file SET epoch=$1")
         .bind(epoch)
         .execute(&mut *tx)
         .await
@@ -787,7 +796,7 @@ pub async fn restore(
     stopping(&cancel)?;
     store.check_health().await?;
     let mut owner = store.owner.lock().await;
-    sqlx::query("DROP TABLE devres_archive_restore_pending")
+    sqlx_core::query::query("DROP TABLE devres_archive_restore_pending")
         .execute(&mut *owner)
         .await
         .map_err(|_| unavailable())?;
@@ -802,10 +811,11 @@ async fn verify_manifest_database(
     expected: u64,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_archive_file")
-        .fetch_one(&store.pool)
-        .await
-        .map_err(|_| unavailable())?;
+    let total: i64 =
+        sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_archive_file")
+            .fetch_one(&store.pool)
+            .await
+            .map_err(|_| unavailable())?;
     if u64::try_from(total).ok() != Some(expected) {
         return Err(integrity());
     }
@@ -817,7 +827,7 @@ async fn verify_manifest_database(
     while let Some(line) = bounded_line(&mut reader).await? {
         stopping(cancel)?;
         let file = FileBinding::decode(&line)?;
-        let matches:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_archive_file WHERE path=$1 AND evidence=$2 AND digest=$3 AND bytes=$4 AND device=$5 AND inode=$6 AND complete)").bind(&file.path).bind(&line).bind(&file.digest).bind(i64::try_from(file.bytes).map_err(|_|integrity())?).bind(file.device.to_string()).bind(file.inode.to_string()).fetch_one(&store.pool).await.map_err(|_|unavailable())?;
+        let matches:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_archive_file WHERE path=$1 AND evidence=$2 AND digest=$3 AND bytes=$4 AND device=$5 AND inode=$6 AND complete)").bind(&file.path).bind(&line).bind(&file.digest).bind(i64::try_from(file.bytes).map_err(|_|integrity())?).bind(file.device.to_string()).bind(file.inode.to_string()).fetch_one(&store.pool).await.map_err(|_|unavailable())?;
         if !matches {
             return Err(integrity());
         }
@@ -923,12 +933,12 @@ mod tests {
         saved.prefix = format!("{}/backup-saved-{suffix}", original.prefix);
         let mut destination = original;
         destination.prefix = format!("{}/backup-restored-{suffix}", destination.prefix);
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_backup_source")
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        sqlx_core::query::query("CREATE DATABASE devres_s3_backup_source")
             .execute(&admin)
             .await
             .unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_backup_restored")
+        sqlx_core::query::query("CREATE DATABASE devres_s3_backup_restored")
             .execute(&admin)
             .await
             .unwrap();
@@ -1064,22 +1074,24 @@ mod tests {
                 .join(crate::integrity::relative_path(&newer_body).unwrap())
                 .exists()
         );
-        let restored_protection: bool = sqlx::query_scalar(
+        let restored_protection: bool = sqlx_core::query_scalar::query_scalar(
             "SELECT source_protected FROM devres_archive_transfer WHERE singleton",
         )
         .fetch_one(&store.pool)
         .await
         .unwrap();
         assert!(!restored_protection);
-        let source_pool = sqlx::PgPool::connect(source_url.as_str()).await.unwrap();
-        let source_protection: bool = sqlx::query_scalar(
+        let source_pool = sqlx_postgres::PgPool::connect(source_url.as_str())
+            .await
+            .unwrap();
+        let source_protection: bool = sqlx_core::query_scalar::query_scalar(
             "SELECT source_protected FROM devres_archive_transfer WHERE singleton",
         )
         .fetch_one(&source_pool)
         .await
         .unwrap();
         assert!(source_protection);
-        let pending: bool = sqlx::query_scalar(
+        let pending: bool = sqlx_core::query_scalar::query_scalar(
             "SELECT to_regclass('public.devres_archive_restore_pending') IS NOT NULL",
         )
         .fetch_one(&store.pool)
@@ -1097,8 +1109,8 @@ mod tests {
         let path = std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 config required");
         let mut config: S3Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         config.prefix.push_str("/single-runtime-worker");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
-        sqlx::query("CREATE DATABASE devres_s3_single_worker")
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        sqlx_core::query::query("CREATE DATABASE devres_s3_single_worker")
             .execute(&admin)
             .await
             .unwrap();

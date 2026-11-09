@@ -8,7 +8,7 @@ use devres_application::advisory::{
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
 use serde_json::{Value, json};
-use sqlx::{Connection, Row, types::Json};
+use sqlx_core::{connection::Connection, row::Row, types::Json};
 
 fn bounded(value: &impl serde::Serialize, limit: usize) -> Result<Value> {
     let bytes =
@@ -32,7 +32,7 @@ fn key(kind: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn row(row: sqlx::postgres::PgRow) -> Result<AdvisoryRow> {
+fn row(row: sqlx_postgres::PgRow) -> Result<AdvisoryRow> {
     let kind: String = row.try_get("kind").map_err(|_| storage_error())?;
     let mut key: String = row.try_get("key").map_err(|_| storage_error())?;
     let data = payload_integrity::row("devres_advisory_rows", &row)?;
@@ -154,14 +154,15 @@ impl AdvisoryStore for PgBlobStore {
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         let identities: Vec<_> = records.iter().map(|(id, _)| id.clone()).collect();
-        let existing: std::collections::HashSet<String> =
-            sqlx::query_scalar("SELECT id FROM devres_advisory_records WHERE id=ANY($1::text[])")
-                .bind(&identities)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?
-                .into_iter()
-                .collect();
+        let existing: std::collections::HashSet<String> = sqlx_core::query_scalar::query_scalar(
+            "SELECT id FROM devres_advisory_records WHERE id=ANY($1::text[])",
+        )
+        .bind(&identities)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?
+        .into_iter()
+        .collect();
         for id in &existing {
             let retained = payload_integrity::load(&mut *tx, "devres_advisory_records", "", id)
                 .await?
@@ -188,16 +189,16 @@ impl AdvisoryStore for PgBlobStore {
                     payload_integrity::digest("devres_advisory_records", "", id, data)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            sqlx::query("INSERT INTO devres_advisory_records(id,data,data_integrity) SELECT * FROM UNNEST($1::text[],$2::jsonb[],$3::text[]) ON CONFLICT DO NOTHING")
+            sqlx_core::query::query("INSERT INTO devres_advisory_records(id,data,data_integrity) SELECT * FROM UNNEST($1::text[],$2::jsonb[],$3::text[]) ON CONFLICT DO NOTHING")
                 .bind(ids).bind(data).bind(digests).execute(&mut *tx).await.map_err(|_|storage_error())?;
         }
-        let sequence: i64 = sqlx::query_scalar(
+        let sequence: i64 = sqlx_core::query_scalar::query_scalar(
             "SELECT nextval(pg_get_serial_sequence('devres_advisory_snapshots','sequence'))",
         )
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_advisory_snapshots(id,format,revision,data,data_integrity,sequence) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_advisory_snapshots(id,format,revision,data,data_integrity,sequence) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
             .bind(&snapshot.id).bind(&snapshot.format).bind(&snapshot.revision).bind(Json(&descriptor)).bind(payload_integrity::digest("devres_advisory_snapshots","",&snapshot.id,&payload_integrity::advisory_snapshot_payload(sequence,&snapshot.format,&snapshot.revision,&descriptor)?)?).bind(sequence).execute(&mut *tx).await.map_err(|_|storage_error())?;
         let retained: Json<Value> =
             payload_integrity::load(&mut *tx, "devres_advisory_snapshots", "", &snapshot.id)
@@ -208,9 +209,9 @@ impl AdvisoryStore for PgBlobStore {
         }
         let positions: Vec<i32> = (0..records.len() as i32).collect();
         let record_ids: Vec<_> = records.iter().map(|(id, _)| id.clone()).collect();
-        sqlx::query("INSERT INTO devres_advisory_members(snapshot,position,record) SELECT $1,p,r FROM UNNEST($2::integer[],$3::text[]) AS members(p,r) ON CONFLICT DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_advisory_members(snapshot,position,record) SELECT $1,p,r FROM UNNEST($2::integer[],$3::text[]) AS members(p,r) ON CONFLICT DO NOTHING")
             .bind(&snapshot.id).bind(positions).bind(record_ids).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        let retained_members: Vec<String> = sqlx::query_scalar(
+        let retained_members: Vec<String> = sqlx_core::query_scalar::query_scalar(
             "SELECT record FROM devres_advisory_members WHERE snapshot=$1 ORDER BY position",
         )
         .bind(&snapshot.id)
@@ -224,13 +225,13 @@ impl AdvisoryStore for PgBlobStore {
         if snapshot.format == "rustsec" {
             for capture in &snapshot.captures {
                 if capture.key == "rustsec:head" {
-                    sqlx::query("INSERT INTO devres_advisory_aliases(alias,snapshot) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                    sqlx_core::query::query("INSERT INTO devres_advisory_aliases(alias,snapshot) VALUES($1,$2) ON CONFLICT DO NOTHING")
                         .bind(&capture.id).bind(&snapshot.id).execute(&mut *tx).await.map_err(|_|storage_error())?;
                 }
             }
         }
         if make_default {
-            sqlx::query("INSERT INTO devres_advisory_defaults(format,snapshot) VALUES($1,$2) ON CONFLICT(format) DO UPDATE SET snapshot=EXCLUDED.snapshot")
+            sqlx_core::query::query("INSERT INTO devres_advisory_defaults(format,snapshot) VALUES($1,$2) ON CONFLICT(format) DO UPDATE SET snapshot=EXCLUDED.snapshot")
                 .bind(&snapshot.format).bind(&snapshot.id).execute(&mut *tx).await.map_err(|_|storage_error())?;
         }
         tx.commit().await.map_err(|_| storage_error())
@@ -244,7 +245,7 @@ impl AdvisoryStore for PgBlobStore {
         if !matches!(format, "rustsec" | "osv") || id.is_some_and(|v| !valid_hash(v)) {
             return Err(Error::invalid("Invalid advisory snapshot selector."));
         }
-        let value:Option<(String,Json<Value>,String,i64,String)>=sqlx::query_as("SELECT s.id,s.data,s.data_integrity,s.sequence,s.revision FROM devres_advisory_snapshots s WHERE s.format=$2 AND s.id=COALESCE($1::text,(SELECT snapshot FROM devres_advisory_defaults WHERE format=$2)) OR (s.format=$2 AND s.id=(SELECT snapshot FROM devres_advisory_aliases WHERE alias=$1)) LIMIT 1")
+        let value:Option<(String,Json<Value>,String,i64,String)>=sqlx_core::query_as::query_as("SELECT s.id,s.data,s.data_integrity,s.sequence,s.revision FROM devres_advisory_snapshots s WHERE s.format=$2 AND s.id=COALESCE($1::text,(SELECT snapshot FROM devres_advisory_defaults WHERE format=$2)) OR (s.format=$2 AND s.id=(SELECT snapshot FROM devres_advisory_aliases WHERE alias=$1)) LIMIT 1")
             .bind(id).bind(format).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
         let Some((id, value, expected, sequence, revision)) = value else {
             return Ok(None);
@@ -266,7 +267,7 @@ impl AdvisoryStore for PgBlobStore {
             .ok_or_else(|| Error::integrity("Advisory membership count missing."))?;
         let mut snapshot: AdvisorySnapshot = serde_json::from_value(value)
             .map_err(|_| Error::integrity("Invalid retained advisory snapshot."))?;
-        let records:Vec<(String,Json<Value>,String)>=sqlx::query_as("SELECT r.id,r.data,r.data_integrity FROM devres_advisory_members m JOIN devres_advisory_records r ON r.id=m.record WHERE m.snapshot=$1 ORDER BY m.position LIMIT 20001")
+        let records:Vec<(String,Json<Value>,String)>=sqlx_core::query_as::query_as("SELECT r.id,r.data,r.data_integrity FROM devres_advisory_members m JOIN devres_advisory_records r ON r.id=m.record WHERE m.snapshot=$1 ORDER BY m.position LIMIT 20001")
             .bind(&id).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         if records.len() > 20_000 {
             return Err(Error::capacity(
@@ -316,13 +317,13 @@ impl AdvisoryStore for PgBlobStore {
             return Err(Error::invalid("Invalid advisory evidence page."));
         }
         let hidden = self.visibility_aliases("advisory", kind, cutoff).await?;
-        let bytes:i64=sqlx::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM(SELECT octet_length(data::text) AS n FROM devres_advisory_rows WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4) page").bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(hidden.as_ref()).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let bytes:i64=sqlx_core::query_scalar::query_scalar("SELECT COALESCE(sum(n),0)::bigint FROM(SELECT octet_length(data::text) AS n FROM devres_advisory_rows WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4) page").bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(hidden.as_ref()).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if bytes > 64 * 1024 * 1024 {
             return Err(Error::capacity(
                 "Advisory evidence page exceeds memory budget.",
             ));
         }
-        sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4")
+        sqlx_core::query::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind=$1 AND sequence>$2 AND ($3::bigint IS NULL OR sequence<=$3) AND NOT(key=ANY($5::text[])) ORDER BY sequence LIMIT $4")
             .bind(kind).bind(after).bind(cutoff).bind(limit as i64).bind(hidden.as_ref()).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
     }
     async fn advisory_projection_state(
@@ -354,7 +355,7 @@ impl AdvisoryStore for PgBlobStore {
         self.fence().await?;
         key(kind, value)?;
         let resolved = self.advisory_natural_key(kind, value, None).await?;
-        sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind=$1 AND key=$2")
+        sqlx_core::query::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind=$1 AND key=$2")
             .bind(kind)
             .bind(&resolved)
             .fetch_optional(&self.pool)
@@ -368,7 +369,7 @@ impl AdvisoryStore for PgBlobStore {
         if let Some(cutoff) = self.migration_cutoff("advisory").await? {
             return Ok(cutoff);
         }
-        let row=sqlx::query("SELECT sequence,sequence_integrity,kind,key FROM devres_advisory_rows ORDER BY sequence DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+        let row=sqlx_core::query::query("SELECT sequence,sequence_integrity,kind,key FROM devres_advisory_rows ORDER BY sequence DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
         row.map(|row| {
             super::sequence_integrity::verify_row("devres_advisory_rows", &row)?;
             row.try_get("sequence").map_err(|_| storage_error())
@@ -399,7 +400,7 @@ impl AdvisoryStore for PgBlobStore {
         for key in &keys {
             resolved_keys.push(self.advisory_natural_key("processing", key, cutoff).await?);
         }
-        let Some(found) = sqlx::query("SELECT c.sequence,c.sequence_integrity,c.kind,c.key,c.data,c.data_integrity,p.sequence AS processing_sequence,p.key AS processing_key,p.data AS processing_data,p.data_integrity AS processing_integrity,p.sequence_integrity AS processing_sequence_integrity FROM devres_advisory_rows c LEFT JOIN LATERAL (SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='processing' AND key=ANY($3::text[]) AND ($2::bigint IS NULL OR sequence<=$2) ORDER BY sequence DESC LIMIT 1) p ON true WHERE c.kind='commits' AND c.key=$1 AND ($2::bigint IS NULL OR c.sequence<=$2)")
+        let Some(found) = sqlx_core::query::query("SELECT c.sequence,c.sequence_integrity,c.kind,c.key,c.data,c.data_integrity,p.sequence AS processing_sequence,p.key AS processing_key,p.data AS processing_data,p.data_integrity AS processing_integrity,p.sequence_integrity AS processing_sequence_integrity FROM devres_advisory_rows c LEFT JOIN LATERAL (SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='processing' AND key=ANY($3::text[]) AND ($2::bigint IS NULL OR sequence<=$2) ORDER BY sequence DESC LIMIT 1) p ON true WHERE c.kind='commits' AND c.key=$1 AND ($2::bigint IS NULL OR c.sequence<=$2)")
             .bind(&revision_key).bind(cutoff).bind(&resolved_keys).fetch_optional(&self.pool).await.map_err(|_|storage_error())? else {return Ok(None);};
         let projection = found
             .try_get::<Option<Json<Value>>, _>("processing_data")
@@ -470,7 +471,7 @@ impl AdvisoryStore for PgBlobStore {
         for value in keys {
             key(kind, value)?;
         }
-        sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind=$1 AND key=ANY($2::text[]) ORDER BY sequence")
+        sqlx_core::query::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind=$1 AND key=ANY($2::text[]) ORDER BY sequence")
             .bind(kind).bind(keys).fetch_all(&self.pool).await.map_err(|_|storage_error())?.into_iter().map(row).collect()
     }
     async fn advisory_ref_rows(
@@ -486,7 +487,7 @@ impl AdvisoryStore for PgBlobStore {
             return Err(Error::invalid("Invalid advisory history page."));
         }
         let mut tx = self.pool.begin().await.map_err(|_| storage_error())?;
-        sqlx::query("SET LOCAL statement_timeout='5s'")
+        sqlx_core::query::query("SET LOCAL statement_timeout='5s'")
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
@@ -496,7 +497,7 @@ impl AdvisoryStore for PgBlobStore {
         let (old_commits, new_commits) = self
             .visibility_pairs("advisory", "commits", Some(cutoff))
             .await?;
-        let latest=sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='refs' AND sequence<=$1 AND NOT(key=ANY($2::text[])) ORDER BY COALESCE((data->>'observation_sequence')::bigint,sequence) DESC,sequence DESC LIMIT 1")
+        let latest=sqlx_core::query::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='refs' AND sequence<=$1 AND NOT(key=ANY($2::text[])) ORDER BY COALESCE((data->>'observation_sequence')::bigint,sequence) DESC,sequence DESC LIMIT 1")
             .bind(cutoff).bind(hidden.as_ref()).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
         let roots = if let Some(latest) = latest {
             let value = payload_integrity::row("devres_advisory_rows", &latest)?;
@@ -513,7 +514,7 @@ impl AdvisoryStore for PgBlobStore {
         let mut result = Vec::new();
         {
             // Every visited parent payload is verified, including ancestors outside the requested page.
-            let mut stream=sqlx::query("WITH RECURSIVE mappings(legacy,canonical) AS(SELECT * FROM UNNEST($3::text[],$4::text[])),ancestry(oid) AS(SELECT UNNEST($1::text[]) UNION SELECT p.value FROM ancestry a JOIN devres_advisory_rows c ON c.kind='commits' AND c.key=COALESCE((SELECT canonical FROM mappings WHERE legacy=a.oid),a.oid) AND c.sequence<=$2 CROSS JOIN LATERAL jsonb_array_elements_text(c.data->'parents') p) SELECT c.sequence,c.sequence_integrity,c.kind,c.key,c.data,c.data_integrity FROM devres_advisory_rows c JOIN ancestry a ON c.key=COALESCE((SELECT canonical FROM mappings WHERE legacy=a.oid),a.oid) WHERE c.kind='commits' AND c.sequence<=$2 ORDER BY c.sequence")
+            let mut stream=sqlx_core::query::query("WITH RECURSIVE mappings(legacy,canonical) AS(SELECT * FROM UNNEST($3::text[],$4::text[])),ancestry(oid) AS(SELECT UNNEST($1::text[]) UNION SELECT p.value FROM ancestry a JOIN devres_advisory_rows c ON c.kind='commits' AND c.key=COALESCE((SELECT canonical FROM mappings WHERE legacy=a.oid),a.oid) AND c.sequence<=$2 CROSS JOIN LATERAL jsonb_array_elements_text(c.data->'parents') p) SELECT c.sequence,c.sequence_integrity,c.kind,c.key,c.data,c.data_integrity FROM devres_advisory_rows c JOIN ancestry a ON c.key=COALESCE((SELECT canonical FROM mappings WHERE legacy=a.oid),a.oid) WHERE c.kind='commits' AND c.sequence<=$2 ORDER BY c.sequence")
                 .bind(&roots).bind(cutoff).bind(old_commits.as_ref()).bind(new_commits.as_ref()).fetch(&mut *tx);
             while let Some(found) = stream.try_next().await.map_err(|_| {
                 Error::capacity("Advisory ancestry query exceeded its processing budget.")
@@ -538,7 +539,7 @@ impl AdvisoryStore for PgBlobStore {
             super::sequence_integrity::reserve_one(&mut tx, "devres_advisory_rows").await?;
         let sequence_integrity =
             super::sequence_integrity::digest("devres_advisory_rows", kind, value, sequence)?;
-        sqlx::query("INSERT INTO devres_advisory_rows(sequence,kind,key,data,data_integrity,sequence_integrity) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(sequence).bind(kind).bind(value).bind(Json(&data)).bind(payload_integrity::digest("devres_advisory_rows",kind,value,&data)?).bind(sequence_integrity).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        sqlx_core::query::query("INSERT INTO devres_advisory_rows(sequence,kind,key,data,data_integrity,sequence_integrity) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(sequence).bind(kind).bind(value).bind(Json(&data)).bind(payload_integrity::digest("devres_advisory_rows",kind,value,&data)?).bind(sequence_integrity).execute(&mut *tx).await.map_err(|_|storage_error())?;
         let old: Json<Value> =
             payload_integrity::load(&mut *tx, "devres_advisory_rows", kind, value)
                 .await?
@@ -562,14 +563,14 @@ impl AdvisoryStore for PgBlobStore {
         let data = bounded(data, 4 * 1024 * 1024)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_advisory_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(value).bind(Json(&data)).bind(payload_integrity::digest("devres_advisory_state","",value,&data)?).execute(&mut *owner).await.map_err(|_|storage_error())?;
+        sqlx_core::query::query("INSERT INTO devres_advisory_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity").bind(value).bind(Json(&data)).bind(payload_integrity::digest("devres_advisory_state","",value,&data)?).execute(&mut *owner).await.map_err(|_|storage_error())?;
         Ok(())
     }
     async fn advisory_status(&self) -> Result<Value> {
         self.fence().await?;
-        let counts:Json<Value>=sqlx::query_scalar("SELECT jsonb_build_object('snapshots',(SELECT count(*) FROM devres_advisory_snapshots s WHERE NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:snapshots' AND a.legacy=s.id)),'representations',(SELECT count(*) FROM devres_advisory_records r WHERE NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:records' AND a.legacy=r.id)),'commits',(SELECT count(*) FROM devres_advisory_rows r WHERE kind='commits' AND NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:commits' AND a.legacy=r.key)),'ref_observations',(SELECT count(DISTINCT data->>'id') FROM devres_advisory_rows r WHERE kind='refs' AND NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:refs' AND a.legacy=r.key)))")
+        let counts:Json<Value>=sqlx_core::query_scalar::query_scalar("SELECT jsonb_build_object('snapshots',(SELECT count(*) FROM devres_advisory_snapshots s WHERE NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:snapshots' AND a.legacy=s.id)),'representations',(SELECT count(*) FROM devres_advisory_records r WHERE NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:records' AND a.legacy=r.id)),'commits',(SELECT count(*) FROM devres_advisory_rows r WHERE kind='commits' AND NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:commits' AND a.legacy=r.key)),'ref_observations',(SELECT count(DISTINCT data->>'id') FROM devres_advisory_rows r WHERE kind='refs' AND NOT EXISTS(SELECT 1 FROM devres_content_aliases a WHERE a.namespace='advisory:refs' AND a.legacy=r.key)))")
             .fetch_one(&self.pool).await.map_err(|_|storage_error())?;
-        let states:Vec<(String,Json<Value>,String)>=sqlx::query_as("SELECT key,data,data_integrity FROM devres_advisory_state WHERE key IN('current','history','history-error','history-retry','config') ORDER BY key").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let states:Vec<(String,Json<Value>,String)>=sqlx_core::query_as::query_as("SELECT key,data,data_integrity FROM devres_advisory_state WHERE key IN('current','history','history-error','history-retry','config') ORDER BY key").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         let states = states
             .into_iter()
             .map(|(key, data, expected)| {
@@ -577,7 +578,7 @@ impl AdvisoryStore for PgBlobStore {
                     .map(|data| (key, Json(data)))
             })
             .collect::<Result<Vec<_>>>()?;
-        let defaults:Vec<(String,String)>=sqlx::query_as("SELECT s.id,s.format FROM devres_advisory_defaults d JOIN devres_advisory_snapshots s ON s.id=d.snapshot ORDER BY s.format")
+        let defaults:Vec<(String,String)>=sqlx_core::query_as::query_as("SELECT s.id,s.format FROM devres_advisory_defaults d JOIN devres_advisory_snapshots s ON s.id=d.snapshot ORDER BY s.format")
             .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         let mut snapshots = Vec::new();
         for (id, format) in defaults {
@@ -797,7 +798,7 @@ impl PgBlobStore {
         let mut after = 0_i64;
         loop {
             advisory_migration_cancel(&cancel)?;
-            let positions: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+            let positions: Vec<(i64, String, i64, i64)> = sqlx_core::query_as::query_as(
                 "SELECT sequence,key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_advisory_rows WHERE kind='refs' AND key NOT LIKE 'blake3:%' AND key !~ ':processed:' AND sequence>$1 ORDER BY sequence LIMIT $2"
             ).bind(after).bind(execution.options().workers as i64)
                 .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
@@ -825,7 +826,7 @@ impl PgBlobStore {
             let prepared = execution.graph_map_ordered(
                 positions, &cancel,
                 |(sequence, old), token| async move {
-                    let found=sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='refs' AND sequence=$1 AND key=$2")
+                    let found=sqlx_core::query::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE kind='refs' AND sequence=$1 AND key=$2")
                         .bind(sequence).bind(&old).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
                     let mut data = payload_integrity::row("devres_advisory_rows", &found)?;
                     let manifest = self.rewrite_advisory_manifest(&data["manifest"], read_mappings, config, &token).await?;
@@ -867,7 +868,7 @@ impl PgBlobStore {
         let mut after = 0_i64;
         loop {
             advisory_migration_cancel(&cancel)?;
-            let positions: Vec<(i64, String, String, i64, i64)> = sqlx::query_as(
+            let positions: Vec<(i64, String, String, i64, i64)> = sqlx_core::query_as::query_as(
                 "SELECT sequence,id,format,octet_length(data::text)::bigint+COALESCE((SELECT sum(octet_length(r.data::text))::bigint FROM devres_advisory_members m JOIN devres_advisory_records r ON r.id=m.record WHERE m.snapshot=s.id),0),jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint+COALESCE((SELECT sum(jsonb_array_length(jsonb_path_query_array(r.data,'strict $.**.type()')))::bigint FROM devres_advisory_members m JOIN devres_advisory_records r ON r.id=m.record WHERE m.snapshot=s.id),0) FROM devres_advisory_snapshots s WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT $2"
             ).bind(after).bind(execution.options().workers as i64)
                 .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
@@ -898,7 +899,7 @@ impl PgBlobStore {
                         .advisory_snapshot(Some(&old), &format)
                         .await?
                         .ok_or_else(|| Error::integrity("Legacy advisory snapshot missing."))?;
-                    let old_records: Vec<String> = sqlx::query_scalar(
+                    let old_records: Vec<String> = sqlx_core::query_scalar::query_scalar(
                 "SELECT record FROM devres_advisory_members WHERE snapshot=$1 ORDER BY position",
             )
             .bind(&old)
@@ -1002,7 +1003,7 @@ impl PgBlobStore {
         let mut after = 0_i64;
         loop {
             advisory_migration_cancel(&cancel)?;
-            let positions: Vec<(i64, String, String, i64, i64)> = sqlx::query_as(
+            let positions: Vec<(i64, String, String, i64, i64)> = sqlx_core::query_as::query_as(
                 "SELECT sequence,kind,key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_advisory_rows WHERE key NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT $2"
             ).bind(after).bind(execution.options().workers as i64)
                 .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
@@ -1035,7 +1036,7 @@ impl PgBlobStore {
                         return Err(Error::integrity("Unrecognized advisory evidence family during migration."));
                     }
                     if kind == "refs" && !old.contains(":processed:") { return Ok(None); }
-                    let found=sqlx::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE sequence=$1 AND kind=$2 AND key=$3")
+                    let found=sqlx_core::query::query("SELECT sequence,sequence_integrity,kind,key,data,data_integrity FROM devres_advisory_rows WHERE sequence=$1 AND kind=$2 AND key=$3")
                         .bind(sequence).bind(&kind).bind(&old).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
                     let mut data = payload_integrity::row("devres_advisory_rows", &found)?;
                     let read_mappings = read_mappings.clone();
@@ -1076,11 +1077,12 @@ impl PgBlobStore {
                 0,
             );
         }
-        let defaults: Vec<(String, String)> =
-            sqlx::query_as("SELECT format,snapshot FROM devres_advisory_defaults ORDER BY format")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|_| storage_error())?;
+        let defaults: Vec<(String, String)> = sqlx_core::query_as::query_as(
+            "SELECT format,snapshot FROM devres_advisory_defaults ORDER BY format",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         for (format, snapshot) in defaults {
             let canonical = advisory_migration_ref("advisory:snapshots", &snapshot, mappings)?;
             payload_integrity::stage(
@@ -1094,7 +1096,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             advisory_migration_cancel(&cancel)?;
-            let key: Option<String> = sqlx::query_scalar(
+            let key: Option<String> = sqlx_core::query_scalar::query_scalar(
                 "SELECT key FROM devres_advisory_state WHERE key>$1 ORDER BY key LIMIT 1",
             )
             .bind(&after)
@@ -1113,7 +1115,7 @@ impl PgBlobStore {
                     &cancel,
                 )
                 .await?;
-            let found=sqlx::query("SELECT ''::text AS kind,key,data,data_integrity FROM devres_advisory_state WHERE key=$1").bind(&key).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+            let found=sqlx_core::query::query("SELECT ''::text AS kind,key,data,data_integrity FROM devres_advisory_state WHERE key=$1").bind(&key).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
             let mut data = payload_integrity::row("devres_advisory_state", &found)?;
             if let Some(manifest) = data.get_mut("manifest") {
                 *manifest = self

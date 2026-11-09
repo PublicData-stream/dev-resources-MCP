@@ -1,5 +1,6 @@
 use super::{BrokerError, Result, crypto::Keyring, identity::PodIdentity, random_id};
-use sqlx::{Connection, Row, postgres::PgConnection};
+use sqlx_core::{connection::Connection, row::Row};
+use sqlx_postgres::PgConnection;
 
 pub(crate) struct Journal {
     pub connection: PgConnection,
@@ -44,21 +45,22 @@ impl Journal {
             .await
             .map_err(|_| BrokerError::Unavailable)?;
         let corpus: bool =
-            sqlx::query_scalar("SELECT to_regclass('public.devres_captures') IS NOT NULL OR to_regclass('public.devres_schema') IS NOT NULL")
+            sqlx_core::query_scalar::query_scalar("SELECT to_regclass('public.devres_captures') IS NOT NULL OR to_regclass('public.devres_schema') IS NOT NULL")
                 .fetch_one(&mut connection)
                 .await
                 .map_err(|_| BrokerError::Unavailable)?;
         if corpus {
             return Err(BrokerError::Forbidden);
         }
-        sqlx::query("SET statement_timeout='10s'")
+        sqlx_core::query::query("SET statement_timeout='10s'")
             .execute(&mut connection)
             .await
             .map_err(|_| BrokerError::Unavailable)?;
-        let owner: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(685214478215001)")
-            .fetch_one(&mut connection)
-            .await
-            .map_err(|_| BrokerError::Unavailable)?;
+        let owner: bool =
+            sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(685214478215001)")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(|_| BrokerError::Unavailable)?;
         if !owner {
             return Err(BrokerError::Capacity);
         }
@@ -66,21 +68,21 @@ impl Journal {
             .begin()
             .await
             .map_err(|_| BrokerError::Unavailable)?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS devres_credential_broker_meta(singleton boolean PRIMARY KEY CHECK(singleton), broker_id text NOT NULL, version integer NOT NULL CHECK(version=1))")
+        sqlx_core::query::query("CREATE TABLE IF NOT EXISTS devres_credential_broker_meta(singleton boolean PRIMARY KEY CHECK(singleton), broker_id text NOT NULL, version integer NOT NULL CHECK(version=1))")
             .execute(&mut *tx).await.map_err(|_|BrokerError::Unavailable)?;
-        sqlx::query(
+        sqlx_core::query::query(
             "ALTER TABLE devres_credential_broker_meta ADD COLUMN IF NOT EXISTS cluster_uid text",
         )
         .execute(&mut *tx)
         .await
         .map_err(|_| BrokerError::Unavailable)?;
-        sqlx::query("INSERT INTO devres_credential_broker_meta(singleton,broker_id,version) VALUES(true,$1,1) ON CONFLICT(singleton) DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_credential_broker_meta(singleton,broker_id,version) VALUES(true,$1,1) ON CONFLICT(singleton) DO NOTHING")
             .bind(random_id()?).execute(&mut *tx).await.map_err(|_|BrokerError::Unavailable)?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS devres_credential_broker_keys(intent text PRIMARY KEY, pod_uid text NOT NULL, namespace text NOT NULL, service_account text NOT NULL, service_account_uid text NOT NULL, pod_name text NOT NULL, token_expires_at bigint NOT NULL, profile text NOT NULL, application_id text NOT NULL, description text NOT NULL UNIQUE, requested_expiry bigint NOT NULL, state text NOT NULL CHECK(state IN ('pending','issued','revoke','revoked')), access_key text UNIQUE, expires_at bigint NOT NULL, encryption_key text, ciphertext bytea, created_at timestamptz NOT NULL DEFAULT now())")
+        sqlx_core::query::query("CREATE TABLE IF NOT EXISTS devres_credential_broker_keys(intent text PRIMARY KEY, pod_uid text NOT NULL, namespace text NOT NULL, service_account text NOT NULL, service_account_uid text NOT NULL, pod_name text NOT NULL, token_expires_at bigint NOT NULL, profile text NOT NULL, application_id text NOT NULL, description text NOT NULL UNIQUE, requested_expiry bigint NOT NULL, state text NOT NULL CHECK(state IN ('pending','issued','revoke','revoked')), access_key text UNIQUE, expires_at bigint NOT NULL, encryption_key text, ciphertext bytea, created_at timestamptz NOT NULL DEFAULT now())")
             .execute(&mut *tx).await.map_err(|_|BrokerError::Unavailable)?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS devres_broker_active_pod ON devres_credential_broker_keys(pod_uid,expires_at) WHERE state <> 'revoked'")
+        sqlx_core::query::query("CREATE INDEX IF NOT EXISTS devres_broker_active_pod ON devres_credential_broker_keys(pod_uid,expires_at) WHERE state <> 'revoked'")
             .execute(&mut *tx).await.map_err(|_|BrokerError::Unavailable)?;
-        let broker_id: String = sqlx::query_scalar(
+        let broker_id: String = sqlx_core::query_scalar::query_scalar(
             "SELECT broker_id FROM devres_credential_broker_meta WHERE singleton AND version=1",
         )
         .fetch_one(&mut *tx)
@@ -104,7 +106,7 @@ impl Journal {
             .begin()
             .await
             .map_err(|_| BrokerError::Unavailable)?;
-        let stored: Option<String> = sqlx::query_scalar(
+        let stored: Option<String> = sqlx_core::query_scalar::query_scalar(
             "SELECT cluster_uid FROM devres_credential_broker_meta WHERE singleton FOR UPDATE",
         )
         .fetch_one(&mut *tx)
@@ -116,16 +118,17 @@ impl Journal {
                 return Err(BrokerError::Forbidden);
             }
         } else {
-            let nonempty: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_credential_broker_keys)")
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|_| BrokerError::Unavailable)?;
+            let nonempty: bool = sqlx_core::query_scalar::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM devres_credential_broker_keys)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| BrokerError::Unavailable)?;
             if nonempty {
                 tx.rollback().await.map_err(|_| BrokerError::Unavailable)?;
                 return Err(BrokerError::Forbidden);
             }
-            sqlx::query("UPDATE devres_credential_broker_meta SET cluster_uid=$1 WHERE singleton AND cluster_uid IS NULL")
+            sqlx_core::query::query("UPDATE devres_credential_broker_meta SET cluster_uid=$1 WHERE singleton AND cluster_uid IS NULL")
                 .bind(cluster_uid).execute(&mut *tx).await.map_err(|_|BrokerError::Unavailable)?;
         }
         tx.commit().await.map_err(|_| BrokerError::Unavailable)?;
@@ -140,7 +143,7 @@ impl Journal {
     }
     pub async fn records(&mut self, limit: i64) -> Result<Vec<Record>> {
         self.bound()?;
-        let rows=sqlx::query("SELECT intent,pod_uid,namespace,service_account,service_account_uid,pod_name,token_expires_at,profile,application_id,description,requested_expiry,state,access_key,expires_at,encryption_key,ciphertext FROM devres_credential_broker_keys WHERE state <> 'revoked' ORDER BY created_at,intent LIMIT $1")
+        let rows=sqlx_core::query::query("SELECT intent,pod_uid,namespace,service_account,service_account_uid,pod_name,token_expires_at,profile,application_id,description,requested_expiry,state,access_key,expires_at,encryption_key,ciphertext FROM devres_credential_broker_keys WHERE state <> 'revoked' ORDER BY created_at,intent LIMIT $1")
             .bind(limit+1).fetch_all(&mut self.connection).await.map_err(|_|BrokerError::Unavailable)?;
         if rows.len() as i64 > limit {
             return Err(BrokerError::Capacity);
@@ -205,7 +208,7 @@ impl Journal {
         self.bound()?;
         let intent = random_id()?;
         let description = format!("devres-broker:{}:{intent}", self.broker_id);
-        sqlx::query("INSERT INTO devres_credential_broker_keys(intent,pod_uid,namespace,service_account,service_account_uid,pod_name,token_expires_at,profile,application_id,description,requested_expiry,state,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$11)")
+        sqlx_core::query::query("INSERT INTO devres_credential_broker_keys(intent,pod_uid,namespace,service_account,service_account_uid,pod_name,token_expires_at,profile,application_id,description,requested_expiry,state,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$11)")
             .bind(&intent).bind(&identity.pod_uid).bind(&identity.namespace).bind(&identity.service_account)
             .bind(&identity.service_account_uid).bind(&identity.pod_name).bind(identity.token_expires_at)
             .bind(profile).bind(app).bind(&description).bind(expires).execute(&mut self.connection).await.map_err(|_|BrokerError::Unavailable)?;
@@ -230,7 +233,7 @@ impl Journal {
         plaintext: &[u8],
     ) -> Result<()> {
         let cipher = keyring.seal(&self.aad(row)?, plaintext)?;
-        let affected=sqlx::query("UPDATE devres_credential_broker_keys SET access_key=$2,expires_at=$3,state='issued',encryption_key=$4,ciphertext=$5 WHERE intent=$1 AND state='pending'")
+        let affected=sqlx_core::query::query("UPDATE devres_credential_broker_keys SET access_key=$2,expires_at=$3,state='issued',encryption_key=$4,ciphertext=$5 WHERE intent=$1 AND state='pending'")
             .bind(&row.intent).bind(&row.access_key).bind(row.expires_at).bind(&keyring.active).bind(cipher)
             .execute(&mut self.connection).await.map_err(|_|BrokerError::Unavailable)?.rows_affected();
         if affected != 1 {
@@ -240,13 +243,13 @@ impl Journal {
     }
     pub async fn revoke_pending(&mut self, row: &Record) -> Result<()> {
         self.bound()?;
-        sqlx::query("UPDATE devres_credential_broker_keys SET state='revoke',access_key=$2,expires_at=$3 WHERE intent=$1 AND state <> 'revoked'")
+        sqlx_core::query::query("UPDATE devres_credential_broker_keys SET state='revoke',access_key=$2,expires_at=$3 WHERE intent=$1 AND state <> 'revoked'")
             .bind(&row.intent).bind(&row.access_key).bind(row.expires_at).execute(&mut self.connection).await.map_err(|_|BrokerError::Unavailable)?;
         Ok(())
     }
     pub async fn revoked(&mut self, intent: &str) -> Result<()> {
         self.bound()?;
-        sqlx::query("UPDATE devres_credential_broker_keys SET state='revoked',ciphertext=NULL,encryption_key=NULL WHERE intent=$1")
+        sqlx_core::query::query("UPDATE devres_credential_broker_keys SET state='revoked',ciphertext=NULL,encryption_key=NULL WHERE intent=$1")
             .bind(intent).execute(&mut self.connection).await.map_err(|_|BrokerError::Unavailable)?;
         Ok(())
     }
@@ -266,7 +269,7 @@ impl Journal {
         )?;
         if key != keys.active {
             let cipher = keys.seal(&aad, &plain)?;
-            sqlx::query("UPDATE devres_credential_broker_keys SET encryption_key=$2,ciphertext=$3 WHERE intent=$1")
+            sqlx_core::query::query("UPDATE devres_credential_broker_keys SET encryption_key=$2,ciphertext=$3 WHERE intent=$1")
                 .bind(&row.intent).bind(&keys.active).bind(cipher).execute(&mut self.connection).await.map_err(|_|BrokerError::Unavailable)?;
         }
         plain.fill(0);
@@ -348,7 +351,7 @@ mod tests {
         let mut admission = PgConnection::connect(&database)
             .await
             .expect("fixture database");
-        let name: String = sqlx::query_scalar("SELECT current_database()")
+        let name: String = sqlx_core::query_scalar::query_scalar("SELECT current_database()")
             .fetch_one(&mut admission)
             .await
             .expect("database name");
@@ -438,13 +441,15 @@ mod tests {
             plaintext
         );
         journal.revoked(&row.intent).await.expect("revoke");
-        let discarded:bool=sqlx::query_scalar("SELECT ciphertext IS NULL AND encryption_key IS NULL FROM devres_credential_broker_keys WHERE intent=$1")
+        let discarded:bool=sqlx_core::query_scalar::query_scalar("SELECT ciphertext IS NULL AND encryption_key IS NULL FROM devres_credential_broker_keys WHERE intent=$1")
             .bind(&row.intent).fetch_one(&mut journal.connection).await.expect("discard encrypted secret");
         assert!(discarded);
-        sqlx::query("UPDATE devres_credential_broker_meta SET cluster_uid=NULL WHERE singleton")
-            .execute(&mut journal.connection)
-            .await
-            .expect("simulate legacy unbound journal");
+        sqlx_core::query::query(
+            "UPDATE devres_credential_broker_meta SET cluster_uid=NULL WHERE singleton",
+        )
+        .execute(&mut journal.connection)
+        .await
+        .expect("simulate legacy unbound journal");
         journal.connection.close().await.expect("close owner");
         let mut legacy = Journal::connect(&database).await.expect("legacy journal");
         assert_eq!(
@@ -452,7 +457,7 @@ mod tests {
             Err(BrokerError::Forbidden),
             "nonempty unbound journals cannot silently acquire a cluster"
         );
-        sqlx::query("UPDATE devres_credential_broker_meta SET cluster_uid='fixture-cluster-devres' WHERE singleton")
+        sqlx_core::query::query("UPDATE devres_credential_broker_meta SET cluster_uid='fixture-cluster-devres' WHERE singleton")
             .execute(&mut legacy.connection).await.expect("restore fixture cluster binding");
         legacy
             .connection
@@ -462,7 +467,7 @@ mod tests {
         let mut fixture = PgConnection::connect(&database)
             .await
             .expect("fixture admission");
-        sqlx::query("CREATE TABLE devres_schema(version integer)")
+        sqlx_core::query::query("CREATE TABLE devres_schema(version integer)")
             .execute(&mut fixture)
             .await
             .expect("synthetic corpus schema marker");
@@ -473,7 +478,7 @@ mod tests {
             ),
             "corpus and broker must never share a database"
         );
-        sqlx::query("DROP TABLE devres_schema")
+        sqlx_core::query::query("DROP TABLE devres_schema")
             .execute(&mut fixture)
             .await
             .expect("remove synthetic corpus marker");

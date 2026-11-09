@@ -4,7 +4,8 @@ use devres_application::{Cached, Store};
 use devres_domain::{
     Body, Capture, Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators,
 };
-use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgPoolOptions};
+use sqlx_core::{connection::Connection, row::Row};
+use sqlx_postgres::{PgConnection, PgPool, PgPoolOptions};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -71,11 +72,12 @@ impl PgBlobStore {
         let sql = format!(
             "SELECT octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM {table} WHERE key=$1"
         );
-        let shape: Option<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| storage_error())?;
+        let shape: Option<(i64, i64)> =
+            sqlx_core::query_as::query_as(sqlx_core::sql_str::AssertSqlSafe(sql))
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| storage_error())?;
         let (bytes, nodes) = shape.unwrap_or((0, 0));
         let charge = crate::MigrationExecution::graph_input_charge(
             usize::try_from(bytes).map_err(|_| storage_error())?,
@@ -218,11 +220,12 @@ impl PgBlobStore {
         action: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value> {
-        let backend: String =
-            sqlx::query_scalar("SELECT backend FROM devres_archive_control WHERE singleton")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|_| storage_error())?;
+        let backend: String = sqlx_core::query_scalar::query_scalar(
+            "SELECT backend FROM devres_archive_control WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         if backend == "filesystem" {
             self.verify_storage(cancel.clone()).await?;
         }
@@ -262,10 +265,12 @@ impl PgBlobStore {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         self.fence().await?;
-        let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| storage_error())?;
+        let version: i32 = sqlx_core::query_scalar::query_scalar(
+            "SELECT version FROM devres_schema WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         if !matches!(version, 11..=13) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
@@ -300,7 +305,7 @@ impl PgBlobStore {
         } else {
             "SELECT pg_try_advisory_lock_shared(1835365490, 2)"
         };
-        let lifecycle: bool = sqlx::query_scalar(lifecycle_sql)
+        let lifecycle: bool = sqlx_core::query_scalar::query_scalar(lifecycle_sql)
             .fetch_one(&mut owner)
             .await
             .map_err(|_| storage_error())?;
@@ -312,7 +317,7 @@ impl PgBlobStore {
         let acquired: bool = if reader {
             true
         } else {
-            sqlx::query_scalar("SELECT pg_try_advisory_lock(1835365490, 1)")
+            sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490, 1)")
                 .fetch_one(&mut owner)
                 .await
                 .map_err(|_| storage_error())?
@@ -322,7 +327,7 @@ impl PgBlobStore {
                 "Only one serving instance may own this database",
             ));
         }
-        let restore_pending: bool = sqlx::query_scalar(
+        let restore_pending: bool = sqlx_core::query_scalar::query_scalar(
             "SELECT to_regclass('public.devres_archive_restore_pending') IS NOT NULL",
         )
         .fetch_one(&mut owner)
@@ -333,12 +338,12 @@ impl PgBlobStore {
                 "Object archive restore is pending verification.",
             ));
         }
-        let identity=sqlx::query("SELECT pid,EXTRACT(EPOCH FROM backend_start)::text AS started FROM pg_stat_activity WHERE pid=pg_backend_pid()")
+        let identity=sqlx_core::query::query("SELECT pid,EXTRACT(EPOCH FROM backend_start)::text AS started FROM pg_stat_activity WHERE pid=pg_backend_pid()")
             .fetch_one(&mut owner).await.map_err(|_|storage_error())?;
         let owner_pid = identity.try_get("pid").map_err(|_| storage_error())?;
         let owner_started = identity.try_get("started").map_err(|_| storage_error())?;
         if read_only {
-            sqlx::query("SET default_transaction_read_only=on")
+            sqlx_core::query::query("SET default_transaction_read_only=on")
                 .execute(&mut owner)
                 .await
                 .map_err(|_| storage_error())?;
@@ -347,7 +352,7 @@ impl PgBlobStore {
             .after_connect(move |connection, _metadata| {
                 Box::pin(async move {
                     if read_only {
-                        sqlx::query("SET default_transaction_read_only=on")
+                        sqlx_core::query::query("SET default_transaction_read_only=on")
                             .execute(connection)
                             .await?;
                     }
@@ -363,21 +368,24 @@ impl PgBlobStore {
             return Self::attach_reader(root.as_ref(), s3, pool, owner, owner_pid, owner_started)
                 .await;
         }
-        let existed: bool = sqlx::query_scalar("SELECT to_regclass('devres_schema') IS NOT NULL")
-            .fetch_one(&mut owner)
-            .await
-            .map_err(|_| storage_error())?;
+        let existed: bool = sqlx_core::query_scalar::query_scalar(
+            "SELECT to_regclass('devres_schema') IS NOT NULL",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .map_err(|_| storage_error())?;
         if !existed && matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
             return Err(Error::unavailable(
                 "No initialized storage schema to inspect.",
             ));
         }
         if existed && !allow_migration {
-            let existing: i32 =
-                sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-                    .fetch_one(&mut owner)
-                    .await
-                    .map_err(|_| storage_error())?;
+            let existing: i32 = sqlx_core::query_scalar::query_scalar(
+                "SELECT version FROM devres_schema WHERE singleton",
+            )
+            .fetch_one(&mut owner)
+            .await
+            .map_err(|_| storage_error())?;
             if existing < 10 {
                 return Err(Error::unavailable(
                     "Offline BLAKE3 storage migration required.",
@@ -386,93 +394,97 @@ impl PgBlobStore {
         }
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
-            sqlx::raw_sql(SCHEMA)
+            sqlx_core::raw_sql::raw_sql(SCHEMA)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
-        let version: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&mut *tx)
+        let version: i32 = sqlx_core::query_scalar::query_scalar(
+            "SELECT version FROM devres_schema WHERE singleton",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?;
+        if version == 1 {
+            sqlx_core::raw_sql::raw_sql(corpus_storage::SCHEMA_V2)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+            sqlx_core::query::query(
+                "UPDATE devres_schema SET version=2 WHERE singleton AND version=1",
+            )
+            .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        if version == 1 {
-            sqlx::raw_sql(corpus_storage::SCHEMA_V2)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=2 WHERE singleton AND version=1")
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
         } else if !(2..=13).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
-            sqlx::raw_sql(crate_storage::SCHEMA_V3)
+            sqlx_core::raw_sql::raw_sql(crate_storage::SCHEMA_V3)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=3 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=3 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         if version <= 3 {
-            sqlx::raw_sql(advisory_storage::SCHEMA_V4)
+            sqlx_core::raw_sql::raw_sql(advisory_storage::SCHEMA_V4)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=4 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=4 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         if version <= 4 {
-            sqlx::raw_sql(mdn_storage::SCHEMA_V5)
+            sqlx_core::raw_sql::raw_sql(mdn_storage::SCHEMA_V5)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=5 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=5 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         if version <= 5 {
-            sqlx::raw_sql(whatwg_storage::SCHEMA_V6)
+            sqlx_core::raw_sql::raw_sql(whatwg_storage::SCHEMA_V6)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=6 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=6 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         if version <= 6 {
-            sqlx::raw_sql(w3c_storage::SCHEMA_V7)
+            sqlx_core::raw_sql::raw_sql(w3c_storage::SCHEMA_V7)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=7 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=7 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         if version <= 7 {
-            sqlx::raw_sql(chromium_storage::SCHEMA_V8)
+            sqlx_core::raw_sql::raw_sql(chromium_storage::SCHEMA_V8)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=8 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=8 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         if version <= 8 {
-            sqlx::raw_sql(npm_storage::SCHEMA_V9)
+            sqlx_core::raw_sql::raw_sql(npm_storage::SCHEMA_V9)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_schema SET version=9 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=9 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
@@ -480,11 +492,12 @@ impl PgBlobStore {
         if version <= 9 {
             migration::prepare(&mut tx, !existed).await?;
         }
-        let active: bool =
-            sqlx::query_scalar("SELECT active FROM devres_integrity_control WHERE singleton")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
+        let active: bool = sqlx_core::query_scalar::query_scalar(
+            "SELECT active FROM devres_integrity_control WHERE singleton",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?;
         if !maintenance && !active {
             return Err(Error::unavailable(
                 "BLAKE3 storage migration is pending activation.",
@@ -506,7 +519,7 @@ impl PgBlobStore {
             ));
         }
         if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
-            sqlx::raw_sql(crate::durable_archive::SCHEMA)
+            sqlx_core::raw_sql::raw_sql(crate::durable_archive::SCHEMA)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
@@ -517,10 +530,10 @@ impl PgBlobStore {
                     crate::durable_archive::config_binding(s3.as_ref().ok_or_else(storage_error)?)?;
                 // Namespace authority and fresh origin commit with the schema,
                 // before any fallible filesystem/transport initialization.
-                sqlx::query("UPDATE devres_archive_control SET initializing_s3=true,pending_binding=$1,epoch=epoch+1 WHERE singleton").bind(binding).execute(&mut *tx).await.map_err(|_|storage_error())?;
+                sqlx_core::query::query("UPDATE devres_archive_control SET initializing_s3=true,pending_binding=$1,epoch=epoch+1 WHERE singleton").bind(binding).execute(&mut *tx).await.map_err(|_|storage_error())?;
             }
         } else if version >= 12 {
-            let remote: bool = sqlx::query_scalar("SELECT backend='s3' OR pending_binding IS NOT NULL FROM devres_archive_control WHERE singleton").fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
+            let remote: bool = sqlx_core::query_scalar::query_scalar("SELECT backend='s3' OR pending_binding IS NOT NULL FROM devres_archive_control WHERE singleton").fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
             if remote {
                 return Err(Error::unavailable("Object archive configuration required."));
             }
@@ -529,20 +542,24 @@ impl PgBlobStore {
             mode,
             OpenMode::Serve | OpenMode::Maintenance | OpenMode::Transfer | OpenMode::RestoreCheck
         ) {
-            sqlx::query("UPDATE devres_schema SET version=13 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=13 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
         }
         if !maintenance {
-            sqlx::query("UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'")
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
-            sqlx::query("UPDATE devres_crate_jobs SET state='pending' WHERE state='running'")
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
+            sqlx_core::query::query(
+                "UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'",
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| storage_error())?;
+            sqlx_core::query::query(
+                "UPDATE devres_crate_jobs SET state='pending' WHERE state='running'",
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| storage_error())?;
         }
         tx.commit().await.map_err(|_| storage_error())?;
         if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
@@ -696,7 +713,7 @@ impl PgBlobStore {
         // Reads and supervision must not wait behind a bulk publication on the owner
         // connection. Verify its exact live backend and advisory lock independently;
         // backend_start also prevents PID reuse from impersonating a lost owner.
-        let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid=1 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)")
+        let owned:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid=1 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)")
             .bind(self.owner_pid).bind(&self.owner_started).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if !owned {
             return Err(Error::unavailable(
@@ -914,7 +931,7 @@ impl PgBlobStore {
         let _ = tokio::fs::remove_file(stage).await;
         result
     }
-    async fn load_row(&self, row: sqlx::postgres::PgRow, head: bool) -> Result<StoredCapture> {
+    async fn load_row(&self, row: sqlx_postgres::PgRow, head: bool) -> Result<StoredCapture> {
         let capture = Capture {
             id: row.try_get("id").map_err(|_| storage_error())?,
             key: row.try_get("source_key").map_err(|_| storage_error())?,
@@ -962,7 +979,7 @@ impl PgBlobStore {
 impl Store for PgBlobStore {
     async fn latest(&self, key: &str) -> Result<Option<Cached>> {
         self.fence().await?;
-        let row = sqlx::query("SELECT c.*, h.validated_at AS head_validated_at, h.etag, h.last_modified,h.head_integrity FROM devres_heads h JOIN devres_captures c ON c.id=h.capture_id WHERE h.source_key=$1")
+        let row = sqlx_core::query::query("SELECT c.*, h.validated_at AS head_validated_at, h.etag, h.last_modified,h.head_integrity FROM devres_heads h JOIN devres_captures c ON c.id=h.capture_id WHERE h.source_key=$1")
             .bind(key).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
         match row {
             None => Ok(None),
@@ -983,7 +1000,7 @@ impl Store for PgBlobStore {
         if !valid_hash(id) {
             return Err(Error::invalid("Invalid capture identifier"));
         }
-        let row = sqlx::query("SELECT c.*, GREATEST(COALESCE((SELECT MAX(o.validated_at) FROM devres_observations o WHERE o.capture_id=c.id OR o.capture_id IN (SELECT legacy FROM devres_content_aliases WHERE namespace='capture' AND canonical=c.id)),c.retrieved_at),COALESCE((SELECT MAX(o.observed_at) FROM devres_rfc_import_observations o WHERE o.capture_id=c.id OR o.capture_id IN (SELECT legacy FROM devres_content_aliases WHERE namespace='capture' AND canonical=c.id)),c.retrieved_at)) AS capture_validated_at FROM devres_captures c WHERE c.id=$1")
+        let row = sqlx_core::query::query("SELECT c.*, GREATEST(COALESCE((SELECT MAX(o.validated_at) FROM devres_observations o WHERE o.capture_id=c.id OR o.capture_id IN (SELECT legacy FROM devres_content_aliases WHERE namespace='capture' AND canonical=c.id)),c.retrieved_at),COALESCE((SELECT MAX(o.observed_at) FROM devres_rfc_import_observations o WHERE o.capture_id=c.id OR o.capture_id IN (SELECT legacy FROM devres_content_aliases WHERE namespace='capture' AND canonical=c.id)),c.retrieved_at)) AS capture_validated_at FROM devres_captures c WHERE c.id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -1027,11 +1044,11 @@ impl Store for PgBlobStore {
         owner.ping().await.map_err(|_| storage_error())?;
         // Publication uses the same connection that owns the serving fence.
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_captures (id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_captures (id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING")
             .bind(&id).bind(&request.key).bind(&request.url).bind(&body_hash).bind(&request.media_type).bind(now).bind(&metadata_digest).execute(&mut *tx).await.map_err(|_| storage_error())?;
         let head_payload = serde_json::json!({"source_key":request.key,"capture_id":id,"validated_at":now,"etag":response.validators.etag,"last_modified":response.validators.last_modified});
         let head_integrity = events::event_digest("devres_heads", &request.key, &head_payload)?;
-        sqlx::query("INSERT INTO devres_heads (source_key,capture_id,validated_at,etag,last_modified,head_integrity) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(source_key) DO UPDATE SET capture_id=EXCLUDED.capture_id,validated_at=EXCLUDED.validated_at,etag=EXCLUDED.etag,last_modified=EXCLUDED.last_modified,head_integrity=EXCLUDED.head_integrity")
+        sqlx_core::query::query("INSERT INTO devres_heads (source_key,capture_id,validated_at,etag,last_modified,head_integrity) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(source_key) DO UPDATE SET capture_id=EXCLUDED.capture_id,validated_at=EXCLUDED.validated_at,etag=EXCLUDED.etag,last_modified=EXCLUDED.last_modified,head_integrity=EXCLUDED.head_integrity")
             .bind(&request.key).bind(&id).bind(now).bind(&response.validators.etag).bind(&response.validators.last_modified).bind(head_integrity).execute(&mut *tx).await.map_err(|_| storage_error())?;
         if imported {
             events::append_import(&mut tx, &id, now, &request.url).await?;
@@ -1063,7 +1080,7 @@ impl Store for PgBlobStore {
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let prior=sqlx::query("SELECT source_key,capture_id,validated_at,etag,last_modified,head_integrity FROM devres_heads WHERE source_key=$1 AND capture_id=$2 FOR UPDATE")
+        let prior=sqlx_core::query::query("SELECT source_key,capture_id,validated_at,etag,last_modified,head_integrity FROM devres_heads WHERE source_key=$1 AND capture_id=$2 FOR UPDATE")
             .bind(key).bind(id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?.ok_or_else(||Error::integrity("Source head changed during revalidation"))?;
         let prior_payload = serde_json::json!({"source_key":key,"capture_id":id,"validated_at":prior.try_get::<i64,_>("validated_at").map_err(|_|storage_error())?,"etag":prior.try_get::<Option<String>,_>("etag").map_err(|_|storage_error())?,"last_modified":prior.try_get::<Option<String>,_>("last_modified").map_err(|_|storage_error())?});
         let proof: String = prior
@@ -1080,7 +1097,7 @@ impl Store for PgBlobStore {
             .map_err(|_| storage_error())?);
         let payload = serde_json::json!({"source_key":key,"capture_id":id,"validated_at":now,"etag":etag,"last_modified":modified});
         let proof = events::event_digest("devres_heads", key, &payload)?;
-        sqlx::query("UPDATE devres_heads SET validated_at=$3,etag=$4,last_modified=$5,head_integrity=$6 WHERE source_key=$1 AND capture_id=$2")
+        sqlx_core::query::query("UPDATE devres_heads SET validated_at=$3,etag=$4,last_modified=$5,head_integrity=$6 WHERE source_key=$1 AND capture_id=$2")
             .bind(key).bind(id).bind(now).bind(etag).bind(modified).bind(proof).execute(&mut *tx).await.map_err(|_|storage_error())?;
         events::append_http(&mut tx, id, now, 304).await?;
         tx.commit().await.map_err(|_| storage_error())?;

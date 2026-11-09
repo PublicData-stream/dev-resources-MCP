@@ -4,7 +4,7 @@ use crate::MigrationExecution;
 use crate::integrity::{self, FileEvidence};
 use devres_domain::{Error, Result};
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, Row};
+use sqlx_core::{connection::Connection, row::Row};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -508,9 +508,9 @@ async fn persist_sql(
         .map(|(old, new)| mapping_digest("body", old, new))
         .collect::<Result<_>>()?;
     let result: Result<()> = async {
-        sqlx::query("INSERT INTO devres_integrity_files(path,digest,bytes) SELECT * FROM UNNEST($1::text[],$2::text[],$3::bigint[]) ON CONFLICT(path) DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_integrity_files(path,digest,bytes) SELECT * FROM UNNEST($1::text[],$2::text[],$3::bigint[]) ON CONFLICT(path) DO NOTHING")
             .bind(&paths).bind(&digests).bind(&sizes).execute(&mut *tx).await.map_err(|_| storage_error())?;
-        sqlx::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) SELECT 'body',* FROM UNNEST($1::text[],$2::text[],$3::text[]) ON CONFLICT DO NOTHING")
+        sqlx_core::query::query("INSERT INTO devres_content_aliases(namespace,legacy,canonical,mapping_integrity) SELECT 'body',* FROM UNNEST($1::text[],$2::text[],$3::text[]) ON CONFLICT DO NOTHING")
             .bind(&old).bind(&canonical).bind(&proofs).execute(&mut *tx).await.map_err(|_| storage_error())?;
         verify_sql(&mut tx, &batch, &paths, &old).await?;
         canceled(cancel)?;
@@ -526,17 +526,18 @@ async fn persist_sql(
 }
 
 async fn verify_sql(
-    connection: &mut sqlx::PgConnection,
+    connection: &mut sqlx_postgres::PgConnection,
     batch: &DurableBatch,
     paths: &[&str],
     aliases: &[&str],
 ) -> Result<()> {
-    let files =
-        sqlx::query("SELECT path,digest,bytes FROM devres_integrity_files WHERE path=ANY($1)")
-            .bind(paths)
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|_| storage_error())?;
+    let files = sqlx_core::query::query(
+        "SELECT path,digest,bytes FROM devres_integrity_files WHERE path=ANY($1)",
+    )
+    .bind(paths)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| storage_error())?;
     for entry in &batch.0 {
         let prior = files
             .iter()
@@ -557,7 +558,7 @@ async fn verify_sql(
             return Err(Error::integrity("Retained migration checkpoint changed."));
         }
     }
-    let rows = sqlx::query("SELECT legacy,canonical,mapping_integrity FROM devres_content_aliases WHERE namespace='body' AND legacy=ANY($1)")
+    let rows = sqlx_core::query::query("SELECT legacy,canonical,mapping_integrity FROM devres_content_aliases WHERE namespace='body' AND legacy=ANY($1)")
         .bind(aliases).fetch_all(&mut *connection).await.map_err(|_| storage_error())?;
     for entry in &batch.0 {
         if let Some(old) = &entry.alias {

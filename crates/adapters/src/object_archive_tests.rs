@@ -11,7 +11,7 @@ async fn s3_capture_transfer_resume_activation_and_cold_history() {
         toml::from_str(&std::fs::read_to_string(configured).unwrap()).unwrap();
     config.prefix.push_str("/capture-transfer");
     let admin = PgPool::connect(&base).await.unwrap();
-    sqlx::query("CREATE DATABASE devres_s3_capture_transfer")
+    sqlx_core::query::query("CREATE DATABASE devres_s3_capture_transfer")
         .execute(&admin)
         .await
         .unwrap();
@@ -167,7 +167,7 @@ async fn s3_fresh_initialization_resumes_only_its_matching_failed_attempt() {
         toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     config.prefix.push_str("/fresh-initialization-retry");
     let admin = PgPool::connect(&base).await.unwrap();
-    sqlx::query("CREATE DATABASE devres_s3_fresh_retry")
+    sqlx_core::query::query("CREATE DATABASE devres_s3_fresh_retry")
         .execute(&admin)
         .await
         .unwrap();
@@ -193,7 +193,7 @@ async fn s3_fresh_initialization_resumes_only_its_matching_failed_attempt() {
             .is_err()
     );
     let inspect = PgPool::connect(database.as_str()).await.unwrap();
-    let pending:bool=sqlx::query_scalar("SELECT initializing_s3 AND backend='filesystem' AND pending_binding IS NOT NULL FROM devres_archive_control WHERE singleton").fetch_one(&inspect).await.unwrap();
+    let pending:bool=sqlx_core::query_scalar::query_scalar("SELECT initializing_s3 AND backend='filesystem' AND pending_binding IS NOT NULL FROM devres_archive_control WHERE singleton").fetch_one(&inspect).await.unwrap();
     assert!(pending);
     let mut other = config.clone();
     other.prefix.push_str("/different");
@@ -206,7 +206,7 @@ async fn s3_fresh_initialization_resumes_only_its_matching_failed_attempt() {
         .await
         .unwrap();
     store.check_health().await.unwrap();
-    let active: bool = sqlx::query_scalar(
+    let active: bool = sqlx_core::query_scalar::query_scalar(
         "SELECT backend='s3' AND NOT initializing_s3 FROM devres_archive_control WHERE singleton",
     )
     .fetch_one(&inspect)

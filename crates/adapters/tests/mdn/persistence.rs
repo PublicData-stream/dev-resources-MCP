@@ -67,7 +67,9 @@ async fn publish_evidence(
 async fn mdn_owner_fenced_immutable_pair_budget_and_restart() {
     let base =
         std::env::var("DEVRES_TEST_DATABASE_URL").expect("explicit disposable database required");
-    let admin = sqlx::PgPool::connect(&base).await.expect("fixture admin");
+    let admin = sqlx_postgres::PgPool::connect(&base)
+        .await
+        .expect("fixture admin");
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -79,24 +81,28 @@ async fn mdn_owner_fenced_immutable_pair_budget_and_restart() {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     );
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-        .execute(&admin)
-        .await
-        .expect("create owned fixture database");
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .expect("create owned fixture database");
     let mut database_url = url::Url::parse(&base).expect("database URL");
     database_url.set_path(&format!("/{database}"));
     let root = tempfile::tempdir().expect("owned fixture blobs");
     let store = PgBlobStore::connect(database_url.as_str(), root.path())
         .await
         .expect("schema migration");
-    let database_pool = sqlx::PgPool::connect(database_url.as_str())
+    let database_pool = sqlx_postgres::PgPool::connect(database_url.as_str())
         .await
         .expect("fixture inspection");
     assert_eq!(
-        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&database_pool)
-            .await
-            .expect("schema version"),
+        sqlx_core::query_scalar::query_scalar::<_, i32>(
+            "SELECT version FROM devres_schema WHERE singleton"
+        )
+        .fetch_one(&database_pool)
+        .await
+        .expect("schema version"),
         13
     );
     assert_eq!(
@@ -451,8 +457,8 @@ async fn mdn_owner_fenced_immutable_pair_budget_and_restart() {
     );
     drop(large);
     // Kill only this fixture database's dedicated owner to verify fail-closed reads.
-    let owner:i32=sqlx::query_scalar("SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&database_pool).await.expect("owned fixture lock");
-    sqlx::query("SELECT pg_terminate_backend($1)")
+    let owner:i32=sqlx_core::query_scalar::query_scalar("SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&database_pool).await.expect("owned fixture lock");
+    sqlx_core::query::query("SELECT pg_terminate_backend($1)")
         .bind(owner)
         .execute(&database_pool)
         .await
@@ -501,7 +507,7 @@ async fn mdn_owner_fenced_immutable_pair_budget_and_restart() {
     );
     drop(restarted);
     database_pool.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "DROP DATABASE {database} WITH (FORCE)"
     )))
     .execute(&admin)

@@ -56,8 +56,8 @@ async fn rustsec_atomic_publication_local_research_history_and_restart() {
         }
     }
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
-    sqlx::query("CREATE DATABASE devres_rustsec_fixture")
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+    sqlx_core::query::query("CREATE DATABASE devres_rustsec_fixture")
         .execute(&admin)
         .await
         .unwrap();
@@ -368,8 +368,8 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
     };
     use serde_json::json;
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
-    sqlx::query("CREATE DATABASE devres_crate_storage_fixture")
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+    sqlx_core::query::query("CREATE DATABASE devres_crate_storage_fixture")
         .execute(&admin)
         .await
         .unwrap();
@@ -420,9 +420,9 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
             record: record(v, false),
         })
         .collect();
-    let blocker = sqlx::PgPool::connect(&database).await.unwrap();
+    let blocker = sqlx_postgres::PgPool::connect(&database).await.unwrap();
     let mut blocked = blocker.begin().await.unwrap();
-    sqlx::query("SELECT id FROM devres_crate_inventories WHERE id=$1 FOR UPDATE")
+    sqlx_core::query::query("SELECT id FROM devres_crate_inventories WHERE id=$1 FOR UPDATE")
         .bind(&epoch.id)
         .fetch_one(&mut *blocked)
         .await
@@ -902,7 +902,7 @@ async fn crate_corpus_epochs_generation_visibility_and_restart() {
     assert_eq!(store.capture(&old_text.id).await.unwrap().body, b"old docs");
     assert!(store.artifact(&old_text.id).await.unwrap().is_some());
     drop(store);
-    sqlx::query("DROP DATABASE devres_crate_storage_fixture WITH(FORCE)")
+    sqlx_core::query::query("DROP DATABASE devres_crate_storage_fixture WITH(FORCE)")
         .execute(&admin)
         .await
         .unwrap();
@@ -916,9 +916,9 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     use sha2::{Digest, Sha256};
 
     let base_url = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-    let admin = sqlx::PgPool::connect(&base_url).await.unwrap();
+    let admin = sqlx_postgres::PgPool::connect(&base_url).await.unwrap();
     let database_name = "devres_rfc_storage_fixture";
-    sqlx::query("CREATE DATABASE devres_rfc_storage_fixture")
+    sqlx_core::query::query("CREATE DATABASE devres_rfc_storage_fixture")
         .execute(&admin)
         .await
         .unwrap();
@@ -926,9 +926,9 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     parsed_url.set_path(&format!("/{database_name}"));
     let url = parsed_url.to_string();
     let root = tempfile::tempdir().unwrap();
-    let fixture_pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let fixture_pool = sqlx_postgres::PgPool::connect(&url).await.unwrap();
     // The disposable database begins with the original v1 schema and a retained body.
-    sqlx::raw_sql("CREATE TABLE devres_schema(singleton boolean PRIMARY KEY CHECK(singleton),version integer NOT NULL); INSERT INTO devres_schema VALUES(true,1); CREATE TABLE devres_captures(id text PRIMARY KEY,source_key text NOT NULL,source_url text NOT NULL,body_hash text NOT NULL,media_type text NOT NULL,retrieved_at bigint NOT NULL); CREATE TABLE devres_heads(source_key text PRIMARY KEY,capture_id text NOT NULL REFERENCES devres_captures(id),validated_at bigint NOT NULL,etag text,last_modified text); CREATE TABLE devres_observations(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,capture_id text NOT NULL REFERENCES devres_captures(id),validated_at bigint NOT NULL,status smallint NOT NULL CHECK(status IN (200,304))); ")
+    sqlx_core::raw_sql::raw_sql("CREATE TABLE devres_schema(singleton boolean PRIMARY KEY CHECK(singleton),version integer NOT NULL); INSERT INTO devres_schema VALUES(true,1); CREATE TABLE devres_captures(id text PRIMARY KEY,source_key text NOT NULL,source_url text NOT NULL,body_hash text NOT NULL,media_type text NOT NULL,retrieved_at bigint NOT NULL); CREATE TABLE devres_heads(source_key text PRIMARY KEY,capture_id text NOT NULL REFERENCES devres_captures(id),validated_at bigint NOT NULL,etag text,last_modified text); CREATE TABLE devres_observations(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,capture_id text NOT NULL REFERENCES devres_captures(id),validated_at bigint NOT NULL,status smallint NOT NULL CHECK(status IN (200,304))); ")
         .execute(&fixture_pool).await.unwrap();
     let original_hash = hex::encode(Sha256::digest(b"v1 retained capture"));
     let original_id = hex::encode(Sha256::digest(
@@ -937,7 +937,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     tokio::fs::write(root.path().join(&original_hash), b"v1 retained capture")
         .await
         .unwrap();
-    sqlx::query("INSERT INTO devres_captures VALUES($1,'fixture:v1','https://fixture.invalid/v1',$2,'text/plain',1)")
+    sqlx_core::query::query("INSERT INTO devres_captures VALUES($1,'fixture:v1','https://fixture.invalid/v1',$2,'text/plain',1)")
         .bind(&original_id).bind(&original_hash).execute(&fixture_pool).await.unwrap();
     assert!(
         PgBlobStore::connect(&url, root.path()).await.is_err(),
@@ -962,7 +962,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     // Offline BLAKE3 conversion still ends at schema 10. Normal serving then
     // performs bounded attribution and split-runtime bootstrap to schema 13.
     assert_eq!(
-        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema")
+        sqlx_core::query_scalar::query_scalar::<_, i32>("SELECT version FROM devres_schema")
             .fetch_one(&fixture_pool)
             .await
             .unwrap(),
@@ -971,7 +971,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     drop(migrating);
     let store = PgBlobStore::connect(&url, root.path()).await.unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema")
+        sqlx_core::query_scalar::query_scalar::<_, i32>("SELECT version FROM devres_schema")
             .fetch_one(&fixture_pool)
             .await
             .unwrap(),
@@ -1295,7 +1295,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         .await
         .unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
+        sqlx_core::query_scalar::query_scalar::<_, i64>(
             "SELECT count(*) FROM devres_observations WHERE capture_id=$1"
         )
         .bind(&imported.capture.id)
@@ -1305,7 +1305,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         0
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
+        sqlx_core::query_scalar::query_scalar::<_, i64>(
             "SELECT count(*) FROM devres_rfc_import_observations WHERE capture_id=$1"
         )
         .bind(&imported.capture.id)
@@ -1350,7 +1350,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         store.capture(&original_id).await.unwrap().body,
         b"v1 retained capture"
     );
-    sqlx::query("SELECT pg_terminate_backend(pid,5000) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
+    sqlx_core::query::query("SELECT pg_terminate_backend(pid,5000) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
         .execute(&fixture_pool).await.unwrap();
     assert!(store.save_dataset("catalogue", &dataset).await.is_err());
     assert!(store.schedule(std::slice::from_ref(&job)).await.is_err());
@@ -1364,7 +1364,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     assert!(store.save_snapshot(&snapshot).await.is_err());
     drop(store);
     fixture_pool.close().await;
-    sqlx::query("DROP DATABASE devres_rfc_storage_fixture WITH (FORCE)")
+    sqlx_core::query::query("DROP DATABASE devres_rfc_storage_fixture WITH (FORCE)")
         .execute(&admin)
         .await
         .unwrap();
@@ -1475,8 +1475,8 @@ async fn permanent_history_revalidation_and_integrity() {
         store.latest(&req.key).await.unwrap().unwrap().stored.body,
         b"second"
     );
-    let maintenance = sqlx::PgPool::connect(&url).await.unwrap();
-    let terminated: Vec<bool> = sqlx::query_scalar("SELECT pg_terminate_backend(pid,5000) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
+    let maintenance = sqlx_postgres::PgPool::connect(&url).await.unwrap();
+    let terminated: Vec<bool> = sqlx_core::query_scalar::query_scalar("SELECT pg_terminate_backend(pid,5000) FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")
         .fetch_all(&maintenance).await.unwrap();
     assert_eq!(terminated, vec![true]);
     assert!(store.check_health().await.is_err());
@@ -1539,12 +1539,12 @@ async fn permanent_history_revalidation_and_integrity() {
 async fn crate_jobs_resume_in_same_owner_after_interrupted_worker_group() {
     use devres_application::crate_corpus::{CollectionJob, CrateCorpusStore};
     use serde_json::json;
-    use sqlx::Row;
+    use sqlx_core::row::Row;
 
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
     let name = "devres_crate_worker_recovery_fixture";
-    sqlx::query("CREATE DATABASE devres_crate_worker_recovery_fixture")
+    sqlx_core::query::query("CREATE DATABASE devres_crate_worker_recovery_fixture")
         .execute(&admin)
         .await
         .unwrap();
@@ -1554,7 +1554,9 @@ async fn crate_jobs_resume_in_same_owner_after_interrupted_worker_group() {
     let store = PgBlobStore::connect(database.as_str(), root.path())
         .await
         .unwrap();
-    let observer = sqlx::PgPool::connect(database.as_str()).await.unwrap();
+    let observer = sqlx_postgres::PgPool::connect(database.as_str())
+        .await
+        .unwrap();
     let artifact = store
         .save_text(
             "cargo:derived:recovery-fixture",
@@ -1598,7 +1600,7 @@ async fn crate_jobs_resume_in_same_owner_after_interrupted_worker_group() {
 
     // No reconnect: this is exactly the lifecycle retry used after a transient S3 outage.
     store.recover_interrupted_jobs().await.unwrap();
-    let row = sqlx::query("SELECT state,attempts,artifact,last_error,due_at FROM devres_crate_jobs WHERE source_key='interrupted'")
+    let row = sqlx_core::query::query("SELECT state,attempts,artifact,last_error,due_at FROM devres_crate_jobs WHERE source_key='interrupted'")
         .fetch_one(&observer).await.unwrap();
     assert_eq!(row.get::<String, _>("state"), "pending");
     assert_eq!(row.get::<i64, _>("attempts"), 2);
@@ -1610,27 +1612,29 @@ async fn crate_jobs_resume_in_same_owner_after_interrupted_worker_group() {
     assert_eq!(resumed.key, interrupted.key);
     assert_eq!(resumed.attempts, 3);
     assert_eq!(resumed.artifact.as_deref(), Some(artifact.id.as_str()));
-    let state: String =
-        sqlx::query_scalar("SELECT state FROM devres_crate_jobs WHERE source_key='scheduled'")
-            .fetch_one(&observer)
-            .await
-            .unwrap();
+    let state: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT state FROM devres_crate_jobs WHERE source_key='scheduled'",
+    )
+    .fetch_one(&observer)
+    .await
+    .unwrap();
     assert_eq!(state, "captured");
 
     // The reset must not succeed after the dedicated owner connection loses its fence.
-    let killed: Vec<bool> = sqlx::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND granted AND pid<>pg_backend_pid()")
+    let killed: Vec<bool> = sqlx_core::query_scalar::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND granted AND pid<>pg_backend_pid()")
         .fetch_all(&observer).await.unwrap();
     assert!(!killed.is_empty());
     assert!(store.recover_interrupted_jobs().await.is_err());
-    let state: String =
-        sqlx::query_scalar("SELECT state FROM devres_crate_jobs WHERE source_key='interrupted'")
-            .fetch_one(&observer)
-            .await
-            .unwrap();
+    let state: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT state FROM devres_crate_jobs WHERE source_key='interrupted'",
+    )
+    .fetch_one(&observer)
+    .await
+    .unwrap();
     assert_eq!(state, "running");
     drop(store);
     observer.close().await;
-    sqlx::query("DROP DATABASE devres_crate_worker_recovery_fixture WITH(FORCE)")
+    sqlx_core::query::query("DROP DATABASE devres_crate_worker_recovery_fixture WITH(FORCE)")
         .execute(&admin)
         .await
         .unwrap();

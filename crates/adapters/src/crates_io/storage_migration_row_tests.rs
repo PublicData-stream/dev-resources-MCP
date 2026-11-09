@@ -3,8 +3,8 @@ use super::*;
 use std::time::Duration;
 
 struct RowFixture {
-    admin: sqlx::PgPool,
-    pool: sqlx::PgPool,
+    admin: sqlx_postgres::PgPool,
+    pool: sqlx_postgres::PgPool,
     store: Arc<PgBlobStore>,
     root: tempfile::TempDir,
     database: String,
@@ -15,16 +15,18 @@ struct RowFixture {
 impl RowFixture {
     async fn new(count: usize, padding: usize, observations: usize) -> Self {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let database = format!("devres_crate_rows_{suffix}");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
         let mut url = url::Url::parse(&base).unwrap();
         url.set_path(&format!("/{database}"));
         let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -33,7 +35,7 @@ impl RowFixture {
                 .await
                 .unwrap(),
         );
-        let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+        let pool = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
         let mut maps = crate::MigrationMap::new();
         let mut pairs = Vec::new();
         let body = b"public synthetic retained crate evidence";
@@ -56,7 +58,7 @@ impl RowFixture {
                     retrieved_at: 17,
                     validated_at: 17,
                 };
-                sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7)")
+                sqlx_core::query::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7)")
                     .bind(id).bind(&key).bind(&source_url).bind(body_hash).bind("text/plain").bind(17_i64)
                     .bind(crate::storage::capture_metadata_digest(&capture).unwrap()).execute(&pool).await.unwrap();
             }
@@ -68,7 +70,7 @@ impl RowFixture {
                 &payload_integrity::crate_artifact_payload(body.len() as u64, &provenance),
             )
             .unwrap();
-            sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4)")
+            sqlx_core::query::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4)")
                 .bind(&old).bind(body.len() as i64).bind(Json(&provenance)).bind(seal).execute(&pool).await.unwrap();
             for _ in 0..observations {
                 let mut connection = pool.acquire().await.unwrap();
@@ -99,18 +101,18 @@ impl RowFixture {
     }
 
     async fn canonical_tuples(&self) -> Vec<(String, String)> {
-        sqlx::query_as("SELECT capture_id,ctid::text FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id")
+        sqlx_core::query_as::query_as("SELECT capture_id,ctid::text FROM devres_crate_artifacts WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id")
             .fetch_all(&self.pool).await.unwrap()
     }
 
     async fn semantic_rows(&self) -> Vec<Value> {
-        let rows: Vec<Json<Value>> = sqlx::query_scalar("SELECT to_jsonb(a) FROM devres_crate_artifacts a WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id")
+        let rows: Vec<Json<Value>> = sqlx_core::query_scalar::query_scalar("SELECT to_jsonb(a) FROM devres_crate_artifacts a WHERE capture_id LIKE 'blake3:%' ORDER BY capture_id")
             .fetch_all(&self.pool).await.unwrap();
         let mut values: Vec<Value> = rows.into_iter().map(|value| value.0).collect();
-        let rows: Vec<Json<Value>> = sqlx::query_scalar("SELECT to_jsonb(o) FROM devres_crate_observations o WHERE capture_id LIKE 'blake3:%' ORDER BY sequence")
+        let rows: Vec<Json<Value>> = sqlx_core::query_scalar::query_scalar("SELECT to_jsonb(o) FROM devres_crate_observations o WHERE capture_id LIKE 'blake3:%' ORDER BY sequence")
             .fetch_all(&self.pool).await.unwrap();
         values.extend(rows.into_iter().map(|value| value.0));
-        let rows: Vec<Json<Value>> = sqlx::query_scalar("SELECT to_jsonb(s) FROM devres_integrity_staged_state s WHERE provider='crate' ORDER BY key")
+        let rows: Vec<Json<Value>> = sqlx_core::query_scalar::query_scalar("SELECT to_jsonb(s) FROM devres_integrity_staged_state s WHERE provider='crate' ORDER BY key")
             .fetch_all(&self.pool).await.unwrap();
         values.extend(rows.into_iter().map(|value| value.0));
         values
@@ -121,17 +123,19 @@ impl RowFixture {
             table,
             "devres_crate_artifacts" | "devres_crate_observations" | "devres_crate_staging"
         ));
-        sqlx::raw_sql("CREATE TABLE fixture_transactions(xid bigint NOT NULL); CREATE FUNCTION fixture_record_tx() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO fixture_transactions VALUES(txid_current()); RETURN NEW; END $$;")
+        sqlx_core::raw_sql::raw_sql("CREATE TABLE fixture_transactions(xid bigint NOT NULL); CREATE FUNCTION fixture_record_tx() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO fixture_transactions VALUES(txid_current()); RETURN NEW; END $$;")
             .execute(&self.pool).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE TRIGGER fixture_record_tx AFTER INSERT ON {table} FOR EACH ROW WHEN (NEW.{} LIKE 'blake3:%') EXECUTE FUNCTION fixture_record_tx()", if table == "devres_crate_staging" { "inventory" } else { "capture_id" })))
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!("CREATE TRIGGER fixture_record_tx AFTER INSERT ON {table} FOR EACH ROW WHEN (NEW.{} LIKE 'blake3:%') EXECUTE FUNCTION fixture_record_tx()", if table == "devres_crate_staging" { "inventory" } else { "capture_id" })))
             .execute(&self.pool).await.unwrap();
     }
 
     async fn batch_sizes(&self) -> Vec<i64> {
-        sqlx::query_scalar("SELECT count(*) FROM fixture_transactions GROUP BY xid ORDER BY xid")
-            .fetch_all(&self.pool)
-            .await
-            .unwrap()
+        sqlx_core::query_scalar::query_scalar(
+            "SELECT count(*) FROM fixture_transactions GROUP BY xid ORDER BY xid",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
     }
 
     async fn close(self) {
@@ -148,7 +152,7 @@ impl RowFixture {
         drop(store);
         pool.close().await;
         drop(root);
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"
         )))
         .execute(&admin)
@@ -192,13 +196,13 @@ async fn crate_row_pipeline_serial_parallel_boundaries_and_occurrence_resume() {
                 .migrate_observation_rows(&fixture.maps, &cancel, &execution)
                 .await
                 .unwrap();
-            let observations: i64 = sqlx::query_scalar(
+            let observations: i64 = sqlx_core::query_scalar::query_scalar(
                 "SELECT count(*) FROM devres_crate_observations WHERE capture_id LIKE 'blake3:%'",
             )
             .fetch_one(&fixture.pool)
             .await
             .unwrap();
-            let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'observation:%'")
+            let receipts: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'observation:%'")
                 .fetch_one(&fixture.pool).await.unwrap();
             assert_eq!(
                 observations,
@@ -210,7 +214,7 @@ async fn crate_row_pipeline_serial_parallel_boundaries_and_occurrence_resume() {
                 "one retained receipt per source occurrence"
             );
             let before = fixture.canonical_tuples().await;
-            let receipt_tuples:Vec<(String,String)> = sqlx::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
+            let receipt_tuples:Vec<(String,String)> = sqlx_core::query_as::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
                 .fetch_all(&fixture.pool).await.unwrap();
             let semantic = fixture.semantic_rows().await;
             if let Some(expected) = &reference {
@@ -241,7 +245,7 @@ async fn crate_row_pipeline_serial_parallel_boundaries_and_occurrence_resume() {
                 fixture.semantic_rows().await,
                 "resume consumes no additional observations or receipts"
             );
-            let after:Vec<(String,String)>=sqlx::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
+            let after:Vec<(String,String)>=sqlx_core::query_as::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
                 .fetch_all(&fixture.pool).await.unwrap();
             assert_eq!(
                 receipt_tuples, after,
@@ -320,13 +324,14 @@ async fn crate_row_pipeline_rejects_corrupt_source_target_and_receipt() {
         .await
         .unwrap();
     let (old, new) = &fixture.pairs[0];
-    let source: Json<Value> =
-        sqlx::query_scalar("SELECT provenance FROM devres_crate_artifacts WHERE capture_id=$1")
-            .bind(old)
-            .fetch_one(&fixture.pool)
-            .await
-            .unwrap();
-    sqlx::query("UPDATE devres_crate_artifacts SET provenance=provenance||'{\"changed\":true}'::jsonb WHERE capture_id=$1")
+    let source: Json<Value> = sqlx_core::query_scalar::query_scalar(
+        "SELECT provenance FROM devres_crate_artifacts WHERE capture_id=$1",
+    )
+    .bind(old)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx_core::query::query("UPDATE devres_crate_artifacts SET provenance=provenance||'{\"changed\":true}'::jsonb WHERE capture_id=$1")
         .bind(old).execute(&fixture.pool).await.unwrap();
     assert_eq!(
         fixture
@@ -337,18 +342,19 @@ async fn crate_row_pipeline_rejects_corrupt_source_target_and_receipt() {
             .code,
         "integrity"
     );
-    sqlx::query("UPDATE devres_crate_artifacts SET provenance=$2 WHERE capture_id=$1")
+    sqlx_core::query::query("UPDATE devres_crate_artifacts SET provenance=$2 WHERE capture_id=$1")
         .bind(old)
         .bind(source)
         .execute(&fixture.pool)
         .await
         .unwrap();
-    let target: Json<Value> =
-        sqlx::query_scalar("SELECT provenance FROM devres_crate_artifacts WHERE capture_id=$1")
-            .bind(new)
-            .fetch_one(&fixture.pool)
-            .await
-            .unwrap();
+    let target: Json<Value> = sqlx_core::query_scalar::query_scalar(
+        "SELECT provenance FROM devres_crate_artifacts WHERE capture_id=$1",
+    )
+    .bind(new)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
     let changed_seal = payload_integrity::digest(
         "devres_crate_artifacts",
         "",
@@ -356,7 +362,7 @@ async fn crate_row_pipeline_rejects_corrupt_source_target_and_receipt() {
         &payload_integrity::crate_artifact_payload(999, &target.0),
     )
     .unwrap();
-    sqlx::query(
+    sqlx_core::query::query(
         "UPDATE devres_crate_artifacts SET bytes=999,provenance_integrity=$2 WHERE capture_id=$1",
     )
     .bind(new)
@@ -374,7 +380,7 @@ async fn crate_row_pipeline_rejects_corrupt_source_target_and_receipt() {
         "integrity",
         "a self-consistent conflicting target must not be accepted by ON CONFLICT"
     );
-    sqlx::query("UPDATE devres_integrity_staged_state SET data=data||'{\"sequence\":999999}'::jsonb WHERE provider='crate' AND key=(SELECT min(key) FROM devres_integrity_staged_state WHERE provider='crate')")
+    sqlx_core::query::query("UPDATE devres_integrity_staged_state SET data=data||'{\"sequence\":999999}'::jsonb WHERE provider='crate' AND key=(SELECT min(key) FROM devres_integrity_staged_state WHERE provider='crate')")
         .execute(&fixture.pool).await.unwrap();
     assert_eq!(
         fixture
@@ -390,11 +396,11 @@ async fn crate_row_pipeline_rejects_corrupt_source_target_and_receipt() {
 }
 
 async fn wait_for_gate(
-    pool: &sqlx::PgPool,
+    pool: &sqlx_postgres::PgPool,
 ) -> std::result::Result<(), tokio::time::error::Elapsed> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=802171201 AND objid=1 AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))")
+            let waiting:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=802171201 AND objid=1 AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))")
                 .fetch_one(pool).await.unwrap();
             if waiting {break;}
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -418,7 +424,7 @@ async fn crate_row_pipeline_cancel_later_batches_preserves_prior_artifacts_and_r
         let gate = if observations {
             "NEW.sequence=387".to_owned() // 258 retained source occurrences + 129th target.
         } else {
-            let old:String=sqlx::query_scalar("SELECT capture_id FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' ORDER BY capture_id OFFSET 128 LIMIT 1")
+            let old:String=sqlx_core::query_scalar::query_scalar("SELECT capture_id FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' ORDER BY capture_id OFFSET 128 LIMIT 1")
                 .fetch_one(&fixture.pool).await.unwrap();
             let target = fixture.maps.get(&format!("capture:{old}")).unwrap();
             format!("NEW.capture_id='{target}'")
@@ -428,10 +434,10 @@ async fn crate_row_pipeline_cancel_later_batches_preserves_prior_artifacts_and_r
         } else {
             "devres_crate_artifacts"
         };
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION fixture_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF {gate} THEN PERFORM pg_advisory_xact_lock(802171201,1); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_pause BEFORE INSERT ON {table} FOR EACH ROW WHEN (NEW.capture_id LIKE 'blake3:%') EXECUTE FUNCTION fixture_pause();")))
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!("CREATE FUNCTION fixture_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF {gate} THEN PERFORM pg_advisory_xact_lock(802171201,1); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_pause BEFORE INSERT ON {table} FOR EACH ROW WHEN (NEW.capture_id LIKE 'blake3:%') EXECUTE FUNCTION fixture_pause();")))
             .execute(&fixture.pool).await.unwrap();
         let mut blocker = fixture.pool.acquire().await.unwrap();
-        sqlx::query("SELECT pg_advisory_lock(802171201,1)")
+        sqlx_core::query::query("SELECT pg_advisory_lock(802171201,1)")
             .execute(&mut *blocker)
             .await
             .unwrap();
@@ -449,13 +455,13 @@ async fn crate_row_pipeline_cancel_later_batches_preserves_prior_artifacts_and_r
         });
         let waiting = wait_for_gate(&fixture.pool).await;
         let before: Vec<(String, String)> = if observations {
-            sqlx::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
+            sqlx_core::query_as::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
                 .fetch_all(&fixture.pool).await.unwrap()
         } else {
             fixture.canonical_tuples().await
         };
         cancel.cancel();
-        sqlx::query("SELECT pg_advisory_unlock(802171201,1)")
+        sqlx_core::query::query("SELECT pg_advisory_unlock(802171201,1)")
             .execute(&mut *blocker)
             .await
             .unwrap();
@@ -471,7 +477,7 @@ async fn crate_row_pipeline_cancel_later_batches_preserves_prior_artifacts_and_r
             "the previous complete batch is durably visible"
         );
         let after: Vec<(String, String)> = if observations {
-            sqlx::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
+            sqlx_core::query_as::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
                 .fetch_all(&fixture.pool).await.unwrap()
         } else {
             fixture.canonical_tuples().await
@@ -480,14 +486,14 @@ async fn crate_row_pipeline_cancel_later_batches_preserves_prior_artifacts_and_r
             before, after,
             "the incomplete batch rolled back without rewriting prior commits"
         );
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT count(*) FROM {table} WHERE capture_id LIKE 'blake3:%'"
-        )))
+        let count: i64 = sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(
+            format!("SELECT count(*) FROM {table} WHERE capture_id LIKE 'blake3:%'"),
+        ))
         .fetch_one(&fixture.pool)
         .await
         .unwrap();
         assert_eq!(count, 128, "observation and receipt publication are atomic");
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP TRIGGER fixture_pause ON {table}; DROP FUNCTION fixture_pause();"
         )))
         .execute(&fixture.pool)
@@ -507,15 +513,15 @@ async fn crate_row_pipeline_cancel_later_batches_preserves_prior_artifacts_and_r
                 .await
                 .unwrap();
         }
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT count(*) FROM {table} WHERE capture_id LIKE 'blake3:%'"
-        )))
+        let count: i64 = sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(
+            format!("SELECT count(*) FROM {table} WHERE capture_id LIKE 'blake3:%'"),
+        ))
         .fetch_one(&fixture.pool)
         .await
         .unwrap();
         assert_eq!(count, if observations { 258 } else { 129 });
         let completed: Vec<(String, String)> = if observations {
-            sqlx::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
+            sqlx_core::query_as::query_as("SELECT key,ctid::text FROM devres_integrity_staged_state WHERE provider='crate' ORDER BY key")
                 .fetch_all(&fixture.pool).await.unwrap()
         } else {
             fixture.canonical_tuples().await
@@ -537,17 +543,17 @@ async fn crate_row_pipeline_cancel_later_batches_preserves_prior_artifacts_and_r
 async fn crate_row_pipeline_owner_loss_never_reconnects_or_publishes_partial_batch() {
     let fixture = RowFixture::new(129, 64, 0).await;
     let execution = RowFixture::execution(8, 1024 * 1024 * 1024);
-    let old:String=sqlx::query_scalar("SELECT capture_id FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' ORDER BY capture_id OFFSET 128 LIMIT 1")
+    let old:String=sqlx_core::query_scalar::query_scalar("SELECT capture_id FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%' ORDER BY capture_id OFFSET 128 LIMIT 1")
         .fetch_one(&fixture.pool).await.unwrap();
     let target = fixture.maps.get(&format!("capture:{old}")).unwrap();
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION fixture_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.capture_id='{target}' THEN PERFORM pg_advisory_xact_lock(802171201,1); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_pause BEFORE INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id LIKE 'blake3:%') EXECUTE FUNCTION fixture_pause();")))
+    sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!("CREATE FUNCTION fixture_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.capture_id='{target}' THEN PERFORM pg_advisory_xact_lock(802171201,1); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_pause BEFORE INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id LIKE 'blake3:%') EXECUTE FUNCTION fixture_pause();")))
         .execute(&fixture.pool).await.unwrap();
     let mut blocker = fixture.pool.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(802171201,1)")
+    sqlx_core::query::query("SELECT pg_advisory_lock(802171201,1)")
         .execute(&mut *blocker)
         .await
         .unwrap();
-    let owner: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+    let owner: i32 = sqlx_core::query_scalar::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *fixture.store.owner.lock().await)
         .await
         .unwrap();
@@ -560,16 +566,17 @@ async fn crate_row_pipeline_owner_loss_never_reconnects_or_publishes_partial_bat
         tokio::spawn(async move { store.migrate_artifact_rows(&maps, &token, &runner).await });
     let waiting = wait_for_gate(&fixture.pool).await;
     if waiting.is_ok() {
-        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1,5000)")
-            .bind(owner)
-            .fetch_one(&fixture.pool)
-            .await
-            .unwrap();
+        let terminated: bool =
+            sqlx_core::query_scalar::query_scalar("SELECT pg_terminate_backend($1,5000)")
+                .bind(owner)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
         assert!(terminated);
     } else {
         cancel.cancel();
     }
-    sqlx::query("SELECT pg_advisory_unlock(802171201,1)")
+    sqlx_core::query::query("SELECT pg_advisory_unlock(802171201,1)")
         .execute(&mut *blocker)
         .await
         .unwrap();
@@ -598,7 +605,7 @@ async fn staging_fixture(fixture: &RowFixture, ordinal: usize, count: usize) -> 
     let old = crate::integrity::legacy_hash(format!("crate-inventory:1:{revision}").as_bytes());
     let new = hash(format!("crate-inventory:1:{revision}").as_bytes());
     for id in [&old, &new] {
-        sqlx::query("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at) VALUES($1,$2,17,17)")
+        sqlx_core::query::query("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at) VALUES($1,$2,17,17)")
             .bind(id).bind(&revision).execute(&fixture.pool).await.unwrap();
     }
     for index in 0..count {
@@ -619,7 +626,7 @@ async fn staging_fixture(fixture: &RowFixture, ordinal: usize, count: usize) -> 
             &payload_integrity::crate_staging_payload(metadata, &record),
         )
         .unwrap();
-        sqlx::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6)")
+        sqlx_core::query::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(&old).bind(name).bind(version).bind(metadata).bind(Json(record)).bind(seal)
             .execute(&fixture.pool).await.unwrap();
     }
@@ -632,11 +639,11 @@ async fn crate_row_pipeline_staging_preserves_sql_order_and_rebuilds_temporary_c
     let fixture = RowFixture::new(2, 64, 0).await;
     let execution = RowFixture::execution(8, 1024 * 1024 * 1024);
     fixture.transaction_log("devres_crate_staging").await;
-    sqlx::raw_sql("CREATE TABLE fixture_staging_order(ordinal bigserial,inventory text,name text,version text); CREATE FUNCTION fixture_stage_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO fixture_staging_order(inventory,name,version) VALUES(NEW.inventory,NEW.name,NEW.version); RETURN NEW; END $$; CREATE TRIGGER fixture_stage_order AFTER INSERT ON devres_crate_staging FOR EACH ROW WHEN (NEW.inventory LIKE 'blake3:%') EXECUTE FUNCTION fixture_stage_order();")
+    sqlx_core::raw_sql::raw_sql("CREATE TABLE fixture_staging_order(ordinal bigserial,inventory text,name text,version text); CREATE FUNCTION fixture_stage_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO fixture_staging_order(inventory,name,version) VALUES(NEW.inventory,NEW.name,NEW.version); RETURN NEW; END $$; CREATE TRIGGER fixture_stage_order AFTER INSERT ON devres_crate_staging FOR EACH ROW WHEN (NEW.inventory LIKE 'blake3:%') EXECUTE FUNCTION fixture_stage_order();")
         .execute(&fixture.pool).await.unwrap();
     for inventory in 0..2 {
         let (old, new) = staging_fixture(&fixture, inventory, 257).await;
-        let source_order:Vec<String>=sqlx::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
+        let source_order:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
             .bind(&old).fetch_all(&fixture.pool).await.unwrap();
         fixture
             .store
@@ -649,13 +656,13 @@ async fn crate_row_pipeline_staging_preserves_sql_order_and_rebuilds_temporary_c
             )
             .await
             .unwrap();
-        let actual:Vec<String>=sqlx::query_scalar("SELECT name||'@'||version FROM fixture_staging_order WHERE inventory=$1 ORDER BY ordinal")
+        let actual:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT name||'@'||version FROM fixture_staging_order WHERE inventory=$1 ORDER BY ordinal")
             .bind(&new).fetch_all(&fixture.pool).await.unwrap();
         assert_eq!(
             source_order, actual,
             "staging retains PostgreSQL concatenation order rather than tuple or Rust ordering"
         );
-        let before:Vec<(String,String)>=sqlx::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
+        let before:Vec<(String,String)>=sqlx_core::query_as::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
             .bind(&new).fetch_all(&fixture.pool).await.unwrap();
         fixture
             .store
@@ -668,7 +675,7 @@ async fn crate_row_pipeline_staging_preserves_sql_order_and_rebuilds_temporary_c
             )
             .await
             .unwrap();
-        let after:Vec<(String,String)>=sqlx::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
+        let after:Vec<(String,String)>=sqlx_core::query_as::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
             .bind(&new).fetch_all(&fixture.pool).await.unwrap();
         assert_eq!(
             before, after,
@@ -694,7 +701,7 @@ async fn crate_row_pipeline_staging_rejects_ambiguous_concatenated_keys() {
             &payload_integrity::crate_staging_payload(&fixture.pairs[0].0, &record),
         )
         .unwrap();
-        sqlx::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6)")
+        sqlx_core::query::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(&old).bind(name).bind(version).bind(&fixture.pairs[0].0).bind(Json(record)).bind(seal)
             .execute(&fixture.pool).await.unwrap();
     }
@@ -714,12 +721,13 @@ async fn crate_row_pipeline_staging_rejects_ambiguous_concatenated_keys() {
             .code,
         "integrity"
     );
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM devres_crate_staging WHERE inventory=$1")
-            .bind(&new)
-            .fetch_one(&fixture.pool)
-            .await
-            .unwrap();
+    let count: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT count(*) FROM devres_crate_staging WHERE inventory=$1",
+    )
+    .bind(&new)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
     assert_eq!(count, 0);
     fixture.close().await;
 }
@@ -732,7 +740,7 @@ async fn crate_row_pipeline_inventory_header_resume_preserves_tuple_sequence_and
     let (_old, new) = staging_fixture(&fixture, 0, 129).await;
     let execution = RowFixture::execution(2, 1024 * 1024 * 1024);
     let mut aliases = crate::migration_map::MigrationAliases::new(&mut fixture.maps).unwrap();
-    let before:(String,i64,i64)=sqlx::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_inventories_sequence_seq) FROM devres_crate_inventories WHERE id=$1")
+    let before:(String,i64,i64)=sqlx_core::query_as::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_inventories_sequence_seq) FROM devres_crate_inventories WHERE id=$1")
         .bind(&new).fetch_one(&fixture.pool).await.unwrap();
     for _ in 0..2 {
         fixture
@@ -745,18 +753,20 @@ async fn crate_row_pipeline_inventory_header_resume_preserves_tuple_sequence_and
             )
             .await
             .unwrap();
-        let after:(String,i64,i64)=sqlx::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_inventories_sequence_seq) FROM devres_crate_inventories WHERE id=$1")
+        let after:(String,i64,i64)=sqlx_core::query_as::query_as("SELECT ctid::text,sequence,(SELECT last_value FROM devres_crate_inventories_sequence_seq) FROM devres_crate_inventories WHERE id=$1")
             .bind(&new).fetch_one(&fixture.pool).await.unwrap();
         assert_eq!(
             before, after,
             "existing canonical inventory is checked without consuming a sequence or rewriting its tuple"
         );
     }
-    sqlx::query("UPDATE devres_crate_inventories SET validated_at=validated_at+1 WHERE id=$1")
-        .bind(&new)
-        .execute(&fixture.pool)
-        .await
-        .unwrap();
+    sqlx_core::query::query(
+        "UPDATE devres_crate_inventories SET validated_at=validated_at+1 WHERE id=$1",
+    )
+    .bind(&new)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
     assert_eq!(
         fixture
             .store
@@ -780,16 +790,16 @@ async fn crate_row_pipeline_inventory_header_resume_preserves_tuple_sequence_and
 async fn crate_row_pipeline_staging_cancel_releases_catalog_and_resumes_prior_batch() {
     let fixture = RowFixture::new(2, 0, 0).await;
     let (old, new) = staging_fixture(&fixture, 0, 129).await;
-    let key:String=sqlx::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version OFFSET 128 LIMIT 1")
+    let key:String=sqlx_core::query_scalar::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version OFFSET 128 LIMIT 1")
         .bind(&old).fetch_one(&fixture.pool).await.unwrap();
     assert!(
         key.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.@".contains(&b))
     );
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION fixture_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.inventory='{new}' AND NEW.name||'@'||NEW.version='{key}' THEN PERFORM pg_advisory_xact_lock(802171201,1); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_pause BEFORE INSERT ON devres_crate_staging FOR EACH ROW WHEN (NEW.inventory LIKE 'blake3:%') EXECUTE FUNCTION fixture_pause();")))
+    sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!("CREATE FUNCTION fixture_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.inventory='{new}' AND NEW.name||'@'||NEW.version='{key}' THEN PERFORM pg_advisory_xact_lock(802171201,1); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_pause BEFORE INSERT ON devres_crate_staging FOR EACH ROW WHEN (NEW.inventory LIKE 'blake3:%') EXECUTE FUNCTION fixture_pause();")))
         .execute(&fixture.pool).await.unwrap();
     let mut blocker = fixture.pool.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(802171201,1)")
+    sqlx_core::query::query("SELECT pg_advisory_lock(802171201,1)")
         .execute(&mut *blocker)
         .await
         .unwrap();
@@ -807,10 +817,10 @@ async fn crate_row_pipeline_staging_cancel_releases_catalog_and_resumes_prior_ba
             .await
     });
     let waiting = wait_for_gate(&fixture.pool).await;
-    let before:Vec<(String,String)>=sqlx::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
+    let before:Vec<(String,String)>=sqlx_core::query_as::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
         .bind(&new).fetch_all(&fixture.pool).await.unwrap();
     cancel.cancel();
-    sqlx::query("SELECT pg_advisory_unlock(802171201,1)")
+    sqlx_core::query::query("SELECT pg_advisory_unlock(802171201,1)")
         .execute(&mut *blocker)
         .await
         .unwrap();
@@ -821,11 +831,12 @@ async fn crate_row_pipeline_staging_cancel_releases_catalog_and_resumes_prior_ba
     waiting.expect("second staging batch reached deterministic gate");
     assert_eq!(result.unwrap_err().code, "cancelled");
     assert_eq!(before.len(), 128);
-    let remains: bool =
-        sqlx::query_scalar("SELECT to_regclass('pg_temp.devres_crate_migration_keys') IS NOT NULL")
-            .fetch_one(&mut *fixture.store.owner.lock().await)
-            .await
-            .unwrap();
+    let remains: bool = sqlx_core::query_scalar::query_scalar(
+        "SELECT to_regclass('pg_temp.devres_crate_migration_keys') IS NOT NULL",
+    )
+    .fetch_one(&mut *fixture.store.owner.lock().await)
+    .await
+    .unwrap();
     assert!(
         !remains,
         "cooperative cancellation removes its session-local source key catalog"
@@ -841,7 +852,7 @@ async fn crate_row_pipeline_staging_cancel_releases_catalog_and_resumes_prior_ba
         )
         .await
         .unwrap();
-    let after:Vec<(String,String)>=sqlx::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
+    let after:Vec<(String,String)>=sqlx_core::query_as::query_as("SELECT name||'@'||version,ctid::text FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
         .bind(&new).fetch_all(&fixture.pool).await.unwrap();
     assert_eq!(after.len(), 129);
     assert!(before.iter().all(|tuple| after.contains(tuple)));
@@ -870,11 +881,11 @@ async fn crate_row_pipeline_staging_long_compressible_versions_use_exclusive_adm
             &payload_integrity::crate_staging_payload(&fixture.pairs[0].0, &record),
         )
         .unwrap();
-        sqlx::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) VALUES($1,'fixture',$2,$3,$4,$5)")
+        sqlx_core::query::query("INSERT INTO devres_crate_staging(inventory,name,version,metadata_capture,record,record_integrity) VALUES($1,'fixture',$2,$3,$4,$5)")
             .bind(&old).bind(version).bind(&fixture.pairs[0].0).bind(Json(record)).bind(seal)
             .execute(&fixture.pool).await.unwrap();
     }
-    let source:Vec<String>=sqlx::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
+    let source:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
         .bind(&old).fetch_all(&fixture.pool).await.unwrap();
     let execution = RowFixture::execution(8, 1024);
     fixture
@@ -888,7 +899,7 @@ async fn crate_row_pipeline_staging_long_compressible_versions_use_exclusive_adm
         )
         .await
         .unwrap();
-    let retained:Vec<String>=sqlx::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
+    let retained:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT name||'@'||version FROM devres_crate_staging WHERE inventory=$1 ORDER BY name||'@'||version")
         .bind(&new).fetch_all(&fixture.pool).await.unwrap();
     assert_eq!(source, retained);
     assert_eq!(fixture.batch_sizes().await, vec![1, 1, 1]);
@@ -903,7 +914,7 @@ impl RowFixture {
     async fn seed_canonical_artifact(&self, index: usize) -> String {
         let old = &self.pairs[index].0;
         let capture = self.maps.get(&format!("capture:{old}")).unwrap();
-        let row = sqlx::query("SELECT bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id=$1")
+        let row = sqlx_core::query::query("SELECT bytes,provenance,provenance_integrity FROM devres_crate_artifacts WHERE capture_id=$1")
             .bind(old).fetch_one(&self.pool).await.unwrap();
         let bytes: i64 = row.try_get("bytes").unwrap();
         let checked = payload_integrity::checked(
@@ -926,7 +937,7 @@ impl RowFixture {
             &payload_integrity::crate_artifact_payload(bytes as u64, &provenance),
         )
         .unwrap();
-        sqlx::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4)")
+        sqlx_core::query::query("INSERT INTO devres_crate_artifacts(capture_id,bytes,provenance,provenance_integrity) VALUES($1,$2,$3,$4)")
             .bind(&capture).bind(bytes).bind(Json(provenance)).bind(seal).execute(&self.pool).await.unwrap();
         capture
     }
@@ -956,12 +967,13 @@ impl RowFixture {
             let old = &self.pairs[index].0;
             let provenance = json!({"synthetic":true,"capture":old,
                 "retained_payload":if contradictory && index==1 {"different"} else {"same"}});
-            let bytes: i64 =
-                sqlx::query_scalar("SELECT bytes FROM devres_crate_artifacts WHERE capture_id=$1")
-                    .bind(old)
-                    .fetch_one(&self.pool)
-                    .await
-                    .unwrap();
+            let bytes: i64 = sqlx_core::query_scalar::query_scalar(
+                "SELECT bytes FROM devres_crate_artifacts WHERE capture_id=$1",
+            )
+            .bind(old)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
             let seal = payload_integrity::digest(
                 "devres_crate_artifacts",
                 "",
@@ -969,7 +981,7 @@ impl RowFixture {
                 &payload_integrity::crate_artifact_payload(bytes as u64, &provenance),
             )
             .unwrap();
-            sqlx::query("UPDATE devres_crate_artifacts SET provenance=$2,provenance_integrity=$3 WHERE capture_id=$1")
+            sqlx_core::query::query("UPDATE devres_crate_artifacts SET provenance=$2,provenance_integrity=$3 WHERE capture_id=$1")
                 .bind(old).bind(Json(provenance)).bind(seal).execute(&self.pool).await.unwrap();
         }
     }
@@ -1004,7 +1016,7 @@ async fn crate_row_pipeline_artifact_publication_mixed_resume_inserts_only_missi
         .map(|capture| format!("'{capture}'"))
         .collect::<Vec<_>>()
         .join(",");
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION fixture_refuse_resumed_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture_resumed_target_insert'; END $$; CREATE TRIGGER fixture_refuse_resumed_insert BEFORE INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id=ANY(ARRAY[{protected}]::text[])) EXECUTE FUNCTION fixture_refuse_resumed_insert();")))
+    sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!("CREATE FUNCTION fixture_refuse_resumed_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture_resumed_target_insert'; END $$; CREATE TRIGGER fixture_refuse_resumed_insert BEFORE INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id=ANY(ARRAY[{protected}]::text[])) EXECUTE FUNCTION fixture_refuse_resumed_insert();")))
         .execute(&fixture.pool).await.unwrap();
     fixture.transaction_log("devres_crate_artifacts").await;
     let execution = RowFixture::execution(8, 1024 * 1024 * 1024);
@@ -1073,7 +1085,7 @@ async fn crate_row_pipeline_artifact_publication_identical_mapping_duplicates_re
         assert_eq!(before, fixture.canonical_tuples().await);
         assert_eq!(evidence, fixture.semantic_rows().await);
         assert_eq!(fixture.batch_sizes().await, vec![2]);
-        let source_count: i64 = sqlx::query_scalar(
+        let source_count: i64 = sqlx_core::query_scalar::query_scalar(
             "SELECT count(*) FROM devres_crate_artifacts WHERE capture_id NOT LIKE 'blake3:%'",
         )
         .fetch_one(&fixture.pool)
@@ -1152,7 +1164,7 @@ async fn crate_row_pipeline_artifact_publication_trigger_changes_roll_back_entir
         };
         // Only fixed action text and fixture-generated hash identities are
         // interpolated; retained source values remain ordinary bind parameters.
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION fixture_artifact_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} END $$; CREATE TRIGGER fixture_artifact_fault {timing} INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id='{fresh}') EXECUTE FUNCTION fixture_artifact_fault();")))
+        sqlx_core::raw_sql::raw_sql(sqlx_core::sql_str::AssertSqlSafe(format!("CREATE FUNCTION fixture_artifact_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} END $$; CREATE TRIGGER fixture_artifact_fault {timing} INSERT ON devres_crate_artifacts FOR EACH ROW WHEN (NEW.capture_id='{fresh}') EXECUTE FUNCTION fixture_artifact_fault();")))
             .execute(&fixture.pool).await.unwrap();
         let execution = RowFixture::execution(8, 1024 * 1024 * 1024);
         let result = fixture
@@ -1175,7 +1187,7 @@ async fn crate_row_pipeline_artifact_publication_trigger_changes_roll_back_entir
             "trigger action {action} cannot alter previously committed evidence"
         );
         assert_artifact_preparation_drained(&execution);
-        sqlx::raw_sql("DROP TRIGGER fixture_artifact_fault ON devres_crate_artifacts; DROP FUNCTION fixture_artifact_fault();")
+        sqlx_core::raw_sql::raw_sql("DROP TRIGGER fixture_artifact_fault ON devres_crate_artifacts; DROP FUNCTION fixture_artifact_fault();")
             .execute(&fixture.pool).await.unwrap();
         fixture
             .store

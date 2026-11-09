@@ -9,7 +9,7 @@ use super::{
 };
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use sqlx::Connection;
+use sqlx_core::connection::Connection;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,

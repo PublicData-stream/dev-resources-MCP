@@ -2,7 +2,8 @@
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
 use serde_json::{Value, json};
-use sqlx::{PgConnection, Row, postgres::PgRow};
+use sqlx_core::row::Row;
+use sqlx_postgres::{PgConnection, PgRow};
 
 const TABLES: &[&str] = &[
     "devres_mdn_evidence",
@@ -50,7 +51,7 @@ pub(super) async fn reserve(
     if count > 1000 {
         return Err(Error::capacity("Occurrence allocation exceeds its bound."));
     }
-    sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence($1,'sequence')::regclass) FROM generate_series(1,$2::bigint)")
+    sqlx_core::query_scalar::query_scalar("SELECT nextval(pg_get_serial_sequence($1,'sequence')::regclass) FROM generate_series(1,$2::bigint)")
         .bind(table).bind(count as i64).fetch_all(conn).await.map_err(|_| failure())
 }
 pub(super) async fn reserve_one(conn: &mut PgConnection, table: &str) -> Result<i64> {
@@ -108,7 +109,7 @@ pub(super) async fn admit(
     let sql = format!(
         "SELECT sequence,kind,key,data,data_integrity,sequence_integrity FROM {table} WHERE kind=$1 AND key=$2"
     );
-    let retained = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let retained = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql))
         .bind(kind)
         .bind(key)
         .fetch_optional(conn)
@@ -136,7 +137,7 @@ pub(super) async fn verify_keys(
     let sql = format!(
         "SELECT retained.sequence,retained.kind,retained.key,retained.sequence_integrity FROM {table} retained JOIN UNNEST($1::text[],$2::text[]) requested(kind,key) ON retained.kind=requested.kind AND retained.key=requested.key"
     );
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let rows = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql))
         .bind(kinds)
         .bind(keys)
         .fetch_all(conn)
@@ -164,7 +165,8 @@ pub(super) async fn backfill(
         let sql = format!(
             "SELECT ctid::text AS locator,sequence,kind,key,sequence_integrity FROM {table}"
         );
-        let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&store.pool);
+        let mut rows =
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql)).fetch(&store.pool);
         let mut batch = SealBatch::with_execution(execution);
         let mut window = SealWindow::new(execution, verify_only);
         let target = SealTarget {
@@ -224,16 +226,18 @@ mod tests {
             whatwg::WhatwgStore,
         };
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let database = format!("devres_sequence_fixture_{suffix}");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
         let mut url = url::Url::parse(&base).unwrap();
         url.set_path(&format!("/{database}"));
         let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -251,16 +255,16 @@ mod tests {
                 assert_eq!(store.$put("projections", &key, &value).await.unwrap(),sequence);
                 assert_eq!(store.$get("projections", &key).await.unwrap().unwrap().sequence, sequence);
                 let shifted = sequence + 100_000;
-                sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {} SET sequence=$1 WHERE kind='projections' AND key=$2",$table))).bind(shifted).bind(&key).execute(&store.pool).await.unwrap();
+                sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!("UPDATE {} SET sequence=$1 WHERE kind='projections' AND key=$2",$table))).bind(shifted).bind(&key).execute(&store.pool).await.unwrap();
                 assert_eq!(store.$get("projections", &key).await.unwrap_err().code,"integrity");
                 assert_eq!(store.$put("projections", &key, &value).await.unwrap_err().code,"integrity");
                 assert_eq!(store.$page("projections",0,10,None).await.unwrap_err().code,"integrity");
-                sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {} SET sequence=$1 WHERE kind='projections' AND key=$2",$table))).bind(sequence).bind(&key).execute(&store.pool).await.unwrap();
+                sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!("UPDATE {} SET sequence=$1 WHERE kind='projections' AND key=$2",$table))).bind(sequence).bind(&key).execute(&store.pool).await.unwrap();
                 // Simulate an original, qualified row: replay is supported without creating a new occurrence.
                 let mut owner = store.owner.lock().await;
                 let retained_sequence = reserve_one(&mut owner,$table).await.unwrap();
-                sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO {}(sequence,kind,key,data,data_integrity,sequence_integrity) VALUES($1,'projections',$2,$3,$4,$5)",$table)))
-                    .bind(retained_sequence).bind(&legacy).bind(sqlx::types::Json(&value))
+                sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!("INSERT INTO {}(sequence,kind,key,data,data_integrity,sequence_integrity) VALUES($1,'projections',$2,$3,$4,$5)",$table)))
+                    .bind(retained_sequence).bind(&legacy).bind(sqlx_core::types::Json(&value))
                     .bind(super::super::payload_integrity::digest($table,"projections",&legacy,&value).unwrap())
                     .bind(digest($table,"projections",&legacy,retained_sequence).unwrap()).execute(&mut *owner).await.unwrap();
                 drop(owner);
@@ -283,7 +287,7 @@ mod tests {
             chromium_rows
         );
         let sequence = store.npm_put("documents", &key, &value).await.unwrap();
-        sqlx::query("UPDATE devres_npm_evidence SET sequence=sequence+100000 WHERE kind='documents' AND key=$1").bind(&key).execute(&store.pool).await.unwrap();
+        sqlx_core::query::query("UPDATE devres_npm_evidence SET sequence=sequence+100000 WHERE kind='documents' AND key=$1").bind(&key).execute(&store.pool).await.unwrap();
         assert_eq!(
             store.npm_get("documents", &key).await.unwrap_err().code,
             "integrity"
@@ -304,18 +308,20 @@ mod tests {
                 .code,
             "integrity"
         );
-        sqlx::query("UPDATE devres_npm_evidence SET sequence=$2 WHERE kind='documents' AND key=$1")
-            .bind(&key)
-            .bind(sequence)
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        sqlx_core::query::query(
+            "UPDATE devres_npm_evidence SET sequence=$2 WHERE kind='documents' AND key=$1",
+        )
+        .bind(&key)
+        .bind(sequence)
+        .execute(&store.pool)
+        .await
+        .unwrap();
         let rows = [MdnWrite {
             kind: "projections".into(),
             key: key.clone(),
             data: value.clone(),
         }];
-        sqlx::query("UPDATE devres_mdn_evidence SET sequence=sequence+200000 WHERE kind='projections' AND key=$1").bind(&key).execute(&store.pool).await.unwrap();
+        sqlx_core::query::query("UPDATE devres_mdn_evidence SET sequence=sequence+200000 WHERE kind='projections' AND key=$1").bind(&key).execute(&store.pool).await.unwrap();
         assert_eq!(
             store
                 .mdn_get_many("projections", std::slice::from_ref(&key))
@@ -341,7 +347,7 @@ mod tests {
             "integrity"
         );
         drop(store);
-        sqlx::query(sqlx::AssertSqlSafe(format!(
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"
         )))
         .execute(&admin)

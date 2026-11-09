@@ -7,7 +7,7 @@ use serde_json::json;
 async fn fresh_content_events_and_unreferenced_files_fail_closed() {
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
     let admin = PgPool::connect(&base).await.unwrap();
-    sqlx::query("CREATE DATABASE devres_integrated_integrity_fixture")
+    sqlx_core::query::query("CREATE DATABASE devres_integrated_integrity_fixture")
         .execute(&admin)
         .await
         .unwrap();
@@ -63,7 +63,7 @@ async fn fresh_content_events_and_unreferenced_files_fail_closed() {
             .as_deref(),
         Some("fixture-etag")
     );
-    sqlx::query("UPDATE devres_observations SET validated_at=21 WHERE status=304")
+    sqlx_core::query::query("UPDATE devres_observations SET validated_at=21 WHERE status=304")
         .execute(&store.pool)
         .await
         .unwrap();
@@ -71,11 +71,11 @@ async fn fresh_content_events_and_unreferenced_files_fail_closed() {
         store.capture(&captured.capture.id).await.unwrap_err().code,
         "integrity"
     );
-    sqlx::query("UPDATE devres_observations SET validated_at=20 WHERE status=304")
+    sqlx_core::query::query("UPDATE devres_observations SET validated_at=20 WHERE status=304")
         .execute(&store.pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE devres_heads SET etag='different-existing-validator'")
+    sqlx_core::query::query("UPDATE devres_heads SET etag='different-existing-validator'")
         .execute(&store.pool)
         .await
         .unwrap();
@@ -88,11 +88,11 @@ async fn fresh_content_events_and_unreferenced_files_fail_closed() {
             .code,
         "integrity"
     );
-    sqlx::query("UPDATE devres_heads SET etag='fixture-etag'")
+    sqlx_core::query::query("UPDATE devres_heads SET etag='fixture-etag'")
         .execute(&store.pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE devres_captures SET retrieved_at=999")
+    sqlx_core::query::query("UPDATE devres_captures SET retrieved_at=999")
         .execute(&store.pool)
         .await
         .unwrap();
@@ -100,7 +100,7 @@ async fn fresh_content_events_and_unreferenced_files_fail_closed() {
         store.capture(&captured.capture.id).await.unwrap_err().code,
         "integrity"
     );
-    sqlx::query("UPDATE devres_captures SET retrieved_at=10")
+    sqlx_core::query::query("UPDATE devres_captures SET retrieved_at=10")
         .execute(&store.pool)
         .await
         .unwrap();
@@ -137,7 +137,7 @@ async fn fresh_content_events_and_unreferenced_files_fail_closed() {
         json!(1)
     );
     assert!(
-        sqlx::query("UPDATE devres_integrity_control SET active=false")
+        sqlx_core::query::query("UPDATE devres_integrity_control SET active=false")
             .execute(&inspector.pool)
             .await
             .is_err()
@@ -182,7 +182,7 @@ async fn fresh_content_events_and_unreferenced_files_fail_closed() {
         "integrity"
     );
     drop(store);
-    sqlx::query("DROP DATABASE devres_integrated_integrity_fixture WITH(FORCE)")
+    sqlx_core::query::query("DROP DATABASE devres_integrated_integrity_fixture WITH(FORCE)")
         .execute(&admin)
         .await
         .unwrap();

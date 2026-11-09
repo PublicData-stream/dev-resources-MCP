@@ -162,7 +162,7 @@ impl PgBlobStore {
         cancel: &CancellationToken,
         execution: &crate::MigrationExecution,
     ) -> Result<SnapshotAdoption> {
-        let cutoff: i64 = sqlx::query_scalar("SELECT COALESCE(max(sequence),0)::bigint FROM devres_crate_snapshots WHERE id LIKE 'blake3:%'")
+        let cutoff: i64 = sqlx_core::query_scalar::query_scalar("SELECT COALESCE(max(sequence),0)::bigint FROM devres_crate_snapshots WHERE id LIKE 'blake3:%'")
             .fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         let mut adoption = SnapshotAdoption {
             cutoff,
@@ -171,7 +171,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             stop(cancel)?;
-            let aliases: Vec<(String,String)> = sqlx::query_as("SELECT legacy,canonical FROM devres_content_aliases WHERE namespace='crate:snapshots' AND legacy>$1 ORDER BY legacy LIMIT 128")
+            let aliases: Vec<(String,String)> = sqlx_core::query_as::query_as("SELECT legacy,canonical FROM devres_content_aliases WHERE namespace='crate:snapshots' AND legacy>$1 ORDER BY legacy LIMIT 128")
                 .bind(&after).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
             if aliases.is_empty() {
                 break;
@@ -187,13 +187,13 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             stop(cancel)?;
-            let source: Option<(String,i64,i64)> = sqlx::query_as("SELECT key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'snapshot-prepared:%' AND key>$1 ORDER BY key LIMIT 1")
+            let source: Option<(String,i64,i64)> = sqlx_core::query_as::query_as("SELECT key,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_integrity_staged_state WHERE provider='crate' AND key LIKE 'snapshot-prepared:%' AND key>$1 ORDER BY key LIMIT 1")
                 .bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some((key, bytes, nodes)) = source else {
                 break;
             };
             let _reservation = reserve_source(execution, cancel, bytes, nodes).await?;
-            let row = sqlx::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1")
+            let row = sqlx_core::query::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1")
                 .bind(&key).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
             let data = payload_integrity::checked(
                 "devres_integrity_staged_state",
@@ -278,7 +278,7 @@ impl PgBlobStore {
             adoption,
         } = source;
         let checkpoint = format!("snapshot-prepared:{old}");
-        let receipt = sqlx::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1")
+        let receipt = sqlx_core::query::query("SELECT data,data_integrity FROM devres_integrity_staged_state WHERE provider='crate' AND key=$1")
             .bind(&checkpoint).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
         if let Some(receipt) = receipt {
             let data = payload_integrity::checked(
@@ -331,7 +331,7 @@ impl PgBlobStore {
         let mut adopted = None;
         loop {
             stop(cancel)?;
-            let candidate:Option<(i64,String)> = sqlx::query_as("SELECT sequence,id FROM devres_crate_snapshots WHERE id LIKE 'blake3:%' AND sequence>$1 AND data-'id'-'index_manifest'=$2::jsonb AND (data->'index_manifest'<>'null'::jsonb)=$3 AND sequence<=$4 ORDER BY sequence LIMIT 1")
+            let candidate:Option<(i64,String)> = sqlx_core::query_as::query_as("SELECT sequence,id FROM devres_crate_snapshots WHERE id LIKE 'blake3:%' AND sequence>$1 AND data-'id'-'index_manifest'=$2::jsonb AND (data->'index_manifest'<>'null'::jsonb)=$3 AND sequence<=$4 ORDER BY sequence LIMIT 1")
                 .bind(after).bind(Json(&expected_base)).bind(!original_index.is_null()).bind(adoption.cutoff).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some((sequence, id)) = candidate else {
                 break;
@@ -436,7 +436,7 @@ impl PgBlobStore {
         let mut committed = 0_u64;
         loop {
             stop(&cancel)?;
-            let positions: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+            let positions: Vec<(i64, String, i64, i64)> = sqlx_core::query_as::query_as(
                 "SELECT sequence,id,octet_length(data::text)::bigint,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint FROM devres_crate_snapshots WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT $2"
             ).bind(after).bind(if adoption.cutoff > 0 { 1_i64 } else { execution.options().workers as i64 })
                 .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
@@ -473,7 +473,7 @@ impl PgBlobStore {
             let prepared = execution.graph_map_ordered(
                 positions, &cancel,
                 |(sequence, old), token| async move {
-                    let row=sqlx::query("SELECT sequence,inventory,content_sequence,''::text AS kind,id AS key,data,data_integrity FROM devres_crate_snapshots WHERE id=$1 AND sequence=$2")
+                    let row=sqlx_core::query::query("SELECT sequence,inventory,content_sequence,''::text AS kind,id AS key,data,data_integrity FROM devres_crate_snapshots WHERE id=$1 AND sequence=$2")
                         .bind(&old).bind(sequence).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
             let source_integrity: String = row.try_get("data_integrity").map_err(|_|storage_error())?;
             let mut snapshot: Snapshot =
@@ -482,7 +482,7 @@ impl PgBlobStore {
             let old_index = snapshot.index_manifest.take();
             let inventory_id = mapped(read_maps, "crate:inventories", &snapshot.inventory.id)?;
             snapshot.inventory = inventory(
-                sqlx::query("SELECT * FROM devres_crate_inventories WHERE id=$1")
+                sqlx_core::query::query("SELECT * FROM devres_crate_inventories WHERE id=$1")
                     .bind(&inventory_id)
                     .fetch_one(&self.pool)
                     .await
@@ -532,7 +532,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             stop(&cancel)?;
-            let row=sqlx::query("SELECT source_key,metadata_capture,artifact FROM devres_crate_jobs WHERE source_key>$1 ORDER BY source_key LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let row=sqlx_core::query::query("SELECT source_key,metadata_capture,artifact FROM devres_crate_jobs WHERE source_key>$1 ORDER BY source_key LIMIT 1").bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
             };
@@ -566,7 +566,7 @@ impl PgBlobStore {
         cancel: &CancellationToken,
         execution: &crate::MigrationExecution,
     ) -> Result<BTreeMap<i64, i64>> {
-        let orphaned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_versions v LEFT JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id IS NULL)").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
+        let orphaned:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_crate_versions v LEFT JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id IS NULL)").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         if orphaned {
             return Err(Error::integrity(
                 "Retained crate version has no inventory occurrence.",
@@ -576,13 +576,13 @@ impl PgBlobStore {
         let mut after = 0_i64;
         loop {
             stop(cancel)?;
-            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_inventories WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1) source").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let source_size: Option<(i64,i64)> = sqlx_core::query_as::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_inventories WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1) source").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some((source_bytes, source_nodes)) = source_size else {
                 break;
             };
             let _source_reservation =
                 reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-            let row=sqlx::query("SELECT * FROM devres_crate_inventories WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let row=sqlx_core::query::query("SELECT * FROM devres_crate_inventories WHERE id NOT LIKE 'blake3:%' AND sequence>$1 ORDER BY sequence LIMIT 1").bind(after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
             };
@@ -601,7 +601,7 @@ impl PgBlobStore {
                 .transpose()?;
             let sequence = {
                 let mut owner = self.owner.lock().await;
-                let existing: Option<(i64, bool)> = sqlx::query_as("SELECT sequence,revision=$2 AND created_at=$3 AND validated_at=$4 AND cursor IS NOT DISTINCT FROM $5::text AND published=$6 AND manifest IS NOT DISTINCT FROM $7::text FROM devres_crate_inventories WHERE id=$1")
+                let existing: Option<(i64, bool)> = sqlx_core::query_as::query_as("SELECT sequence,revision=$2 AND created_at=$3 AND validated_at=$4 AND cursor IS NOT DISTINCT FROM $5::text AND published=$6 AND manifest IS NOT DISTINCT FROM $7::text FROM devres_crate_inventories WHERE id=$1")
                     .bind(&new).bind(&revision).bind(created_at).bind(validated_at).bind(&cursor).bind(published).bind(&manifest).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
                 if let Some((sequence, matches)) = existing {
                     if !matches {
@@ -612,14 +612,14 @@ impl PgBlobStore {
                     sequence
                 } else {
                     stop(cancel)?;
-                    sqlx::query_scalar("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at,cursor,published,manifest) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING sequence")
+                    sqlx_core::query_scalar::query_scalar("INSERT INTO devres_crate_inventories(id,revision,created_at,validated_at,cursor,published,manifest) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING sequence")
                         .bind(&new).bind(&revision).bind(created_at).bind(validated_at).bind(&cursor).bind(published).bind(&manifest).fetch_one(&mut *owner).await.map_err(|_|storage_error())?
                 }
             };
             sequences.insert(after, sequence);
             id_alias(maps, aliases, "inventories", &old, &new)?;
-            sqlx::query("INSERT INTO devres_crate_inventory_gaps(inventory,name,error) SELECT $2,name,error FROM devres_crate_inventory_gaps WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
-            sqlx::query("INSERT INTO devres_crate_changes(inventory,name) SELECT $2,name FROM devres_crate_changes WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+            sqlx_core::query::query("INSERT INTO devres_crate_inventory_gaps(inventory,name,error) SELECT $2,name,error FROM devres_crate_inventory_gaps WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+            sqlx_core::query::query("INSERT INTO devres_crate_changes(inventory,name) SELECT $2,name FROM devres_crate_changes WHERE inventory=$1 ON CONFLICT DO NOTHING").bind(&old).bind(&new).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             drop(row);
             drop(_source_reservation);
             self.migrate_staging_rows(&old, &new, maps, cancel, execution)
@@ -629,13 +629,13 @@ impl PgBlobStore {
         let mut after = (String::new(), String::new(), 0_i64);
         loop {
             stop(cancel)?;
-            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT v.* FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id NOT LIKE 'blake3:%' AND (v.name,v.version,v.valid_from)>($1,$2,$3) ORDER BY v.name,v.version,v.valid_from LIMIT 1) source").bind(&after.0).bind(&after.1).bind(after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let source_size: Option<(i64,i64)> = sqlx_core::query_as::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT v.* FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id NOT LIKE 'blake3:%' AND (v.name,v.version,v.valid_from)>($1,$2,$3) ORDER BY v.name,v.version,v.valid_from LIMIT 1) source").bind(&after.0).bind(&after.1).bind(after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some((source_bytes, source_nodes)) = source_size else {
                 break;
             };
             let _source_reservation =
                 reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-            let row=sqlx::query("SELECT v.* FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id NOT LIKE 'blake3:%' AND (v.name,v.version,v.valid_from)>($1,$2,$3) ORDER BY v.name,v.version,v.valid_from LIMIT 1").bind(&after.0).bind(&after.1).bind(after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let row=sqlx_core::query::query("SELECT v.* FROM devres_crate_versions v JOIN devres_crate_inventories i ON i.sequence=v.valid_from WHERE i.id NOT LIKE 'blake3:%' AND (v.name,v.version,v.valid_from)>($1,$2,$3) ORDER BY v.name,v.version,v.valid_from LIMIT 1").bind(&after.0).bind(&after.1).bind(after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
             };
@@ -654,7 +654,7 @@ impl PgBlobStore {
                 &row.try_get::<String, _>("metadata_capture")
                     .map_err(|_| storage_error())?,
             )?;
-            sqlx::query("INSERT INTO devres_crate_versions(name,version,valid_from,valid_to,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING").bind(&name).bind(&version).bind(new_from).bind(new_to).bind(mapped(maps,"capture",&row.try_get::<String,_>("metadata_capture").map_err(|_|storage_error())?)?).bind(Json(&record)).bind(payload_integrity::digest("devres_crate_versions",&new_from.to_string(),&format!("{name}@{version}"),&payload_integrity::crate_record_payload(&metadata,new_to,&record))?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+            sqlx_core::query::query("INSERT INTO devres_crate_versions(name,version,valid_from,valid_to,metadata_capture,record,record_integrity) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING").bind(&name).bind(&version).bind(new_from).bind(new_to).bind(mapped(maps,"capture",&row.try_get::<String,_>("metadata_capture").map_err(|_|storage_error())?)?).bind(Json(&record)).bind(payload_integrity::digest("devres_crate_versions",&new_from.to_string(),&format!("{name}@{version}"),&payload_integrity::crate_record_payload(&metadata,new_to,&record))?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             after = (name, version, from);
         }
         Ok(sequences)
@@ -671,16 +671,16 @@ impl PgBlobStore {
         let mut after = String::new();
         let mut generation_after = (i64::MIN, String::new());
         loop {
-            let old:Option<String>=sqlx::query_scalar("SELECT id FROM devres_crate_generations WHERE id NOT LIKE 'blake3:%' AND (COALESCE(published_sequence,9223372036854775807),id)>($1,$2) ORDER BY published_sequence NULLS LAST,id LIMIT 1").bind(generation_after.0).bind(&generation_after.1).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let old:Option<String>=sqlx_core::query_scalar::query_scalar("SELECT id FROM devres_crate_generations WHERE id NOT LIKE 'blake3:%' AND (COALESCE(published_sequence,9223372036854775807),id)>($1,$2) ORDER BY published_sequence NULLS LAST,id LIMIT 1").bind(generation_after.0).bind(&generation_after.1).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(old) = old else {
                 break;
             };
             stop(cancel)?;
-            let (source_bytes,source_nodes):(i64,i64) = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM devres_crate_generations source WHERE id=$1")
+            let (source_bytes,source_nodes):(i64,i64) = sqlx_core::query_as::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM devres_crate_generations source WHERE id=$1")
                 .bind(&old).fetch_one(&self.pool).await.map_err(|_|storage_error())?;
             let _source_reservation =
                 reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-            let row = sqlx::query("SELECT * FROM devres_crate_generations WHERE id=$1")
+            let row = sqlx_core::query::query("SELECT * FROM devres_crate_generations WHERE id=$1")
                 .bind(&old)
                 .fetch_one(&self.pool)
                 .await
@@ -707,7 +707,7 @@ impl PgBlobStore {
             generation_after = (published.unwrap_or(i64::MAX), old.clone());
             let mut owner = self.owner.lock().await;
             let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-            let retained = sqlx::query("SELECT published_sequence,summary,summary_integrity FROM devres_crate_generations WHERE id=$1 FOR UPDATE")
+            let retained = sqlx_core::query::query("SELECT published_sequence,summary,summary_integrity FROM devres_crate_generations WHERE id=$1 FOR UPDATE")
                 .bind(&new).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
             let canonical: Option<i64> = if let Some(retained) = retained {
                 let sequence: Option<i64> = retained
@@ -733,7 +733,7 @@ impl PgBlobStore {
             } else {
                 let sequence = if published.is_some() {
                     Some(
-                        sqlx::query_scalar::<_, i64>(
+                        sqlx_core::query_scalar::query_scalar::<_, i64>(
                             "SELECT nextval('devres_crate_content_sequence')",
                         )
                         .fetch_one(&mut *tx)
@@ -743,7 +743,7 @@ impl PgBlobStore {
                 } else {
                     None
                 };
-                sqlx::query("INSERT INTO devres_crate_generations(id,published_sequence,summary,summary_integrity) VALUES($1,$2,$3,$4)")
+                sqlx_core::query::query("INSERT INTO devres_crate_generations(id,published_sequence,summary,summary_integrity) VALUES($1,$2,$3,$4)")
                     .bind(&new).bind(sequence).bind(Json(&summary))
                     .bind(payload_integrity::digest("devres_crate_generations","",&new,&payload_integrity::crate_generation_payload(sequence,&summary)?)?)
                     .execute(&mut *tx).await.map_err(|_|storage_error())?;
@@ -760,13 +760,13 @@ impl PgBlobStore {
             drop(_source_reservation);
             after.clear();
             loop {
-                let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_content WHERE generation=$1 AND id>$2 ORDER BY id LIMIT 1) source").bind(&old).bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+                let source_size: Option<(i64,i64)> = sqlx_core::query_as::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_content WHERE generation=$1 AND id>$2 ORDER BY id LIMIT 1) source").bind(&old).bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
                 let Some((source_bytes, source_nodes)) = source_size else {
                     break;
                 };
                 let _source_reservation =
                     reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-                let row=sqlx::query("SELECT * FROM devres_crate_content WHERE generation=$1 AND id>$2 ORDER BY id LIMIT 1").bind(&old).bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+                let row=sqlx_core::query::query("SELECT * FROM devres_crate_content WHERE generation=$1 AND id>$2 ORDER BY id LIMIT 1").bind(&old).bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
                 let Some(row) = row else {
                     break;
                 };
@@ -783,7 +783,7 @@ impl PgBlobStore {
                 let path: String = row.try_get("path").map_err(|_| storage_error())?;
                 let id = hash(format!("{capture}\0{kind}\0{target}\0{path}").as_bytes());
                 let content_payload = json!({"id":id,"name":row.try_get::<String,_>("name").map_err(|_|storage_error())?,"version":row.try_get::<String,_>("version").map_err(|_|storage_error())?,"target":target,"path":path,"kind":kind,"capture":capture,"metadata_capture":mapped(maps,"capture",&row.try_get::<String,_>("metadata_capture").map_err(|_|storage_error())?)?,"archive_capture":mapped(maps,"capture",&row.try_get::<String,_>("archive_capture").map_err(|_|storage_error())?)?,"attributes":attributes});
-                sqlx::query("INSERT INTO devres_crate_content(generation,id,name,version,target,path,kind,capture,metadata_capture,archive_capture,attributes,attributes_integrity) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING")
+                sqlx_core::query::query("INSERT INTO devres_crate_content(generation,id,name,version,target,path,kind,capture,metadata_capture,archive_capture,attributes,attributes_integrity) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING")
                     .bind(&new).bind(&id).bind(row.try_get::<String,_>("name").map_err(|_|storage_error())?).bind(row.try_get::<String,_>("version").map_err(|_|storage_error())?).bind(target).bind(path).bind(kind).bind(capture).bind(mapped(maps,"capture",&row.try_get::<String,_>("metadata_capture").map_err(|_|storage_error())?)?).bind(mapped(maps,"capture",&row.try_get::<String,_>("archive_capture").map_err(|_|storage_error())?)?).bind(Json(&attributes)).bind(payload_integrity::digest("devres_crate_content",&new,&id,&content_payload)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
                 id_alias(maps, aliases, "content", &old_content, &id)?;
                 after = old_content;
@@ -802,13 +802,13 @@ impl PgBlobStore {
         let mut after = (String::new(), String::new(), String::new());
         loop {
             stop(cancel)?;
-            let source_size: Option<(i64,i64)> = sqlx::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_enrichment WHERE artifact NOT LIKE 'blake3:%' AND (artifact,kind,external_id)>($1,$2,$3) ORDER BY artifact,kind,external_id LIMIT 1) source").bind(&after.0).bind(&after.1).bind(&after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let source_size: Option<(i64,i64)> = sqlx_core::query_as::query_as("SELECT octet_length(to_jsonb(source)::text)::bigint,jsonb_array_length(jsonb_path_query_array(to_jsonb(source),'strict $.**.type()'))::bigint FROM (SELECT * FROM devres_crate_enrichment WHERE artifact NOT LIKE 'blake3:%' AND (artifact,kind,external_id)>($1,$2,$3) ORDER BY artifact,kind,external_id LIMIT 1) source").bind(&after.0).bind(&after.1).bind(&after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some((source_bytes, source_nodes)) = source_size else {
                 break;
             };
             let _source_reservation =
                 reserve_source(execution, cancel, source_bytes, source_nodes).await?;
-            let row=sqlx::query("SELECT * FROM devres_crate_enrichment WHERE artifact NOT LIKE 'blake3:%' AND (artifact,kind,external_id)>($1,$2,$3) ORDER BY artifact,kind,external_id LIMIT 1").bind(&after.0).bind(&after.1).bind(&after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
+            let row=sqlx_core::query::query("SELECT * FROM devres_crate_enrichment WHERE artifact NOT LIKE 'blake3:%' AND (artifact,kind,external_id)>($1,$2,$3) ORDER BY artifact,kind,external_id LIMIT 1").bind(&after.0).bind(&after.1).bind(&after.2).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(row) = row else {
                 break;
             };
@@ -817,7 +817,7 @@ impl PgBlobStore {
             let key: String = row.try_get("external_id").map_err(|_| storage_error())?;
             let data = checked_enrichment(&old, &kind, &row)?;
             let new = mapped(maps, "capture", &old)?;
-            sqlx::query("INSERT INTO devres_crate_enrichment(artifact,kind,external_id,data,data_integrity) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(&new).bind(&kind).bind(&key).bind(Json(&data)).bind(payload_integrity::digest("devres_crate_enrichment",&format!("{new}:{kind}"),&key,&data)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+            sqlx_core::query::query("INSERT INTO devres_crate_enrichment(artifact,kind,external_id,data,data_integrity) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(&new).bind(&kind).bind(&key).bind(Json(&data)).bind(payload_integrity::digest("devres_crate_enrichment",&format!("{new}:{kind}"),&key,&data)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
             after = (old, kind, key);
             committed += 1;
             execution.report(
@@ -828,9 +828,9 @@ impl PgBlobStore {
                 _source_reservation.accounted_bytes(),
             );
         }
-        let heads:Vec<String>=sqlx::query_scalar("SELECT artifact FROM devres_crate_enrichment_heads WHERE artifact NOT LIKE 'blake3:%' ORDER BY sequence").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let heads:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT artifact FROM devres_crate_enrichment_heads WHERE artifact NOT LIKE 'blake3:%' ORDER BY sequence").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         for old in heads {
-            sqlx::query("INSERT INTO devres_crate_enrichment_heads(artifact) VALUES($1) ON CONFLICT DO NOTHING").bind(mapped(maps,"capture",&old)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
+            sqlx_core::query::query("INSERT INTO devres_crate_enrichment_heads(artifact) VALUES($1) ON CONFLICT DO NOTHING").bind(mapped(maps,"capture",&old)?).execute(&mut *self.owner.lock().await).await.map_err(|_|storage_error())?;
         }
         Ok(())
     }

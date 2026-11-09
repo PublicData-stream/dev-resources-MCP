@@ -79,7 +79,7 @@ fn predecode_windows_keep_order_split_budget_and_allow_one_large_unit() {
 #[ignore = "requires disposable PostgreSQL; verifies scalar predecode metadata without schema changes"]
 async fn postgres_graph_metadata_counts_every_container_and_scalar_before_decode() {
     let url = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-    let pool = sqlx::PgPool::connect(&url)
+    let pool = sqlx_postgres::PgPool::connect(&url)
         .await
         .expect("connect fixture PostgreSQL");
     for value in [
@@ -88,8 +88,8 @@ async fn postgres_graph_metadata_counts_every_container_and_scalar_before_decode
         json!({}),
         json!({"a":[1,{"b":[true,false,null]}],"escaped":"\n\"한글"}),
     ] {
-        let (bytes,count):(i64,i64) = sqlx::query_as("SELECT octet_length($1::jsonb::text)::bigint,jsonb_array_length(jsonb_path_query_array($1::jsonb,'strict $.**.type()'))::bigint")
-            .bind(sqlx::types::Json(&value)).fetch_one(&pool).await.expect("scalar source metadata");
+        let (bytes,count):(i64,i64) = sqlx_core::query_as::query_as("SELECT octet_length($1::jsonb::text)::bigint,jsonb_array_length(jsonb_path_query_array($1::jsonb,'strict $.**.type()'))::bigint")
+            .bind(sqlx_core::types::Json(&value)).fetch_one(&pool).await.expect("scalar source metadata");
         assert_eq!(
             count as usize,
             nodes(&value),

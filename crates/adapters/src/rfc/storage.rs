@@ -5,7 +5,7 @@ use devres_application::corpus::{Dataset, Document, Job, JobSpec, RfcCorpusStore
 use devres_domain::{Capture, Error, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::{Connection, Row, types::Json};
+use sqlx_core::{connection::Connection, row::Row, types::Json};
 
 const MAX_JSON: usize = 64 * 1024 * 1024;
 
@@ -107,9 +107,12 @@ pub(super) fn imported_source(key: &str, url: &str) -> Result<bool> {
     Ok(false)
 }
 
-async fn check_capture(connection: &mut sqlx::PgConnection, capture: &Capture) -> Result<()> {
+async fn check_capture(
+    connection: &mut sqlx_postgres::PgConnection,
+    capture: &Capture,
+) -> Result<()> {
     capture_checked(capture)?;
-    let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_captures WHERE id=$1 AND source_key=$2 AND source_url=$3 AND body_hash=$4 AND media_type=$5 AND retrieved_at=$6)")
+    let matches: bool = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_captures WHERE id=$1 AND source_key=$2 AND source_url=$3 AND body_hash=$4 AND media_type=$5 AND retrieved_at=$6)")
         .bind(&capture.id).bind(&capture.key).bind(&capture.source_url).bind(&capture.body_hash)
         .bind(&capture.media_type).bind(capture.retrieved_at)
         .fetch_one(connection).await.map_err(|_| storage_error())?;
@@ -121,7 +124,10 @@ async fn check_capture(connection: &mut sqlx::PgConnection, capture: &Capture) -
     Ok(())
 }
 
-async fn check_captures(connection: &mut sqlx::PgConnection, captures: &[&Capture]) -> Result<()> {
+async fn check_captures(
+    connection: &mut sqlx_postgres::PgConnection,
+    captures: &[&Capture],
+) -> Result<()> {
     if captures.is_empty() {
         return Ok(());
     }
@@ -153,7 +159,7 @@ async fn check_captures(connection: &mut sqlx::PgConnection, captures: &[&Captur
     // of matching distinct rows would change the scalar check's semantics.
     // IS NOT TRUE also rejects corrupt NULL fields rather than letting SQL's
     // three-valued logic hide a mismatched representation.
-    let matches: bool = sqlx::query_scalar(
+    let matches: bool = sqlx_core::query_scalar::query_scalar(
         "SELECT NOT EXISTS(SELECT 1 FROM UNNEST($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::bigint[]) AS requested(id,source_key,source_url,body_hash,media_type,retrieved_at) LEFT JOIN devres_captures AS retained ON retained.id=requested.id WHERE retained.id IS NULL OR (retained.source_key=requested.source_key AND retained.source_url=requested.source_url AND retained.body_hash=requested.body_hash AND retained.media_type=requested.media_type AND retained.retrieved_at=requested.retrieved_at) IS NOT TRUE)",
     )
     .bind(ids)
@@ -192,15 +198,15 @@ impl RfcCorpusStore for PgBlobStore {
         owner.ping().await.map_err(|_| storage_error())?;
         check_capture(&mut owner, &dataset.capture).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let saved: Option<String> = sqlx::query_scalar("INSERT INTO devres_rfc_datasets(kind,capture_id,data,data_integrity) VALUES($1,$2,$3,$4) ON CONFLICT(kind,capture_id) DO UPDATE SET capture_id=EXCLUDED.capture_id WHERE devres_rfc_datasets.data->'records'=EXCLUDED.data->'records' RETURNING capture_id")
+        let saved: Option<String> = sqlx_core::query_scalar::query_scalar("INSERT INTO devres_rfc_datasets(kind,capture_id,data,data_integrity) VALUES($1,$2,$3,$4) ON CONFLICT(kind,capture_id) DO UPDATE SET capture_id=EXCLUDED.capture_id WHERE devres_rfc_datasets.data->'records'=EXCLUDED.data->'records' RETURNING capture_id")
             .bind(kind).bind(&dataset.capture.id).bind(Json(&value)).bind(payload_integrity::digest("devres_rfc_datasets",kind,&dataset.capture.id,&value)?)
             .fetch_optional(&mut *tx).await.map_err(|_| storage_error())?;
         if saved.is_none() {
             return Err(Error::integrity("Immutable RFC dataset cannot be replaced"));
         }
-        let retained=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(&dataset.capture.id).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
+        let retained=sqlx_core::query::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(&dataset.capture.id).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         payload_integrity::row("devres_rfc_datasets", &retained)?;
-        sqlx::query("INSERT INTO devres_rfc_dataset_heads(kind,capture_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM devres_heads WHERE source_key=$3 AND capture_id=$2) ON CONFLICT(kind) DO UPDATE SET capture_id=EXCLUDED.capture_id")
+        sqlx_core::query::query("INSERT INTO devres_rfc_dataset_heads(kind,capture_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM devres_heads WHERE source_key=$3 AND capture_id=$2) ON CONFLICT(kind) DO UPDATE SET capture_id=EXCLUDED.capture_id")
             .bind(kind).bind(&dataset.capture.id).bind(expected_key).execute(&mut *tx).await.map_err(|_| storage_error())?;
         tx.commit().await.map_err(|_| storage_error())
     }
@@ -211,7 +217,7 @@ impl RfcCorpusStore for PgBlobStore {
             return Err(Error::invalid("Invalid RFC dataset capture"));
         }
         self.fence().await?;
-        let row = sqlx::query("SELECT d.kind,d.capture_id AS key,d.data,d.data_integrity,COALESCE((SELECT MAX(validated_at) FROM devres_observations WHERE capture_id=d.capture_id),c.retrieved_at) AS validated_at FROM devres_rfc_datasets d JOIN devres_captures c ON c.id=d.capture_id WHERE d.kind=$1 AND d.capture_id=COALESCE($2,(SELECT capture_id FROM devres_rfc_dataset_heads WHERE kind=$1))")
+        let row = sqlx_core::query::query("SELECT d.kind,d.capture_id AS key,d.data,d.data_integrity,COALESCE((SELECT MAX(validated_at) FROM devres_observations WHERE capture_id=d.capture_id),c.retrieved_at) AS validated_at FROM devres_rfc_datasets d JOIN devres_captures c ON c.id=d.capture_id WHERE d.kind=$1 AND d.capture_id=COALESCE($2,(SELECT capture_id FROM devres_rfc_dataset_heads WHERE kind=$1))")
             .bind(kind).bind(capture).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
         row.map(|row| {
             let value = payload_integrity::row("devres_rfc_datasets", &row)?;
@@ -235,10 +241,10 @@ impl RfcCorpusStore for PgBlobStore {
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
         for job in jobs {
-            sqlx::query("INSERT INTO devres_rfc_jobs(source_key,number,format,source_url,assurance,due_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_key) DO NOTHING")
+            sqlx_core::query::query("INSERT INTO devres_rfc_jobs(source_key,number,format,source_url,assurance,due_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_key) DO NOTHING")
                 .bind(&job.key).bind(i64::from(job.number)).bind(&job.format).bind(&job.source_url)
                 .bind(&job.assurance).bind(job.due_at).execute(&mut *tx).await.map_err(|_| storage_error())?;
-            let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_jobs WHERE source_key=$1 AND number=$2 AND format=$3 AND source_url=$4 AND assurance=$5)")
+            let same: bool = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_jobs WHERE source_key=$1 AND number=$2 AND format=$3 AND source_url=$4 AND assurance=$5)")
                 .bind(&job.key).bind(i64::from(job.number)).bind(&job.format).bind(&job.source_url).bind(&job.assurance)
                 .fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
             if !same {
@@ -252,7 +258,7 @@ impl RfcCorpusStore for PgBlobStore {
         self.owner_fence().await?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        let row = sqlx::query("UPDATE devres_rfc_jobs SET status='running',attempts=attempts+1 WHERE source_key=(SELECT source_key FROM devres_rfc_jobs WHERE assurance='https' AND status<>'running' AND due_at<=$1 AND attempts<4294967295 ORDER BY due_at,source_key FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
+        let row = sqlx_core::query::query("UPDATE devres_rfc_jobs SET status='running',attempts=attempts+1 WHERE source_key=(SELECT source_key FROM devres_rfc_jobs WHERE assurance='https' AND status<>'running' AND due_at<=$1 AND attempts<4294967295 ORDER BY due_at,source_key FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
             .bind(now).fetch_optional(&mut *owner).await.map_err(|_| storage_error())?;
         row.map(|row| {
             let number: i64 = row.try_get("number").map_err(|_| storage_error())?;
@@ -307,7 +313,7 @@ impl RfcCorpusStore for PgBlobStore {
                 payload_integrity::digest("devres_rfc_jobs", "capture_metadata", key, value)
             })
             .transpose()?;
-        let result = sqlx::query("UPDATE devres_rfc_jobs SET status=CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'captured' END,capture_id=COALESCE($2,capture_id),capture_metadata=COALESCE($3,capture_metadata),capture_metadata_integrity=COALESCE($7,capture_metadata_integrity),last_error=$4,due_at=$5 WHERE source_key=$1 AND ($2::text IS NULL OR source_url=$6)")
+        let result = sqlx_core::query::query("UPDATE devres_rfc_jobs SET status=CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'captured' END,capture_id=COALESCE($2,capture_id),capture_metadata=COALESCE($3,capture_metadata),capture_metadata_integrity=COALESCE($7,capture_metadata_integrity),last_error=$4,due_at=$5 WHERE source_key=$1 AND ($2::text IS NULL OR source_url=$6)")
             .bind(key).bind(capture.map(|capture| capture.id.as_str())).bind(value.map(Json))
             .bind(error).bind(next_due).bind(capture.map(|capture| capture.source_url.as_str())).bind(integrity)
             .execute(&mut *owner).await.map_err(|_| storage_error())?;
@@ -321,7 +327,7 @@ impl RfcCorpusStore for PgBlobStore {
 
     async fn documents(&self) -> Result<Vec<Document>> {
         self.fence().await?;
-        let rows = sqlx::query("SELECT source_key,number,format,assurance,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE capture_id IS NOT NULL ORDER BY number,format,assurance")
+        let rows = sqlx_core::query::query("SELECT source_key,number,format,assurance,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE capture_id IS NOT NULL ORDER BY number,format,assurance")
             .fetch_all(&self.pool).await.map_err(|_| storage_error())?;
         rows.into_iter()
             .map(|row| {
@@ -449,7 +455,7 @@ impl RfcCorpusStore for PgBlobStore {
         }
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        let datasets_present: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_datasets WHERE kind='catalogue' AND capture_id=$1) AND ($2::text IS NULL OR EXISTS(SELECT 1 FROM devres_rfc_datasets WHERE kind='errata' AND capture_id=$2))")
+        let datasets_present: bool = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM devres_rfc_datasets WHERE kind='catalogue' AND capture_id=$1) AND ($2::text IS NULL OR EXISTS(SELECT 1 FROM devres_rfc_datasets WHERE kind='errata' AND capture_id=$2))")
             .bind(&snapshot.catalogue_capture).bind(&snapshot.errata_capture).fetch_one(&mut *owner).await.map_err(|_| storage_error())?;
         if !datasets_present {
             return Err(Error::integrity(
@@ -461,11 +467,11 @@ impl RfcCorpusStore for PgBlobStore {
             ("errata", snapshot.errata_capture.as_ref()),
         ] {
             if let Some(id) = id {
-                let row=sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(id).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
+                let row=sqlx_core::query::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2").bind(kind).bind(id).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
                 payload_integrity::row("devres_rfc_datasets", &row)?;
             }
         }
-        let order: i64 = sqlx::query_scalar(
+        let order: i64 = sqlx_core::query_scalar::query_scalar(
             "SELECT nextval(pg_get_serial_sequence('devres_rfc_snapshots','published_order'))",
         )
         .fetch_one(&mut *owner)
@@ -484,7 +490,7 @@ impl RfcCorpusStore for PgBlobStore {
                 &value,
             )?,
         )?;
-        let result: Option<String> = sqlx::query_scalar("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,created_at,complete,data,data_integrity,published_order) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id WHERE devres_rfc_snapshots.data=EXCLUDED.data RETURNING id")
+        let result: Option<String> = sqlx_core::query_scalar::query_scalar("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,created_at,complete,data,data_integrity,published_order) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id WHERE devres_rfc_snapshots.data=EXCLUDED.data RETURNING id")
             .bind(&snapshot.id).bind(&snapshot.catalogue_capture).bind(&snapshot.errata_capture)
             .bind(snapshot.created_at).bind(snapshot.complete).bind(Json(&value)).bind(integrity).bind(order)
             .fetch_optional(&mut *owner).await.map_err(|_| storage_error())?;
@@ -493,7 +499,7 @@ impl RfcCorpusStore for PgBlobStore {
                 "Immutable RFC snapshot cannot be replaced",
             ));
         }
-        let retained=sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id=$1").bind(&snapshot.id).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
+        let retained=sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id=$1").bind(&snapshot.id).fetch_one(&mut *owner).await.map_err(|_|storage_error())?;
         payload_integrity::row("devres_rfc_snapshots", &retained)?;
         Ok(())
     }
@@ -503,7 +509,7 @@ impl RfcCorpusStore for PgBlobStore {
             return Err(Error::invalid("Invalid RFC snapshot identifier"));
         }
         self.fence().await?;
-        let row = sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY complete DESC,published_order DESC LIMIT 1")
+        let row = sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE ($1::text IS NULL OR id=$1) ORDER BY complete DESC,published_order DESC LIMIT 1")
             .bind(id).fetch_optional(&self.pool).await.map_err(|_| storage_error())?;
         row.map(|row| decode(payload_integrity::row("devres_rfc_snapshots", &row)?))
             .transpose()
@@ -511,7 +517,7 @@ impl RfcCorpusStore for PgBlobStore {
 
     async fn status(&self) -> Result<Value> {
         self.fence().await?;
-        let rows = sqlx::query("SELECT status,count(*) AS count,count(capture_id) AS retained_count,min(due_at) AS earliest_due FROM devres_rfc_jobs GROUP BY status ORDER BY status")
+        let rows = sqlx_core::query::query("SELECT status,count(*) AS count,count(capture_id) AS retained_count,min(due_at) AS earliest_due FROM devres_rfc_jobs GROUP BY status ORDER BY status")
             .fetch_all(&self.pool).await.map_err(|_| storage_error())?;
         let mut counts = serde_json::Map::new();
         let mut total_jobs = 0_i64;
@@ -529,13 +535,13 @@ impl RfcCorpusStore for PgBlobStore {
             }
             counts.insert(status, json!({"count":count,"earliest_due":earliest_due}));
         }
-        let errors = sqlx::query("SELECT source_key,last_error,due_at FROM devres_rfc_jobs WHERE last_error IS NOT NULL ORDER BY due_at,source_key LIMIT 20")
+        let errors = sqlx_core::query::query("SELECT source_key,last_error,due_at FROM devres_rfc_jobs WHERE last_error IS NOT NULL ORDER BY due_at,source_key LIMIT 20")
             .fetch_all(&self.pool).await.map_err(|_| storage_error())?;
         let errors = errors.into_iter().map(|row| {
             Ok(json!({"key":row.try_get::<String,_>("source_key").map_err(|_| storage_error())?,"error":row.try_get::<String,_>("last_error").map_err(|_| storage_error())?,"next_due":row.try_get::<i64,_>("due_at").map_err(|_| storage_error())?}))
         }).collect::<Result<Vec<_>>>()?;
         let latest = self.snapshot(None).await?;
-        let partial = sqlx::query("SELECT published_order,catalogue_capture,errata_capture,complete,id,id AS key,''::text AS kind,created_at,data,data_integrity FROM devres_rfc_snapshots WHERE NOT complete ORDER BY published_order DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?.map(|row|Ok::<_,Error>(json!({"id":row.try_get::<String,_>("id").map_err(|_|storage_error())?,"created_at":row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?,"coverage":payload_integrity::row("devres_rfc_snapshots",&row)?["coverage"]}))).transpose()?;
+        let partial = sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,complete,id,id AS key,''::text AS kind,created_at,data,data_integrity FROM devres_rfc_snapshots WHERE NOT complete ORDER BY published_order DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?.map(|row|Ok::<_,Error>(json!({"id":row.try_get::<String,_>("id").map_err(|_|storage_error())?,"created_at":row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?,"coverage":payload_integrity::row("devres_rfc_snapshots",&row)?["coverage"]}))).transpose()?;
         Ok(
             json!({"jobs":counts,"total_jobs":total_jobs,"captured_documents":captured_documents,"pending_documents":total_jobs-captured_documents,"outstanding_jobs":outstanding_jobs,"errors":errors,"latest_partial":partial,"snapshot":latest.map(|snapshot| json!({"id":snapshot.id,"complete":snapshot.complete,"created_at":snapshot.created_at,"coverage":snapshot.coverage}))}),
         )
@@ -651,7 +657,7 @@ impl PgBlobStore {
         let mut after = (String::new(), String::new());
         loop {
             migration_cancel(&cancel)?;
-            let metadata=sqlx::query("SELECT kind,capture_id AS key,octet_length(data::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_datasets WHERE capture_id NOT LIKE 'blake3:%' AND (kind,capture_id)>($1,$2) ORDER BY kind,capture_id LIMIT 1")
+            let metadata=sqlx_core::query::query("SELECT kind,capture_id AS key,octet_length(data::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_datasets WHERE capture_id NOT LIKE 'blake3:%' AND (kind,capture_id)>($1,$2) ORDER BY kind,capture_id LIMIT 1")
                 .bind(&after.0).bind(&after.1).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(metadata) = metadata else {
                 break;
@@ -660,7 +666,7 @@ impl PgBlobStore {
             let old: String = metadata.try_get("key").map_err(|_| storage_error())?;
             let charge = rfc_migration_input_charge(&metadata)?;
             let _reservation = execution.graph_reserve(charge, &cancel).await?;
-            let row = sqlx::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2")
+            let row = sqlx_core::query::query("SELECT kind,capture_id AS key,data,data_integrity FROM devres_rfc_datasets WHERE kind=$1 AND capture_id=$2")
                 .bind(&kind).bind(&old).fetch_one(&self.pool).await.map_err(|_| storage_error())?;
             let mut dataset: Dataset =
                 decode(payload_integrity::row("devres_rfc_datasets", &row)?)?;
@@ -688,7 +694,7 @@ impl PgBlobStore {
                     .workers
                     .min(crate::migration_execution::MIGRATION_WINDOW_RECORDS)
             {
-                let found=sqlx::query("SELECT published_order,id AS key,octet_length(data::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%' AND published_order>$1 ORDER BY published_order LIMIT 1")
+                let found=sqlx_core::query::query("SELECT published_order,id AS key,octet_length(data::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(data,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%' AND published_order>$1 ORDER BY published_order LIMIT 1")
                     .bind(next).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
                 let Some(found) = found else {
                     break;
@@ -745,7 +751,7 @@ impl PgBlobStore {
                         let root = self.root.clone();
                         async move {
                             migration_cancel(&token)?;
-                            let found = sqlx::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE published_order=$1 AND id=$2")
+                            let found = sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE published_order=$1 AND id=$2")
                                 .bind(order).bind(&old).fetch_one(&self.pool).await.map_err(|_| storage_error())?;
                             let mut snapshot: Snapshot =
                                 decode(payload_integrity::row("devres_rfc_snapshots", &found)?)?;
@@ -830,11 +836,12 @@ impl PgBlobStore {
                 );
             }
         }
-        let heads: Vec<(String, String)> =
-            sqlx::query_as("SELECT kind,capture_id FROM devres_rfc_dataset_heads ORDER BY kind")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|_| storage_error())?;
+        let heads: Vec<(String, String)> = sqlx_core::query_as::query_as(
+            "SELECT kind,capture_id FROM devres_rfc_dataset_heads ORDER BY kind",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
         for (kind, capture) in heads {
             let canonical = migration_reference(&capture, mappings)?;
             payload_integrity::stage(
@@ -848,7 +855,7 @@ impl PgBlobStore {
         let mut after = String::new();
         loop {
             migration_cancel(&cancel)?;
-            let metadata=sqlx::query("SELECT source_key,octet_length(capture_metadata::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(capture_metadata,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_jobs WHERE capture_metadata IS NOT NULL AND source_key>$1 ORDER BY source_key LIMIT 1")
+            let metadata=sqlx_core::query::query("SELECT source_key,octet_length(capture_metadata::text)::bigint AS payload_bytes,jsonb_array_length(jsonb_path_query_array(capture_metadata,'strict $.**.type()'))::bigint AS payload_nodes FROM devres_rfc_jobs WHERE capture_metadata IS NOT NULL AND source_key>$1 ORDER BY source_key LIMIT 1")
                 .bind(&after).fetch_optional(&self.pool).await.map_err(|_|storage_error())?;
             let Some(metadata) = metadata else {
                 break;
@@ -858,7 +865,7 @@ impl PgBlobStore {
                 .map_err(|_| storage_error())?;
             let charge = rfc_migration_input_charge(&metadata)?;
             let _reservation = execution.graph_reserve(charge, &cancel).await?;
-            let found = sqlx::query("SELECT source_key,capture_id,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE source_key=$1 AND capture_metadata IS NOT NULL")
+            let found = sqlx_core::query::query("SELECT source_key,capture_id,capture_metadata,capture_metadata_integrity FROM devres_rfc_jobs WHERE source_key=$1 AND capture_metadata IS NOT NULL")
                 .bind(&key).fetch_one(&self.pool).await.map_err(|_| storage_error())?;
             let data: Json<Value> = found
                 .try_get("capture_metadata")
@@ -889,7 +896,7 @@ impl PgBlobStore {
     }
 }
 
-fn rfc_migration_input_charge(metadata: &sqlx::postgres::PgRow) -> Result<usize> {
+fn rfc_migration_input_charge(metadata: &sqlx_postgres::PgRow) -> Result<usize> {
     let encoded_bytes = usize::try_from(
         metadata
             .try_get::<i64, _>("payload_bytes")
@@ -947,7 +954,7 @@ mod migration_tests {
         let _indexes = crate::rfc::index::TEST_SERIAL.lock().await;
         let base =
             std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
-        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -960,17 +967,19 @@ mod migration_tests {
             (3, true, true),
         ] {
             let database = format!("devres_rfc_graph_{suffix}_{workers}_{partial}_{small_budget}");
-            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-                .execute(&admin)
-                .await
-                .unwrap();
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+                "CREATE DATABASE {database}"
+            )))
+            .execute(&admin)
+            .await
+            .unwrap();
             let mut url = url::Url::parse(&base).unwrap();
             url.set_path(&format!("/{database}"));
             let root = tempfile::tempdir_in("/tmp").unwrap();
             let store = PgBlobStore::connect(url.as_str(), root.path())
                 .await
                 .unwrap();
-            let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+            let pool = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
             let mut captures = Vec::new();
             for (key, url, body) in [
                 (
@@ -1036,7 +1045,7 @@ mod migration_tests {
             );
             std::fs::write(root.path().join(&legacy_catalogue.body_hash), b"catalogue").unwrap();
             let metadata_proof = super::super::capture_metadata_digest(&legacy_catalogue).unwrap();
-            sqlx::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7)")
+            sqlx_core::query::query("INSERT INTO devres_captures(id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES($1,$2,$3,$4,$5,$6,$7)")
                 .bind(&legacy_catalogue.id).bind(&legacy_catalogue.key).bind(&legacy_catalogue.source_url).bind(&legacy_catalogue.body_hash).bind(&legacy_catalogue.media_type).bind(legacy_catalogue.retrieved_at).bind(metadata_proof).execute(&pool).await.unwrap();
             let legacy_dataset = serde_json::to_value(Dataset {
                 capture: legacy_catalogue.clone(),
@@ -1050,7 +1059,7 @@ mod migration_tests {
                 &legacy_dataset,
             )
             .unwrap();
-            sqlx::query("INSERT INTO devres_rfc_datasets(kind,capture_id,data,data_integrity) VALUES('catalogue',$1,$2,$3)")
+            sqlx_core::query::query("INSERT INTO devres_rfc_datasets(kind,capture_id,data,data_integrity) VALUES('catalogue',$1,$2,$3)")
                 .bind(&legacy_catalogue.id).bind(Json(legacy_dataset)).bind(dataset_proof).execute(&pool).await.unwrap();
             store
                 .schedule(&[JobSpec {
@@ -1123,9 +1132,9 @@ mod migration_tests {
                     .unwrap(),
                 )
                 .unwrap();
-                sqlx::query("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,created_at,complete,data,data_integrity,published_order) OVERRIDING SYSTEM VALUE VALUES($1,$2,NULL,$3,$4,$5,$6,$7)")
+                sqlx_core::query::query("INSERT INTO devres_rfc_snapshots(id,catalogue_capture,errata_capture,created_at,complete,data,data_integrity,published_order) OVERRIDING SYSTEM VALUE VALUES($1,$2,NULL,$3,$4,$5,$6,$7)")
                     .bind(&old).bind(&snapshot.catalogue_capture).bind(snapshot.created_at).bind(snapshot.complete).bind(Json(value)).bind(proof).bind(order).execute(&pool).await.unwrap();
-                let coverage_nodes: i64 = sqlx::query_scalar("SELECT jsonb_array_length(jsonb_path_query_array(data->'coverage','strict $.**.type()'))::bigint FROM devres_rfc_snapshots WHERE id=$1")
+                let coverage_nodes: i64 = sqlx_core::query_scalar::query_scalar("SELECT jsonb_array_length(jsonb_path_query_array(data->'coverage','strict $.**.type()'))::bigint FROM devres_rfc_snapshots WHERE id=$1")
                     .bind(&old).fetch_one(&pool).await.unwrap();
                 assert_eq!(
                     coverage_nodes, 2051,
@@ -1133,13 +1142,13 @@ mod migration_tests {
                 );
                 originals.push(snapshot);
             }
-            sqlx::query(
+            sqlx_core::query::query(
                 "SELECT setval(pg_get_serial_sequence('devres_rfc_snapshots','published_order'),3)",
             )
             .execute(&pool)
             .await
             .unwrap();
-            sqlx::query("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false WHERE singleton").execute(&pool).await.unwrap();
+            sqlx_core::query::query("UPDATE devres_integrity_control SET active=false,files_complete=false,sql_complete=false,graph_complete=false WHERE singleton").execute(&pool).await.unwrap();
             if partial {
                 // Produce the exact checkpoint shape written by the old serial
                 // schema-ten implementation, then reopen it in another invocation.
@@ -1207,7 +1216,7 @@ mod migration_tests {
                 .await
                 .unwrap();
             assert_eq!(aliases.try_chunks(100).next().unwrap().unwrap().len(), 4);
-            let staged_job: Json<Value> = sqlx::query_scalar(
+            let staged_job: Json<Value> = sqlx_core::query_scalar::query_scalar(
                 "SELECT data FROM devres_integrity_staged_state WHERE provider='rfc' AND key=$1",
             )
             .bind(format!("job:{}", captures[1].key))
@@ -1218,7 +1227,7 @@ mod migration_tests {
                 staged_job.0["capture_metadata"],
                 serde_json::to_value(&captures[1]).unwrap()
             );
-            let rows: Vec<Json<Value>> = sqlx::query_scalar("SELECT data FROM devres_rfc_snapshots WHERE id LIKE 'blake3:%' ORDER BY published_order").fetch_all(&pool).await.unwrap();
+            let rows: Vec<Json<Value>> = sqlx_core::query_scalar::query_scalar("SELECT data FROM devres_rfc_snapshots WHERE id LIKE 'blake3:%' ORDER BY published_order").fetch_all(&pool).await.unwrap();
             let rows: Vec<Value> = rows.into_iter().map(|row| row.0).collect();
             assert_eq!(rows.len(), 3);
             assert_eq!(
@@ -1231,7 +1240,7 @@ mod migration_tests {
                 store.snapshot(None).await.unwrap().unwrap().id,
                 rows[2]["id"].as_str().unwrap()
             );
-            let legacy_count: i64 = sqlx::query_scalar(
+            let legacy_count: i64 = sqlx_core::query_scalar::query_scalar(
                 "SELECT count(*) FROM devres_rfc_snapshots WHERE id NOT LIKE 'blake3:%'",
             )
             .fetch_one(&pool)
@@ -1259,7 +1268,7 @@ mod migration_tests {
             drop(mappings);
             drop(store);
             pool.close().await;
-            sqlx::query(sqlx::AssertSqlSafe(format!(
+            sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
                 "DROP DATABASE {database} WITH(FORCE)"
             )))
             .execute(&admin)

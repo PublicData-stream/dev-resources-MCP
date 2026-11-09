@@ -3,7 +3,7 @@ use super::{PgBlobStore, storage_error};
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx_core::row::Row;
 use tokio_util::sync::CancellationToken;
 
 fn invalid() -> Error {
@@ -23,22 +23,22 @@ fn verify(table: &str, key: &str, payload: &Value, expected: &str) -> Result<()>
     }
     Ok(())
 }
-fn http_payload(row: &sqlx::postgres::PgRow) -> Result<Value> {
+fn http_payload(row: &sqlx_postgres::PgRow) -> Result<Value> {
     Ok(
         json!({"capture_id":row.try_get::<String,_>("capture_id").map_err(|_|invalid())?,"validated_at":row.try_get::<i64,_>("validated_at").map_err(|_|invalid())?,"status":row.try_get::<i16,_>("status").map_err(|_|invalid())?}),
     )
 }
-fn import_payload(row: &sqlx::postgres::PgRow) -> Result<Value> {
+fn import_payload(row: &sqlx_postgres::PgRow) -> Result<Value> {
     Ok(
         json!({"capture_id":row.try_get::<String,_>("capture_id").map_err(|_|invalid())?,"observed_at":row.try_get::<i64,_>("observed_at").map_err(|_|invalid())?,"source_url":row.try_get::<String,_>("source_url").map_err(|_|invalid())?}),
     )
 }
-fn head_payload(row: &sqlx::postgres::PgRow) -> Result<Value> {
+fn head_payload(row: &sqlx_postgres::PgRow) -> Result<Value> {
     Ok(
         json!({"source_key":row.try_get::<String,_>("source_key").map_err(|_|invalid())?,"capture_id":row.try_get::<String,_>("capture_id").map_err(|_|invalid())?,"validated_at":row.try_get::<i64,_>("validated_at").map_err(|_|invalid())?,"etag":row.try_get::<Option<String>,_>("etag").map_err(|_|invalid())?,"last_modified":row.try_get::<Option<String>,_>("last_modified").map_err(|_|invalid())?}),
     )
 }
-fn alias_payload(row: &sqlx::postgres::PgRow) -> Result<Value> {
+fn alias_payload(row: &sqlx_postgres::PgRow) -> Result<Value> {
     Ok(
         json!({"namespace":row.try_get::<String,_>("namespace").map_err(|_|invalid())?,"legacy":row.try_get::<String,_>("legacy").map_err(|_|invalid())?,"canonical":row.try_get::<String,_>("canonical").map_err(|_|invalid())?}),
     )
@@ -77,7 +77,8 @@ impl PgBlobStore {
         ] {
             seal_not_cancelled(cancel)?;
             let sql = format!("SELECT ctid::text AS seal_locator,* FROM {table}");
-            let mut rows = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&self.pool);
+            let mut rows =
+                sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql)).fetch(&self.pool);
             let mut batch = SealBatch::with_execution(execution);
             let mut window = SealWindow::new(execution, verify_only);
             let target = SealTarget {
@@ -155,7 +156,7 @@ impl PgBlobStore {
 
     pub(super) async fn verify_effective_validation(&self, capture_id: &str) -> Result<()> {
         self.fence().await?;
-        let aliases=sqlx::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases WHERE namespace='capture' AND canonical=$1").bind(capture_id).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let aliases=sqlx_core::query::query("SELECT namespace,legacy,canonical,mapping_integrity FROM devres_content_aliases WHERE namespace='capture' AND canonical=$1").bind(capture_id).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         let mut ids = vec![capture_id.to_owned()];
         for alias in aliases {
             let legacy: String = alias.try_get("legacy").map_err(|_| invalid())?;
@@ -169,10 +170,10 @@ impl PgBlobStore {
             )?;
             ids.push(legacy);
         }
-        if let Some(row)=sqlx::query("SELECT id,capture_id,validated_at,status,event_integrity FROM devres_observations WHERE capture_id=ANY($1::text[]) ORDER BY validated_at DESC,id DESC LIMIT 1").bind(&ids).fetch_optional(&self.pool).await.map_err(|_|storage_error())? {
+        if let Some(row)=sqlx_core::query::query("SELECT id,capture_id,validated_at,status,event_integrity FROM devres_observations WHERE capture_id=ANY($1::text[]) ORDER BY validated_at DESC,id DESC LIMIT 1").bind(&ids).fetch_optional(&self.pool).await.map_err(|_|storage_error())? {
             verify("devres_observations",&row.try_get::<i64,_>("id").map_err(|_|invalid())?.to_string(),&http_payload(&row)?,&row.try_get::<String,_>("event_integrity").map_err(|_|invalid())?)?;
         }
-        if let Some(row)=sqlx::query("SELECT id,capture_id,observed_at,source_url,event_integrity FROM devres_rfc_import_observations WHERE capture_id=ANY($1::text[]) ORDER BY observed_at DESC,id DESC LIMIT 1").bind(&ids).fetch_optional(&self.pool).await.map_err(|_|storage_error())? {
+        if let Some(row)=sqlx_core::query::query("SELECT id,capture_id,observed_at,source_url,event_integrity FROM devres_rfc_import_observations WHERE capture_id=ANY($1::text[]) ORDER BY observed_at DESC,id DESC LIMIT 1").bind(&ids).fetch_optional(&self.pool).await.map_err(|_|storage_error())? {
             verify("devres_rfc_import_observations",&row.try_get::<i64,_>("id").map_err(|_|invalid())?.to_string(),&import_payload(&row)?,&row.try_get::<String,_>("event_integrity").map_err(|_|invalid())?)?;
         }
         Ok(())
@@ -180,29 +181,30 @@ impl PgBlobStore {
 }
 
 pub(super) async fn append_http(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx_postgres::PgConnection,
     capture: &str,
     time: i64,
     status: i16,
 ) -> Result<()> {
-    let id: i64 =
-        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('devres_observations','id'))")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| storage_error())?;
+    let id: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT nextval(pg_get_serial_sequence('devres_observations','id'))",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| storage_error())?;
     let payload = json!({"capture_id":capture,"validated_at":time,"status":status});
     let digest = event_digest("devres_observations", &id.to_string(), &payload)?;
-    sqlx::query("INSERT INTO devres_observations(id,capture_id,validated_at,status,event_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5)")
+    sqlx_core::query::query("INSERT INTO devres_observations(id,capture_id,validated_at,status,event_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5)")
         .bind(id).bind(capture).bind(time).bind(status).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
     Ok(())
 }
 pub(super) async fn append_import(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx_postgres::PgConnection,
     capture: &str,
     time: i64,
     url: &str,
 ) -> Result<()> {
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx_core::query_scalar::query_scalar(
         "SELECT nextval(pg_get_serial_sequence('devres_rfc_import_observations','id'))",
     )
     .fetch_one(&mut *tx)
@@ -210,7 +212,7 @@ pub(super) async fn append_import(
     .map_err(|_| storage_error())?;
     let payload = json!({"capture_id":capture,"observed_at":time,"source_url":url});
     let digest = event_digest("devres_rfc_import_observations", &id.to_string(), &payload)?;
-    sqlx::query("INSERT INTO devres_rfc_import_observations(id,capture_id,observed_at,source_url,event_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5)")
+    sqlx_core::query::query("INSERT INTO devres_rfc_import_observations(id,capture_id,observed_at,source_url,event_integrity) OVERRIDING SYSTEM VALUE VALUES($1,$2,$3,$4,$5)")
         .bind(id).bind(capture).bind(time).bind(url).bind(digest).execute(&mut *tx).await.map_err(|_|storage_error())?;
     Ok(())
 }

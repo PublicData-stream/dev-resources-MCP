@@ -328,9 +328,9 @@ fn supported_public_api_fixture_is_qualified_for_comparison() {
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
-    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
     let database_name = "devres_crate_pipeline_fixture";
-    sqlx::query("CREATE DATABASE devres_crate_pipeline_fixture")
+    sqlx_core::query::query("CREATE DATABASE devres_crate_pipeline_fixture")
         .execute(&admin)
         .await
         .unwrap();
@@ -401,9 +401,9 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     assert_eq!(before.coverage["inventory_complete"], false);
     assert_eq!(before.coverage["inventory_enumeration_complete"], true);
     assert_eq!(before.coverage["metadata_gaps"], 1);
-    let gaps: i64 = sqlx::query_scalar("SELECT count(*) FROM devres_crate_inventory_gaps WHERE inventory=$1 AND name='a' AND error='capacity'")
+    let gaps: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_crate_inventory_gaps WHERE inventory=$1 AND name='a' AND error='capacity'")
         .bind(&before.inventory.id)
-        .fetch_one(&sqlx::PgPool::connect(database.as_str()).await.unwrap())
+        .fetch_one(&sqlx_postgres::PgPool::connect(database.as_str()).await.unwrap())
         .await
         .unwrap();
     assert_eq!(gaps, 1);
@@ -760,7 +760,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     drop(retrieval);
     drop(store);
     sentinel.abort();
-    sqlx::query("DROP DATABASE devres_crate_pipeline_fixture WITH (FORCE)")
+    sqlx_core::query::query("DROP DATABASE devres_crate_pipeline_fixture WITH (FORCE)")
         .execute(&admin)
         .await
         .unwrap();

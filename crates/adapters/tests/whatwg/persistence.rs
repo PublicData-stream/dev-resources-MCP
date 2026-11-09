@@ -30,7 +30,9 @@ fn view(catalog: &str, snapshot: &Snapshot, validated_at: i64) -> View {
 async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
     let base =
         std::env::var("DEVRES_TEST_DATABASE_URL").expect("explicit disposable PostgreSQL required");
-    let admin = sqlx::PgPool::connect(&base).await.expect("fixture admin");
+    let admin = sqlx_postgres::PgPool::connect(&base)
+        .await
+        .expect("fixture admin");
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -41,24 +43,28 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     );
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
-        .execute(&admin)
-        .await
-        .expect("owned fixture database");
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .expect("owned fixture database");
     let mut url = url::Url::parse(&base).expect("fixture URL");
     url.set_path(&format!("/{database}"));
     let root = tempfile::tempdir().expect("owned fixture blobs");
     let store = PgBlobStore::connect(url.as_str(), root.path())
         .await
         .expect("current schema migration");
-    let inspection = sqlx::PgPool::connect(url.as_str())
+    let inspection = sqlx_postgres::PgPool::connect(url.as_str())
         .await
         .expect("fixture inspection");
     assert_eq!(
-        sqlx::query_scalar::<_, i32>("SELECT version FROM devres_schema WHERE singleton")
-            .fetch_one(&inspection)
-            .await
-            .expect("schema"),
+        sqlx_core::query_scalar::query_scalar::<_, i32>(
+            "SELECT version FROM devres_schema WHERE singleton"
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("schema"),
         13
     );
     assert_eq!(
@@ -386,12 +392,13 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
     );
 
     // Terminate only the fixture database's own dedicated ownership session.
-    let owner:i32=sqlx::query_scalar("SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&inspection).await.expect("owned lock");
-    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1,5000)")
-        .bind(owner)
-        .fetch_one(&inspection)
-        .await
-        .expect("stop own fixture owner");
+    let owner:i32=sqlx_core::query_scalar::query_scalar("SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").fetch_one(&inspection).await.expect("owned lock");
+    let terminated: bool =
+        sqlx_core::query_scalar::query_scalar("SELECT pg_terminate_backend($1,5000)")
+            .bind(owner)
+            .fetch_one(&inspection)
+            .await
+            .expect("stop own fixture owner");
     assert!(
         terminated,
         "owned fixture backend must terminate before testing lost ownership"
@@ -462,7 +469,7 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
     );
     drop(restarted);
     inspection.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
         "DROP DATABASE {database} WITH (FORCE)"
     )))
     .execute(&admin)
