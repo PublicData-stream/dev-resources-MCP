@@ -82,7 +82,11 @@ PYBROKERDIAG
     diag_capture backend-memory.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" exec deployment/backend -- sh -c 'for file in /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.events; do if test -r "$file"; then echo "$file"; cat "$file"; fi; done'
     diag_capture events.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" get events --field-selector type=Warning --sort-by=.lastTimestamp
     diag_capture backend-previous.log minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" logs deploy/backend --previous --tail=100 --limit-bytes=65536
-  for component in backend writer credential-broker edge postgres; do
+    if [[ ${credential_broker:-0} == 1 ]]; then
+      diag_capture broker-journal-state.txt minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" exec deployment/postgres -- psql -U devres -d devres_broker_test -Atc "SELECT state,expires_at<EXTRACT(EPOCH FROM now()) AS expired,expires_at-requested_expiry AS expiry_delta,access_key IS NULL AS missing_public_key,ciphertext IS NULL AS missing_ciphertext,encryption_key IS NULL AS missing_key_id,count(*) FROM devres_credential_broker_keys GROUP BY 1,2,3,4,5,6 ORDER BY 1,2,3,4,5,6"
+      diag_capture iam-fixture-counters.json minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" exec deployment/iam-fixture -- python3 -I -B -c 'import json,pathlib; raw=pathlib.Path("/fixture/broker-state/iam-state.json").read_bytes(); assert len(raw)<=1048576; state=json.loads(raw); counters=state["counters"]; selected={key:counters[key] for key in ("create","delete","list")}; assert all(isinstance(value,int) and 0<=value<=1000000 for value in selected.values()); selected["entries"]=len(state["entries"]); print(json.dumps(selected))'
+    fi
+  for component in backend writer credential-broker iam-fixture edge postgres; do
       diag_capture "$component.log" minikube -p "$profile" kubectl -- --cache-dir="${DEVRES_TMP_ROOT:-$scratch}/kube/cache" --context="$profile" --request-timeout=10s -n "$namespace" logs "deploy/$component" --tail=100 --limit-bytes=65536
     done
   fi

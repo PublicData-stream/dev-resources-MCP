@@ -1175,6 +1175,15 @@ authority or provision their prerequisites.
    alive. Report fixture, provider, local cluster, hosted native architectures and
    production acceptance separately.
 
+Disposable acceptance uses `scripts/test-credential-broker.sh` for the broker's
+IAM facade, direct RustFS policy enforcement, expiry/recovery, keyring rotation,
+and database isolation. Run `scripts/test-minikube.sh --s3 --credential-broker`
+for projected pod identities, encrypted native Secrets, Service/CNI boundaries,
+and coordinated S3 restore; `scripts/test-minikube.sh` covers filesystem roles.
+Use the temporary-state and Docker setup described above. These gates use only
+synthetic credentials and disposable stores. Live Scaleway issuer confinement,
+expiry, quota and One Zone acceptance remain separate prerequisites for activation.
+
 Schema 13 blocks reopening with older combined binaries. Roll back only by stopping
 both roles and restoring the coordinated pre-upgrade database/archive backup with
 its matching binary/config; never decrement the schema number or overwrite/delete

@@ -18,6 +18,7 @@ if [[ ${DEVRES_TMP_STATE:-} != 1 ]]; then
 fi
 export CARGO_TARGET_DIR=/tmp/rust/target OXIBELT_TARGET_DIR=/tmp/rust/target PYTHONDONTWRITEBYTECODE=1
 if [[ -n ${DEVRES_DOCKER_HOST:-} ]]; then unset DOCKER_CONTEXT; export DOCKER_HOST="$DEVRES_DOCKER_HOST"; fi
+python3 -I -B scripts/scaleway-iam-fixture.py --self-test
 scratch=$(mktemp -d /tmp/devres-broker.XXXXXX)
 token=${scratch##*/}; token=${token,,}; token=${token//./-}
 run_id="devres-broker-$$-$token"

@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import sys
 import threading
+import xml.etree.ElementTree as ET
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, build_opener, ProxyHandler
@@ -20,6 +21,35 @@ from urllib.request import Request, build_opener, ProxyHandler
 READONLY = '11111111-1111-4111-8111-111111111111'
 READWRITE = '22222222-2222-4222-8222-222222222222'
 ISSUER = '33333333-3333-4333-8333-333333333333'
+
+
+def native_error_code(body):
+    """Retain only the two static codes needed for missing-account recovery."""
+    try:
+        value = json.loads(body)
+        code = value.get('Code', value.get('code')) if isinstance(value, dict) else None
+    except (ValueError, TypeError):
+        try:
+            code = ET.fromstring(body).findtext('Code')
+        except ET.ParseError:
+            return None
+    return code if code in ('InvalidRequest', 'NoSuchResource') else None
+
+
+def delete_service_account(provider, access):
+    """Normalize only a confirmed missing native account; preserve other failures."""
+    try:
+        status, error = provider.call('DELETE', '/rustfs/admin/v3/delete-service-account', query={'accessKey': access})
+        print(f'rustfs-service-account-delete status={status}', flush=True)
+        if status == 400 and error.get('Code') == 'InvalidRequest':
+            info_status, info_error = provider.call('GET', '/rustfs/admin/v3/info-service-account', query={'accessKey': access})
+            print(f'rustfs-service-account-info status={info_status}', flush=True)
+            if info_status == 404 and info_error.get('Code') == 'NoSuchResource':
+                return 404
+        return status
+    except (OSError, ValueError):
+        print('rustfs-service-account-delete status=unavailable', flush=True)
+        return 502
 
 
 def policy(bucket, prefix, write):
@@ -71,8 +101,14 @@ class RustFS:
                     raise ValueError('fixture response bound')
                 return response.status, data if raw else json.loads(data) if data else {}
         except HTTPError as error:
-            error.close()
-            return error.code, {}
+            try:
+                data = error.read(262145)
+                if len(data) > 262144:
+                    raise ValueError('fixture response bound')
+                code = native_error_code(data)
+                return error.code, {'Code': code} if code else {}
+            finally:
+                error.close()
 
 
 def serve(config_file):
@@ -198,7 +234,7 @@ def serve(config_file):
             with lock:
                 if access not in entries:
                     return self.reply(404, {})
-                status, _ = provider.call('DELETE', '/rustfs/admin/v3/delete-service-account', query={'accessKey': access})
+                status = delete_service_account(provider, access)
                 if status not in (200, 204, 404):
                     return self.reply(502, {})
                 del entries[access]
@@ -206,10 +242,83 @@ def serve(config_file):
                 persist()
             self.reply(204, {})
 
-    ThreadingHTTPServer(('0.0.0.0', 8001), Handler).serve_forever()
+    class QuietServer(ThreadingHTTPServer):
+        def handle_error(self, *_):
+            # Never let HTTP/URL exceptions print request paths or credential values.
+            print('iam-fixture-request failure', flush=True)
+
+    QuietServer(('0.0.0.0', 8001), Handler).serve_forever()
+
+
+def self_test():
+    """Bounded regression for a successful native delete whose reply was lost."""
+    import contextlib
+    import io
+    import unittest
+
+    class DeleteRecovery(unittest.TestCase):
+        def run_case(self, replies, expected, calls):
+            class Provider:
+                def __init__(self):
+                    self.methods = []
+
+                def call(self, method, path, query):
+                    self.methods.append((method, path, query))
+                    value = replies[len(self.methods) - 1]
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+
+            provider = Provider()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(delete_service_account(provider, 'synthetic-private-key'), expected)
+            self.assertEqual(len(provider.methods), calls)
+            self.assertNotIn('synthetic-private-key', output.getvalue())
+            self.assertEqual(provider.methods[0][0:2], ('DELETE', '/rustfs/admin/v3/delete-service-account'))
+            if calls == 2:
+                self.assertEqual(provider.methods[1][0:2], ('GET', '/rustfs/admin/v3/info-service-account'))
+                self.assertEqual(provider.methods[0][2], provider.methods[1][2])
+
+        def test_lost_delete_reply_is_recoverable_only_after_proven_absence(self):
+            self.run_case([(400, {'Code': 'InvalidRequest'}), (404, {'Code': 'NoSuchResource'})], 404, 2)
+
+        def test_existing_account_is_not_forgotten(self):
+            self.run_case([(400, {'Code': 'InvalidRequest'}), (200, {})], 400, 2)
+
+        def test_unproven_or_unavailable_absence_stays_failure(self):
+            for status, error in ((404, {}), (403, {'Code': 'NoSuchResource'}), (500, {})):
+                with self.subTest(status=status):
+                    self.run_case([(400, {'Code': 'InvalidRequest'}), (status, error)], 400, 2)
+
+        def test_other_delete_errors_are_not_reinterpreted(self):
+            for status, error in ((400, {}), (403, {}), (500, {})):
+                with self.subTest(status=status):
+                    self.run_case([(status, error)], status, 1)
+
+        def test_transport_failure_remains_failure(self):
+            self.run_case([OSError('private request detail')], 502, 1)
+
+        def test_successful_and_missing_delete_need_no_lookup(self):
+            for status in (200, 204, 404):
+                with self.subTest(status=status):
+                    self.run_case([(status, {})], status, 1)
+
+        def test_only_static_native_codes_are_retained(self):
+            self.assertEqual(native_error_code(b'<Error><Code>NoSuchResource</Code></Error>'), 'NoSuchResource')
+            self.assertEqual(native_error_code(b'{"Code":"InvalidRequest","Message":"private"}'), 'InvalidRequest')
+            self.assertIsNone(native_error_code(b'{"Code":"private"}'))
+            self.assertIsNone(native_error_code(b'not structured'))
+
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(DeleteRecovery))
+    raise SystemExit(0 if result.wasSuccessful() else 1)
 
 
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--self-test']:
+        self_test()
     if len(sys.argv) != 2:
         raise SystemExit('usage: scaleway-iam-fixture.py PRIVATE_CONFIG.json')
-    serve(sys.argv[1])
+    try:
+        serve(sys.argv[1])
+    except Exception:
+        raise SystemExit('IAM fixture failed') from None
