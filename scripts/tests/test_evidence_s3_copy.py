@@ -801,4 +801,72 @@ class CopyTests(unittest.TestCase):
         get.assert_not_called()
 
 
+    def test_error_classifier_accepts_known_codes_and_rejects_every_malformed_layer(self):
+        class Unprintable:
+            def __str__(self): raise AssertionError('provider values must not be stringified')
+        malformed=[None,'provider detail',0,False,[],{'Error':None},{'Error':'provider detail'},
+                   {'Error':[]},{'Error':False},{'Error':0},{'Error':{'Code':None}},
+                   {'Error':{'Code':[]}},{'Error':{'Code':{}}},{'Error':{'Code':True}},
+                   {'Error':{'Code':Unprintable()}},{'Error':{'Code':10**5000}}]
+        for response in malformed:
+            with self.subTest(response_type=type(response).__name__):
+                error=S3Error('unused'); error.response=response
+                self.assertEqual(copy.error_code(error),'')
+                self.assertFalse(copy.missing(error))
+                with patch.object(self.s3,'get_object',side_effect=error) as request:
+                    with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$'):
+                        self.copier().existing('blobs/first')
+                self.assertEqual(request.call_count,1)
+        for code in ('404','NoSuchKey','NotFound','412','PreconditionFailed','NoSuchUpload',404,412):
+            with self.subTest(code=code):
+                error=S3Error(code)
+                self.assertEqual(copy.error_code(error),str(code))
+                with patch.object(self.s3,'get_object',side_effect=error):
+                    if str(code) in ('404','NoSuchKey','NotFound'):
+                        self.assertIsNone(self.copier().existing('blobs/first'))
+                    else:
+                        with self.assertRaises(S3Error) as caught: self.copier().existing('blobs/first')
+                        self.assertIs(caught.exception,error)
+
+    def test_error_classifier_ignores_broken_response_accessors_and_dict_overrides(self):
+        class BrokenResponse(Exception):
+            @property
+            def response(self): raise RuntimeError('private error detail')
+        error=BrokenResponse()
+        self.assertEqual(copy.error_code(error),'')
+        with patch.object(self.s3,'get_object',side_effect=error):
+            with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$'): self.copier().call('get_object',Key='blobs/first')
+        class BrokenGet(dict):
+            def get(self,*_args): raise AttributeError('provider dict override')
+        valid=S3Error('unused'); valid.response=BrokenGet(Error=BrokenGet(Code='NoSuchUpload'))
+        self.assertEqual(copy.error_code(valid),'NoSuchUpload')
+
+    def test_streamed_malformed_s3_error_keeps_original_failure_and_closes_body(self):
+        error=S3Error('unused'); error.response={'Error':None}
+        class Stream:
+            closed=False
+            def read(self,_size): raise error
+            def close(self): self.closed=True
+        body=Stream()
+        with patch.object(self.s3,'get_object',return_value={'Body':body,'Metadata':{}}) as request:
+            with self.assertRaises(S3Error) as caught: self.copier().existing('blobs/first')
+        self.assertIs(caught.exception,error)
+        self.assertEqual(copy.error_code(caught.exception),'')
+        self.assertTrue(body.closed); self.assertEqual(request.call_count,1)
+
+    def test_malformed_put_error_stops_once_without_complete_or_overwrite(self):
+        put=self.s3.put_object; attempts=[]; error=S3Error('unused'); error.response={'Error':'provider detail'}
+        def failed(**kwargs):
+            if kwargs['Key']=='blobs/first':
+                attempts.append(kwargs)
+                raise error
+            return put(**kwargs)
+        self.s3.put_object=failed
+        with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$'): self.copier().run()
+        self.assertEqual(len(attempts),1); self.assertEqual(attempts[0]['IfNoneMatch'],'*')
+        self.assertNotIn('blobs/first',self.s3.objects)
+        self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+        self.assertIn(copy.CONTROL+'owner.json',self.s3.objects)
+
+
 if __name__=='__main__': unittest.main()

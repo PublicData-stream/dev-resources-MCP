@@ -452,8 +452,24 @@ class PartBody(io.RawIOBase):
 
 
 def error_code(error):
-    response = getattr(error, 'response', {})
-    return str(response.get('Error', {}).get('Code', ''))
+    # Some S3-compatible errors carry a null/non-mapping Error (or response).
+    # Classification must never replace the original failure with a parser error
+    # or stringify an arbitrary provider value.
+    try:
+        response = getattr(error, 'response', None)
+    except Exception:
+        return ''
+    if not isinstance(response, dict):
+        return ''
+    detail = dict.get(response, 'Error')
+    if not isinstance(detail, dict):
+        return ''
+    code = dict.get(detail, 'Code')
+    if type(code) is str:
+        return code
+    if type(code) is int and 0 <= code <= 999:
+        return str(code)
+    return ''
 
 
 def missing(error):
