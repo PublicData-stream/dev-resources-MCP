@@ -379,6 +379,7 @@ scripts/test-image.sh --platform linux/amd64
 scripts/test-image.sh --platform linux/amd64 --target server
 scripts/test-image.sh --platform linux/amd64 --target probe
 scripts/test-image.sh --platform linux/amd64 --target audit-worker
+scripts/test-image.sh --platform linux/amd64 --target credential-broker
 ```
 
 Use `linux/arm64` on an ARM64 Linux host. Explicit foreign-platform builds require
@@ -400,10 +401,12 @@ each with amd64 and ARM64 descriptors:
 | `dev-resources-server` | Server plus its required sibling audit worker |
 | `dev-resources-probe` | WebTransport acceptance client |
 | `dev-resources-audit-worker` | Private stdin/stdout helper; no remote worker service |
+| `dev-resources-credential-broker` | Private credential broker |
 
 The default Dockerfile target remains the combined compatibility image. Explicit
-`--target server`, `--target probe`, and `--target audit-worker` select the separate
-images. No Kubernetes manifest or runtime configuration automatically selects them.
+`--target server`, `--target probe`, `--target audit-worker`, and
+`--target credential-broker` select the separate images. No Kubernetes manifest or
+runtime configuration automatically selects them.
 
 Publication uses annotated, unprefixed version tags whose commits are in main
 history: `X.Y.Z`, `X.Y.Z-beta.N`, or `X.Y.Z-build.<8-lowercase-hex-commit>`.
@@ -422,9 +425,10 @@ the newest complete successful main-push CI attempt for the exact commit within
 24 hours. All ten expanded jobs, including both architectures and both edge
 scenarios, must have succeeded in that same attempt. Stale, incomplete, failed,
 ambiguous or unavailable evidence requires fresh full stamped release CI.
-When ordinary CI is reused, separate native jobs build and smoke the six stamped
-release images; fresh release CI already produces those artifacts. An explicit
-gate requires exactly one successful path before any registry-writing job starts.
+When ordinary CI is reused, separate native jobs build and smoke every stamped
+release image on both architectures; fresh release CI already produces those
+artifacts. An explicit gate requires exactly one successful path before any
+registry-writing job starts.
 The tested OCI artifacts are promoted without rebuilding. Immutable platform tags
 `VERSION-amd64` and `VERSION-arm64` support an index at `VERSION`, where `VERSION`
 is the complete unprefixed Git tag. Matching artifact retries are idempotent;
@@ -465,9 +469,10 @@ artifacts and all existing identity, conflict, provenance, and acceptance gates;
 never move its tag or rebuild over a conflicting digest.
 
 The GitHub Release contains `source.tar.gz`, its SHA-256 file, release identity,
-and three JSON image-digest records. Stable/beta Releases must be mutable: the
-workflow appends missing assets after image acceptance, preserves matching assets
-and human-written release metadata, and rejects conflicts without replacing them.
+and a JSON image-digest record for each image family. Stable/beta Releases must be
+mutable: the workflow appends missing assets after image acceptance, preserves
+matching assets and human-written release metadata, and rejects conflicts without
+replacing them.
 All existing required assets are checked before uploading any missing asset.
 Immutable stable/beta Releases are rejected before registry publication. Build
 candidates retain draft creation, asset upload, and prerelease publication. Since
@@ -494,9 +499,10 @@ Beta/build releases are marked prerelease. Set the configured `source.url` to an
 accessible offer for this exact corresponding source before independent deployment.
 
 Before the first independently authorized publication, verify organization package
-permissions and set all three GHCR packages public (new packages default private).
-After platform/index publication, workflow acceptance verifies all three version
-indexes and all six platform provenance statements, binding the source commit,
+permissions and set the GHCR package for every image family public (new packages
+default private).
+After platform/index publication, workflow acceptance verifies every version
+index and platform provenance statement, binding the source commit,
 tag and publishing workflow. Explicit anonymous Skopeo copies download every
 platform image into fresh isolated storage and check manifest/config/layer content
 and source labels without executing the images. Only complete acceptance produces

@@ -39,6 +39,25 @@ def descriptor(raw, media_type):
     return {"digest": acceptance.content_digest(raw), "size": len(raw), "mediaType": media_type}
 
 
+def verify_fixture_coverage(records, expected_downloads, result, attestations, downloads):
+    """Check identities and per-copy traffic against independently seeded evidence."""
+    if Counter(encoded(record) for record in result["images"]) != Counter(encoded(record) for record in records):
+        raise ValueError("Local fixture returned unexpected release images")
+    expected_subjects = Counter(
+        "oci://" + record["image"] + "@" + digest
+        for record in records
+        for digest in (record["digest"], *(record["platforms"][arch] for arch in acceptance.ARCHES))
+    )
+    if (any(arguments[:3] != ["gh", "attestation", "verify"] or len(arguments) < 4 for arguments in attestations)
+            or Counter(arguments[3] for arguments in attestations) != expected_subjects):
+        raise ValueError("Local fixture did not verify every release provenance subject")
+    if Counter(reference for reference, _ in downloads) != Counter(expected_downloads.keys()):
+        raise ValueError("Local fixture did not copy every release platform exactly once")
+    for reference, requests in downloads:
+        if any(requests[path] <= 0 for path in expected_downloads[reference]):
+            raise ValueError("Local fixture did not fetch every platform manifest, config and layer")
+
+
 def check_docker_inline_store(root: Path, port: int) -> None:
     """Real Docker must use inline credentials even when native helpers exist."""
     class Initialized(BaseException):
@@ -138,6 +157,7 @@ def main():
             check_docker_inline_store(root, server.server_port)
             digests = root / "digests"
             digests.mkdir()
+            records, expected_downloads = [], {}
             for target in acceptance.FAMILIES:
                 image = prefix + target
                 route = "/v2/dev-resources-" + target
@@ -160,13 +180,19 @@ def main():
                     platforms[arch] = item["digest"]
                     routes[route + "/manifests/" + item["digest"]] = (manifest, item["mediaType"])
                     routes[route + "/blobs/" + config_descriptor["digest"]] = (config, "application/octet-stream")
+                    expected_downloads["docker://" + image + "@" + item["digest"]] = {
+                        route + "/manifests/" + item["digest"],
+                        route + "/blobs/" + config_descriptor["digest"],
+                        route + "/blobs/" + layer_descriptor["digest"],
+                    }
                 index = encoded({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": descriptors})
                 routes[route + "/manifests/" + tag] = (index, "application/vnd.oci.image.index.v1+json")
                 record = {"image": image, "tag": tag, "commit": commit,
                           "digest": acceptance.content_digest(index), "platforms": platforms}
                 (digests / (target + ".json")).write_bytes(encoded(record))
+                records.append(record)
             real_command = acceptance.command
-            attestations = []
+            attestations, downloads = [], []
 
             def command(arguments, environment, **kwargs):
                 if arguments[0] == "gh":
@@ -175,14 +201,17 @@ def main():
                 arguments = arguments.copy()
                 # HTTP is limited to this loopback-only fixture. Production retains TLS.
                 arguments.insert(2, "--tls-verify=false" if arguments[1] == "inspect" else "--src-tls-verify=false")
-                return real_command(arguments, environment, **kwargs)
+                before = requests.copy()
+                output = real_command(arguments, environment, **kwargs)
+                if arguments[1] == "copy":
+                    downloads.append((arguments[-2], requests - before))
+                return output
 
             with patch.object(acceptance, "REGISTRY", prefix), patch.object(acceptance, "command", side_effect=command):
                 result = acceptance.accept(digests, tag, commit, root / "accepted.json")
-            layer_fetches = sum(count for path, count in requests.items() if path.endswith("/blobs/" + layer_descriptor["digest"]))
-            if len(result["images"]) != 3 or len(attestations) != 9 or layer_fetches != 6:
-                raise ValueError("Local fixture did not fetch all six complete platforms")
-            print("Loopback registry accepted: three indexes, six complete anonymous platform pulls; nine provenance checks mocked")
+            verify_fixture_coverage(records, expected_downloads, result, attestations, downloads)
+            print(f"Loopback registry accepted: {len(records)} indexes, {len(expected_downloads)} complete "
+                  f"anonymous platform pulls; {len(attestations)} provenance checks mocked")
     finally:
         server.shutdown()
         server.server_close()
