@@ -277,6 +277,126 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
+    async fn s3_committed_reopen_and_verification_preserve_reader_admission() {
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
+        let configured =
+            std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
+        let mut config: crate::object_storage::S3Config =
+            toml::from_str(&std::fs::read_to_string(configured).unwrap()).unwrap();
+        config.prefix.push_str("/committed-reopen");
+        let admin = PgPool::connect(&base).await.unwrap();
+        sqlx::query("CREATE DATABASE devres_s3_reopen_fixture")
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path("/devres_s3_reopen_fixture");
+        let root = tempfile::tempdir().unwrap();
+        let writer = PgBlobStore::connect_archive(url.as_str(), root.path(), Some(config.clone()))
+            .await
+            .unwrap();
+        let request = FetchRequest {
+            key: "fixture:s3-reopen".into(),
+            url: "https://fixtures.invalid/s3-reopen".into(),
+            ttl_secs: 60,
+            max_bytes: 128,
+            media_type: "text/plain".into(),
+        };
+        let captured = writer
+            .publish(
+                &request,
+                FetchResponse {
+                    status: 200,
+                    body: b"retained across committed reopen".to_vec(),
+                    validators: Validators::default(),
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        let committed: (i64, String) = sqlx::query_as(
+            "SELECT epoch,binding FROM devres_archive_control WHERE singleton AND backend='s3' AND pending_binding IS NULL AND NOT initializing_s3",
+        ).fetch_one(&writer.pool).await.unwrap();
+        drop(writer);
+        // Ordinary restarts and offline publication (such as storage-probe) must
+        // preserve exactly the committed binding rather than begin a transfer.
+        for maintenance in [false, true, false] {
+            let writer = if maintenance {
+                PgBlobStore::connect_archive_for_maintenance(
+                    url.as_str(),
+                    root.path(),
+                    Some(config.clone()),
+                )
+                .await
+                .unwrap()
+            } else {
+                PgBlobStore::connect_archive(url.as_str(), root.path(), Some(config.clone()))
+                    .await
+                    .unwrap()
+            };
+            let control: (i64, String) = sqlx::query_as(
+                "SELECT epoch,binding FROM devres_archive_control WHERE singleton AND pending_binding IS NULL AND NOT initializing_s3",
+            ).fetch_one(&writer.pool).await.unwrap();
+            assert_eq!(control, committed);
+            if !maintenance {
+                let cold = tempfile::tempdir().unwrap();
+                let reader =
+                    PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(config.clone()))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    &*reader.capture(&captured.capture.id).await.unwrap().body,
+                    b"retained across committed reopen"
+                );
+            }
+        }
+        let transfer = Arc::new(
+            PgBlobStore::connect_for_object_transfer(url.as_str(), root.path(), config.clone())
+                .await
+                .unwrap(),
+        );
+        transfer
+            .transfer_object_archive(
+                "verify-object-storage",
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        drop(transfer);
+        let cold = tempfile::tempdir().unwrap();
+        let reader = PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(config.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            &*reader.capture(&captured.capture.id).await.unwrap().body,
+            b"retained across committed reopen"
+        );
+        let pool = PgPool::connect(url.as_str()).await.unwrap();
+        drop(reader);
+        // An ambiguous preexisting transition is never committed by reopening.
+        for initializing in [false, true] {
+            sqlx::query("UPDATE devres_archive_control SET pending_binding=binding,initializing_s3=$1 WHERE singleton")
+                .bind(initializing).execute(&pool).await.unwrap();
+            let writer =
+                PgBlobStore::connect_archive(url.as_str(), root.path(), Some(config.clone()))
+                    .await
+                    .unwrap();
+            let pending: (Option<String>, bool) = sqlx::query_as(
+                "SELECT pending_binding,initializing_s3 FROM devres_archive_control WHERE singleton",
+            ).fetch_one(&pool).await.unwrap();
+            assert_eq!(pending, (Some(committed.1.clone()), initializing));
+            let cold = tempfile::tempdir().unwrap();
+            assert!(
+                PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(config.clone()))
+                    .await
+                    .is_err()
+            );
+            drop(writer);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
     async fn s3_concurrent_reader_cold_cache_observes_only_committed_writer_publication() {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
         let config =

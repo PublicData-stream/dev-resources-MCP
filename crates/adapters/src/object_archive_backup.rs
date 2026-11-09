@@ -1023,6 +1023,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(restored["verified"], true);
+        let reader_cache = tempfile::tempdir_in("/tmp").unwrap();
+        let reader = PgBlobStore::connect_reader(
+            destination_url.as_str(),
+            reader_cache.path(),
+            Some(destination.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            &*reader.capture(&id).await.unwrap().body,
+            b"retained backup evidence"
+        );
+        assert_eq!(
+            &*reader.capture(&newer_id).await.unwrap().body,
+            b"new S3-only backup evidence"
+        );
+        drop(reader);
         let store =
             PgBlobStore::connect_archive(destination_url.as_str(), cold.path(), Some(destination))
                 .await

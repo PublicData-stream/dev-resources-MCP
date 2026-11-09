@@ -1008,6 +1008,15 @@ source files; serving must subsequently use a separate local working directory s
 for its configured cache and provider workspaces. Changing only a configuration
 file never migrates populated storage automatically.
 
+An already committed S3 binding stays committed across ordinary restarts and offline
+verification. A preexisting pending or initializing binding remains fail-closed,
+including markers left by an older combined process. Keep both runtime roles stopped.
+A pending filesystem-to-S3 transfer uses the existing offline verification/activation
+procedure; verification alone does not activate it. An already-S3 archive with an
+ambiguous pending or initializing marker requires a coordinated verified restore or
+separately reviewed recovery; the existing activation command does not repair that
+state. Never delete its markers manually.
+
 For S3 backup, stop writers and use a separate, initially empty backup prefix.
 `BACKUP-S3.toml` contains the standalone contents of an S3 configuration table,
 including its selected credential table, without the `storage.s3` wrapper.

@@ -987,9 +987,15 @@ impl Archive {
                 ));
             }
         }
-        // The target binding is fixed before remote I/O; serving remains stopped
-        // while a transfer is pending. A different database cannot claim a prefix.
-        sqlx::query("UPDATE devres_archive_control SET pending_binding=$1,epoch=$2,initializing_s3=initializing_s3 OR $3 WHERE singleton AND (binding IS NULL OR binding=$1)").bind(&binding).bind(epoch).bind(admission==ArchiveAdmission::Fresh).execute(&mut *tx).await.map_err(|_|unavailable())?;
+        // Reopening an already committed S3 archive changes neither its binding
+        // nor epoch, including offline verification and restored-target checks.
+        // Genuine pending/initializing transitions retain their original fence.
+        let committed = backend == "s3" && pending.is_none() && !initializing;
+        if !committed {
+            // Fix the target before remote I/O; a different database cannot claim
+            // the prefix, and readers remain stopped while a transfer is pending.
+            sqlx::query("UPDATE devres_archive_control SET pending_binding=$1,epoch=$2,initializing_s3=initializing_s3 OR $3 WHERE singleton AND (binding IS NULL OR binding=$1)").bind(&binding).bind(epoch).bind(admission==ArchiveAdmission::Fresh).execute(&mut *tx).await.map_err(|_|unavailable())?;
+        }
         tx.commit().await.map_err(|_| unavailable())?;
         drop(connection);
         remote
