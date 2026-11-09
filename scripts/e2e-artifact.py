@@ -3,17 +3,129 @@
 
 export DIRECTORY IMAGE PLATFORM COMMIT VERSION
 verify DIRECTORY PLATFORM COMMIT VERSION  (loads image, prints tag only)
+acquire-minikube DIRECTORY PLATFORM COMMIT VERSION
+verify-minikube DIRECTORY PLATFORM COMMIT VERSION  (prints verified tool path only)
 """
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 OXIBELT_REVISION = "4f3154d8db0e0a49bce7a528c0a0f4c36d169040"
 TAG = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._/:\-]*\Z")
+MINIKUBE_VERSION = "v1.39.0"
+MINIKUBE_SHA256 = {
+    "linux/amd64": "b738496da01be06bbaf80c688f57ce25acd3849fbb518155f3a88e03ef555aa4",
+    "linux/arm64": "202f331cb677761c5aec81c58472d16d65707358b9f66226210be3fe3275b1c3",
+}
+
+
+class MinikubeError(ValueError):
+    def __init__(self, message, status=1):
+        super().__init__(message)
+        self.status = status
+
+
+def minikube_digest(platform):
+    if platform not in MINIKUBE_SHA256:
+        raise ValueError("unsupported minikube platform")
+    return MINIKUBE_SHA256[platform]
+
+
+def tool_directory(path, create=False):
+    """Reject linked artifact directories before resolving fixed companion names."""
+    path = path.absolute()
+    for parent in reversed((path, *path.parents)):
+        if parent.is_symlink():
+            raise ValueError("minikube artifact directory must not be a symlink")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise ValueError("expected minikube artifact directory")
+    return path
+
+
+def minikube_diagnostic(command, platform, stage, status):
+    """Only fixed bootstrap fields are eligible for retained diagnostics."""
+    try:
+        root = os.environ.get("DEVRES_E2E_DIAGNOSTICS_DIR")
+        if not root:
+            return
+        directory = tool_directory(Path(root) / "bootstrap", create=True)
+        data = dict(stage=stage, tool="minikube", minikube_version=MINIKUBE_VERSION,
+                    platform=platform if platform in MINIKUBE_SHA256 else "unsupported",
+                    status=status)
+        path = directory / f"{command}.json"
+        # Diagnostics never follow an existing path into private fixture state.
+        with path.open("x") as stream:
+            json.dump(data, stream, sort_keys=True)
+            stream.write("\n")
+    except (OSError, ValueError):
+        pass
+
+
+def acquire_minikube(directory, platform, commit, version):
+    expected = minikube_digest(platform)
+    directory = tool_directory(directory, create=True) / "minikube"
+    # An exclusive directory is an ownership fence for failed-acquisition cleanup.
+    if directory.exists() or directory.is_symlink():
+        raise ValueError("refusing to overwrite a minikube artifact")
+    directory.mkdir()
+    try:
+        with tempfile.TemporaryDirectory(prefix="devres-minikube-download.", dir="/tmp") as temporary:
+            binary = Path(temporary) / "minikube"
+            url = ("https://github.com/kubernetes/minikube/releases/download/"
+                   f"{MINIKUBE_VERSION}/minikube-linux-{platform.split('/')[1]}")
+            try:
+                subprocess.run([
+                    "curl", "--fail", "--location", "--silent", "--show-error",
+                    "--proto", "=https", "--proto-redir", "=https",
+                    "--retry", "4", "--connect-timeout", "15", "--max-time", "60",
+                    "--retry-max-time", "180", "--url", url, "--output", str(binary),
+                ], check=True, timeout=240, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as error:
+                raise MinikubeError("minikube download failed", error.returncode) from None
+            except subprocess.TimeoutExpired:
+                raise MinikubeError("minikube download timed out", 124) from None
+            if checksum(regular(binary)) != expected:
+                raise ValueError("minikube checksum mismatch")
+            # Keep the published file non-executable; consumers verify before install.
+            with (directory / "minikube").open("xb") as output, binary.open("rb") as source:
+                shutil.copyfileobj(source, output)
+            data = dict(schema_version=1, platform=platform, commit=commit, version=version,
+                        minikube_version=MINIKUBE_VERSION, sha256=expected)
+            with (directory / "metadata.json").open("x") as stream:
+                json.dump(data, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def verify_minikube(directory, platform, commit, version):
+    expected = minikube_digest(platform)
+    directory = tool_directory(tool_directory(directory) / "minikube")
+    metadata = regular(directory / "metadata.json")
+    if metadata.stat().st_size > 65536:
+        raise ValueError("minikube metadata exceeds limit")
+    data = json.loads(metadata.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("minikube metadata must be an object")
+    for key, value in (("schema_version", 1), ("platform", platform), ("commit", commit),
+                       ("version", version), ("minikube_version", MINIKUBE_VERSION),
+                       ("sha256", expected)):
+        if data.get(key) != value:
+            raise ValueError(f"minikube artifact {key} mismatch")
+    binary = regular(directory / "minikube")
+    if checksum(binary) != expected:
+        raise ValueError("minikube checksum mismatch")
+    return str(binary)
 
 
 def docker(*args):
@@ -113,7 +225,7 @@ def verify(directory, platform, commit, version):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("export", "verify"):
+    for name in ("export", "verify", "acquire-minikube", "verify-minikube"):
         sub = commands.add_parser(name)
         sub.add_argument("directory", type=Path)
         if name == "export":
@@ -122,6 +234,18 @@ def main():
             sub.add_argument(arg)
     args = vars(parser.parse_args())
     command = args.pop("command")
+    if command in ("acquire-minikube", "verify-minikube"):
+        status = 0
+        try:
+            result = globals()[command.replace("-", "_")](**args)
+            if result is not None:
+                print(result)
+        except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
+            status = error.status if isinstance(error, MinikubeError) else 1
+            # Never echo untrusted metadata, paths or download response details.
+            print(f"artifact: {command} failed (exit {status})", file=sys.stderr)
+        minikube_diagnostic(command, args["platform"], command, status)
+        return status
     try:
         result = globals()[command](**args)
         if result is not None:
