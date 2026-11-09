@@ -137,6 +137,101 @@ print("1.2.3")
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(calls, [["sudo", "-n", "apt-get", "update"]])
 
+    def prepare_full_driver(self):
+        """Exercise orchestration with fake tools, keeping real admission and install."""
+        logger = f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+name = Path(sys.argv[0]).name
+with open(os.environ["TEST_LOG"], "a") as output:
+    output.write(json.dumps([name, *sys.argv[1:]]) + "\\n")
+'''
+        for name in ("sudo", "rustup"):
+            self.executable(self.bin / name, logger)
+        self.executable(self.scripts / "with-local-docker.sh", logger + '''
+os.execvp(sys.argv[1], sys.argv[1:])
+''')
+        for name in ("check-native-platform.sh", "build-harness.sh", "e2e-storage.sh",
+                     "test-oxibelt.sh", "test-credential-broker.sh"):
+            self.executable(self.scripts / name, logger)
+        self.executable(self.root / "fixture-minikube", logger)
+        self.executable(self.scripts / "test-minikube.sh", logger + '''
+import subprocess
+subprocess.run(["minikube", "version"], check=True)
+''')
+        (self.scripts / "e2e-artifact.py").write_text(logger + '''
+command = sys.argv[1]
+if command == os.environ.get("TEST_TOOL_FAILURE"):
+    sys.exit(37)
+if command == "verify-minikube":
+    print(Path(__file__).resolve().parents[1] / "fixture-minikube")
+elif command == "verify":
+    print("fixture:test")
+''')
+
+    def test_build_acquires_companion_once_before_daemon_and_export(self):
+        self.prepare_full_driver()
+        for platform in ("linux/amd64", "linux/arm64"):
+            with self.subTest(platform=platform):
+                self.log.unlink(missing_ok=True)
+                result, calls = self.run_driver("build", platform, "artifact")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                tool_calls = [call for call in calls if call[0] == "e2e-artifact.py"]
+                self.assertEqual(tool_calls[0], ["e2e-artifact.py", "acquire-minikube",
+                                                str(self.root / "artifact"), platform, COMMIT, "0.0.0"])
+                self.assertEqual([call[1] for call in tool_calls], ["acquire-minikube", "export"])
+                names = [call[0] for call in calls]
+                self.assertLess(names.index("e2e-artifact.py"), names.index("with-local-docker.sh"))
+                self.assertLess(names.index("build-harness.sh"), len(calls) - 1)
+                self.assertEqual(tool_calls[1][0:2], ["e2e-artifact.py", "export"])
+
+    def test_minikube_consumers_install_verified_companion_without_download(self):
+        self.prepare_full_driver()
+        for scenario in ("minikube", "minikube-s3"):
+            for platform in ("linux/amd64", "linux/arm64"):
+                with self.subTest(scenario=scenario, platform=platform):
+                    self.log.unlink(missing_ok=True)
+                    result, calls = self.run_driver("test", scenario, platform, "artifact", RELEASE_TAG="1.2.3")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    tool_calls = [call for call in calls if call[0] == "e2e-artifact.py"]
+                    self.assertEqual(tool_calls, [
+                        ["e2e-artifact.py", command, str(self.root / "artifact"), platform, COMMIT, "1.2.3"]
+                        for command in ("verify-minikube", "verify")
+                    ])
+                    names = [call[0] for call in calls]
+                    self.assertLess(names.index("e2e-artifact.py"), names.index("with-local-docker.sh"))
+                    expected = ["test-minikube.sh", "--image", "fixture:test"]
+                    if scenario == "minikube-s3":
+                        expected += ["--s3", "--credential-broker"]
+                    self.assertIn(expected, calls)
+                    self.assertEqual(calls[-1], ["minikube", "version"])
+                    self.assertEqual((self.state / "bin/minikube").read_bytes(),
+                                     (self.root / "fixture-minikube").read_bytes())
+
+    def test_docker_consumer_ignores_companion(self):
+        self.prepare_full_driver()
+        result, calls = self.run_driver("test", "docker", "linux/amd64", "artifact")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[1] for call in calls if call[0] == "e2e-artifact.py"], ["verify"])
+        self.assertIn(["test-oxibelt.sh", "--image", "fixture:test"], calls)
+        self.assertIn(["test-credential-broker.sh", "--image", "fixture:test"], calls)
+        self.assertFalse((self.state / "bin/minikube").exists())
+
+    def test_companion_failures_preserve_status_and_block_downstream(self):
+        self.prepare_full_driver()
+        for args, failure in (
+            (("build", "linux/amd64", "artifact"), "acquire-minikube"),
+            (("test", "minikube", "linux/amd64", "artifact"), "verify-minikube"),
+            (("test", "minikube-s3", "linux/arm64", "artifact"), "verify-minikube"),
+        ):
+            with self.subTest(args=args):
+                self.log.unlink(missing_ok=True)
+                result, calls = self.run_driver(*args, TEST_TOOL_FAILURE=failure)
+                self.assertEqual(result.returncode, 37, result.stderr)
+                self.assertEqual(calls[-1][0:2], ["e2e-artifact.py", failure])
+                self.assertNotIn("with-local-docker.sh", [call[0] for call in calls])
+                self.assertFalse((self.state / "bin/minikube").exists())
+
     def test_consumer_storage_failures_preserve_verification_and_scenario_status(self):
         # Exercise the real child-shell driver without host installs or daemon setup.
         for name in ("sudo", "rustup"):

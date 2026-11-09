@@ -140,6 +140,8 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Build native harness artifact
+        env:
+          DEVRES_E2E_DIAGNOSTICS_DIR: /tmp/devres-e2e-build-diagnostics
         run: scripts/ci-e2e.sh build "linux/${{ matrix.arch }}" "/tmp/devres-e2e-harness"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -148,6 +150,14 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
+      - name: Retain build diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-build-diagnostics-${{ matrix.arch }}
+          path: /tmp/devres-e2e-build-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
   e2e:
     name: e2e (${{ matrix.scenario }}, ${{ matrix.arch }})
     needs: e2e-build

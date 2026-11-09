@@ -308,7 +308,8 @@ provider coverage, and production deployment require their own evidence.
 
 `scripts/ci-e2e.sh build PLATFORM DIRECTORY` builds the fixture harness once per
 native architecture and exports a Docker-save artifact through
-`scripts/e2e-artifact.py`. `test docker|minikube PLATFORM DIRECTORY` verifies its
+`scripts/e2e-artifact.py`, together with a verified minikube companion.
+`test docker|minikube|minikube-s3 PLATFORM DIRECTORY` verifies its
 platform, commit, version and contents, loads it, and passes `--image` to the
 scenario harness without rebuilding. Release builds stamp their sources; consumers
 validate the version from the release tag without stamping their checkout.
@@ -323,7 +324,8 @@ limits. The `e2e` matrix runs Docker and minikube on both architectures with
 45-minute limits and fail-fast disabled. The always-running `edge` aggregate
 requires both matrices to succeed, including rejecting skipped or cancelled work.
 Harness artifacts `e2e-harness-ARCH` live for one day; scenario diagnostics selected
-by `DEVRES_E2E_DIAGNOSTICS_DIR` live for seven days. Diagnostics exclude fixture
+by `DEVRES_E2E_DIAGNOSTICS_DIR` live for seven days, including tool preparation
+diagnostics from the build jobs. Diagnostics exclude fixture
 private keys and request contents.
 
 Storage diagnostics run before and after artifact loading and cluster startup,
@@ -336,8 +338,16 @@ never replace the scenario's exit status. No host software or shared caches are 
 The driver enters owned `/tmp` state through `with-tmp-state.sh`, then overrides
 Cargo and OxiBelt targets to `/tmp/rust/target`. It installs Rust 1.99.1
 before checking native host/compiler/daemon agreement inside an isolated rootful
-`with-local-docker.sh` daemon. Minikube 1.39.0 downloads are checked against pinned
-architecture-specific SHA-256 values and use Kubernetes 1.37.0. These disposable
+`with-local-docker.sh` daemon. Each native build downloads minikube 1.39.0 once,
+with four transient-error retries, a 15-second connection timeout, a 60-second
+request timeout, a 180-second retry window and a 240-second process limit. Producer
+and minikube consumers verify its pinned architecture-specific SHA-256 and its
+platform, commit and release-version metadata. Consumers copy the verified binary
+into their owned temporary state without downloading it again; Docker consumers
+ignore the companion. A terminal tool preparation failure fails the build and
+blocks its dependent scenarios. Tool diagnostics contain only fixed stage, tool,
+version, architecture and exit-status fields; diagnostic write failures preserve
+the original result. Kubernetes remains pinned to 1.37.0. These disposable
 fixture gates perform no publication or live-provider acceptance; hosted native
 results and production operations remain separate evidence.
 

@@ -19,8 +19,8 @@ if [[ $mode == test ]]; then scenario=$1; shift; fi
 platform=$1
 artifact=$2
 case "$platform" in
-  linux/amd64) arch=amd64; checksum=b738496da01be06bbaf80c688f57ce25acd3849fbb518155f3a88e03ef555aa4 ;;
-  linux/arm64) arch=arm64; checksum=202f331cb677761c5aec81c58472d16d65707358b9f66226210be3fe3275b1c3 ;;
+  linux/amd64) arch=amd64 ;;
+  linux/arm64) arch=arm64 ;;
   *) echo 'Unsupported native platform' >&2; exit 2 ;;
 esac
 case "$mode:$scenario" in build:|test:docker|test:minikube|test:minikube-s3) ;; *) echo 'Unsupported CI scenario' >&2; exit 2 ;; esac
@@ -44,13 +44,12 @@ sudo -n chown "$(id -u):$(id -g)" /tmp/rust/target
 rustup toolchain install 1.99.1 --profile minimal
 export RUSTUP_TOOLCHAIN=1.99.1
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
-if [[ $scenario == minikube || $scenario == minikube-s3 ]]; then
+if [[ $mode == build ]]; then
+  python3 scripts/e2e-artifact.py acquire-minikube "$artifact" "$platform" "$commit" "$version"
+elif [[ $scenario == minikube || $scenario == minikube-s3 ]]; then
+  minikube_binary=$(python3 scripts/e2e-artifact.py verify-minikube "$artifact" "$platform" "$commit" "$version")
   mkdir -p "$DEVRES_TMP_ROOT/bin"
-  curl --fail --location --silent --show-error \
-    "https://github.com/kubernetes/minikube/releases/download/v1.39.0/minikube-linux-$arch" \
-    -o "$DEVRES_TMP_ROOT/bin/minikube"
-  printf '%s  %s\n' "$checksum" "$DEVRES_TMP_ROOT/bin/minikube" | sha256sum --check --strict
-  chmod 755 "$DEVRES_TMP_ROOT/bin/minikube"
+  install -m 755 -- "$minikube_binary" "$DEVRES_TMP_ROOT/bin/minikube"
   export PATH="$DEVRES_TMP_ROOT/bin:$PATH"
   export DEVRES_KUBERNETES_VERSION=v1.37.0
 fi
