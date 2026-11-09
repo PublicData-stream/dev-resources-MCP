@@ -1410,6 +1410,63 @@ impl MdnGit {
     }
 }
 
+impl MdnGit {
+    /// Inspect exactly one retained Git object in disposable private scratch.
+    /// This never initializes or recovers the permanent/shared repository.
+    pub(crate) async fn retained_blob_page(
+        &self,
+        artifact: &BulkArtifact,
+        oid: &str,
+        offset: u64,
+        limit: usize,
+        scratch: &Path,
+        cancel: CancellationToken,
+    ) -> Result<BlobPage> {
+        check_oid(oid)?;
+        if !(1..=32768).contains(&limit) {
+            return Err(Error::invalid("Invalid retained Git byte-page limit."));
+        }
+        let deadline = Instant::now() + READ_RUNTIME;
+        // Serialize per-repository scratch pack sets under the existing gate.
+        let _gate = bulk::bounded(&cancel, deadline, async { Ok(self.gate.lock().await) }).await?;
+        let manifest = bulk::bounded(
+            &cancel,
+            deadline,
+            self.read_manifest(artifact, cancel.clone()),
+        )
+        .await?;
+        let packs = manifest
+            .packs
+            .into_iter()
+            .map(|pack| (pack.name, pack.artifact))
+            .collect();
+        let workspace = crate::writer_coordination::retained_git::prepare(
+            scratch,
+            self.artifacts.as_ref(),
+            packs,
+            self.max_git_bytes,
+            self.min_free_bytes,
+            &cancel,
+            deadline,
+        )
+        .await?;
+        let reader = Self {
+            root: workspace.root().to_owned(),
+            repo: self.repo,
+            artifacts: self.artifacts.clone(),
+            max_git_bytes: self.max_git_bytes,
+            min_free_bytes: self.min_free_bytes,
+            gate: Arc::new(Mutex::new(())),
+        };
+        bulk::bounded(
+            &cancel,
+            deadline,
+            reader.blob_page(oid, offset, limit, cancel.clone()),
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1669,6 +1726,293 @@ pub(crate) mod tests {
         assert!(parse_commit_order(format!("1 {a} {b}").as_bytes()).is_ok());
         assert!(parse_commit_order(b"1 bad").is_err());
     }
+    struct RetainedFixture {
+        oid: String,
+        body: Vec<u8>,
+        mdn: BulkArtifact,
+        whatwg: BulkArtifact,
+        w3c: BulkArtifact,
+        whatwg_repo: crate::whatwg::git::Repo,
+        w3c_repo: crate::w3c::git::Repo,
+    }
+    async fn retained_fixture(root: &Path) -> RetainedFixture {
+        let git = MdnGit::new(
+            root,
+            Repo::Content,
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+        fixture_init(&git).await;
+        // This raw member is deliberately larger than the 16 MiB projection
+        // bound and has no executable meaning; only its immutable Git OID is read.
+        let body = (0..17 * 1024 * 1024)
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        let revision = commit_files(&git, &[("unsupported-large.bin", &body)], &[]).await;
+        update(&git, "refs/heads/main", &revision).await;
+        let entry = git
+            .entry(&revision, "unsupported-large.bin", CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        git.run(
+            &["repack", "-a", "-d"],
+            4096,
+            &CancellationToken::new(),
+            Instant::now() + READ_RUNTIME,
+        )
+        .await
+        .unwrap();
+        let packs = git.capture_packs(CancellationToken::new()).await.unwrap();
+        let commits = git
+            .artifacts
+            .capture_bytes(
+                format!("0 {revision}\n").into_bytes(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let manifest = Manifest {
+            version: 1,
+            source_url: Repo::Content.source_url().into(),
+            repo: Repo::Content,
+            observed_at: devres_domain::unix_now(),
+            refs: vec![RefEvidence {
+                name: "refs/heads/main".into(),
+                oid: revision.clone(),
+                object_type: "commit".into(),
+                peeled_commit: Some(revision.clone()),
+            }],
+            roots: vec![revision],
+            packs: packs.clone(),
+            commits: commits.clone(),
+            total_commits: 1,
+        };
+        let mdn = git
+            .artifacts
+            .capture_bytes(
+                serde_json::to_vec(&manifest).unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let whatwg_repo = crate::whatwg::git::Repo::new("whatwg/dom").unwrap();
+        let whatwg = crate::whatwg::git::WhatwgGit::new(
+            root,
+            whatwg_repo.clone(),
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+        let w3c_repo = crate::w3c::git::Repo::new("w3c/csswg-drafts").unwrap();
+        let w3c = crate::w3c::git::W3cGit::new(
+            root,
+            w3c_repo.clone(),
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value["current_ref"] = serde_json::json!("refs/heads/main");
+        let mut manifests = Vec::new();
+        for (artifacts, repo, url) in [
+            (
+                whatwg.artifacts(),
+                serde_json::to_value(&whatwg_repo).unwrap(),
+                whatwg_repo.source_url(),
+            ),
+            (
+                w3c.artifacts(),
+                serde_json::to_value(&w3c_repo).unwrap(),
+                w3c_repo.source_url(),
+            ),
+        ] {
+            for expected in packs
+                .iter()
+                .map(|p| &p.artifact)
+                .chain(std::iter::once(&commits))
+            {
+                let bytes =
+                    std::fs::read(git.artifacts.root().join(&expected.relative_path)).unwrap();
+                assert_eq!(
+                    artifacts
+                        .capture_bytes(bytes, CancellationToken::new())
+                        .await
+                        .unwrap(),
+                    *expected
+                );
+            }
+            value["repo"] = repo;
+            value["source_url"] = serde_json::json!(url);
+            manifests.push(
+                artifacts
+                    .capture_bytes(
+                        serde_json::to_vec(&value).unwrap(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        std::fs::remove_dir_all(git.repository()).unwrap();
+        RetainedFixture {
+            oid: entry.oid,
+            body,
+            mdn,
+            whatwg: manifests.remove(0),
+            w3c: manifests.remove(0),
+            whatwg_repo,
+            w3c_repo,
+        }
+    }
+    async fn verify_retained_readers(root: &Path, scratch: &Path, fixture: &RetainedFixture) {
+        let expected_hash = format!("blake3:{}", blake3::hash(&fixture.body).to_hex());
+        let mdn = MdnGit::for_verification(root, Repo::Content, 64 * 1024 * 1024, 64 * 1024 * 1024)
+            .unwrap();
+        let whatwg = crate::whatwg::git::WhatwgGit::for_verification(
+            root,
+            fixture.whatwg_repo.clone(),
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let w3c = crate::w3c::git::W3cGit::for_verification(
+            root,
+            fixture.w3c_repo.clone(),
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let page = mdn
+            .retained_blob_page(
+                &fixture.mdn,
+                &fixture.oid,
+                12345,
+                128,
+                scratch,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.bytes, fixture.body[12345..12473]);
+        assert_eq!(page.total_bytes, fixture.body.len() as u64);
+        assert_eq!(page.body_hash, expected_hash);
+        let page = whatwg
+            .retained_blob_page(
+                &fixture.whatwg,
+                &fixture.oid,
+                12345,
+                128,
+                scratch,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.bytes, fixture.body[12345..12473]);
+        assert_eq!(page.body_hash, expected_hash);
+        let page = w3c
+            .retained_blob_page(
+                &fixture.w3c,
+                &fixture.oid,
+                12345,
+                128,
+                scratch,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.bytes, fixture.body[12345..12473]);
+        assert_eq!(page.body_hash, expected_hash);
+        assert!(!mdn.repository().exists());
+        assert!(!whatwg.repository().exists());
+        assert!(!w3c.repository().exists());
+        assert_eq!(std::fs::read_dir(scratch).unwrap().count(), 0);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            mdn.retained_blob_page(&fixture.mdn, &fixture.oid, 0, 128, scratch, cancelled)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(scratch).unwrap().count(), 0);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readonly_retained_git_raw_pages_use_only_disposable_scratch() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let fixture = retained_fixture(root.path()).await;
+        verify_retained_readers(root.path(), scratch.path(), &fixture).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
+    async fn s3_readonly_cold_raw_git_pages_materialize_verified_packs_without_archive_writes() {
+        use sqlx::{Connection, Row};
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
+        let configured = std::env::var("DEVRES_TEST_S3_CONFIG").unwrap();
+        let mut config: crate::object_storage::S3Config =
+            toml::from_str(&std::fs::read_to_string(configured).unwrap()).unwrap();
+        config.prefix.push_str("/readonly-raw-git");
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        sqlx::query("CREATE DATABASE devres_s3_raw_git_reader")
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut database = url::Url::parse(&base).unwrap();
+        database.set_path("/devres_s3_raw_git_reader");
+        let writer_root = tempfile::tempdir_in("/tmp").unwrap();
+        let cache = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let writer = crate::PgBlobStore::connect_archive(
+            database.as_str(),
+            writer_root.path(),
+            Some(config.clone()),
+        )
+        .await
+        .unwrap();
+        let fixture = retained_fixture(writer_root.path()).await;
+        let mut writer_db = sqlx::PgConnection::connect(database.as_str())
+            .await
+            .unwrap();
+        sqlx::query("CREATE ROLE devres_s3_raw_git_reader LOGIN PASSWORD 'disposable-reader'")
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::raw_sql("GRANT CONNECT ON DATABASE devres_s3_raw_git_reader TO devres_s3_raw_git_reader; GRANT USAGE ON SCHEMA public TO devres_s3_raw_git_reader; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_s3_raw_git_reader;").execute(&mut writer_db).await.unwrap();
+        let before = sqlx::query("SELECT count(*)::bigint AS files FROM devres_archive_file")
+            .fetch_one(&mut writer_db)
+            .await
+            .unwrap()
+            .get::<i64, _>("files");
+        let mut reader_database = database.clone();
+        reader_database
+            .set_username("devres_s3_raw_git_reader")
+            .unwrap();
+        reader_database
+            .set_password(Some("disposable-reader"))
+            .unwrap();
+        let reader = crate::PgBlobStore::connect_reader(
+            reader_database.as_str(),
+            cache.path(),
+            Some(config),
+        )
+        .await
+        .unwrap();
+        assert!(!cache.path().join("mdn/content").exists());
+        verify_retained_readers(cache.path(), scratch.path(), &fixture).await;
+        let after = sqlx::query("SELECT count(*)::bigint AS files FROM devres_archive_file")
+            .fetch_one(&mut writer_db)
+            .await
+            .unwrap()
+            .get::<i64, _>("files");
+        assert_eq!(after, before, "readers must not publish archive bindings");
+        assert!(reader.is_reader());
+        assert!(!writer.is_reader());
+    }
+
     #[tokio::test]
     async fn full_graph_dropped_refs_pages_and_offline_restore() {
         let _test = crate::mdn::index::TEST_GATE.lock().await;

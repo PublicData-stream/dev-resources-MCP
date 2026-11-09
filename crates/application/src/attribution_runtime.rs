@@ -34,6 +34,7 @@ pub struct AttributionRuntime {
     enabled: Vec<String>,
     wake: Notify,
     sweep_gaps: Mutex<BTreeMap<String, String>>,
+    delegate: Option<Arc<dyn crate::acquisition::AcquisitionDelegate>>,
 }
 impl AttributionRuntime {
     pub fn new(
@@ -53,9 +54,25 @@ impl AttributionRuntime {
             enabled,
             wake: Notify::new(),
             sweep_gaps: Mutex::new(BTreeMap::new()),
+            delegate: None,
         })
     }
 
+    pub fn with_delegate(
+        mut self,
+        delegate: Arc<dyn crate::acquisition::AcquisitionDelegate>,
+    ) -> Self {
+        self.delegate = Some(delegate);
+        self
+    }
+    pub async fn enqueue_public(&self, target: &AttributionTarget) -> Result<()> {
+        if !ATTRIBUTION_PROVIDERS.contains(&target.subject.provider.as_str()) {
+            return Err(Error::invalid("Unknown attribution provider."));
+        }
+        self.store.attribution_enqueue(target, 1).await?;
+        self.wake.notify_one();
+        Ok(())
+    }
     pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
         let mut provider = 0;
         loop {
@@ -230,7 +247,15 @@ impl AttributionGate for AttributionRuntime {
                     // The compiler never receives request-only audit input. Audits
                     // must pass public snapshot evidence and cannot schedule repairs.
                     if !audit {
-                        self.store.attribution_enqueue(&target, 1).await?;
+                        if let Some(delegate) = &self.delegate {
+                            delegate
+                                .effect(crate::acquisition::WriterEffect::AttributionEnqueue {
+                                    target,
+                                })
+                                .await?;
+                        } else {
+                            self.store.attribution_enqueue(&target, 1).await?;
+                        }
                     }
                     pending = true;
                 }
@@ -285,6 +310,9 @@ impl AttributionGate for AttributionRuntime {
         )
     }
     async fn status(&self) -> Result<Value> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.attribution_status().await;
+        }
         let mut status = self.store.attribution_status().await?;
         status["enabled_providers"] = json!(self.enabled);
         status["policy_epoch"] = json!(ATTRIBUTION_POLICY_EPOCH);

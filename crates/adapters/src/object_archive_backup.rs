@@ -115,7 +115,7 @@ impl BackupReceipt {
     fn validate(&self) -> Result<()> {
         if self.version != 1
             || self.kind != "devres-object-archive-backup"
-            || self.schema != 12
+            || !matches!(self.schema, 12 | 13)
             || self.store_id.is_empty()
             || self.store_id.len() > 128
             || self.store_id.chars().any(char::is_control)
@@ -543,10 +543,14 @@ pub async fn backup(
             &cancel,
         )
         .await?;
+    let schema: i32 = sqlx::query_scalar("SELECT version FROM devres_schema WHERE singleton")
+        .fetch_one(&store.pool)
+        .await
+        .map_err(|_| unavailable())?;
     let receipt = BackupReceipt {
         version: 1,
         kind: "devres-object-archive-backup".into(),
-        schema: 12,
+        schema,
         store_id,
         source_binding,
         destination_binding,
@@ -656,6 +660,15 @@ pub async fn restore(
     let mut owner = PgConnection::connect(database_url)
         .await
         .map_err(|_| unavailable())?;
+    let lifecycle: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(1835365490,2)")
+        .fetch_one(&mut owner)
+        .await
+        .map_err(|_| unavailable())?;
+    if !lifecycle {
+        return Err(Error::capacity(
+            "Restore requires all readers and writers to stop.",
+        ));
+    }
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(1835365490,1)")
         .fetch_one(&mut owner)
         .await

@@ -117,7 +117,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
             .fetch_one(&inspection)
             .await
             .unwrap(),
-        11
+        13
     );
     assert_eq!(
         store

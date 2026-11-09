@@ -1,0 +1,20 @@
+[package]
+name = "devres-credential-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+devres-adapters = { version = "0.0.0", path = "../../crates/adapters" }
+axum = "0.8"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-rustls = "0.26"
+serde_json = "1"

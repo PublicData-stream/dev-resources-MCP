@@ -22,6 +22,11 @@ struct Fixture {
     credentials_expired: bool,
     sts_requests: usize,
     hosts: Vec<String>,
+    storage_classes: Vec<Option<String>>,
+    no_session_token: bool,
+    credential_requests: usize,
+    stall_credentials: bool,
+    credential_ttl_secs: Option<u64>,
 }
 
 fn response(status: u16, body: impl Into<Body>) -> Response {
@@ -43,6 +48,11 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
         .get("if-none-match")
         .is_some_and(|value| value == "*");
     let authorization = request.headers().get("authorization").cloned();
+    let storage_class = request
+        .headers()
+        .get("x-amz-storage-class")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let host = request
         .headers()
         .get("host")
@@ -51,6 +61,10 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
     let body = to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
         .unwrap();
+    let stall_credentials = state.lock().unwrap().stall_credentials;
+    if path == "/credentials" && stall_credentials {
+        return std::future::pending().await;
+    }
     let mut state = state.lock().unwrap();
     if let Some(host) = host {
         state.hosts.push(host);
@@ -67,17 +81,37 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
             .unwrap();
     }
     if path == "/credentials" {
+        state.credential_requests += 1;
         assert_eq!(authorization.as_ref().unwrap(), "fixture-auth");
         let expiration = if state.credentials_expired {
-            "2020-01-01T00:00:00Z"
+            "2020-01-01T00:00:00Z".to_owned()
+        } else if let Some(ttl) = state.credential_ttl_secs {
+            aws_smithy_types::DateTime::from(
+                std::time::SystemTime::now() + Duration::from_secs(ttl),
+            )
+            .fmt(aws_smithy_types::date_time::Format::DateTime)
+            .unwrap()
         } else {
-            "2035-01-01T00:00:00Z"
+            "2035-01-01T00:00:00Z".to_owned()
         };
         return response(
             200,
             format!(
-                r#"{{"AccessKeyId":"fixture-key","SecretAccessKey":"fixture-secret","Token":"fixture-token","Expiration":"{expiration}"}}"#
+                r#"{{"AccessKeyId":"fixture-key","SecretAccessKey":"fixture-secret",{}"Expiration":"{expiration}"}}"#,
+                if state.no_session_token {
+                    ""
+                } else {
+                    r#""Token":"fixture-token","#
+                }
             ),
+        );
+    }
+    if method == http::Method::GET && query.contains_key("list-type") {
+        assert_eq!(query.get("prefix").map(String::as_str), Some("namespace/"));
+        assert_eq!(query.get("max-keys").map(String::as_str), Some("1"));
+        return response(
+            200,
+            "<ListBucketResult><Name>fixture</Name><IsTruncated>false</IsTruncated></ListBucketResult>",
         );
     }
     if path == "/" && method == http::Method::POST {
@@ -124,6 +158,7 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
         );
     }
     if method == http::Method::POST && query.contains_key("uploads") {
+        state.storage_classes.push(storage_class);
         state.multipart.insert(path.clone(), BTreeMap::new());
         return response(
             200,
@@ -172,6 +207,7 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
         }
     }
     if method == http::Method::PUT {
+        state.storage_classes.push(storage_class);
         assert!(conditional);
         state.conditional_writes += 1;
         if state.objects.contains_key(&path) {
@@ -229,6 +265,7 @@ impl Server {
             allow_http: true,
             ca_file: None,
             cache_max_bytes: 64 * 1024 * 1024,
+            storage_class: None,
             credentials: S3Credentials::Files {
                 access_key_file: access,
                 secret_key_file: secret,
@@ -439,9 +476,11 @@ async fn explicit_container_identity_reloads_and_rejects_expiry() {
             authorization_token_file: Some(token),
             allow_http: true,
             ca_file: None,
+            refresh_before_secs: 300,
         },
         region: "us-east-1".into(),
         identity_client: Some(http_client(None).unwrap()),
+        container_cache: Default::default(),
     };
     assert_eq!(
         provider.load().await.unwrap().access_key_id(),
@@ -449,6 +488,154 @@ async fn explicit_container_identity_reloads_and_rejects_expiry() {
     );
     server.state.lock().unwrap().credentials_expired = true;
     assert!(provider.load().await.is_err());
+}
+
+#[tokio::test]
+async fn scaleway_pair_is_cached_then_refreshed_before_expiry() {
+    let server = Server::new().await;
+    server.state.lock().unwrap().no_session_token = true;
+    let token = server._directory.path().join("pair-token");
+    std::fs::write(&token, "fixture-auth").unwrap();
+    let provider = ExplicitCredentials {
+        source: S3Credentials::Container {
+            endpoint: format!("{}/credentials", server.endpoint),
+            authorization_token_file: Some(token),
+            allow_http: true,
+            ca_file: None,
+            refresh_before_secs: 300,
+        },
+        region: "us-east-1".into(),
+        identity_client: Some(http_client(None).unwrap()),
+        container_cache: Default::default(),
+    };
+    assert!(
+        provider
+            .cached_load()
+            .await
+            .unwrap()
+            .session_token()
+            .is_none()
+    );
+    provider.cached_load().await.unwrap();
+    assert_eq!(server.state.lock().unwrap().credential_requests, 1);
+    *provider.container_cache.value.lock().unwrap() = Some(Credentials::new(
+        "old",
+        "old-secret",
+        None,
+        Some(std::time::SystemTime::now() + Duration::from_secs(299)),
+        "fixture",
+    ));
+    assert_eq!(
+        provider.cached_load().await.unwrap().access_key_id(),
+        "fixture-key"
+    );
+    assert_eq!(server.state.lock().unwrap().credential_requests, 2);
+    *provider.container_cache.value.lock().unwrap() = Some(Credentials::new(
+        "expired",
+        "old-secret",
+        None,
+        Some(std::time::SystemTime::now() - Duration::from_secs(1)),
+        "fixture",
+    ));
+    server.state.lock().unwrap().credentials_expired = true;
+    assert!(provider.cached_load().await.is_err());
+    *provider.container_cache.value.lock().unwrap() = Some(Credentials::new(
+        "still-valid",
+        "cached-secret",
+        None,
+        Some(std::time::SystemTime::now() + Duration::from_secs(100)),
+        "fixture",
+    ));
+    server.state.lock().unwrap().stall_credentials = true;
+    let cached = provider
+        .cached_load_until(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await
+        .unwrap();
+    assert_eq!(cached.access_key_id(), "still-valid");
+}
+
+#[tokio::test]
+async fn health_and_parallel_signers_keep_valid_keys_during_a_hanging_refresh() {
+    let server = Server::new().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.no_session_token = true;
+        state.credential_ttl_secs = Some(100);
+    }
+    let token = server._directory.path().join("health-identity");
+    std::fs::write(&token, "fixture-auth").unwrap();
+    let mut config = server.config.clone();
+    config.credentials = S3Credentials::Container {
+        endpoint: format!("{}/credentials", server.endpoint),
+        authorization_token_file: Some(token),
+        allow_http: true,
+        ca_file: None,
+        refresh_before_secs: 300,
+    };
+    let archive = S3Archive::new(config).await.unwrap();
+    archive.health().await.unwrap();
+    server.state.lock().unwrap().stall_credentials = true;
+    let (first, second, third) = tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(archive.health(), archive.health(), archive.health())
+    })
+    .await
+    .expect("cached identity survives within the S3 health budget");
+    first.unwrap();
+    second.unwrap();
+    third.unwrap();
+}
+
+#[tokio::test]
+async fn one_zone_applies_to_small_and_multipart_writes_without_reclassifying_existing_objects() {
+    let server = Server::new().await;
+    let mut config = server.config.clone();
+    config.storage_class = Some("ONEZONE_IA".into());
+    let archive = S3Archive::new(config).await.unwrap();
+    archive
+        .put_bytes_immutable("descriptor", b"descriptor")
+        .await
+        .unwrap();
+    let small = server._directory.path().join("small-one-zone");
+    std::fs::write(&small, b"small").unwrap();
+    archive
+        .put_file_immutable(
+            "small",
+            &small,
+            &crate::integrity::hash(b"small"),
+            5,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let large = server._directory.path().join("large-one-zone");
+    let bytes = vec![7_u8; 16 * 1024 * 1024 + 1];
+    std::fs::write(&large, &bytes).unwrap();
+    archive
+        .put_file_immutable(
+            "large",
+            &large,
+            &crate::integrity::hash(&bytes),
+            bytes.len() as u64,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let writes = server.state.lock().unwrap().storage_classes.clone();
+    assert_eq!(writes, vec![Some("ONEZONE_IA".into()); 3]);
+    let mut default_config = server.config.clone();
+    default_config.storage_class = None;
+    let other = S3Archive::new(default_config).await.unwrap();
+    other
+        .put_file_immutable(
+            "large",
+            &large,
+            &crate::integrity::hash(&bytes),
+            bytes.len() as u64,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(server.state.lock().unwrap().storage_classes, writes);
 }
 
 #[tokio::test]
@@ -467,6 +654,7 @@ async fn explicit_oidc_identity_uses_only_configured_sts() {
         },
         region: "us-east-1".into(),
         identity_client: Some(http_client(None).unwrap()),
+        container_cache: Default::default(),
     };
     assert_eq!(
         provider.load().await.unwrap().access_key_id(),

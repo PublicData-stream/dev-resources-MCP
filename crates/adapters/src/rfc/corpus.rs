@@ -138,6 +138,16 @@ impl RfcCorpus {
     }
 
     async fn refresh_catalogue(&self) -> Result<Dataset> {
+        if let Some(delegate) = self.retrieval.delegate() {
+            delegate
+                .effect(devres_application::acquisition::WriterEffect::RfcCatalogue)
+                .await?;
+            return self
+                .store
+                .dataset("catalogue", None)
+                .await?
+                .ok_or_else(|| Error::unavailable("RFC catalogue publication unavailable."));
+        }
         let _lock = self.catalogue_lock.lock().await;
         let stored = self
             .retrieval
@@ -193,6 +203,16 @@ impl RfcCorpus {
     }
 
     pub(crate) async fn refresh_errata(&self) -> Result<Dataset> {
+        if let Some(delegate) = self.retrieval.delegate() {
+            delegate
+                .effect(devres_application::acquisition::WriterEffect::RfcErrata)
+                .await?;
+            return self
+                .store
+                .dataset("errata", None)
+                .await?
+                .ok_or_else(|| Error::unavailable("RFC errata publication unavailable."));
+        }
         let stored = self
             .retrieval
             .get_validated(
@@ -371,6 +391,15 @@ impl RfcCorpus {
     }
 
     pub(crate) async fn publish_snapshot(&self) -> Result<Snapshot> {
+        if let Some(delegate) = self.retrieval.delegate() {
+            let id = delegate.rfc_snapshot().await?;
+            valid_snapshot_id(&id)?;
+            return self
+                .store
+                .snapshot(Some(&id))
+                .await?
+                .ok_or_else(|| Error::unavailable("Committed RFC snapshot is unavailable."));
+        }
         self.publish_snapshot_inner(false).await
     }
     pub async fn rebuild_index(&self) -> Result<Value> {
@@ -603,6 +632,11 @@ impl RfcCorpus {
     }
 
     pub(crate) async fn status(&self) -> Result<Value> {
+        if let Some(delegate) = self.retrieval.delegate() {
+            return delegate
+                .source_status(devres_application::acquisition::SourceStatus::Rfc)
+                .await;
+        }
         let mut value = self.store.status().await?;
         value["collection_enabled"] = json!(self.config.enabled);
         value["body_refresh_secs"] = json!(self.config.body_refresh_secs);
@@ -616,6 +650,17 @@ impl RfcCorpus {
         format: &str,
         capture: &devres_domain::Capture,
     ) -> Result<()> {
+        if let Some(delegate) = self.retrieval.delegate() {
+            return delegate
+                .effect(
+                    devres_application::acquisition::WriterEffect::RfcForeground {
+                        number,
+                        format: format.into(),
+                        capture: capture.id.clone(),
+                    },
+                )
+                .await;
+        }
         self.store
             .schedule(&[JobSpec {
                 key: capture.key.clone(),
@@ -638,10 +683,22 @@ impl RfcCorpus {
         Ok(())
     }
     pub(crate) async fn refresh_partial(&self) -> Result<()> {
+        if let Some(delegate) = self.retrieval.delegate() {
+            return delegate
+                .effect(devres_application::acquisition::WriterEffect::RfcRefreshPartial)
+                .await;
+        }
         if self.dirty.load(Ordering::Relaxed) > 0 {
             self.publish_snapshot().await?;
         }
         Ok(())
+    }
+
+    pub(crate) fn writer_config(&self) -> &RfcConfig {
+        &self.config
+    }
+    pub(crate) async fn writer_catalogue(&self) -> Result<Dataset> {
+        self.refresh_catalogue().await
     }
 
     /// Call only before workers start, while the storage owner fence is held.
@@ -757,6 +814,10 @@ pub(crate) fn valid_snapshot_id(id: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "reader_tests.rs"]
+mod reader_tests;
 
 #[cfg(test)]
 mod tests {

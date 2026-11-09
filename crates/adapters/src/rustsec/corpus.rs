@@ -142,6 +142,24 @@ pub(crate) fn normalize_records(
 }
 
 impl AdvisoryCorpus {
+    pub fn new_reader(
+        retrieval: Arc<Retrieval>,
+        store: Arc<dyn AdvisoryStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: RustSecConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let history = AdvisoryHistory::for_reader(store.clone(), broker, root, config.clone())?;
+        Ok(Self {
+            retrieval,
+            store,
+            config,
+            gate: Mutex::new(()),
+            history,
+        })
+    }
+
     pub fn new(
         retrieval: Arc<Retrieval>,
         store: Arc<dyn AdvisoryStore>,
@@ -342,6 +360,21 @@ impl AdvisoryCorpus {
             tokio::select! {_=shutdown.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(self.config.collection_interval_secs))=>{}}
         }
     }
+}
+
+pub(crate) async fn writer_head(retrieval: &Retrieval, force: bool) -> Result<StoredCapture> {
+    retrieval
+        .get_validated(
+            FetchRequest {
+                key: "rustsec:head".into(),
+                url: HEAD_URL.into(),
+                ttl_secs: if force { 0 } else { 86400 },
+                max_bytes: 4 * 1024 * 1024,
+                media_type: "application/json".into(),
+            },
+            &HeadValidator,
+        )
+        .await
 }
 
 #[cfg(test)]

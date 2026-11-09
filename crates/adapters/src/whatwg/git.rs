@@ -1626,6 +1626,59 @@ impl WhatwgGit {
     }
 }
 
+impl WhatwgGit {
+    /// Inspect exactly one retained Git object in disposable private scratch.
+    /// This never initializes or recovers the permanent/shared repository.
+    pub(crate) async fn retained_blob_page(
+        &self,
+        artifact: &BulkArtifact,
+        oid: &str,
+        offset: u64,
+        limit: usize,
+        scratch: &Path,
+        cancel: CancellationToken,
+    ) -> Result<BlobPage> {
+        check_oid(oid)?;
+        if !(1..=32768).contains(&limit) {
+            return Err(Error::invalid("Invalid retained Git byte-page limit."));
+        }
+        let deadline = Instant::now() + READ_RUNTIME;
+        // Serialize per-repository scratch pack sets under the existing gate.
+        let _gate = bulk::bounded(&cancel, deadline, async { Ok(self.gate.lock().await) }).await?;
+        let manifest = bulk::bounded(
+            &cancel,
+            deadline,
+            self.read_manifest(artifact, cancel.clone()),
+        )
+        .await?;
+        let packs = manifest
+            .packs
+            .into_iter()
+            .map(|pack| (pack.name, pack.artifact))
+            .collect();
+        let workspace = crate::writer_coordination::retained_git::prepare(
+            scratch,
+            self.artifacts.as_ref(),
+            packs,
+            self.max_git_bytes,
+            self.min_free_bytes,
+            &cancel,
+            deadline,
+        )
+        .await?;
+        let reader = Self {
+            root: workspace.root().to_owned(),
+            ..self.clone()
+        };
+        bulk::bounded(
+            &cancel,
+            deadline,
+            reader.blob_page(oid, offset, limit, cancel.clone()),
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

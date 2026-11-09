@@ -1191,6 +1191,7 @@ dependencies = [
  "quick-xml",
  "redb",
  "reqwest",
+ "ring",
  "rustsec",
  "semver",
  "serde",
@@ -1223,6 +1224,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "devres-credential-broker"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "devres-adapters",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+]
+
+[[package]]
 name = "devres-domain"
 version = "0.0.0"
 dependencies = [
@@ -1234,6 +1249,7 @@ dependencies = [
 name = "devres-server"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum",
  "devres-adapters",
  "devres-application",
@@ -3174,6 +3190,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

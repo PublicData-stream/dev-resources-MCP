@@ -139,6 +139,26 @@ async fn admitted_index(
     }
 }
 impl MdnCorpus {
+    pub fn with_reader_scratch(mut self, scratch: Option<&Path>) -> Result<Self> {
+        if let Some(scratch) = scratch {
+            Arc::get_mut(&mut self.research)
+                .ok_or_else(|| {
+                    Error::integrity("Reader scratch must attach before sharing research.")
+                })?
+                .reader_scratch(scratch)?;
+        }
+        Ok(self)
+    }
+
+    /// Open published evidence without creating directories or recovering writer stages.
+    pub fn new_reader(
+        store: Arc<dyn MdnStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: MdnConfig,
+    ) -> Result<Self> {
+        Self::for_verification(store, broker, root, config)
+    }
     /// Construct frozen-graph verification handles without initializing storage.
     pub(crate) fn for_verification(
         store: Arc<dyn MdnStore>,

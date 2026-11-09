@@ -103,6 +103,14 @@ pub struct GitRegistry {
     sync_gate: Mutex<()>,
 }
 impl GitRegistry {
+    pub(crate) fn for_reader(root: impl AsRef<Path>, max_repository_bytes: u64) -> Result<Self> {
+        Ok(Self {
+            root: root.as_ref().to_owned(),
+            max_repository_bytes,
+            sync_gate: Mutex::new(()),
+        })
+    }
+
     pub fn new(root: impl AsRef<Path>, max_repository_bytes: u64) -> Result<Self> {
         if max_repository_bytes == 0 || max_repository_bytes > 128 * 1024 * 1024 * 1024 {
             return Err(Error::invalid("Invalid registry Git storage budget."));

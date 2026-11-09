@@ -30,7 +30,7 @@ ordering; new cursors identify their format/generation. This compatibility is
 separate from the earlier tool-name migration described below.
 
 Storage upgrade, verification and activation are private operator commands, never
-MCP tools. They require stopped serving/collection writers and preserve retained
+MCP tools. They require stopped serving readers and collection writers and preserve retained
 history and request-only audit privacy. Existing retrieval, freshness, licensing,
 paging, result-size and transport behavior continues to apply.
 
@@ -38,7 +38,19 @@ Active schema-10 stores automatically receive additive schema-11 attribution
 tables at normal startup under the exclusive storage-owner fence. This bounded
 transition does not perform the schema 1–9 BLAKE3 conversion, scan the corpus or
 request upstream data. Pending conversion still requires offline activation.
-Schema-11 stores require a matching schema and attribution-policy binary.
+Normal writer startup then records schema 13 for filesystem and S3, preventing
+older combined binaries from reopening the store. Serving readers require the
+committed schema-13 backend. Attribution policy compatibility remains independent
+of that private topology marker.
+
+Serving and collection run as separate workloads. Public-source acquisition needed
+by a foreground read is delegated to the sole writer with the existing request
+bounds and cancellation; immutable selected captures remain fixed. Serving has
+read-only archive credentials and SELECT-only database access. Supplied lockfiles,
+dependency graphs, audit reports and audit-derived repair requests remain confined
+to serving request memory; none are sent to the writer or credential broker.
+Broker issuance, private acquisition and deployment-role settings are operator
+interfaces and add no public tools, resource schemes or authentication requirements.
 
 Content-bearing results require qualified, versioned attribution for their exact
 source evidence. Tools include structured `attribution` and readable notices;

@@ -65,6 +65,7 @@ impl AdvisoryStore for PgBlobStore {
         snapshot: &AdvisorySnapshot,
         make_default: bool,
     ) -> Result<()> {
+        self.owner_fence().await?;
         if !snapshot.id.starts_with("blake3:") {
             let retained = self
                 .advisory_snapshot(Some(&snapshot.id), &snapshot.format)
@@ -380,6 +381,7 @@ impl AdvisoryStore for PgBlobStore {
         revision: &str,
         cutoff: Option<i64>,
     ) -> Result<Option<AdvisoryRow>> {
+        self.owner_fence().await?;
         self.fence().await?;
         key("commits", revision)?;
         if cutoff.is_some_and(|value| value < 0) {
@@ -526,6 +528,7 @@ impl AdvisoryStore for PgBlobStore {
         Ok(result)
     }
     async fn put_advisory_row(&self, kind: &str, value: &str, data: &Value) -> Result<()> {
+        self.owner_fence().await?;
         key(kind, value)?;
         let data = bounded(data, 4 * 1024 * 1024)?;
         let mut owner = self.owner.lock().await;
@@ -554,6 +557,7 @@ impl AdvisoryStore for PgBlobStore {
         )
     }
     async fn set_advisory_state(&self, value: &str, data: &Value) -> Result<()> {
+        self.owner_fence().await?;
         key("state", value)?;
         let data = bounded(data, 4 * 1024 * 1024)?;
         let mut owner = self.owner.lock().await;
@@ -645,6 +649,7 @@ impl PgBlobStore {
         config: &devres_application::advisory::RustSecConfig,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value> {
+        self.owner_fence().await?;
         if descriptor.is_null() {
             return Err(Error::integrity("Advisory manifest descriptor missing."));
         }
@@ -766,6 +771,7 @@ impl PgBlobStore {
         config: &devres_application::advisory::RustSecConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.owner_fence().await?;
         self.migrate_advisory_graph_with_execution(
             mappings,
             config,
@@ -782,6 +788,7 @@ impl PgBlobStore {
         cancel: tokio_util::sync::CancellationToken,
         execution: &crate::MigrationExecution,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.owner_fence().await?;
         self.fence().await?;
         let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         // Original ref observations are identified by their retained manifest body.

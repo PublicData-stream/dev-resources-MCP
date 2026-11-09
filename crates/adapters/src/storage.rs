@@ -87,6 +87,8 @@ impl PgBlobStore {
     }
 }
 
+#[path = "storage_reader.rs"]
+mod reader;
 #[path = "storage_sequence.rs"]
 mod sequence_integrity;
 #[path = "storage_visibility.rs"]
@@ -119,6 +121,8 @@ fn stage_name(name: &str) -> bool {
 pub struct PgBlobStore {
     pub(crate) pool: PgPool,
     active: AtomicBool,
+    reader: bool,
+    lifecycle_shared: bool,
     visibility: tokio::sync::OnceCell<visibility::VisibilityRegistry>,
     root: PathBuf,
     read_budget: Arc<Semaphore>,
@@ -156,6 +160,8 @@ enum OpenMode {
     Activate,
     Transfer,
     RestoreCheck,
+    Reader,
+    Maintenance,
 }
 
 impl PgBlobStore {
@@ -169,6 +175,28 @@ impl PgBlobStore {
         config: Option<crate::object_storage::S3Config>,
     ) -> Result<Self> {
         Self::connect_inner(database_url, root, OpenMode::Serve, config).await
+    }
+
+    /// Open a publication-capable offline task only while all runtime participants stop.
+    pub async fn connect_archive_for_maintenance(
+        database_url: &str,
+        root: impl AsRef<Path>,
+        config: Option<crate::object_storage::S3Config>,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Maintenance, config).await
+    }
+
+    /// Open committed evidence without acquiring writer authority or changing storage.
+    /// Filesystem roots must be mounted read-only; S3 roots are private disposable caches.
+    pub async fn connect_reader(
+        database_url: &str,
+        root: impl AsRef<Path>,
+        config: Option<crate::object_storage::S3Config>,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Reader, config).await
+    }
+    pub const fn is_reader(&self) -> bool {
+        self.reader
     }
 
     pub async fn connect_for_object_transfer(
@@ -238,7 +266,7 @@ impl PgBlobStore {
             .fetch_one(&self.pool)
             .await
             .map_err(|_| storage_error())?;
-        if !matches!(version, 11 | 12) {
+        if !matches!(version, 11..=13) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
             ));
@@ -254,16 +282,41 @@ impl PgBlobStore {
         if let Some(config) = &s3 {
             config.validate()?;
         }
-        let maintenance = mode != OpenMode::Serve;
+        let reader = mode == OpenMode::Reader;
+        // Maintenance publication needs normal archive initialization/recovery,
+        // but its exclusive lifecycle lock must precede all of those operations.
+        let maintenance = !matches!(
+            mode,
+            OpenMode::Serve | OpenMode::Reader | OpenMode::Maintenance
+        );
+        let lifecycle_exclusive = !matches!(mode, OpenMode::Serve | OpenMode::Reader);
         let allow_migration = mode == OpenMode::Migrate;
-        let read_only = mode == OpenMode::Inspect;
+        let read_only = matches!(mode, OpenMode::Inspect | OpenMode::Reader);
         let mut owner = PgConnection::connect(database_url)
             .await
             .map_err(|_| storage_error())?;
-        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(1835365490, 1)")
+        let lifecycle_sql = if lifecycle_exclusive {
+            "SELECT pg_try_advisory_lock(1835365490, 2)"
+        } else {
+            "SELECT pg_try_advisory_lock_shared(1835365490, 2)"
+        };
+        let lifecycle: bool = sqlx::query_scalar(lifecycle_sql)
             .fetch_one(&mut owner)
             .await
             .map_err(|_| storage_error())?;
+        if !lifecycle {
+            return Err(Error::capacity(
+                "Storage maintenance requires all readers and writers to stop.",
+            ));
+        }
+        let acquired: bool = if reader {
+            true
+        } else {
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(1835365490, 1)")
+                .fetch_one(&mut owner)
+                .await
+                .map_err(|_| storage_error())?
+        };
         if !acquired {
             return Err(Error::capacity(
                 "Only one serving instance may own this database",
@@ -306,6 +359,10 @@ impl PgBlobStore {
             .connect(database_url)
             .await
             .map_err(|_| storage_error())?;
+        if reader {
+            return Self::attach_reader(root.as_ref(), s3, pool, owner, owner_pid, owner_started)
+                .await;
+        }
         let existed: bool = sqlx::query_scalar("SELECT to_regclass('devres_schema') IS NOT NULL")
             .fetch_one(&mut owner)
             .await
@@ -347,7 +404,7 @@ impl PgBlobStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-        } else if !(2..=12).contains(&version) {
+        } else if !(2..=13).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -448,27 +505,34 @@ impl PgBlobStore {
                 "Activate schema eleven before object archive migration.",
             ));
         }
-        if s3.is_some() {
+        if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
             sqlx::raw_sql(crate::durable_archive::SCHEMA)
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
-            if !existed && mode == OpenMode::Serve {
+        }
+        if s3.is_some() {
+            if !existed && matches!(mode, OpenMode::Serve | OpenMode::Maintenance) {
                 let binding =
                     crate::durable_archive::config_binding(s3.as_ref().ok_or_else(storage_error)?)?;
                 // Namespace authority and fresh origin commit with the schema,
                 // before any fallible filesystem/transport initialization.
                 sqlx::query("UPDATE devres_archive_control SET initializing_s3=true,pending_binding=$1,epoch=epoch+1 WHERE singleton").bind(binding).execute(&mut *tx).await.map_err(|_|storage_error())?;
             }
-            sqlx::query("UPDATE devres_schema SET version=12 WHERE singleton")
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| storage_error())?;
-        } else if version == 12 {
+        } else if version >= 12 {
             let remote: bool = sqlx::query_scalar("SELECT backend='s3' OR pending_binding IS NOT NULL FROM devres_archive_control WHERE singleton").fetch_one(&mut *tx).await.map_err(|_| storage_error())?;
             if remote {
                 return Err(Error::unavailable("Object archive configuration required."));
             }
+        }
+        if matches!(
+            mode,
+            OpenMode::Serve | OpenMode::Maintenance | OpenMode::Transfer | OpenMode::RestoreCheck
+        ) {
+            sqlx::query("UPDATE devres_schema SET version=13 WHERE singleton")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
         }
         if !maintenance {
             sqlx::query("UPDATE devres_rfc_jobs SET status='pending' WHERE status='running'")
@@ -530,6 +594,8 @@ impl PgBlobStore {
             .map_err(|_| storage_error())?;
         let store = Self {
             active: AtomicBool::new(active),
+            reader: false,
+            lifecycle_shared: !lifecycle_exclusive,
             visibility: tokio::sync::OnceCell::new(),
             pool,
             root,
@@ -601,20 +667,32 @@ impl PgBlobStore {
         self.fence().await
     }
     pub async fn check_ownership(&self) -> Result<()> {
-        self.owner_fence().await
+        if self.reader {
+            self.lifecycle_fence().await
+        } else {
+            self.owner_fence().await
+        }
     }
     pub fn has_object_archive(&self) -> bool {
         self.archive.get().is_some()
     }
 
     async fn fence(&self) -> Result<()> {
-        self.owner_fence().await?;
+        if self.reader {
+            self.lifecycle_fence().await?;
+        } else {
+            self.owner_fence().await?;
+        }
         if let Some(archive) = self.archive.get() {
             archive.health().await?;
         }
         Ok(())
     }
     async fn owner_fence(&self) -> Result<()> {
+        if self.reader {
+            return Err(Error::unavailable("Reader storage cannot publish."));
+        }
+        self.lifecycle_fence().await?;
         // Reads and supervision must not wait behind a bulk publication on the owner
         // connection. Verify its exact live backend and advisory lock independently;
         // backend_start also prevents PID reuse from impersonating a lost owner.
@@ -708,6 +786,7 @@ impl PgBlobStore {
         .map_err(|_| storage_error())?
     }
     async fn write_blob(&self, content_hash: &str, body: &[u8]) -> Result<()> {
+        self.owner_fence().await?;
         if !content_hash.starts_with(crate::integrity::BLAKE3_PREFIX) {
             return Err(Error::integrity("New immutable objects require BLAKE3."));
         }
@@ -918,6 +997,7 @@ impl Store for PgBlobStore {
         response: FetchResponse,
         now: i64,
     ) -> Result<StoredCapture> {
+        self.owner_fence().await?;
         self.fence().await?;
         if response.status != 200 || response.body.len() > request.max_bytes {
             return Err(Error::invalid(
@@ -971,6 +1051,7 @@ impl Store for PgBlobStore {
         validators: Validators,
         now: i64,
     ) -> Result<StoredCapture> {
+        self.owner_fence().await?;
         if key.starts_with("rfc:rsync:")
             || key.starts_with("cargo:git-index:")
             || key.starts_with("cargo:derived:")

@@ -198,6 +198,7 @@ impl W3cStore for PgBlobStore {
             .transpose()
     }
     async fn w3c_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
+        self.owner_fence().await?;
         checked(kind, key)?;
         bounded(data)?;
         let resolved = payload_integrity::natural_key(&self.pool, "w3c", kind, key).await?;
@@ -237,6 +238,7 @@ impl W3cStore for PgBlobStore {
         Ok(sequence)
     }
     async fn w3c_put_many(&self, rows: &[Write]) -> Result<()> {
+        self.owner_fence().await?;
         let mut resolved_rows = rows.to_vec();
         for row in &mut resolved_rows {
             row.key =
@@ -324,6 +326,7 @@ impl W3cStore for PgBlobStore {
         )
     }
     async fn w3c_set_state(&self, key: &str, data: &Value) -> Result<()> {
+        self.owner_fence().await?;
         checked("state", key)?;
         bounded(data)?;
         let mut owner = self.owner.lock().await;
@@ -332,6 +335,7 @@ impl W3cStore for PgBlobStore {
         Ok(())
     }
     async fn w3c_publish_view(&self, view: &View) -> Result<()> {
+        self.owner_fence().await?;
         let identity = serde_json::to_vec(&(
             &view.catalog,
             &view.snapshots,

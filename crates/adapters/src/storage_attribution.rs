@@ -616,6 +616,7 @@ fn qualified(row: &PgRow) -> Result<QualifiedAttribution> {
 #[async_trait]
 impl AttributionStore for PgBlobStore {
     async fn attribution_enqueue(&self, target: &AttributionTarget, priority: u8) -> Result<()> {
+        self.owner_fence().await?;
         self.fence().await?;
         let mut owner = self.owner.lock().await;
         verify_control(&mut owner).await?;
@@ -664,6 +665,7 @@ impl AttributionStore for PgBlobStore {
         enabled: &[String],
         now: i64,
     ) -> Result<Option<AttributionJob>> {
+        self.owner_fence().await?;
         if enabled.len() > PROVIDERS.len() || now < 0 {
             return Err(Error::invalid("Invalid attribution admission."));
         }
@@ -714,6 +716,7 @@ impl AttributionStore for PgBlobStore {
         job: &AttributionJob,
         value: &AttributionGeneration,
     ) -> Result<()> {
+        self.owner_fence().await?;
         if value.policy_epoch != ATTRIBUTION_POLICY_EPOCH
             || value.policy_fingerprint != ATTRIBUTION_POLICY_FINGERPRINT
         {
@@ -778,6 +781,7 @@ impl AttributionStore for PgBlobStore {
         retry_at: Option<i64>,
         code: &str,
     ) -> Result<()> {
+        self.owner_fence().await?;
         if code.is_empty()
             || code.len() > 64
             || !code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
@@ -861,6 +865,7 @@ impl AttributionStore for PgBlobStore {
         )
     }
     async fn attribution_sweep_page(&self, name: &str) -> Result<Vec<AttributionTarget>> {
+        self.owner_fence().await?;
         self.sweep_attribution(name).await
     }
 }
@@ -1264,6 +1269,7 @@ impl PgBlobStore {
         Ok(())
     }
     async fn sweep_attribution(&self, name: &str) -> Result<Vec<AttributionTarget>> {
+        self.owner_fence().await?;
         let sources = sources(name)?;
         self.fence().await?;
         let mut owner = self.owner.lock().await;
@@ -1636,7 +1642,7 @@ mod tests {
             .fetch_one(&store.pool)
             .await
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 13);
         let request = FetchRequest {
             key: "rfc:9000".into(),
             url: "https://www.rfc-editor.org/rfc/rfc9000.txt".into(),
@@ -2103,7 +2109,7 @@ mod tests {
             .fetch_one(&store.pool)
             .await
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 13);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
             .attribution_claim(&["rfc".into()], now)

@@ -1038,7 +1038,10 @@ impl MdnIndex {
         if reference["path"] != manifest_relative(expected)? {
             return Err(integrity());
         }
-        if self.verification_only {
+        // A reader's cold S3 cache may not yet contain this nested search
+        // root. Exact retained-file materialization below creates only cache
+        // parents; ordinary missing filesystem files still fail closed.
+        if self.verification_only && self.root.try_exists().map_err(|_| failure())? {
             real_directory(&self.root)?;
         }
         let key = format!("{}:{expected}", self.root.display());

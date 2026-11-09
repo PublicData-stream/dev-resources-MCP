@@ -529,6 +529,38 @@ pub async fn get(retrieval: &Retrieval, input: GetInput) -> Result<Value> {
 pub(crate) struct Validator;
 #[async_trait]
 impl ResponseValidator for Validator {
+    fn acquisition(
+        &self,
+        request: &FetchRequest,
+    ) -> Result<Option<devres_application::acquisition::Acquisition>> {
+        use devres_application::acquisition::Acquisition;
+        let operation = if request.key == INDEX_KEY {
+            Acquisition::RfcCatalogue
+        } else if request.key == "rfc:errata" {
+            Acquisition::RfcErrata
+        } else if let Some(number) = request.key.strip_prefix("rfc:text:") {
+            Acquisition::RfcRepresentation {
+                number: number
+                    .parse()
+                    .map_err(|_| Error::invalid("Invalid RFC identity."))?,
+                format: "txt".into(),
+            }
+        } else if let Some(value) = request.key.strip_prefix("rfc:format:") {
+            let (number, format) = value
+                .split_once(':')
+                .ok_or_else(|| Error::invalid("Invalid RFC identity."))?;
+            Acquisition::RfcRepresentation {
+                number: number
+                    .parse()
+                    .map_err(|_| Error::invalid("Invalid RFC identity."))?,
+                format: format.into(),
+            }
+        } else {
+            return Err(Error::invalid("Unsupported RFC acquisition."));
+        };
+        Ok(Some(operation))
+    }
+
     async fn validate(
         &self,
         request: &FetchRequest,

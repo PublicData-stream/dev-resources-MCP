@@ -12,6 +12,7 @@ mod rate_limit;
 pub mod registry;
 mod timed_io;
 pub mod webtransport;
+pub mod writer_rpc;
 
 /// Local diagnostic errors must never be serialized as public tool failures.
 pub type ServerError = Box<dyn std::error::Error + Send + Sync>;

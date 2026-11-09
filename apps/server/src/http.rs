@@ -31,7 +31,7 @@ use wtransport::tls::rustls;
 trait HttpIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> HttpIo for T {}
 
-async fn serve_bounded(
+pub(crate) async fn serve_bounded(
     listener: tokio::net::TcpListener,
     app: Router,
     context: EndpointContext,

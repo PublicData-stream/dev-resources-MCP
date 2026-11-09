@@ -176,6 +176,7 @@ async fn check_captures(connection: &mut sqlx::PgConnection, captures: &[&Captur
 #[async_trait]
 impl RfcCorpusStore for PgBlobStore {
     async fn save_dataset(&self, kind: &str, dataset: &Dataset) -> Result<()> {
+        self.owner_fence().await?;
         kind_checked(kind)?;
         capture_checked(&dataset.capture)?;
         let expected_key = if kind == "catalogue" {
@@ -223,6 +224,7 @@ impl RfcCorpusStore for PgBlobStore {
     }
 
     async fn schedule(&self, jobs: &[JobSpec]) -> Result<()> {
+        self.owner_fence().await?;
         if jobs.len() > 100 {
             return Err(Error::capacity("RFC scheduling batch exceeds 100 jobs"));
         }
@@ -247,6 +249,7 @@ impl RfcCorpusStore for PgBlobStore {
     }
 
     async fn claim(&self, now: i64) -> Result<Option<Job>> {
+        self.owner_fence().await?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let row = sqlx::query("UPDATE devres_rfc_jobs SET status='running',attempts=attempts+1 WHERE source_key=(SELECT source_key FROM devres_rfc_jobs WHERE assurance='https' AND status<>'running' AND due_at<=$1 AND attempts<4294967295 ORDER BY due_at,source_key FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
@@ -278,6 +281,7 @@ impl RfcCorpusStore for PgBlobStore {
         error: Option<&str>,
         next_due: i64,
     ) -> Result<()> {
+        self.owner_fence().await?;
         if key.len() > 2048
             || capture.is_some() == error.is_some()
             || error.is_some_and(|error| {
@@ -345,6 +349,7 @@ impl RfcCorpusStore for PgBlobStore {
     }
 
     async fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        self.owner_fence().await?;
         if !snapshot.id.starts_with("blake3:") {
             let retained = RfcCorpusStore::snapshot(self, Some(&snapshot.id))
                 .await?
@@ -625,6 +630,7 @@ impl PgBlobStore {
         mappings: &mut crate::migration_map::MigrationMap,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.owner_fence().await?;
         self.migrate_rfc_graph_with_execution(
             mappings,
             cancel,
@@ -639,6 +645,7 @@ impl PgBlobStore {
         cancel: tokio_util::sync::CancellationToken,
         execution: &crate::MigrationExecution,
     ) -> Result<crate::migration_map::MigrationAliases> {
+        self.owner_fence().await?;
         self.fence().await?;
         let mut aliases = crate::migration_map::MigrationAliases::new(mappings)?;
         let mut after = (String::new(), String::new());

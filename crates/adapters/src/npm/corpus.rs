@@ -58,6 +58,26 @@ fn state_key(prefix: &str, name: &str) -> String {
     )
 }
 impl NpmCorpus {
+    pub fn new_reader(
+        store: Arc<dyn NpmStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: NpmConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            store,
+            broker,
+            raw: Arc::new(BulkArtifactStore::for_verification(
+                root.join("npm/raw-artifacts"),
+                config.min_free_bytes,
+            )?),
+            index: NpmIndex::for_verification(root)?,
+            config,
+            processing: Mutex::new(()),
+        })
+    }
+
     pub fn new(
         store: Arc<dyn NpmStore>,
         broker: Arc<BulkBroker>,

@@ -4,6 +4,7 @@ mod attribution;
 pub mod attribution_providers;
 pub use attribution::AttributionAdapter;
 pub mod bulk;
+pub mod credential_broker;
 pub mod durable_archive;
 pub(crate) mod immutable_index;
 pub mod integrity;
@@ -11,6 +12,7 @@ mod migration_execution;
 pub(crate) mod migration_map;
 pub mod object_archive_backup;
 pub mod object_storage;
+pub mod writer_coordination;
 pub use migration_execution::{
     GraphPrepared, GraphReservation, MigrationExecution, MigrationExecutionOptions,
     MigrationGraphOptions,

@@ -47,7 +47,10 @@ impl MetadataNumbers {
 enum Validation {
     Metadata(String, String, MetadataNumbers),
     Search,
-    Archive(Value),
+    Archive {
+        record: Value,
+        metadata_capture: String,
+    },
 }
 struct Validator {
     validation: Validation,
@@ -55,13 +58,62 @@ struct Validator {
 }
 #[async_trait]
 impl ResponseValidator for Validator {
+    fn acquisition(
+        &self,
+        request: &FetchRequest,
+    ) -> Result<Option<devres_application::acquisition::Acquisition>> {
+        use devres_application::acquisition::Acquisition;
+        Ok(Some(match &self.validation {
+            Validation::Metadata(name, version, numbers) => Acquisition::NpmMetadata {
+                name: name.clone(),
+                version: version.clone(),
+                source_identity: matches!(numbers, MetadataNumbers::ArchiveIdentity),
+            },
+            Validation::Search => {
+                let value = request
+                    .key
+                    .strip_prefix("npm:search:")
+                    .ok_or_else(|| Error::invalid("Invalid npm search identity."))?;
+                let (query, offset) = value
+                    .rsplit_once(':')
+                    .ok_or_else(|| Error::invalid("Invalid npm search identity."))?;
+                Acquisition::NpmSearch {
+                    query: query.into(),
+                    offset: offset
+                        .parse()
+                        .map_err(|_| Error::invalid("Invalid npm search page."))?,
+                }
+            }
+            Validation::Archive {
+                record,
+                metadata_capture,
+            } => Acquisition::NpmArchive {
+                name: record["name"]
+                    .as_str()
+                    .ok_or_else(|| Error::integrity("Missing npm package identity."))?
+                    .into(),
+                version: record["version"]
+                    .as_str()
+                    .ok_or_else(|| Error::integrity("Missing npm version identity."))?
+                    .into(),
+                metadata_capture: metadata_capture.clone(),
+            },
+        }))
+    }
+
     async fn validate(&self, _: &FetchRequest, response: FetchResponse) -> Result<FetchResponse> {
         let validation = match &self.validation {
             Validation::Metadata(name, version, numbers) => {
                 Validation::Metadata(name.clone(), version.clone(), *numbers)
             }
             Validation::Search => Validation::Search,
-            Validation::Archive(record) => Validation::Archive(record.clone()),
+            Validation::Archive {
+                record,
+                metadata_capture,
+            } => Validation::Archive {
+                record: record.clone(),
+                metadata_capture: metadata_capture.clone(),
+            },
         };
         process(self.lease.clone(), move || {
             match validation {
@@ -72,7 +124,7 @@ impl ResponseValidator for Validator {
                     search_document(&response.body)?;
                 }
                 // Raw checksum verification is independent of archive processing.
-                Validation::Archive(record) => {
+                Validation::Archive { record, .. } => {
                     npm_processing::verify_integrity(&response.body, &record)?;
                 }
             }
@@ -407,7 +459,10 @@ impl NpmPackages {
                             media_type: "application/gzip".into(),
                         },
                         &Validator {
-                            validation: Validation::Archive(record.clone()),
+                            validation: Validation::Archive {
+                                record: record.clone(),
+                                metadata_capture: metadata.capture.id.clone(),
+                            },
                             lease: lease.clone(),
                         },
                     )
@@ -598,4 +653,108 @@ pub fn schemas() -> Vec<Value> {
         vec!["name", "version", "path"],
     );
     tools
+}
+
+/// Writer-side canonical reconstruction; the request cannot supply a destination.
+pub(crate) async fn writer_acquire(
+    retrieval: Arc<Retrieval>,
+    operation: &devres_application::acquisition::Acquisition,
+) -> Result<StoredCapture> {
+    use devres_application::acquisition::Acquisition;
+    let lease = Arc::new(archive::admit()?);
+    match operation {
+        Acquisition::NpmMetadata {
+            name,
+            version,
+            source_identity,
+        } => {
+            npm_processing::parse_version(version)?;
+            let numbers = if *source_identity {
+                MetadataNumbers::ArchiveIdentity
+            } else {
+                MetadataNumbers::Canonical
+            };
+            NpmPackages::new(retrieval)
+                .packument(name, version, None, numbers, lease)
+                .await
+                .map(|(stored, _)| stored)
+        }
+        Acquisition::NpmSearch { query, offset } => {
+            if query.trim().is_empty() || query.len() > 256 || *offset > 10000 || *offset % 100 != 0
+            {
+                return Err(Error::invalid("Invalid npm acquisition page."));
+            }
+            let url = Operation::Search {
+                query: query.clone(),
+                offset: *offset,
+                limit: 100,
+            }
+            .url()?;
+            retrieval
+                .get_validated(
+                    FetchRequest {
+                        key: format!("npm:search:{query}:{offset}"),
+                        url,
+                        ttl_secs: METADATA_TTL,
+                        max_bytes: MAX_SEARCH,
+                        media_type: "application/json".into(),
+                    },
+                    &Validator {
+                        validation: Validation::Search,
+                        lease,
+                    },
+                )
+                .await
+        }
+        Acquisition::NpmArchive {
+            name,
+            version,
+            metadata_capture,
+        } => {
+            npm_processing::validate_name(name)?;
+            npm_processing::parse_version(version)?;
+            let packages = NpmPackages::new(retrieval.clone());
+            let (_, document) = packages
+                .packument(
+                    name,
+                    version,
+                    Some(metadata_capture),
+                    MetadataNumbers::ArchiveIdentity,
+                    lease.clone(),
+                )
+                .await?;
+            let record = selected(&document, version)?;
+            let original = record["version"]
+                .as_str()
+                .ok_or_else(|| Error::integrity("Missing npm version."))?;
+            let tarball = record["dist"]["tarball"]
+                .as_str()
+                .ok_or_else(|| Error::integrity("Missing npm archive identity."))?;
+            let url = Operation::Archive {
+                name: name.clone(),
+                version: original.into(),
+                url: tarball.into(),
+            }
+            .url()?;
+            retrieval
+                .get_validated(
+                    FetchRequest {
+                        key: archive_key(name, original, &record)?,
+                        url,
+                        ttl_secs: ARCHIVE_TTL,
+                        max_bytes: 128 * 1024 * 1024,
+                        media_type: "application/gzip".into(),
+                    },
+                    &Validator {
+                        validation: Validation::Archive {
+                            record,
+                            metadata_capture: metadata_capture.clone(),
+                        },
+                        lease,
+                    },
+                )
+                .await
+        }
+        _ => Err(Error::invalid("Unsupported npm acquisition.")),
+    }
 }

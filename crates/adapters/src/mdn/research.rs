@@ -135,6 +135,7 @@ fn bounded_string(s: &str) -> Result<()> {
 pub struct MdnResearch {
     store: Arc<dyn MdnStore>,
     root: PathBuf,
+    reader_scratch: Option<PathBuf>,
     index: MdnIndex,
     content_git: MdnGit,
     compat_git: MdnGit,
@@ -252,10 +253,18 @@ struct Cursor {
 }
 
 impl MdnResearch {
+    pub(crate) fn reader_scratch(&mut self, scratch: &Path) -> Result<()> {
+        self.reader_scratch = Some(crate::writer_coordination::retained_git::scratch_root(
+            scratch, &self.root,
+        )?);
+        Ok(())
+    }
+
     pub(crate) fn for_verification(store: Arc<dyn MdnStore>, root: &Path) -> Result<Self> {
         Ok(Self {
             store,
             root: root.into(),
+            reader_scratch: None,
             index: MdnIndex::for_verification(root)?,
             content_git: MdnGit::for_verification(
                 root,
@@ -278,6 +287,7 @@ impl MdnResearch {
         Ok(Self {
             store,
             root: std::fs::canonicalize(root).map_err(|_| failure())?,
+            reader_scratch: None,
             index: MdnIndex::new(root)?,
             content_git: MdnGit::new(
                 root,
@@ -770,9 +780,36 @@ impl MdnResearch {
                 Repo::Compat => &self.compat_git,
             };
             let oid = raw["oid"].as_str().unwrap_or(&member.oid);
-            let page = git
-                .blob_page(oid, offset as u64, limit, CancellationToken::new())
-                .await?;
+            if oid != member.oid {
+                return Err(integrity());
+            }
+            let page = if let Some(scratch) = &self.reader_scratch {
+                // The manifest is only an offline object locator. The selected
+                // immutable inventory OID remains the identity of returned bytes.
+                let observation: crate::mdn::git::Observation = from_value(
+                    self.store
+                        .mdn_state(&format!("{}-observation", repo(repository)?.as_str()))
+                        .await?
+                        .ok_or_else(|| {
+                            Error::unavailable("Retained MDN Git observation unavailable.")
+                        })?,
+                )?;
+                if observation.repo != repo(repository)? {
+                    return Err(integrity());
+                }
+                git.retained_blob_page(
+                    &observation.manifest,
+                    oid,
+                    offset as u64,
+                    limit,
+                    scratch,
+                    CancellationToken::new(),
+                )
+                .await?
+            } else {
+                git.blob_page(oid, offset as u64, limit, CancellationToken::new())
+                    .await?
+            };
             return Ok(
                 json!({"data":STANDARD.encode(&page.bytes),"encoding":"base64","offset":offset,"next_offset":if (offset as u64)+(page.bytes.len()as u64)<page.total_bytes{Some(offset+page.bytes.len())}else{None},"total_bytes":page.total_bytes,"body_hash":page.body_hash}),
             );

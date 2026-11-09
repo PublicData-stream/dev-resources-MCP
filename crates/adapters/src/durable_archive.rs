@@ -811,6 +811,7 @@ pub struct Archive {
     pool: PgPool,
     owner: Weak<tokio::sync::Mutex<PgConnection>>,
     epoch: i64,
+    reader: bool,
     owner_pid: i32,
     owner_started: String,
     binding: String,
@@ -863,6 +864,60 @@ impl ArchiveLease {
 }
 
 impl Archive {
+    pub(crate) async fn attach_reader(
+        root: PathBuf,
+        config: S3Config,
+        pool: PgPool,
+        owner: Arc<tokio::sync::Mutex<PgConnection>>,
+        owner_pid: i32,
+        owner_started: String,
+    ) -> Result<Arc<Self>> {
+        let remote = S3Archive::new(config).await?;
+        let binding = config_binding(remote.config())?;
+        let row = sqlx::query("SELECT epoch,store_id FROM devres_archive_control WHERE singleton AND backend='s3' AND binding=$1 AND pending_binding IS NULL AND NOT initializing_s3")
+            .bind(&binding).fetch_optional(&pool).await.map_err(|_| unavailable())?.ok_or_else(integrity)?;
+        let epoch: i64 = row.try_get("epoch").map_err(|_| integrity())?;
+        let store_id: String = row.try_get("store_id").map_err(|_| integrity())?;
+        let descriptor = remote.get_bytes("store.json", 16 * 1024).await?;
+        if serde_json::from_slice::<serde_json::Value>(&descriptor).map_err(|_| integrity())?
+            != serde_json::json!({"version":1,"store_id":store_id})
+        {
+            return Err(integrity());
+        }
+        let original: Option<String> = sqlx::query_scalar(
+            "SELECT source_root FROM devres_archive_transfer WHERE singleton AND source_protected",
+        )
+        .fetch_optional(&pool)
+        .await
+        .map_err(|_| unavailable())?;
+        if original.as_ref().is_some_and(|original| {
+            root.starts_with(original) || Path::new(original).starts_with(&root)
+        }) {
+            return Err(Error::invalid(
+                "Reader requires a separate disposable cache.",
+            ));
+        }
+        let mut cache = Cache::load(&root, &pool).await?;
+        admit_local(&root, &mut cache, 0, remote.config().cache_max_bytes, &[])?;
+        let archive = Arc::new(Self {
+            root,
+            remote,
+            pool,
+            owner: Arc::downgrade(&owner),
+            epoch,
+            reader: true,
+            owner_pid,
+            owner_started,
+            binding,
+            cache: Mutex::new(cache),
+        });
+        archive.health().await?;
+        registry()
+            .lock()
+            .map_err(|_| unavailable())?
+            .insert(archive.root.clone(), Arc::downgrade(&archive));
+        Ok(archive)
+    }
     pub(crate) async fn attach(
         root: PathBuf,
         config: S3Config,
@@ -963,6 +1018,7 @@ impl Archive {
             pool,
             owner: Arc::downgrade(&owner),
             epoch,
+            reader: false,
             owner_pid,
             owner_started,
             binding,
@@ -982,8 +1038,8 @@ impl Archive {
     }
     async fn fence(&self) -> Result<()> {
         let _owner = self.owner.upgrade().ok_or_else(unavailable)?;
-        let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid=1 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)").bind(self.owner_pid).bind(&self.owner_started).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
-        let matches:bool=sqlx::query_scalar("SELECT epoch=$1 AND COALESCE(binding,pending_binding)=$2 FROM devres_archive_control WHERE singleton").bind(self.epoch).bind(&self.binding).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
+        let owned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid::bigint=$3 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)").bind(self.owner_pid).bind(&self.owner_started).bind(if self.reader { 2_i64 } else { 1_i64 }).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
+        let matches:bool=sqlx::query_scalar("SELECT epoch=$1 AND COALESCE(binding,pending_binding)=$2 AND (NOT $3 OR (backend='s3' AND pending_binding IS NULL AND NOT initializing_s3)) FROM devres_archive_control WHERE singleton").bind(self.epoch).bind(&self.binding).bind(self.reader).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
         if !owned || !matches {
             return Err(Error::unavailable(
                 "Storage ownership lost; restart required",
@@ -1105,6 +1161,9 @@ impl Archive {
         bytes: u64,
         accounting: Option<(u64, u64)>,
     ) -> Result<()> {
+        if self.reader {
+            return Err(Error::unavailable("Reader archive cannot publish."));
+        }
         self.health().await?;
         let relative = self.relative(path)?;
         let metadata = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;

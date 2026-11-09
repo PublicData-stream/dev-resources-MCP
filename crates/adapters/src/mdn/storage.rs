@@ -212,6 +212,7 @@ impl MdnStore for PgBlobStore {
             .transpose()
     }
     async fn mdn_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
+        self.owner_fence().await?;
         checked(kind, key)?;
         bounded(data)?;
         let resolved = payload_integrity::natural_key(&self.pool, "mdn", kind, key).await?;
@@ -251,6 +252,7 @@ impl MdnStore for PgBlobStore {
         Ok(sequence)
     }
     async fn mdn_put_many(&self, rows: &[MdnWrite]) -> Result<()> {
+        self.owner_fence().await?;
         let mut resolved_rows = rows.to_vec();
         for row in &mut resolved_rows {
             row.key =
@@ -338,6 +340,7 @@ impl MdnStore for PgBlobStore {
         )
     }
     async fn mdn_set_state(&self, key: &str, data: &Value) -> Result<()> {
+        self.owner_fence().await?;
         checked("state", key)?;
         bounded(data)?;
         let mut owner = self.owner.lock().await;
@@ -346,6 +349,7 @@ impl MdnStore for PgBlobStore {
         Ok(())
     }
     async fn mdn_publish_view(&self, view: &View) -> Result<()> {
+        self.owner_fence().await?;
         let identity = serde_json::to_vec(&(
             &view.content,
             &view.compatibility,

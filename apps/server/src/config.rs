@@ -307,6 +307,7 @@ pub struct SourceConfig {
 pub struct StorageConfig {
     pub database_url: String,
     pub blob_dir: PathBuf,
+    pub scratch_dir: Option<PathBuf>,
     #[serde(default)]
     pub backend: StorageBackend,
     pub s3: Option<devres_adapters::object_storage::S3Config>,
@@ -322,6 +323,48 @@ pub enum StorageBackend {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct WriterClientConfig {
+    pub endpoint: String,
+    pub token_file: PathBuf,
+    pub ca_file: Option<PathBuf>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterClientIdentity {
+    pub namespace: String,
+    pub service_account: String,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterListenerConfig {
+    pub bind: SocketAddr,
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+    pub auth: devres_adapters::credential_broker::identity::AuthConfig,
+    pub allowed_clients: Vec<WriterClientIdentity>,
+}
+impl WriterClientConfig {
+    pub fn validate(&self) -> Result<(), ServerError> {
+        let url = url::Url::parse(&self.endpoint).map_err(|_| "invalid writer endpoint")?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/v1/acquire"
+            || !self.token_file.is_absolute()
+            || self.ca_file.as_ref().is_some_and(|p| !p.is_absolute())
+        {
+            return Err(
+                "writer requires an explicit HTTPS acquisition endpoint and mounted token".into(),
+            );
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub source: SourceConfig,
     pub http: HttpConfig,
@@ -329,6 +372,8 @@ pub struct Config {
     pub health: HealthConfig,
     pub storage: StorageConfig,
     pub edge_mtls: Option<EdgeMtlsConfig>,
+    pub writer_client: Option<WriterClientConfig>,
+    pub writer_listener: Option<WriterListenerConfig>,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -351,6 +396,9 @@ pub struct Config {
 impl Config {
     pub fn validate(&self) -> Result<(), ServerError> {
         self.limits.validate()?;
+        if let Some(client) = &self.writer_client {
+            client.validate()?;
+        }
         self.rfc.validate()?;
         self.crates.validate()?;
         self.rustsec.validate()?;

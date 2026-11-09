@@ -390,11 +390,14 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
             for filter in [&input.status, &input.kind].into_iter().flatten() {
                 check_query(filter, false)?;
             }
-            if input.snapshot.is_none() && corpus.store.dataset("errata", None).await?.is_none() {
+            let snapshot = if input.snapshot.is_none()
+                && corpus.store.dataset("errata", None).await?.is_none()
+            {
                 corpus.refresh_errata().await?;
-                corpus.publish_snapshot().await?;
-            }
-            let snapshot = corpus.selected_snapshot(input.snapshot.as_deref()).await?;
+                corpus.publish_snapshot().await?
+            } else {
+                corpus.selected_snapshot(input.snapshot.as_deref()).await?
+            };
             let dataset = dataset_for(corpus, &snapshot, "errata").await?;
             let records = dataset
                 .records

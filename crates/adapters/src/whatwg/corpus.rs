@@ -93,6 +93,7 @@ pub struct WhatwgCorpus {
     broker: Arc<BulkBroker>,
     root: PathBuf,
     verification_only: bool,
+    reader_scratch: Option<PathBuf>,
     config: WhatwgConfig,
     raw: Arc<BulkArtifactStore>,
     index: WhatwgIndex,
@@ -272,6 +273,15 @@ impl<'a> IndexDocuments<'a> {
     }
 }
 impl WhatwgCorpus {
+    pub fn with_reader_scratch(mut self, scratch: Option<&Path>) -> Result<Self> {
+        if let Some(scratch) = scratch {
+            self.reader_scratch = Some(crate::writer_coordination::retained_git::scratch_root(
+                scratch, &self.root,
+            )?);
+        }
+        Ok(self)
+    }
+
     async fn publication_chunks(
         &self,
         artifact: &BulkArtifact,
@@ -592,6 +602,15 @@ impl WhatwgCorpus {
         }
         Ok(false)
     }
+    /// Open published evidence without creating directories or recovering writer stages.
+    pub fn new_reader(
+        store: Arc<dyn WhatwgStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: WhatwgConfig,
+    ) -> Result<Self> {
+        Self::for_verification(store, broker, root, config)
+    }
     /// Construct frozen-graph verification handles without initializing storage.
     pub(crate) fn for_verification(
         store: Arc<dyn WhatwgStore>,
@@ -611,6 +630,7 @@ impl WhatwgCorpus {
             broker,
             root: root.into(),
             verification_only: true,
+            reader_scratch: None,
             config,
             raw,
             index,
@@ -638,6 +658,7 @@ impl WhatwgCorpus {
             broker,
             root: root.into(),
             verification_only: false,
+            reader_scratch: None,
             config,
             raw,
             index,
@@ -929,13 +950,25 @@ impl WhatwgCorpus {
             (bytes, artifact.bytes, artifact.body_hash)
         } else {
             let git = self.git(&snapshot.repository)?;
-            if !git.repository().is_dir() {
+            let page = if let Some(scratch) = &self.reader_scratch {
                 let manifest: BulkArtifact = decode(raw["manifest"].clone())?;
-                git.restore(&manifest, CancellationToken::new()).await?;
-            }
-            let page = git
-                .blob_page(&member.oid, offset, limit, CancellationToken::new())
-                .await?;
+                git.retained_blob_page(
+                    &manifest,
+                    &member.oid,
+                    offset,
+                    limit,
+                    scratch,
+                    CancellationToken::new(),
+                )
+                .await?
+            } else {
+                if !git.repository().is_dir() {
+                    let manifest: BulkArtifact = decode(raw["manifest"].clone())?;
+                    git.restore(&manifest, CancellationToken::new()).await?;
+                }
+                git.blob_page(&member.oid, offset, limit, CancellationToken::new())
+                    .await?
+            };
             (page.bytes, page.total_bytes, page.body_hash)
         };
         let next = offset.saturating_add(bytes.len() as u64);

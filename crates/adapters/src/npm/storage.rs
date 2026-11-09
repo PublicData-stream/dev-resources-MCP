@@ -91,6 +91,7 @@ impl NpmStore for PgBlobStore {
             .transpose()
     }
     async fn npm_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
+        self.owner_fence().await?;
         checked(kind, key)?;
         bounded(data)?;
         let resolved = payload_integrity::natural_key(&self.pool, "npm", kind, key).await?;
@@ -171,6 +172,7 @@ impl NpmStore for PgBlobStore {
         )
     }
     async fn npm_set_state(&self, key: &str, data: &Value) -> Result<()> {
+        self.owner_fence().await?;
         checked("state", key)?;
         bounded(data)?;
         let mut owner = self.owner.lock().await;
@@ -180,6 +182,7 @@ impl NpmStore for PgBlobStore {
         Ok(())
     }
     async fn npm_commit_index(&self, index: &Value, ids: &[String]) -> Result<()> {
+        self.owner_fence().await?;
         bounded(index)?;
         if !index.is_object()
             || ids.len() > 512
@@ -201,6 +204,7 @@ impl NpmStore for PgBlobStore {
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn npm_commit_rebuilt_index(&self, index: &Value, build: &str) -> Result<()> {
+        self.owner_fence().await?;
         bounded(index)?;
         if !index.is_object() || !valid_hash(build) {
             return Err(Error::invalid("Invalid npm index rebuild identity."));
@@ -251,6 +255,7 @@ impl NpmStore for PgBlobStore {
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn npm_publish(&self, lane: &str, snapshot: &Value) -> Result<()> {
+        self.owner_fence().await?;
         if !matches!(lane, "research" | "advisories") {
             return Err(Error::invalid("Invalid npm publication lane."));
         }

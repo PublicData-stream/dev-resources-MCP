@@ -35,7 +35,11 @@ async fn parse<T: Send + 'static>(
 enum Validation {
     Search,
     Index(String),
-    Archive { checksum: String, root: String },
+    Archive {
+        checksum: String,
+        root: String,
+        metadata_capture: String,
+    },
 }
 
 struct Validator {
@@ -45,13 +49,59 @@ struct Validator {
 
 #[async_trait]
 impl ResponseValidator for Validator {
+    fn acquisition(
+        &self,
+        request: &FetchRequest,
+    ) -> Result<Option<devres_application::acquisition::Acquisition>> {
+        use devres_application::acquisition::Acquisition;
+        Ok(Some(match &self.validation {
+            Validation::Search => {
+                let value = request
+                    .key
+                    .strip_prefix("cargo:search:")
+                    .ok_or_else(|| Error::invalid("Invalid crate search identity."))?;
+                let (query, page) = value
+                    .rsplit_once(':')
+                    .ok_or_else(|| Error::invalid("Invalid crate search page."))?;
+                Acquisition::CrateSearch {
+                    query: query.into(),
+                    page: page
+                        .parse()
+                        .map_err(|_| Error::invalid("Invalid crate search page."))?,
+                }
+            }
+            Validation::Index(name) => Acquisition::CrateIndex { name: name.clone() },
+            Validation::Archive {
+                metadata_capture, ..
+            } => {
+                let value = request
+                    .key
+                    .strip_prefix("cargo:archive:")
+                    .ok_or_else(|| Error::invalid("Invalid crate archive identity."))?;
+                let mut parts = value.split(':');
+                let name = parts
+                    .next()
+                    .ok_or_else(|| Error::invalid("Invalid crate archive identity."))?;
+                let version = parts
+                    .next()
+                    .ok_or_else(|| Error::invalid("Invalid crate archive identity."))?;
+                Acquisition::CrateArchive {
+                    name: name.into(),
+                    version: version.into(),
+                    metadata_capture: metadata_capture.clone(),
+                }
+            }
+        }))
+    }
+
     async fn validate(&self, _: &FetchRequest, response: FetchResponse) -> Result<FetchResponse> {
         let validation = match &self.validation {
             Validation::Search => Validation::Search,
             Validation::Index(name) => Validation::Index(name.clone()),
-            Validation::Archive { checksum, root } => Validation::Archive {
+            Validation::Archive { checksum, root, .. } => Validation::Archive {
                 checksum: checksum.clone(),
                 root: root.clone(),
+                metadata_capture: String::new(),
             },
         };
         parse(self.lease.clone(), move || {
@@ -62,7 +112,7 @@ impl ResponseValidator for Validator {
                 Validation::Index(name) => {
                     visit_index(&response.body, &name, |_| Ok(()))?;
                 }
-                Validation::Archive { checksum, root } => {
+                Validation::Archive { checksum, root, .. } => {
                     archive::inspect(&response.body, &checksum, &root, None)?;
                 }
             }
@@ -532,7 +582,7 @@ async fn sources(
     );
     let archive = match archive_id {
         Some(id) => { let stored = retrieval.read_capture(id).await?; ensure_capture(&stored,&key)?; stored },
-        None => retrieval.get_validated(FetchRequest { key,url:format!("https://static.crates.io/crates/{canonical_name}/{canonical_name}-{version}.crate"),ttl_secs:365*86400,max_bytes:archive::MAX_COMPRESSED,media_type:"application/gzip".into() }, &Validator { validation: Validation::Archive { checksum: checksum.clone(), root: format!("{canonical_name}-{version}") }, lease }).await?,
+        None => retrieval.get_validated(FetchRequest { key,url:format!("https://static.crates.io/crates/{canonical_name}/{canonical_name}-{version}.crate"),ttl_secs:365*86400,max_bytes:archive::MAX_COMPRESSED,media_type:"application/gzip".into() }, &Validator { validation: Validation::Archive { checksum: checksum.clone(), root: format!("{canonical_name}-{version}"), metadata_capture: metadata.capture.id.clone() }, lease }).await?,
     };
     Ok(Sources {
         metadata,
@@ -684,6 +734,88 @@ pub async fn source_read(retrieval: &Retrieval, input: SourceReadInput) -> Resul
     Ok(
         json!({"path":input.path,"page":page,"resource_uri":uri,"metadata_capture":capture_json(&source.metadata.capture,3600),"archive_capture":capture_json(&source.archive.capture,365*86400),"checksum_verified":true,"license_notice":"Published source retains its original copyright and licensing."}),
     )
+}
+
+/// Reconstruct every provider destination and validation recipe inside the writer.
+pub(crate) async fn writer_acquire(
+    retrieval: &Retrieval,
+    operation: &devres_application::acquisition::Acquisition,
+) -> Result<StoredCapture> {
+    use devres_application::acquisition::Acquisition;
+    let lease = Arc::new(archive::admit()?);
+    match operation {
+        Acquisition::CrateSearch { query, page } => {
+            if query.trim().is_empty() || query.len() > 256 || *page == 0 || *page > 10001 {
+                return Err(Error::invalid("Invalid crate acquisition page."));
+            }
+            let mut url = url::Url::parse("https://crates.io/api/v1/crates")
+                .map_err(|_| Error::invalid("Invalid registry configuration."))?;
+            url.query_pairs_mut()
+                .append_pair("q", query)
+                .append_pair("per_page", "100")
+                .append_pair("page", &page.to_string());
+            retrieval
+                .get_validated(
+                    FetchRequest {
+                        key: format!("cargo:search:{query}:{page}"),
+                        url: url.into(),
+                        ttl_secs: 3600,
+                        max_bytes: MAX_SEARCH,
+                        media_type: "application/json".into(),
+                    },
+                    &Validator {
+                        validation: Validation::Search,
+                        lease,
+                    },
+                )
+                .await
+        }
+        Acquisition::CrateIndex { name } => index(retrieval, name, None, lease).await,
+        Acquisition::CrateArchive {
+            name,
+            version,
+            metadata_capture,
+        } => {
+            validate_name(name)?;
+            validate_version(version)?;
+            let metadata = retrieval.read_capture(metadata_capture).await?;
+            ensure_metadata_capture(&metadata, name)?;
+            let record = selected_record(&metadata, name, version, lease.clone()).await?;
+            let checksum = record["cksum"]
+                .as_str()
+                .ok_or_else(|| Error::integrity("Missing crate checksum."))?
+                .to_ascii_lowercase();
+            let canonical = record["name"]
+                .as_str()
+                .ok_or_else(|| Error::integrity("Missing crate identity."))?;
+            let request = FetchRequest {
+                key: format!(
+                    "cargo:archive:{}:{version}:{checksum}",
+                    canonical.to_ascii_lowercase()
+                ),
+                url: format!(
+                    "https://static.crates.io/crates/{canonical}/{canonical}-{version}.crate"
+                ),
+                ttl_secs: 365 * 86400,
+                max_bytes: archive::MAX_COMPRESSED,
+                media_type: "application/gzip".into(),
+            };
+            retrieval
+                .get_validated(
+                    request,
+                    &Validator {
+                        validation: Validation::Archive {
+                            checksum,
+                            root: format!("{canonical}-{version}"),
+                            metadata_capture: metadata_capture.clone(),
+                        },
+                        lease,
+                    },
+                )
+                .await
+        }
+        _ => Err(Error::invalid("Unsupported crate acquisition.")),
+    }
 }
 
 #[cfg(test)]

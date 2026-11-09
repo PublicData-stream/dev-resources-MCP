@@ -60,7 +60,7 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | rmcp, Axum, Hyper, Tokio, tokio-util, futures | Standard MCP HTTP transport and async runtime; a hand-written HTTP stack would duplicate protocol/security work. Disable rmcp defaults and enable server/HTTP only; no client command execution. |
 | wtransport, tokio-rustls, x509-parser | Custom reliable QUIC binding, TLS, exact edge SAN verification. Reuse the reference transport contract instead of inventing framing. wtransport uses ring; rustls provider is selected explicitly where required. |
 | serde/json, jsonschema, TOML, URL | Typed schemas, strict configuration, source decoding, and canonical URL construction. Remote schema resolution is disabled. These parsers handle untrusted data under application limits. |
-| reqwest | Bounded fixed-source HTTPS with no redirects, gzip auto-expansion, or arbitrary caller URLs. A separate retry owner avoids amplification. rustls+stream only, no default features. |
+| reqwest | Bounded fixed-source HTTPS with no redirects, gzip auto-expansion, or arbitrary caller URLs. A separate retry owner avoids amplification. rustls+stream plus bounded query encoding, no default features. |
 | sqlx | PostgreSQL transactions and explicit bound queries; no runtime SQL from callers, no compile-time database access or macros. Memory-only storage would not meet retention requirements. |
 | BLAKE3, SHA-2/SHA-1, hex, fs2 | BLAKE3 addresses and verifies service-owned durable content. SHA-2/SHA-1 retain upstream registry/Git checksums, legacy evidence verification, and stable operational lookup names. fs2 provides safe filesystem-space calls rather than adding unsafe local FFI. |
 | quick-xml, tar, flate2 | Streaming official RFC metadata and bounded crate/advisory archives. Neither tar extraction nor link following is used. XML general entities and mixed text need parser tests. |
@@ -245,3 +245,25 @@ a 60-second deadline. Existing `nix` gains only the `resource` feature to set a
 bytes. Per-page decompression and overall page/text counts are bounded. Failed,
 encrypted, malformed and image-only decoding remain explicit projection gaps;
 original public PDF captures stay readable independently.
+
+
+## Credential broker and private coordination
+
+The broker makes the already resolved `ring 0.17.14` a direct adapter dependency
+for AES-256-GCM, authenticated associated data, and operating-system randomness.
+Its resolved package manifest declares Apache-2.0 AND ISC. The existing ring
+native build script/toolchain was already admitted through transport cryptography;
+this change adds no version, new download mechanism, or inspected-package execution.
+A maintained AEAD implementation is preferable to handwritten encryption; a separate
+crypto stack would duplicate primitives already present in the graph. Persistent
+ciphertexts are private broker state, never corpus evidence.
+
+The existing reqwest dependency adds `query` solely for fixed Scaleway IAM listing
+parameters. Defaults and automatic redirects remain disabled, and callers cannot
+choose IAM endpoints in production. The new executable reuses existing axum,
+hyper/hyper-util, tokio-rustls, SQLx, serde and Tokio versions/features for bounded
+private HTTPS and a dedicated journal. These dependencies introduce Kubernetes
+TokenReview/live identity and Scaleway IAM destinations only through operator
+configuration; they do not extend public request URL authority. Dependency versions
+remain locked. Advisory, license, source and generated notice checks still apply to
+the integrated graph; successful compilation is not current dependency admission.

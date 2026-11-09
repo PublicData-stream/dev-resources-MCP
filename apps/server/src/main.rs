@@ -6,6 +6,7 @@ use devres_server::{
     http::{HealthEndpoint, HttpEndpoint},
     registry::server_info_registry,
     webtransport::WebTransportEndpoint,
+    writer_rpc::{WriterClient, WriterEndpoint},
 };
 use std::{
     path::Path,
@@ -182,6 +183,7 @@ async fn main() -> Result<(), ServerError> {
         println!("{receipt}");
         return Ok(());
     }
+    let (runtime_role, args) = devres_server::writer_rpc::runtime_arguments(args)?;
     let mdn_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-mdn-index");
     let whatwg_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-whatwg-index");
     let w3c_rebuild = matches!(args.as_slice(),[command,_] if command=="rebuild-w3c-index");
@@ -203,14 +205,66 @@ async fn main() -> Result<(), ServerError> {
         _ => return Err("usage: devres-server CONFIG.toml | refresh-advisories CONFIG.toml | rebuild-rfc-index CONFIG.toml | rebuild-crate-index CONFIG.toml | rebuild-mdn-index CONFIG.toml | rebuild-whatwg-index CONFIG.toml | rebuild-w3c-index CONFIG.toml | rebuild-chromium-index CONFIG.toml | rebuild-npm-index CONFIG.toml | import-crate-corpus CONFIG.toml --manifest SHA256 | import-rfcs CONFIG.toml --max-bytes N".into()),
     };
     let config = Config::load(Path::new(config_path)).await?;
-    let store = Arc::new(
+    let maintenance = refresh
+        || rebuild
+        || import.is_some()
+        || crate_command.is_some()
+        || mdn_rebuild
+        || whatwg_rebuild
+        || w3c_rebuild
+        || chromium_rebuild
+        || npm_rebuild;
+    let writer_role =
+        runtime_role == devres_server::writer_rpc::RuntimeRole::Collect || maintenance;
+    let delegate: Option<Arc<dyn devres_application::acquisition::AcquisitionDelegate>> =
+        if writer_role {
+            None
+        } else {
+            let client = config
+                .writer_client
+                .clone()
+                .ok_or("serve requires writer_client configuration")?;
+            Some(Arc::new(WriterClient::new(
+                client,
+                Duration::from_secs(config.limits.search_timeout_secs),
+            )?))
+        };
+    if !writer_role {
+        let scratch = config
+            .storage
+            .scratch_dir
+            .as_ref()
+            .ok_or("serve requires a separate storage.scratch_dir")?;
+        if !scratch.is_absolute()
+            || scratch.starts_with(&config.storage.blob_dir)
+            || config.storage.blob_dir.starts_with(scratch)
+        {
+            return Err("reader scratch and permanent archive/cache must be separate".into());
+        }
+        tokio::fs::create_dir_all(scratch).await?;
+    }
+    let store = Arc::new(if maintenance {
+        devres_adapters::PgBlobStore::connect_archive_for_maintenance(
+            &config.storage.database_url,
+            &config.storage.blob_dir,
+            config.storage.s3.clone(),
+        )
+        .await?
+    } else if writer_role {
         devres_adapters::PgBlobStore::connect_archive(
             &config.storage.database_url,
             &config.storage.blob_dir,
             config.storage.s3.clone(),
         )
-        .await?,
-    );
+        .await?
+    } else {
+        devres_adapters::PgBlobStore::connect_reader(
+            &config.storage.database_url,
+            &config.storage.blob_dir,
+            config.storage.s3.clone(),
+        )
+        .await?
+    });
     let broker = Arc::new(
         devres_adapters::bulk::BulkBroker::new(config.crates.bulk_config())?.with_npm_rates(
             config.npm.registry_requests_per_second,
@@ -218,37 +272,59 @@ async fn main() -> Result<(), ServerError> {
         )?,
     );
     let fetcher = Arc::new(devres_adapters::HttpFetcher::with_broker(broker.clone())?);
-    let retrieval = Arc::new(devres_application::Retrieval::new(store.clone(), fetcher));
+    let mut retrieval = devres_application::Retrieval::new(store.clone(), fetcher);
+    if let Some(delegate) = &delegate {
+        retrieval = retrieval.with_delegate(delegate.clone());
+    }
+    let retrieval = Arc::new(retrieval);
     let corpus = Arc::new(devres_adapters::rfc::RfcCorpus::new(
         retrieval.clone(),
         store.clone(),
         &config.storage.blob_dir,
         config.rfc.clone(),
     )?);
-    corpus.recover_stages().await?;
-    let crate_corpus = Arc::new(devres_adapters::crates_io::CrateCorpus::new(
+    if writer_role {
+        corpus.recover_stages().await?;
+    }
+    let crate_corpus = Arc::new((if writer_role {
+        devres_adapters::crates_io::CrateCorpus::new
+    } else {
+        devres_adapters::crates_io::CrateCorpus::new_reader
+    })(
         store.clone(),
         retrieval.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.crates.clone(),
     )?);
-    store.attach_artifact_budget(crate_corpus.artifact_budget())?;
-    crate_corpus.recover_stages().await?;
-    let advisory_corpus = Arc::new(devres_adapters::rustsec::AdvisoryCorpus::new(
+    if writer_role {
+        store.attach_artifact_budget(crate_corpus.artifact_budget())?;
+        crate_corpus.recover_stages().await?;
+    }
+    let advisory_corpus = Arc::new((if writer_role {
+        devres_adapters::rustsec::AdvisoryCorpus::new
+    } else {
+        devres_adapters::rustsec::AdvisoryCorpus::new_reader
+    })(
         retrieval.clone(),
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.rustsec.clone(),
     )?);
-    let npm_corpus = Arc::new(devres_adapters::npm::NpmCorpus::new(
+    let npm_corpus = Arc::new((if writer_role {
+        devres_adapters::npm::NpmCorpus::new
+    } else {
+        devres_adapters::npm::NpmCorpus::new_reader
+    })(
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.npm.clone(),
     )?);
-    npm_corpus.initialize_status().await?;
+    if writer_role {
+        npm_corpus.initialize_status().await?;
+    }
     if npm_rebuild {
         let shutdown = CancellationToken::new();
         let signal = shutdown.clone();
@@ -262,34 +338,79 @@ async fn main() -> Result<(), ServerError> {
         println!("{}", result?);
         return Ok(());
     }
-    let mdn_corpus = Arc::new(devres_adapters::mdn::MdnCorpus::new(
-        store.clone(),
-        broker.clone(),
-        &config.storage.blob_dir,
-        config.mdn.clone(),
-    )?);
-    mdn_corpus.initialize_status().await?;
-    let whatwg_corpus = Arc::new(devres_adapters::whatwg::WhatwgCorpus::new(
-        store.clone(),
-        broker.clone(),
-        &config.storage.blob_dir,
-        config.whatwg.clone(),
-    )?);
-    whatwg_corpus.initialize_status().await?;
-    let w3c_corpus = Arc::new(devres_adapters::w3c::W3cCorpus::new(
-        store.clone(),
-        broker.clone(),
-        &config.storage.blob_dir,
-        config.w3c.clone(),
-    )?);
-    w3c_corpus.initialize_status().await?;
-    let chromium_corpus = Arc::new(devres_adapters::chromium::ChromiumCorpus::new(
+    let mdn_corpus = Arc::new(
+        (if writer_role {
+            devres_adapters::mdn::MdnCorpus::new
+        } else {
+            devres_adapters::mdn::MdnCorpus::new_reader
+        })(
+            store.clone(),
+            broker.clone(),
+            &config.storage.blob_dir,
+            config.mdn.clone(),
+        )?
+        .with_reader_scratch(if writer_role {
+            None
+        } else {
+            config.storage.scratch_dir.as_deref()
+        })?,
+    );
+    if writer_role {
+        mdn_corpus.initialize_status().await?;
+    }
+    let whatwg_corpus = Arc::new(
+        (if writer_role {
+            devres_adapters::whatwg::WhatwgCorpus::new
+        } else {
+            devres_adapters::whatwg::WhatwgCorpus::new_reader
+        })(
+            store.clone(),
+            broker.clone(),
+            &config.storage.blob_dir,
+            config.whatwg.clone(),
+        )?
+        .with_reader_scratch(if writer_role {
+            None
+        } else {
+            config.storage.scratch_dir.as_deref()
+        })?,
+    );
+    if writer_role {
+        whatwg_corpus.initialize_status().await?;
+    }
+    let w3c_corpus = Arc::new(
+        (if writer_role {
+            devres_adapters::w3c::W3cCorpus::new
+        } else {
+            devres_adapters::w3c::W3cCorpus::new_reader
+        })(
+            store.clone(),
+            broker.clone(),
+            &config.storage.blob_dir,
+            config.w3c.clone(),
+        )?
+        .with_reader_scratch(if writer_role {
+            None
+        } else {
+            config.storage.scratch_dir.as_deref()
+        })?,
+    );
+    if writer_role {
+        w3c_corpus.initialize_status().await?;
+    }
+    let chromium_corpus = Arc::new((if writer_role {
+        devres_adapters::chromium::ChromiumCorpus::new
+    } else {
+        devres_adapters::chromium::ChromiumCorpus::new_reader
+    })(
         store.clone(),
         broker.clone(),
         &config.storage.blob_dir,
         config.chromium.clone(),
     )?);
-    chromium_corpus.initialize_status().await?;
+    if writer_role {
+        chromium_corpus.initialize_status().await?;
+    }
     if chromium_rebuild {
         let shutdown = CancellationToken::new();
         let signal = shutdown.clone();
@@ -357,18 +478,20 @@ async fn main() -> Result<(), ServerError> {
     .filter(|(_, enabled)| *enabled)
     .map(|(name, _)| name.to_owned())
     .collect();
-    let attribution = Arc::new(
-        devres_application::attribution_runtime::AttributionRuntime::new(
+    let mut attribution = devres_application::attribution_runtime::AttributionRuntime::new(
+        store.clone(),
+        Arc::new(devres_adapters::AttributionAdapter::new(
+            broker.clone(),
             store.clone(),
-            Arc::new(devres_adapters::AttributionAdapter::new(
-                broker.clone(),
-                store.clone(),
-            )),
-            enabled_attribution,
-        )?,
-    );
+        )),
+        enabled_attribution,
+    )?;
+    if let Some(delegate) = &delegate {
+        attribution = attribution.with_delegate(delegate.clone());
+    }
+    let attribution = Arc::new(attribution);
     let research = Arc::new(
-        devres_adapters::Research::new(retrieval)
+        devres_adapters::Research::new(retrieval.clone())
             .await?
             .with_corpus(corpus.clone())
             .with_crate_corpus(crate_corpus.clone())
@@ -421,132 +544,156 @@ async fn main() -> Result<(), ServerError> {
         println!("{}", corpus.rebuild_index().await?);
         return Ok(());
     }
+    let coordinator = Arc::new(
+        devres_adapters::writer_coordination::WriterCoordinator::new(
+            retrieval,
+            corpus.clone(),
+            crate_corpus.clone(),
+            attribution.clone(),
+        ),
+    );
     let mut registry = server_info_registry(config.source.url.clone())?;
-    registry.register_research(research)?;
+    if !writer_role {
+        registry.register_research(research)?;
+    }
     let mut server = ServerBuilder::new(registry, config.limits, config.source.url);
+    if writer_role {
+        let listener = config
+            .writer_listener
+            .clone()
+            .ok_or("collect requires writer_listener configuration")?;
+        server.register_endpoint(WriterEndpoint {
+            config: listener,
+            coordinator,
+        })?;
+    }
     let recover_archive_worker = store.has_object_archive();
-    server.register_worker("attribution-repair", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            attribution.run(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("rfc-collector", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            corpus.run(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("crate-collector", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            crate_corpus.clone().run(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("npm-collector", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            npm_corpus.run(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    let current = advisory_corpus.clone();
-    server.register_worker("rustsec-current", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            current.run_current(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("rustsec-history", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            advisory_corpus.run_history(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    let mdn_current = mdn_corpus.clone();
-    server.register_worker("mdn-current", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            mdn_current.run_current(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("mdn-history", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            mdn_corpus.run_history(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    let whatwg_current = whatwg_corpus.clone();
-    server.register_worker("whatwg-current", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            whatwg_current.run_current(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("whatwg-history", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            whatwg_corpus.run_history(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    let chromium_current = chromium_corpus.clone();
-    server.register_worker("chromium-current", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            chromium_current.run_current(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("chromium-history", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            chromium_corpus.run_history(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    let w3c_current = w3c_corpus.clone();
-    server.register_worker("w3c-current", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            w3c_current.run_current(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_worker("w3c-history", move |shutdown| async move {
-        storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
-            w3c_corpus.run_history(shutdown)
-        })
-        .await
-        .map_err(Into::into)
-    })?;
-    server.register_endpoint(HttpEndpoint {
-        bind: config.http.bind,
-        access: AccessPolicy {
-            allowed_hosts: config.http.allowed_hosts,
-            allowed_origins: config.http.allowed_origins,
-        },
-        tls: config.http.tls,
-        edge_mtls: config.edge_mtls.clone(),
-    })?;
-    server.register_endpoint(WebTransportEndpoint {
-        bind: config.webtransport.bind,
-        certificate: config.webtransport.certificate,
-        private_key: config.webtransport.private_key,
-        access: AccessPolicy {
-            allowed_hosts: config.webtransport.allowed_hosts,
-            allowed_origins: config.webtransport.allowed_origins,
-        },
-        edge_mtls: config.edge_mtls,
-    })?;
+    if writer_role {
+        server.register_worker("attribution-repair", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                attribution.run(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("rfc-collector", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                corpus.run(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("crate-collector", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                crate_corpus.clone().run(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("npm-collector", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                npm_corpus.run(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        let current = advisory_corpus.clone();
+        server.register_worker("rustsec-current", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                current.run_current(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("rustsec-history", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                advisory_corpus.run_history(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        let mdn_current = mdn_corpus.clone();
+        server.register_worker("mdn-current", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                mdn_current.run_current(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("mdn-history", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                mdn_corpus.run_history(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        let whatwg_current = whatwg_corpus.clone();
+        server.register_worker("whatwg-current", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                whatwg_current.run_current(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("whatwg-history", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                whatwg_corpus.run_history(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        let chromium_current = chromium_corpus.clone();
+        server.register_worker("chromium-current", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                chromium_current.run_current(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("chromium-history", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                chromium_corpus.run_history(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        let w3c_current = w3c_corpus.clone();
+        server.register_worker("w3c-current", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                w3c_current.run_current(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("w3c-history", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
+                w3c_corpus.run_history(shutdown)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+    }
+    if !writer_role {
+        server.register_endpoint(HttpEndpoint {
+            bind: config.http.bind,
+            access: AccessPolicy {
+                allowed_hosts: config.http.allowed_hosts,
+                allowed_origins: config.http.allowed_origins,
+            },
+            tls: config.http.tls,
+            edge_mtls: config.edge_mtls.clone(),
+        })?;
+        server.register_endpoint(WebTransportEndpoint {
+            bind: config.webtransport.bind,
+            certificate: config.webtransport.certificate,
+            private_key: config.webtransport.private_key,
+            access: AccessPolicy {
+                allowed_hosts: config.webtransport.allowed_hosts,
+                allowed_origins: config.webtransport.allowed_origins,
+            },
+            edge_mtls: config.edge_mtls,
+        })?;
+    }
     let storage_ready = Arc::new(AtomicBool::new(true));
     let monitor_ready = storage_ready.clone();
     server.register_worker("storage-ownership", move |shutdown| async move {

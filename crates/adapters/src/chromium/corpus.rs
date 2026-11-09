@@ -144,6 +144,15 @@ fn component(id: &str) -> Result<Component> {
     })
 }
 impl ChromiumCorpus {
+    /// Open published evidence without creating directories or recovering writer stages.
+    pub fn new_reader(
+        store: Arc<dyn ChromiumStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: ChromiumConfig,
+    ) -> Result<Self> {
+        Self::for_verification(store, broker, root, config)
+    }
     /// Construct frozen-graph verification handles without initializing storage.
     pub(crate) fn for_verification(
         store: Arc<dyn ChromiumStore>,

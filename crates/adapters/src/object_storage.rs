@@ -40,6 +40,9 @@ pub struct S3Config {
     pub allow_http: bool,
     pub ca_file: Option<PathBuf>,
     pub cache_max_bytes: u64,
+    /// Explicit placement for new objects; omitted preserves provider defaults.
+    #[serde(default)]
+    pub storage_class: Option<String>,
     pub credentials: S3Credentials,
 }
 
@@ -71,7 +74,13 @@ pub enum S3Credentials {
         #[serde(default)]
         allow_http: bool,
         ca_file: Option<PathBuf>,
+        #[serde(default = "default_refresh_before_secs")]
+        refresh_before_secs: u64,
     },
+}
+
+const fn default_refresh_before_secs() -> u64 {
+    300
 }
 
 fn invalid_config() -> Error {
@@ -140,6 +149,10 @@ impl S3Config {
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
             || !valid_key(&self.prefix)
             || self.cache_max_bytes < 64 * 1024 * 1024
+            || self
+                .storage_class
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "STANDARD" | "ONEZONE_IA"))
         {
             return Err(invalid_config());
         }
@@ -180,9 +193,13 @@ impl S3Config {
                 endpoint,
                 authorization_token_file,
                 allow_http,
+                refresh_before_secs,
                 ..
             } => {
                 endpoint_url(endpoint, *allow_http, true)?;
+                if !(1..=3600).contains(refresh_before_secs) {
+                    return Err(invalid_config());
+                }
                 if let Some(path) = authorization_token_file {
                     valid_secret_path(path)?;
                 }
@@ -348,6 +365,13 @@ struct ExplicitCredentials {
     source: S3Credentials,
     region: String,
     identity_client: Option<reqwest::Client>,
+    container_cache: std::sync::Arc<ContainerCache>,
+}
+
+#[derive(Default)]
+struct ContainerCache {
+    value: std::sync::Mutex<Option<Credentials>>,
+    refresh: tokio::sync::Mutex<()>,
 }
 impl std::fmt::Debug for ExplicitCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -360,9 +384,8 @@ impl ProvideCredentials for ExplicitCredentials {
         Self: 'a,
     {
         CredentialsFuture::new(async move {
-            tokio::time::timeout(Duration::from_secs(15), self.load())
+            self.cached_load()
                 .await
-                .map_err(|_| CredentialsError::provider_error("Storage credentials unavailable."))?
                 .map_err(|_| CredentialsError::provider_error("Storage credentials unavailable."))
         })
     }
@@ -373,11 +396,98 @@ impl ProvideCredentials for ExplicitCredentials {
 struct ContainerCredentials {
     access_key_id: String,
     secret_access_key: String,
-    token: String,
+    token: Option<String>,
     expiration: String,
 }
 
 impl ExplicitCredentials {
+    async fn cached_load(&self) -> Result<Credentials> {
+        self.cached_load_until(tokio::time::Instant::now() + Duration::from_secs(15))
+            .await
+    }
+
+    async fn cached_load_until(&self, deadline: tokio::time::Instant) -> Result<Credentials> {
+        let S3Credentials::Container {
+            refresh_before_secs,
+            ..
+        } = self.source
+        else {
+            return tokio::time::timeout_at(deadline, self.load())
+                .await
+                .map_err(|_| unavailable())?;
+        };
+        let cached = self.cached_value()?;
+        if let Some(value) = cached.as_ref()
+            && value.expiry().is_some_and(|expiry| {
+                expiry > std::time::SystemTime::now() + Duration::from_secs(refresh_before_secs)
+            })
+        {
+            return Ok(value.clone());
+        }
+        // A concurrent signer can keep using the valid current key while another
+        // signer refreshes it. No async network wait holds the value mutex.
+        let _refresh = match self.container_cache.refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                if let Some(value) = cached.as_ref()
+                    && usable(value, 5)
+                {
+                    return Ok(value.clone());
+                }
+                tokio::time::timeout_at(deadline, self.container_cache.refresh.lock())
+                    .await
+                    .map_err(|_| unavailable())?
+            }
+        };
+        let cached = self.cached_value()?;
+        if let Some(value) = cached.as_ref()
+            && usable(value, refresh_before_secs)
+        {
+            return Ok(value.clone());
+        }
+        // Health checks have a five-second total budget. A still-valid key must
+        // remain usable when identity resolution hangs, so refresh gets two
+        // seconds and leaves the rest of that budget for the actual S3 request.
+        let deadline = if cached.as_ref().is_some_and(|value| usable(value, 5)) {
+            deadline.min(tokio::time::Instant::now() + Duration::from_secs(2))
+        } else {
+            deadline
+        };
+        // Timeouts enter the same fallback path as other refresh failures. The
+        // cache guard stays owned until that decision, then releases on return.
+        match tokio::time::timeout_at(deadline, self.load())
+            .await
+            .unwrap_or_else(|_| Err(unavailable()))
+        {
+            Ok(value) => {
+                *self
+                    .container_cache
+                    .value
+                    .lock()
+                    .map_err(|_| unavailable())? = Some(value.clone());
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(value) = cached.as_ref()
+                    && value.expiry().is_some_and(|expiry| {
+                        expiry > std::time::SystemTime::now() + Duration::from_secs(5)
+                    })
+                {
+                    return Ok(value.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn cached_value(&self) -> Result<Option<Credentials>> {
+        self.container_cache
+            .value
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| unavailable())
+    }
+
     async fn load(&self) -> Result<Credentials> {
         match &self.source {
             S3Credentials::Files {
@@ -468,9 +578,12 @@ impl ExplicitCredentials {
                 }
                 let value: ContainerCredentials =
                     serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
-                if [&value.access_key_id, &value.secret_access_key, &value.token]
+                if [&value.access_key_id, &value.secret_access_key]
                     .iter()
                     .any(|value| value.is_empty() || value.chars().any(char::is_control))
+                    || value.token.as_ref().is_some_and(|value| {
+                        value.is_empty() || value.chars().any(char::is_control)
+                    })
                 {
                     return Err(unavailable());
                 }
@@ -485,13 +598,19 @@ impl ExplicitCredentials {
                 Ok(Credentials::new(
                     value.access_key_id,
                     value.secret_access_key,
-                    Some(value.token),
+                    value.token,
                     Some(expiration),
                     "explicit-container",
                 ))
             }
         }
     }
+}
+
+fn usable(value: &Credentials, margin_secs: u64) -> bool {
+    value.expiry().is_some_and(|expiry| {
+        expiry > std::time::SystemTime::now() + Duration::from_secs(margin_secs)
+    })
 }
 
 fn validate_expiration(expiration: std::time::SystemTime) -> Result<()> {
@@ -534,7 +653,9 @@ impl S3Archive {
             source: config.credentials.clone(),
             region: config.region.clone(),
             identity_client,
+            container_cache: Default::default(),
         };
+        let container_identity = matches!(&config.credentials, S3Credentials::Container { .. });
         let builder = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(config.region.clone()))
@@ -552,6 +673,13 @@ impl S3Archive {
                 &destination,
             ))
             .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3));
+        // Container refresh is owned by ExplicitCredentials so the SDK cannot
+        // cache past the configured refresh margin (which would hide rotation).
+        let builder = if container_identity {
+            builder.identity_cache(aws_sdk_s3::config::IdentityCache::no_cache())
+        } else {
+            builder
+        };
         let client = aws_sdk_s3::Client::from_conf(builder.build());
         Ok(Self { client, config })
     }
@@ -574,7 +702,12 @@ impl S3Archive {
     pub async fn health(&self) -> Result<()> {
         tokio::time::timeout(
             Duration::from_secs(5),
-            self.client.head_bucket().bucket(&self.config.bucket).send(),
+            self.client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(format!("{}/", self.config.prefix))
+                .max_keys(1)
+                .send(),
         )
         .await
         .map_err(|_| unavailable())?
@@ -767,6 +900,12 @@ impl S3Archive {
                     .client
                     .put_object()
                     .bucket(&self.config.bucket)
+                    .set_storage_class(
+                        self.config
+                            .storage_class
+                            .as_deref()
+                            .map(aws_sdk_s3::types::StorageClass::from),
+                    )
                     .key(self.key(key)?)
                     .if_none_match("*")
                     .content_length(bytes.len() as i64)
@@ -833,6 +972,12 @@ impl S3Archive {
                         .client
                         .put_object()
                         .bucket(&self.config.bucket)
+                        .set_storage_class(
+                            self.config
+                                .storage_class
+                                .as_deref()
+                                .map(aws_sdk_s3::types::StorageClass::from),
+                        )
                         .key(self.key(key)?)
                         .if_none_match("*")
                         .content_length(bytes as i64)
@@ -866,6 +1011,12 @@ impl S3Archive {
             .client
             .create_multipart_upload()
             .bucket(&self.config.bucket)
+            .set_storage_class(
+                self.config
+                    .storage_class
+                    .as_deref()
+                    .map(aws_sdk_s3::types::StorageClass::from),
+            )
             .key(&remote_key)
             .send()
             .await

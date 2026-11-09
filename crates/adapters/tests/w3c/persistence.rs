@@ -278,7 +278,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
             .fetch_one(&inspection)
             .await
             .expect("schema"),
-        11
+        13
     );
     // Recognized opaque acceptance evidence can migrate without invented provider graph variants.
     // Exercise the actual version-six migration branch with retained older-provider evidence.
@@ -369,7 +369,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
             .fetch_one(&inspection)
             .await
             .expect("upgraded schema"),
-        11
+        13
     );
     assert_eq!(
         store

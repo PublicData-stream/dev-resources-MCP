@@ -130,6 +130,40 @@ pub struct CrateCorpus {
     cursor: AtomicUsize,
 }
 impl CrateCorpus {
+    /// Reader handles bind immutable paths without initialization or quota mutation.
+    pub fn new_reader(
+        store: Arc<dyn CrateCorpusStore>,
+        retrieval: Arc<Retrieval>,
+        broker: Arc<BulkBroker>,
+        root: impl AsRef<Path>,
+        config: CrateConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let root = root.as_ref().to_owned();
+        let workers = config.max_processing_workers;
+        Ok(Self {
+            store,
+            retrieval,
+            broker,
+            artifacts: Arc::new(BulkArtifactStore::for_verification(
+                &root,
+                config.min_free_bytes,
+            )?),
+            git: Arc::new(GitRegistry::for_reader(
+                root.join("crate-git"),
+                config.max_git_bytes,
+            )?),
+            root,
+            config,
+            state: Mutex::new(json!({})),
+            publication: Mutex::new(()),
+            running: Mutex::new(()),
+            last_publication: AtomicI64::new(0),
+            parsers: Arc::new(Semaphore::new(workers)),
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
     pub fn new(
         store: Arc<dyn CrateCorpusStore>,
         retrieval: Arc<Retrieval>,
@@ -175,6 +209,11 @@ impl CrateCorpus {
         self.artifacts.clone()
     }
     pub async fn status(&self) -> Result<Value> {
+        if let Some(delegate) = self.retrieval.delegate() {
+            return delegate
+                .source_status(devres_application::acquisition::SourceStatus::Crates)
+                .await;
+        }
         let mut status = self.store.status().await?;
         status["collection_enabled"] = json!(self.config.enabled);
         status["collector"] = self.state.lock().await.clone();

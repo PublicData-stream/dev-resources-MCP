@@ -1,7 +1,9 @@
 # Configuration
 
-The server takes exactly one operator-controlled TOML path. `refresh-advisories`
-followed by that path runs private maintenance without starting listeners. Unknown
+Run `devres-server serve CONFIG.toml` and `devres-server collect CONFIG.toml` as
+separate serving and writer workloads. The old `devres-server CONFIG.toml`
+invocation aliases serving only. Each takes one operator-controlled TOML path.
+`refresh-advisories` followed by that path runs private maintenance without starting listeners. Unknown
 fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
@@ -20,7 +22,8 @@ and certificate paths appropriate to the harness; supply your own for hosting.
 | `webtransport.allowed_hosts`, `webtransport.allowed_origins` | Independent authority/origin allowlists |
 | `health.bind` | Private plaintext health/metrics socket |
 | `storage.database_url` | PostgreSQL connection string; treat as a secret |
-| `storage.blob_dir` | Exclusively owned archive directory; disposable local working/cache directory when S3 is selected |
+| `storage.blob_dir` | Permanent archive root for filesystem (read-only in serving, writer-owned in collection); private disposable cache per pod for S3 |
+| `storage.scratch_dir` | Required writable serving scratch root, separate from and outside `blob_dir` |
 | `storage.backend` | `filesystem` by default; optional `s3` backend |
 | `edge_mtls.client_ca_file` | CA for authenticated backend edge clients |
 | `edge_mtls.required_client_dns_san` | Exact DNS SAN required on the edge client certificate |
@@ -217,9 +220,10 @@ member count at 20,000, and selected file content at 4 MiB, with a parsing deadl
 Text output remains paged to 32 KiB. Supplied lockfiles cap at 1 MiB and 10,000
 packages. These are explicit rejection boundaries, not silent truncation rules.
 
-Run one serving replica. Use Recreate updates and stop all writers before backup
-or restore. A dedicated database ownership fence prevents a second server; lost
-ownership requires restart. Size storage for permanent history and retain at least
+Run serving separately from the single writer replica. Use Recreate writer updates
+and stop both readers and writer before backup or restore. Dedicated database
+fences prevent a second writer and exclude maintenance while readers remain;
+lost lifecycle or writer ownership requires restart. Size storage for permanent history and retain at least
 64 MiB of free blob headroom. See [Operations](operations.md).
 
 ## MDN defaults
@@ -426,8 +430,9 @@ and derived indexes. Schema 9 and processing/privacy limits are described in
 Existing configurations retain filesystem storage. To store all permanent bodies,
 bulk artifacts, retained Git evidence, integrity descriptors, and frozen search
 files remotely, select `storage.backend = "s3"` and supply `[storage.s3]`.
-PostgreSQL remains required. The server still has one owner/replica and uses
-Recreate updates. Public tool schemas, capture identities, freshness, source
+PostgreSQL remains required. One writer owns durable publication; serving runs
+separately with SELECT-only database access and read-only archive credentials.
+Use Recreate updates for the writer. Public tool schemas, capture identities, freshness, source
 budgets, licensing, and request-only audit privacy are unchanged.
 
 ```toml
@@ -456,7 +461,10 @@ secret_key_file = "/run/secrets/s3-secret-key"
 Endpoint, bucket, region, prefix, cache capacity, and credential mode are required.
 The prefix is exclusive to this database; accidental rebinding fails closed.
 Path-style addressing defaults to true, plain HTTP defaults to false, and cache
-capacity must be at least 64 MiB. Production endpoints should use TLS; a custom
+capacity must be at least 64 MiB. Optional `storage_class` accepts `STANDARD` or
+`ONEZONE_IA`; omission retains provider defaults. It applies to new single-object
+and multipart creation only, never converts existing objects, and has no class
+fallback. Production endpoints should use TLS; a custom
 CA file adds trust without disabling verification. Plain HTTP requires an explicit
 opt-in for the individual controlled private endpoint. URLs reject userinfo,
 queries, fragments and redirects. Endpoints and secret paths are operator-only
@@ -465,7 +473,10 @@ settings, never public request parameters. Unknown fields fail configuration.
 Choose exactly one credential mode. `files` uses the paths above. `oidc` uses
 `token_file`, `role_arn`, `session_name`, and `sts_endpoint` to exchange a projected
 service-account token. `container` uses `endpoint` and optional
-`authorization_token_file`. Both identity modes support their own optional
+`authorization_token_file`, plus `refresh_before_secs` (default 300, range
+1..3600). Container credentials may omit `Token` for expiring provider IAM keys;
+expiry is still required. The mounted authorization value is sent verbatim.
+Both identity modes support their own optional
 `ca_file` and `allow_http` settings. Temporary credentials refresh; failures never
 fall through to profiles, instance metadata, external credential commands, or
 another identity source. Keep secret values out of TOML and process arguments.
@@ -499,3 +510,42 @@ existing filesystem database requires explicit offline transfer even if its
 capture table or the selected local directory is empty; selecting a new directory
 cannot bypass retained provider data. After cutover, use a separate disposable
 cache directory; the migrated source directory is protected from cache eviction.
+
+
+## Split runtime and credential broker
+
+The split is required for both filesystem and S3. `serve` requires `[writer_client]`
+with an explicit HTTPS `/v1/acquire` `endpoint`, absolute `token_file`, and optional
+`ca_file`. `collect` requires `[writer_listener]` with `bind`, TLS `certificate` and
+`private_key`, `allowed_clients` namespace/service-account pairs, and `[writer_listener.auth]`
+Kubernetes API/token/CA/audience settings. The writer exposes private acquisition
+and health only; serving owns public MCP and request-only audit computation.
+Public selectors, freshness, result limits, and capture-fixed reads are unchanged.
+
+Serving uses SELECT-only PostgreSQL credentials, has no writer-owner lock, and
+runs no migration, stage recovery, or collectors. The sole writer initializes and
+publishes schema 13 for either backend. Existing configuration values and backend
+defaults remain; operators must add the role-specific client/listener/scratch
+settings and deploy both processes. See the [operator templates](../deploy/examples/scaleway-credential-broker/README.md).
+
+`devres-credential-broker BROKER.toml` serves private HTTPS `/v1/credentials` and
+`/healthz`. It maps verified live pod identity to operator profiles; requests cannot
+choose role or object scope. Profiles bind namespace/service account, Scaleway
+application/project, bucket/prefix, `readonly` or `readwrite`, and admitted policy
+digest. Scaleway mode issues expiring IAM API keys, rather than an AWS STS session.
+The existing `container` source consumes their key pair and expiry. No broker
+identity or credential API is a public MCP tool or edge route.
+
+Defaults are `ttl_secs=900`, `refresh_before_secs=300`, `max_pods=16`,
+`max_issued_keys=32`, and `quota_reserve=8`. The config names only mounted secret
+paths for issuer secret, encryption keyring, and a dedicated per-cluster broker
+database URL. The broker pins the trusted API's `kube-system` namespace UID in that
+journal; cross-cluster reuse and nonempty unbound journals fail closed. Its RBAC
+requires GET for that one Namespace in addition to TokenReview and live identity
+reads. Project broker-audience tokens for 3600 seconds to support the default
+900-second leases, which are capped at JWT expiry minus five seconds.
+An unexpired operator acceptance receipt binds issuer identity and secret fingerprint, exact profiles,
+TTL, quota, expiry acceptance, and negative privilege tests. Fixture receipts
+cannot authorize production mode. Native cluster Secret encryption is a deployment
+prerequisite in addition to authenticated journal encryption. Full configuration,
+policy templates, receipt bootstrap, and rotation are documented with the examples.

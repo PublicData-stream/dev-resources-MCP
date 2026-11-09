@@ -301,3 +301,73 @@ async fn immutable_notice_pages_do_not_repeat_unbounded_generation_payloads() {
             .is_ok()
     );
 }
+
+struct PublicSchedulingDelegate(AtomicUsize);
+#[async_trait]
+impl crate::acquisition::AcquisitionDelegate for PublicSchedulingDelegate {
+    async fn attribution_status(&self) -> Result<Value> {
+        Ok(
+            json!({"scan_gaps":{"mdn":"capacity"},"complete":false,"repair_complete_for_enqueued_targets":false}),
+        )
+    }
+
+    async fn acquire(&self, _: crate::acquisition::Acquisition) -> Result<devres_domain::Capture> {
+        Err(Error::integrity("Unexpected acquisition."))
+    }
+    async fn effect(&self, effect: crate::acquisition::WriterEffect) -> Result<()> {
+        match effect {
+            crate::acquisition::WriterEffect::AttributionEnqueue { target: queued } => {
+                assert_eq!(queued, target())
+            }
+            _ => panic!("Unexpected source effect"),
+        }
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn reader_schedules_public_notices_through_writer_but_audit_never_crosses_processes() {
+    let store = Arc::new(Memory::default());
+    let acquirer = Arc::new(Acquirer {
+        calls: AtomicUsize::new(0),
+        stalled: false,
+    });
+    let delegate = Arc::new(PublicSchedulingDelegate(AtomicUsize::new(0)));
+    let reader = runtime(store.clone(), acquirer.clone(), true).with_delegate(delegate.clone());
+    assert_eq!(
+        reader
+            .qualify("audit:mdn", &json!({"snapshot":"public-snapshot"}))
+            .await
+            .unwrap_err()
+            .code,
+        "unavailable"
+    );
+    assert_eq!(delegate.0.load(Ordering::SeqCst), 0);
+    assert!(store.queued.lock().await.is_empty());
+    assert_eq!(
+        reader
+            .qualify("mdn", &json!({"snapshot":"public-snapshot"}))
+            .await
+            .unwrap_err()
+            .code,
+        "unavailable"
+    );
+    assert_eq!(delegate.0.load(Ordering::SeqCst), 1);
+    assert!(store.queued.lock().await.is_empty());
+    assert_eq!(acquirer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reader_status_reports_writer_scan_gaps_instead_of_empty_local_state() {
+    let store = Arc::new(Memory::default());
+    let acquirer = Arc::new(Acquirer {
+        calls: AtomicUsize::new(0),
+        stalled: false,
+    });
+    let delegate = Arc::new(PublicSchedulingDelegate(AtomicUsize::new(0)));
+    let reader = runtime(store, acquirer, true).with_delegate(delegate);
+    let status = reader.status().await.unwrap();
+    assert_eq!(status["scan_gaps"]["mdn"], "capacity");
+    assert_eq!(status["complete"], false);
+    assert_eq!(status["repair_complete_for_enqueued_targets"], false);
+}

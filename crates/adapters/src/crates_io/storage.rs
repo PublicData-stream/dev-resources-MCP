@@ -88,6 +88,7 @@ impl PgBlobStore {
 #[async_trait]
 impl CrateCorpusStore for PgBlobStore {
     async fn begin_inventory(&self, revision: &str, now: i64) -> Result<Inventory> {
+        self.owner_fence().await?;
         if revision.len() != 40
             || !revision
                 .bytes()
@@ -143,6 +144,7 @@ impl CrateCorpusStore for PgBlobStore {
         versions: &[VersionRecord],
         cursor: &str,
     ) -> Result<()> {
+        self.owner_fence().await?;
         checked_id(epoch)?;
         crate::crates_io::packages::validate_name(name)?;
         if cursor.len() > 256
@@ -213,6 +215,7 @@ impl CrateCorpusStore for PgBlobStore {
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn commit_inventory(&self, epoch: &str, manifest: &str) -> Result<Inventory> {
+        self.owner_fence().await?;
         checked_id(epoch)?;
         checked_id(manifest)?;
         let mut owner = self.owner.lock().await;
@@ -296,6 +299,7 @@ impl CrateCorpusStore for PgBlobStore {
         Ok(inv)
     }
     async fn stage_gap(&self, epoch: &str, name: &str, error: &str, cursor: &str) -> Result<()> {
+        self.owner_fence().await?;
         if !matches!(
             error,
             "invalid_input" | "integrity" | "capacity" | "unsupported_format"
@@ -353,6 +357,7 @@ impl CrateCorpusStore for PgBlobStore {
             .collect()
     }
     async fn save_artifact(&self, artifact: &Artifact, http: bool) -> Result<()> {
+        self.owner_fence().await?;
         let c = &artifact.capture;
         checked_id(&c.id)?;
         checked_id(&c.body_hash)?;
@@ -482,6 +487,7 @@ impl CrateCorpusStore for PgBlobStore {
         body: &[u8],
         now: i64,
     ) -> Result<Capture> {
+        self.owner_fence().await?;
         if crate::crates_io::packages::sparse_path(name)? != path
             || revision.len() != 40
             || oid.len() != 40
@@ -503,6 +509,7 @@ impl CrateCorpusStore for PgBlobStore {
         provenance: Value,
         now: i64,
     ) -> Result<Capture> {
+        self.owner_fence().await?;
         if !key.starts_with("cargo:derived:") || text.len() > 4 * 1024 * 1024 || text.contains('\0')
         {
             return Err(Error::invalid("Invalid derived public text."));
@@ -511,6 +518,7 @@ impl CrateCorpusStore for PgBlobStore {
             .await
     }
     async fn schedule(&self, jobs: &[CollectionJob], due: i64) -> Result<()> {
+        self.owner_fence().await?;
         if jobs.len() > 1000 {
             return Err(Error::capacity("Collection batch exceeds 1000 jobs."));
         }
@@ -532,6 +540,7 @@ impl CrateCorpusStore for PgBlobStore {
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn recover_interrupted_jobs(&self) -> Result<()> {
+        self.owner_fence().await?;
         // Recovery needs PostgreSQL ownership, not a healthy archive endpoint. It must also
         // finish before the replacement collector can claim anything.
         self.check_ownership().await?;
@@ -544,6 +553,7 @@ impl CrateCorpusStore for PgBlobStore {
         Ok(())
     }
     async fn claim(&self, now: i64, kind: &str) -> Result<Option<CollectionJob>> {
+        self.owner_fence().await?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let row=sqlx::query("UPDATE devres_crate_jobs SET state='running',attempts=attempts+1 WHERE source_key=(SELECT source_key FROM devres_crate_jobs WHERE kind=$2 AND state<>'running' AND due_at<=$1 AND attempts<4294967295 ORDER BY due_at,source_key FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *").bind(now).bind(kind).fetch_optional(&mut *owner).await.map_err(|_|storage_error())?;
@@ -573,6 +583,7 @@ impl CrateCorpusStore for PgBlobStore {
         error: Option<&str>,
         next: i64,
     ) -> Result<()> {
+        self.owner_fence().await?;
         if error.is_some_and(|e| {
             !matches!(
                 e,
@@ -595,6 +606,7 @@ impl CrateCorpusStore for PgBlobStore {
         Ok(())
     }
     async fn stage_content(&self, generation: &str, records: &[ContentRecord]) -> Result<()> {
+        self.owner_fence().await?;
         checked_id(generation)?;
         self.fence().await?;
         if !generation.starts_with("blake3:") {
@@ -730,6 +742,7 @@ impl CrateCorpusStore for PgBlobStore {
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn commit_content(&self, generation: &str, summary: Value) -> Result<()> {
+        self.owner_fence().await?;
         checked_id(generation)?;
         self.fence().await?;
         let summary = json_limit(&summary, 1024 * 1024)?;
@@ -844,6 +857,7 @@ impl CrateCorpusStore for PgBlobStore {
         kind: &str,
         rows: &[(String, Value)],
     ) -> Result<()> {
+        self.owner_fence().await?;
         checked_id(artifact)?;
         if rows.len() > 1000
             || !matches!(
@@ -992,6 +1006,7 @@ impl CrateCorpusStore for PgBlobStore {
             .collect()
     }
     async fn commit_enrichment(&self, artifact: &str) -> Result<()> {
+        self.owner_fence().await?;
         checked_id(artifact)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
@@ -1064,6 +1079,7 @@ impl CrateCorpusStore for PgBlobStore {
         Ok(result)
     }
     async fn prepare_snapshot(&self, epoch: &str, now: i64) -> Result<Snapshot> {
+        self.owner_fence().await?;
         checked_id(epoch)?;
         let index_manifest = Value::Null;
         let mut owner = self.owner.lock().await;
@@ -1124,6 +1140,7 @@ impl CrateCorpusStore for PgBlobStore {
         Ok(snapshot)
     }
     async fn commit_snapshot(&self, mut snapshot: Snapshot) -> Result<Snapshot> {
+        self.owner_fence().await?;
         checked_id(&snapshot.inventory.id)?;
         json_limit(&snapshot.index_manifest, 2 * 1024 * 1024)?;
         if !snapshot.index_manifest.is_null()
@@ -1162,6 +1179,7 @@ impl CrateCorpusStore for PgBlobStore {
         index_manifest: Value,
         now: i64,
     ) -> Result<Snapshot> {
+        self.owner_fence().await?;
         let mut snapshot = self.prepare_snapshot(epoch, now).await?;
         snapshot.index_manifest = index_manifest;
         self.commit_snapshot(snapshot).await

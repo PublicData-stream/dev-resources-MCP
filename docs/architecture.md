@@ -35,9 +35,10 @@ I/O is outside database transactions and application bookkeeping locks. Canceled
 owners release their work; request retrieval has no detached refreshes. A waiter can
 become the next owner. The HTTPS adapter alone owns bounded retry and throttling.
 
-The store takes a PostgreSQL session advisory lock at startup and rejects a second
-serving owner. The owner connection never reconnects; losing ownership fails storage
-operations until restart. Deployment must use one replica and Recreate updates.
+The writer takes a PostgreSQL session advisory lock at startup and rejects a second
+writer owner. Readers hold separate shared lifecycle sessions and SELECT-only
+connections. Dedicated sessions never reconnect; losing one fails its participant
+until restart. Use one writer replica with Recreate updates and separate serving.
 PostgreSQL stores immutable representation records, mutable source heads, and
 append-only successful-fetch/revalidation observations. Schema version 2 adds
 owner-fenced RFC datasets, resumable jobs, import observations and research snapshot
@@ -85,9 +86,10 @@ archive capture; checksum verification precedes archive parsing.
 
 ## BLAKE3 enforcement and schema 10
 
-Fresh stores initialize with enforced BLAKE3 and schema 11. Schemas 1–9 require explicit
+Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 13. Schemas 1–9 require explicit
 private offline migration; serving rejects pre-10 schemas or pending migration.
-The maintenance path acquires the same exclusive owner fence before any provider
+The maintenance path first excludes readers and writer with the lifecycle fence,
+then acquires the exclusive writer fence before any provider
 workers or listeners start. It makes no upstream requests and never executes
 inspected package code.
 
@@ -436,11 +438,12 @@ after eviction. Default selection and freshness are checked through owner-fenced
 storage for every request; verification handles bypass the cache.
 
 
-## Optional S3 archive and schema 12
+## Optional S3 archive and schema 13
 
-Filesystem publication retains the existing fsync/hardlink contract. Opting into
-S3 expands schema 11 to schema 12; filesystem-only stores keep their existing
-schema/defaults. The adapter-owned durable archive mediates permanent file
+Filesystem publication retains the existing fsync/hardlink contract.
+The archive layout introduced in schema 12 retains its immutable format. Schema 13
+marks the required reader/writer topology for both backends; filesystem remains
+the default. The adapter-owned durable archive mediates permanent file
 publication and leased local materialization; application/domain ports remain free
 of transport-specific types. PostgreSQL remains authoritative for metadata,
 ordering, ownership and immutable logical file bindings. A process-local root
@@ -478,3 +481,45 @@ supervision. Replacement attempts retain the same provider budgets and checkpoin
 Crate groups fully drain their owned tasks before owner-fenced interrupted-claim
 recovery; fatal processing errors still stop supervision. The independent database
 ownership monitor remains authoritative for required process restart.
+
+
+## Reader, writer, and credential boundaries
+
+Serving has a SELECT-only connection pool and its own non-reconnecting lifecycle
+session. It does not acquire the exclusive writer-owner lock. Normal readers and
+the sole writer share a lifecycle advisory lock; maintenance requires its exclusive
+form before the writer lock. Losing either dedicated session is fatal to its
+participant even if a connection pool reconnects. Schema 13 rejects older combined
+binaries. Reader admission checks active integrity policy, committed backend and
+absence of pending restore without migrations or startup writes.
+
+Filesystem readers share an archive mounted read-only and put scratch outside it.
+S3 readers attach by verifying the existing store descriptor and backend epoch;
+they neither PUT the descriptor nor recover uploads. Each pod owns a disposable
+cache with local leases and accounting. Writer-only publication retains existing
+intent, conditional write, integrity, quota and immutable-history rules. Credential
+CRUD authority does not enable permanent deletion in application code.
+
+Typed private HTTPS operations delegate public source acquisition, RFC errata
+bootstrap, and public attribution enqueueing to the writer. The writer reconstructs
+trusted source URLs, limits and validators and returns committed identities.
+Reader-side parsing and immutable selection continue to use local read ports.
+No arbitrary fetch URL, SQL, publication bytes, or whole-tool proxy crosses this
+interface. Request-only audits never cross it, including matched advisory subsets
+or audit-derived attribution repairs.
+
+The separate credential broker authenticates audience-scoped projected tokens with
+TokenReview and live pod/ServiceAccount UID checks. Fixed profiles select provider
+applications; distinct pod-bound issuance journals prevent key sharing between
+pods. Returned S3 keys are bearer credentials until expiry/revocation. Scaleway's
+adapter creates expiring IAM keys; the generic AWS OIDC mode remains separate.
+An operator receipt gates provider confinement and TTL acceptance; local policy
+mapping alone cannot prove provider enforcement.
+
+The broker has a dedicated PostgreSQL database, a non-reconnecting singleton
+session, bounded issuance/revocation records, and authenticated AES-256-GCM
+ciphertexts bound to row and identity. Its secrets/journal never enter public
+corpus backups or S3 captures. Native Kubernetes Secret encryption protects mounted
+issuer/keyring material at rest; application envelope encryption is an additional
+boundary, not a replacement. Missing keys, uncertain issuance, invalid receipts,
+provider errors, or expired identity fail closed.

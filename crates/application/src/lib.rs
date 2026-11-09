@@ -1,4 +1,5 @@
 //! Retrieval policy shared by every transport and research operation.
+pub mod acquisition;
 pub mod advisory;
 pub mod attribution;
 pub mod attribution_gate;
@@ -59,6 +60,9 @@ pub trait Fetcher: Send + Sync {
 /// Ownership permits bounded blocking validation without duplicating large bodies.
 #[async_trait]
 pub trait ResponseValidator: Send + Sync {
+    fn acquisition(&self, _request: &FetchRequest) -> Result<Option<acquisition::Acquisition>> {
+        Ok(None)
+    }
     async fn validate(
         &self,
         request: &FetchRequest,
@@ -85,6 +89,7 @@ pub struct Retrieval {
     keys: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     negatives: Mutex<HashMap<String, i64>>,
     foreground: AtomicUsize,
+    delegate: Option<Arc<dyn acquisition::AcquisitionDelegate>>,
 }
 impl Retrieval {
     pub fn new(store: Arc<dyn Store>, fetcher: Arc<dyn Fetcher>) -> Self {
@@ -103,7 +108,15 @@ impl Retrieval {
             keys: Mutex::new(HashMap::new()),
             negatives: Mutex::new(HashMap::new()),
             foreground: AtomicUsize::new(0),
+            delegate: None,
         }
+    }
+    pub fn with_delegate(mut self, delegate: Arc<dyn acquisition::AcquisitionDelegate>) -> Self {
+        self.delegate = Some(delegate);
+        self
+    }
+    pub fn delegate(&self) -> Option<&Arc<dyn acquisition::AcquisitionDelegate>> {
+        self.delegate.as_ref()
     }
     pub async fn read_capture(&self, id: &str) -> Result<StoredCapture> {
         if !devres_domain::valid_content_id(id) {
@@ -190,6 +203,44 @@ impl Retrieval {
         background: bool,
         allow_stale: bool,
     ) -> Result<StoredCapture> {
+        if let Some(delegate) = &self.delegate {
+            if background {
+                return Err(Error::integrity("Reader cannot run collection."));
+            }
+            let operation = match validator {
+                Some(validator) => validator.acquisition(&request)?,
+                None => {
+                    if request.key == "rustsec:head" {
+                        Some(acquisition::Acquisition::RustsecHead {
+                            force: request.ttl_secs == 0,
+                        })
+                    } else {
+                        request.key.strip_prefix("rustsec:bundle:").map(|revision| {
+                            acquisition::Acquisition::RustsecBundle {
+                                revision: revision.into(),
+                            }
+                        })
+                    }
+                }
+            }
+            .ok_or_else(|| Error::integrity("Acquisition requires a trusted source descriptor."))?;
+            let receipt = delegate.acquire(operation).await?;
+            let stored = self.read_capture(&receipt.id).await?;
+            if stored.capture.key != request.key
+                || stored.capture.source_url != request.url
+                || stored.capture.body_hash != receipt.body_hash
+                || stored.capture.validated_at < receipt.validated_at
+                || stored.body.len() > request.max_bytes
+            {
+                return Err(Error::integrity(
+                    "Writer capture receipt does not match acquisition.",
+                ));
+            }
+            return Ok(StoredCapture {
+                capture: receipt,
+                body: stored.body,
+            });
+        }
         struct Foreground<'a>(Option<&'a AtomicUsize>);
         impl Drop for Foreground<'_> {
             fn drop(&mut self) {
@@ -528,3 +579,6 @@ mod tests {
         assert!(!retrieval.foreground_active());
     }
 }
+
+#[cfg(test)]
+mod acquisition_tests;

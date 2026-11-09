@@ -129,6 +129,28 @@ impl Drop for CommitOrderStage {
     }
 }
 impl AdvisoryHistory {
+    pub(crate) fn for_reader(
+        store: Arc<dyn AdvisoryStore>,
+        broker: Arc<BulkBroker>,
+        root: &Path,
+        config: RustSecConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let root = root.join("rustsec-history");
+        Ok(Self {
+            store,
+            broker,
+            artifacts: Arc::new(BulkArtifactStore::for_verification(
+                root.join("artifacts"),
+                config.min_free_bytes,
+            )?),
+            root,
+            config,
+            gate: Mutex::new(()),
+            restored: Mutex::new(None),
+        })
+    }
+
     pub fn new(
         store: Arc<dyn AdvisoryStore>,
         broker: Arc<BulkBroker>,
