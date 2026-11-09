@@ -154,8 +154,14 @@ old key. Do not discard unresolved issuance/revocation records to free quota.
 Default sessions last 900 seconds and refresh 300 seconds early. Kubernetes token
 validity, provider expiry, current identity, and profile still constrain issuance.
 The broker caps pod count and issued/unresolved keys, journals issuance intent
-before calling IAM, and reconciles uncertainty before another issuance. A failed
-refresh never falls back to a long-lived key. Pod/profile removal triggers bounded
+before calling IAM, and reconciles uncertainty before another issuance. An uncertain create
+with negative provider listing stays fenced until the requested key expiry plus
+60 seconds, unless later reconciliation resolves it. For a 900-second requested
+lease, that expiry-based boundary is 960 seconds after the attempt; provider
+failures can prolong recovery. Confirm an authoritative archive
+read after recovery; broker or routing readiness alone does not establish per-pod
+credential recovery.
+A failed refresh never falls back to a long-lived key. Pod/profile removal triggers bounded
 revocation maintenance; provider errors remain explicit and expiry remains the
 outer limit rather than a claim of instantaneous revocation.
 

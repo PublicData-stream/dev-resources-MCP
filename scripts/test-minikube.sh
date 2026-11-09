@@ -409,7 +409,66 @@ seeded_webtransport() {
 }
 s3_capture_state() {
   k exec -i deployment/backend -- python3 - "$capture" "$1" <<'PYS3CAPTURE'
-import http.client, json, runpy, socket, sys, types
+import http.client, re, runpy, socket, sys, time, types, urllib.error, urllib.request
+def capture_state(client, capture, expected, clock=time.monotonic, sleep=time.sleep, deadline_secs=180, ready=None):
+    assert expected in ("healthy", "unavailable", "recover"), "unknown capture state"
+    deadline = clock() + deadline_secs if expected == "recover" else None
+    uri = "devres://capture/" + capture
+    while True:
+        remaining = deadline - clock() if deadline is not None else 20
+        assert remaining > 0, "authoritative capture recovery deadline exceeded"
+        client.timeout = min(20, remaining)
+        try:
+            status, response = client.exchange("tools/call", {
+                "name": "fetch", "arguments": {"id": uri}})
+        except (OSError, ValueError):
+            raise AssertionError("backend RPC transport or decoding failed") from None
+        if deadline is not None:
+            assert clock() <= deadline, "authoritative capture recovery deadline exceeded"
+        assert status == 200 and isinstance(response, dict) and "error" not in response, "backend RPC exchange failed"
+        result = response.get("result")
+        assert isinstance(result, dict), "backend RPC result missing"
+        if result.get("isError") is True:
+            error = result.get("structuredContent")
+            assert isinstance(error, dict), "typed capture error missing"
+            code = error.get("code")
+            assert isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,64}", code), "typed capture error code invalid"
+            print("Archive capture state code=" + code, flush=True)
+            if expected == "unavailable":
+                assert code == "unavailable", "unexpected storage error code=" + code
+                return
+            assert expected == "recover" and code == "unavailable", "healthy archive read failed code=" + code
+            remaining = deadline - clock()
+            assert remaining > 0, "authoritative capture recovery deadline exceeded"
+            sleep(min(1, remaining))
+            continue
+        assert result.get("isError") is None or result.get("isError") is False, "invalid capture error flag"
+        assert expected != "unavailable", "warm cached capture escaped the archive outage gate"
+        value = result.get("structuredContent")
+        assert isinstance(value, dict), "structured capture result missing"
+        contents = value.get("contents")
+        assert isinstance(contents, list) and all(isinstance(item, dict) for item in contents), "capture contents invalid"
+        selected = [item for item in contents if item.get("uri") == uri]
+        assert len(selected) == 1, "capture identity changed"
+        for item in contents:
+            if item.get("uri") != uri:
+                assert isinstance(item.get("uri"), str) and item["uri"].startswith("devres://attribution/"), "unexpected capture resource"
+        item = selected[0]
+        assert item.get("mimeType") == "text/plain", "capture media type changed"
+        assert item.get("text") == "Synthetic dev-resources persistence acceptance fixture\n", "capture body changed"
+        if expected == "recover" and ready is not None:
+            while True:
+                remaining = deadline - clock()
+                assert remaining > 0, "private storage readiness recovery deadline exceeded"
+                available = ready(min(2, remaining))
+                assert clock() <= deadline, "private storage readiness recovery deadline exceeded"
+                if available:
+                    break
+                remaining = deadline - clock()
+                assert remaining > 0, "private storage readiness recovery deadline exceeded"
+                sleep(min(1, remaining))
+        return
+
 class LoopbackHTTPS(http.client.HTTPSConnection):
     def connect(self):
         connection = socket.create_connection(("127.0.0.1", self.port), self.timeout)
@@ -421,17 +480,20 @@ Client.exchange.__globals__["http"] = types.SimpleNamespace(client=types.SimpleN
     HTTPSConnection=LoopbackHTTPS, HTTPConnection=http.client.HTTPConnection))
 client = Client("https://backend:8080/mcp", "/fixture/cert/ca.pem",
                 "/fixture/cert/edge-client.pem", "/fixture/cert/edge-client-key.pem")
-client.timeout = 20
-status, response = client.exchange("tools/call", {
-    "name": "fetch", "arguments": {"id": "devres://capture/" + sys.argv[1]}})
-assert status == 200 and response and "result" in response, "backend RPC exchange failed"
-result = response["result"]
-if sys.argv[2] == "unavailable":
-    assert result.get("isError") is True, "warm cached capture escaped the archive outage gate"
-    assert result.get("structuredContent", {}).get("code") == "unavailable", "unexpected storage error"
-else:
-    assert not result.get("isError"), "healthy archive read failed"
-    assert "Synthetic dev-resources persistence acceptance fixture" in json.dumps(result)
+def private_ready(timeout):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open("http://127.0.0.1:9090/ready", timeout=timeout) as response:
+            assert response.status == 200, "private health returned an unexpected status"
+            return True
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        assert status == 503, "private health returned an unexpected error status"
+        return False
+    except (OSError, ValueError):
+        raise AssertionError("private health transport failed") from None
+capture_state(client, sys.argv[1], sys.argv[2], ready=private_ready)
 PYS3CAPTURE
 }
 stop_backend
@@ -471,9 +533,12 @@ PYS3READY
   k scale deployment/objectstore --replicas=1
   k rollout status deployment/objectstore --timeout=180s
   wait_edge
+  # Ambiguous credential renewal during the outage remains reserved until the
+  # fixture lease (60s) plus uncertainty (60s) expires. Only typed unavailable is
+  # retryable; a fixed capture and exact body must recover within 180 seconds.
+  s3_capture_state recover
   test "$(k get pod -l app=backend -o jsonpath='{.items[0].metadata.uid}')" = "$backend_uid"
   test "$(k get pod -l app=backend -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')" = "$backend_restarts"
-  s3_capture_state healthy
   echo 'Same backend process recovered after object-store restart'
 fi
 stop_backend
