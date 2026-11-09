@@ -38,6 +38,7 @@ class Limiter:
 class S3:
     def __init__(self):
         self.objects, self.uploads, self.calls, self.gets = {}, {}, [], []
+        self.classes = {}
         self.fail_part, self.corrupt_get, self.on_put = False, None, None
     def get_bucket_versioning(self, **kwargs): self.calls.append(('versioning',)); return {}
     def get_bucket_acl(self, **kwargs):
@@ -49,7 +50,8 @@ class S3:
         if Key not in self.objects: raise S3Error('NoSuchKey')
         data, metadata = self.objects[Key]
         if self.corrupt_get == Key: data += b'corrupt'
-        return {'Body': io.BytesIO(data), 'Metadata': metadata}
+        return {'Body': io.BytesIO(data), 'Metadata': metadata, 'StorageClass': self.classes.get(Key,'STANDARD'),
+                'ETag': '"'+copy.digest(self.objects[Key][0])+'"'}
     @staticmethod
     def consume(body):
         if isinstance(body, bytes): return body
@@ -58,18 +60,33 @@ class S3:
             value = body.read(1024 * 1024)
             if not value: return b''.join(parts)
             parts.append(value)
-    def put_object(self, Key, Body, Metadata, IfNoneMatch, **kwargs):
+    def put_object(self, Key, Body, Metadata, IfNoneMatch, StorageClass, **kwargs):
         self.calls.append(('put', Key, IfNoneMatch))
         if IfNoneMatch != '*': raise AssertionError('overwrite condition missing')
         if Key in self.objects: raise S3Error('PreconditionFailed')
         data = self.consume(Body)
         if self.on_put: self.on_put(Key)
+        self.assert_class(StorageClass)
         self.objects[Key] = data, Metadata
+        self.classes[Key] = StorageClass
         return {}
-    def create_multipart_upload(self, Key, Metadata, **kwargs):
+    @staticmethod
+    def assert_class(value):
+        if value != copy.STORAGE_CLASS: raise AssertionError('wrong storage class')
+    def copy_object(self, Key, CopySource, CopySourceIfMatch, MetadataDirective, StorageClass, **kwargs):
+        self.calls.append(('copy',Key,CopySourceIfMatch))
+        if CopySource != {'Bucket':copy.BUCKET,'Key':Key}: raise AssertionError('cross-object copy')
+        if MetadataDirective != 'COPY': raise AssertionError('metadata replacement')
+        self.assert_class(StorageClass)
+        if Key not in self.objects: raise S3Error('NoSuchKey')
+        if CopySourceIfMatch != '"'+copy.digest(self.objects[Key][0])+'"': raise S3Error('PreconditionFailed')
+        self.classes[Key] = StorageClass
+        return {}
+    def create_multipart_upload(self, Key, Metadata, StorageClass, **kwargs):
         identifier = 'upload-' + str(len(self.calls))
         self.calls.append(('create', Key, identifier))
-        self.uploads[identifier] = {'key': Key, 'metadata': Metadata, 'parts': {}}
+        self.assert_class(StorageClass)
+        self.uploads[identifier] = {'key': Key, 'metadata': Metadata, 'parts': {},'storage_class':StorageClass}
         return {'UploadId': identifier}
     def upload_part(self, Key, UploadId, PartNumber, Body, **kwargs):
         self.calls.append(('part', Key, UploadId, PartNumber))
@@ -83,6 +100,7 @@ class S3:
         value = self.uploads.pop(UploadId)
         data = b''.join(value['parts'][p['PartNumber']] for p in MultipartUpload['Parts'])
         self.objects[Key] = data, value['metadata']
+        self.classes[Key] = value['storage_class']
         return {}
     def abort_multipart_upload(self, Key, UploadId, **kwargs):
         self.calls.append(('abort', Key, UploadId))
@@ -446,6 +464,7 @@ class CopyTests(unittest.TestCase):
         def race(**kwargs):
             if kwargs['Key']=='blobs/first' and kwargs['Key'] not in self.s3.objects:
                 self.s3.objects[kwargs['Key']]=(S3.consume(kwargs['Body']),kwargs['Metadata'])
+                self.s3.classes[kwargs['Key']]=kwargs['StorageClass']
                 raise S3Error('PreconditionFailed')
             return put(**kwargs)
         self.s3.put_object=race
@@ -459,6 +478,7 @@ class CopyTests(unittest.TestCase):
         def race(**kwargs):
             if kwargs['Key']==copy.CONTROL+'owner.json' and kwargs['Key'] not in self.s3.objects:
                 self.s3.objects[kwargs['Key']]=(S3.consume(kwargs['Body']),kwargs['Metadata'])
+                self.s3.classes[kwargs['Key']]=kwargs['StorageClass']
                 raise S3Error('PreconditionFailed')
             return put(**kwargs)
         self.s3.put_object=race
@@ -867,6 +887,270 @@ class CopyTests(unittest.TestCase):
         self.assertNotIn('blobs/first',self.s3.objects)
         self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
         self.assertIn(copy.CONTROL+'owner.json',self.s3.objects)
+
+
+    def legacy_objects(self):
+        self.copier().run()
+        for key in self.s3.objects: self.s3.classes[key]='STANDARD'
+        self.s3.objects.pop(copy.CONTROL+'COMPLETE.json')
+        self.s3.classes.pop(copy.CONTROL+'COMPLETE.json')
+        self.s3.calls.clear(); self.s3.gets.clear()
+
+    def test_onezone_new_put_and_mpu_and_legacy_same_key_conversion_preserve_body_metadata(self):
+        self.legacy_objects()
+        expected=dict(self.s3.objects); convert=self.s3.copy_object; job=self.copier()
+        def admitted(**kwargs):
+            self.assertTrue(job.admitted)
+            return convert(**kwargs)
+        self.s3.copy_object=admitted
+        self.assertTrue(job.run()['complete'])
+        copied=[c[1] for c in self.s3.calls if c[0]=='copy']
+        self.assertEqual(set(copied),set(expected)); self.assertEqual(len(copied),len(expected))
+        for key,value in expected.items(): self.assertEqual(self.s3.objects[key],value)
+        self.assertEqual(set(self.s3.classes.values()),{copy.STORAGE_CLASS})
+        self.assertFalse(any(c[0] in ('create','complete_mpu') for c in self.s3.calls))
+        self.assertEqual([c[1] for c in self.s3.calls if c[0]=='put'],[copy.CONTROL+'COMPLETE.json'])
+        self.assertEqual(copied[0],copy.CONTROL+'owner.json')
+        self.s3=S3(); self.state=self.root/'onezone-mpu'; self.state.mkdir(mode=0o700)
+        self.plan={**self.plan,'state_dir':str(self.state)}
+        with patch.object(copy,'MIN_PART',8),patch.object(copy,'part_size',return_value=16):
+            self.assertTrue(self.max_copier().run()['complete'])
+        self.assertEqual(set(self.s3.classes.values()),{copy.STORAGE_CLASS})
+        self.assertTrue(any(c[0]=='complete_mpu' for c in self.s3.calls))
+
+    def test_legacy_foreign_owner_or_owner_metadata_never_authorizes_conversion(self):
+        self.legacy_objects()
+        key=copy.CONTROL+'owner.json'; original=self.s3.objects[key]
+        self.s3.objects[key]=(b'foreign owner',original[1])
+        with self.assertRaisesRegex(copy.CopyError,'owner_collision'): self.copier().run()
+        self.assertFalse(any(c[0]=='copy' for c in self.s3.calls))
+        self.s3.objects[key]=(original[0],{'foreign':'metadata'})
+        with self.assertRaisesRegex(copy.CopyError,'metadata_collision'): self.copier().run()
+        self.assertFalse(any(c[0]=='copy' for c in self.s3.calls))
+
+    def test_legacy_wrong_hash_never_converts_that_object_or_publishes_complete(self):
+        self.legacy_objects(); key='blobs/.hidden'; original=self.s3.objects[key]
+        self.s3.objects[key]=(b'corrupt content',original[1])
+        with self.assertRaisesRegex(copy.CopyError,'object_content_collision|object_size_collision'): self.copier().run()
+        self.assertFalse(any(c[0]=='copy' and c[1]==key for c in self.s3.calls))
+        self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+        self.assertEqual(self.s3.objects[key][0],b'corrupt content')
+
+    def test_legacy_conversion_failure_or_ignored_class_never_completes_or_repeats_copy(self):
+        self.legacy_objects()
+        with patch.object(self.s3,'copy_object',side_effect=S3Error('ServerFailure')) as attempted:
+            with self.assertRaisesRegex(copy.CopyError,'s3_request_failed'): self.copier().run()
+        self.assertEqual(attempted.call_count,1)
+        with patch.object(self.s3,'copy_object',return_value={}) as ignored:
+            with self.assertRaisesRegex(copy.CopyError,'storage_class_mismatch'): self.copier().run()
+        self.assertEqual(ignored.call_count,1)
+        self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+
+    def test_legacy_copy_cas_race_requires_post_get_proof_and_never_replays_copy(self):
+        self.legacy_objects(); original=self.s3.copy_object
+        def lost_ack(**kwargs):
+            original(**kwargs)
+            raise S3Error('PreconditionFailed')
+        with patch.object(self.s3,'copy_object',side_effect=lost_ack) as converted:
+            self.assertTrue(self.copier().run()['complete'])
+        self.assertGreater(converted.call_count,0)
+        self.assertEqual(len([c for c in self.s3.calls if c[0]=='copy']),converted.call_count)
+        self.legacy_objects()
+        def race(**kwargs):
+            key=kwargs['Key']; data,meta=self.s3.objects[key]
+            self.s3.objects[key]=(b'foreign bytes',meta)
+            raise S3Error('PreconditionFailed')
+        with patch.object(self.s3,'copy_object',side_effect=race) as refused:
+            with self.assertRaisesRegex(copy.CopyError,'object_content_collision|object_size_collision'): self.copier().run()
+        self.assertEqual(refused.call_count,1)
+        self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+
+    def test_legacy_copy_limit_unknown_class_etag_and_readonly_check_fail_closed(self):
+        self.legacy_objects(); key='blobs/.hidden'
+        self.assertTrue(self.copier().check()['check_passed'])
+        self.assertFalse(any(c[0]=='copy' for c in self.s3.calls))
+        # Keep controls already in the target class, isolating the data guard.
+        for other in self.s3.objects:
+            if other!=key: self.s3.classes[other]=copy.STORAGE_CLASS
+        with patch.object(copy,'MAX_SINGLE_COPY',1):
+            with self.assertRaisesRegex(copy.CopyError,'copy_too_large'): self.copier().run()
+        self.assertFalse(any(c[0]=='copy' for c in self.s3.calls))
+        self.s3.classes[key]='GLACIER'
+        with self.assertRaisesRegex(copy.CopyError,'storage_class_mismatch'): self.copier().run()
+        self.s3.classes[key]='STANDARD'; get=self.s3.get_object
+        for etag in (None,'*','"*"','bad\r\nheader'):
+            def altered(**kwargs):
+                value=get(**kwargs)
+                if kwargs['Key']==key: value['ETag']=etag
+                return value
+            with patch.object(self.s3,'get_object',side_effect=altered):
+                with self.assertRaisesRegex(copy.CopyError,'etag_invalid'): self.copier().run()
+        self.assertFalse(any(c[0]=='copy' for c in self.s3.calls))
+        self.assertNotIn(copy.CONTROL+'COMPLETE.json',self.s3.objects)
+
+
+    @staticmethod
+    def transient_error(status=503):
+        error=S3Error('ServiceUnavailable')
+        error.response['ResponseMetadata']={'HTTPStatusCode':status}
+        return error
+
+    def test_standard_owner_with_foreign_namespace_never_authorizes_any_copy(self):
+        self.legacy_objects(); self.s3.objects['foreign-object']=(b'foreign',{})
+        before=dict(self.s3.classes)
+        with self.assertRaisesRegex(copy.CopyError,'unexpected_existing_bucket_object'): self.copier().run()
+        self.assertFalse(any(c[0] in ('copy','put','create','complete_mpu') for c in self.s3.calls))
+        self.assertEqual(self.s3.classes,before)
+
+    def test_whole_get_retry_has_one_total_budget_and_safe_failure_fingerprint(self):
+        job=self.copier(); data=b'complete verified evidence'
+        self.s3.objects['blobs/first']=(data,{})
+        original=self.s3.get_object; errors=[self.transient_error(503),self.transient_error(429)]
+        def eventually(**kwargs):
+            if errors: raise errors.pop(0)
+            return original(**kwargs)
+        with patch.object(self.s3,'get_object',side_effect=eventually) as request,patch.object(job,'retry_wait') as wait:
+            self.assertTrue(job.existing('blobs/first',{},copy.digest(data),len(data)))
+        self.assertEqual(request.call_count,3)
+        self.assertEqual([c.args[0] for c in wait.call_args_list],[.25,.5])
+        with patch.object(self.s3,'get_object',side_effect=self.transient_error()) as request,patch.object(job,'retry_wait'):
+            with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$') as caught:
+                job.existing('blobs/first',{},copy.digest(data),len(data))
+        self.assertEqual(request.call_count,3)
+        self.assertEqual(caught.exception.s3_exception_type,'S3Error')
+        self.assertEqual(caught.exception.s3_http_status,503)
+
+    def test_safe_readonly_retries_four_but_never_unknown_permissions_or_mpu_lifecycle(self):
+        job=self.copier()
+        with patch.object(self.s3,'list_objects_v2',side_effect=self.transient_error()) as request,patch.object(job,'retry_wait') as wait:
+            with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$'): job.call('list_objects_v2',MaxKeys=1)
+        self.assertEqual(request.call_count,4)
+        self.assertEqual([c.args[0] for c in wait.call_args_list],[.25,.5,1.0])
+        for method,params in (('create_multipart_upload',{}),('complete_multipart_upload',{}),('copy_object',{}),
+                              ('put_object',{'Body':b'data'})):
+            with patch.object(self.s3,method,side_effect=self.transient_error()) as request,patch.object(job,'retry_wait') as wait:
+                with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$'): job.call(method,Key='blobs/first',**params)
+            self.assertEqual(request.call_count,1); wait.assert_not_called()
+        for status in (401,403,404,412,418):
+            with patch.object(self.s3,'list_objects_v2',side_effect=self.transient_error(status)) as request,patch.object(job,'retry_wait') as wait:
+                with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$'): job.call('list_objects_v2')
+            self.assertEqual(request.call_count,1); wait.assert_not_called()
+        malformed=S3Error('unused'); malformed.response={'Error':None}
+        with patch.object(self.s3,'list_objects_v2',side_effect=malformed) as request,patch.object(job,'retry_wait') as wait:
+            with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$'): job.call('list_objects_v2')
+        self.assertEqual(request.call_count,1); wait.assert_not_called()
+
+    def test_conditional_put_lost_ack_rewinds_then_412_requires_full_get(self):
+        job=self.copier(); job.manifest_hash='b'*64; data=b'unchanged conditional object'
+        original=self.s3.put_object; positions=[]
+        def lost(**kwargs):
+            positions.append(kwargs['Body'].tell())
+            self.assertEqual(kwargs['IfNoneMatch'],'*')
+            if len(positions)==1:
+                body=S3.consume(kwargs['Body'])
+                self.s3.objects[kwargs['Key']]=(body,kwargs['Metadata'])
+                self.s3.classes[kwargs['Key']]=kwargs['StorageClass']
+                raise ConnectionResetError(104,'private transport detail')
+            return original(**kwargs)
+        with patch.object(self.s3,'put_object',side_effect=lost),patch.object(job,'retry_wait'):
+            job.upload('blobs/first',io.BytesIO(data),len(data),copy.digest(data))
+        self.assertEqual(positions,[0,0])
+        self.assertTrue(job.existing('blobs/first',job.control_metadata(copy.digest(data)),copy.digest(data),len(data)))
+        self.assertEqual(self.s3.objects['blobs/first'][0],data)
+        self.assertIn('blobs/first',self.s3.gets)
+
+    def test_known_part_retry_rewinds_exact_same_upload_and_number(self):
+        job=self.copier(); data=b'owned multipart bytes'; positions=[]
+        self.s3.uploads['known-upload']={'key':'blobs/first','metadata':{},'parts':{}}
+        original=self.s3.upload_part
+        def interrupted(**kwargs):
+            positions.append((kwargs['UploadId'],kwargs['PartNumber'],kwargs['Body'].tell()))
+            if len(positions)==1:
+                kwargs['Body'].read(3)
+                raise TimeoutError(110,'private network detail')
+            return original(**kwargs)
+        body=copy.PartBody(io.BytesIO(data),0,len(data),job.limiter)
+        with patch.object(self.s3,'upload_part',side_effect=interrupted),patch.object(job,'retry_wait'):
+            job.call('upload_part',Key='blobs/first',UploadId='known-upload',PartNumber=1,Body=body,ContentLength=len(data))
+        self.assertEqual(positions,[('known-upload',1,0),('known-upload',1,0)])
+        self.assertEqual(self.s3.uploads['known-upload']['parts'][1],data)
+
+    def test_truncated_stream_restarts_whole_get_fresh_hash_and_closes_each_body(self):
+        class IncompleteReadError(Exception): pass
+        data=b'complete retained bytes'; bodies=[]
+        class Stream(io.BytesIO):
+            def __init__(self,fail): super().__init__(data); self.fail=fail; self.first=True
+            def read(self,size):
+                if self.fail and not self.first: raise IncompleteReadError('private truncated response')
+                self.first=False
+                return super().read(4 if self.fail else size)
+        def response(**_kwargs):
+            body=Stream(len(bodies)==0); bodies.append(body)
+            return {'Body':body,'Metadata':{}}
+        job=self.copier()
+        with patch.dict('sys.modules',{'botocore.exceptions':SimpleNamespace(IncompleteReadError=IncompleteReadError)}), \
+                patch.object(self.s3,'get_object',side_effect=response) as request,patch.object(job,'retry_wait'):
+            self.assertTrue(job.existing('blobs/first',{},copy.digest(data),len(data)))
+        self.assertEqual(request.call_count,2); self.assertTrue(all(body.closed for body in bodies))
+        bodies.clear()
+        def broken(**_kwargs):
+            body=Stream(True); bodies.append(body); return {'Body':body,'Metadata':{}}
+        with patch.dict('sys.modules',{'botocore.exceptions':SimpleNamespace(IncompleteReadError=IncompleteReadError)}), \
+                patch.object(self.s3,'get_object',side_effect=broken) as request,patch.object(job,'retry_wait'):
+            with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$') as caught:
+                job.existing('blobs/first',{},copy.digest(data),len(data))
+        self.assertEqual(request.call_count,3); self.assertTrue(all(body.closed for body in bodies))
+        self.assertEqual(caught.exception.s3_exception_type,'IncompleteReadError')
+        self.assertIsNone(caught.exception.s3_http_status)
+
+    def test_retry_wait_honors_deadline_or_cancel_before_replaying_request(self):
+        for cancel in (False,True):
+            self.guard.failure=None; job=self.copier()
+            def stop(_delay):
+                if cancel: job.cancelled.set()
+                else: self.guard.failure='copy_deadline_exceeded'
+            with patch.object(self.s3,'list_objects_v2',side_effect=self.transient_error()) as request, \
+                    patch.object(copy.time,'sleep',side_effect=stop):
+                with self.assertRaisesRegex(copy.CopyError,'copy_worker_cancelled|copy_deadline_exceeded'):
+                    job.call('list_objects_v2')
+            self.assertEqual(request.call_count,1)
+        self.guard.failure=None
+
+    def test_copy_lost_ack_transient_never_replays_and_requires_onezone_post_proof(self):
+        self.legacy_objects(); original=self.s3.copy_object
+        def acknowledged_lost(**kwargs):
+            original(**kwargs)
+            raise ConnectionResetError(104,'private transport detail')
+        with patch.object(self.s3,'copy_object',side_effect=acknowledged_lost) as request:
+            self.assertTrue(self.copier().run()['complete'])
+        self.assertEqual(request.call_count,len([c for c in self.s3.calls if c[0]=='copy']))
+        self.assertEqual(set(self.s3.classes.values()),{copy.STORAGE_CLASS})
+
+
+    def test_generic_http_client_bug_is_not_a_retryable_transport(self):
+        class HTTPClientError(Exception):
+            def __init__(self,error): self.kwargs={'error':error}
+        error=HTTPClientError(TypeError('private bug detail'))
+        job=self.copier()
+        with patch.dict('sys.modules',{'botocore.exceptions':SimpleNamespace(HTTPClientError=HTTPClientError)}), \
+                patch.object(self.s3,'list_objects_v2',side_effect=error) as request,patch.object(job,'retry_wait') as wait:
+            with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$') as caught:
+                job.call('list_objects_v2')
+        self.assertEqual(request.call_count,1); wait.assert_not_called()
+        self.assertEqual(caught.exception.s3_exception_type,'HTTPClientError')
+
+
+    def test_broken_oserror_errno_is_unknown_without_masking_or_retry(self):
+        class BrokenErrno(OSError):
+            @property
+            def errno(self): raise RuntimeError('private SDK property failure')
+        error=BrokenErrno(); job=self.copier()
+        self.assertFalse(copy.transient_s3(error))
+        with patch.object(self.s3,'list_objects_v2',side_effect=error) as request,patch.object(job,'retry_wait') as wait:
+            with self.assertRaisesRegex(copy.CopyError,'^s3_request_failed$') as caught:
+                job.call('list_objects_v2')
+        self.assertEqual(request.call_count,1); wait.assert_not_called()
+        self.assertEqual(caught.exception.s3_exception_type,'BrokenErrno')
 
 
 if __name__=='__main__': unittest.main()

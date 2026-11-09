@@ -1057,6 +1057,31 @@ while the existing filesystem migration continues. It does not activate the S3
 backend, alter database/schema state, or constitute a coordinated database backup.
 In-progress derived staging files can be present in the frozen tree.
 
+The authorized destination class is Scaleway
+[Standard One Zone](https://www.scaleway.com/en/docs/object-storage/concepts/)
+(`ONEZONE_IA`).
+Every new control-object PUT, data-object PUT, and multipart initiation requests
+that class explicitly. Resuming an existing owned Standard Multi-AZ object first
+verifies its full contents against the expected metadata, size, and SHA-256, then
+uses a same-key server-side copy with an exact source ETag precondition to change
+its storage class. A second full GET verifies unchanged contents and the One Zone
+class before accepting it. Root ownership and key admission precede any class
+conversion. Existing objects larger than 5,000,000,000 bytes fail explicitly rather
+than attempting an unsupported single-request class copy. New large objects use
+One Zone multipart uploads directly.
+[Scaleway lifecycle transitions](https://www.scaleway.com/en/docs/object-storage/api-cli/lifecycle-rules-api/)
+require at least 30 days in Standard, so this operation does not use lifecycle
+rules for immediate conversion.
+
+The helper owns bounded retries; the SDK remains at one attempt. Read-only
+requests, conditional object creation, and known multipart parts may retry
+recognized transient HTTP or transport failures up to four attempts, with guarded
+backoff and upload-body rewind. Full-object GET proofs have a separate total
+budget of three complete requests and discard partial reads before retrying.
+Multipart initiation and completion are never automatically replayed. A class
+conversion is issued once; an uncertain response requires a fresh full GET that
+proves both unchanged contents and One Zone before it can be accepted.
+
 The root-owned, mode-0600 plan pins dataset/snapshot GUIDs, the snapshot hold,
 source root, original migration proof and deadline, and the owner-only destination.
 Authentication uses only the remote `codex` account's selected `newprofile` through

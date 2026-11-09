@@ -8,6 +8,7 @@ Only this job's journaled incomplete multipart upload may be aborted.
 import argparse
 import base64
 import contextlib
+import errno
 import concurrent.futures
 import fcntl
 import hashlib
@@ -34,6 +35,8 @@ BUCKET = 'dev-resources-mcp'
 ENDPOINT = 'https://s3.fr-par.scw.cloud'
 REGION = 'fr-par'
 CONTROL = '_devres-copy/'
+STORAGE_CLASS = 'ONEZONE_IA'
+MAX_SINGLE_COPY = 5_000_000_000
 JOURNAL = Path('/var/lib/devres-staging/upgrade/state.json')
 PLAN_FIELDS = {'version', 'source_dataset', 'source_dataset_guid', 'source_snapshot',
                'source_snapshot_guid', 'source_root', 'hold', 'bucket', 'endpoint',
@@ -476,6 +479,52 @@ def missing(error):
     return error_code(error) in ('404', 'NoSuchKey', 'NotFound')
 
 
+def http_status(error):
+    try:
+        response = getattr(error, 'response', None)
+    except Exception:
+        return None
+    if not isinstance(response, dict):
+        return None
+    metadata = dict.get(response, 'ResponseMetadata')
+    if not isinstance(metadata, dict):
+        return None
+    status = dict.get(metadata, 'HTTPStatusCode')
+    return status if type(status) is int and 100 <= status <= 599 else None
+
+
+def transient_s3(error):
+    if isinstance(error, CopyError):
+        return getattr(error, '_s3_transient', False) is True
+    status = http_status(error)
+    if status is not None:
+        return status in (408, 429, 500, 502, 503, 504)
+    if isinstance(error, OSError):
+        try:
+            number = getattr(error, 'errno', None)
+        except Exception:
+            return False
+        if type(number) is int and number in (
+                errno.ECONNRESET, errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE,
+                errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
+            return True
+    sdk = sys.modules.get('botocore.exceptions')
+    classes = tuple(value for name in ('EndpointConnectionError', 'ReadTimeoutError',
+        'ConnectTimeoutError', 'ConnectionClosedError',
+        'IncompleteReadError', 'ResponseStreamingError')
+        if isinstance(value := getattr(sdk, name, None), type))
+    return isinstance(error, classes)
+
+
+def s3_failure(error):
+    failure = CopyError('s3_request_failed')
+    name = type(error).__name__
+    failure.s3_exception_type = name if re.fullmatch('[A-Za-z_][A-Za-z0-9_]{0,79}', name) else 'UnknownS3Error'
+    failure.s3_http_status = http_status(error)
+    failure._s3_transient = transient_s3(error)
+    return failure
+
+
 def make_client(plan, max_speed=False):
     try:
         account = pwd.getpwnam('codex')
@@ -537,6 +586,7 @@ class Copier:
         self.last_progress = 0
         self.manifest_hash = None
         self.fresh_root = False
+        self.admitted = False
 
     def check_active(self):
         if self.cancelled.is_set():
@@ -545,16 +595,50 @@ class Copier:
         if self.cancelled.is_set():
             raise CopyError('copy_worker_cancelled')
 
-    def call(self, method, **kwargs):
-        self.check_active()
-        try:
-            return getattr(self.s3, method)(Bucket=BUCKET, **kwargs)
-        except CopyError:
-            raise
-        except Exception as error:
-            if missing(error) or error_code(error) in ('PreconditionFailed', '412', 'NoSuchUpload'):
+    def retry_wait(self, delay):
+        target = time.monotonic() + delay
+        while True:
+            self.check_active()
+            remaining = target - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.05, remaining))
+
+    def call(self, method, *, _attempts=None, **kwargs):
+        # There is one explicit retry owner. SDK attempts remain one. A whole
+        # streaming GET below supplies _attempts=1 and owns its total budget.
+        safe = method in ('get_object', 'get_bucket_versioning', 'get_bucket_acl', 'list_objects_v2')
+        safe |= method == 'put_object' and kwargs.get('IfNoneMatch') == '*'
+        safe |= (method == 'upload_part' and isinstance(kwargs.get('UploadId'), str)
+                 and bool(kwargs['UploadId']) and type(kwargs.get('PartNumber')) is int
+                 and 1 <= kwargs['PartNumber'] <= 1000)
+        attempts = min(4, _attempts) if safe and _attempts is not None else 4 if safe else 1
+        body = kwargs.get('Body')
+        origin = None
+        if body is not None and not isinstance(body, (bytes, bytearray, memoryview)):
+            try:
+                origin = body.tell()
+                if not body.seekable():
+                    attempts = 1
+            except Exception:
+                attempts = 1
+        for attempt in range(attempts):
+            self.check_active()
+            try:
+                return getattr(self.s3, method)(Bucket=BUCKET, **kwargs)
+            except CopyError:
                 raise
-            raise CopyError('s3_request_failed') from None
+            except Exception as error:
+                if missing(error) or error_code(error) in ('PreconditionFailed', '412', 'NoSuchUpload'):
+                    raise
+                if attempt + 1 == attempts or not transient_s3(error):
+                    raise s3_failure(error) from None
+                if origin is not None:
+                    try:
+                        body.seek(origin)
+                    except Exception:
+                        raise s3_failure(error) from None
+                self.retry_wait((0.25, 0.5, 1.0)[attempt])
 
     def bucket_check(self):
         versioning = self.call('get_bucket_versioning')
@@ -568,9 +652,9 @@ class Copier:
                 or g.get('Grantee', {}).get('ID') != owner or g.get('Permission') != 'FULL_CONTROL' for g in grants):
             raise CopyError('bucket_acl_not_owner_only')
 
-    def existing(self, key, metadata=None, expected_hash=None, expected_size=None, maximum=None):
+    def read_existing(self, key, metadata, expected_hash, expected_size, maximum):
         try:
-            value = self.call('get_object', Key=key)
+            value = self.call('get_object', Key=key, _attempts=1)
         except Exception as error:
             if missing(error): return None
             raise
@@ -592,9 +676,57 @@ class Copier:
             if ((expected_size is not None and length != expected_size)
                     or (expected_hash is not None and hasher.hexdigest() != expected_hash)):
                 raise CopyError('object_content_collision')
-            return bytes(output) if maximum is not None else True
+            result = bytes(output) if maximum is not None else True
         finally:
             body.close()
+        return value, result, length
+
+    def existing(self, key, metadata=None, expected_hash=None, expected_size=None, maximum=None, *, allow_conversion=True):
+        # At most three complete GET requests per proof, including request-level
+        # failures. Every retry discards the old hasher/body and closes the body.
+        for attempt in range(3):
+            try:
+                read = self.read_existing(key, metadata, expected_hash, expected_size, maximum)
+                if read is None:
+                    return None
+                value, result, length = read
+                break
+            except Exception as error:
+                if not transient_s3(error):
+                    raise
+                if attempt == 2:
+                    if isinstance(error, CopyError):
+                        raise
+                    raise s3_failure(error) from None
+                self.retry_wait((0.25, 0.5)[attempt])
+        if self.admitted and metadata is not None and expected_hash is not None and expected_size is not None:
+            storage_class = value.get('StorageClass', 'STANDARD')
+            if storage_class != STORAGE_CLASS:
+                if storage_class != 'STANDARD' or not allow_conversion:
+                    raise CopyError('object_storage_class_mismatch')
+                if length > MAX_SINGLE_COPY:
+                    raise CopyError('legacy_storage_class_copy_too_large')
+                etag = value.get('ETag')
+                if not isinstance(etag, str) or not re.fullmatch(r'"[0-9A-Za-z._:/+=-]{1,200}"', etag):
+                    raise CopyError('object_storage_class_etag_invalid')
+                # Only this admitted namespace's fully read/hash-verified object
+                # may change class. The same-key source CAS preserves its bytes
+                # and user metadata; neither delete nor re-upload is permitted.
+                try:
+                    self.call('copy_object', Key=key, CopySource={'Bucket': BUCKET, 'Key': key},
+                              CopySourceIfMatch=etag, MetadataDirective='COPY', StorageClass=STORAGE_CLASS)
+                except Exception as error:
+                    # A prior acknowledged-lost conversion may have changed its
+                    # ETag. Never repeat CopyObject: prove the target class and
+                    # unchanged content with a fresh complete GET instead.
+                    if error_code(error) not in ('PreconditionFailed', '412') and not transient_s3(error):
+                        raise
+                verified = self.existing(key, metadata, expected_hash, expected_size, maximum,
+                                         allow_conversion=False)
+                if verified is None:
+                    raise CopyError('storage_class_converted_object_missing')
+                return verified
+        return result
 
     def owner(self):
         return {'version': 1, 'plan_sha256': self.plan_hash, 'manifest_sha256': self.manifest_hash,
@@ -616,7 +748,7 @@ class Copier:
             return False
         created = False
         try:
-            self.call('put_object', Key=key, Body=data, ContentLength=len(data), Metadata=metadata, IfNoneMatch='*')
+            self.call('put_object', Key=key, Body=data, ContentLength=len(data), Metadata=metadata, StorageClass=STORAGE_CLASS, IfNoneMatch='*')
             created = True
         except Exception as error:
             if error_code(error) not in ('PreconditionFailed', '412'): raise
@@ -736,6 +868,9 @@ class Copier:
         created = self.conditional_bytes(CONTROL + 'owner.json', expected)
         self.verify_bucket_keys()
         self.fresh_root = existing is None and created
+        self.admitted = True
+        self.existing(CONTROL + 'owner.json', self.control_metadata(digest(expected)),
+                      digest(expected), len(expected)) or self.fail('admitted_owner_missing')
 
     def abort_pending(self):
         row = self.db.execute('SELECT object_key,upload_id,metadata FROM multipart WHERE singleton=1').fetchone()
@@ -760,13 +895,13 @@ class Copier:
         if size <= MIN_PART:
             body = PartBody(stream, 0, size, self.limiter)
             try:
-                self.call('put_object', Key=key, Body=body, ContentLength=size, Metadata=metadata, IfNoneMatch='*')
+                self.call('put_object', Key=key, Body=body, ContentLength=size, Metadata=metadata, StorageClass=STORAGE_CLASS, IfNoneMatch='*')
             except Exception as error:
                 if error_code(error) not in ('PreconditionFailed', '412'): raise
             return
         self.db.execute('INSERT INTO multipart VALUES (1,?,NULL,?)', (key, json.dumps(metadata, sort_keys=True)))
         self.db.commit()
-        result = self.call('create_multipart_upload', Key=key, Metadata=metadata)
+        result = self.call('create_multipart_upload', Key=key, Metadata=metadata, StorageClass=STORAGE_CLASS)
         upload_id = result.get('UploadId')
         if not isinstance(upload_id, str) or not upload_id or len(upload_id) > 4096:
             raise CopyError('invalid_multipart_identity')
