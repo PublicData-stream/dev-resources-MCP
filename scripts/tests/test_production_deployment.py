@@ -120,6 +120,94 @@ class ProductionDeploymentTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 production.settings_checked({**self.settings, **changes})
 
+    def test_static_storage_omits_issuer_resources_and_isolates_credentials(self):
+        settings = {key: value for key, value in self.settings.items() if key != 'iam_cidrs'}
+        settings['storage_auth'] = 'scaleway_static'
+        checked = production.settings_checked(settings)
+        manifest = production.manifests(checked)
+        objects = {(item['kind'], item['metadata']['name']): item for item in manifest['items']}
+        self.assertEqual({name for kind, name in objects if kind == 'Deployment'},
+                         set(production.workload_names(checked)))
+        self.assertEqual(set(production.workload_names(checked)), {'postgres', 'writer', 'backend'})
+        self.assertFalse(any('broker' in name for _, name in objects))
+        self.assertNotIn('Secret', {kind for kind, _ in objects})
+        for role, secret in (('backend', 'devres-serving-s3'), ('writer', 'devres-writer-s3')):
+            pod = objects['Deployment', role]['spec']['template']['spec']
+            self.assertFalse(pod['automountServiceAccountToken'])
+            self.assertEqual(objects['Deployment', role]['spec']['replicas'], 0)
+            volume = next(value for value in pod['volumes'] if value['name'] == 's3')
+            self.assertEqual(volume['secret'], {'secretName': secret, 'defaultMode': 0o440,
+                             'items': [{'key': key, 'path': key} for key in ('access-key', 'secret-key')]})
+            mounted = next(value for value in pod['containers'][0]['volumeMounts'] if value['name'] == 's3')
+            self.assertEqual(mounted, {'name': 's3', 'mountPath': '/run/devres-s3', 'readOnly': True})
+            serialized = json.dumps(pod)
+            self.assertNotIn('broker', serialized)
+            self.assertNotIn('devres-writer-s3' if role == 'backend' else 'devres-serving-s3', serialized)
+            policy = objects['NetworkPolicy', role + '-boundary']['spec']
+            self.assertNotIn('credential-broker', json.dumps(policy))
+            self.assertNotIn('iam_cidrs', json.dumps(policy))
+        serving = objects['Deployment', 'backend']['spec']['template']['spec']
+        writer_tls = next(value for value in serving['volumes'] if value['name'] == 'writer-tls')
+        self.assertEqual(writer_tls['secret']['items'], [{'key': 'ca.crt', 'path': 'ca.crt'}])
+        writer_token = next(value for value in serving['volumes'] if value['name'] == 'writer-identity')
+        self.assertEqual(writer_token['projected']['sources'][0]['serviceAccountToken']['audience'], 'devres-writer')
+        self.assertIn(('ClusterRole', 'devres-writer-reviewer'), objects)
+        self.assertIn(('NetworkPolicy', 'default-deny'), objects)
+        self.assertIn(production.peer('writer'), objects['NetworkPolicy', 'backend-boundary']['spec']['egress'][-1]['to'])
+        self.assertEqual(production.runtime_secret_names(checked),
+                         ('devres-serving-config', 'devres-writer-config', 'devres-backend-tls',
+                          'devres-writer-tls', 'devres-serving-s3', 'devres-writer-s3'))
+
+    def test_static_render_uses_files_without_changing_public_or_writer_contracts(self):
+        settings = {**self.settings, 'storage_auth': 'scaleway_static'}
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            paths = production.render(Path(temporary), settings)
+            self.assertNotIn('credential-broker.toml.example', paths)
+            for writer, role in ((False, 'serving'), (True, 'writer')):
+                before = tomllib.loads(production.runtime_config(writer))
+                after = tomllib.loads(paths[role + '.toml.example'].read_text())
+                credentials = after['storage']['s3']['credentials']
+                self.assertEqual(credentials, {'mode': 'files',
+                                 'access_key_file': '/run/devres-s3/access-key',
+                                 'secret_key_file': '/run/devres-s3/secret-key'})
+                after['storage']['s3']['credentials'] = before['storage']['s3']['credentials']
+                self.assertEqual(after, before)
+        self.assertFalse(production.STATIC_AUTH_RELEASE_QUALIFIED)
+
+    def test_auth_selection_is_explicit_and_broker_remains_default(self):
+        self.assertEqual(production.storage_auth({}), 'broker')
+        self.assertEqual(production.manifests(production.settings_checked(self.settings)),
+                         production.manifests(production.settings_checked({**self.settings, 'storage_auth': 'broker'})))
+        for invalid in ('files', '', None, False, []):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                production.settings_checked({**self.settings, 'storage_auth': invalid})
+        no_iam = {key: value for key, value in self.settings.items() if key != 'iam_cidrs'}
+        with self.assertRaises(ValueError):
+            production.settings_checked(no_iam)
+
+    def test_static_policy_examples_allow_abort_and_deny_permanent_deletion(self):
+        directory = ROOT / 'deploy/examples/scaleway-static'
+        for role in ('readonly', 'readwrite'):
+            policy = json.loads((directory / (role + '-bucket-policy.json')).read_text())
+            statements = policy['Statement']
+            allowed = {action for statement in statements if statement['Effect'] == 'Allow'
+                       for action in statement['Action']}
+            denied = {action for statement in statements if statement['Effect'] == 'Deny'
+                      for action in statement['Action']}
+            self.assertTrue({'s3:GetObject', 's3:ListBucket'} <= allowed)
+            self.assertTrue({'s3:DeleteObject', 's3:DeleteObjectVersion'} <= denied)
+            self.assertFalse({'s3:DeleteObject', 's3:DeleteObjectVersion'} & allowed)
+            if role == 'readwrite':
+                self.assertTrue({'s3:PutObject', 's3:AbortMultipartUpload',
+                                 's3:ListMultipartUploadParts', 's3:ListBucketMultipartUploads'} <= allowed)
+            else:
+                self.assertTrue({'s3:PutObject', 's3:AbortMultipartUpload'} <= denied)
+        for role in ('serving', 'writer'):
+            fragment = tomllib.loads((directory / (role + '-fragment.toml.example')).read_text())
+            self.assertEqual(fragment['storage']['s3']['credentials'],
+                             tomllib.loads(production.runtime_config(role == 'writer', 'scaleway_static'))
+                             ['storage']['s3']['credentials'])
+
     def test_edge_is_dedicated_and_preserves_transport_boundary(self):
         compose = production.edge_compose(production.settings_checked(self.settings))
         self.assertEqual(set(compose['networks']), {'devres-net'})

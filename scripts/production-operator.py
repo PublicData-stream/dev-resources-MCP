@@ -162,7 +162,7 @@ def secret_manifest(name, fields):
                      for key, value in fields.items()}}
 
 
-def postgres_inputs():
+def postgres_inputs(storage_auth="broker"):
     """Generate passwords locally; no secret appears in argv or normal output."""
     values = {key: secrets.token_hex(24) for key in ("corpus_admin", "writer", "reader",
                                                    "broker_admin", "broker")}
@@ -184,13 +184,17 @@ def postgres_inputs():
               "\\connect devres_broker\n"
               "ALTER SCHEMA public OWNER TO devres_broker;\n"
               "REVOKE CREATE ON SCHEMA public FROM PUBLIC;\n")
-    return values, [secret_manifest("devres-corpus-postgres", {
+    manifests = [secret_manifest("devres-corpus-postgres", {
                        "postgres-password": values["corpus_admin"], "init.sql": corpus}),
                     secret_manifest("devres-broker-postgres", {
                        "postgres-password": values["broker_admin"], "init.sql": broker})]
+    if storage_auth == "scaleway_static":
+        values = {key: values[key] for key in ("corpus_admin", "writer", "reader")}
+        manifests = manifests[:1]
+    return values, manifests
 
 
-def prepare_tls(bundle):
+def prepare_tls(bundle, storage_auth="broker"):
     """Create private service/edge identities; public wildcard TLS is retained."""
     tls = safe_directory(Path(bundle) / 'tls', create=True)
     with tempfile.TemporaryDirectory(prefix='devres-tls-', dir='/tmp') as temporary:
@@ -215,6 +219,8 @@ def prepare_tls(bundle):
                 ('writer', 'coordination-ca', ['writer', 'writer.devres.svc', 'writer.devres.svc.cluster.local'], 'serverAuth'),
                 ('credential-broker', 'coordination-ca', ['credential-broker', 'credential-broker.devres.svc',
                                                          'credential-broker.devres.svc.cluster.local'], 'serverAuth')):
+            if storage_auth == "scaleway_static" and name == "credential-broker":
+                continue
             private_key = key(name)
             request = scratch / (name + '.csr')
             extensions = scratch / (name + '.ext')
@@ -396,6 +402,69 @@ def provider_receipt(value, now=None):
         raise OperatorError("provider_acceptance_expired_or_invalid") from error
 
 
+STATIC_STORAGE_CHECKS = (
+    'reader_read_list', 'reader_mutations_denied', 'writer_read_conditional_put',
+    'writer_multipart_complete_abort', 'permanent_deletion_denied',
+    'other_bucket_prefix_denied', 'administration_denied', 'rotation_revocation_verified',
+)
+
+
+def static_storage_receipt(value, binding, now=None):
+    """Admit independently obtained real evidence, never a fixture or broker receipt."""
+    now = now or datetime.now(timezone.utc)
+    if (value.get('version') != 1 or value.get('mode') != 'scaleway_static'
+            or value.get('fixture') is not False or value.get('binding') != binding
+            or any(value.get('checks', {}).get(name) is not True for name in STATIC_STORAGE_CHECKS)):
+        raise OperatorError('real_static_storage_acceptance_required')
+    try:
+        verified = datetime.fromisoformat(value['verified_at'].replace('Z', '+00:00'))
+        expires = datetime.fromisoformat(value['expires_at'].replace('Z', '+00:00'))
+        if (verified.utcoffset() is None or expires.utcoffset() is None or verified > now
+                or (now - verified).total_seconds() > 31 * 86400 or expires <= now or expires <= verified):
+            raise ValueError()
+    except (KeyError, ValueError, TypeError, AttributeError) as error:
+        raise OperatorError('static_storage_acceptance_expired_or_invalid') from error
+
+
+def static_key_pair(access, secret):
+    """Bound private input reads; accept the same trailing newline convention as S3."""
+    values = []
+    for path in (access, secret):
+        try:
+            value = private_read(path, 65536).decode().rstrip('\r\n')
+        except UnicodeError as error:
+            raise OperatorError('invalid_static_storage_key') from error
+        if not value or not value.isascii() or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise OperatorError('invalid_static_storage_key')
+        values.append(value)
+    return {'access-key': values[0], 'secret-key': values[1]}
+
+
+def static_binding(config, identity, pairs):
+    storage = config['storage']['s3']
+    binding = {key: storage[key] for key in ('endpoint', 'region', 'bucket', 'prefix', 'path_style')}
+    for name in ('organization_id', 'project_id', 'reader_application_id', 'writer_application_id'):
+        try:
+            if str(uuid.UUID(identity[name])) != identity[name]:
+                raise ValueError()
+        except (KeyError, ValueError, TypeError, AttributeError) as error:
+            raise OperatorError('invalid_private_identity') from error
+        binding[name] = identity[name]
+    if identity['reader_application_id'] == identity['writer_application_id']:
+        raise OperatorError('application_identities_must_differ')
+    if pairs['reader']['access-key'] == pairs['writer']['access-key']:
+        raise OperatorError('static_storage_keys_must_differ')
+    for role in ('reader', 'writer'):
+        digest = identity.get(role + '_policy_sha256', '')
+        if not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest):
+            raise OperatorError('invalid_private_policy_fingerprint')
+        binding[role + '_policy_sha256'] = digest
+        # Hash a canonical pair; never persist the input files or raw secret in evidence.
+        encoded = json.dumps(pairs[role], sort_keys=True, separators=(',', ':')).encode()
+        binding[role + '_credential_sha256'] = hashlib.sha256(encoded).hexdigest()
+    return binding
+
+
 def verify_broker_fingerprints(config, issuer_secret, receipt):
     """Use the deployed binary's offline canonical hashes before any Secret write."""
     with tempfile.TemporaryDirectory(prefix='devres-broker-admission-', dir='/tmp') as temporary:
@@ -428,6 +497,40 @@ class Operator:
             raise OperatorError("explicit_context_required")
         self.context = context
         self.bundle = safe_directory(bundle)
+
+    def settings(self):
+        settings = read_json(self.bundle / 'settings.json')
+        state = read_json(self.bundle / 'state.json')
+        if hashlib.sha256(private_read(self.bundle / 'settings.json')).hexdigest() != state.get('settings_sha256'):
+            raise OperatorError('bundle_settings_changed')
+        return renderer().settings_checked(settings)
+
+    def auth_mode(self):
+        return renderer().storage_auth(self.settings())
+
+    def workloads(self):
+        return renderer().workload_names(self.settings())
+
+    def runtime_secrets(self):
+        return renderer().runtime_secret_names(self.settings())
+
+    def database_workloads(self):
+        return tuple(name for name in self.workloads() if name in ('postgres', 'broker-postgres'))
+
+    def runtime_workloads(self):
+        return tuple(name for name in self.workloads() if name not in self.database_workloads())
+
+    def require_static_release(self):
+        if self.auth_mode() == 'scaleway_static' and not renderer().STATIC_AUTH_RELEASE_QUALIFIED:
+            raise OperatorError('qualified_static_storage_release_required')
+
+    def admit_storage_receipt(self):
+        self.require_static_release()
+        value = read_json(self.bundle / 'acceptance-receipt.json')
+        if self.auth_mode() == 'broker':
+            provider_receipt(value)
+        else:
+            static_storage_receipt(value, self.static_runtime_binding())
 
     def k(self, *args, data=None, timeout=180):
         return call(["k3s", "kubectl", "--context", self.context, "--namespace", NAMESPACE,
@@ -496,6 +599,11 @@ class Operator:
                     if item['kind'] == 'Deployment'}
         live = json.loads(self.k('get', 'deployments', '-o', 'json'))['items']
         actual = {item['metadata']['name']: item for item in live if item['metadata']['name'] in WORKLOADS}
+        if self.auth_mode() == 'scaleway_static':
+            for name in ('credential-broker', 'broker-postgres'):
+                retired = actual.pop(name, None)
+                if retired and (retired['spec'].get('replicas', 1) != 0 or retired.get('status', {}).get('replicas', 0) != 0):
+                    raise OperatorError('broker_runtime_not_retired')
         if set(actual) != set(expected):
             raise OperatorError('runtime_deployment_set_mismatch')
         for name, item in expected.items():
@@ -512,7 +620,7 @@ class Operator:
             for key in ('command', 'args', 'env', 'envFrom'):
                 if expected_container.get(key, []) != observed_container.get(key, []):
                     raise OperatorError('runtime_invocation_changed')
-        for name in RUNTIME_SECRETS:
+        for name in self.runtime_secrets():
             observed = json.loads(self.k('get', 'secret', name, '-o', 'json'))
             expected_secret = read_json(self.bundle / (name + '.json'))
             if observed.get('data') != expected_secret.get('data'):
@@ -524,6 +632,10 @@ class Operator:
                 or value['metadata'].get('namespace') != NAMESPACE or value.get('type') != 'Opaque'):
             raise OperatorError('unexpected_secret_manifest')
         self.k('apply', '-f', '-', data=encoded)
+
+    def provision_secret(self, name, encoded):
+        if not read_json(self.bundle / 'state.json').get('auth_switch_pending', False):
+            self.apply_secret(name, encoded)
 
     def install_firewall(self):
         desired = private_read(self.bundle / 'devres-guard.nft')
@@ -586,15 +698,17 @@ class Operator:
         self.k("apply", "-f", "-", data=manifest)
         # Only the PostgreSQL initialization secrets may exist before live IAM
         # admission. Other secrets are provisioned after independent acceptance.
-        for name in ("devres-corpus-postgres", "devres-broker-postgres"):
+        for name in ("devres-corpus-postgres",) + (("devres-broker-postgres",) if self.auth_mode() == "broker" else ()):
             secret = private_read(self.bundle / (name + ".json"))
             self.apply_secret(name, secret)
         self.record(phase='installed')
         return {"installed": True, "runtime_stopped": True}
 
     def prepare_local_volumes(self):
-        for directory, uid in (('/database/devres/corpus', 70), ('/database/devres/broker', 70),
-                               ('/var/cache/devres/serving', 65532), ('/var/cache/devres/writer', 65532)):
+        directories = [('/database/devres/corpus', 70), ('/var/cache/devres/serving', 65532), ('/var/cache/devres/writer', 65532)]
+        if self.auth_mode() == 'broker':
+            directories.append(('/database/devres/broker', 70))
+        for directory, uid in directories:
             path = Path(directory)
             if any(item.is_symlink() for item in (path, *path.parents)):
                 raise OperatorError('unsafe_local_volume')
@@ -606,18 +720,25 @@ class Operator:
 
     def start_postgres(self):
         self.validate_cluster()
-        for name in WORKLOADS[2:]:
+        state = read_json(self.bundle / 'state.json')
+        if state.get('auth_switch_pending') or state.get('auth_successor'):
+            raise OperatorError('active_authentication_bundle_required')
+        for name in self.runtime_workloads():
             if self.status().get(name, {}).get("desired", 0):
                 raise OperatorError("postgres_bootstrap_requires_stopped_runtime")
-        for name in WORKLOADS[:2]:
+        for name in self.database_workloads():
             self.scale(name, 1)
-        self.record(phase='postgres_ready')
+        if state.get('phase') not in ('runtime_provisioned', 'stopped', 'start_failed'):
+            self.record(phase='postgres_ready')
         return {"postgres_started": True}
 
     def provision_runtime(self, inputs_file):
         self.validate_cluster()
-        if any(self.status().get(name, {}).get('desired', 0) for name in WORKLOADS[2:]):
+        if any(self.status().get(name, {}).get('desired', 0) for name in self.runtime_workloads()):
             raise OperatorError('runtime_secret_update_requires_stopped_roles')
+        self.require_static_release()
+        if self.auth_mode() == 'scaleway_static':
+            return self.provision_static_runtime(inputs_file)
         inputs = read_json(inputs_file)
         for name in ('organization_id', 'project_id', 'issuer_application_id',
                      'reader_application_id', 'writer_application_id'):
@@ -690,16 +811,275 @@ class Operator:
         for name, manifest in manifests.items():
             encoded = json.dumps(manifest).encode()
             private_replace(self.bundle / (name + '.json'), encoded)
-            self.apply_secret(name, encoded)
+            self.provision_secret(name, encoded)
         for name, text in configs.items():
             private_replace(self.bundle / (name + '.toml'), text)
         self.record(phase='runtime_provisioned', runtime_receipt_sha256=hashlib.sha256(receipt_bytes).hexdigest())
         return {'runtime_secrets_provisioned': True, 'collectors_enabled': False}
 
+    def static_inputs(self, inputs_file):
+        inputs = read_json(inputs_file)
+        identity_fields = {'organization_id', 'project_id', 'reader_application_id', 'writer_application_id',
+                           'reader_policy_sha256', 'writer_policy_sha256'}
+        paths = {role + '_' + kind + '_file' for role in ('reader', 'writer') for kind in ('access_key', 'secret_key')}
+        if set(inputs) != identity_fields | paths | {'acceptance_receipt_file'}:
+            raise OperatorError('invalid_static_storage_inputs')
+        pairs = {role: static_key_pair(inputs[role + '_access_key_file'], inputs[role + '_secret_key_file'])
+                 for role in ('reader', 'writer')}
+        config = tomllib.loads(private_read(self.bundle / 'serving.toml.example').decode())
+        binding = static_binding(config, inputs, pairs)
+        return inputs, pairs, binding
+
+    def static_runtime_binding(self):
+        identity = read_json(self.bundle / 'static-storage-identity.json')
+        configs = {role: tomllib.loads(private_read(self.bundle / (role + '.toml')).decode())
+                   for role in ('serving', 'writer')}
+        for role, config in configs.items():
+            expected = renderer().runtime_config(writer=role == 'writer', auth='scaleway_static')
+            expected_storage = tomllib.loads(expected)['storage']['s3']
+            if config['storage']['s3'] != expected_storage:
+                raise OperatorError('static_storage_configuration_changed')
+        pairs = {}
+        for role, name in (('reader', 'devres-serving-s3'), ('writer', 'devres-writer-s3')):
+            secret = read_json(self.bundle / (name + '.json'))
+            if set(secret.get('data', {})) != {'access-key', 'secret-key'}:
+                raise OperatorError('static_storage_secret_invalid')
+            try:
+                pairs[role] = {key: base64.b64decode(value, validate=True).decode() for key, value in secret['data'].items()}
+            except (ValueError, UnicodeError) as error:
+                raise OperatorError('static_storage_secret_invalid') from error
+        return static_binding(configs['serving'], identity, pairs)
+
+    def provision_static_runtime(self, inputs_file):
+        self.require_roles_stopped()
+        inputs, pairs, binding = self.static_inputs(inputs_file)
+        receipt_bytes = private_read(inputs['acceptance_receipt_file'], 65536)
+        static_storage_receipt(json.loads(receipt_bytes), binding)
+        passwords = read_json(self.bundle / 'database-passwords.json')
+        configs = {}
+        for role, password in (('serving', 'reader'), ('writer', 'writer')):
+            text = private_read(self.bundle / (role + '.toml.example')).decode()
+            text = text.replace('@CORPUS_' + password.upper() + '_PASSWORD@', quote(passwords[password], safe=''))
+            if re.search(r'@[A-Z_]+@', text):
+                raise OperatorError('unresolved_private_configuration')
+            parsed = tomllib.loads(text)
+            expected = tomllib.loads(renderer().runtime_config(writer=role == 'writer', auth='scaleway_static'))
+            if parsed['storage']['s3'] != expected['storage']['s3']:
+                raise OperatorError('static_storage_configuration_changed')
+            if (parsed['storage']['s3']['credentials']['mode'] != 'files'
+                    or any(parsed[provider]['enabled'] for provider in COLLECTORS)):
+                raise OperatorError('invalid_static_storage_configuration')
+            configs[role] = text
+        tls = self.bundle / 'tls'
+        manifests = {name: secret_manifest(name, fields) for name, fields in (
+            ('devres-serving-config', {'serving.toml': configs['serving']}),
+            ('devres-writer-config', {'writer.toml': configs['writer']}),
+            ('devres-serving-s3', pairs['reader']), ('devres-writer-s3', pairs['writer']),
+            ('devres-backend-tls', {'backend.pem': private_read(tls / 'backend.crt'),
+                                   'backend-key.pem': private_read(tls / 'backend.key'),
+                                   'client-ca.pem': private_read(tls / 'edge-client-ca.crt')}),
+            ('devres-writer-tls', {'tls.crt': private_read(tls / 'writer.crt'),
+                                 'tls.key': private_read(tls / 'writer.key'),
+                                 'ca.crt': private_read(tls / 'coordination-ca.crt')}))}
+        identity = {key: inputs[key] for key in ('organization_id', 'project_id', 'reader_application_id',
+                                                'writer_application_id', 'reader_policy_sha256', 'writer_policy_sha256')}
+        # Validate every private input before the first cluster write. Partial writes remain stopped.
+        private_replace(self.bundle / 'static-storage-identity.json', json.dumps(identity))
+        private_replace(self.bundle / 'acceptance-receipt.json', receipt_bytes)
+        for role, text in configs.items():
+            private_replace(self.bundle / (role + '.toml'), text)
+        for name, manifest in manifests.items():
+            encoded = json.dumps(manifest).encode()
+            private_replace(self.bundle / (name + '.json'), encoded)
+            self.provision_secret(name, encoded)
+        self.record(phase='runtime_provisioned', runtime_receipt_sha256=hashlib.sha256(receipt_bytes).hexdigest())
+        return {'runtime_secrets_provisioned': True, 'collectors_enabled': False}
+
+    def require_roles_stopped(self):
+        current = self.status()
+        if any(current.get(name, {}).get('desired', 0) or current.get(name, {}).get('ready', 0)
+               for name in ('backend', 'writer')):
+            raise OperatorError('authentication_switch_requires_stopped_roles')
+        for name in ('backend', 'writer'):
+            self.k('wait', '--for=delete', 'pod', '-l', 'app=' + name, '--timeout=120s')
+
+    def pause_collectors(self):
+        """Disable only scheduling switches while both roles are stopped; leave broker keys alone."""
+        self.validate_cluster()
+        self.require_roles_stopped()
+        self.validate_runtime_state()
+        originals = {role: private_read(self.bundle / (role + '.toml')).decode() for role in ('serving', 'writer')}
+        disabled = {role: collector_config(text, False) for role, text in originals.items()}
+
+        def store(configs):
+            for role, text in configs.items():
+                name = 'devres-' + role + '-config'
+                encoded = json.dumps(secret_manifest(name, {role + '.toml': text}))
+                self.apply_secret(name, encoded.encode())
+                private_replace(self.bundle / (role + '.toml'), text)
+                private_replace(self.bundle / (name + '.json'), encoded)
+        try:
+            store(disabled)
+        except (OperatorError, OSError, ValueError):
+            try:
+                store(originals)
+            except (OperatorError, OSError, ValueError):
+                self.record(phase='collector_pause_recovery_incomplete')
+                raise OperatorError('collector_pause_recovery_incomplete') from None
+            raise
+        self.record(phase='stopped')
+        return {'collectors_paused': True, 'runtime_stopped': True, 'history_preserved': True}
+
+    def prepare_auth_switch(self, target_bundle, settings_file):
+        """Prepare a separate private bundle without initializing or changing storage."""
+        self.validate_cluster()
+        self.require_roles_stopped()
+        target = Path(target_bundle).absolute()
+        if target.exists() or target.is_symlink():
+            raise OperatorError('output_already_exists')
+        settings = renderer().settings_checked(read_json(settings_file))
+        old = self.settings()
+        mode = renderer().storage_auth(settings)
+        if mode == self.auth_mode():
+            raise OperatorError('authentication_mode_must_change')
+        if mode != 'scaleway_static':
+            raise OperatorError('rollback_requires_original_broker_bundle')
+        if {key: value for key, value in old.items() if key not in ('storage_auth', 'iam_cidrs')} != {
+                key: value for key, value in settings.items() if key not in ('storage_auth', 'iam_cidrs')}:
+            raise OperatorError('authentication_switch_settings_changed')
+        self.validate_runtime_state()
+        for role in ('serving', 'writer'):
+            config = tomllib.loads(private_read(self.bundle / (role + '.toml')).decode())
+            if any(config[name]['enabled'] for name in COLLECTORS):
+                raise OperatorError('authentication_switch_requires_disabled_collectors')
+        target.mkdir(mode=0o700)
+        previous = os.umask(0o077)
+        try:
+            renderer().render(target, settings)
+            # Keep original PostgreSQL identity and TLS; never invoke fresh bootstrap.
+            for name in ('database-passwords.json', 'devres-corpus-postgres.json', 'devres-guard.nft'):
+                private_replace(target / name, private_read(self.bundle / name))
+            tls = safe_directory(target / 'tls', create=True)
+            for path in (self.bundle / 'tls').iterdir():
+                if mode == 'scaleway_static' and path.name.startswith('credential-broker.'):
+                    continue
+                private_write(tls / path.name, private_read(path))
+            encoded = json.dumps(settings, sort_keys=True)
+            private_replace(target / 'settings.json', encoded)
+            for name in ('boot-guard-acceptance.json', 'lego-renewal.json', 'certificate-renewal-state.json',
+                         'source-acceptance.json', 'edge-acceptance.json'):
+                if (self.bundle / name).exists():
+                    private_replace(target / name, private_read(self.bundle / name))
+            if (self.bundle / 'edge-previous').exists():
+                snapshots = safe_directory(target / 'edge-previous', create=True)
+                for path in (self.bundle / 'edge-previous').iterdir():
+                    private_write(snapshots / path.name, private_read(path))
+            source_state = read_json(self.bundle / 'state.json')
+            state = {key: source_state[key] for key in ('version', 'revision', 'cluster_uid', 'node_uid', 'namespace_uid',
+                                                        'legacy_edge_adopted', 'edge_admitted')
+                     if key in source_state}
+            state.update(phase='auth_switch_prepared', settings_sha256=hashlib.sha256(encoded.encode()).hexdigest(),
+                         auth_switch_source=str(self.bundle), auth_switch_pending=True)
+            private_replace(target / 'state.json', json.dumps(state))
+        finally:
+            os.umask(previous)
+        return {'authentication_switch_prepared': True, 'runtime_stopped': True, 'history_preserved': True}
+
+    def broker_drained(self):
+        # Read only aggregate private journal state. The running broker owns reconciliation/revocation.
+        raw = self.k('exec', 'deployment/broker-postgres', '--', 'psql', '-U', 'devres_admin',
+                     '-d', 'devres_broker', '-At', '-v', 'ON_ERROR_STOP=1', '-c',
+                     "SELECT count(*) FROM devres_credential_broker_keys WHERE state <> 'revoked'")
+        if raw.strip() != b'0':
+            raise OperatorError('broker_issuance_or_revocation_unresolved')
+
+    def switch_storage_auth(self, target_bundle):
+        """Activate staged auth assets while stopped; never start roles or delete state."""
+        target = Operator(self.context, target_bundle)
+        if target.bundle == self.bundle:
+            raise OperatorError('separate_authentication_bundle_required')
+        with bundle_lock(target.bundle):
+            self.validate_cluster()
+            target.validate_cluster()
+            target.require_static_release()
+            target.admit_storage_receipt()
+            self.require_roles_stopped()
+            self.validate_runtime_state()
+            if target.auth_mode() == self.auth_mode():
+                raise OperatorError('authentication_mode_must_change')
+            source_state = read_json(self.bundle / 'state.json')
+            target_state = read_json(target.bundle / 'state.json')
+            if target_state.get('auth_switch_pending'):
+                if target_state.get('auth_switch_source') != str(self.bundle):
+                    raise OperatorError('authentication_switch_source_mismatch')
+            elif source_state.get('auth_switch_source') != str(target.bundle):
+                raise OperatorError('authentication_rollback_source_mismatch')
+            for name in ('database-passwords.json', 'devres-corpus-postgres.json'):
+                if private_read(self.bundle / name) != private_read(target.bundle / name):
+                    raise OperatorError('authentication_switch_database_changed')
+            for role in ('serving', 'writer'):
+                left = tomllib.loads(private_read(self.bundle / (role + '.toml')).decode())
+                right = tomllib.loads(private_read(target.bundle / (role + '.toml')).decode())
+                left_s3 = dict(left['storage']['s3'])
+                right_s3 = dict(right['storage']['s3'])
+                left_s3.pop('credentials')
+                right_s3.pop('credentials')
+                if left['storage']['database_url'] != right['storage']['database_url'] or left_s3 != right_s3:
+                    raise OperatorError('authentication_switch_archive_binding_changed')
+            broker = self if self.auth_mode() == 'broker' else target
+            static = target if target.auth_mode() == 'scaleway_static' else self
+            old_apps = set(read_json(broker.bundle / 'acceptance-receipt.json')['confined_application_ids'])
+            static_identity = read_json(static.bundle / 'static-storage-identity.json')
+            if old_apps & {static_identity['reader_application_id'], static_identity['writer_application_id']}:
+                raise OperatorError('static_applications_must_be_outside_broker_management')
+            if self.auth_mode() == 'broker':
+                self.broker_drained()
+            manifest = private_read(target.bundle / 'kubernetes.json', 4 * 1024**2)
+            if json.loads(manifest) != renderer().manifests(target.settings()):
+                raise OperatorError('rendered_manifest_changed')
+            self.k('apply', '--dry-run=server', '-f', '-', data=manifest)
+            self.record(phase='auth_switch_in_progress', auth_switch_target=str(target.bundle))
+            try:
+                if self.auth_mode() == 'broker':
+                    self.scale('credential-broker', 0)
+                    self.scale('broker-postgres', 0)
+                for name in target.runtime_secrets():
+                    target.apply_secret(name, private_read(target.bundle / (name + '.json')))
+                self.k('apply', '-f', '-', data=manifest)
+                if target.auth_mode() == 'scaleway_static':
+                    # Explicit allowlist only. Keep broker Deployment/DB/PV/Secrets and journal/keyring for rollback.
+                    for kind, names in (
+                            ('service', ('credential-broker', 'broker-postgres')),
+                            ('networkpolicy', ('credential-broker-boundary', 'broker-postgres-boundary')),
+                            ('rolebinding', ('devres-credential-broker-reviewer',)),
+                            ('role', ('devres-credential-broker-reviewer',)),
+                            ('clusterrolebinding', ('devres-credential-broker-reviewer',)),
+                            ('clusterrole', ('devres-credential-broker-reviewer',))):
+                        self.k('delete', kind, *names, '--ignore-not-found=true')
+                target.record(phase='runtime_provisioned', auth_switch_pending=False, auth_successor=None,
+                              auth_switch_source=str(self.bundle))
+                target.validate_runtime_state()
+                self.record(phase='auth_retired', auth_switch_target=str(target.bundle), auth_successor=str(target.bundle))
+            except (OperatorError, OSError, ValueError, KeyError):
+                try:
+                    for name in self.runtime_secrets():
+                        self.apply_secret(name, private_read(self.bundle / (name + '.json')))
+                    self.k('apply', '-f', '-', data=private_read(self.bundle / 'kubernetes.json', 4 * 1024**2))
+                    self.record(phase='stopped', auth_successor=None)
+                    target.record(phase='auth_switch_failed', auth_switch_pending=True)
+                except (OperatorError, OSError, ValueError):
+                    self.record(phase='auth_switch_recovery_incomplete')
+                    raise OperatorError('authentication_switch_recovery_incomplete') from None
+                raise
+            return {'authentication_switched': True, 'runtime_stopped': True, 'history_preserved': True,
+                    'startup_and_storage_acceptance_required': True}
+
     def admit_start(self):
         self.validate_cluster()
+        if read_json(self.bundle / 'state.json').get('auth_switch_pending'):
+            raise OperatorError('authentication_switch_not_applied')
         self.validate_runtime_state()
-        provider_receipt(read_json(self.bundle / "acceptance-receipt.json"))
+        self.admit_storage_receipt()
         # Runtime Secret/configuration provisioning is an independent prerequisite.
         # Presence alone is not proof; the broker verifies exact profile/secret
         # fingerprints and the trusted live cluster UID before issuing a key.
@@ -709,18 +1089,18 @@ class Operator:
             config = tomllib.loads(private_read(self.bundle / (role + '.toml')).decode())
             if any(config[name]['enabled'] for name in COLLECTORS):
                 raise OperatorError('initial_collectors_must_be_disabled')
-        for name in RUNTIME_SECRETS:
+        for name in self.runtime_secrets():
             self.k("get", "secret", name, "-o", "name")
         if shutil.disk_usage('/database/devres').free < MIN_FREE:
             raise OperatorError('capacity_reserve_required')
         try:
-            for name in WORKLOADS:
+            for name in self.workloads():
                 self.scale(name, 1)
         except OperatorError:
             self.record(phase='start_failed')
             self.stop()
             raise
-        self.record(phase='runtime_ready')
+        self.record(phase='edge_ready' if read_json(self.bundle / 'state.json').get('edge_admitted') else 'runtime_ready')
         return {"runtime_started": True, "collectors_require_separate_acceptance": True}
 
     def stop(self):
@@ -733,12 +1113,37 @@ class Operator:
                     self.scale(name, 0)
                 except OperatorError:
                     failures.append(name)
-        self.record(phase='stop_incomplete' if failures else 'stopped')
+        state = read_json(self.bundle / 'state.json')
+        admitted_edge = state.get('edge_admitted', False) or state.get('phase') in ('edge_ready', 'collectors_active')
+        self.record(phase='stop_incomplete' if failures else 'stopped', edge_admitted=admitted_edge)
         if failures:
             raise OperatorError('role_stop_incomplete')
         return {"serving_stopped": True, "writer_stopped": True, "history_preserved": True}
 
+    def active_auth_operator(self):
+        current = self
+        visited = set()
+        for _ in range(8):
+            if current.bundle in visited:
+                raise OperatorError('authentication_successor_cycle')
+            visited.add(current.bundle)
+            state = read_json(current.bundle / 'state.json')
+            successor = state.get('auth_successor')
+            if not successor:
+                return current
+            if state.get('phase') != 'auth_retired':
+                raise OperatorError('authentication_successor_not_retired')
+            following = Operator(self.context, successor)
+            if read_json(following.bundle / 'state.json').get('auth_switch_source') != str(current.bundle):
+                raise OperatorError('authentication_successor_binding_invalid')
+            current = following
+        raise OperatorError('authentication_successor_chain_exceeds_bound')
+
     def capacity(self):
+        active = self.active_auth_operator()
+        if active is not self:
+            with bundle_lock(active.bundle):
+                return active.capacity()
         self.validate_cluster()
         free = shutil.disk_usage("/database/devres").free
         if free < MIN_FREE:
@@ -798,8 +1203,13 @@ class Operator:
         call(['systemctl', 'enable', '--now', 'devres-cert-renew.timer'])
 
     def cert_renew(self):
+        active = self.active_auth_operator()
+        if active is not self:
+            with bundle_lock(active.bundle, '.certificate.lock'):
+                return active.cert_renew()
         self.validate_cluster()
-        if read_json(self.bundle / 'state.json').get('phase') not in ('edge_ready', 'collectors_active'):
+        state = read_json(self.bundle / 'state.json')
+        if state.get('phase') not in ('edge_ready', 'collectors_active') and not state.get('edge_admitted'):
             raise OperatorError('certificate_renewal_requires_admitted_edge')
         accepted = read_json(self.bundle / 'lego-renewal.json')
         compose = json.loads(call(['docker', 'compose', '--profile', 'run-lego', '-f', EDGE / 'docker-compose.yml',
@@ -982,7 +1392,7 @@ class Operator:
                 self.withdraw()
                 self.record(phase='edge_install_failed')
                 raise
-        self.record(phase='edge_ready', edge_installing=False)
+        self.record(phase='edge_ready', edge_installing=False, edge_admitted=True)
         return {'edge_started': True, 'public_acceptance_required': True}
 
     def withdraw(self):
@@ -1010,7 +1420,7 @@ class Operator:
         edge = read_json(edge_file)
         source_receipt(source)
         edge_receipt(edge)
-        provider_receipt(read_json(self.bundle / 'acceptance-receipt.json'))
+        self.admit_storage_receipt()
         if shutil.disk_usage('/database/devres').free < MIN_FREE:
             self.withdraw()
             raise OperatorError('capacity_reserve_required')
@@ -1070,13 +1480,15 @@ def prepare(output, settings_file):
         renderer().render(output, settings)
         encoded_settings = json.dumps(settings, sort_keys=True)
         private_write(output / 'settings.json', encoded_settings)
-        passwords, manifests = postgres_inputs()
+        mode = renderer().storage_auth(settings)
+        passwords, manifests = postgres_inputs(mode)
         private_write(output / "database-passwords.json", json.dumps(passwords))
         for item in manifests:
             private_write(output / (item["metadata"]["name"] + ".json"), json.dumps(item))
         private_write(output / "devres-guard.nft", firewall_rules())
-        private_write(output / 'broker-keyring.json', json.dumps({'active_key_id': 'initial', 'keys': {'initial': secrets.token_hex(32)}}))
-        prepare_tls(output)
+        if mode == 'broker':
+            private_write(output / 'broker-keyring.json', json.dumps({'active_key_id': 'initial', 'keys': {'initial': secrets.token_hex(32)}}))
+        prepare_tls(output, mode)
         private_write(output / 'state.json', json.dumps({'version': 1, 'revision': REVISION, 'phase': 'prepared',
                       'settings_sha256': hashlib.sha256(encoded_settings.encode()).hexdigest()}))
     finally:
@@ -1089,11 +1501,13 @@ def main():
     parser.add_argument("--context")
     parser.add_argument("--bundle", required=True, type=Path)
     parser.add_argument("--settings", type=Path)
+    parser.add_argument("--target-bundle", type=Path)
     parser.add_argument('--inputs', type=Path)
     parser.add_argument('--source-receipt', type=Path)
     parser.add_argument('--edge-receipt', type=Path)
     parser.add_argument("operation", choices=("prepare", "install", "start-postgres", "provision-runtime", "start",
-                        "adopt-serve", "edge-install", "cert-renew", "activate-collectors", "withdraw", "stop", "status", "capacity"))
+                        "adopt-serve", "edge-install", "cert-renew", "activate-collectors", "withdraw", "stop", "status", "capacity",
+                        "prepare-auth-switch", "switch-storage-auth", "static-fingerprints", "pause-collectors"))
     args = parser.parse_args()
     if args.operation == "prepare":
         if args.settings is None:
@@ -1102,13 +1516,25 @@ def main():
     else:
         operator = Operator(args.context, args.bundle)
         method = {"install": operator.install, "start-postgres": operator.start_postgres,
-                  "start": operator.admit_start, "stop": operator.stop,
+                  "start": operator.admit_start, "stop": operator.stop, "pause-collectors": operator.pause_collectors,
                   "status": operator.status, "capacity": operator.capacity,
                   'adopt-serve': operator.adopt_serve, 'edge-install': operator.edge_install, 'cert-renew': operator.cert_renew,
                   'withdraw': operator.withdraw}.get(args.operation)
         # Certificate propagation waits must not hold the capacity/lifecycle lock.
         with bundle_lock(operator.bundle, '.certificate.lock' if args.operation == 'cert-renew' else '.operator.lock'):
-            if args.operation == 'provision-runtime':
+            if args.operation == 'prepare-auth-switch':
+                if args.target_bundle is None or args.settings is None:
+                    parser.error('prepare-auth-switch requires --target-bundle and --settings')
+                result = operator.prepare_auth_switch(args.target_bundle, args.settings)
+            elif args.operation == 'switch-storage-auth':
+                if args.target_bundle is None:
+                    parser.error('switch-storage-auth requires --target-bundle')
+                result = operator.switch_storage_auth(args.target_bundle)
+            elif args.operation == 'static-fingerprints':
+                if args.inputs is None or operator.auth_mode() != 'scaleway_static':
+                    parser.error('static-fingerprints requires static mode and --inputs')
+                result = {'binding': operator.static_inputs(args.inputs)[2]}
+            elif args.operation == 'provision-runtime':
                 if args.inputs is None:
                     parser.error('provision-runtime requires --inputs')
                 result = operator.provision_runtime(args.inputs)

@@ -479,5 +479,337 @@ class ProductionOperatorTests(unittest.TestCase):
         self.assertIn(b'DNS:writer.devres.svc', writer)
 
 
+
+class StaticProductionOperatorTests(unittest.TestCase):
+    write = ProductionOperatorTests.write
+    # Reuse setup helpers, but run the static-focused tests below only.
+    def setUp(self):
+        ProductionOperatorTests.setUp(self)
+        self.settings['storage_auth'] = 'scaleway_static'
+        self.settings.pop('iam_cidrs')
+        previous = os.umask(0o077)
+        try:
+            operator.renderer().render(self.bundle, self.settings)
+        finally:
+            os.umask(previous)
+        encoded = json.dumps(self.settings, sort_keys=True)
+        self.write('settings.json', encoded)
+        self.write('state.json', json.dumps({'version': 1, 'revision': operator.REVISION, 'phase': 'prepared',
+                   'settings_sha256': hashlib.sha256(encoded.encode()).hexdigest()}))
+        self.op = FakeOperator(self.bundle)
+        self.op.current = {name: {'desired': 0, 'ready': 0} for name in self.op.workloads()}
+
+    def static_inputs(self):
+        apps = ('66666666-6666-4666-8666-666666666666', '77777777-7777-4777-8777-777777777777')
+        values = {'organization_id': '55555555-5555-4555-8555-555555555555',
+                  'project_id': '44444444-4444-4444-8444-444444444444',
+                  'reader_application_id': apps[0], 'writer_application_id': apps[1],
+                  'reader_policy_sha256': 'd' * 64, 'writer_policy_sha256': 'e' * 64,
+                  'acceptance_receipt_file': str(self.bundle / 'real-static-receipt.json')}
+        for role in ('reader', 'writer'):
+            for kind in ('access_key', 'secret_key'):
+                name = role + '-' + kind
+                self.write(name, 'test-only-' + name)
+                values[role + '_' + kind + '_file'] = str(self.bundle / name)
+        self.write('static-inputs.json', json.dumps(values))
+        binding = self.op.static_inputs(self.bundle / 'static-inputs.json')[2]
+        now = datetime.now(timezone.utc)
+        accepted = {'version': 1, 'mode': 'scaleway_static', 'fixture': False, 'binding': binding,
+                    'checks': {key: True for key in operator.STATIC_STORAGE_CHECKS},
+                    'verified_at': (now - timedelta(minutes=1)).isoformat(),
+                    'expires_at': (now + timedelta(hours=1)).isoformat()}
+        self.write('real-static-receipt.json', json.dumps(accepted))
+        return self.bundle / 'static-inputs.json', accepted
+
+    def static_provision(self):
+        inputs, _ = self.static_inputs()
+        with patch.object(self.op, 'require_static_release'):
+            self.op.provision_runtime(inputs)
+        return inputs
+
+    def test_static_old_release_denied_before_any_secret_write(self):
+        inputs, _ = self.static_inputs()
+        with self.assertRaisesRegex(operator.OperatorError, 'qualified_static_storage_release_required'):
+            self.op.provision_runtime(inputs)
+        self.assertEqual(self.op.events, [])
+
+    def test_static_import_separates_keys_and_excludes_issuer_material(self):
+        self.static_provision()
+        secrets = {event[2]['metadata']['name']: event[2] for event in self.op.events
+                   if event[0] == 'k' and event[2] and event[2].get('kind') == 'Secret'}
+        self.assertEqual(set(secrets), set(self.op.runtime_secrets()))
+        self.assertNotIn('devres-credential-broker-private', secrets)
+        self.assertNotEqual(secrets['devres-serving-s3']['data'], secrets['devres-writer-s3']['data'])
+        with patch.object(self.op, 'require_static_release'):
+            self.op.admit_storage_receipt()
+        for role in ('serving', 'writer'):
+            config = operator.private_read(self.bundle / (role + '.toml')).decode()
+            self.assertNotIn('test-only-reader-secret_key', config)
+            self.assertEqual(tomllib.loads(config)['storage']['s3']['credentials']['mode'], 'files')
+
+    def test_static_receipt_rejects_fixture_expired_checks_binding_and_broker_mode(self):
+        _, accepted = self.static_inputs()
+        binding = accepted['binding']
+        for changed in ({'fixture': True}, {'mode': 'broker'}, {'checks': {}},
+                        {'binding': {**binding, 'prefix': 'different'}},
+                        {'expires_at': '2000-01-01T00:00:00Z'}):
+            with self.subTest(changed=changed), self.assertRaises(operator.OperatorError):
+                operator.static_storage_receipt({**accepted, **changed}, binding)
+        with self.assertRaises(operator.OperatorError):
+            operator.provider_receipt(accepted)
+        with self.assertRaises(operator.OperatorError):
+            operator.static_storage_receipt(receipt(), binding)
+
+    def test_static_key_swap_requires_renewed_receipt_and_complete_distinct_pairs(self):
+        inputs, accepted = self.static_inputs()
+        self.write('reader-secret_key', 'test-only-rotated-secret')
+        self.op.events.clear()
+        with patch.object(self.op, 'require_static_release'), self.assertRaises(operator.OperatorError):
+            self.op.provision_runtime(inputs)
+        self.assertFalse(any(event[2] for event in self.op.events if event[0] == 'k'))
+        self.write('reader-access_key', 'test-only-writer-access_key')
+        with self.assertRaisesRegex(operator.OperatorError, 'static_storage_keys_must_differ'):
+            self.op.static_inputs(inputs)
+        self.write('reader-access_key', '\n')
+        with self.assertRaises(operator.OperatorError):
+            self.op.static_inputs(inputs)
+
+    def test_static_running_roles_refuse_rotation(self):
+        inputs, _ = self.static_inputs()
+        self.op.current['writer']['desired'] = 1
+        with patch.object(self.op, 'require_static_release'), self.assertRaises(operator.OperatorError):
+            self.op.provision_runtime(inputs)
+        self.assertEqual(self.op.events, [])
+
+    def test_static_modified_private_secret_rejected_at_start(self):
+        self.static_provision()
+        value = operator.read_json(self.bundle / 'devres-serving-s3.json')
+        value['data']['secret-key'] = base64.b64encode(b'test-only-different-key').decode()
+        self.write('devres-serving-s3.json', json.dumps(value))
+        with patch.object(self.op, 'require_static_release'), self.assertRaises(operator.OperatorError):
+            self.op.admit_start()
+        self.assertFalse(any(event[0] == 'scale' for event in self.op.events))
+
+    def test_static_start_has_no_broker_and_starts_writer_before_serving(self):
+        self.static_provision()
+        self.op.events.clear()
+        with patch.object(self.op, 'require_static_release'), patch.object(operator.shutil, 'disk_usage',
+                return_value=shutil._ntuple_diskusage(1000, 0, operator.MIN_FREE + 1)):
+            self.op.admit_start()
+        self.assertEqual([event for event in self.op.events if event[0] == 'scale'],
+                         [('scale', 'postgres', 1), ('scale', 'writer', 1), ('scale', 'backend', 1)])
+
+    def test_static_mode_settings_cannot_be_changed_in_place(self):
+        self.settings['storage_auth'] = 'broker'
+        self.write('settings.json', json.dumps(self.settings))
+        with self.assertRaisesRegex(operator.OperatorError, 'bundle_settings_changed'):
+            self.op.auth_mode()
+
+    def test_static_cutover_provision_stages_secrets_without_cluster_writes(self):
+        self.op.record(auth_switch_pending=True, auth_switch_source=str(self.root / 'original'))
+        self.static_provision()
+        self.assertFalse(any(event[2] for event in self.op.events if event[0] == 'k'))
+        self.assertEqual(operator.read_json(self.bundle / 'state.json')['phase'], 'runtime_provisioned')
+
+    def test_static_writer_template_tampering_rejected_before_secret_writes(self):
+        inputs, _ = self.static_inputs()
+        text = operator.private_read(self.bundle / 'writer.toml.example').decode()
+        self.write('writer.toml.example', text.replace('prefix = "production"', 'prefix = "other"'))
+        with patch.object(self.op, 'require_static_release'), self.assertRaisesRegex(
+                operator.OperatorError, 'static_storage_configuration_changed'):
+            self.op.provision_runtime(inputs)
+        self.assertFalse(any(event[2] for event in self.op.events if event[0] == 'k'))
+        self.assertFalse((self.bundle / 'static-storage-identity.json').exists())
+
+    def test_database_restart_preserves_admission_for_static_start(self):
+        self.static_provision()
+        self.op.start_postgres()
+        self.assertEqual(operator.read_json(self.bundle / 'state.json')['phase'], 'runtime_provisioned')
+        with patch.object(self.op, 'require_static_release'), patch.object(operator.shutil, 'disk_usage',
+                return_value=shutil._ntuple_diskusage(1000, 0, operator.MIN_FREE + 1)):
+            self.op.admit_start()
+        self.assertEqual(self.op.current['backend']['ready'], 1)
+
+    def test_static_postgres_generation_has_no_broker_identity(self):
+        passwords, manifests = operator.postgres_inputs('scaleway_static')
+        self.assertEqual(set(passwords), {'corpus_admin', 'reader', 'writer'})
+        self.assertEqual([item['metadata']['name'] for item in manifests], ['devres-corpus-postgres'])
+
+
+
+class AuthenticationSwitchTests(unittest.TestCase):
+    setUp = ProductionOperatorTests.setUp
+    write = ProductionOperatorTests.write
+    private_inputs = ProductionOperatorTests.private_inputs
+
+    def prepared_target(self):
+        self.write('devres-guard.nft', 'test-only-firewall')
+        with patch.object(operator, 'verify_broker_fingerprints'):
+            self.op.provision_runtime(self.private_inputs())
+        target_settings = {key: value for key, value in self.settings.items() if key != 'iam_cidrs'}
+        target_settings['storage_auth'] = 'scaleway_static'
+        self.write('target-settings.json', json.dumps(target_settings))
+        target_path = self.root / 'static-bundle'
+        self.op.prepare_auth_switch(target_path, self.bundle / 'target-settings.json')
+        target = FakeOperator(target_path)
+        holder = type('Fixture', (), {})()
+        holder.bundle = target_path
+        holder.op = target
+        holder.write = lambda name, value: operator.private_replace(target_path / name, value)
+        inputs, _ = StaticProductionOperatorTests.static_inputs(holder)
+        with patch.object(target, 'require_static_release'):
+            target.provision_runtime(inputs)
+        return target
+
+    def switch(self, source, target):
+        # Fixture only: never represent this mocked qualification as a production receipt.
+        with patch.object(operator, 'Operator', return_value=target), patch.object(target, 'require_static_release'):
+            return source.switch_storage_auth(target.bundle)
+
+    def test_cutover_and_original_bundle_rollback_preserve_database_binding_and_leave_stopped(self):
+        target = self.prepared_target()
+        original_database = operator.private_read(self.bundle / 'database-passwords.json')
+        self.assertEqual(operator.private_read(target.bundle / 'database-passwords.json'), original_database)
+        with patch.object(self.op, 'broker_drained'):
+            result = self.switch(self.op, target)
+        self.assertTrue(result['runtime_stopped'])
+        self.assertEqual(operator.read_json(self.bundle / 'state.json')['phase'], 'auth_retired')
+        self.assertFalse(operator.read_json(target.bundle / 'state.json')['auth_switch_pending'])
+        self.assertIn(('scale', 'credential-broker', 0), self.op.events)
+        self.assertIn(('scale', 'broker-postgres', 0), self.op.events)
+        deleted = [event[1] for event in self.op.events if event[0] == 'k' and event[1][0] == 'delete']
+        self.assertTrue(deleted)
+        self.assertFalse(any(kind in args for args in deleted for kind in ('secret', 'persistentvolume', 'persistentvolumeclaim', 'deployment')))
+        self.switch(target, self.op)
+        self.assertEqual(operator.read_json(self.bundle / 'state.json')['phase'], 'runtime_provisioned')
+        self.assertEqual(operator.private_read(self.bundle / 'database-passwords.json'), original_database)
+        self.assertFalse(any(event[0] == 'scale' and event[2] == 1 for event in self.op.events + target.events))
+
+    def test_unresolved_broker_journal_blocks_cutover_before_runtime_changes(self):
+        target = self.prepared_target()
+        self.op.events.clear()
+        with self.assertRaisesRegex(operator.OperatorError, 'broker_issuance_or_revocation_unresolved'):
+            self.switch(self.op, target)
+        self.assertFalse(any(event[0] == 'scale' or (event[0] == 'k' and event[1][0] in ('apply', 'delete'))
+                             for event in self.op.events))
+
+    def test_broker_count_probe_requires_zero_nonrevoked_records(self):
+        with patch.object(self.op, 'k', return_value=b'1\n'), self.assertRaises(operator.OperatorError):
+            self.op.broker_drained()
+        with patch.object(self.op, 'k', return_value=b'0\n'):
+            self.op.broker_drained()
+
+    def test_pending_authentication_bundle_cannot_start(self):
+        target = self.prepared_target()
+        target.events.clear()
+        with self.assertRaisesRegex(operator.OperatorError, 'authentication_switch_not_applied'):
+            target.admit_start()
+        self.assertEqual(target.events, [])
+
+    def test_binding_change_and_running_roles_prevent_cutover(self):
+        target = self.prepared_target()
+        self.op.current['writer']['desired'] = 1
+        with self.assertRaisesRegex(operator.OperatorError, 'authentication_switch_requires_stopped_roles'):
+            self.switch(self.op, target)
+        self.op.current['writer']['desired'] = 0
+        self.write('writer.toml', operator.private_read(self.bundle / 'writer.toml').decode().replace('prefix = "production"', 'prefix = "changed"'))
+        with self.assertRaisesRegex(operator.OperatorError, 'authentication_switch_archive_binding_changed'):
+            self.switch(self.op, target)
+
+    def test_application_overlap_prevents_broker_retirement(self):
+        target = self.prepared_target()
+        accepted = operator.read_json(self.bundle / 'acceptance-receipt.json')
+        identity = operator.read_json(target.bundle / 'static-storage-identity.json')
+        accepted['confined_application_ids'][0] = identity['reader_application_id']
+        self.write('acceptance-receipt.json', json.dumps(accepted))
+        with self.assertRaisesRegex(operator.OperatorError, 'static_applications_must_be_outside_broker_management'):
+            self.switch(self.op, target)
+
+    def test_old_release_cutover_gate_precedes_mutations(self):
+        target = self.prepared_target()
+        self.op.events.clear()
+        with patch.object(operator, 'Operator', return_value=target), self.assertRaisesRegex(
+                operator.OperatorError, 'qualified_static_storage_release_required'):
+            self.op.switch_storage_auth(target.bundle)
+        self.assertEqual(self.op.events, [])
+
+    def test_cutover_database_restart_start_and_rollback_start(self):
+        target = self.prepared_target()
+        with patch.object(self.op, 'broker_drained'):
+            self.switch(self.op, target)
+        target.start_postgres()
+        with patch.object(target, 'require_static_release'), patch.object(operator.shutil, 'disk_usage',
+                return_value=shutil._ntuple_diskusage(1000, 0, operator.MIN_FREE + 1)):
+            target.admit_start()
+        target.stop()
+        self.switch(target, self.op)
+        self.op.start_postgres()
+        with patch.object(operator.shutil, 'disk_usage',
+                return_value=shutil._ntuple_diskusage(1000, 0, operator.MIN_FREE + 1)):
+            self.op.admit_start()
+        self.assertEqual(self.op.current['backend']['ready'], 1)
+
+    def test_partial_apply_restores_source_configuration_without_starting_roles(self):
+        target = self.prepared_target()
+        with patch.object(self.op, 'broker_drained'), patch.object(target, 'apply_secret', side_effect=operator.OperatorError('fixture-apply-failure')):
+            with self.assertRaisesRegex(operator.OperatorError, 'fixture-apply-failure'):
+                self.switch(self.op, target)
+        self.assertEqual(operator.read_json(self.bundle / 'state.json')['phase'], 'stopped')
+        self.assertTrue(operator.read_json(target.bundle / 'state.json')['auth_switch_pending'])
+        self.assertFalse(any(event[0] == 'scale' and event[2] == 1 for event in self.op.events))
+
+
+    def test_enabled_collectors_block_prepare_until_stopped_pause_preserving_broker(self):
+        self.write('devres-guard.nft', 'test-only-firewall')
+        with patch.object(operator, 'verify_broker_fingerprints'):
+            self.op.provision_runtime(self.private_inputs())
+        for role in ('serving', 'writer'):
+            text = operator.private_read(self.bundle / (role + '.toml')).decode()
+            self.write(role + '.toml', operator.collector_config(text, True))
+        self.op.record(phase='collectors_active', legacy_edge_adopted=True)
+        self.op.stop()
+        settings = {**self.settings, 'storage_auth': 'scaleway_static'}
+        self.write('target-settings.json', json.dumps(settings))
+        with self.assertRaisesRegex(operator.OperatorError, 'authentication_switch_requires_disabled_collectors'):
+            self.op.prepare_auth_switch(self.root / 'refused', self.bundle / 'target-settings.json')
+        self.assertFalse((self.root / 'refused').exists())
+        self.op.current['credential-broker']['desired'] = 1
+        original = {role: tomllib.loads(operator.private_read(self.bundle / (role + '.toml')).decode()) for role in ('serving', 'writer')}
+        self.op.pause_collectors()
+        self.assertEqual(self.op.current['credential-broker']['desired'], 1)
+        for role in ('serving', 'writer'):
+            expected = original[role]
+            for provider in operator.COLLECTORS:
+                expected[provider]['enabled'] = False
+            self.assertEqual(tomllib.loads(operator.private_read(self.bundle / (role + '.toml')).decode()), expected)
+        self.op.prepare_auth_switch(self.root / 'paused-target', self.bundle / 'target-settings.json')
+        target = FakeOperator(self.root / 'paused-target')
+        self.assertTrue(operator.read_json(target.bundle / 'state.json')['edge_admitted'])
+        for role in ('serving', 'writer'):
+            config = tomllib.loads(operator.private_read(self.bundle / (role + '.toml')).decode())
+            self.assertFalse(any(config[name]['enabled'] for name in operator.COLLECTORS))
+
+    def test_edge_ownership_and_existing_timers_follow_cutover_and_rollback(self):
+        self.op.record(phase='edge_ready', legacy_edge_adopted=True)
+        self.op.stop()
+        accepted = {'revision': operator.REVISION, 'test_only': True}
+        self.write('lego-renewal.json', json.dumps(accepted))
+        operator.private_write(self.bundle / 'edge-previous' / 'original.toml', 'test-only-edge-preimage')
+        target = self.prepared_target()
+        self.assertTrue(operator.read_json(target.bundle / 'state.json')['legacy_edge_adopted'])
+        self.assertEqual(operator.read_json(target.bundle / 'lego-renewal.json'), accepted)
+        self.assertEqual(operator.private_read(target.bundle / 'edge-previous' / 'original.toml'), b'test-only-edge-preimage')
+        with patch.object(self.op, 'broker_drained'):
+            self.switch(self.op, target)
+        with patch.object(operator, 'Operator', return_value=target), patch.object(target, 'cert_renew', return_value={'forwarded': True}):
+            self.assertEqual(self.op.cert_renew(), {'forwarded': True})
+        with patch.object(operator, 'Operator', return_value=target), patch.object(target, 'capacity', return_value={'forwarded': True}):
+            self.assertEqual(self.op.capacity(), {'forwarded': True})
+        self.switch(target, self.op)
+        self.assertIs(self.op.active_auth_operator(), self.op)
+        with patch.object(operator, 'Operator', return_value=self.op):
+            self.assertIs(target.active_auth_operator(), self.op)
+
+
 if __name__ == '__main__':
     unittest.main()

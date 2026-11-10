@@ -1,0 +1,14 @@
+# Merge with the normal listener, source and role-specific writer configuration.
+# Both roles bind the same archive; each pod has its own disposable local cache.
+[storage.s3]
+endpoint = "https://s3.fr-par.scw.cloud"
+bucket = "devres-archive"
+region = "fr-par"
+prefix = "production"
+path_style = true
+cache_max_bytes = 68719476736
+
+[storage.s3.credentials]
+mode = "files"
+access_key_file = "/run/devres-s3/access-key"
+secret_key_file = "/run/devres-s3/secret-key"

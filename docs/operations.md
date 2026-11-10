@@ -1163,6 +1163,17 @@ a matching PostgreSQL backup and the separate application restore/acceptance
 procedure remain necessary for a server migration.
 
 
+## Static Scaleway authentication
+
+The optional [static Scaleway profile](../deploy/examples/scaleway-static/README.md)
+uses separate mounted read-only serving and read/write writer key pairs through
+the existing S3 file credential source. The broker remains the production default.
+Its stopped authentication-switch procedure preserves the database/archive binding,
+requires broker issuance/revocation to drain before retirement, and retains the
+original private broker bundle and journal for rollback. Real provider permission
+evidence and a qualified immutable release remain production admission gates;
+disposable fixture results do not satisfy them.
+
 ## Credential broker and split runtime upgrade
 
 This is a full-stop configuration/topology upgrade for filesystem and S3. Existing

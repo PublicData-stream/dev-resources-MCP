@@ -481,6 +481,13 @@ Both identity modes support their own optional
 fall through to profiles, instance metadata, external credential commands, or
 another identity source. Keep secret values out of TOML and process arguments.
 
+Static Scaleway IAM pairs use the existing `files` mode with separate serving
+read-only and writer read/write key files. The optional production deployment
+profile, permission templates, restart-based rotation, and acceptance gates are
+documented in the [static Scaleway example](../deploy/examples/scaleway-static/README.md).
+Changing authentication alone preserves the exact existing archive binding;
+static keys do not inherit broker lease expiry or automatic revocation.
+
 The local cache must fit pinned search generations, admitted downloads, and
 managed staging. Eviction removes only disposable, unleased materializations.
 An oversized working set fails explicitly; public reads retain existing deadlines

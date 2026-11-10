@@ -12,6 +12,9 @@ REVISION = '172d528d88d16c9ec4fd83a16674280815178930'
 SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:da44682428c2ee37568867cb5bf0b0c3d75cb01b4d1c027c00f313bb29cf737f'
 BROKER = 'ghcr.io/publicdata-stream/dev-resources-credential-broker@sha256:4ae4ea7fadeb1076cb387cd82a32ea25419914f32c4a454dbb015391a95e1889'
 PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:324c117f72029a4ab153029a6559ccda4d50cf464db164b361ff379a08b3839d'
+# The pinned production server predates role-derived object-storage transport guards.
+# A separately qualified immutable release must update this gate before static activation.
+STATIC_AUTH_RELEASE_QUALIFIED = False
 SOURCE_SHA256 = 'f3680663c2a1e69dfb12489ba44cc56512759b4068704443d3fb0c98bd7f57b0'
 OXIBELT = 'ghcr.io/oxibelt/oxibelt@sha256:9f8aa1715586a5c15e26fe48ab982b43c28abe49dc2f09b78c1450ffa01b33d1'
 LEGO = 'goacme/lego@sha256:6f1583fc026a455ea46a7a5858c576105bb69c2e2de69db391cab7f14750350c'
@@ -40,15 +43,40 @@ def resource(kind, name, spec=None, **fields):
     return result
 
 
+def storage_auth(settings):
+    value = settings.get('storage_auth', 'broker')
+    if value not in ('broker', 'scaleway_static'):
+        raise ValueError('Unknown storage authentication method')
+    return value
+
+
+def workload_names(settings):
+    if storage_auth(settings) == 'broker':
+        return ('postgres', 'broker-postgres', 'credential-broker', 'writer', 'backend')
+    return ('postgres', 'writer', 'backend')
+
+
+def runtime_secret_names(settings):
+    common = ('devres-serving-config', 'devres-writer-config')
+    if storage_auth(settings) == 'broker':
+        return (*common, 'devres-credential-broker-config', 'devres-backend-tls',
+                'devres-writer-tls', 'devres-broker-trust', 'devres-credential-broker-private')
+    return (*common, 'devres-backend-tls', 'devres-writer-tls', 'devres-serving-s3', 'devres-writer-s3')
+
+
 def settings_checked(settings):
-    allowed = {'node_name', 'node_ipv4', 'kube_api_cidrs', 'iam_cidrs', 'edge_image', 'oxibelt_digest'}
+    allowed = {'node_name', 'node_ipv4', 'kube_api_cidrs', 'iam_cidrs', 'edge_image', 'oxibelt_digest',
+               'storage_auth'}
     if set(settings) - allowed:
         raise ValueError('Unknown production setting')
     result = {'node_name': 'publicdatamcp-b130e', 'node_ipv4': '62.210.240.40', **settings}
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', result['node_name']):
         raise ValueError('Invalid Kubernetes node name')
     ipaddress.IPv4Address(result['node_ipv4'])
+    auth = storage_auth(result)
     for key in ('kube_api_cidrs', 'iam_cidrs'):
+        if key == 'iam_cidrs' and auth == 'scaleway_static' and key not in result:
+            continue
         if not isinstance(result.get(key), list) or not result[key]:
             raise ValueError('Explicit Kubernetes API and IAM CIDRs are required')
         networks = [ipaddress.ip_network(value, strict=True) for value in result[key]]
@@ -147,6 +175,7 @@ def rule(peers, ports, direction='to'):
 
 
 def manifests(settings):
+    auth = storage_auth(settings)
     node = settings['node_name']
     namespace = resource('Namespace', NAMESPACE)
     namespace['metadata']['labels'] = {'pod-security.kubernetes.io/' + key: 'restricted'
@@ -253,16 +282,36 @@ def manifests(settings):
                     rule([peer('credential-broker')], [(9444, 'TCP')])]),
         'credential-broker': ([rule([peer('backend'), peer('writer')], [(9444, 'TCP')], 'from')],
                               [dns, api, rule([peer('broker-postgres')], [(5432, 'TCP')]),
-                               rule([{'ipBlock': {'cidr': value}} for value in settings['iam_cidrs']], [(443, 'TCP')])]),
+                               rule([{'ipBlock': {'cidr': value}} for value in settings.get('iam_cidrs', [])], [(443, 'TCP')])]),
         'postgres': ([rule([peer('backend'), peer('writer')], [(5432, 'TCP')], 'from')], []),
         'broker-postgres': ([rule([peer('credential-broker')], [(5432, 'TCP')], 'from')], [])}
     for name, (ingress, egress) in policies.items():
         items.append(resource('NetworkPolicy', name + '-boundary', {'podSelector': peer(name)['podSelector'],
                      'policyTypes': ['Ingress', 'Egress'], 'ingress': ingress, 'egress': egress}))
+    if auth == 'scaleway_static':
+        # Remove the complete issuer runtime, rather than leaving dormant credentials,
+        # identities, storage or network grants in an otherwise static deployment.
+        items = [item for item in items if 'broker' not in item['metadata']['name']]
+        for item in items:
+            name = item['metadata']['name']
+            if item['kind'] == 'Deployment' and name in ('backend', 'writer'):
+                pod = item['spec']['template']['spec']
+                pod['volumes'] = [value for value in pod['volumes'] if not value['name'].startswith('broker-')]
+                container = pod['containers'][0]
+                container['volumeMounts'] = [value for value in container['volumeMounts']
+                                            if not value['name'].startswith('broker-')]
+                identity = secret('s3', 'devres-writer-s3' if name == 'writer' else 'devres-serving-s3')
+                identity['secret']['items'] = [{'key': key, 'path': key} for key in ('access-key', 'secret-key')]
+                pod['volumes'].append(identity)
+                container['volumeMounts'].append(mount('s3', '/run/devres-s3', True))
+            elif item['kind'] == 'NetworkPolicy' and name in ('backend-boundary', 'writer-boundary'):
+                item['spec']['egress'] = [entry for entry in item['spec']['egress']
+                                          if peer('credential-broker') not in entry.get('to', [])]
     return {'apiVersion': 'v1', 'kind': 'List', 'items': items}
 
 
-def runtime_config(writer=False):
+def runtime_config(writer=False, auth='broker'):
+    storage_auth({'storage_auth': auth})
     role = 'WRITER' if writer else 'READER'
     sections = ['# PRIVATE TEMPLATE: substitute credentials locally; never commit the result.',
                 '[source]', f'url = "https://github.com/PublicData-stream/dev-resources-MCP/releases/download/{VERSION}/source.tar.gz"']
@@ -310,6 +359,11 @@ endpoint = "https://credential-broker.devres.svc:9444/v1/credentials"
 authorization_token_file = "/run/devres-broker-identity/token"
 ca_file = "/run/devres-broker-trust/ca.crt"
 refresh_before_secs = 300''')
+    if auth == 'scaleway_static':
+        sections[-1] = sections[-1].split('[storage.s3.credentials]')[0] + '''[storage.s3.credentials]
+mode = "files"
+access_key_file = "/run/devres-s3/access-key"
+secret_key_file = "/run/devres-s3/secret-key"'''
     if writer:
         sections.append('''
 [writer_listener]
@@ -369,14 +423,16 @@ def render(output_dir: Path, settings: dict):
     settings = settings_checked(settings)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    auth = storage_auth(settings)
     values = {'kubernetes.json': json.dumps(manifests(settings), indent=2, sort_keys=True) + '\n',
-              'serving.toml.example': runtime_config(), 'writer.toml.example': runtime_config(True),
-              'credential-broker.toml.example': broker_config(),
+              'serving.toml.example': runtime_config(auth=auth), 'writer.toml.example': runtime_config(True, auth),
               'edge-compose.json': json.dumps(edge_compose(settings), indent=2, sort_keys=True) + '\n',
               'release.json': json.dumps({'version': VERSION, 'revision': REVISION, 'server': SERVER,
                                          'broker': BROKER, 'probe': PROBE, 'postgres': POSTGRES,
                                          'source_sha256': SOURCE_SHA256}, indent=2, sort_keys=True) + '\n',
               'edge.toml': 'include = ["oxibelt-conf/*.toml"]\n'}
+    if auth == 'broker':
+        values['credential-broker.toml.example'] = broker_config()
     for template in (HERE / 'edge-conf').glob('*.toml'):
         values['edge-conf/' + template.name] = template.read_text()
     paths = {}

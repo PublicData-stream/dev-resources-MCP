@@ -5,9 +5,15 @@ These assets render the separately authorized fresh deployment of
 historical staging operator. Rendering does not install anything or create
 credentials. The generated Kubernetes `List` is JSON accepted by `kubectl -f`.
 
-Production activation remains gated on provider-confirmed issuer confinement to
-the two workload applications. Preparation never manufactures that acceptance and
-never substitutes file credentials for the broker architecture.
+The default `broker` authentication method remains gated on provider-confirmed
+issuer confinement to the two workload applications. Preparation never
+manufactures that acceptance. An explicitly selected `scaleway_static` profile
+renders separate static serving/writer key mounts; it requires its own real
+storage-permission acceptance and never satisfies broker admission. The pinned
+server release predates the role-derived transport guard, so static production
+provisioning/start/cutover remain fenced until a separately qualified immutable
+release updates `STATIC_AUTH_RELEASE_QUALIFIED`. Rendering alone does not qualify
+or activate it. See the [static Scaleway examples](../examples/scaleway-static/README.md).
 
 The dated [preparation evidence](acceptance-evidence.md) records the published
 release, local checks, inactive target state and incomplete acceptance gates.
@@ -39,8 +45,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 deploy/production/production.py \
   --output /tmp/devres-production-rendered
 ```
 
-Settings contain `node_name` (the actual lowercase Kubernetes node name),
-`node_ipv4`, explicit narrow `kube_api_cidrs` and `iam_cidrs` lists, and
+Settings accept `storage_auth` (`broker` by default or `scaleway_static`) and contain `node_name` (the actual lowercase Kubernetes node name),
+`node_ipv4`, explicit narrow `kube_api_cidrs` and broker-only `iam_cidrs` lists, and
 `oxibelt_digest` (the verified 64-character SHA-256 digest). Include both the
 Kubernetes Service IP and its actual API endpoint when CNI translation requires
 them. IAM destinations must be public IPv4 networks of /24 or narrower. Resolve
@@ -68,6 +74,14 @@ and command arguments.
 | `devres-broker-trust` | `ca.crt` |
 | `devres-credential-broker-private` | `tls.crt`, `tls.key`, `database-url`, `keyring.json`, `issuer-secret-key`, `acceptance-receipt.json` |
 
+For `scaleway_static`, omit all broker-specific Secrets in the table and add
+`devres-serving-s3` and `devres-writer-s3`, each with `access-key` and `secret-key`.
+Only the matching role mounts each Secret, at `/run/devres-s3`, read-only. Static
+output omits the broker workload, database/PV, service account/RBAC, identity
+projections, trust material and IAM policy rule. Keep native Secret encryption,
+writer authentication, private networking and role-separated database authority.
+The renderer writes no populated credentials or passing acceptance receipt.
+
 The corpus PostgreSQL login roles are `devres_reader` and `devres_writer`, with
 database `devres` on Service `postgres`. The writer owns its database/schema;
 the reader has SELECT-only, NOINHERIT authority and default transaction read-only.
@@ -77,7 +91,7 @@ exists in that instance. Initialization SQL and passwords are supplied privately
 changing a Secret does not rotate an initialized database. Both PostgreSQL Pods
 use the pinned Alpine image's UID/GID 70 and PostgreSQL 18 data directory.
 
-All five Deployments start at zero replicas. All eight collector switches are
+All five broker Deployments, or the three static Deployments, start at zero replicas. All eight collector switches are
 false in both runtime templates; npm's catalog remains empty and its advisory
 switch retains true. Apply namespace and deny policies before workloads, provision
 private identities and local directories, verify native Secret encryption, then
@@ -106,7 +120,7 @@ python3 scripts/production-operator.py --context default --bundle /var/lib/devre
 python3 scripts/production-operator.py --context default --bundle /var/lib/devres-production withdraw
 ```
 
-Private runtime inputs name `organization_id`, `project_id`, `issuer_access_key`,
+For broker authentication, private runtime inputs name `organization_id`, `project_id`, `issuer_access_key`,
 `issuer_application_id`, `reader_application_id`, `writer_application_id`,
 `reader_policy_sha256`, `writer_policy_sha256`, `issuer_secret_file`, and
 `acceptance_receipt_file`. An optional `keyring_file` replaces the locally generated
@@ -116,10 +130,36 @@ any runtime Secret is applied. The operator never writes a passing provider rece
 Its state binds kube-system, node and devres namespace UIDs, private settings, exact
 release identities, live workload templates and runtime Secret bytes.
 
-`prepare` creates private PostgreSQL initialization, separate mTLS identities and
-journal encryption material. `install` keeps all five replicas at zero and applies
-the NodePort firewall before Services. Start both PostgreSQL instances, the broker,
-exactly one writer, then serving.
+For broker authentication, `prepare` creates private PostgreSQL initialization,
+separate mTLS identities and journal encryption material. `install` keeps all five
+replicas at zero and applies the NodePort firewall before Services. Start both
+PostgreSQL instances, the broker, exactly one writer, then serving.
+
+For static authentication, preparation omits the broker database, keyring and
+issuer identities. Use `static-fingerprints --inputs PRIVATE_STATIC_INPUTS` to
+obtain the binding for an independently verified real storage receipt, then
+`provision-runtime` and `start`. The current production release gate still refuses
+static provisioning/start/switch; local code and rendering do not qualify its
+pinned binary. The [static operator workflow](../examples/scaleway-static/README.md#production-operator-workflow)
+lists exact input fields, receipt checks, controlled restart rotation and commands.
+For an existing corpus, stop source roles and disable source collector admission
+before `prepare-auth-switch --target-bundle NEW --settings STATIC_SETTINGS`.
+For an activated broker source, run `pause-collectors` after `stop`; it verifies
+stopped serving/writer roles and exact runtime state, changes only the eight
+collector flags in their two configurations/Secrets, and preserves all budgets and
+the running broker's credentials. Failed updates restore the original role
+configurations. Do not reprovision issuer keys or drain the broker before the
+actual switch. Preparation refuses enabled source configurations. Privately stage
+target credentials, and run
+`switch-storage-auth --target-bundle NEW` from the source. The switch leaves roles
+stopped, preserves archive/database binding and retains the original broker bundle
+and journal for explicit rollback; it does not bootstrap or generically prune
+retained storage. Original edge metadata/snapshots and adoption/renewal
+qualification accompany the target bundle. Existing capacity/certificate timers
+follow the retired source's bounded reciprocal `auth_successor` binding; the
+switch changes no systemd unit, edge route or edge process. Target startup returns
+to `edge_ready` for separate acceptance/collector activation. Rollback restores
+the original bundle and clears its successor.
 Use the explicit-context [runtime helper](../../scripts/split-runtime-control.py)
 after prerequisites are installed. Validate native projected-token identity,
 pod replacement/key expiry, cross-database denial, RO object denial, a refused
