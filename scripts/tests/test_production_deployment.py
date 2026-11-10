@@ -1,4 +1,5 @@
 """Behavioral checks for production rendering and runtime isolation contracts."""
+import hashlib
 import importlib.util
 import ipaddress
 import json
@@ -21,6 +22,31 @@ class ProductionDeploymentTests(unittest.TestCase):
                          'iam_cidrs': ['51.159.0.1/32'], 'oxibelt_digest': 'a' * 64}
         self.manifest = production.manifests(production.settings_checked(self.settings))
         self.objects = {(item['kind'], item['metadata']['name']): item for item in self.manifest['items']}
+
+    def test_optional_apparmor_changes_only_pod_profile_for_each_auth_topology(self):
+        for auth, count in [('broker', 5), ('scaleway_static', 3)]:
+            settings = {**self.settings, 'storage_auth': auth}
+            original = production.manifests(production.settings_checked(settings))
+            selected = production.manifests(production.settings_checked({
+                **settings, 'apparmor_profile': 'devres-runtime'}))
+            changed = 0
+            for item in selected['items']:
+                if item['kind'] == 'Deployment':
+                    profile = item['spec']['template']['spec']['securityContext'].pop('appArmorProfile')
+                    self.assertEqual(profile, {'type': 'Localhost', 'localhostProfile': 'devres-runtime'})
+                    changed += 1
+            self.assertEqual(changed, count)
+            self.assertEqual(selected, original)
+        asset = production.HERE / 'apparmor/devres-runtime'
+        self.assertEqual(hashlib.sha256(asset.read_bytes()).hexdigest(), production.APPARMOR_SHA256)
+
+    def test_invalid_apparmor_is_rejected_before_render_creates_output(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            for invalid in ('unconfined', 'docker-default', '../devres-runtime', '', None, True, []):
+                output = Path(temporary) / 'not-created'
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    production.render(output, {**self.settings, 'apparmor_profile': invalid})
+                self.assertFalse(output.exists())
 
     def test_render_is_deterministic_and_templates_parse(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:

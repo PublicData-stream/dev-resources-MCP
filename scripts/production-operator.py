@@ -36,6 +36,9 @@ WORKLOADS = ("postgres", "broker-postgres", "credential-broker", "writer", "back
 COLLECTORS = ("rfc", "crates", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm")
 MIN_FREE = 128 * 1024**3
 EDGE = Path('/serve')
+APPARMOR_FILE = Path('/etc/apparmor.d/devres-runtime')
+APPARMOR_PROFILES = Path('/sys/kernel/security/apparmor/profiles')
+APPARMOR_SHA256 = '4375146629c956b8e63cc4b358ef52c6bcda458621b7dcf8601b0f3d922b3e7e'
 RUNTIME_SECRETS = ('devres-serving-config', 'devres-writer-config', 'devres-credential-broker-config',
                    'devres-backend-tls', 'devres-writer-tls', 'devres-broker-trust',
                    'devres-credential-broker-private')
@@ -139,6 +142,36 @@ def renderer():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def validate_apparmor(settings):
+    """Check an explicitly selected host policy; never install or load it."""
+    if 'apparmor_profile' not in settings:
+        return
+    if settings['apparmor_profile'] != 'devres-runtime':
+        raise OperatorError('unsupported_apparmor_profile')
+    try:
+        if any(path.is_symlink() for path in (APPARMOR_FILE, *APPARMOR_FILE.parents)):
+            raise OperatorError('unsafe_apparmor_profile_file')
+        descriptor = os.open(APPARMOR_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                    or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 65536):
+                raise OperatorError('unsafe_apparmor_profile_file')
+            with os.fdopen(descriptor, 'rb', closefd=False) as source:
+                value = source.read(65537)
+            if hashlib.sha256(value).hexdigest() != APPARMOR_SHA256:
+                raise OperatorError('apparmor_profile_hash_mismatch')
+        finally:
+            os.close(descriptor)
+        descriptor = os.open(APPARMOR_PROFILES, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as source:
+            loaded = source.read(1024**2 + 1)
+        if len(loaded) > 1024**2 or b'devres-runtime (enforce)' not in loaded.splitlines():
+            raise OperatorError('apparmor_profile_not_enforcing')
+    except OSError as error:
+        raise OperatorError('apparmor_profile_unavailable') from error
 
 
 def read_json(path):
@@ -572,7 +605,12 @@ class Operator:
             raise OperatorError("bundle_release_identity_mismatch")
         return identity
 
-    def validate_cluster(self, bind=False):
+    def validate_cluster(self, bind=False, require_host_policy=True):
+        # Start/install check policy before API access. Safety shutdowns retain
+        # every identity check while remaining possible after host-policy drift.
+        settings = self.settings()
+        if require_host_policy:
+            validate_apparmor(settings)
         self.validate_identity()
         state = read_json(self.bundle / 'state.json')
         if state.get('revision') != REVISION:
@@ -595,7 +633,8 @@ class Operator:
         if bind and state.get('cluster_uid') is None:
             self.record(cluster_uid=uid, node_uid=node_uid, namespace_uid=namespace_uid)
 
-    def validate_runtime_state(self):
+    def validate_workload_templates(self, names=None):
+        settings = self.settings()
         manifest = read_json(self.bundle / 'kubernetes.json')
         if manifest != renderer().manifests(renderer().settings_checked(read_json(self.bundle / 'settings.json'))):
             raise OperatorError('rendered_manifest_changed')
@@ -603,7 +642,13 @@ class Operator:
                     if item['kind'] == 'Deployment'}
         live = json.loads(self.k('get', 'deployments', '-o', 'json'))['items']
         actual = {item['metadata']['name']: item for item in live if item['metadata']['name'] in WORKLOADS}
-        if self.auth_mode() == 'scaleway_static':
+        if names is not None:
+            selected = set(names)
+            if not selected or not selected <= set(expected):
+                raise OperatorError('unexpected_workload_selection')
+            expected = {name: item for name, item in expected.items() if name in selected}
+            actual = {name: item for name, item in actual.items() if name in selected}
+        elif self.auth_mode() == 'scaleway_static':
             for name in ('credential-broker', 'broker-postgres'):
                 retired = actual.pop(name, None)
                 if retired and (retired['spec'].get('replicas', 1) != 0 or retired.get('status', {}).get('replicas', 0) != 0):
@@ -617,6 +662,13 @@ class Operator:
                     or any(container.get('securityContext', {}).get('privileged')
                            for container in observed.get('containers', []))):
                 raise OperatorError('unexpected_runtime_privilege')
+            if 'apparmor_profile' in settings:
+                annotations = actual[name]['spec']['template']['metadata'].get('annotations', {})
+                if (any('appArmorProfile' in container.get('securityContext', {})
+                        for container in observed.get('containers', []))
+                        or any(key.startswith('container.apparmor.security.beta.kubernetes.io/')
+                               for key in annotations)):
+                    raise OperatorError('unexpected_apparmor_override')
             if not contains_expected(observed, desired):
                 raise OperatorError('runtime_deployment_identity_mismatch')
             expected_container = desired['containers'][0]
@@ -624,6 +676,9 @@ class Operator:
             for key in ('command', 'args', 'env', 'envFrom'):
                 if expected_container.get(key, []) != observed_container.get(key, []):
                     raise OperatorError('runtime_invocation_changed')
+
+    def validate_runtime_state(self):
+        self.validate_workload_templates()
         for name in self.runtime_secrets():
             observed = json.loads(self.k('get', 'secret', name, '-o', 'json'))
             expected_secret = read_json(self.bundle / (name + '.json'))
@@ -730,6 +785,7 @@ class Operator:
         for name in self.runtime_workloads():
             if self.status().get(name, {}).get("desired", 0):
                 raise OperatorError("postgres_bootstrap_requires_stopped_runtime")
+        self.validate_workload_templates(self.database_workloads())
         for name in self.database_workloads():
             self.scale(name, 1)
         if state.get('phase') not in ('runtime_provisioned', 'stopped', 'start_failed'):
@@ -1108,7 +1164,7 @@ class Operator:
         return {"runtime_started": True, "collectors_require_separate_acceptance": True}
 
     def stop(self):
-        self.validate_cluster()
+        self.validate_cluster(require_host_policy=False)
         current = self.status()
         failures = []
         for name in ("backend", "writer"):
@@ -1148,7 +1204,7 @@ class Operator:
         if active is not self:
             with bundle_lock(active.bundle):
                 return active.capacity()
-        self.validate_cluster()
+        self.validate_cluster(require_host_policy=False)
         free = shutil.disk_usage("/database/devres").free
         if free < MIN_FREE:
             self.withdraw()
@@ -1400,7 +1456,7 @@ class Operator:
         return {'edge_started': True, 'public_acceptance_required': True}
 
     def withdraw(self):
-        self.validate_cluster()
+        self.validate_cluster(require_host_policy=False)
         failures = []
         try:
             call(['docker', 'compose', '-f', EDGE / 'docker-compose.yml', 'stop', 'oxibelt'])

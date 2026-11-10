@@ -278,3 +278,29 @@ activation step after provider/isolation acceptance, then observe readiness,
 restarts, broker leases, corpus progress and capacity for ten minutes. A failure
 withdraws the edge and stops serving/writer while retaining both databases,
 broker journal and S3 objects. Report each acceptance boundary separately.
+
+Production settings optionally accept `"apparmor_profile": "devres-runtime"`.
+Omitting it preserves the existing runtime-default behavior. This is the only
+accepted explicit name; unknown names, empty/null values and Unconfined are
+rejected before rendering output. Selecting it sets the Pod-level Localhost
+AppArmor profile for every generated workload: PostgreSQL, writer and serving in
+static mode, plus broker PostgreSQL and credential broker in broker mode. Existing
+UIDs, capabilities, seccomp, read-only roots, replicas and storage stay unchanged.
+
+Before any cluster API call in install/start validation, the operator requires
+`/etc/apparmor.d/devres-runtime` to be a regular root:root file, without symlinks or
+hard links, not writable by group/others, with the reviewed SHA-256. It also
+requires the exact `devres-runtime (enforce)` kernel profile entry. Missing,
+modified or non-enforcing policy fails closed. PostgreSQL startup validates the
+actual database Deployment templates, including the selected Pod profile and
+absence of container/legacy-annotation overrides, before scaling. This check does
+not require writer/serving runtime Secrets before their provisioning stage. Full
+runtime validation uses the same template checks before checking Secrets.
+
+Safety `stop`, `withdraw` and capacity fencing retain release, canonical settings,
+cluster, node and namespace identity checks while permitting shutdown after host
+policy drift. They bypass only the host-policy health gate, and never use that
+exception to start a workload. This setting does not install or load host policy. Changing a prepared bundle requires a separately
+reviewed stopped-runtime migration that updates its settings hash, canonical
+manifest and exact workload profile fields together; editing settings alone is
+rejected. See the [profile provenance and controlled apply/rollback procedure](apparmor/README.md).

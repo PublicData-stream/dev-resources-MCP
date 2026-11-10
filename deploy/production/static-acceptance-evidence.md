@@ -191,3 +191,123 @@ The old RFC integrity failure and its spent requests remain preserved; no source
 gate was retried or relabeled as belonging to this release. Public edge, boot
 failure denial, certificate reload, ten-minute observation and corpus acceptance
 remain separate gates. Backups and full corpus coverage are not claimed.
+
+## Continuation through fixed-source acceptance
+
+A later continuation on 2026-11-10 installed the static foundation with all three
+Deployments stopped. The host guard received explicit k3s/Docker dependencies and
+an exact live-rule verifier. Actual starts of each daemon were denied for an
+invalid guard file, missing file and missing table: six negative cases. Services
+and the guard were restored. The original controller's final check rejected
+systemd's native empty `Job` value; a separate locked reconciliation verified the
+executed sources, all six logs, quiescent controller/watchdog, effective units,
+node readiness and zero workloads before recording genuine acceptance. No fault
+was replayed and no reboot was tested.
+
+The same short-lived presigned list requests returned 200 on the target, 403 from
+the development KVM, then 200 again on the target before expiry. This is observed
+source-address enforcement; it does not establish every allowed IPv6 path.
+A separately authorized private empty canary in the other owned project produced
+403 `AccessDenied` for both applications' list and native bucket-delete requests,
+with production-list positive controls. Administrator cleanup deleted only that
+empty bucket and confirmed absence. Its creation CLI had exited 1; ownership,
+privacy and empty state were independently reconciled without retrying creation
+or claiming CLI success or proven creation causation.
+
+All eight fixed-source parser and rights checks then passed against the selected
+release libraries. Every failed attempt remains in the same carried ledger:
+
+| Family | Total spent requests |
+| --- | ---: |
+| RFC | 4 |
+| crates | 3 |
+| RustSec | 7 |
+| MDN | 5 |
+| WHATWG | 5 |
+| W3C | 2 |
+| Chromium | 5 |
+| npm | 3 |
+
+The shared GitHub count was 17 of 20. The unchanged predecessor and every
+single-use recovery marker remain retained. Helper corrections cover the actual
+RFC header, Git v2 HTTP advertisement/HEAD negotiation, early response retention,
+and projection of immutable content provenance for rights qualification. The
+released rights compiler still requires one exact target and performs its normal
+charged source/license acquisitions. This is bounded fixed-source acceptance,
+not full collection or publication of these test artifacts.
+
+Focused source-helper checks passed 19 Rust tests and five wrapper tests; the
+production startup changes passed 57 Python tests (two optional skips). A fresh
+isolated minikube fixture passed encrypted Secrets, TCP/UDP NodePorts, CNI
+isolation, PVC restart/coordinated restore, HTTP MCP and both supported
+WebTransport revision checks. Its owned profile, daemons, bridge and firewall
+chains were removed. These local results do not replace hosted native release
+checks or target acceptance.
+
+Starting fresh target PostgreSQL exposed a separate host regression: kernel
+AppArmor audit records refused required interprocess signals to the exact
+`//&unconfined` stacked peer. Longer bounded TCP startup checks prevented early
+liveness interruption but did not resolve that policy fault. PostgreSQL was
+stopped again with its existing data preserved; database bootstrap roles/grants
+remain unverified. A dedicated profile proposal received separate host-security
+authorization; native application and acceptance were still pending at this
+checkpoint. Default profiles and restriction sysctls had not been changed.
+
+The newly approved isolated rotation trial had not created keys or S3 objects.
+Preparation failures happened before that boundary; failed temporary state was
+retained and owned processes were cleaned up. Exported image indexes, native
+platform manifests, configurations and layers were verified cryptographically;
+Docker's containerd-backed image-ID representation was recorded separately from
+traditional config IDs. Runtime rotation/revocation, version-deletion and
+administrative mutation denial, real private/public edge acceptance and the
+production observation window remain incomplete. No production storage receipt,
+collector activation or public service readiness is claimed.
+
+
+## Dedicated profile and preserved partial rotation trial
+
+After separate host-security approval, the exact dedicated `devres-runtime`
+profile was installed and loaded in enforcing mode. Only the three stopped
+static-mode Deployment templates and their canonical bundle were updated. The
+runtime-default profiles, restriction sysctls and existing boot settings were
+preserved. UID70 and UID65532 isolated signal fixtures passed; their observed
+labels were bare, so those fixtures alone do not establish the stacked-peer case.
+The actual target PostgreSQL then became Ready with zero restarts under the
+selected profile, preserving its system identifier, PV/PVC and existing data.
+
+The interrupted first bootstrap had created the data directory but no application
+database or application roles. A separately reviewed reconciliation verified that
+absence and the exact original mounted initialization SQL before running it once.
+Database roles, grants, default read permissions and reader read-only settings
+were checked against the intended initialization. No data was recreated or wiped,
+and writer/backend remained stopped.
+
+The approved isolated runtime trial created exactly two 900-second keys and
+successfully published its first synthetic capture through the released SDK.
+Its observer then stopped because it had omitted the SDK's archived integrity
+sidecar and sidecar binding from the expected object inventory. There were five
+owned objects totaling 808 bytes, within the approved sixteen-key/four-MiB
+ceiling. Owned trial containers and daemon were stopped and removed; the capture,
+PostgreSQL data and failed observer evidence were retained. Both exact temporary
+keys were explicitly revoked and confirmed absent before their expiry, while the
+operating baseline keys remained unchanged. This partial attempt does not prove
+runtime rotation or post-revocation cold reads. Additional temporary keys require
+a separately approved continuation; the first capture must not be republished.
+
+A fresh read-only IAM snapshot found one direct policy and no groups for each
+application. Reader permissions were ObjectStorageObjectsRead and
+ObjectStorageReadOnly. Writer additionally had ObjectStorageObjectsWrite and
+ObjectStorageObjectsDelete. Both scopes remained the selected project with the
+exact two approved source-IP conditions. A representative IAM DELETE request to
+an administrator-verified nonexistent policy returned 404, so its strict denial
+check stopped before the second role. Administrator readback still found that
+sentinel absent. This is inconclusive administration-denial evidence, not a
+passing 403 test or a claim about provider authorization ordering.
+
+The integrated optional-profile renderer/operator test run completed successfully:
+64 focused Python cases, including two existing optional skips. Independent security/storage review
+closed those changes. Source acceptance, local minikube and hosted native release
+results above remain separate evidence. Production storage admission, runtime
+rotation, version-deletion denial, public edge acceptance, collector activation
+and the ten-minute observation gate are still incomplete. Public service remains
+inactive; backups, reboot acceptance and full corpus coverage are not claimed.

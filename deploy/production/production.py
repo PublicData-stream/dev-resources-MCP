@@ -19,6 +19,8 @@ STATIC_AUTH_RELEASE_QUALIFIED = True
 SOURCE_SHA256 = '98f107f09bc4cb69b519408cbd21518307470f77006597bdc70a3feebe339a06'
 OXIBELT = 'ghcr.io/oxibelt/oxibelt@sha256:9f8aa1715586a5c15e26fe48ab982b43c28abe49dc2f09b78c1450ffa01b33d1'
 LEGO = 'goacme/lego@sha256:6f1583fc026a455ea46a7a5858c576105bb69c2e2de69db391cab7f14750350c'
+APPARMOR_PROFILE = 'devres-runtime'
+APPARMOR_SHA256 = '4375146629c956b8e63cc4b358ef52c6bcda458621b7dcf8601b0f3d922b3e7e'
 POSTGRES = 'postgres:18.6-alpine3.24@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395'
 HOST = 'dev-resources.mcp.publicdata.stream'
 NAMESPACE = 'devres'
@@ -67,9 +69,11 @@ def runtime_secret_names(settings):
 
 def settings_checked(settings):
     allowed = {'node_name', 'node_ipv4', 'kube_api_cidrs', 'iam_cidrs', 'edge_image', 'oxibelt_digest',
-               'storage_auth'}
+               'storage_auth', 'apparmor_profile'}
     if set(settings) - allowed:
         raise ValueError('Unknown production setting')
+    if 'apparmor_profile' in settings and settings['apparmor_profile'] != APPARMOR_PROFILE:
+        raise ValueError('Only the reviewed devres-runtime AppArmor profile is supported')
     result = {'node_name': 'publicdatamcp-b130e', 'node_ipv4': '62.210.240.40', **settings}
     if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', result['node_name']):
         raise ValueError('Invalid Kubernetes node name')
@@ -137,6 +141,9 @@ def deployment(name, image, command, requests, limits, volumes, mounts, ports, s
            'securityContext': {'runAsNonRoot': True, 'runAsUser': uid, 'runAsGroup': uid,
                                'fsGroup': uid, 'seccompProfile': {'type': 'RuntimeDefault'}},
            'containers': [container], 'volumes': volumes}
+    if 'apparmor_profile' in settings:
+        pod['securityContext']['appArmorProfile'] = {
+            'type': 'Localhost', 'localhostProfile': settings['apparmor_profile']}
     if service_account:
         pod['serviceAccountName'] = service_account
     if database:

@@ -38,10 +38,13 @@ class FakeOperator(operator.Operator):
         self.current = {name: {'desired': 0, 'ready': 0} for name in operator.WORKLOADS}
         self.fail_scale = set()
 
-    def validate_cluster(self, bind=False):
+    def validate_cluster(self, bind=False, require_host_policy=True):
         self.validate_identity()
 
     def validate_runtime_state(self):
+        pass
+
+    def validate_workload_templates(self, names=None):
         pass
 
     def status(self):
@@ -110,6 +113,180 @@ class ProductionOperatorTests(unittest.TestCase):
                   'issuer_secret_file': str(self.bundle / 'issuer-key')}
         self.write('inputs.json', json.dumps(values))
         return self.bundle / 'inputs.json'
+
+    def test_optional_apparmor_host_gate_precedes_api_and_workload_changes(self):
+        self.settings['apparmor_profile'] = 'devres-runtime'
+        encoded = json.dumps(self.settings, sort_keys=True)
+        self.write('settings.json', encoded)
+        self.op.record(settings_sha256=hashlib.sha256(encoded.encode()).hexdigest())
+        real = operator.Operator('production-test', self.bundle)
+        with patch.object(operator, 'APPARMOR_FILE', self.root / 'missing-profile'), \
+                patch.object(operator, 'call') as invoke:
+            for action in (real.install, real.start_postgres, real.admit_start):
+                with self.assertRaisesRegex(operator.OperatorError, 'apparmor_profile_unavailable'):
+                    action()
+            invoke.assert_not_called()
+        self.settings['apparmor_profile'] = 'unconfined'
+        encoded = json.dumps(self.settings, sort_keys=True)
+        self.write('settings.json', encoded)
+        self.op.record(settings_sha256=hashlib.sha256(encoded.encode()).hexdigest())
+        with patch.object(operator, 'call') as invoke, self.assertRaises(ValueError):
+            real.validate_cluster()
+        invoke.assert_not_called()
+
+    def test_apparmor_asset_integrity_and_kernel_enforcing_state_are_both_required(self):
+        profile = self.root / 'profile'
+        profile.write_bytes((operator.ROOT / 'deploy/production/apparmor/devres-runtime').read_bytes())
+        profile.chmod(0o644)
+        loaded = self.root / 'profiles'
+        loaded.write_text('devres-runtime (enforce)\n')
+        inode = profile.stat().st_ino
+        actual_fstat = os.fstat
+
+        def fixture_root_owner(descriptor):
+            info = actual_fstat(descriptor)
+            if info.st_ino == inode:
+                fields = list(info)
+                fields[4:6] = [0, 0]
+                return os.stat_result(fields)
+            return info
+
+        settings = {**self.settings, 'apparmor_profile': 'devres-runtime'}
+        with patch.object(operator, 'APPARMOR_FILE', profile), \
+                patch.object(operator, 'APPARMOR_PROFILES', loaded), \
+                patch.object(operator.os, 'fstat', side_effect=fixture_root_owner):
+            operator.validate_apparmor(settings)
+            for invalid in ('', 'devres-runtime (complain)\n', 'unconfined\n',
+                            'devres-runtime//&unconfined (enforce)\n'):
+                loaded.write_text(invalid)
+                with self.subTest(label=invalid), self.assertRaisesRegex(
+                        operator.OperatorError, 'apparmor_profile_not_enforcing'):
+                    operator.validate_apparmor(settings)
+            loaded.write_text('devres-runtime (enforce)\n')
+            profile.write_bytes(profile.read_bytes() + b'\n')
+            with self.assertRaisesRegex(operator.OperatorError, 'apparmor_profile_hash_mismatch'):
+                operator.validate_apparmor(settings)
+            profile.chmod(0o666)
+            with self.assertRaisesRegex(operator.OperatorError, 'unsafe_apparmor_profile_file'):
+                operator.validate_apparmor(settings)
+            profile.chmod(0o644)
+            os.link(profile, self.root / 'profile-hardlink')
+            with self.assertRaisesRegex(operator.OperatorError, 'unsafe_apparmor_profile_file'):
+                operator.validate_apparmor(settings)
+        with patch.object(operator.os, 'open', side_effect=AssertionError('host I/O forbidden')):
+            operator.validate_apparmor(self.settings)
+
+    def test_selected_profile_rejects_container_and_legacy_annotation_overrides(self):
+        real = operator.Operator('production-test', self.bundle)
+        self.settings['apparmor_profile'] = 'devres-runtime'
+        encoded = json.dumps(self.settings, sort_keys=True)
+        self.write('settings.json', encoded)
+        real.record(settings_sha256=hashlib.sha256(encoded.encode()).hexdigest())
+        manifest = operator.renderer().manifests(operator.renderer().settings_checked(self.settings))
+        self.write('kubernetes.json', json.dumps(manifest))
+        live = {'items': [item for item in manifest['items'] if item['kind'] == 'Deployment']}
+        secrets = {name: operator.secret_manifest(name, {'test': 'value'}) for name in operator.RUNTIME_SECRETS}
+        for name, value in secrets.items():
+            self.write(name + '.json', json.dumps(value))
+
+        def get(*args, **kwargs):
+            return json.dumps(live if args[1] == 'deployments' else secrets[args[2]]).encode()
+
+        with patch.object(real, 'k', side_effect=get):
+            operator.Operator.validate_runtime_state(real)
+            template = live['items'][0]['spec']['template']
+            container_security = template['spec']['containers'][0]['securityContext']
+            container_security['appArmorProfile'] = {'type': 'Unconfined'}
+            with self.assertRaisesRegex(operator.OperatorError, 'unexpected_apparmor_override'):
+                operator.Operator.validate_runtime_state(real)
+            container_security.pop('appArmorProfile')
+            template['metadata']['annotations'] = {
+                'container.apparmor.security.beta.kubernetes.io/postgres': 'unconfined'}
+            with self.assertRaisesRegex(operator.OperatorError, 'unexpected_apparmor_override'):
+                operator.Operator.validate_runtime_state(real)
+
+    def test_database_start_validates_live_profile_before_scale_without_runtime_secrets(self):
+        self.settings['apparmor_profile'] = 'devres-runtime'
+        encoded = json.dumps(self.settings, sort_keys=True)
+        self.write('settings.json', encoded)
+        self.op.record(settings_sha256=hashlib.sha256(encoded.encode()).hexdigest())
+        manifest = operator.renderer().manifests(operator.renderer().settings_checked(self.settings))
+        self.write('kubernetes.json', json.dumps(manifest))
+        live = {'items': [item for item in manifest['items'] if item['kind'] == 'Deployment']}
+        real = operator.Operator('production-test', self.bundle)
+        template = live['items'][0]['spec']['template']
+        security = template['spec']['securityContext']
+        expected = security['appArmorProfile']
+
+        def get(*args, **kwargs):
+            self.assertEqual(args[0], 'get')
+            self.assertIn(args[1], ('deploy', 'deployments'))
+            return json.dumps(live).encode()
+
+        with patch.object(real, 'validate_cluster'), patch.object(real, 'k', side_effect=get), \
+                patch.object(real, 'scale') as scale:
+            security.pop('appArmorProfile')
+            with self.assertRaises(operator.OperatorError):
+                real.start_postgres()
+            security['appArmorProfile'] = {'type': 'Unconfined'}
+            with self.assertRaises(operator.OperatorError):
+                real.start_postgres()
+            security['appArmorProfile'] = expected
+            container = template['spec']['containers'][0]['securityContext']
+            container['appArmorProfile'] = {'type': 'Unconfined'}
+            with self.assertRaisesRegex(operator.OperatorError, 'unexpected_apparmor_override'):
+                real.start_postgres()
+            container.pop('appArmorProfile')
+            template['metadata']['annotations'] = {
+                'container.apparmor.security.beta.kubernetes.io/postgres': 'unconfined'}
+            with self.assertRaisesRegex(operator.OperatorError, 'unexpected_apparmor_override'):
+                real.start_postgres()
+            scale.assert_not_called()
+            template['metadata'].pop('annotations')
+            self.assertFalse((self.bundle / 'devres-serving-config.json').exists())
+            real.start_postgres()
+            self.assertEqual(scale.call_args_list, [unittest.mock.call('postgres', 1),
+                                                   unittest.mock.call('broker-postgres', 1)])
+
+    def test_host_policy_drift_blocks_start_but_not_identity_bound_safety_shutdown(self):
+        self.settings['apparmor_profile'] = 'devres-runtime'
+        encoded = json.dumps(self.settings, sort_keys=True)
+        self.write('settings.json', encoded)
+        self.op.record(settings_sha256=hashlib.sha256(encoded.encode()).hexdigest(),
+                       cluster_uid='cluster-1', node_uid='node-1', namespace_uid='namespace-1')
+        real = operator.Operator('production-test', self.bundle)
+        node = {'metadata': {'uid': 'node-1'},
+                'status': {'addresses': [{'address': self.settings['node_ipv4']}]}}
+
+        def get(*args, **kwargs):
+            self.assertEqual(args[0], 'get')
+            if args[1] == 'node':
+                value = node
+            elif args[1] == 'namespace':
+                value = {'metadata': {'uid': 'cluster-1' if args[2] == 'kube-system' else 'namespace-1'}}
+            else:
+                value = {'items': [{'metadata': {'name': name}, 'spec': {'replicas': 1},
+                                    'status': {'readyReplicas': 1}} for name in ('writer', 'backend')]}
+            return json.dumps(value).encode()
+
+        with patch.object(operator, 'validate_apparmor', side_effect=operator.OperatorError('apparmor_profile_hash_mismatch')) as gate, \
+                patch.object(real, 'k', side_effect=get), patch.object(real, 'scale') as scale, \
+                patch.object(operator, 'call', return_value=b'') as external:
+            with self.assertRaisesRegex(operator.OperatorError, 'apparmor_profile_hash_mismatch'):
+                real.start_postgres()
+            real.stop()
+            real.withdraw()
+            with patch.object(operator.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(1000, 999, 1)):
+                self.assertTrue(real.capacity()['capacity_fenced'])
+            gate.assert_called_once()
+            self.assertTrue(scale.call_args_list)
+            self.assertTrue(all(item.args[1] == 0 for item in scale.call_args_list))
+            self.assertTrue(all(item.args[0][-2:] == ['stop', 'oxibelt'] for item in external.call_args_list))
+            scale.reset_mock()
+            node['metadata']['uid'] = 'recreated-node'
+            with self.assertRaisesRegex(operator.OperatorError, 'runtime_identity_recreated'):
+                real.stop()
+            scale.assert_not_called()
 
     def test_database_wait_encloses_startup_budget_without_delaying_other_roles(self):
         real = operator.Operator('production-test', self.bundle)
@@ -257,6 +434,7 @@ class ProductionOperatorTests(unittest.TestCase):
             operator.merge_edge_compose(existing, desired)
 
     def test_api_defaulted_runtime_accepts_writable_mounts_and_rejects_image_or_privilege_changes(self):
+        real = operator.Operator('production-test', self.bundle)
         manifest = operator.read_json(self.bundle / 'kubernetes.json')
         live = {'items': [item for item in manifest['items'] if item['kind'] == 'Deployment']}
         for item in live['items']:
@@ -270,17 +448,17 @@ class ProductionOperatorTests(unittest.TestCase):
         def get(*args, **kwargs):
             return json.dumps(live if args[1] == 'deployments' else secrets[args[2]]).encode()
 
-        with patch.object(self.op, 'k', side_effect=get):
-            operator.Operator.validate_runtime_state(self.op)
+        with patch.object(real, 'k', side_effect=get):
+            operator.Operator.validate_runtime_state(real)
             container = live['items'][0]['spec']['template']['spec']['containers'][0]
             original = container['image']
             container['image'] = 'unrelated:latest'
             with self.assertRaises(operator.OperatorError):
-                operator.Operator.validate_runtime_state(self.op)
+                operator.Operator.validate_runtime_state(real)
             container['image'] = original
             live['items'][0]['spec']['template']['spec']['hostNetwork'] = True
             with self.assertRaises(operator.OperatorError):
-                operator.Operator.validate_runtime_state(self.op)
+                operator.Operator.validate_runtime_state(real)
 
     def renewal_fixture(self):
         edge = self.root / 'serve'

@@ -88,3 +88,13 @@ The adaptation renders two workload-specific names and adds exact same-workload
 stacked-label signal permission for the deployment host's AppArmor behavior.
 It retains the upstream proc/sys/mount restrictions and confines the change to
 these new workloads; existing cluster profiles are not modified.
+
+## Production AppArmor profile
+
+The optional [production profile](deploy/production/apparmor/devres-runtime)
+adapts k3s-io/containerd at `605c492164bf52dfbf3fb1c9a2388f2483579f77`
+and Moby's vendored container profile at
+`70efc0e31da3a115fc87574d1b786fa2b867c346`. Copyright The docker Authors,
+The Moby Authors, and The containerd Authors. It remains Apache-2.0; original
+source snapshots, exact hashes, modifications and the complete license accompany
+it in [profile provenance](deploy/production/apparmor/README.md).
