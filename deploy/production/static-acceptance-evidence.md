@@ -311,3 +311,47 @@ results above remain separate evidence. Production storage admission, runtime
 rotation, version-deletion denial, public edge acceptance, collector activation
 and the ten-minute observation gate are still incomplete. Public service remains
 inactive; backups, reboot acceptance and full corpus coverage are not claimed.
+
+
+The subsequent approved PostgreSQL restart replaced only the exact UID-bound Pod.
+The replacement belonged to the original Deployment and became Ready with zero
+restarts. Its system identifier, PV/PVC identities, roles, grants and reader
+read-only behavior matched the pre-restart state; writer/backend remained stopped.
+The old runtime container record had already been garbage-collected when checked,
+so no old-container exit-code or graceful-shutdown claim is made.
+
+Current direct policy and group API responses also confirmed complete pagination:
+one policy and zero groups per application, matching the CLI snapshot. An
+independent effective-policy review checked their single project rules, current
+permission-set definitions, exact IP conditions and the unchanged approved bucket
+policy fingerprint. Neither role had IAM or bucket-administration grants. Fresh
+known-existing application GET requests returned 403 `permissions_denied` for
+both operating pairs. These controls and the earlier real empty-bucket DELETE
+403 support the administration boundary; the absent-policy DELETE 404 remains
+inconclusive and is not relabeled as a mutation-denial success.
+
+The partial runtime trial's SDK sidecar accounting was corrected independently:
+four keys per capture plus the shared descriptor yield five existing keys or nine
+for two captures. Eleven offline cleanup tests, nine continuation-flow tests and
+five mocked IAM lifecycle tests passed. The corrected controllers preserve the
+original first capture, data, spent requests and failure records, and require a
+separate explicit scope for two replacement test keys. No replacement key was
+created at this checkpoint, and no production storage admission was emitted.
+
+
+A later bounded kernel audit scanned 1,580 records since 17:00 UTC without reaching
+its 2,000-record cap and found zero signal denials naming the dedicated profile.
+PostgreSQL remained Ready with zero restarts. Raw kernel messages were not exported.
+
+The version-deletion probe could not obtain a positive version control. Its first
+read-only preflight rejected Scaleway's single empty XML `Status` element before
+any object request. A separately reviewed compatibility correction preserved that
+failure and its two read-only requests. The fresh preflight accepted the empty
+status but its exact-object `GET ?versionId=null` returned 404. A separate regular
+GET returned the retained 82-byte body with its expected SHA-256 and ETag. Thus five
+administrator reads were spent across the original preflight, diagnostic,
+corrected preflight and regular positive control; no workload DELETE was sent.
+No actual non-null version was available, so version-deletion acceptance remains
+incomplete. A versioned canary would require separate resource/policy/test/cleanup
+authorization, with results explicitly scoped to that canary. Neither production
+bucket versioning nor its policy was changed.
