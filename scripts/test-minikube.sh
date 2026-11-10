@@ -173,6 +173,8 @@ python3 scripts/secrets-encryption-fixture.py verify "$scratch/encrypted-secret"
 k delete secret devres-encryption-canary
 if (( s3 )); then
   k create secret generic devres-s3-credentials --from-file="$scratch/fixture/s3/"
+  k create secret generic devres-serving-s3 --from-file="$scratch/fixture/s3-serving/"
+  k create secret generic devres-writer-s3 --from-file="$scratch/fixture/s3-writer/"
 fi
 k create secret generic devres-config --from-file=backend.toml="$scratch/fixture/backend.toml" \
   --from-literal=postgres-password=fixture-only
@@ -188,12 +190,12 @@ fi
 k create secret generic devres-tls --from-file="$scratch/fixture/cert/"
 k create configmap devres-edge-config --from-file=oxibelt.toml="$scratch/fixture/config/oxibelt.toml"
 sed "s|DEVRES_HARNESS_IMAGE|$image|g" deploy/kubernetes/foundation.yaml > "$scratch/foundation.yaml"
-if (( s3 )); then python3 scripts/s3-kubernetes-fixture.py foundation "$scratch/foundation.yaml"; fi
+if (( s3 && ! credential_broker )); then python3 scripts/s3-kubernetes-fixture.py foundation "$scratch/foundation.yaml"; fi
 if (( credential_broker )); then python3 scripts/broker-kubernetes-fixture.py workloads "$scratch/foundation.yaml"; fi
 k apply -f "$scratch/foundation.yaml"
 sed -e "s|DEVRES_HARNESS_IMAGE|$image|g" -e "s|DEVRES_AUTH_REVIEWER|$run_id-reviewer|g" \
   deploy/kubernetes/split-runtime.yaml > "$scratch/split-runtime.yaml"
-if (( s3 )); then python3 scripts/s3-kubernetes-fixture.py writer "$scratch/split-runtime.yaml"; fi
+if (( s3 && ! credential_broker )); then python3 scripts/s3-kubernetes-fixture.py writer "$scratch/split-runtime.yaml"; fi
 if (( credential_broker )); then python3 scripts/broker-kubernetes-fixture.py workloads "$scratch/split-runtime.yaml"; fi
 k apply -f "$scratch/split-runtime.yaml"
 k rollout status deployment/postgres --timeout=180s
@@ -301,6 +303,30 @@ else:
 PYBROKERRECOVERY
   echo 'Real pod identities and distinct S3 role enforcement verified'
 fi
+if (( s3 && ! credential_broker )); then
+  k exec deployment/writer -- python3 -I -B /harness/static-s3-fixture.py check writer \
+    /fixture/s3/probe.json /fixture/s3 > "$scratch/static-writer-id"
+  k exec deployment/backend -- python3 -I -B /harness/static-s3-fixture.py check serving \
+    /fixture/s3/probe.json /fixture/s3 > "$scratch/static-serving-id"
+  if cmp -s "$scratch/static-writer-id" "$scratch/static-serving-id"; then
+    echo 'Static serving and writer received the same key' >&2; exit 1
+  fi
+  echo 'Distinct static credentials and S3 read/write boundaries verified'
+fi
+static_admin_action() {
+  python3 - "$scratch/objectstore-init.json" "$1" > "$scratch/static-s3-operation.json" <<'PYSTATICJOB'
+import json, sys
+assert sys.argv[2] in ('bootstrap', 'revoke-serving')
+manifest = json.load(open(sys.argv[1]))
+manifest['metadata']['name'] = 'static-s3-operation'
+manifest['spec']['template']['spec']['containers'][0]['command'] = [
+    'python3', '-I', '-B', '/harness/static-s3-fixture.py', sys.argv[2], '/fixture/s3/static-fixture.json']
+print(json.dumps(manifest))
+PYSTATICJOB
+  k apply -f "$scratch/static-s3-operation.json"
+  k wait --for=condition=Complete job/static-s3-operation --timeout=120s
+  k delete job/static-s3-operation --wait=true
+}
 node_ip=$(minikube -p "$profile" ip)
 docker_network=$(docker inspect --format '{{range $name, $value := .NetworkSettings.Networks}}{{$name}}{{end}}' "$profile")
 external() {
@@ -376,7 +402,7 @@ pod={"apiVersion":"v1","kind":"Pod","metadata":{"name":"storage-maintenance","la
 if sys.argv[2]=='1':
     pod['spec']['containers'][0]['env'].append({'name':'DEVRES_TEST_S3_CONFIG','value':'/fixture/s3/s3.toml'})
     pod['spec']['containers'][0]['volumeMounts'].append({'name':'s3','mountPath':'/fixture/s3','readOnly':True})
-    pod['spec']['volumes'].append({'name':'s3','secret':{'secretName':'devres-s3-credentials','defaultMode':0o440}})
+    pod['spec']['volumes'].append({'name':'s3','secret':{'secretName':'devres-writer-s3','defaultMode':0o440}})
 print(json.dumps(pod))
 PY
   k apply -f "$scratch/maintenance.yaml"
@@ -541,6 +567,44 @@ PYS3READY
   test "$(k get pod -l app=backend -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')" = "$backend_restarts"
   echo 'Same backend process recovered after object-store restart'
 fi
+if (( s3 && ! credential_broker )); then
+  static_admin_action revoke-serving
+  k exec -i deployment/backend -- python3 -I -B - <<'PYSTATICREADY'
+import time, urllib.error, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+for attempt in range(20):
+    try:
+        opener.open('http://127.0.0.1:9090/ready', timeout=2).close()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        assert status == 503
+        break
+    time.sleep(1)
+else:
+    raise SystemExit('Revoked static credentials did not withhold readiness')
+PYSTATICREADY
+  s3_capture_state unavailable
+  stop_backend
+  python3 -I -B scripts/s3-kubernetes-fixture.py rotate "$scratch"
+  for name in devres-s3-credentials devres-serving-s3 devres-writer-s3; do
+    case "$name" in
+      devres-s3-credentials) directory=s3 ;;
+      devres-serving-s3) directory=s3-serving ;;
+      devres-writer-s3) directory=s3-writer ;;
+    esac
+    k create secret generic "$name" --from-file="$scratch/fixture/$directory/" --dry-run=client -o yaml | k apply -f -
+  done
+  static_admin_action bootstrap
+  start_backend
+  k exec deployment/backend -- python3 -I -B /harness/static-s3-fixture.py check serving /fixture/s3/probe.json /fixture/s3 > "$scratch/rotated-static-serving-id"
+  k exec deployment/writer -- python3 -I -B /harness/static-s3-fixture.py check writer /fixture/s3/probe.json /fixture/s3 > "$scratch/rotated-static-writer-id"
+  if cmp -s "$scratch/static-serving-id" "$scratch/rotated-static-serving-id" || cmp -s "$scratch/static-writer-id" "$scratch/rotated-static-writer-id"; then
+    echo 'Static rotation did not replace both role identities' >&2; exit 1
+  fi
+  s3_capture_state recover
+  echo 'Static revocation failed closed; stopped role rotation preserved historical reads'
+fi
 stop_backend
 maintenance_start
 test "$(k exec storage-maintenance -- storage-probe read)" = "$before"
@@ -559,6 +623,80 @@ if (( s3 )); then
   start_backend
   external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
   seeded_webtransport
+  if (( credential_broker )); then
+    # Rehearse credential-method changes against one committed binding. Serving's
+    # emptyDir cache is lost with each stopped Pod; no archive or journal is pruned.
+    k exec deployment/postgres -- psql -U devres -d devres -Atc \
+      'SELECT binding,epoch FROM devres_archive_control WHERE singleton' > "$scratch/broker-original-binding"
+    stop_backend
+    deadline=$((SECONDS+180))
+    until [[ $(k exec deployment/postgres -- psql -U devres -d devres_broker_test -Atc \
+      "SELECT count(*) FROM devres_credential_broker_keys WHERE state <> 'revoked'") == 0 ]]; do
+      if (( SECONDS >= deadline )); then echo 'Broker journal did not drain before static cutover' >&2; exit 1; fi
+      sleep 2
+    done
+    k scale deployment/credential-broker --replicas=0
+    k wait --for=delete pod -l app=credential-broker --timeout=120s
+    cp -p "$scratch/fixture/backend.toml" "$scratch/broker-backend.toml"
+    cp -p "$scratch/fixture/writer.toml" "$scratch/broker-writer.toml"
+    python3 -I -B scripts/s3-kubernetes-fixture.py configure-static "$scratch"
+    k create secret generic devres-config --from-file=backend.toml="$scratch/fixture/backend.toml" \
+      --from-literal=postgres-password=fixture-only --dry-run=client -o yaml | k apply -f -
+    k create secret generic devres-writer-config --from-file=writer.toml="$scratch/fixture/writer.toml" \
+      --dry-run=client -o yaml | k apply -f -
+    for deployment in backend writer; do
+      k get deployment "$deployment" -o json > "$scratch/$deployment-broker-deployment.json"
+      python3 - "$scratch/$deployment-broker-deployment.json" "$scratch/$deployment" "$deployment" <<'PYCUTOVERTEMPLATE'
+import json, pathlib, sys
+original = json.loads(pathlib.Path(sys.argv[1]).read_text())['spec']['template']
+pathlib.Path(sys.argv[2] + '-broker-template.json').write_text(json.dumps({'spec': {'template': original}}))
+pod = original['spec']
+pod['volumes'] = [value for value in pod['volumes'] if value['name'] != 'broker-identity']
+role = 'serving' if sys.argv[3] == 'backend' else 'writer'
+pod['volumes'].append({'name': 's3', 'secret': {'secretName': 'devres-' + role + '-s3', 'defaultMode': 0o440}})
+for container in pod['containers']:
+    container['volumeMounts'] = [value for value in container['volumeMounts'] if value['name'] != 'broker-identity']
+    container['volumeMounts'].append({'name': 's3', 'mountPath': '/fixture/s3', 'readOnly': True})
+pathlib.Path(sys.argv[2] + '-static-template.json').write_text(json.dumps({'spec': {'template': original}}))
+PYCUTOVERTEMPLATE
+      k patch deployment "$deployment" --type merge --patch-file "$scratch/$deployment-static-template.json"
+    done
+    start_backend
+    external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
+    k exec deployment/backend -- python3 -I -B /harness/static-s3-fixture.py check serving /fixture/s3/probe.json /fixture/s3 > "$scratch/cutover-static-serving-id"
+    k exec deployment/writer -- python3 -I -B /harness/static-s3-fixture.py check writer /fixture/s3/probe.json /fixture/s3 > "$scratch/cutover-static-writer-id"
+    k exec deployment/postgres -- psql -U devres -d devres -Atc \
+      'SELECT binding,epoch FROM devres_archive_control WHERE singleton' > "$scratch/static-binding"
+    cmp "$scratch/broker-original-binding" "$scratch/static-binding"
+    stop_backend
+    cp -p "$scratch/broker-backend.toml" "$scratch/fixture/backend.toml"
+    cp -p "$scratch/broker-writer.toml" "$scratch/fixture/writer.toml"
+    k create secret generic devres-config --from-file=backend.toml="$scratch/fixture/backend.toml" \
+      --from-literal=postgres-password=fixture-only --dry-run=client -o yaml | k apply -f -
+    k create secret generic devres-writer-config --from-file=writer.toml="$scratch/fixture/writer.toml" \
+      --dry-run=client -o yaml | k apply -f -
+    for deployment in backend writer; do
+      k patch deployment "$deployment" --type merge --patch-file "$scratch/$deployment-broker-template.json"
+    done
+    k scale deployment/credential-broker --replicas=1
+    k rollout status deployment/credential-broker --timeout=180s
+    start_backend
+    wait_broker_service
+    broker_reader_probe > "$scratch/rollback-reader-key-metadata.json"
+    k exec deployment/writer -- python3 -I -B /harness/broker-pod-probe.py readwrite > "$scratch/rollback-writer-key-id"
+    python3 - "$scratch/rollback-reader-key-metadata.json" "$scratch/recovered-reader-key-metadata.json" \
+      "$scratch/rollback-writer-key-id" "$scratch/writer-key-id" <<'PYCUTOVERKEYS'
+import json, pathlib, sys
+reader, previous = (json.loads(pathlib.Path(name).read_text()) for name in sys.argv[1:3])
+assert reader['key_hash'] != previous['key_hash'], 'Rollback reused a revoked serving key'
+assert pathlib.Path(sys.argv[3]).read_text() != pathlib.Path(sys.argv[4]).read_text(), 'Rollback reused a revoked writer key'
+PYCUTOVERKEYS
+    external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
+    k exec deployment/postgres -- psql -U devres -d devres -Atc \
+      'SELECT binding,epoch FROM devres_archive_control WHERE singleton' > "$scratch/rollback-binding"
+    cmp "$scratch/broker-original-binding" "$scratch/rollback-binding"
+    echo 'Stopped broker-to-static-to-broker cutover preserved binding, epoch, and cold historical reads'
+  fi
   echo 'Real minikube S3 isolation, complete cache loss, database restore, and HTTP/WebTransport acceptance passed'
   exit 0
 fi

@@ -117,6 +117,30 @@ impl PgBlobStore {
 mod tests {
     use super::*;
 
+    fn s3_fixture_configs(
+        suffix: &str,
+    ) -> (
+        crate::object_storage::S3Config,
+        crate::object_storage::S3Config,
+    ) {
+        let path = std::env::var_os("DEVRES_TEST_S3_CONFIG")
+            .expect("disposable S3 writer configuration required");
+        let mut writer: crate::object_storage::S3Config =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut reader = std::env::var_os("DEVRES_TEST_S3_READER_CONFIG").map_or_else(
+            || writer.clone(),
+            |path| toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap(),
+        );
+        writer.prefix.push_str(suffix);
+        reader.prefix.push_str(suffix);
+        assert_eq!(
+            crate::durable_archive::config_binding(&writer).unwrap(),
+            crate::durable_archive::config_binding(&reader).unwrap(),
+            "fixture role credentials must address the same archive"
+        );
+        (writer, reader)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
     async fn concurrent_filesystem_reader_has_no_publication_or_maintenance_authority() {
@@ -282,11 +306,7 @@ mod tests {
     #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
     async fn s3_committed_reopen_and_verification_preserve_reader_admission() {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-        let configured =
-            std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
-        let mut config: crate::object_storage::S3Config =
-            toml::from_str(&std::fs::read_to_string(configured).unwrap()).unwrap();
-        config.prefix.push_str("/committed-reopen");
+        let (config, reader_config) = s3_fixture_configs("/committed-reopen");
         let admin = PgPool::connect(&base).await.unwrap();
         sqlx_core::query::query("CREATE DATABASE devres_s3_reopen_fixture")
             .execute(&admin)
@@ -343,10 +363,13 @@ mod tests {
             assert_eq!(control, committed);
             if !maintenance {
                 let cold = tempfile::tempdir().unwrap();
-                let reader =
-                    PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(config.clone()))
-                        .await
-                        .unwrap();
+                let reader = PgBlobStore::connect_reader(
+                    url.as_str(),
+                    cold.path(),
+                    Some(reader_config.clone()),
+                )
+                .await
+                .unwrap();
                 assert_eq!(
                     &*reader.capture(&captured.capture.id).await.unwrap().body,
                     b"retained across committed reopen"
@@ -367,9 +390,10 @@ mod tests {
             .unwrap();
         drop(transfer);
         let cold = tempfile::tempdir().unwrap();
-        let reader = PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(config.clone()))
-            .await
-            .unwrap();
+        let reader =
+            PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(reader_config.clone()))
+                .await
+                .unwrap();
         assert_eq!(
             &*reader.capture(&captured.capture.id).await.unwrap().body,
             b"retained across committed reopen"
@@ -390,7 +414,7 @@ mod tests {
             assert_eq!(pending, (Some(committed.1.clone()), initializing));
             let cold = tempfile::tempdir().unwrap();
             assert!(
-                PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(config.clone()))
+                PgBlobStore::connect_reader(url.as_str(), cold.path(), Some(reader_config.clone()))
                     .await
                     .is_err()
             );
@@ -402,11 +426,7 @@ mod tests {
     #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
     async fn s3_concurrent_reader_cold_cache_observes_only_committed_writer_publication() {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
-        let config =
-            std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
-        let mut config: crate::object_storage::S3Config =
-            toml::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
-        config.prefix.push_str("/reader-isolation");
+        let (config, reader_config) = s3_fixture_configs("/reader-isolation");
         let admin = PgPool::connect(&base).await.unwrap();
         sqlx_core::query::query("CREATE DATABASE devres_s3_reader_fixture")
             .execute(&admin)
@@ -453,9 +473,10 @@ mod tests {
             .await
             .unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let reader = PgBlobStore::connect_reader(reader_url.as_str(), cache.path(), Some(config))
-            .await
-            .unwrap();
+        let reader =
+            PgBlobStore::connect_reader(reader_url.as_str(), cache.path(), Some(reader_config))
+                .await
+                .unwrap();
         let request = FetchRequest {
             key: "fixture:s3-reader".into(),
             url: "https://fixtures.invalid/s3-reader".into(),

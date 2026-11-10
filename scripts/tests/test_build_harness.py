@@ -28,7 +28,7 @@ class BuildHarnessTests(unittest.TestCase):
         shutil.copy2(SCRIPTS / "build-harness.sh", scripts / "build-harness.sh")
         (scripts / "mcp_smoke.py").write_text("# smoke fixture\n")
         (scripts / "kube-identity-fixture.py").write_text("# identity fixture\n")
-        for name in ('scaleway-iam-fixture.py', 'credential-broker-fixture.py', 'credential-broker-probe.py', 'broker-pod-probe.py'):
+        for name in ('scaleway-iam-fixture.py', 'credential-broker-fixture.py', 'credential-broker-probe.py', 'broker-pod-probe.py', 'static-s3-fixture.py'):
             (scripts / name).write_text('# broker fixture\n')
         deploy = self.root / "deploy" / "oxibelt"
         deploy.mkdir(parents=True)
@@ -104,6 +104,7 @@ with open(os.environ["TEST_LOG"], "a") as output:
                 self.log.unlink(missing_ok=True)
                 result, calls, original = self.run_build(supplied=supplied)
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.scratch / 'build/scripts/static-s3-fixture.py').read_text(), '# broker fixture\n')
                 staged = self.scratch / "build" / "bin"
                 self.assertEqual([call[2] for call in calls if call[0] == "strip"],
                                  [str(staged / name) for name in BINARIES])

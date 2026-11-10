@@ -85,13 +85,14 @@ for attempt in {1..60}; do
   sleep 1
 done
 for attempt in {1..60}; do
-  if curl --noproxy '*' --silent --fail --output /dev/null "http://127.0.0.1:$s3_port/health"; then break; fi
+  if curl --noproxy '*' --connect-timeout 2 --max-time 3 --silent --fail --output /dev/null "http://127.0.0.1:$s3_port/health"; then break; fi
   if (( attempt == 60 )); then echo 'Disposable RustFS readiness timed out' >&2; exit 1; fi
   sleep 1
 done
 python3 - "$scratch" "$s3_port" <<'PY'
 import json
 from pathlib import Path
+import secrets
 import sys
 
 root = Path(sys.argv[1])
@@ -117,9 +118,41 @@ request = (
 )
 (root / "create-bucket.curl").write_text(request)
 (root / "create-bucket.curl").chmod(0o600)
+identities = {}
+for role in ('serving', 'writer'):
+    pair = {'access_key': 'static-' + secrets.token_hex(12), 'secret_key': secrets.token_hex(32)}
+    identities[role] = pair
+    directory = root / role
+    directory.mkdir(mode=0o700)
+    for name, value in {'access-key': pair['access_key'], 'secret-key': pair['secret_key']}.items():
+        path = directory / name
+        path.write_text(value)
+        path.chmod(0o600)
+    role_config = config.replace(str(root / 'access-key'), str(directory / 'access-key')).replace(
+        str(root / 'secret-key'), str(directory / 'secret-key'))
+    path = root / (role + '.toml')
+    path.write_text(role_config)
+    path.chmod(0o600)
+setup = {'endpoint': endpoint, 'access_key': access, 'secret_key': secret,
+         'bucket': 'devres-fixture', 'prefix': 'acceptance', 'identities': identities}
+path = root / 'static-fixture.json'
+path.write_text(json.dumps(setup))
+path.chmod(0o600)
+path = root / 'probe.json'
+path.write_text(json.dumps({key: setup[key] for key in ('endpoint', 'bucket', 'prefix')}))
+path.chmod(0o600)
 PY
-curl --config "$scratch/create-bucket.curl"
+curl --connect-timeout 5 --max-time 15 --retry 5 --retry-delay 1 --retry-max-time 20 --config "$scratch/create-bucket.curl"
+python3 -I -B scripts/static-s3-fixture.py bootstrap "$scratch/static-fixture.json"
+python3 -I -B scripts/static-s3-fixture.py check writer "$scratch/probe.json" "$scratch/writer" > "$scratch/writer-id"
+python3 -I -B scripts/static-s3-fixture.py check serving "$scratch/probe.json" "$scratch/serving" > "$scratch/serving-id"
+if cmp -s "$scratch/writer-id" "$scratch/serving-id"; then
+  echo 'Static serving and writer received the same key' >&2; exit 1
+fi
+python3 -I -B scripts/static-s3-fixture.py revoke-serving "$scratch/static-fixture.json"
+python3 -I -B scripts/static-s3-fixture.py bootstrap "$scratch/static-fixture.json"
 export DEVRES_TEST_DATABASE_URL="postgres://devres:fixture-only@127.0.0.1:$postgres_port/devres"
-export DEVRES_TEST_S3_CONFIG="$scratch/s3.toml"
+export DEVRES_TEST_S3_CONFIG="$scratch/writer.toml"
+export DEVRES_TEST_S3_READER_CONFIG="$scratch/serving.toml"
 cargo test --locked -p devres-adapters --lib s3_ -- --ignored --test-threads=1
 echo 'Disposable RustFS/PostgreSQL acceptance passed'

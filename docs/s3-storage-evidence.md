@@ -66,3 +66,54 @@ arm64 and hosted Actions are configured but were not executed here. Full-corpus
 capacity, production operations, registry publication and native ChatGPT UI were
 not tested. Independent agent review is not human GitHub approval. Delivery uses
 signed local commits with the assistance trailer; no push or deployment is claimed.
+
+## Static Scaleway IAM (2026-11-10)
+
+Native Linux amd64 validation covers the reader transport guard in signed commit
+`6146877`, static production configuration/lifecycle support in `63d2a9b`, and the
+accompanying enforcing static credential fixtures. No public tool schema, source
+budget, archive layout, database schema or dependency lockfile changed.
+
+| Check | Observed result |
+| --- | --- |
+| Workspace formatting and locked all-target Clippy with warnings denied | Passed |
+| Locked workspace tests | Passed; opt-in database/storage cases ran separately below |
+| Current cargo-audit and cargo-deny | Passed using official advisory data |
+| Final Python helper regression suite | 757 tests, zero failures, four existing skips |
+| Reader method fence | GET/HEAD work with unrestricted fixture credentials; PUT/DELETE and multipart mutations send no outbound mutation requests |
+| Complete PostgreSQL persistence harness | Passed |
+| RustFS/PostgreSQL S3 acceptance | 13 passed with distinct enforcing writer/reader keys, including cold readers, backup/restore and publication recovery |
+| Pinned OxiBelt Docker acceptance | Passed HTTP and WebTransport for both supported MCP revisions |
+| Credential broker Docker acceptance | Passed role/prefix enforcement, encrypted restart/reuse, issuance uncertainty, revocation and database isolation |
+| Filesystem minikube | Passed routing, CNI/private-service isolation, PVC restart and coordinated restore |
+| Static S3 minikube | Passed distinct key enforcement, both transports, warm-cache outage denial, same-process recovery, revoked-key readiness denial, stopped pair replacement, cold reads and database restore |
+| Broker S3 minikube | Passed real pod identities, encrypted credential reuse, bounded outage recovery and complete cache loss/restore |
+| Stopped broker to static to broker rehearsal | Passed with unchanged archive binding/epoch, cold historical readback in both modes and fresh broker credentials after rollback |
+| Independent review | Upstream/Storage and Security Boundary review findings resolved on actual implementation and affected callers |
+
+The production operator tests additionally cover credential-bound static receipts,
+fixture/cross-mode/expired receipt rejection, template validation before Secret
+writes, stopped rotation, collector pause without broker key changes, preserved
+edge evidence and timer ownership, and recovery from partially applied switches.
+The runtime/server image used by these local harnesses is a disposable test image,
+not a newly qualified production release.
+
+The configured shared Docker stores could not launch the cached PostgreSQL image
+entrypoint, including a direct `/bin/sh` probe. Acceptance therefore used the
+repository's `with-local-docker.sh` isolated daemon below `/tmp`; shared daemon
+state and existing operator clusters were preserved. One initial S3 fixture setup
+returned 503 after `/health` had succeeded. Bounded fixture-only creation retries
+were added, tested against a real loopback server returning 503 twice then 200,
+and the 13-case S3 rerun passed. Per-attempt connect/request limits and the
+Kubernetes Job deadline remain enforced; production retry policy was not changed.
+All generated test state and Cargo targets remained below `/tmp`.
+
+See the [static operator guide](../deploy/examples/scaleway-static/README.md) for
+permission sets, Secret inputs, stopped rotation/cutover and rollback. The broker
+remains the production default. Current production image pins predate the guard,
+so static production provisioning/start/cutover remain blocked until a separately
+qualified immutable release is pinned and real Scaleway permission evidence is
+admitted. These synthetic provider and local cluster results do not establish
+live Scaleway enforcement, hosted/native arm64 CI, registry publication,
+production operations or native ChatGPT UI acceptance. No push or deployment was
+performed; independent agent review is not human GitHub approval.

@@ -34,6 +34,6 @@ done
 cp scripts/mcp_smoke.py "$scratch/build/scripts/"
 cp scripts/kube-identity-fixture.py "$scratch/build/scripts/"
 cp scripts/scaleway-iam-fixture.py scripts/credential-broker-fixture.py scripts/credential-broker-probe.py "$scratch/build/scripts/"
-cp scripts/broker-pod-probe.py "$scratch/build/scripts/"
+cp scripts/static-s3-fixture.py scripts/broker-pod-probe.py "$scratch/build/scripts/"
 cp deploy/oxibelt/Dockerfile.harness "$scratch/build/Dockerfile"
 docker build --label "devres.test-owner=$image" -t "$image" "$scratch/build"
