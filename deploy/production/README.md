@@ -9,6 +9,9 @@ Production activation remains gated on provider-confirmed issuer confinement to
 the two workload applications. Preparation never manufactures that acceptance and
 never substitutes file credentials for the broker architecture.
 
+The dated [preparation evidence](acceptance-evidence.md) records the published
+release, local checks, inactive target state and incomplete acceptance gates.
+
 The private [issuer preflight](../../scripts/scaleway-issuer-preflight.py) accepts
 a root-owned mode-0600 JSON input with `organization_id`, `project_id`,
 `issuer_application_id`, `reader_application_id`, `writer_application_id`,
