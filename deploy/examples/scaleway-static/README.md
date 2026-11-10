@@ -114,6 +114,17 @@ hot-rotation guarantee; restart both roles. Missing/revoked credentials and stor
 outages fail closed even for cached objects. Static keys do not inherit broker
 lease expiry or pod-deletion revocation; revoke them through the provider.
 
+The [inert rehearsal renderer](../../../scripts/scaleway-static-runtime-rehearsal.py)
+creates zero-scale candidates and a private execution plan under a fresh `/tmp`
+directory. Its explicit synthetic helper uses the released storage implementation
+to publish two small captures and verify both through fresh reader caches, with
+unchanged archive binding and epoch. Stop both actual runtime roles before each
+maintenance publication. Keep test keys, database, daemon and child prefix separate
+from operating state; obtain authorization for their creation and exact cleanup.
+Rendering performs no key, database, container or provider operation. Neither the
+renderer nor the helper issues a production acceptance receipt or proves public
+MCP transport or Kubernetes writer identity.
+
 ## Production operator workflow
 
 The commands below describe the workflow for a qualified immutable release.

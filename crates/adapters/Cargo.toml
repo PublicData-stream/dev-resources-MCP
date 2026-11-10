@@ -200,3 +200,7 @@ path = "examples/shared/deployment-live-probe.rs"
 [[test]]
 name = "migration_parallel"
 path = "tests/shared/migration_parallel.rs"
+
+[[example]]
+name = "static-rotation-probe"
+path = "examples/shared/static-rotation-probe.rs"
