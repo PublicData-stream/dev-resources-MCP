@@ -87,7 +87,8 @@ repository files or diagnostic output. The obsolete issuer is not part of the
 static profile and its API-key-list permissions are no longer an admission gate
 for this deployment.
 
-Direct, signed S3 reads from the deployment host returned:
+Before the approved bucket-policy application, signed S3 reads from the
+deployment host returned:
 
 | Request | Serving | Writer |
 | --- | --- | --- |
@@ -96,10 +97,11 @@ Direct, signed S3 reads from the deployment host returned:
 | Bucket policy GET | 200 | 200 |
 
 Policy GET is a read operation; this result alone does not establish policy-write
-authority. The observed bucket policy lacks `s3:ListBucket` for both applications,
-grants object access beyond the intended prefix, and permits writer permanent
-object/version deletion. The missing list allowance is a concrete blocker; other
-requirements still need effective-policy and live-provider acceptance.
+authority. The pre-change bucket policy lacked `s3:ListBucket` for both applications,
+granted object access beyond the intended prefix, and permitted writer permanent
+object/version deletion. The missing list allowance was the initial blocker,
+resolved by the policy application below. Other requirements still need
+effective-policy and live-provider acceptance.
 
 ## Approved policy application and remaining gates
 
@@ -130,14 +132,60 @@ readback's canonical SHA-256 is
 Post-application S3 reads returned 200 with zero keys for `production/` listing
 with both roles, and 403 `AccessDenied` for both out-of-prefix list requests.
 Bucket policy GET remained 200, consistent with the IAM read-only permission set.
-No other CLI writes are authorized by that approval. No S3 object was created or
-deleted, no multipart upload was initiated, and no key or IAM policy was changed.
-Actual conditional PUT/multipart behavior, storage class, workload
-mutation/deletion denials, other-bucket isolation, administrative denial and key
-rotation/revocation remain incomplete. Final key pairs alone cannot prove a real
-revocation; separately managed disposable or retired keys are required. Completed
-probe objects require separately authorized cleanup because workload keys must
-not delete permanent objects.
+That policy approval authorized no other CLI writes. At that checkpoint no S3
+object or multipart upload had been created, and no key or IAM policy had been
+changed. The subsequent bounded trial below had separate explicit authority.
+
+## Separately approved real-provider trial
+
+The user authorized one 900-second test key for each existing workload application,
+at most two disposable object keys totaling at most 20 MiB under a unique
+`production/.acceptance/` run, and exact recorded cleanup. The operating keys,
+permanent capture layout and policies were outside the permitted mutation set.
+
+The [live helper](../../scripts/scaleway-static-live-probe.py) was checked with
+13 offline tests; the complete Python suite then ran 781 tests successfully with
+four existing skips. Independent Security Boundary and Upstream/Storage review
+closed for this bounded attempt. The transferred helper's SHA-256 was
+`bcf2cf2c28c3dcb4e6ce994d715c8f0b52cb712c5ae2bd113a81c5360809bab4`.
+The operator also independently reviewed the private key-lifecycle and exact
+cleanup scripts before creating either test key. All local and remote temporary
+files were under `/tmp`. Fsynced journals there survive process failure, not a
+deployment-host reboot.
+
+Both test keys were created once, with application/project/expiry readback, after
+recording the original operating-key inventory. The expected four-pair credential
+fingerprint and designated state root were recorded before the first S3 request.
+There were no retries, replayed mutations or uncertain outcomes.
+
+| Real Scaleway check | Observed result |
+| --- | --- |
+| Writer conditional create and overwrite collision | Create 200; collision 412; original content unchanged |
+| Reader GET/HEAD/list | Passed against the owned conditional object and run prefix |
+| Reader PUT/DELETE and multipart initiation/part/completion/abort | All denied with 403 `AccessDenied` |
+| Writer multipart | 17 MiB completion/readback, conditional completion collision, and interrupted upload abort passed |
+| New-object storage class | HEAD confirmed `ONEZONE_IA` for small and multipart objects |
+| Writer object DELETE | Denied with 403 `AccessDenied` |
+| Other-prefix object/list access | Denied for both test identities |
+| Test-key revocation | Both API keys deleted and absent in IAM; both then received S3 403 before expiry |
+| Operating keys after test-key revocation | GET/list remained 200; original IAM inventory unchanged |
+| Exact administrator cleanup | Owned contents verified before deletion; final object and multipart listings empty |
+
+The helper made 35 initial requests and six post-revocation requests. Request
+bodies totaled 17,826,267 bytes; the two completed objects totaled 17,825,834 bytes.
+At revocation readback, at least 684 seconds remained before the earliest test-key
+expiry, separating observed revocation from automatic expiration. Administrator
+cleanup used ten additional requests and found zero remaining objects or uploads.
+Only the two journal-bound keys were deleted. The bucket policy remained identical
+to its approved post-application fingerprint. Revoked-key plaintext files and
+transfer archives were removed; retained creation metadata was redacted.
+
+This is partial provider evidence, not a production acceptance receipt. The bucket
+was unversioned and returned no actual non-null version ID, so version-deletion
+denial was not established. No other bucket or alternate egress probe was
+authorized. Administrative mutation denial and a controlled restart rotation of
+the operating pairs were not tested. The helper leaves those checks incomplete;
+the real production receipt was not emitted, and no workload was activated.
 
 The old RFC integrity failure and its spent requests remain preserved; no source
 gate was retried or relabeled as belonging to this release. Public edge, boot

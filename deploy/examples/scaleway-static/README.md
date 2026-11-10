@@ -216,6 +216,54 @@ require deliberate revocation.
 Do not revive the retired source independently or reuse a pending bundle after an
 unresolved switch. Inspect private state and preserve stopped roles after failure.
 
+## Bounded live probe
+
+The [live probe](../../../scripts/scaleway-static-live-probe.py) runs only as a
+root operator on the deployment host, against the fixed Paris endpoint and
+`dev-resources-mcp` bucket. Obtain separate authority for two 900-second test keys,
+two disposable objects and exact administrator cleanup before running it. The
+helper creates or revokes no IAM key, changes no policy, and emits no production
+acceptance receipt. Never supply administrator credentials to it.
+
+Its private mode-0600 input JSON contains eight file paths: for each prefix
+`test_reader`, `test_writer`, `current_reader` and `current_writer`, supply
+`<prefix>_access_key_file` and `<prefix>_secret_key_file`. All four pairs must be
+distinct and readable only by root. Keep keys, input JSON and state under private
+directories in `/tmp`, apart from already provisioned operating-key paths.
+Record the exact credential binding and designated state root before live I/O.
+
+```sh
+python3 -B scripts/scaleway-static-live-probe.py \
+  --inputs /tmp/devres-live-inputs.json --state-root /tmp/devres-live-new run
+python3 -B scripts/scaleway-static-live-probe.py \
+  --state-root /tmp/devres-live-new status
+# Independently revoke only this run's test keys before their expiry, then:
+python3 -B scripts/scaleway-static-live-probe.py \
+  --inputs /tmp/devres-live-inputs.json --state-root /tmp/devres-live-new verify-revoked
+```
+
+`run` requires a new root and cannot resume. It allocates exactly two random
+`production/.acceptance/<run>/` keys, with a 17 MiB multipart body and at most
+20 MiB of cumulative request bodies, an eight-minute run deadline and an
+80-request ceiling including verification. Durable intent precedes every request;
+there is no automatic retry. Failure preserves the journal and spent budget.
+The status includes uncertain intents; a lost initiation response may require
+bounded administrator reconciliation of uploads for only those two keys.
+
+Before cleanup, record the observed run ID from the designated root and verify
+its credential binding. The helper does not delete completed test objects as an
+administrator. A separately authorized operator must verify exact owned content,
+abort only owned uploads, remove only journal-bound objects/versions, and confirm
+empty inventories. Never use recursive prefix deletion. Remove revoked-key
+plaintext copies only after revocation readback and cleanup. `/tmp` may be tmpfs;
+journal fsync does not establish reboot durability.
+
+The helper reports actual checks and explicit gaps. In particular, revoked test
+keys plus working operating keys do not establish a controlled restart rotation
+of the operating pairs. Missing version IDs, other-bucket, administrative or
+alternate-egress evidence remain incomplete. See the dated
+[real-provider trial](../../production/static-acceptance-evidence.md#separately-approved-real-provider-trial).
+
 ## Acceptance boundary
 
 Use disposable objects outside permanent evidence to verify serving GET/HEAD and
