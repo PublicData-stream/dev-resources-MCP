@@ -172,7 +172,21 @@ class ProductionDeploymentTests(unittest.TestCase):
                                  'secret_key_file': '/run/devres-s3/secret-key'})
                 after['storage']['s3']['credentials'] = before['storage']['s3']['credentials']
                 self.assertEqual(after, before)
-        self.assertFalse(production.STATIC_AUTH_RELEASE_QUALIFIED)
+        self.assertTrue(production.STATIC_AUTH_RELEASE_QUALIFIED)
+
+    def test_qualified_release_identity_reaches_rendered_workloads(self):
+        self.assertEqual(production.VERSION, '0.1.0-build.a938112b')
+        self.assertEqual(production.REVISION, 'a938112b5af87996661ddd91ae68755dc0d579b9')
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            paths = production.render(Path(temporary), self.settings)
+            identity = json.loads(paths['release.json'].read_text())
+        self.assertEqual(identity['revision'], production.REVISION)
+        self.assertEqual(identity['source_sha256'], '98f107f09bc4cb69b519408cbd21518307470f77006597bdc70a3feebe339a06')
+        expected = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:a966e685fe3d32ffc5625b471d0ab77b71d881827f4ae17e5a16bd2b760016a8'
+        self.assertEqual(identity['server'], expected)
+        for workload in ('backend', 'writer'):
+            container = self.objects['Deployment', workload]['spec']['template']['spec']['containers'][0]
+            self.assertEqual(container['image'], expected)
 
     def test_auth_selection_is_explicit_and_broker_remains_default(self):
         self.assertEqual(production.storage_auth({}), 'broker')
@@ -185,23 +199,21 @@ class ProductionDeploymentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             production.settings_checked(no_iam)
 
-    def test_static_policy_examples_allow_abort_and_deny_permanent_deletion(self):
+    def test_static_policy_examples_allow_abort_and_omit_permanent_deletion(self):
         directory = ROOT / 'deploy/examples/scaleway-static'
         for role in ('readonly', 'readwrite'):
             policy = json.loads((directory / (role + '-bucket-policy.json')).read_text())
             statements = policy['Statement']
             allowed = {action for statement in statements if statement['Effect'] == 'Allow'
                        for action in statement['Action']}
-            denied = {action for statement in statements if statement['Effect'] == 'Deny'
-                      for action in statement['Action']}
+            self.assertTrue(all(statement['Effect'] == 'Allow' for statement in statements))
             self.assertTrue({'s3:GetObject', 's3:ListBucket'} <= allowed)
-            self.assertTrue({'s3:DeleteObject', 's3:DeleteObjectVersion'} <= denied)
             self.assertFalse({'s3:DeleteObject', 's3:DeleteObjectVersion'} & allowed)
             if role == 'readwrite':
                 self.assertTrue({'s3:PutObject', 's3:AbortMultipartUpload',
                                  's3:ListMultipartUploadParts', 's3:ListBucketMultipartUploads'} <= allowed)
             else:
-                self.assertTrue({'s3:PutObject', 's3:AbortMultipartUpload'} <= denied)
+                self.assertFalse({'s3:PutObject', 's3:AbortMultipartUpload'} & allowed)
         for role in ('serving', 'writer'):
             fragment = tomllib.loads((directory / (role + '-fragment.toml.example')).read_text())
             self.assertEqual(fragment['storage']['s3']['credentials'],

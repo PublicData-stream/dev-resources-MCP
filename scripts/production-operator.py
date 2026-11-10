@@ -28,8 +28,8 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.0-build.172d528d"
-REVISION = "172d528d88d16c9ec4fd83a16674280815178930"
+VERSION = "0.1.0-build.a938112b"
+REVISION = "a938112b5af87996661ddd91ae68755dc0d579b9"
 OXIBELT_REVISION = "4f3154d8db0e0a49bce7a528c0a0f4c36d169040"
 NAMESPACE = "devres"
 WORKLOADS = ("postgres", "broker-postgres", "credential-broker", "writer", "backend")

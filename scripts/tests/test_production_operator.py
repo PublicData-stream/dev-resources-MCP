@@ -529,8 +529,20 @@ class StaticProductionOperatorTests(unittest.TestCase):
 
     def test_static_old_release_denied_before_any_secret_write(self):
         inputs, _ = self.static_inputs()
-        with self.assertRaisesRegex(operator.OperatorError, 'qualified_static_storage_release_required'):
+        unqualified = operator.renderer()
+        unqualified.STATIC_AUTH_RELEASE_QUALIFIED = False
+        with patch.object(operator, 'renderer', return_value=unqualified), self.assertRaisesRegex(operator.OperatorError, 'qualified_static_storage_release_required'):
             self.op.provision_runtime(inputs)
+        self.assertEqual(self.op.events, [])
+
+    def test_qualified_release_does_not_admit_an_older_bundle(self):
+        self.op.require_static_release()
+        identity = operator.read_json(self.bundle / 'release.json')
+        identity['version'] = '0.1.0-build.172d528d'
+        identity['revision'] = '172d528d88d16c9ec4fd83a16674280815178930'
+        self.write('release.json', json.dumps(identity))
+        with self.assertRaisesRegex(operator.OperatorError, 'bundle_release_identity_mismatch'):
+            self.op.validate_identity()
         self.assertEqual(self.op.events, [])
 
     def test_static_import_separates_keys_and_excludes_issuer_material(self):
@@ -728,7 +740,9 @@ class AuthenticationSwitchTests(unittest.TestCase):
     def test_old_release_cutover_gate_precedes_mutations(self):
         target = self.prepared_target()
         self.op.events.clear()
-        with patch.object(operator, 'Operator', return_value=target), self.assertRaisesRegex(
+        unqualified = operator.renderer()
+        unqualified.STATIC_AUTH_RELEASE_QUALIFIED = False
+        with patch.object(operator, 'renderer', return_value=unqualified), patch.object(operator, 'Operator', return_value=target), self.assertRaisesRegex(
                 operator.OperatorError, 'qualified_static_storage_release_required'):
             self.op.switch_storage_auth(target.bundle)
         self.assertEqual(self.op.events, [])

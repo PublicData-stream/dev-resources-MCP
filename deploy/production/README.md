@@ -1,7 +1,7 @@
 # Dedicated production deployment
 
 These assets render the separately authorized fresh deployment of
-`0.1.0-build.172d528d`. They do not change public APIs, provider defaults, or the
+`0.1.0-build.a938112b`. They do not change public APIs, provider defaults, or the
 historical staging operator. Rendering does not install anything or create
 credentials. The generated Kubernetes `List` is JSON accepted by `kubectl -f`.
 
@@ -10,13 +10,14 @@ issuer confinement to the two workload applications. Preparation never
 manufactures that acceptance. An explicitly selected `scaleway_static` profile
 renders separate static serving/writer key mounts; it requires its own real
 storage-permission acceptance and never satisfies broker admission. The pinned
-server release predates the role-derived transport guard, so static production
-provisioning/start/cutover remain fenced until a separately qualified immutable
-release updates `STATIC_AUTH_RELEASE_QUALIFIED`. Rendering alone does not qualify
-or activate it. See the [static Scaleway examples](../examples/scaleway-static/README.md).
+server release includes the role-derived read-only transport guard and passed the
+release qualification checks. `STATIC_AUTH_RELEASE_QUALIFIED` permits admission
+of independently obtained provider evidence; it does not replace that evidence
+or activate workloads. See the [static Scaleway examples](../examples/scaleway-static/README.md).
 
-The dated [preparation evidence](acceptance-evidence.md) records the published
-release, local checks, inactive target state and incomplete acceptance gates.
+The dated [original preparation evidence](acceptance-evidence.md) and
+[static preparation checkpoint](static-acceptance-evidence.md) distinguish the
+published releases, local checks, inactive target state and incomplete gates.
 
 The private [issuer preflight](../../scripts/scaleway-issuer-preflight.py) accepts
 a root-owned mode-0600 JSON input with `organization_id`, `project_id`,
@@ -138,9 +139,9 @@ PostgreSQL instances, the broker, exactly one writer, then serving.
 For static authentication, preparation omits the broker database, keyring and
 issuer identities. Use `static-fingerprints --inputs PRIVATE_STATIC_INPUTS` to
 obtain the binding for an independently verified real storage receipt, then
-`provision-runtime` and `start`. The current production release gate still refuses
-static provisioning/start/switch; local code and rendering do not qualify its
-pinned binary. The [static operator workflow](../examples/scaleway-static/README.md#production-operator-workflow)
+`provision-runtime` and `start`. The qualified release still refuses admission
+without the matching real provider receipt. Rendering does not establish provider
+permissions. The [static operator workflow](../examples/scaleway-static/README.md#production-operator-workflow)
 lists exact input fields, receipt checks, controlled restart rotation and commands.
 For an existing corpus, stop source roles and disable source collector admission
 before `prepare-auth-switch --target-bundle NEW --settings STATIC_SETTINGS`.

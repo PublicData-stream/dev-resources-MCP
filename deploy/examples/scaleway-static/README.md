@@ -8,9 +8,10 @@ issuance, broker, OIDC exchange, session token or credential fallback.
 
 These examples do not authorize deployment or prove real Scaleway permissions.
 The production renderer accepts `"storage_auth": "scaleway_static"` in its JSON
-settings; omission retains `broker`. Its current server image pin predates the
-role-derived transport guard, so production static provisioning/start/cutover
-remain blocked until a separately qualified immutable release updates that gate.
+settings; omission retains `broker`. Static provisioning/start/cutover require a
+qualified immutable release containing the role-derived transport guard and a
+matching real-provider acceptance receipt. Release qualification does not establish
+production acceptance.
 
 ## Applications and effective permissions
 
@@ -30,21 +31,62 @@ Serving needs `ObjectStorageObjectsRead`. Writer needs
 `ObjectStorageObjectsDelete`: Scaleway maps `AbortMultipartUpload`, required for
 interrupted application-owned uploads, to the Delete permission set. This does not
 permit the application to delete permanent evidence. The writer bucket-policy
-example allows abort and explicitly denies `s3:DeleteObject` and
-`s3:DeleteObjectVersion`; the read-only example also denies object mutation.
+allowlist includes abort and omits `s3:DeleteObject` and `s3:DeleteObjectVersion`.
+The reader allowlist also omits PUT and multipart mutation actions.
 Do not grant bucket, IAM or policy administration.
 
 Replace the application UUIDs, bucket and prefix in the
 [read-only](readonly-bucket-policy.json) and [read/write](readwrite-bucket-policy.json)
-statements and merge them into the bucket's policy. They use Scaleway application
-principals and resource syntax. Allow statements alone cannot remove permission
-granted elsewhere. Review effective IAM and bucket policies together; validate
-other-prefix/bucket denials using the actual account. Do not claim these examples
-establish confinement without provider evidence. See
+statements and replace the affected applications' grants in the bucket's policy.
+Replace the documentation-only `192.0.2.1/32` source address with the actual allowed
+egress IPs. They use Scaleway application principals and resource syntax.
+
+For policy version `2023-04-17`, an operation must be allowed by both IAM and a
+matching bucket-policy Allow statement. Scaleway documents Deny statements as
+ineffective for this version; these examples use only explicit allowlists. Broader
+IAM grants cannot bypass the current bucket's allowlist. Other matching bucket
+Allow statements, including wildcard principals, can still widen an application's
+access. Remove the affected applications from every prior Allow statement before
+adding their minimal grants; simply appending these examples is insufficient.
+Unrelated buckets in the same project still require their own restriction and
+negative checks. Review effective IAM and bucket policies together; do not claim
+confinement without provider evidence. See
 [using IAM keys with Object Storage](https://www.scaleway.com/en/docs/iam/api-cli/using-api-key-object-storage/),
 [permission sets](https://www.scaleway.com/en/docs/iam/policies-permissions/permission-sets/),
 [S3/IAM permission equivalence](https://www.scaleway.com/en/docs/object-storage/reference-content/s3-iam-permissions-equivalence/)
 and [bucket policies](https://www.scaleway.com/en/docs/object-storage/api-cli/bucket-policy/).
+
+The offline merge helper builds a fresh private candidate without applying it:
+
+```sh
+python3 -B scripts/scaleway-static-policy.py \
+  --current-policy /tmp/devres-policy/current.json \
+  --inputs /tmp/devres-policy/inputs.json \
+  --output /tmp/devres-policy/candidate.json
+```
+
+The private input JSON contains exactly `reader_application_id`,
+`writer_application_id`, `bucket`, `prefix` and a nonempty `source_ips` list of
+explicit IP addresses/CIDRs. Supply independently verified application UUIDs;
+the helper does not derive or verify identities and accepts no credentials. Inputs
+must be regular private files in an owner-only directory. The output must be a
+new path in an owner-only directory and is created with mode `0600`.
+
+The helper removes the two selected application principals from every existing
+Allow statement, preserving other explicit principals, owner statements, resources
+and conditions. It then adds role-specific object/list grants constrained by TLS,
+the supplied source IPs and prefix. It refuses wildcard or ambiguous principals,
+unsupported versions/effects/condition forms, duplicate JSON keys or statement IDs,
+and output replacement. It does not infer an exception for a wildcard owner or
+silently remove unrelated access. Unsupported input requires private manual review;
+no candidate is written after validation failure.
+
+Review the complete candidate against the original policy and effective IAM grants
+before a separately authorized application/readback. Keep the owner/recovery grants
+intact. This helper performs no provider requests, policy application, credential
+issuance or acceptance-receipt generation. Omitted object deletion also applies to
+completed acceptance objects: cleanup requires separate authority over exact
+disposable targets and must not widen the workload allowlists.
 
 ## Runtime isolation and rotation
 
@@ -74,10 +116,9 @@ lease expiry or pod-deletion revocation; revoke them through the provider.
 
 ## Production operator workflow
 
-The commands below describe the workflow for a qualified immutable release. The
-current production release gate refuses static `provision-runtime`, `start` and
-`switch-storage-auth`; rendering templates or computing fingerprints does not
-lift that gate. Use a fresh private bundle for each authentication method, an
+The commands below describe the workflow for a qualified immutable release.
+Rendering templates or computing fingerprints does not replace release
+qualification or the real-provider acceptance gate. Use a fresh private bundle for each authentication method, an
 explicit cluster context for cluster operations, and root-owned private inputs.
 
 Static inputs contain exactly these identity, policy and secret-file references:

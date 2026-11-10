@@ -6,7 +6,7 @@ if [[ $# != 2 || ! ${1:-} =~ ^--(live|resume|initialize)$ || ${2:-} != /tmp/* ]]
   echo 'usage: scripts/deployment-live-probe.sh --live NEW_ROOT | --resume OWNED_ROOT | --initialize NEW_ROOT (no network; below /tmp)' >&2
   exit 2
 fi
-revision=172d528d88d16c9ec4fd83a16674280815178930
+revision=a938112b5af87996661ddd91ae68755dc0d579b9
 # Tooling may be added on top of this release, but released runtime/library source
 # and dependency resolution must remain exact. This does not stamp another image.
 git cat-file -e "$revision^{commit}"

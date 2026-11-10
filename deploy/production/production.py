@@ -7,15 +7,16 @@ from pathlib import Path
 import re
 
 
-VERSION = '0.1.0-build.172d528d'
-REVISION = '172d528d88d16c9ec4fd83a16674280815178930'
-SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:da44682428c2ee37568867cb5bf0b0c3d75cb01b4d1c027c00f313bb29cf737f'
-BROKER = 'ghcr.io/publicdata-stream/dev-resources-credential-broker@sha256:4ae4ea7fadeb1076cb387cd82a32ea25419914f32c4a454dbb015391a95e1889'
-PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:324c117f72029a4ab153029a6559ccda4d50cf464db164b361ff379a08b3839d'
-# The pinned production server predates role-derived object-storage transport guards.
-# A separately qualified immutable release must update this gate before static activation.
-STATIC_AUTH_RELEASE_QUALIFIED = False
-SOURCE_SHA256 = 'f3680663c2a1e69dfb12489ba44cc56512759b4068704443d3fb0c98bd7f57b0'
+VERSION = '0.1.0-build.a938112b'
+REVISION = 'a938112b5af87996661ddd91ae68755dc0d579b9'
+SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:a966e685fe3d32ffc5625b471d0ab77b71d881827f4ae17e5a16bd2b760016a8'
+BROKER = 'ghcr.io/publicdata-stream/dev-resources-credential-broker@sha256:15109a00b10b92fd313838ab6caf6444a3c816ed4abbccf1a4ecc67581903ef1'
+PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:8f9df1e095d6538b8244b98ddefd37a4bec8ec486a82b7d8ade35f1292fbd5b7'
+# This immutable release passed native amd64/arm64 reader/S3/static-cutover gates.
+# Direct static revocation/rotation also passed locally on amd64. Real provider
+# receipts and deployment acceptance remain required independently of this gate.
+STATIC_AUTH_RELEASE_QUALIFIED = True
+SOURCE_SHA256 = '98f107f09bc4cb69b519408cbd21518307470f77006597bdc70a3feebe339a06'
 OXIBELT = 'ghcr.io/oxibelt/oxibelt@sha256:9f8aa1715586a5c15e26fe48ab982b43c28abe49dc2f09b78c1450ffa01b33d1'
 LEGO = 'goacme/lego@sha256:6f1583fc026a455ea46a7a5858c576105bb69c2e2de69db391cab7f14750350c'
 POSTGRES = 'postgres:18.6-alpine3.24@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395'

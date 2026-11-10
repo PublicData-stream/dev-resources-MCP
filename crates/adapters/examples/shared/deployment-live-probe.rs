@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 #[path = "../support/root.rs"]
 mod root;
 
-const REVISION: &str = "172d528d88d16c9ec4fd83a16674280815178930";
+const REVISION: &str = "a938112b5af87996661ddd91ae68755dc0d579b9";
 const MARKER: &[u8] = b"devres-deployment-live-v1\n";
 const FAMILIES: [&str; 8] = [
     "rfc", "crates", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
@@ -865,7 +865,7 @@ mod tests {
         ledger.github = 1;
         assert!(ledger.validate().is_err());
         let mut wrong_revision = Ledger::new();
-        wrong_revision.revision = "23b25cc7117d5e535c660f96caeb5f26c0fafdb7".into();
+        wrong_revision.revision = "172d528d88d16c9ec4fd83a16674280815178930".into();
         assert!(wrong_revision.validate().is_err());
         let mut oversized_host_count = Ledger::new();
         oversized_host_count
