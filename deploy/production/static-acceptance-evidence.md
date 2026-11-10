@@ -33,6 +33,23 @@ provider evidence. It does not bypass its eight receipt checks, credential/polic
 binding, expiry, stopped-role checks, source/edge acceptance or boot safety gate.
 The release qualification does not admit bundles from the previous release.
 
+## Inactive target preparation
+
+The target cached the pinned server/probe images and verified their native amd64
+architecture and release revision. Sixteen source files from signed tooling
+commit `7c7a24fc7a715833c926398fa02769f083a68d3d` were transferred with individual
+hashes and verified before extraction. The transfer archive SHA-256 is
+`1b68db7d5a0ea1573826a698e645a11422efe1eaa8e976efe9d2478bdc22e2a2`.
+
+A new root-private static bundle remains in phase `prepared`; both older bundles
+were preserved. It contains corpus PostgreSQL initialization and separate mTLS
+identities, without a broker keyring or broker PostgreSQL initialization. The
+23-resource manifest passed server-side dry-run. PostgreSQL, writer and backend
+all render with zero replicas. No resources were applied: the final inventory
+found zero devres Deployments, Pods, PVCs and Secrets and zero Docker containers.
+Both permanent PostgreSQL directories remain empty. No passing provider receipt
+was created, and no workload, public edge or collector was activated.
+
 ## Local change verification
 
 After updating the release pins and offline policy tooling, workspace format and
