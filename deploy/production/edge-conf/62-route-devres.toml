@@ -1,0 +1,30 @@
+[[routes]]
+name = "devres-http"
+hosts = ["dev-resources.mcp.publicdata.stream"]
+upstream = "devres-http"
+upstream_http_version = "h1"
+compression = "off"
+[routes.limits]
+max_request_body_bytes = 8388608
+[routes.match.path]
+exact = "/mcp"
+[routes.tls]
+ssl_early_data = "off"
+[[routes]]
+name = "devres-wt"
+hosts = ["dev-resources.mcp.publicdata.stream"]
+upstream = "devres-wt"
+upstream_http_version = "h3"
+compression = "off"
+[routes.match]
+methods = ["CONNECT"]
+protocols = ["webtransport"]
+[routes.match.path]
+exact = "/mcp-wt/v1"
+[routes.actions.cors]
+allow_origins = ["https://chatgpt.com", "https://dev-resources.mcp.publicdata.stream"]
+allow_methods = ["CONNECT"]
+[routes.tls]
+ssl_early_data = "off"
+[routes.timeouts]
+webtransport_idle_timeout_ms = 65000

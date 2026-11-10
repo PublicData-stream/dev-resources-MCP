@@ -1,0 +1,50 @@
+[proxy]
+trusted_ca_certs = ["devres-backend-ca.pem"]
+[proxy.forwarded_headers]
+mode = "overwrite"
+client_ip_source = "resolved"
+[proxy.real_ip]
+enabled = false
+trusted_proxies = []
+header = "x-forwarded-for"
+recursive = true
+fail_on_untrusted_forwarded_headers = false
+[proxy.auto_upgrade]
+enabled = true
+max_http_version = "h2"
+[proxy.upgrades]
+websocket = false
+generic_http_upgrade = false
+connect_tunneling = false
+[proxy.retry]
+enabled = false
+[proxy.buffering]
+request = "streaming"
+response = "streaming"
+max_memory_body_bytes = 1048576
+max_temp_file_bytes = 0
+[proxy.http]
+early_hints = "drop"
+trailers = "pass"
+expect_continue = "auto"
+priority = "ignore"
+sse_auto_streaming = true
+direct_h1_small_request_body_max_bytes = 16384
+[cache]
+enabled = false
+[waf]
+enabled = false
+[compression]
+enabled = false
+[limits]
+max_request_body_bytes = 8388608
+max_connections = 65536
+max_connections_per_ip = 512
+max_requests_per_connection = 10000
+[security.headers]
+hsts = true
+hsts_max_age_seconds = 31536000
+hsts_include_subdomains = true
+hsts_preload = true
+x_content_type_options = "nosniff"
+referrer_policy = "strict-origin-when-cross-origin"

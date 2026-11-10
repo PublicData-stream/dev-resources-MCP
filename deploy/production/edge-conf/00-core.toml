@@ -1,0 +1,36 @@
+[config]
+strict_unknown_fields = true
+warn_on_deprecated_fields = true
+lb_policy_compat_profile = "strict"
+[logging]
+level = "info"
+[logging.access_log]
+enabled = false
+stdout = true
+[runtime]
+linux_only = true
+read_only_rootfs_compatible = true
+memory_only_state = true
+unprivileged_mode = false
+worker_threads = "auto"
+direct_h1_io = "compio"
+[runtime.accept]
+workers = "auto"
+reuse_port = true
+backlog = 8192
+accept_error_backoff_ms = 10
+[runtime.hot_reload]
+mode = "downstream_tls"
+poll_interval_ms = 2000
+[listeners]
+https_binds = ["0.0.0.0:443", "[::]:443"]
+http_mode = "off"
+http1 = true
+http2 = true
+http3 = true
+[admin]
+enabled = false
+[metrics]
+enabled = false
+[health]
+enabled = false

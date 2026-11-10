@@ -1,0 +1,43 @@
+[tls]
+cert_chain = "publicdata-stream.crt"
+private_key = "publicdata-stream.key"
+server_names = ["dev-resources.mcp.publicdata.stream"]
+require_sni = true
+reject_unknown_sni = true
+min_version = "tls1.3"
+max_version = "tls1.3"
+ssl_early_data = "off"
+session_tickets = true
+session_ticket_rotation_seconds = 86400
+[tls.1_3]
+ciphers = ["TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"]
+key_exchange_groups = ["x25519mlkem768", "x25519"]
+[tls.resumption]
+mode = "stateful"
+session_cache_size = 4096
+tls13_ticket_count = 2
+rotation_seconds = 86400
+multi_certificate = "partition_by_sni"
+[tls.ocsp]
+mode = "disabled"
+[quic]
+retry = true
+zero_rtt = "off"
+[quic.alt_svc]
+enabled = true
+max_age_seconds = 86400
+persist = false
+[[quic.alt_svc.port_overrides]]
+bind = "0.0.0.0:443"
+advertised_port = 443
+[quic.socket]
+receive_buffer_bytes = 16777216
+send_buffer_bytes = 16777216
+workers = "auto"
+reuse_port = true
+[quic.downstream.transport]
+idle_timeout_ms = 210000
+keep_alive_interval_ms = 15000
+[quic.upstream.transport]
+idle_timeout_ms = 210000
+keep_alive_interval_ms = 15000
