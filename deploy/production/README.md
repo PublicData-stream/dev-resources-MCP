@@ -19,6 +19,18 @@ The dated [original preparation evidence](acceptance-evidence.md) and
 [static preparation checkpoint](static-acceptance-evidence.md) distinguish the
 published releases, local checks, inactive target state and incomplete gates.
 
+The [fixed-source helper](../../scripts/deployment-live-probe.sh) starts with
+`--live /tmp/NEW_PRIVATE_ROOT`. It retains public source bytes, parser/rights
+results and a durable attempt ledger. A reviewed `--retry-from FAILED_ROOT --live
+NEW_ROOT` carries every spent family/host/shared-GitHub request forward and allows
+only one child of that failed root. It preserves the predecessor unchanged.
+The exceptional `--resume-rfc-identity` and `--resume-git-*` modes accept only
+their narrowly defined historical failure, provenance and counters; each consumes
+a durable single-use marker before I/O. They do not replenish budgets or authorize
+generic partial replay. Keep failed artifacts and recovery records with the final
+receipt. A passing receipt proves bounded fixed-source parsing and rights, not
+full-corpus collection, public transports or production activation.
+
 The private [issuer preflight](../../scripts/scaleway-issuer-preflight.py) accepts
 a root-owned mode-0600 JSON input with `organization_id`, `project_id`,
 `issuer_application_id`, `reader_application_id`, `writer_application_id`,

@@ -2,8 +2,9 @@
 # Explicit opt-in only. Run via the privileged channel when sharing Cargo caches.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-if [[ $# != 2 || ! ${1:-} =~ ^--(live|resume|initialize)$ || ${2:-} != /tmp/* ]]; then
-  echo 'usage: scripts/deployment-live-probe.sh --live NEW_ROOT | --resume OWNED_ROOT | --initialize NEW_ROOT (no network; below /tmp)' >&2
+if ! { [[ $# == 2 && ${1:-} =~ ^--(live|resume|initialize|resume-rfc-identity|resume-git-v2|resume-git-head|resume-git-content|resume-git-rights)$ && ${2:-} == /tmp/* ]] ||
+       [[ $# == 4 && ${1:-} == --retry-from && ${2:-} == /tmp/* && ${3:-} == --live && ${4:-} == /tmp/* ]]; }; then
+  echo 'usage: scripts/deployment-live-probe.sh --live NEW_ROOT | --resume OWNED_ROOT | --resume-rfc-identity OWNED_ROOT | --resume-git-v2 OWNED_ROOT | --resume-git-head OWNED_ROOT | --resume-git-content OWNED_ROOT | --resume-git-rights OWNED_ROOT | --initialize NEW_ROOT (no network) | --retry-from FAILED_ROOT --live NEW_ROOT (all roots below /tmp)' >&2
   exit 2
 fi
 revision=a938112b5af87996661ddd91ae68755dc0d579b9

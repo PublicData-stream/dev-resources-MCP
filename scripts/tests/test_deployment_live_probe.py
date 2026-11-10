@@ -25,6 +25,7 @@ class DeploymentLiveProbeTests(unittest.TestCase):
             for name in ("owner-v1", "attempts.json", "run.lock"):
                 self.assertEqual(stat.S_IMODE((evidence / name).stat().st_mode), 0o600)
             ledger = json.loads((evidence / "attempts.json").read_text())
+            self.assertEqual(ledger["revision"], "a938112b5af87996661ddd91ae68755dc0d579b9")
             self.assertEqual(ledger["families"], {})
             self.assertEqual(ledger["github"], 0)
             repeated = subprocess.run([os.environ["DEVRES_DEPLOYMENT_PROBE_BIN"], "--initialize", str(evidence)], capture_output=True)
@@ -70,20 +71,31 @@ class DeploymentLiveProbeTests(unittest.TestCase):
             evidence = directory / "evidence"
             environment = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
                                PROBE_CALLED=str(called), CARGO_TARGET_DIR="/unexpected")
-            result = subprocess.run(["bash", str(released_script), "--live", str(evidence)],
-                                    env=environment, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            invocation = json.loads(called.read_text())
-            self.assertEqual(invocation["target"], "/tmp/rust/target")
-            self.assertEqual(invocation["tmp"], "/tmp")
-            self.assertEqual(invocation["args"][-3:], ["--", "--live", str(evidence)])
-            self.assertIn("--locked", invocation["args"])
-            self.assertFalse(evidence.exists())
+            for arguments in (["--live", str(evidence)],
+                              ["--resume-rfc-identity", str(evidence)],
+                              ["--resume-git-v2", str(evidence)],
+                              ["--resume-git-head", str(evidence)],
+                              ["--resume-git-content", str(evidence)],
+                              ["--resume-git-rights", str(evidence)],
+                              ["--retry-from", str(directory / "failed"), "--live", str(evidence)]):
+                result = subprocess.run(["bash", str(released_script), *arguments],
+                                        env=environment, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                invocation = json.loads(called.read_text())
+                self.assertEqual(invocation["target"], "/tmp/rust/target")
+                self.assertEqual(invocation["tmp"], "/tmp")
+                self.assertEqual(invocation["args"][-(len(arguments) + 1):], ["--", *arguments])
+                self.assertIn("--locked", invocation["args"])
+                self.assertFalse(evidence.exists())
 
     def test_live_work_requires_explicit_mode_and_tmp_root(self):
         for arguments in ([], ["--live"], ["--live", "/var/lib/public"],
                           ["--resume", "relative"], ["--full", "/tmp/example"],
-                          ["--live", "/tmp/example", "extra"]):
+                          ["--live", "/tmp/example", "extra"],
+                          ["--retry-from", "/tmp/failed"],
+                          ["--retry-from", "/tmp/failed", "--resume", "/tmp/new"],
+                          ["--retry-from", "/var/lib/failed", "--live", "/tmp/new"],
+                          ["--retry-from", "/tmp/failed", "--live", "/var/lib/new"]):
             result = subprocess.run(["bash", str(SCRIPT), *arguments], capture_output=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn(b"usage:", result.stderr)
