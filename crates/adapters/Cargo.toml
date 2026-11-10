@@ -193,6 +193,10 @@ path = "examples/shared/attribution-live-probe.rs"
 name = "staging-attribution-qualify"
 path = "examples/shared/staging-attribution-qualify.rs"
 
+[[example]]
+name = "deployment-live-probe"
+path = "examples/shared/deployment-live-probe.rs"
+
 [[test]]
 name = "migration_parallel"
 path = "tests/shared/migration_parallel.rs"
