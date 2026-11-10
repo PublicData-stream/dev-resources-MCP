@@ -497,8 +497,11 @@ Filesystem readers share an archive mounted read-only and put scratch outside it
 S3 readers attach by verifying the existing store descriptor and backend epoch;
 they neither PUT the descriptor nor recover uploads. Each pod owns a disposable
 cache with local leases and accounting. Writer-only publication retains existing
-intent, conditional write, integrity, quota and immutable-history rules. Credential
-CRUD authority does not enable permanent deletion in application code.
+intent, conditional write, integrity, quota and immutable-history rules. Reader
+construction also restricts the S3 transport to GET/HEAD before transmission,
+including when an operator supplies an overly privileged key. This capability
+comes from the runtime open mode, not configuration or an asserted IAM role.
+Credential CRUD authority does not enable permanent deletion in application code.
 
 Typed private HTTPS operations delegate public source acquisition, RFC errata
 bootstrap, and public attribution enqueueing to the writer. The writer reconstructs

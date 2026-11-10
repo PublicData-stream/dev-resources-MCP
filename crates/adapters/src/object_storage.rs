@@ -282,6 +282,7 @@ pub struct ObjectMetadata {
 struct Connector {
     client: reqwest::Client,
     origin: url::Origin,
+    read_only: bool,
 }
 impl std::fmt::Debug for Connector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -310,6 +311,13 @@ impl HttpConnector for Connector {
             }
             let request = request.try_into_http1x().map_err(|_| connector_error())?;
             let (parts, body) = request.into_parts();
+            if connector.read_only
+                && !matches!(parts.method, http::Method::GET | http::Method::HEAD)
+            {
+                return Err(ConnectorError::user(Box::new(std::io::Error::other(
+                    "Reader object storage mutation rejected.",
+                ))));
+            }
             let unbounded_object_body = parts.method == http::Method::GET
                 && !url
                     .query_pairs()
@@ -352,10 +360,11 @@ impl HttpConnector for Connector {
     }
 }
 
-fn sdk_http(client: reqwest::Client, endpoint: &url::Url) -> SharedHttpClient {
+fn sdk_http(client: reqwest::Client, endpoint: &url::Url, read_only: bool) -> SharedHttpClient {
     let connector = SharedHttpConnector::new(Connector {
         client,
         origin: endpoint.origin(),
+        read_only,
     });
     http_client_fn(move |_, _| connector.clone())
 }
@@ -523,7 +532,7 @@ impl ExplicitCredentials {
                     .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest())
                     .region(aws_sdk_sts::config::Region::new(self.region.clone()))
                     .endpoint_url(sts_endpoint)
-                    .http_client(sdk_http(client, &endpoint))
+                    .http_client(sdk_http(client, &endpoint, false))
                     .retry_config(
                         aws_sdk_sts::config::retry::RetryConfig::standard().with_max_attempts(3),
                     )
@@ -641,6 +650,15 @@ fn storage_destination(config: &S3Config) -> Result<url::Url> {
 
 impl S3Archive {
     pub async fn new(config: S3Config) -> Result<Self> {
+        Self::with_read_only(config, false).await
+    }
+
+    /// Reader authority comes from the storage open mode, never credential configuration.
+    pub(crate) async fn new_reader(config: S3Config) -> Result<Self> {
+        Self::with_read_only(config, true).await
+    }
+
+    async fn with_read_only(config: S3Config, read_only: bool) -> Result<Self> {
         config.validate()?;
         let destination = storage_destination(&config)?;
         let identity_client = match &config.credentials {
@@ -671,6 +689,7 @@ impl S3Archive {
             .http_client(sdk_http(
                 http_client(config.ca_file.as_deref())?,
                 &destination,
+                read_only,
             ))
             .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3));
         // Container refresh is owned by ExplicitCredentials so the SDK cannot

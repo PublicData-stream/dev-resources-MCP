@@ -873,7 +873,7 @@ impl Archive {
         owner_pid: i32,
         owner_started: String,
     ) -> Result<Arc<Self>> {
-        let remote = S3Archive::new(config).await?;
+        let remote = S3Archive::new_reader(config).await?;
         let binding = config_binding(remote.config())?;
         let row = sqlx_core::query::query("SELECT epoch,store_id FROM devres_archive_control WHERE singleton AND backend='s3' AND binding=$1 AND pending_binding IS NULL AND NOT initializing_s3")
             .bind(&binding).fetch_optional(&pool).await.map_err(|_| unavailable())?.ok_or_else(integrity)?;

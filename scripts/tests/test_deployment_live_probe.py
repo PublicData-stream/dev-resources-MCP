@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 import stat
+import re
+import shutil
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deployment-live-probe.sh"
@@ -52,11 +54,23 @@ class DeploymentLiveProbeTests(unittest.TestCase):
                 "'tmp': os.environ['TMPDIR']}))\n"
             )
             cargo.chmod(0o700)
+            # Exercise the positive released-source path in a clean temporary
+            # checkout. The working tree may legitimately contain new runtime code,
+            # which the production source gate must continue to reject.
+            revision = re.search(r'(?m)^revision=([0-9a-f]{40})$', SCRIPT.read_text())[1]
+            checkout = directory / 'released'
+            subprocess.run(['git', 'clone', '--shared', '--no-checkout', '--quiet',
+                            str(SCRIPT.parents[1]), str(checkout)], check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(checkout), 'checkout', '--detach', '--quiet', revision],
+                           check=True, capture_output=True)
+            released_script = checkout / 'scripts' / SCRIPT.name
+            released_script.parent.mkdir(exist_ok=True)
+            shutil.copy2(SCRIPT, released_script)
             called = directory / "called"
             evidence = directory / "evidence"
             environment = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
                                PROBE_CALLED=str(called), CARGO_TARGET_DIR="/unexpected")
-            result = subprocess.run(["bash", str(SCRIPT), "--live", str(evidence)],
+            result = subprocess.run(["bash", str(released_script), "--live", str(evidence)],
                                     env=environment, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             invocation = json.loads(called.read_text())

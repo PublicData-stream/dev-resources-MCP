@@ -12,6 +12,7 @@ use std::{
 
 #[derive(Default)]
 struct Fixture {
+    methods: Vec<http::Method>,
     objects: HashMap<String, Vec<u8>>,
     multipart: HashMap<String, BTreeMap<u32, Vec<u8>>>,
     conditional_writes: usize,
@@ -66,6 +67,7 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
         return std::future::pending().await;
     }
     let mut state = state.lock().unwrap();
+    state.methods.push(method.clone());
     if let Some(host) = host {
         state.hosts.push(host);
     }
@@ -283,6 +285,139 @@ impl Server {
     async fn archive(&self) -> S3Archive {
         S3Archive::new(self.config.clone()).await.unwrap()
     }
+}
+
+#[tokio::test]
+async fn reader_transport_reads_but_sends_no_mutations_with_writer_credentials() {
+    let server = Server::new().await;
+    let writer = server.archive().await;
+    writer
+        .put_bytes_immutable("retained", b"evidence")
+        .await
+        .unwrap();
+    let upload = writer
+        .client
+        .create_multipart_upload()
+        .bucket("fixture")
+        .key("namespace/pending")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = upload.upload_id().unwrap();
+    writer
+        .client
+        .upload_part()
+        .bucket("fixture")
+        .key("namespace/pending")
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"part"))
+        .send()
+        .await
+        .unwrap();
+    // Both clients use the exact same unrestricted fixture credentials. Provider
+    // denial therefore cannot hide a missing reader-side transport restriction.
+    let reader = S3Archive::new_reader(server.config.clone()).await.unwrap();
+    let first_reader_request = server.state.lock().unwrap().methods.len();
+    reader.health().await.unwrap();
+    assert_eq!(reader.head("retained").await.unwrap().unwrap().bytes, 8);
+    assert_eq!(reader.get_bytes("retained", 8).await.unwrap(), b"evidence");
+    let output = server._directory.path().join("reader-materialization");
+    assert_eq!(
+        reader
+            .get_to_file("retained", &output, 8, &CancellationToken::new())
+            .await
+            .unwrap(),
+        (crate::integrity::hash(b"evidence"), 8)
+    );
+    assert_eq!(tokio::fs::read(&output).await.unwrap(), b"evidence");
+
+    let before_mutations = server.state.lock().unwrap().methods.len();
+    assert!(
+        reader
+            .client
+            .put_object()
+            .bucket("fixture")
+            .key("namespace/new")
+            .if_none_match("*")
+            .body(ByteStream::from_static(b"new"))
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .client
+            .delete_object()
+            .bucket("fixture")
+            .key("namespace/retained")
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .client
+            .create_multipart_upload()
+            .bucket("fixture")
+            .key("namespace/new")
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .client
+            .upload_part()
+            .bucket("fixture")
+            .key("namespace/pending")
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"changed"))
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .client
+            .complete_multipart_upload()
+            .bucket("fixture")
+            .key("namespace/pending")
+            .upload_id(upload_id)
+            .if_none_match("*")
+            .multipart_upload(aws_sdk_s3::types::CompletedMultipartUpload::builder().build())
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .client
+            .abort_multipart_upload()
+            .bucket("fixture")
+            .key("namespace/pending")
+            .upload_id(upload_id)
+            .send()
+            .await
+            .is_err()
+    );
+    assert_eq!(server.state.lock().unwrap().methods.len(), before_mutations);
+
+    // Exercise public adapter mutation paths too: readback and recovery listings
+    // remain legal, but their attempted PUT/DELETE must never reach the provider.
+    assert!(reader.put_bytes_immutable("new", b"new").await.is_err());
+    assert!(reader.abort_incomplete("pending").await.is_err());
+    let state = server.state.lock().unwrap();
+    assert!(
+        state.methods[first_reader_request..]
+            .iter()
+            .all(|method| matches!(*method, http::Method::GET | http::Method::HEAD))
+    );
+    assert_eq!(state.objects.len(), 1);
+    assert_eq!(state.objects["/fixture/namespace/retained"], b"evidence");
+    assert_eq!(state.multipart["/fixture/namespace/pending"][&1], b"part");
+    assert_eq!(state.aborted, 0);
 }
 
 #[tokio::test]
@@ -689,7 +824,7 @@ async fn virtual_host_requests_keep_custom_port_and_reject_other_origins() {
             .client
             .config()
             .to_builder()
-            .http_client(sdk_http(client.clone(), &destination))
+            .http_client(sdk_http(client.clone(), &destination, false))
             .build(),
     );
     // A missing key is sufficient to prove the generated SDK request reached
@@ -702,6 +837,7 @@ async fn virtual_host_requests_keep_custom_port_and_reject_other_origins() {
     let connector = Connector {
         client,
         origin: destination.origin(),
+        read_only: false,
     };
     let request = http::Request::builder()
         .uri(format!("http://storage.fixture:{port}/"))
