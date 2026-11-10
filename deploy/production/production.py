@@ -145,7 +145,11 @@ def deployment(name, image, command, requests, limits, volumes, mounts, ports, s
                             {'name': 'POSTGRES_DB', 'value': db},
                             {'name': 'PGDATA', 'value': '/var/lib/postgresql/18/docker'},
                             {'name': 'POSTGRES_PASSWORD_FILE', 'value': '/run/postgres-private/postgres-password'}]
-        probe = {'exec': {'command': ['pg_isready', '-U', 'devres_admin', '-d', db]}}
+        # The image's initialization postmaster is socket-only. TCP readiness
+        # admits only the final postmaster after initialization/recovery finishes.
+        probe = {'exec': {'command': ['pg_isready', '-h', '127.0.0.1', '-U', 'devres_admin', '-d', db]},
+                 'timeoutSeconds': 5, 'periodSeconds': 10}
+        container['startupProbe'] = {**probe, 'failureThreshold': 60}
         container['readinessProbe'] = probe
         container['livenessProbe'] = {**probe, 'initialDelaySeconds': 20}
     elif name == 'credential-broker':
@@ -156,6 +160,7 @@ def deployment(name, image, command, requests, limits, volumes, mounts, ports, s
         container['readinessProbe'] = {'httpGet': {'path': '/ready', 'port': 'health'}}
         container['livenessProbe'] = {'httpGet': {'path': '/live', 'port': 'health'}, 'initialDelaySeconds': 30}
     return resource('Deployment', name, {'replicas': 0, 'strategy': {'type': 'Recreate'},
+                    **({'progressDeadlineSeconds': 720} if database else {}),
                     'selector': {'matchLabels': {'app': name}},
                     'template': {'metadata': {'labels': {'app': name}}, 'spec': pod}})
 

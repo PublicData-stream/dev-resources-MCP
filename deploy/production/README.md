@@ -91,6 +91,12 @@ has its own `devres_broker` login/database on `broker-postgres`; neither corpus 
 exists in that instance. Initialization SQL and passwords are supplied privately;
 changing a Secret does not rotate an initialized database. Both PostgreSQL Pods
 use the pinned Alpine image's UID/GID 70 and PostgreSQL 18 data directory.
+Database startup probes allow ten minutes for initialization or recovery before
+liveness checks can restart a process. TCP loopback probes wait for the final
+postmaster, rather than the image's socket-only initialization server. Database
+rollout waits include that startup window; application rollout waits remain two
+minutes. After interrupted initialization, verify roles and grants explicitly:
+an existing data directory does not prove initialization SQL completed.
 
 All five broker Deployments, or the three static Deployments, start at zero replicas. All eight collector switches are
 false in both runtime templates; npm's catalog remains empty and its advisory

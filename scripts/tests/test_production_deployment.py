@@ -88,6 +88,16 @@ class ProductionDeploymentTests(unittest.TestCase):
             self.assertEqual(env['POSTGRES_DB'], db)
             self.assertEqual(env['PGDATA'], '/var/lib/postgresql/18/docker')
             self.assertNotIn('POSTGRES_PASSWORD', env)
+            startup = container['startupProbe']
+            self.assertEqual(startup['exec']['command'],
+                             ['pg_isready', '-h', '127.0.0.1', '-U', 'devres_admin', '-d', db])
+            self.assertGreaterEqual(startup['periodSeconds'] * startup['failureThreshold'], 600)
+            self.assertGreater(startup['timeoutSeconds'], 3)
+            self.assertLess(startup['timeoutSeconds'], startup['periodSeconds'])
+            self.assertEqual(container['readinessProbe']['exec'], startup['exec'])
+            self.assertEqual(container['livenessProbe']['exec'], startup['exec'])
+            self.assertGreater(self.objects['Deployment', name]['spec']['progressDeadlineSeconds'],
+                               startup['periodSeconds'] * startup['failureThreshold'])
         policy = self.objects['NetworkPolicy', 'broker-postgres-boundary']['spec']
         self.assertEqual(policy['ingress'][0]['from'], [production.peer('credential-broker')])
         broker = self.objects['Deployment', 'credential-broker']['spec']['template']['spec']['containers'][0]

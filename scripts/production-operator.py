@@ -532,14 +532,18 @@ class Operator:
         else:
             static_storage_receipt(value, self.static_runtime_binding())
 
-    def k(self, *args, data=None, timeout=180):
+    def k(self, *args, data=None, timeout=180, request_timeout=30):
         return call(["k3s", "kubectl", "--context", self.context, "--namespace", NAMESPACE,
-                     "--request-timeout=30s", *args], data=data, timeout=timeout)
+                     f"--request-timeout={request_timeout}s", *args], data=data, timeout=timeout)
 
     def scale(self, name, count):
         self.k("scale", "deployment/" + name, "--replicas=" + str(count))
         if count:
-            self.k("rollout", "status", "deployment/" + name, "--timeout=120s")
+            if name in self.database_workloads():
+                self.k("rollout", "status", "deployment/" + name, "--timeout=660s",
+                       timeout=700, request_timeout=670)
+            else:
+                self.k("rollout", "status", "deployment/" + name, "--timeout=120s")
         else:
             self.k("wait", "--for=delete", "pod", "-l", "app=" + name, "--timeout=120s")
 

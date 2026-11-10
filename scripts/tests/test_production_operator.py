@@ -111,6 +111,22 @@ class ProductionOperatorTests(unittest.TestCase):
         self.write('inputs.json', json.dumps(values))
         return self.bundle / 'inputs.json'
 
+    def test_database_wait_encloses_startup_budget_without_delaying_other_roles(self):
+        real = operator.Operator('production-test', self.bundle)
+        for workload in ('postgres', 'broker-postgres'):
+            with patch.object(operator, 'call', return_value=b'') as invoke:
+                real.scale(workload, 1)
+            arguments, options = invoke.call_args
+            self.assertIn('--timeout=660s', arguments[0])
+            self.assertIn('--request-timeout=670s', arguments[0])
+            self.assertEqual(options['timeout'], 700)
+        with patch.object(operator, 'call', return_value=b'') as invoke:
+            real.scale('writer', 1)
+        arguments, options = invoke.call_args
+        self.assertIn('--timeout=120s', arguments[0])
+        self.assertIn('--request-timeout=30s', arguments[0])
+        self.assertEqual(options['timeout'], 180)
+
     def test_initial_install_orders_firewall_and_denies_before_nodeports(self):
         with patch.object(operator, 'call', return_value=b'Encryption Status: Enabled\nServer Encryption Hashes: All hashes match\n'):
             self.op.install()
