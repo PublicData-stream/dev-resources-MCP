@@ -3,6 +3,18 @@ use super::*;
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 static PREFLIGHT: AtomicU64 = AtomicU64::new(0);
+
+// Fixed fields only: source bodies, URLs and underlying error text stay private.
+fn collection_failure(stage: &'static str, error: &Error) {
+    let code = match error.code.as_str() {
+        "invalid_input" | "unavailable" | "not_found" | "capacity" | "integrity" | "cancelled" => {
+            error.code.as_str()
+        }
+        _ => "other",
+    };
+    tracing::warn!(target: "devres_server::collection", provider = "w3c", stage, code, "Public collection stage failed");
+}
+
 struct TemporaryRoot(PathBuf);
 impl TemporaryRoot {
     fn new() -> Result<Self> {
@@ -55,8 +67,10 @@ impl W3cCorpus {
                 },
                 cancel.clone(),
             )
-            .await?;
+            .await
+            .inspect_err(|error| collection_failure("metadata_acquisition", error))?;
         if response.status != 200 {
+            tracing::warn!(target: "devres_server::collection", provider = "w3c", stage = "metadata_http_status", status = response.status, "Public collection stage failed");
             return Err(Error::unavailable("W3C metadata API request failed."));
         }
         let mut bytes = Vec::new();
@@ -94,7 +108,8 @@ impl W3cCorpus {
             let (bytes, artifact) = self
                 .api(catalog::ApiOperation::Catalog { page }, cancel.clone())
                 .await?;
-            let catalog = catalog::parse(&bytes, observed_at)?;
+            let catalog = catalog::parse(&bytes, observed_at)
+                .inspect_err(|error| collection_failure("catalog_validation", error))?;
             for mut standard in catalog.standards {
                 // Retain discovered source associations across catalog refreshes, never invent them.
                 standard.metadata["api_catalog_capture"] = json!(artifact.body_hash);
@@ -559,7 +574,8 @@ impl W3cCorpus {
                 },
                 cancel.clone(),
             )
-            .await?;
+            .await
+            .inspect_err(|error| collection_failure("publication_acquisition", error))?;
         let status = response.status;
         let observed_at = devres_domain::unix_now();
         let temporary = TemporaryRoot::new()?;
@@ -578,7 +594,8 @@ impl W3cCorpus {
             })
             .await?
             {
-                let chunk = chunk?;
+                let chunk =
+                    chunk.inspect_err(|error| collection_failure("publication_body", error))?;
                 total = total.checked_add(chunk.len() as u64).ok_or_else(failure)?;
                 if total > bulk::MAX_ARTIFACT_BYTES
                     || self.raw.quota_bytes().is_some_and(|limit| {
@@ -606,6 +623,7 @@ impl W3cCorpus {
             }
             file.sync_all().await.map_err(|_| failure())?;
         } else {
+            tracing::warn!(target: "devres_server::collection", provider = "w3c", stage = "publication_http_status", status, "Public collection stage failed");
             gaps.push(format!("publication_http_{status}"));
         }
         drop(file);
@@ -657,7 +675,10 @@ impl W3cCorpus {
                 match catalog::publication_metadata(&bytes, &cancel) {
                     Ok(m) => metadata = m,
                     Err(e) if e.code == "cancelled" => return Err(e),
-                    Err(e) => gaps.push(format!("publication_metadata_{}", e.code)),
+                    Err(e) => {
+                        collection_failure("publication_metadata_validation", &e);
+                        gaps.push(format!("publication_metadata_{}", e.code));
+                    }
                 }
             }
         }
@@ -669,7 +690,8 @@ impl W3cCorpus {
             let a = self
                 .raw
                 .ingest_file(&spool, bulk::MAX_ARTIFACT_BYTES, cancel.clone())
-                .await?;
+                .await
+                .inspect_err(|error| collection_failure("publication_storage", error))?;
             if a.body_hash != body_hash || a.bytes != total {
                 return Err(Error::integrity(
                     "W3C preflight/full capture hash mismatch.",
@@ -678,6 +700,7 @@ impl W3cCorpus {
             Some(a)
         } else {
             if status == 200 {
+                tracing::warn!(target: "devres_server::collection", provider = "w3c", stage = "publication_license", code = "unresolved", "Public collection stage withheld");
                 gaps.push("license_unresolved_raw_not_retained".into());
             }
             None
@@ -718,7 +741,8 @@ impl W3cCorpus {
         };
         self.store
             .w3c_put("publications", &id, &encode(&publication)?)
-            .await?;
+            .await
+            .inspect_err(|error| collection_failure("publication_storage", error))?;
         if publish_head
             && publication.status == 200
             && publication.artifact.is_some()

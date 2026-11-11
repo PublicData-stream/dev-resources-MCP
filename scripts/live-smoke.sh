@@ -7,6 +7,21 @@ if [[ ${1:-} != --live ]]; then
   exit 2
 fi
 shift
+if [[ ${1:-} == --html-transport ]]; then
+  shift
+  if (( $# == 0 )); then
+    root=$(mktemp -d /tmp/devres-html-transport.XXXXXX)
+    printf 'devres-html-transport-probe-v1\n' > "$root/owner-v1"
+    chmod 600 "$root/owner-v1"
+  elif (( $# == 1 )); then
+    root=$1
+  else
+    echo 'usage: scripts/live-smoke.sh --live --html-transport [OWNED_ROOT]' >&2
+    exit 2
+  fi
+  printf 'Retained bounded HTML comparison: %s\n' "$root" >&2
+  exec cargo run --locked -p devres-adapters --example html-transport-probe -- --live "$root"
+fi
 if [[ ${1:-} == --attribution ]]; then
   shift
   test "$#" = 0 || { echo 'usage: scripts/live-smoke.sh --live --attribution' >&2; exit 2; }

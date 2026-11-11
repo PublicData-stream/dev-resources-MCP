@@ -1,5 +1,45 @@
 # Dependency admission
 
+## HTML acquisition transport
+
+Qualified W3C HTML publications and the TR index, Chromium/Chrome current HTML,
+and RFC HTML (including exact attribution repair) use `wreq 0.16.3` and
+`wreq-util 0.2.1`, pinned exactly with a committed locked graph. This applies
+[Obscura's network approach](https://github.com/h4ckf0r0day/obscura/blob/e3007167016b169bb58d8b5124ca9662a0b37f2d/crates/obscura-net/src/wreq_client.rs)
+without importing its browser, V8, renderer, CDP server or vendored modules.
+The alternative stock browser/CLI follows navigation and retries connection
+failures internally; it cannot preserve this service's single retry owner and
+per-attempt admission. Keeping reqwest for unrelated operations limits the change
+to the selected representation families.
+
+Both packages are Apache-2.0 and require Rust 1.98, below the pinned workspace
+1.99.1. Defaults are disabled: wreq enables Tokio, streaming and Linux BoringSSL
+symbol prefixes; wreq-util enables emulation. The fixed Chrome145/Windows profile
+changes TLS/HTTP framing, while policy overrides retain the application headers,
+raw body bytes, validated destinations and existing caller-specific proxy policy.
+HTTP decompression, cookie storage, redirects and transport retries are disabled.
+Emulation itself uses compression libraries for TLS certificate compression;
+this does not enable HTTP body expansion. The utility version includes its
+[documented zstd dependency update](https://github.com/0x676e67/wreq-util/releases/tag/wreq-util-v0.2.1),
+avoiding the older prerelease graph vendored by Obscura.
+
+BoringSSL and bindgen introduce native source/build scripts and require C/C++
+build tools, CMake, Clang/libclang, LLVM, Perl and pkg-config in build environments.
+They run while building this service, never while inspecting packages. Native
+amd64 and arm64 builds, current advisory and cargo-deny checks, source/license
+inventory and actual-build image notices remain required gates; package
+availability and successful local compilation do not satisfy them. Preserve the
+BoringSSL and compression-library notices in addition to Rust package licenses.
+Linux system CA trust and hostname/certificate verification remain enabled.
+Different TLS engines do not imply identical handling of every certificate;
+fixture trust, invalid chains and hostname rejection must be checked explicitly.
+No dependency advisory or license exception is pre-authorized.
+
+The direct `tracing` dependency emits only fixed collection stage/provider labels,
+allowlisted domain error codes and HTTP status numbers. It reuses the deployed
+operator logging filter and never records source bodies, client errors, URLs,
+credentials or supplied audit input.
+
 ## S3-compatible archive transport
 
 `aws-sdk-s3 1.157.0` and `aws-sdk-sts 1.124.0` are pinned to the maintained

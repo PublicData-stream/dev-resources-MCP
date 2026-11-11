@@ -1,4 +1,5 @@
 //! Private fixed-source streaming I/O. Public capture reads retain their smaller limits.
+use crate::html_transport::{HtmlClient, ProxyPolicy, Response};
 use devres_domain::{Error, Result, Validators};
 use futures::{Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -174,6 +175,26 @@ impl BulkSource {
             | Self::MdnCompatGit(_) => "github.com",
         }
     }
+    fn html_transport(&self) -> Option<ProxyPolicy> {
+        use crate::{
+            attribution_providers::AttributionSource,
+            chromium::source::Operation,
+            w3c::{catalog::PublicationKind, discovery::DiscoveryOperation},
+        };
+        match self {
+            Self::W3cPublication(source) if source.kind() == PublicationKind::Html => {
+                Some(ProxyPolicy::Public)
+            }
+            Self::W3cDiscovery(DiscoveryOperation::TrIndex)
+            | Self::Chromium(Operation::Page { .. } | Operation::SitePage { .. }) => {
+                Some(ProxyPolicy::Public)
+            }
+            Self::Attribution(AttributionSource::Rfc { format, .. }) if format == "html" => {
+                Some(ProxyPolicy::Direct)
+            }
+            _ => None,
+        }
+    }
     fn media_type(&self) -> &'static str {
         match self {
             Self::Attribution(source) => source.media_type(),
@@ -283,6 +304,8 @@ pub struct AttemptPermit {
 pub struct BulkBroker {
     client: reqwest::Client,
     w3c_client: reqwest::Client,
+    html_public: HtmlClient,
+    html_direct: HtmlClient,
     config: BulkConfig,
     rates: Mutex<HashMap<String, Instant>>,
     bulk_slots: Arc<Semaphore>,
@@ -312,10 +335,13 @@ impl BulkBroker {
         broker.client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|_| Error::unavailable("Fixture HTTP initialization failed."))?;
         broker.test_origin = Some(origin);
         broker.w3c_client = broker.client.clone();
+        broker.html_public = HtmlClient::fixture()?;
+        broker.html_direct = HtmlClient::fixture()?;
         Ok(broker)
     }
     pub fn new(config: BulkConfig) -> Result<Self> {
@@ -331,6 +357,7 @@ impl BulkBroker {
             .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
             .user_agent(
                 "dev-resources-MCP/0.0.0 (+https://github.com/PublicData-stream/dev-resources-MCP)",
@@ -340,6 +367,8 @@ impl BulkBroker {
         Ok(Self {
             client,
             w3c_client: crate::w3c::network::client()?,
+            html_public: HtmlClient::new(ProxyPolicy::Public)?,
+            html_direct: HtmlClient::new(ProxyPolicy::Direct)?,
             bulk_slots: Arc::new(Semaphore::new(config.max_transfers)),
             foreground_slots: Arc::new(Semaphore::new(2)),
             documentation_slots: Arc::new(Semaphore::new(1)),
@@ -562,6 +591,30 @@ impl BulkBroker {
         request: BulkRequest,
         shutdown: CancellationToken,
     ) -> Result<BulkResponse> {
+        self.open_inner(request, shutdown, false).await
+    }
+
+    /// Fixed-source comparison tooling only; shares normal admission and retry policy.
+    #[doc(hidden)]
+    pub async fn open_legacy_html_probe(
+        &self,
+        request: BulkRequest,
+        shutdown: CancellationToken,
+    ) -> Result<BulkResponse> {
+        if request.source.html_transport().is_none() {
+            return Err(Error::invalid(
+                "Legacy HTML comparison requires a qualified HTML source.",
+            ));
+        }
+        self.open_inner(request, shutdown, true).await
+    }
+
+    async fn open_inner(
+        &self,
+        request: BulkRequest,
+        shutdown: CancellationToken,
+        legacy_html: bool,
+    ) -> Result<BulkResponse> {
         if request.max_bytes == 0
             || request.max_bytes > MAX_ARTIFACT_BYTES
             || request.deadline <= Instant::now()
@@ -684,13 +737,36 @@ impl BulkBroker {
                 builder = builder.header(reqwest::header::IF_MODIFIED_SINCE, modified);
             }
             let response = bounded(&shutdown, request.deadline, async {
-                builder
-                    .send()
-                    .await
-                    .map_err(|_| Error::unavailable("Bulk source connection failed."))
+                if let Some(policy) = request.source.html_transport().filter(|_| !legacy_html) {
+                    let prepared = builder
+                        .build()
+                        .map_err(|_| Error::unavailable("Bulk source connection failed."))?;
+                    let html = match policy {
+                        ProxyPolicy::Public => &self.html_public,
+                        ProxyPolicy::Direct => &self.html_direct,
+                        ProxyPolicy::Ambient => {
+                            return Err(Error::invalid("Invalid bulk HTML proxy policy."));
+                        }
+                    };
+                    html.send(&url, prepared.headers().clone())
+                        .await
+                        .map_err(|_| Error::unavailable("Bulk source connection failed."))
+                } else {
+                    builder
+                        .send()
+                        .await
+                        .map(Response::from)
+                        .map_err(|_| Error::unavailable("Bulk source connection failed."))
+                }
             })
-            .await?;
-            let status = response.status().as_u16();
+            .await
+            .inspect_err(|_| {
+                if request.source.html_transport().is_some() {
+                    let provider = if chromium { "chromium" } else if w3c { "w3c" } else { "rfc" };
+                    tracing::warn!(target: "devres_server::collection", provider, stage = "source_connection", "Public collection stage failed");
+                }
+            })?;
+            let status = response.status();
             if status == 307
                 && matches!(request.source, BulkSource::LegacyDatabaseDump)
                 && !redirected
@@ -2583,3 +2659,172 @@ mod w3c_policy_tests {
 #[cfg(test)]
 #[path = "bulk_verification_tests.rs"]
 mod verification_tests;
+
+#[cfg(test)]
+mod html_policy_tests {
+    use super::*;
+    use crate::{
+        attribution_providers::AttributionSource,
+        chromium::source::Operation,
+        w3c::{catalog::PublicationUrl, discovery::DiscoveryOperation},
+    };
+    use axum::{Router, response::IntoResponse, routing::get};
+
+    fn request(source: BulkSource, max_bytes: u64) -> BulkRequest {
+        BulkRequest {
+            source,
+            validators: Validators::default(),
+            max_bytes,
+            deadline: Instant::now() + Duration::from_secs(10),
+            body: Vec::new(),
+        }
+    }
+    fn html() -> BulkSource {
+        BulkSource::Attribution(AttributionSource::Rfc {
+            number: 9000,
+            format: "html".into(),
+        })
+    }
+    async fn fixture(router: Router) -> (BulkBroker, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broker = BulkBroker::fixture(
+            format!("http://{}/", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (broker, task)
+    }
+    #[test]
+    fn selection_is_typed_and_keeps_unrelated_html_unchanged() {
+        for source in [
+            BulkSource::W3cPublication(
+                PublicationUrl::new("https://www.w3.org/TR/css-color-4/").unwrap(),
+            ),
+            BulkSource::W3cDiscovery(DiscoveryOperation::TrIndex),
+            BulkSource::Chromium(Operation::Page {
+                path: "docs/devtools/overview".into(),
+            }),
+            BulkSource::Chromium(Operation::SitePage {
+                path: "Home".into(),
+            }),
+            html(),
+        ] {
+            assert!(source.html_transport().is_some());
+        }
+        for source in [
+            BulkSource::W3cPublication(
+                PublicationUrl::new("https://www.w3.org/TR/css-color-4/index.xml").unwrap(),
+            ),
+            BulkSource::W3cDiscovery(DiscoveryOperation::BrowserSpecs),
+            BulkSource::Chromium(Operation::Sitemap {
+                path: "sitemap.xml".into(),
+            }),
+            BulkSource::Attribution(AttributionSource::Rfc {
+                number: 9000,
+                format: "txt".into(),
+            }),
+            BulkSource::Documentation {
+                name: "serde".into(),
+                version: "1.0.0".into(),
+                operation: DocsOperation::Builds,
+            },
+        ] {
+            assert!(source.html_transport().is_none());
+        }
+    }
+    #[tokio::test]
+    async fn selected_html_retry_and_comparison_share_accounting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let router = Router::new().route(
+            "/rfc/rfc9000.html",
+            get(move |headers: http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    assert_eq!(headers["accept"], "text/html");
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "0")],
+                            "retry",
+                        )
+                            .into_response()
+                    } else {
+                        ([("etag", "\"html\"")], "<html>original</html>").into_response()
+                    }
+                }
+            }),
+        );
+        let (broker, task) = fixture(router).await;
+        let broker = broker.with_attempt_budget(3).unwrap();
+        for legacy in [false, true] {
+            let result = if legacy {
+                broker
+                    .open_legacy_html_probe(request(html(), 1024), CancellationToken::new())
+                    .await
+            } else {
+                broker
+                    .open(request(html(), 1024), CancellationToken::new())
+                    .await
+            };
+            let mut response = result.unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.validators.etag.as_deref(), Some("\"html\""));
+            let mut body = Vec::new();
+            while let Some(chunk) = response.stream.next().await {
+                body.extend(chunk.unwrap());
+            }
+            assert_eq!(body, b"<html>original</html>");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(broker.attempt_count(), 3);
+        assert!(
+            broker
+                .open(request(html(), 1024), CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn selected_html_stream_holds_and_releases_permits_and_enforces_limits() {
+        let router = Router::new().route(
+            "/rfc/rfc9000.html",
+            get(|| async { vec![b'x'; CHUNK_BYTES + 1] }),
+        );
+        let (broker, task) = fixture(router).await;
+        let response = broker
+            .open(request(html(), 1), CancellationToken::new())
+            .await;
+        assert_eq!(response.err().unwrap().code, "capacity");
+        assert_eq!(broker.bulk_slots.available_permits(), 4);
+        let cancel = CancellationToken::new();
+        let mut response = broker
+            .open(request(html(), (CHUNK_BYTES + 1) as u64), cancel.clone())
+            .await
+            .unwrap();
+        assert_eq!(broker.bulk_slots.available_permits(), 3);
+        cancel.cancel();
+        assert!(response.stream.next().await.unwrap().is_err());
+        drop(response);
+        assert_eq!(broker.bulk_slots.available_permits(), 4);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn legacy_comparison_rejects_other_sources_without_admission() {
+        let broker = BulkBroker::new(BulkConfig::default()).unwrap();
+        let response = broker
+            .open_legacy_html_probe(
+                request(BulkSource::DatabaseDump, 1),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(response.err().unwrap().code, "invalid_input");
+        assert_eq!(broker.attempt_count(), 0);
+    }
+}

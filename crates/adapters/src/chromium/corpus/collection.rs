@@ -1,6 +1,16 @@
 use super::*;
 use quick_xml::{Reader, events::Event};
 
+fn collection_failure(stage: &'static str, error: &Error) {
+    let code = match error.code.as_str() {
+        "invalid_input" | "unavailable" | "not_found" | "capacity" | "integrity" | "cancelled" => {
+            error.code.as_str()
+        }
+        _ => "other",
+    };
+    tracing::warn!(target: "devres_server::collection", provider = "chromium", stage, code, "Public collection stage failed");
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Frame {
     path: String,
@@ -93,7 +103,11 @@ impl ChromiumCorpus {
                 "Chromium provider is deferred until its admitted retry time.",
             ));
         }
-        let response = self.source.fetch(operation, cancel).await?;
+        let response = self
+            .source
+            .fetch(operation, cancel)
+            .await
+            .inspect_err(|error| collection_failure("source_acquisition", error))?;
         if let Some(retry_at) = response.retry_at {
             self.store
                 .chromium_set_state(
@@ -103,6 +117,7 @@ impl ChromiumCorpus {
                 .await?;
         }
         if !matches!(response.status, 200 | 404) {
+            tracing::warn!(target: "devres_server::collection", provider = "chromium", stage = "source_http_status", status = response.status, "Public collection stage failed");
             return Err(Error::unavailable(
                 "Chromium provider response is unavailable; absence is unconfirmed.",
             ));
@@ -192,12 +207,14 @@ impl ChromiumCorpus {
             let mut parsed = if absent_optional {
                 BTreeMap::new()
             } else {
-                source::parse_refs(component, &response.bytes)?
+                source::parse_refs(component, &response.bytes)
+                    .inspect_err(|error| collection_failure("source_validation", error))?
             };
             let tags = if absent_optional {
                 BTreeMap::new()
             } else {
-                source::annotated_tags(component, &response.bytes)?
+                source::annotated_tags(component, &response.bytes)
+                    .inspect_err(|error| collection_failure("source_validation", error))?
             };
             for (name, original) in tags {
                 let mut revision = original.clone();
@@ -215,7 +232,8 @@ impl ChromiumCorpus {
                     if response.status != 200 {
                         return Err(Error::unavailable("Chromium annotated tag is unavailable."));
                     }
-                    let tag = source::parse_tag(component, &response.bytes)?;
+                    let tag = source::parse_tag(component, &response.bytes)
+                        .inspect_err(|error| collection_failure("source_validation", error))?;
                     if tag.revision != revision {
                         return Err(Error::integrity(
                             "Chromium annotated tag identity mismatch.",
@@ -351,7 +369,8 @@ impl ChromiumCorpus {
                 "Chromium historical directory is unavailable.",
             ));
         }
-        let directory: Directory = source::parse_tree(component, &response.bytes)?;
+        let directory: Directory = source::parse_tree(component, &response.bytes)
+            .inspect_err(|error| collection_failure("source_validation", error))?;
         if directory.id != tree {
             return Err(Error::integrity(
                 "Chromium selected directory differs from its tree identity.",
@@ -420,7 +439,8 @@ impl ChromiumCorpus {
         if response.status != 200 {
             return Err(Error::not_found("Chromium document body is unavailable."));
         }
-        let bytes = source::decode_blob(component, &response.bytes, oid)?;
+        let bytes = source::decode_blob(component, &response.bytes, oid)
+            .inspect_err(|error| collection_failure("source_validation", error))?;
         Ok((bytes, response.source_url))
     }
     async fn local_license(
@@ -593,7 +613,8 @@ impl ChromiumCorpus {
                     .await?;
                 return Ok(None);
             }
-            let commit = source::parse_commit(component, &response.bytes)?;
+            let commit = source::parse_commit(component, &response.bytes)
+                .inspect_err(|error| collection_failure("source_validation", error))?;
             if commit.revision != revision {
                 return Err(Error::integrity("Chromium commit identity mismatch."));
             }
@@ -1105,7 +1126,8 @@ impl ChromiumCorpus {
                             "Chromium sitemap inventory is unavailable.",
                         ));
                     }
-                    let (maps, pages) = sitemap_locations(&response.bytes)?;
+                    let (maps, pages) = sitemap_locations(&response.bytes)
+                        .inspect_err(|error| collection_failure("source_validation", error))?;
                     for path in maps {
                         let id = inventory::digest(format!("{}:{path}", work.id).as_bytes());
                         self.store
@@ -1165,6 +1187,7 @@ impl ChromiumCorpus {
                         .map(|body| licensing::qualify("chrome", body, &response.source_url))
                         .unwrap_or_else(|_| licensing::unresolved("chrome", path));
                     if license["decision"] != "approved" {
+                        tracing::warn!(target: "devres_server::collection", provider = "chromium", stage = "publication_license", code = "unresolved", "Public collection stage withheld");
                         member.gaps.push("license_scope_unresolved".into());
                     } else {
                         let artifact = self
@@ -1200,6 +1223,7 @@ impl ChromiumCorpus {
                                     "invalid_input" | "integrity" | "capacity"
                                 ) =>
                             {
+                                collection_failure("publication_projection", &error);
                                 member.gaps.push(format!("processing_{}", error.code))
                             }
                             Err(error) => return Err(error),

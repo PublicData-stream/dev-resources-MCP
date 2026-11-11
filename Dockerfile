@@ -3,6 +3,7 @@ FROM rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b65
 ARG TARGETARCH
 ARG TARGETVARIANT
 RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    build-essential cmake clang libclang-dev llvm-dev perl pkg-config git \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN cp -a /usr/local/cargo /tmp/cargo && cp -a /usr/local/rustup /tmp/rustup

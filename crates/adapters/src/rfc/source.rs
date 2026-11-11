@@ -588,6 +588,13 @@ impl ResponseValidator for Validator {
         })
         .await
         .map_err(|_| Error::unavailable("RFC validation worker failed."))?
+        .inspect_err(|error: &Error| {
+            let code = match error.code.as_str() {
+                "invalid_input" | "unavailable" | "not_found" | "capacity" | "integrity" | "cancelled" => error.code.as_str(),
+                _ => "other",
+            };
+            tracing::warn!(target: "devres_server::collection", provider = "rfc", stage = "source_validation", code, "Public collection stage failed");
+        })
     }
 }
 

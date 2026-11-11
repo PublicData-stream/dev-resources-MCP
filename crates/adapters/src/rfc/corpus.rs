@@ -322,6 +322,14 @@ impl RfcCorpus {
                         .await?
                 }
                 Err(error) => {
+                    let code = match error.code.as_str() {
+                        "invalid_input" | "unavailable" | "not_found" | "capacity"
+                        | "integrity" | "cancelled" => error.code.as_str(),
+                        _ => "other",
+                    };
+                    // Retrieval includes source validation and durable publication;
+                    // do not infer which of those failed from a generic code.
+                    tracing::warn!(target: "devres_server::collection", provider = "rfc", stage = "validated_acquisition", code, "Public collection stage failed");
                     let delay = if error.code == "not_found" {
                         self.config.body_refresh_secs.max(300)
                     } else {

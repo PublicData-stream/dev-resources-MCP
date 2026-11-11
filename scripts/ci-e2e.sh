@@ -37,7 +37,7 @@ if [[ -n ${RELEASE_TAG:-} ]]; then
   fi
 fi
 sudo -n apt-get update
-sudo -n apt-get install -y build-essential clang cmake libclang-dev perl pkg-config \
+sudo -n apt-get install -y build-essential clang cmake libclang-dev llvm-dev perl pkg-config \
   libssl-dev openssl curl ca-certificates git python3 iproute2 iptables conntrack
 sudo -n mkdir -p /tmp/rust/target
 sudo -n chown "$(id -u):$(id -g)" /tmp/rust/target

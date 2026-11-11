@@ -3,19 +3,26 @@ use devres_domain::{Error, Result};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::{net::IpAddr, sync::Arc, time::Duration};
 
-struct PublicResolver;
+pub(crate) struct PublicResolver;
+async fn public_addresses(host: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let addresses: Vec<_> = tokio::net::lookup_host((host, 0)).await?.collect();
+    if addresses.is_empty() || addresses.len() > 64 || addresses.iter().any(|a| !public_ip(a.ip()))
+    {
+        return Err(std::io::Error::other("W3C destination is not public"));
+    }
+    Ok(addresses)
+}
 impl Resolve for PublicResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
+        Box::pin(async move { Ok(Box::new(public_addresses(&host).await?.into_iter()) as Addrs) })
+    }
+}
+impl wreq::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
+        let host = name.as_str().to_owned();
         Box::pin(async move {
-            let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            if addresses.is_empty()
-                || addresses.len() > 64
-                || addresses.iter().any(|a| !public_ip(a.ip()))
-            {
-                return Err(std::io::Error::other("W3C destination is not public").into());
-            }
-            Ok(Box::new(addresses.into_iter()) as Addrs)
+            Ok(Box::new(public_addresses(&host).await?.into_iter()) as wreq::dns::Addrs)
         })
     }
 }
@@ -50,6 +57,7 @@ pub(crate) fn client() -> Result<reqwest::Client> {
         .https_only(true)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .dns_resolver(Arc::new(PublicResolver))
         .connect_timeout(Duration::from_secs(10))
         .user_agent(

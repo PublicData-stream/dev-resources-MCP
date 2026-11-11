@@ -16,6 +16,9 @@ async-trait = "0.1"
 ring = "=0.17.14"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "query"] }
 futures = "0.3"
+tracing = "0.1"
+wreq = { version = "=0.16.3", default-features = false, features = ["tokio-rt", "stream", "prefix-symbols"] }
+wreq-util = { version = "=0.2.1", default-features = false, features = ["emulation"] }
 sha2 = "0.11"
 blake3 = { version = "=1.8.7", default-features = false, features = ["std", "pure"] }
 sha1 = "0.11"
@@ -58,6 +61,8 @@ http-body-util = "0.1"
 http = "1"
 percent-encoding = "2"
 [dev-dependencies]
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "net"] }
 
@@ -204,3 +209,7 @@ path = "tests/shared/migration_parallel.rs"
 [[example]]
 name = "static-rotation-probe"
 path = "examples/shared/static-rotation-probe.rs"
+
+[[example]]
+name = "html-transport-probe"
+path = "examples/shared/html-transport-probe.rs"

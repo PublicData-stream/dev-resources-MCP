@@ -1,4 +1,5 @@
 //! Fixed-source HTTPS fetcher. This is not an arbitrary URL proxy.
+use crate::html_transport::{HtmlClient, ProxyPolicy, Response};
 use async_trait::async_trait;
 use devres_application::Fetcher;
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, Validators};
@@ -12,6 +13,9 @@ use url::Url;
 
 pub struct HttpFetcher {
     client: reqwest::Client,
+    html: HtmlClient,
+    #[cfg(test)]
+    test_origin: Option<url::Url>,
     limits: Mutex<HashMap<String, Instant>>,
     slots: Semaphore,
     npm_slots: Semaphore,
@@ -22,6 +26,7 @@ impl HttpFetcher {
         let client = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .user_agent(
@@ -31,6 +36,9 @@ impl HttpFetcher {
             .map_err(|_| Error::unavailable("HTTP client initialization failed"))?;
         Ok(Self {
             client,
+            html: HtmlClient::new(ProxyPolicy::Ambient)?,
+            #[cfg(test)]
+            test_origin: None,
             limits: Mutex::new(HashMap::new()),
             slots: Semaphore::new(2),
             npm_slots: Semaphore::new(1),
@@ -42,6 +50,15 @@ impl HttpFetcher {
         fetcher.broker = Some(broker);
         Ok(fetcher)
     }
+    fn is_html(request: &FetchRequest, host: &str) -> bool {
+        host == "www.rfc-editor.org"
+            && request
+                .url
+                .split('?')
+                .next()
+                .is_some_and(|url| url.ends_with(".html"))
+    }
+
     async fn attempt(
         &self,
         request: &FetchRequest,
@@ -63,9 +80,21 @@ impl HttpFetcher {
             scheduled
         };
         tokio::time::sleep_until(scheduled).await;
+        #[cfg(test)]
+        let destination = if let Some(origin) = &self.test_origin {
+            let source =
+                Url::parse(&request.url).map_err(|_| Error::invalid("Invalid fixture source"))?;
+            let mut target = origin.clone();
+            target.set_path(source.path());
+            target.to_string()
+        } else {
+            request.url.clone()
+        };
+        #[cfg(not(test))]
+        let destination = request.url.clone();
         let mut builder = self
             .client
-            .get(&request.url)
+            .get(&destination)
             .header("Accept", &request.media_type);
         if let Some(validators) = validators {
             if let Some(etag) = &validators.etag {
@@ -75,11 +104,27 @@ impl HttpFetcher {
                 builder = builder.header("If-Modified-Since", modified);
             }
         }
-        let response = builder
-            .send()
+        let html = Self::is_html(request, host);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let response = if html {
+            let prepared = builder
+                .build()
+                .map_err(|_| Error::unavailable("Source connection failed"))?;
+            tokio::time::timeout_at(
+                deadline,
+                self.html.send(&destination, prepared.headers().clone()),
+            )
             .await
-            .map_err(|_| Error::unavailable("Source connection failed"))?;
-        let status = response.status().as_u16();
+            .map_err(|_| Error::unavailable("Source connection failed"))?
+            .map_err(|_| Error::unavailable("Source connection failed"))?
+        } else {
+            builder
+                .send()
+                .await
+                .map(Response::from)
+                .map_err(|_| Error::unavailable("Source connection failed"))?
+        };
+        let status = response.status();
         let retry = match response.headers().get("retry-after") {
             None => 1,
             Some(value) => value
@@ -127,7 +172,17 @@ impl HttpFetcher {
         }
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = if html {
+                tokio::time::timeout_at(deadline, stream.next())
+                    .await
+                    .map_err(|_| Error::unavailable("Source body transfer failed"))?
+            } else {
+                stream.next().await
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = chunk.map_err(|_| Error::unavailable("Source body transfer failed"))?;
             if chunk.len() > request.max_bytes.saturating_sub(body.len()) {
                 return Err(Error::capacity("Source body exceeds limit"));
@@ -286,6 +341,115 @@ impl Fetcher for HttpFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn html_request() -> FetchRequest {
+        FetchRequest {
+            key: "rfc:html:9000".into(),
+            url: "https://www.rfc-editor.org/rfc/rfc9000.html".into(),
+            media_type: "text/html".into(),
+            max_bytes: 1024,
+            ttl_secs: 60,
+        }
+    }
+    #[tokio::test]
+    async fn rfc_html_retains_retry_validators_and_raw_body_contract() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new().route(
+            "/rfc/rfc9000.html",
+            get(move |headers: http::HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    assert_eq!(headers["accept"], "text/html");
+                    assert_eq!(headers["if-none-match"], "\"old\"");
+                    if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "0")],
+                            b"ignored".as_slice(),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            [("etag", "\"new\"")],
+                            b"<html>original<script>inert</script></html>".as_slice(),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut fetcher = HttpFetcher::new().unwrap();
+        fetcher.html = HtmlClient::fixture().unwrap();
+        fetcher.test_origin = Some(
+            format!("http://{}/", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let response = fetcher
+            .fetch(
+                &html_request(),
+                Some(&Validators {
+                    etag: Some("\"old\"".into()),
+                    last_modified: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.validators.etag.as_deref(), Some("\"new\""));
+        assert_eq!(
+            response.body,
+            b"<html>original<script>inert</script></html>"
+        );
+        task.abort();
+    }
+    #[tokio::test]
+    async fn rfc_html_error_bodies_are_discarded_and_limits_hold() {
+        use axum::{Router, routing::get};
+        let router = Router::new()
+            .route(
+                "/rfc/rfc9000.html",
+                get(|| async {
+                    (
+                        http::StatusCode::FOUND,
+                        [("location", "https://untrusted.invalid/")],
+                        "untrusted body",
+                    )
+                }),
+            )
+            .route("/rfc/rfc9001.html", get(|| async { vec![b'x'; 1025] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut fetcher = HttpFetcher::new().unwrap();
+        fetcher.html = HtmlClient::fixture().unwrap();
+        fetcher.test_origin = Some(
+            format!("http://{}/", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let response = fetcher.fetch(&html_request(), None).await.unwrap();
+        assert_eq!(response.status, 302);
+        assert!(response.body.is_empty());
+        let mut oversized = html_request();
+        oversized.url = "https://www.rfc-editor.org/rfc/rfc9001.html".into();
+        assert_eq!(
+            fetcher.fetch(&oversized, None).await.unwrap_err().code,
+            "capacity"
+        );
+        task.abort();
+    }
     #[test]
     fn rejects_arbitrary_sources_and_redirect_destinations() {
         for url in [

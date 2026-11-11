@@ -1241,3 +1241,56 @@ revoked, dead-pod and uncertain keys before issuance resumes. Do not remove jour
 records to recover quota. Rotate native cluster encryption and broker envelope keys
 using their separate recovery procedures. The example One Zone option applies only
 to new objects; converting retained objects remains a distinct authorized operation.
+
+
+## Bounded HTML transport comparison
+
+The selected W3C/Chromium/RFC HTML paths use an Obscura-inspired wreq transport.
+Public source identity, source admission, original capture bytes, licensing,
+validation, request clocks and the existing retry owner remain authoritative.
+JSON, XML, PDF, Git and other providers keep their existing transport. No browser
+JavaScript, rendered DOM or additional resource fetches participate in collection.
+
+Operator warnings under `devres_server::collection` identify fixed acquisition,
+HTTP-status, body, validation, licensing, projection or storage stages where that
+stage is actually observed. They contain no source URL/body or underlying client
+error. A generic `validated_acquisition` failure still includes multiple possible
+causes; its code alone is not evidence of bot blocking or a storage fault.
+These warnings do not change public errors, durable retry state or publication
+policy. Initial writer/backend storage-start failures are a separate issue.
+
+An explicit fixed-record comparison can be run through the privileged command
+channel with test state below `/tmp` and `CARGO_TARGET_DIR=/tmp/rust/target`:
+
+```sh
+scripts/with-tmp-state.sh env CARGO_TARGET_DIR=/tmp/rust/target \
+  scripts/live-smoke.sh --live --html-transport
+# Resume only the owned root printed by that invocation; its budget is retained:
+scripts/with-tmp-state.sh env CARGO_TARGET_DIR=/tmp/rust/target \
+  scripts/live-smoke.sh --live --html-transport /tmp/devres-html-transport.OWNED
+```
+
+The comparison uses one persisted, exclusive-root **combined cap of 20 attempts**,
+which is stricter than 20 per provider. Both reqwest and wreq, W3C metadata and all
+status retries share the same broker clocks and counter. The counter is persisted
+before I/O; restart does not renew it. Source failures become individual receipts
+so one failed record does not hide the remaining fixed comparisons. Never clear
+or replace the evidence root to replenish a failed run's allowance.
+
+Fixed targets are the W3C TR index and CSS Color 4 dated publication qualified by
+its official API metadata (the selected dated URL is frozen for resumed runs),
+Chrome DevTools overview, Chromium site Home and RFC
+9000 HTML through exact attribution repair. Source bodies remain in bounded
+process memory and are not persisted or published by this probe. `comparison.json`
+retains only bounded result metadata and original-byte hashes; W3C license and
+W3C/Chromium projection checks are identified separately. Chromium license
+qualification, RFC production validation, durable publication and capture-fixed
+public retrieval are not proved by this raw comparison. Normal fixture and
+minikube collection tests must exercise the production paths independently.
+
+A successful HTTP response is not a successful collection. Report transport,
+validation, licensing, projection, storage/publication and public capture reads as
+separate evidence, and keep unresolved source-coverage gaps explicit. Local
+fixtures, minikube, fixed live comparisons, hosted native architecture CI and
+production activation are separate claims. This probe changes no production
+workload and performs no full-corpus acceptance.
