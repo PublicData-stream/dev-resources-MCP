@@ -86,7 +86,7 @@ archive capture; checksum verification precedes archive parsing.
 
 ## BLAKE3 enforcement and schema 10
 
-Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 13. Schemas 1–9 require explicit
+Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 14. Schemas 1–9 require explicit
 private offline migration; serving rejects pre-10 schemas or pending migration.
 The maintenance path first excludes readers and writer with the lifecycle fence,
 then acquires the exclusive writer fence before any provider
@@ -412,7 +412,7 @@ connection watchdog covers the selected tool timeout and I/O allowance. Private
 aggregate counters distinguish admission expiry from
 application failures without recording request data.
 
-Generic search defaults to all eight source families, validates its complete source
+Generic search defaults to all nine source families, validates its complete source
 selection before dispatch, keeps at most two source futures active, and returns
 results in requested source order. Its default 75-second tool budget permits four
 15-second waves; other tools retain their 30-second default. Explicit selections
@@ -526,3 +526,14 @@ corpus backups or S3 captures. Native Kubernetes Secret encryption protects moun
 issuer/keyring material at rest; application envelope encryption is an additional
 boundary, not a replacement. Missing keys, uncertain issuance, invalid receipts,
 provider errors, or expired identity fail closed.
+
+## Wikipedia acquisition
+
+The Wikipedia application/store port separates provider freshness and immutable
+article identities from concrete REST/SSE adapters. Schema14 adds append-only
+sealed captures/snapshots and atomic mutable work/visibility/checkpoint state.
+Metadata and article acquisition use typed, fixed destinations; a dedicated SSE
+permit does not occupy an article transfer slot. The sole writer owns acquisition,
+and serving demand crosses only typed private writer operations. Public article
+bytes and attribution reads consult a live moderation overlay independently of
+immutable snapshot membership. See [Wikipedia](wikipedia.md).

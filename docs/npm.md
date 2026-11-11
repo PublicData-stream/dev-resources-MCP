@@ -12,7 +12,7 @@ an exact release from full registry metadata. `packages.npm.source_list` and
 `packages.npm.source_read` verify distribution integrity before inspecting a published
 archive. Supply both `metadata_capture` and `archive_capture` to continue against fixed
 evidence. `fetch` accepts `npm:is-number@7.0.0` and scoped identities such as
-`npm:@types/is-number@7.0.5`. Generic `search` includes npm among all eight default
+`npm:@types/is-number@7.0.5`. Generic `search` includes npm among all nine default
 source families; an explicit source list narrows the search. Its npm branch keeps the
 official registry search behavior rather than searching local package content.
 

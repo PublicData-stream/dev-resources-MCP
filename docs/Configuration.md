@@ -8,7 +8,7 @@ fields, oversized configuration (over 64 KiB), missing required tables, invalid
 limits or access lists fail before serving. Never commit populated credential files.
 
 Required tables are `source`, `http`, `webtransport`, `health`, and `storage`.
-`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, `mdn`, `whatwg`, `w3c`, and `chromium` are optional. See the tracked deployment example for values
+`edge_mtls`, `limits`, `rfc`, `crates`, `rustsec`, `mdn`, `whatwg`, `w3c`, `chromium`, `npm`, and `wikipedia` are optional. See the tracked deployment example for values
 and certificate paths appropriate to the harness; supply your own for hosting.
 
 | Setting | Meaning |
@@ -191,8 +191,8 @@ separate coverage states. No full-corpus capacity benchmark is implied.
 
 `search_timeout_secs` applies only to generic `search`; other tools and resource
 reads use `call_timeout_secs`. Generic search keeps at most two source operations
-active and caps each at 15 seconds, so its default permits four waves across all
-eight source families. Completed results survive source-local failures. Cancellation
+active and caps each at 15 seconds, so its default permits five waves across all
+nine source families. Completed results survive source-local failures. Cancellation
 and shorter deadlines can still interrupt work.
 
 Timeout settings accept 1..86400 seconds. Existing explicit overrides remain valid.
@@ -531,7 +531,7 @@ Public selectors, freshness, result limits, and capture-fixed reads are unchange
 
 Serving uses SELECT-only PostgreSQL credentials, has no writer-owner lock, and
 runs no migration, stage recovery, or collectors. The sole writer initializes and
-publishes schema 13 for either backend. Existing configuration values and backend
+publishes schema 14 for either backend, including Wikipedia tables. Existing configuration values and backend
 defaults remain; operators must add the role-specific client/listener/scratch
 settings and deploy both processes. See the [operator templates](../deploy/examples/scaleway-credential-broker/README.md).
 
@@ -564,3 +564,25 @@ TTL, quota, expiry acceptance, and negative privilege tests. Fixture receipts
 cannot authorize production mode. Native cluster Secret encryption is a deployment
 prerequisite in addition to authenticated journal encryption. Full configuration,
 policy templates, receipt bootstrap, and rotation are documented with the examples.
+
+## Wikipedia defaults
+
+Omitting `[wikipedia]` enables recursive English STEM acquisition. `enabled=false`
+pauses background acquisition while retaining local evidence. See
+[Wikipedia](wikipedia.md) for API policies, intervals and acceptance boundaries.
+`category_roots` defaults to the six `Category:` roots Science, Technology,
+Engineering, Mathematics, Artificial intelligence and Computer architecture;
+`excluded_categories=[]` prunes configured categories. There is no default depth
+cutoff. Both category roots (max100) and exclusions (max1000) require category names.
+
+`normal_debounce_secs=300`, `normal_min_refresh_secs=300`,
+`normal_fallback_secs=86400`; `current_debounce_secs=30`,
+`current_min_refresh_secs=60`, `current_fallback_secs=300`.
+`category_reconcile_secs=86400`, `collection_interval_secs=1`,
+`publication_interval_secs=300`. Intervals accept 1..31622400 seconds and do not
+bypass upstream cache freshness or provider cooldowns. Unknown Current state uses
+the Current profile. `requests_per_second=1` accepts 1..3, under shared admission.
+`min_free_bytes=1073741824` (minimum64MiB); optional
+`max_archive_storage_bytes` must cover the free-space reserve. Quotas pause new
+acquisition without deleting permanent bodies. Article representations cap at16MiB;
+public text pages remain at most32KiB. Reader attachment requires schema14.

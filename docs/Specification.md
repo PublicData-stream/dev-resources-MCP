@@ -38,9 +38,9 @@ Active schema-10 stores automatically receive additive schema-11 attribution
 tables at normal startup under the exclusive storage-owner fence. This bounded
 transition does not perform the schema 1–9 BLAKE3 conversion, scan the corpus or
 request upstream data. Pending conversion still requires offline activation.
-Normal writer startup then records schema 13 for filesystem and S3, preventing
-older combined binaries from reopening the store. Serving readers require the
-committed schema-13 backend. Attribution policy compatibility remains independent
+Normal writer startup records schema 14 for filesystem and S3, including the
+schema-13 runtime split and schema-14 Wikipedia tables. Older binaries cannot
+reopen the store; serving readers require the committed schema-14 backend. Attribution policy compatibility remains independent
 of that private topology marker.
 
 Serving and collection run as separate workloads. Public-source acquisition needed
@@ -101,7 +101,7 @@ audits. Examples are `packages.crate.versions`, `packages.npm.search`,
 `packages.crate.advisory_lookup`, and `packages.crate.audit_lockfile`. Other groups
 retain `group.operation` names such as `rfc.catalog_search` and `server.info`.
 Underscores belong to the operation name. Generic `search` and `fetch` keep their names.
-Both transports and supported MCP revisions expose this same set of 88 tools.
+Both transports and supported MCP revisions expose this same set of 98 tools.
 
 This is a breaking rename: `crate.<operation>` and `npm.<operation>` gain the
 `packages.` prefix, `advisory.<operation>` becomes
@@ -116,8 +116,8 @@ behavior.
 | Tool | Inputs and result |
 | --- | --- |
 | `server.info` | Identity, supported revisions, licensing and corresponding-source URL |
-| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium`/`npm` sources, offset/limit; source-specific results/errors; omitted sources search all eight families in that order |
-| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, `w3c:<shortname>#<anchor>`, or immutable `devres://` resource URI |
+| `search` | Query, selected `rfc`/`cargo`/`rustsec`/`mdn`/`whatwg`/`w3c`/`chromium`/`npm`/`wikipedia` sources, offset/limit; source-specific results/errors; omitted sources search all nine families in that order |
+| `fetch` | `rfc:<number>`, `crate:<name>@<version>`, `mdn:<slug>`, `mdn-compat:<feature>`, `whatwg:<standard>#<anchor>`, `w3c:<shortname>#<anchor>`, `wikipedia:<title>`, or immutable `devres://` resource URI |
 | `rfc.search` | Query and optional status; official index metadata with capture-based paging |
 | `rfc.get` | RFC number and byte page; published text |
 | `rfc.metadata` | RFC number, optional research snapshot; rich official metadata |
@@ -538,3 +538,10 @@ use `devres://chromium/<component>/<snapshot>/<representation>/<base64url-path>`
 Paging, strict input validation, cancellation, and technical/English query semantics
 follow the existing research limits. Citations retain source revision, representation,
 notices, and processing provenance. Comparisons make no compatibility certification.
+
+## English Wikipedia
+
+Automatic English STEM collection, observed history, REST/EventStreams freshness,
+Markdown retrieval and the `wikipedia` research group are specified in
+[Wikipedia](wikipedia.md). Generic search adds local Wikipedia as its ninth source.
+Schema 14 adds Wikipedia storage; serving readers require the upgraded store.

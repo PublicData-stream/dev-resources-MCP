@@ -20,8 +20,8 @@ Claude Connectors, with deployment-specific MCP connection packages.
 
 ## Choosing research tools
 
-Generic `search` searches all eight source families when `sources` is omitted:
-RFC, Cargo, RustSec, MDN, WHATWG, W3C, Chromium and npm. Each family keeps its
+Generic `search` searches all nine source families when `sources` is omitted:
+RFC, Cargo, RustSec, MDN, WHATWG, W3C, Chromium, npm and Wikipedia. Each family keeps its
 existing search scope, ranking, pagination and errors; unavailable retained corpora
 remain visible as source errors. To narrow a browser question, select sources,
 for example
@@ -92,3 +92,6 @@ actually executed, source evidence, and the remaining proof boundaries.
 persistence checks from retained full-source acceptance.
 [W3C validation](docs/w3c-acceptance-evidence.md) separates local processing and
 transport checks from bounded provider observations and full-corpus acceptance.
+
+English Wikipedia STEM collection and the `wikipedia` tools are described in
+[Wikipedia research](docs/wikipedia.md).

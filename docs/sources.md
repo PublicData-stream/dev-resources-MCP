@@ -324,3 +324,14 @@ Synthetic fixtures carry explicit first-party provenance. Fixed-record live evid
 retained frozen-corpus acceptance, local transport/cluster acceptance, native hosted
 architecture checks, and production operation are separate claims. Detailed scope,
 interfaces, and maintenance are in [Chromium](chromium.md).
+
+## English Wikipedia
+
+Use current `en.wikipedia.org/w/rest.php/v1` article/search operations and read-only
+`en.wikipedia.org/w/api.php` metadata, plus one `stream.wikimedia.org` EventStreams
+connection. No source text, event URL or external reference expands destination
+authority. Follow Wikimedia's identified-User-Agent, gzip, API rate/slow-request
+and Retry-After rules. Category recursion is an explicitly partial operational
+corpus; a dump bootstrap is not implemented. Exact cache evidence, acquired-at
+attribution qualification, Current scheduling, API/robots interpretation and
+moderation withholding are specified in [Wikipedia](wikipedia.md).

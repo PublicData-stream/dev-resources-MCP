@@ -5,7 +5,8 @@
 Writer startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
 without corpus rewrite or provider acquisition. Existing offline schemas 1–9 to 10
 migration and activation remain required; inspection never bootstraps attribution.
-The same normal writer startup records schema 13 for the required runtime split;
+The same normal writer startup records schema 14, retaining the required runtime
+split and adding Wikipedia tables;
 see [split upgrade](#credential-broker-and-split-runtime-upgrade).
 
 A supervised worker enumerates public history in bounded pages and prioritizes
@@ -1201,7 +1202,7 @@ authority or provision their prerequisites.
    Give serving SELECT-only PostgreSQL and either a read-only filesystem mount plus
    separate writable scratch, or an RO broker profile and its own S3 cache.
 4. Start the broker, then the sole writer. Its bounded additive startup commits
-   schema 13 and retains the archive format/history; earlier pending BLAKE3 migration
+   schema 14 and retains the archive format/history; earlier pending BLAKE3 migration
    still requires the existing offline procedure. Start serving after the committed
    backend is available. No role split silently transfers filesystem data to S3.
 5. Verify historical capture/resource identities and pagination; a foreground cold
@@ -1298,3 +1299,12 @@ workload and performs no full-corpus acceptance.
 
 See the [implementation verification record](html-transport-evidence.md) for the
 bounded 2026-11-11 comparison and its unresolved production boundary.
+
+## Wikipedia operation
+
+Schema14 is an additive sole-writer upgrade; readers require14. Coordinate old
+reader/writer shutdown before upgrade and preserve matching database/archive
+backups. The default-enabled Wikipedia collector adds one continuous stream and
+paced current-body acquisition; explicitly pause it in disposable/offline fixtures.
+The bounded opt-in `scripts/live-smoke.sh --live --wikipedia` check is separate from
+full STEM collection and production activation. See [Wikipedia](wikipedia.md).

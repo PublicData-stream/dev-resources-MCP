@@ -28,7 +28,7 @@ Choose tools according to the needed evidence:
   `packages.crate.api_search`/`packages.crate.api_get`; for npm contracts use `packages.npm.contract_get`.
 - Use `*.dependencies` for declarations and `*.compare` for qualified differences.
 
-Generic `search` defaults to all eight source families, including Cargo and npm. Select
+Generic `search` defaults to all nine source families, including Cargo and npm. Select
 sources explicitly to narrow discovery; ranking, paging and errors remain
 source-specific. Request-driven metadata/source retrieval and local corpus research are
 distinct: fetching a release does not guarantee it appears in the research index. Check

@@ -25,7 +25,7 @@ Choose the evidence family from the question:
 
 Read [source selection](references/source-selection.md) when using historical
 evidence, comparing revisions, or combining these families. Generic `search`
-defaults to all eight source families; explicitly select sources to narrow a
+defaults to all nine source families; explicitly select sources to narrow a
 question. Each family retains its own search scope, ranking and errors. It does not
 replace dedicated full-text, symbol, compatibility or history research.
 
