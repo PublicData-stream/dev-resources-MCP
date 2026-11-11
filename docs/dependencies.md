@@ -1,5 +1,27 @@
 # Dependency admission
 
+## Filesystem advisory admission
+
+The locked transitive `rustix` version is updated from 1.1.5 to 1.1.6 for
+[RUSTSEC-2026-0486](https://github.com/RustSec/advisory-db/blob/main/crates/rustix/RUSTSEC-2026-0486.md).
+Its extended-attribute getters and list functions could mark unwritten bytes as
+initialized when given a zero-length buffer. Updating within the existing callers'
+compatible version ranges avoids replacing their filesystem implementation or
+adding an advisory exception. `tempfile`, `fs4` through Tantivy, and `xattr` through
+`tar` retain the existing `default`, `std`, `alloc`, and `fs` feature union.
+
+Rustix remains maintained by Bytecode Alliance, requires Rust 1.65, and is licensed
+`Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`. Its unchanged build script
+probes the compiler and target platform without downloading code. No package,
+feature, executable capability, or network destination is added. Service archive
+paths iterate bounded entries without extraction, and no first-party path calls
+the affected extended-attribute getters. The fixed release changes zero-length
+getter semantics; `xattr`'s large-attribute size-query fallback relies on the old
+semantics, but that getter path is unused here. Admission covers the existing
+service paths, not general compatibility of that wrapper. Current advisory,
+license/source checks and filesystem/archive fixtures must pass on the updated
+locked graph; no policy suppression is introduced.
+
 ## HTML acquisition transport
 
 Qualified W3C HTML publications and the TR index, Chromium/Chrome current HTML,
