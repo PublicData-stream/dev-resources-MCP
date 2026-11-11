@@ -88,12 +88,12 @@ pub(super) async fn seed(
     let chromium_snapshot = fixture_hash(CHROMIUM_IDENTITY);
     let advisory_snapshot = fixture_hash(FIXTURE_IDENTITY);
     let versions = research
-        .call("npm.versions", json!({"name":"npm-fixture"}))
+        .call("packages.npm.versions", json!({"name":"npm-fixture"}))
         .await?;
     let npm_snapshot = versions["snapshot"]["id"].clone();
     let npm_advisories = research
         .call(
-            "npm.advisory_lookup",
+            "packages.npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         )
         .await?;
@@ -101,22 +101,22 @@ pub(super) async fn seed(
     let mut calls = vec![
         (
             "rustsec",
-            "advisory.get",
+            "packages.crate.advisory_get",
             json!({"id":"RUSTSEC-2024-0001","snapshot":advisory_snapshot}),
         ),
         (
             "rustsec",
-            "advisory.catalog_search",
+            "packages.crate.advisory_catalog_search",
             json!({"snapshot":advisory_snapshot,"filters":{"name":"example","id":"RUSTSEC-2024-0001"}}),
         ),
         (
             "rustsec",
-            "advisory.lookup",
+            "packages.crate.advisory_lookup",
             json!({"name":"example","version":"1.0.0","advisory_snapshot":advisory_snapshot}),
         ),
         (
             "rustsec",
-            "advisory.lookup",
+            "packages.crate.advisory_lookup",
             json!({"name":"example","version":"1.0.1","advisory_snapshot":advisory_snapshot}),
         ),
         (
@@ -149,30 +149,34 @@ pub(super) async fn seed(
             "mdn.browser_get",
             json!({"browser":"fixture_browser","snapshot":mdn_compat}),
         ),
-        ("npm", "npm.versions", json!({"name":"npm-fixture"})),
         (
             "npm",
-            "npm.document_get",
+            "packages.npm.versions",
+            json!({"name":"npm-fixture"}),
+        ),
+        (
+            "npm",
+            "packages.npm.document_get",
             json!({"name":"npm-fixture","version":"1.0.0","snapshot":npm_snapshot,"path":"README.md"}),
         ),
         (
             "npm",
-            "npm.content_search",
+            "packages.npm.content_search",
             json!({"snapshot":npm_snapshot,"query":"FixtureToken"}),
         ),
         (
             "npm",
-            "npm.contract_get",
+            "packages.npm.contract_get",
             json!({"name":"npm-fixture","version":"1.0.0","snapshot":npm_snapshot}),
         ),
         (
             "npm",
-            "npm.advisory_lookup",
+            "packages.npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         ),
         (
             "npm",
-            "npm.advisory_get",
+            "packages.npm.advisory_get",
             json!({"id":"GHSA-fixt-ure0-npm0","snapshot":npm_advisory_snapshot}),
         ),
     ];

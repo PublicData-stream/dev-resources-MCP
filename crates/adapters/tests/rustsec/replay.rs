@@ -111,7 +111,10 @@ async fn official_snapshot_replays_through_research_without_network() {
     .unwrap();
     research.refresh_advisories().await.unwrap();
     let result = research
-        .call("advisory.lookup", json!({"name":"itoa","version":"1.0.15"}))
+        .call(
+            "packages.crate.advisory_lookup",
+            json!({"name":"itoa","version":"1.0.15"}),
+        )
         .await
         .unwrap();
     assert_eq!(result["complete"], true);

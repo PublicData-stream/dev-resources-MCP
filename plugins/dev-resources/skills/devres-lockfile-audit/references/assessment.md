@@ -5,11 +5,11 @@ Live schemas remain authoritative; unknown fields fail validation.
 
 | Input | Tool and selector |
 | --- | --- |
-| Cargo.lock | `audit.lockfile`, with `lockfile` and optional `advisory_snapshot`/`format`. Default representation is `rustsec`. |
-| package-lock.json or npm-shrinkwrap.json | `npm.audit_lockfile`, `lockfile_format="npm"`; supported schemas 1, 2, 3. |
-| pnpm-lock.yaml | `npm.audit_lockfile`, `lockfile_format="pnpm"`; supported schemas 5.4, 6.0, 9.0 including multi-document v9. |
-| Yarn Classic yarn.lock | `npm.audit_lockfile`, `lockfile_format="yarn_classic"`; supported schema 1. |
-| Yarn Berry yarn.lock | `npm.audit_lockfile`, `lockfile_format="yarn_berry"`; supported schemas 4, 6, 8, 10. |
+| Cargo.lock | `packages.crate.audit_lockfile`, with `lockfile` and optional `advisory_snapshot`/`format`. Default representation is `rustsec`. |
+| package-lock.json or npm-shrinkwrap.json | `packages.npm.audit_lockfile`, `lockfile_format="npm"`; supported schemas 1, 2, 3. |
+| pnpm-lock.yaml | `packages.npm.audit_lockfile`, `lockfile_format="pnpm"`; supported schemas 5.4, 6.0, 9.0 including multi-document v9. |
+| Yarn Classic yarn.lock | `packages.npm.audit_lockfile`, `lockfile_format="yarn_classic"`; supported schema 1. |
+| Yarn Berry yarn.lock | `packages.npm.audit_lockfile`, `lockfile_format="yarn_berry"`; supported schemas 4, 6, 8, 10. |
 
 Audit input caps at 1 MiB. npm-family parsers also cap inventory at 10,000 entries.
 Unsupported formats fail explicitly; do not rewrite or truncate private input to

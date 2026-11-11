@@ -637,11 +637,11 @@ mod admission_tests {
             assert_eq!(request_timeout_secs(&limits, &http::Method::GET, bytes), 2);
         }
         for bytes in [
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"crate.search","arguments":{"query":"search"}}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"packages.crate.search","arguments":{"query":"search"}}}"#.as_slice(),
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"name":"search"}}"#,
             br#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search"}}"#,
             br#"{"jsonrpc":"invalid","id":1,"method":"tools/call","params":{"name":"search"}}"#,
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","name":"crate.search"}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","name":"packages.crate.search"}}"#,
             br#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search"}}]"#,
             b"malformed",
         ] {

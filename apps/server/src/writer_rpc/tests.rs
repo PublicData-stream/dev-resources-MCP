@@ -272,7 +272,7 @@ async fn private_rpc_rejects_anonymous_audit_url_and_generic_tool_inputs() {
         StatusCode::UNAUTHORIZED
     );
     for value in [
-        json!({"tool":"audit.lockfile","lockfile":"request-only-marker"}),
+        json!({"tool":"packages.crate.audit_lockfile","lockfile":"request-only-marker"}),
         json!({"kind":"acquire","source":{"operation":"rfc_representation","number":1,"format":"txt","url":"http://private.invalid"}}),
         json!({"kind":"acquire","source":{"operation":"audit_lockfile","lockfile":"request-only-marker"}}),
     ] {

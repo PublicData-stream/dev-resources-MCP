@@ -294,13 +294,13 @@ async fn exhausted_npm_parser_admission_returns_a_source_error_before_fetching()
     let first = packages.clone();
     let first = tokio::spawn(async move {
         first
-            .call("npm.search", json!({"query":"occupied-first"}))
+            .call("packages.npm.search", json!({"query":"occupied-first"}))
             .await
     });
     let second = packages.clone();
     let second = tokio::spawn(async move {
         second
-            .call("npm.search", json!({"query":"occupied-second"}))
+            .call("packages.npm.search", json!({"query":"occupied-second"}))
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), fetcher.occupied.notified())

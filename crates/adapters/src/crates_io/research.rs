@@ -333,31 +333,31 @@ impl CrateResearch {
             .map_err(|_| Error::invalid("Arguments do not match research schema."))?;
         input.validate()?;
         input.name = input.name.map(|name| name.to_ascii_lowercase());
-        if tool == "crate.corpus_status" {
+        if tool == "packages.crate.corpus_status" {
             return self.store.status().await;
         }
         let snapshot = self.snapshot(input.snapshot.as_deref()).await?;
         match tool {
-            "crate.versions" => {
+            "packages.crate.versions" => {
                 input.name()?;
                 self.search(&snapshot, input.spec("version")?, input.snapshot.is_some())
                     .await
             }
-            "crate.catalog_search" => {
+            "packages.crate.catalog_search" => {
                 self.search(&snapshot, input.spec("version")?, input.snapshot.is_some())
                     .await
             }
-            "crate.content_search" | "crate.api_search" => {
+            "packages.crate.content_search" | "packages.crate.api_search" => {
                 if input.query.as_ref().is_none_or(|s| s.trim().is_empty()) {
                     return Err(Error::invalid("A nonempty search query is required."));
                 }
                 let mut spec = input.spec("content")?;
-                if tool == "crate.api_search" {
+                if tool == "packages.crate.api_search" {
                     spec.kind = Some("api".into());
                 }
                 self.search(&snapshot, spec, input.snapshot.is_some()).await
             }
-            "crate.document_get" => {
+            "packages.crate.document_get" => {
                 let (offset, limit) = input.page(true)?;
                 let kind = input
                     .kind
@@ -378,7 +378,7 @@ impl CrateResearch {
                 result["snapshot"] = snapshot_json(&snapshot);
                 Ok(result)
             }
-            "crate.api_get" => {
+            "packages.crate.api_get" => {
                 input.path()?;
                 let row = self
                     .document(&snapshot, &input, "api", input.version()?)
@@ -400,8 +400,8 @@ impl CrateResearch {
                     json!({"item":row,"observed_signature":row.attributes["signature"],"relationships":row.attributes["relationships"],"projection_coverage":projection_coverage,"source_capture":source_capture,"snapshot":snapshot_json(&snapshot),"resource_uri":format!("devres://capture/{}",row.capture),"assessment_scope":"observed captured rustdoc API; no build or compatibility certification"}),
                 )
             }
-            "crate.dependencies" => self.dependencies(&snapshot, &input).await,
-            "crate.compare" => self.compare(&snapshot, &input).await,
+            "packages.crate.dependencies" => self.dependencies(&snapshot, &input).await,
+            "packages.crate.compare" => self.compare(&snapshot, &input).await,
             _ => Err(Error::invalid("Unsupported crate research tool.")),
         }
     }
@@ -809,13 +809,13 @@ pub fn schemas() -> Vec<Value> {
     let mut out = Vec::new();
     let definitions = [
         (
-            "crate.versions",
+            "packages.crate.versions",
             "List all captured versions in semantic-version order.",
             vec!["name"],
             vec!["name", "snapshot", "offset", "limit"],
         ),
         (
-            "crate.catalog_search",
+            "packages.crate.catalog_search",
             "Search local package metadata; defaults to all versions.",
             vec![],
             vec![
@@ -824,7 +824,7 @@ pub fn schemas() -> Vec<Value> {
             ],
         ),
         (
-            "crate.document_get",
+            "packages.crate.document_get",
             "Read captured package text, retaining original notices and capture citations.",
             vec!["name", "version", "kind"],
             vec![
@@ -832,7 +832,7 @@ pub fn schemas() -> Vec<Value> {
             ],
         ),
         (
-            "crate.dependencies",
+            "packages.crate.dependencies",
             "Inspect forward or reverse published dependency declarations; never resolve a graph.",
             vec!["name"],
             vec![
@@ -845,7 +845,7 @@ pub fn schemas() -> Vec<Value> {
             ],
         ),
         (
-            "crate.compare",
+            "packages.crate.compare",
             "Compare exact versions, complete captured release changes, or an exact source/API path.",
             vec!["name", "from_version", "to_version"],
             vec![
@@ -862,7 +862,7 @@ pub fn schemas() -> Vec<Value> {
             ],
         ),
         (
-            "crate.content_search",
+            "packages.crate.content_search",
             "Search captured package source and documentation with global BM25.",
             vec!["query"],
             vec![
@@ -871,7 +871,7 @@ pub fn schemas() -> Vec<Value> {
             ],
         ),
         (
-            "crate.api_search",
+            "packages.crate.api_search",
             "Search observed rustdoc API items across captured versions and targets.",
             vec!["query"],
             vec![
@@ -879,13 +879,13 @@ pub fn schemas() -> Vec<Value> {
             ],
         ),
         (
-            "crate.api_get",
+            "packages.crate.api_get",
             "Read one observed public API path, signature and relationships.",
             vec!["name", "version", "path"],
             vec!["name", "version", "path", "target", "snapshot"],
         ),
         (
-            "crate.corpus_status",
+            "packages.crate.corpus_status",
             "Inspect aggregate corpus progress and coverage without administrative controls.",
             vec![],
             vec![],
@@ -896,11 +896,11 @@ pub fn schemas() -> Vec<Value> {
         let mut keys = keys;
         if matches!(
             tool,
-            "crate.versions"
-                | "crate.catalog_search"
-                | "crate.content_search"
-                | "crate.api_search"
-                | "crate.dependencies"
+            "packages.crate.versions"
+                | "packages.crate.catalog_search"
+                | "packages.crate.content_search"
+                | "packages.crate.api_search"
+                | "packages.crate.dependencies"
         ) {
             keys.push("cursor");
         }
@@ -912,16 +912,19 @@ pub fn schemas() -> Vec<Value> {
                 "snapshot" => snapshot.clone(),
                 "path" => path.clone(),
                 "offset" => {
-                    if matches!(tool, "crate.document_get" | "crate.compare") {
+                    if matches!(
+                        tool,
+                        "packages.crate.document_get" | "packages.crate.compare"
+                    ) {
                         json!({"type":"integer","minimum":0,"default":0})
                     } else {
                         offset.clone()
                     }
                 }
                 "limit" => {
-                    if tool == "crate.document_get" {
+                    if tool == "packages.crate.document_get" {
                         json!({"type":"integer","minimum":1,"maximum":32768,"default":32768})
-                    } else if tool == "crate.compare" {
+                    } else if tool == "packages.crate.compare" {
                         json!({"type":"integer","minimum":1,"maximum":32768,"description":"Release change pages default to 20 (maximum100); exact text pages default to 32768 bytes."})
                     } else {
                         list.clone()
@@ -931,7 +934,7 @@ pub fn schemas() -> Vec<Value> {
                 "mode" => json!({"enum":["technical","english"],"default":"technical"}),
                 "yanked" => json!({"type":"boolean"}),
                 "kind" => {
-                    if tool == "crate.compare" {
+                    if tool == "packages.crate.compare" {
                         json!({"enum":["metadata","dependencies","text","api"],"default":"metadata"})
                     } else {
                         json!({"enum":["source","manifest","readme","license","rustdoc","api"]})
@@ -942,7 +945,7 @@ pub fn schemas() -> Vec<Value> {
             properties.insert(key.into(), value);
         }
         let mut input_schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
-        if tool == "crate.compare" {
+        if tool == "packages.crate.compare" {
             input_schema["allOf"] = json!([{"if":{"required":["path"]},"else":{"properties":{"limit":{"maximum":100},"offset":{"maximum":0}}}}]);
         }
         out.push(json!({"name":tool,"description":description,"inputSchema":input_schema,"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}));
@@ -990,7 +993,7 @@ mod tests {
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
         let page = research
             .call(
-                "crate.versions",
+                "packages.crate.versions",
                 json!({"name":"rustls","offset":200,"limit":50}),
             )
             .await
@@ -1006,7 +1009,7 @@ mod tests {
         }
         let pinned = research
             .call(
-                "crate.versions",
+                "packages.crate.versions",
                 json!({"name":"rustls","offset":200,"limit":50,"snapshot":"c".repeat(64)}),
             )
             .await
@@ -1022,7 +1025,7 @@ mod tests {
         let research = CrateResearch::new(store.clone(), retrieval, root.path().to_path_buf());
         let dependencies = research
             .call(
-                "crate.dependencies",
+                "packages.crate.dependencies",
                 json!({"name":"example","version":"1.10.0"}),
             )
             .await
@@ -1031,19 +1034,19 @@ mod tests {
         assert_eq!(dependencies["metadata_capture"], "e".repeat(64));
         let api = research
             .call(
-                "crate.api_get",
+                "packages.crate.api_get",
                 json!({"name":"example","version":"1.10.0","path":"example::send"}),
             )
             .await
             .unwrap();
         assert_eq!(api["observed_signature"]["input"], "u8");
         assert_eq!(api["item"]["archive_capture"], "3".repeat(64));
-        assert_eq!(research.call("crate.api_get",json!({"name":"example","version":"1.10.0","path":"example::send","surprise":true})).await.unwrap_err().code,"invalid_input");
+        assert_eq!(research.call("packages.crate.api_get",json!({"name":"example","version":"1.10.0","path":"example::send","surprise":true})).await.unwrap_err().code,"invalid_input");
         store.snapshot.lock().unwrap().inventory.validated_at -= 8 * 86400;
         assert_eq!(
             research
                 .call(
-                    "crate.dependencies",
+                    "packages.crate.dependencies",
                     json!({"name":"example","version":"1.10.0"})
                 )
                 .await
@@ -1054,7 +1057,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "crate.dependencies",
+                    "packages.crate.dependencies",
                     json!({"name":"example","version":"1.10.0","snapshot":"c".repeat(64)})
                 )
                 .await
@@ -1067,12 +1070,12 @@ mod tests {
         let store = fixture();
         let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
-        let first=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","limit":1})).await.unwrap();
+        let first=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","limit":1})).await.unwrap();
         assert_eq!(first["items"][0]["path"], "api0");
         assert_eq!(first["next_cursor"], "item0");
-        let second=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","limit":1,"cursor":first["next_cursor"]})).await.unwrap();
+        let second=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","limit":1,"cursor":first["next_cursor"]})).await.unwrap();
         assert_eq!(second["items"][0]["path"], "api1");
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","offset":1})).await.unwrap_err().code,"invalid_input");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","offset":1})).await.unwrap_err().code,"invalid_input");
     }
     #[tokio::test]
     async fn every_research_tool_uses_indexed_or_paged_fixture_evidence() {
@@ -1093,7 +1096,7 @@ mod tests {
         store.snapshot.lock().unwrap().index_manifest = manifest;
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
         let versions = research
-            .call("crate.versions", json!({"name":"example"}))
+            .call("packages.crate.versions", json!({"name":"example"}))
             .await
             .unwrap();
         assert_eq!(versions["total"], 2);
@@ -1101,11 +1104,11 @@ mod tests {
             versions["items"][0]["document"]["record"]["version"],
             "1.10.0"
         );
-        let catalog=research.call("crate.catalog_search",json!({"query":"transport","license":"MIT","msrv":"1.70","keyword":"network","category":"development-tools","yanked":false})).await.unwrap();
+        let catalog=research.call("packages.crate.catalog_search",json!({"query":"transport","license":"MIT","msrv":"1.70","keyword":"network","category":"development-tools","yanked":false})).await.unwrap();
         assert_eq!(catalog["total"], 2);
         let readme = research
             .call(
-                "crate.document_get",
+                "packages.crate.document_get",
                 json!({"name":"example","version":"1.10.0","kind":"readme","offset":0,"limit":9}),
             )
             .await
@@ -1114,7 +1117,7 @@ mod tests {
         assert_eq!(readme["archive_capture"], "b".repeat(64));
         let reverse = research
             .call(
-                "crate.dependencies",
+                "packages.crate.dependencies",
                 json!({"name":"dependency","direction":"reverse"}),
             )
             .await
@@ -1122,7 +1125,7 @@ mod tests {
         assert_eq!(reverse["total"], 2);
         let content = research
             .call(
-                "crate.content_search",
+                "packages.crate.content_search",
                 json!({"query":"source","kind":"source","version":"1.10.0"}),
             )
             .await
@@ -1130,30 +1133,33 @@ mod tests {
         assert_eq!(content["total"], 1);
         let apis = research
             .call(
-                "crate.api_search",
+                "packages.crate.api_search",
                 json!({"query":"transport","name":"example"}),
             )
             .await
             .unwrap();
         assert_eq!(apis["total"], 2);
-        let metadata=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"metadata"})).await.unwrap();
+        let metadata=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"metadata"})).await.unwrap();
         assert_eq!(metadata["changed"], true);
-        let deps=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"dependencies"})).await.unwrap();
+        let deps=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"dependencies"})).await.unwrap();
         assert_eq!(deps["changed"], false);
-        let text=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text","path":"src/lib.rs"})).await.unwrap();
+        let text=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text","path":"src/lib.rs"})).await.unwrap();
         assert_eq!(text["changed"], false);
-        let api=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","path":"example::send"})).await.unwrap();
+        let api=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","path":"example::send"})).await.unwrap();
         assert_eq!(api["changed"], true);
         assert_eq!(
             research
-                .call("crate.corpus_status", json!({}))
+                .call("packages.crate.corpus_status", json!({}))
                 .await
                 .unwrap()["fixture"],
             true
         );
         assert_eq!(
             research
-                .call("crate.content_search", json!({"query":"field:source"}))
+                .call(
+                    "packages.crate.content_search",
+                    json!({"query":"field:source"})
+                )
                 .await
                 .unwrap_err()
                 .code,
@@ -1167,9 +1173,9 @@ mod tests {
         let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
         *store.qualified.lock().unwrap() = false;
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api"})).await.unwrap_err().code,"unavailable");
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text"})).await.unwrap_err().code,"unavailable");
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"0.1.0","to_version":"1.10.0","kind":"api"})).await.unwrap_err().code,"not_found");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api"})).await.unwrap_err().code,"unavailable");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text"})).await.unwrap_err().code,"unavailable");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"0.1.0","to_version":"1.10.0","kind":"api"})).await.unwrap_err().code,"not_found");
     }
     #[tokio::test]
     async fn dotted_rust_targets_are_accepted_by_actual_api_dispatch() {
@@ -1183,9 +1189,9 @@ mod tests {
         let store = Arc::new(store);
         let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
-        let result=research.call("crate.api_get",json!({"name":"example","version":"1.10.0","path":"example::send","target":"thumbv8m.main-none-eabi"})).await.unwrap();
+        let result=research.call("packages.crate.api_get",json!({"name":"example","version":"1.10.0","path":"example::send","target":"thumbv8m.main-none-eabi"})).await.unwrap();
         assert_eq!(result["item"]["target"], "thumbv8m.main-none-eabi");
-        assert_eq!(research.call("crate.api_get",json!({"name":"example","version":"1.10.0","path":"example::send","target":"../escape"})).await.unwrap_err().code,"invalid_input");
+        assert_eq!(research.call("packages.crate.api_get",json!({"name":"example","version":"1.10.0","path":"example::send","target":"../escape"})).await.unwrap_err().code,"invalid_input");
     }
     #[tokio::test]
     async fn exact_captured_text_paths_ignore_unrelated_archive_binary_gaps() {
@@ -1194,13 +1200,13 @@ mod tests {
         *store.skipped_binary.lock().unwrap() = 1;
         let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
-        let result=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text","path":"src/lib.rs"})).await.unwrap();
+        let result=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text","path":"src/lib.rs"})).await.unwrap();
         assert_eq!(result["changed"], false);
         assert_eq!(
             result["comparison_coverage"]["scope"],
             "selected_captured_paths"
         );
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text"})).await.unwrap_err().code,"unavailable");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text"})).await.unwrap_err().code,"unavailable");
     }
     #[tokio::test]
     async fn missing_text_path_with_archive_binary_gaps_is_not_an_addition_claim() {
@@ -1213,7 +1219,7 @@ mod tests {
         let store = Arc::new(store);
         let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text","path":"src/lib.rs"})).await.unwrap_err().code,"unavailable");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"text","path":"src/lib.rs"})).await.unwrap_err().code,"unavailable");
     }
     #[tokio::test]
     async fn exact_api_comparisons_ignore_only_unrelated_unresolved_references() {
@@ -1222,13 +1228,13 @@ mod tests {
         *store.unresolved_references.lock().unwrap() = 3;
         let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
         let research = CrateResearch::new(store, retrieval, root.path().to_path_buf());
-        let result=research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","path":"example::send"})).await.unwrap();
+        let result=research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","path":"example::send"})).await.unwrap();
         assert_eq!(result["changed"], true);
         assert_eq!(
             result["comparison_coverage"]["normalization"],
             "complete_for_selected_items"
         );
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api"})).await.unwrap_err().code,"unavailable");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api"})).await.unwrap_err().code,"unavailable");
         let mut incomplete = Arc::try_unwrap(fixture()).ok().unwrap();
         incomplete
             .contents
@@ -1239,7 +1245,7 @@ mod tests {
         let incomplete = Arc::new(incomplete);
         let retrieval = Arc::new(Retrieval::new(incomplete.clone(), Arc::new(NoNetwork)));
         let research = CrateResearch::new(incomplete, retrieval, root.path().to_path_buf());
-        assert_eq!(research.call("crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","path":"example::send"})).await.unwrap_err().code,"unavailable");
+        assert_eq!(research.call("packages.crate.compare",json!({"name":"example","from_version":"1.9.0","to_version":"1.10.0","kind":"api","path":"example::send"})).await.unwrap_err().code,"unavailable");
     }
     fn age_raw_source(
         store: &crate::crates_io::index::tests::FixtureStore,
@@ -1265,11 +1271,14 @@ mod tests {
         let docs = json!({"name":"example","version":"1.10.0","kind":"rustdoc","path":"example/index.html"});
         age_raw_source(&store, &"3".repeat(64), 2 * 86400);
         age_raw_source(&store, &"9".repeat(64), 2 * 86400);
-        let result = research.call("crate.api_get", api.clone()).await.unwrap();
+        let result = research
+            .call("packages.crate.api_get", api.clone())
+            .await
+            .unwrap();
         assert_eq!(result["source_capture"]["id"], "3".repeat(64));
         assert_eq!(result["source_capture"]["stale"], true);
         let text = research
-            .call("crate.document_get", docs.clone())
+            .call("packages.crate.document_get", docs.clone())
             .await
             .unwrap();
         assert_eq!(text["source_capture"]["id"], "9".repeat(64));
@@ -1281,7 +1290,10 @@ mod tests {
             if let Some(path) = path {
                 input["path"] = json!(path);
             }
-            let compared = research.call("crate.compare", input).await.unwrap();
+            let compared = research
+                .call("packages.crate.compare", input)
+                .await
+                .unwrap();
             let source = compared["comparison_coverage"]["source_captures"]
                 .as_array()
                 .unwrap()
@@ -1298,8 +1310,8 @@ mod tests {
         age_raw_source(&store, &"9".repeat(64), 8 * 86400);
         age_raw_source(&store, &"b".repeat(64), 8 * 86400);
         for (tool, input) in [
-            ("crate.api_get", api.clone()),
-            ("crate.document_get", docs.clone()),
+            ("packages.crate.api_get", api.clone()),
+            ("packages.crate.document_get", docs.clone()),
         ] {
             let error = research.call(tool, input.clone()).await.unwrap_err();
             assert_eq!(error.code, "unavailable");
@@ -1319,14 +1331,19 @@ mod tests {
             }
             assert_eq!(
                 research
-                    .call("crate.compare", compare.clone())
+                    .call("packages.crate.compare", compare.clone())
                     .await
                     .unwrap_err()
                     .code,
                 "unavailable"
             );
             compare["snapshot"] = json!("c".repeat(64));
-            assert!(research.call("crate.compare", compare).await.is_ok());
+            assert!(
+                research
+                    .call("packages.crate.compare", compare)
+                    .await
+                    .is_ok()
+            );
         }
         let before = store
             .artifact_reads
@@ -1334,7 +1351,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "crate.document_get",
+                    "packages.crate.document_get",
                     json!({"name":"example","version":"1.10.0","kind":"source","path":"src/lib.rs"})
                 )
                 .await
@@ -1343,7 +1360,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "crate.dependencies",
+                    "packages.crate.dependencies",
                     json!({"name":"example","version":"1.10.0"})
                 )
                 .await
@@ -1360,7 +1377,7 @@ mod tests {
         pinned["snapshot"] = json!("c".repeat(64));
         assert_eq!(
             research
-                .call("crate.api_get", pinned)
+                .call("packages.crate.api_get", pinned)
                 .await
                 .unwrap_err()
                 .code,
@@ -1400,7 +1417,7 @@ mod tests {
         assert_eq!(
             research
                 .call(
-                    "crate.api_search",
+                    "packages.crate.api_search",
                     json!({"query":"transport","name":"example"})
                 )
                 .await
@@ -1410,7 +1427,7 @@ mod tests {
         );
         let fresh = research
             .call(
-                "crate.api_search",
+                "packages.crate.api_search",
                 json!({"query":"transport","version":"1.9.0"}),
             )
             .await
@@ -1420,7 +1437,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "crate.content_search",
+                    "packages.crate.content_search",
                     json!({"query":"source","kind":"source"})
                 )
                 .await
@@ -1429,7 +1446,7 @@ mod tests {
         assert_eq!(
             research
                 .call(
-                    "crate.content_search",
+                    "packages.crate.content_search",
                     json!({"query":"source","kind":"rustdoc"})
                 )
                 .await
@@ -1439,7 +1456,7 @@ mod tests {
         );
         let historical = research
             .call(
-                "crate.content_search",
+                "packages.crate.content_search",
                 json!({"query":"source","kind":"rustdoc","snapshot":"c".repeat(64)}),
             )
             .await
@@ -1450,7 +1467,7 @@ mod tests {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let historical = research
             .call(
-                "crate.api_search",
+                "packages.crate.api_search",
                 json!({"query":"transport","version":"1.10.0","snapshot":"c".repeat(64)}),
             )
             .await
@@ -1466,7 +1483,7 @@ mod tests {
         age_raw_source(&store, &"3".repeat(64), 2 * 86400);
         let stale = research
             .call(
-                "crate.api_search",
+                "packages.crate.api_search",
                 json!({"query":"transport","version":"1.10.0"}),
             )
             .await
@@ -1477,7 +1494,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             research
-                .call("crate.catalog_search", json!({"name":"example"}))
+                .call("packages.crate.catalog_search", json!({"name":"example"}))
                 .await
                 .unwrap()["total"],
             2
@@ -1492,7 +1509,7 @@ mod tests {
         assert_eq!(
             research
                 .call(
-                    "crate.api_search",
+                    "packages.crate.api_search",
                     json!({"query":"transport","version":"1.10.0","snapshot":"c".repeat(64)})
                 )
                 .await

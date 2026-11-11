@@ -565,13 +565,13 @@ database and blobs in isolation rather than downgrading tables. Fixture checks a
 bounded live smoke establish neither production capacity nor real full-corpus
 acquisition. All live acceptance runs keep collection paused.
 
-Crate collection is also enabled when `[crates]` is omitted. Set `enabled = false`
-in `[crates]` before running disposable or bounded-live acceptance.
-`crate.corpus_status` separates inventory enumeration, metadata gaps, retained
-artifacts, job failures, projections and search coverage. One successful acquisition
-or completed job does not prove whole-registry ingestion. Bootstrap and revalidation
-may take substantial storage/time; no completion estimate or whole-corpus load
-benchmark is implied.
+Crate collection is also enabled when `[crates]` is omitted. Set `enabled = false` in
+`[crates]` before running disposable or bounded-live acceptance.
+`packages.crate.corpus_status` separates inventory enumeration, metadata gaps, retained
+artifacts, job failures, projections and search coverage. One successful acquisition or
+completed job does not prove whole-registry ingestion. Bootstrap and revalidation may
+take substantial storage/time; no completion estimate or whole-corpus load benchmark is
+implied.
 
 The `pending_inventory` status field survives restart and reports the last durable
 record-or-gap cursor. It is null when there is no pending inventory. Oversized
@@ -668,10 +668,11 @@ public database downloads are not committed. See the
 
 Serving supervises hourly current-advisory refresh and daily full branch/tag Git
 synchronization. All public advisory tools are local reads. During bootstrap use
-`advisory.corpus_status` to distinguish a ready service from available source data,
-raw graph acquisition, backfill completion, projection gaps and assessment freshness.
-History processing does not block current publication. Set `[rustsec].enabled=false`
-to pause new scheduling while retaining snapshots and source evidence.
+`packages.crate.advisory_corpus_status` to distinguish a ready service from available
+source data, raw graph acquisition, backfill completion, projection gaps and assessment
+freshness. History processing does not block current publication. Set
+`[rustsec].enabled=false` to pause new scheduling while retaining snapshots and source
+evidence.
 
 Schema 4 retains deduplicated advisory records and immutable ordered memberships.
 Legacy captures are recovered locally in bounded batches with their recorded source

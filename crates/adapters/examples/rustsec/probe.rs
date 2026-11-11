@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let research = Research::new(retrieval).await?.with_advisory_corpus(corpus);
         let lookup = research
             .call(
-                "advisory.lookup",
+                "packages.crate.advisory_lookup",
                 json!({"name":"odbc","version":"0.17.0","advisory_snapshot":snapshot}),
             )
             .await?;
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let detail = research
             .call(
-                "advisory.get",
+                "packages.crate.advisory_get",
                 json!({"id":"RUSTSEC-2022-0039","snapshot":snapshot}),
             )
             .await?;

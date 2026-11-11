@@ -154,7 +154,10 @@ async fn foreground_metadata_numbers_keep_precision_and_literal_marker_objects_s
         fetcher,
     )));
     let parsed = packages
-        .call("npm.metadata", json!({"name":"fixture","version":"1.0.0"}))
+        .call(
+            "packages.npm.metadata",
+            json!({"name":"fixture","version":"1.0.0"}),
+        )
         .await
         .unwrap();
     let observed = &parsed["metadata"]["observations"];
@@ -190,7 +193,10 @@ async fn foreground_metadata_numbers_keep_precision_and_literal_marker_objects_s
     )));
     assert_eq!(
         packages
-            .call("npm.metadata", json!({"name":"fixture","version":"1.0.0"}))
+            .call(
+                "packages.npm.metadata",
+                json!({"name":"fixture","version":"1.0.0"})
+            )
             .await
             .unwrap_err()
             .code,
@@ -611,19 +617,22 @@ async fn tools_pin_both_captures_and_page_utf8_without_further_fetches() {
     let _serial = SERIAL.lock().await;
     let (packages, _, fetcher) = setup(fixture_archive());
     let args = json!({"name":"@fixture/package","version":"1.0.0","limit":2});
-    let first = packages.call("npm.source_list", args).await.unwrap();
+    let first = packages
+        .call("packages.npm.source_list", args)
+        .await
+        .unwrap();
     assert_eq!(first["files"].as_array().unwrap().len(), 2);
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
     let metadata = first["metadata_capture"]["id"].as_str().unwrap();
     let archive = first["archive_capture"]["id"].as_str().unwrap();
-    let page = packages.call("npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":21,"limit":4})).await.unwrap();
+    let page = packages.call("packages.npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":21,"limit":4})).await.unwrap();
     assert_eq!(page["page"]["text"], "한");
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
     let uri = url::Url::parse(page["resource_uri"].as_str().unwrap()).unwrap();
     let parsed = source_input_from_uri(uri.as_str()).unwrap();
     assert_eq!(parsed["path"], "index.js");
-    assert!(packages.call("npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata})).await.is_err());
-    assert!(packages.call("npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":22})).await.is_err());
+    assert!(packages.call("packages.npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata})).await.is_err());
+    assert!(packages.call("packages.npm.source_read",json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":metadata,"archive_capture":archive,"offset":22})).await.is_err());
     assert!(source_input_from_uri(&format!("{}&path=evil", uri)).is_err());
 }
 
@@ -689,7 +698,7 @@ async fn legacy_source_capture_and_resource_keep_distribution_numeric_key() {
     });
     let retrieval = Arc::new(Retrieval::new(store.clone(), fetcher.clone()));
     let packages = NpmPackages::new(retrieval.clone());
-    let pinned = packages.call("npm.source_read", json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":captures[0].capture.id,"archive_capture":captures[1].capture.id})).await.unwrap();
+    let pinned = packages.call("packages.npm.source_read", json!({"name":"@fixture/package","version":"1.0.0","path":"index.js","metadata_capture":captures[0].capture.id,"archive_capture":captures[1].capture.id})).await.unwrap();
     assert_eq!(pinned["archive_capture"]["id"], captures[1].capture.id);
     let mut old_uri = url::Url::parse("devres://npm-source/").unwrap();
     old_uri
@@ -717,7 +726,7 @@ async fn legacy_source_capture_and_resource_keep_distribution_numeric_key() {
 
     let metadata = packages
         .call(
-            "npm.metadata",
+            "packages.npm.metadata",
             json!({"name":"@fixture/package","version":"1.0.0","capture":captures[0].capture.id}),
         )
         .await
@@ -739,7 +748,7 @@ async fn legacy_source_capture_and_resource_keep_distribution_numeric_key() {
     )));
     let fresh = cold
         .call(
-            "npm.source_read",
+            "packages.npm.source_read",
             json!({"name":"@fixture/package","version":"1.0.0","path":"index.js"}),
         )
         .await
@@ -760,7 +769,7 @@ async fn unsupported_archive_processing_preserves_integrity_verified_capture() {
     let (packages, store, fetcher) = setup(bytes);
     let response = packages
         .call(
-            "npm.source_list",
+            "packages.npm.source_list",
             json!({"name":"@fixture/package","version":"1.0.0"}),
         )
         .await
@@ -789,7 +798,7 @@ async fn search_capture_paging_stays_inside_fixed_provider_page() {
     let packages = NpmPackages::new(Arc::new(Retrieval::new(store, fetcher.clone())));
     let first = packages
         .call(
-            "npm.search",
+            "packages.npm.search",
             json!({"query":"fixture","offset":95,"limit":20}),
         )
         .await
@@ -799,7 +808,7 @@ async fn search_capture_paging_stays_inside_fixed_provider_page() {
     let capture = first["capture"]["id"].as_str().unwrap();
     let second = packages
         .call(
-            "npm.search",
+            "packages.npm.search",
             json!({"query":"fixture","offset":96,"limit":2,"capture":capture}),
         )
         .await
@@ -808,7 +817,10 @@ async fn search_capture_paging_stays_inside_fixed_provider_page() {
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     assert!(
         packages
-            .call("npm.search", json!({"query":"other","capture":capture}))
+            .call(
+                "packages.npm.search",
+                json!({"query":"other","capture":capture})
+            )
             .await
             .is_err()
     );
@@ -828,13 +840,13 @@ async fn search_and_exact_metadata_numeric_results_survive_json_round_trip_and_p
     let packages = NpmPackages::new(Arc::new(Retrieval::new(store, fetcher.clone())));
     for (tool, args, number_path, token) in [
         (
-            "npm.search",
+            "packages.npm.search",
             json!({"query":"fixture","limit":1}),
             "/items/0/score/final",
             "478.37408",
         ),
         (
-            "npm.metadata",
+            "packages.npm.metadata",
             json!({"name":"fixture","version":"1.0.0"}),
             "/metadata/large_observation",
             "184467440737095516161234567890",
@@ -862,7 +874,7 @@ async fn checksum_failure_never_publishes_archive_bytes() {
     assert!(
         packages
             .call(
-                "npm.source_list",
+                "packages.npm.source_list",
                 json!({"name":"@fixture/package","version":"1.0.0"})
             )
             .await
@@ -891,7 +903,7 @@ async fn exact_metadata_does_not_return_other_release_timestamps() {
     let packages = NpmPackages::new(Arc::new(Retrieval::new(store.clone(), fetcher)));
     let response = packages
         .call(
-            "npm.metadata",
+            "packages.npm.metadata",
             json!({"name":"@fixture/package","version":"1.0.0"}),
         )
         .await
@@ -950,7 +962,7 @@ async fn large_release_history_selects_metadata_and_replays_pinned_sources() {
     let packages = NpmPackages::new(Arc::new(Retrieval::new(store.clone(), fetcher.clone())));
     let response = packages
         .call(
-            "npm.metadata",
+            "packages.npm.metadata",
             json!({"name":"@fixture/package","version":"v1.0.0"}),
         )
         .await
@@ -964,7 +976,7 @@ async fn large_release_history_selects_metadata_and_replays_pinned_sources() {
     );
     let replay = packages
         .call(
-            "npm.metadata",
+            "packages.npm.metadata",
             json!({"name":"@fixture/package","version":"1.0.0","capture":capture}),
         )
         .await
@@ -973,13 +985,13 @@ async fn large_release_history_selects_metadata_and_replays_pinned_sources() {
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     let listing = packages
         .call(
-            "npm.source_list",
+            "packages.npm.source_list",
             json!({"name":"@fixture/package","version":"1.0.0"}),
         )
         .await
         .unwrap();
     let archive_capture = listing["archive_capture"]["id"].as_str().unwrap();
-    let read = packages.call("npm.source_read", json!({"name":"@fixture/package","version":"1.0.0","path":"README.md","metadata_capture":capture,"archive_capture":archive_capture})).await.unwrap();
+    let read = packages.call("packages.npm.source_read", json!({"name":"@fixture/package","version":"1.0.0","path":"README.md","metadata_capture":capture,"archive_capture":archive_capture})).await.unwrap();
     assert!(read["page"]["text"].as_str().unwrap().contains("# Fixture"));
     assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
 }
@@ -1002,7 +1014,7 @@ async fn unrelated_invalid_releases_are_rejected_before_capture_publication() {
         assert_eq!(
             packages
                 .call(
-                    "npm.metadata",
+                    "packages.npm.metadata",
                     json!({"name":"@fixture/package","version":"1.0.0"})
                 )
                 .await
@@ -1030,7 +1042,7 @@ async fn unrelated_invalid_releases_are_rejected_before_capture_publication() {
             )
             .await
             .unwrap();
-        assert_eq!(packages.call("npm.metadata", json!({"name":"@fixture/package","version":"1.0.0","capture":capture.capture.id})).await.unwrap_err().code,"integrity");
+        assert_eq!(packages.call("packages.npm.metadata", json!({"name":"@fixture/package","version":"1.0.0","capture":capture.capture.id})).await.unwrap_err().code,"integrity");
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     }
 }
@@ -1048,7 +1060,7 @@ async fn selected_metadata_output_limit_retains_full_capture_and_applies_to_repl
     assert_eq!(
         packages
             .call(
-                "npm.metadata",
+                "packages.npm.metadata",
                 json!({"name":"@fixture/package","version":"1.0.0"})
             )
             .await
@@ -1061,7 +1073,7 @@ async fn selected_metadata_output_limit_retains_full_capture_and_applies_to_repl
     assert_eq!(
         packages
             .call(
-                "npm.metadata",
+                "packages.npm.metadata",
                 json!({"name":"@fixture/package","version":"1.0.0","capture":capture.capture.id})
             )
             .await

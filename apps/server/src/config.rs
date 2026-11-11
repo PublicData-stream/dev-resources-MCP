@@ -463,7 +463,7 @@ mod tests {
     fn generic_search_timeout_is_independent_and_explicit_overrides_remain_valid() {
         let defaults: Limits = toml::from_str("").unwrap();
         assert_eq!(defaults.tool_timeout_secs("search"), 75);
-        assert_eq!(defaults.tool_timeout_secs("crate.search"), 30);
+        assert_eq!(defaults.tool_timeout_secs("packages.crate.search"), 30);
         assert_eq!(defaults.tool_timeout_secs("search.other"), 30);
         assert_eq!(defaults.idle_timeout_secs, 120);
         defaults.validate().unwrap();

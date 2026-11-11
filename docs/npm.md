@@ -7,22 +7,23 @@ Cargo tools retain their behavior.
 
 ## Public interfaces
 
-`npm.search` queries official registry search. `npm.metadata` selects an exact
-release from full registry metadata. `npm.source_list` and `npm.source_read`
-verify distribution integrity before inspecting a published archive. Supply both
-`metadata_capture` and `archive_capture` to continue against fixed evidence.
-`fetch` accepts `npm:is-number@7.0.0` and scoped identities such as
+`packages.npm.search` queries official registry search. `packages.npm.metadata` selects
+an exact release from full registry metadata. `packages.npm.source_list` and
+`packages.npm.source_read` verify distribution integrity before inspecting a published
+archive. Supply both `metadata_capture` and `archive_capture` to continue against fixed
+evidence. `fetch` accepts `npm:is-number@7.0.0` and scoped identities such as
 `npm:@types/is-number@7.0.5`. Generic `search` includes npm among all eight default
-source families; an explicit source list narrows the search. Its npm branch keeps
-the official registry search behavior rather than searching local package content.
+source families; an explicit source list narrows the search. Its npm branch keeps the
+official registry search behavior rather than searching local package content.
 
-Local research uses `npm.versions`, `npm.catalog_search`, `npm.document_get`,
-`npm.dependencies`, `npm.compare`, `npm.content_search`, and `npm.contract_get`.
-`npm.history`, `npm.snapshots`, and `npm.corpus_status` expose retained observations
-and coverage. `npm.advisory_lookup`, `npm.advisory_get`, and
-`npm.advisory_catalog_search` read public advisory snapshots.
-Discovery supplies the exact schemas. Lists default to 20 and cap at 100; text
-pages count UTF-8 bytes and cap at 32 KiB. Reuse returned snapshots and cursors.
+Local research uses `packages.npm.versions`, `packages.npm.catalog_search`,
+`packages.npm.document_get`, `packages.npm.dependencies`, `packages.npm.compare`,
+`packages.npm.content_search`, and `packages.npm.contract_get`. `packages.npm.history`,
+`packages.npm.snapshots`, and `packages.npm.corpus_status` expose retained observations
+and coverage. `packages.npm.advisory_lookup`, `packages.npm.advisory_get`, and
+`packages.npm.advisory_catalog_search` read public advisory snapshots. Discovery
+supplies the exact schemas. Lists default to 20 and cap at 100; text pages count UTF-8
+bytes and cap at 32 KiB. Reuse returned snapshots and cursors.
 
 Dependencies are declarations, including aliases and optional/peer/dev metadata.
 They are never resolved. Research covers published source, README/license text,
@@ -62,11 +63,11 @@ not establish unrestricted reuse rights.
 
 ## Local lockfile assessment
 
-`npm.audit_lockfile` requires `lockfile` and `lockfile_format` (`npm`, `pnpm`,
-`yarn_classic`, or `yarn_berry`). It accepts `advisory_snapshot`,
-`registry_context`, `offset`, and `limit`. Continue by resubmitting the same input
-and the returned advisory snapshot. Caller input, inventories and reports remain
-in request memory and have no capture/resource identity.
+`packages.npm.audit_lockfile` requires `lockfile` and `lockfile_format` (`npm`, `pnpm`,
+`yarn_classic`, or `yarn_berry`). It accepts `advisory_snapshot`, `registry_context`,
+`offset`, and `limit`. Continue by resubmitting the same input and the returned advisory
+snapshot. Caller input, inventories and reports remain in request memory and have no
+capture/resource identity.
 
 | Format | Supported schema |
 | --- | --- |

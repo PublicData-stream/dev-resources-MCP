@@ -160,7 +160,7 @@ impl Input {
         Ok(())
     }
     fn fingerprint(&self, tool: &str) -> Result<String> {
-        let format = if tool == "advisory.snapshots" {
+        let format = if tool == "packages.crate.advisory_snapshots" {
             json!(self.format)
         } else {
             json!(self.format()?)
@@ -182,7 +182,7 @@ impl Input {
             .map_err(|_| Error::invalid("Invalid advisory cursor."))?;
         let expected = match cursor.version {
             1 => {
-                let format = if tool == "advisory.snapshots" {
+                let format = if tool == "packages.crate.advisory_snapshots" {
                     json!(self.format)
                 } else {
                     json!(self.format()?)
@@ -224,11 +224,11 @@ impl AdvisoryResearch {
 
     pub async fn call(&self, tool: &str, value: Value) -> Result<Value> {
         let fields: &[&str] = match tool {
-            "advisory.get" => &["id", "format", "snapshot", "offset", "limit"],
-            "advisory.catalog_search" => &[
+            "packages.crate.advisory_get" => &["id", "format", "snapshot", "offset", "limit"],
+            "packages.crate.advisory_catalog_search" => &[
                 "query", "filters", "format", "snapshot", "offset", "limit", "cursor",
             ],
-            "advisory.history" => &[
+            "packages.crate.advisory_history" => &[
                 "id",
                 "format",
                 "ref",
@@ -237,7 +237,7 @@ impl AdvisoryResearch {
                 "limit",
                 "cursor",
             ],
-            "advisory.snapshots" => &[
+            "packages.crate.advisory_snapshots" => &[
                 "kind",
                 "format",
                 "ref",
@@ -246,7 +246,7 @@ impl AdvisoryResearch {
                 "limit",
                 "cursor",
             ],
-            "advisory.corpus_status" => &[],
+            "packages.crate.advisory_corpus_status" => &[],
             _ => return Err(Error::not_found("Unknown advisory research tool.")),
         };
         if value
@@ -262,11 +262,11 @@ impl AdvisoryResearch {
         input.validate()?;
         let _read_permit = admit_reads().await?;
         match tool {
-            "advisory.get" => self.get(&input).await,
-            "advisory.catalog_search" => self.catalog(&input).await,
-            "advisory.history" => self.history(&input).await,
-            "advisory.snapshots" => self.snapshots(&input).await,
-            "advisory.corpus_status" => self.store.advisory_status().await,
+            "packages.crate.advisory_get" => self.get(&input).await,
+            "packages.crate.advisory_catalog_search" => self.catalog(&input).await,
+            "packages.crate.advisory_history" => self.history(&input).await,
+            "packages.crate.advisory_snapshots" => self.snapshots(&input).await,
+            "packages.crate.advisory_corpus_status" => self.store.advisory_status().await,
             _ => Err(Error::not_found("Unknown advisory research tool.")),
         }
     }
@@ -311,7 +311,7 @@ impl AdvisoryResearch {
 
     async fn catalog(&self, input: &Input) -> Result<Value> {
         let limit = input.limit(false)?;
-        let cursor = input.cursor("advisory.catalog_search")?;
+        let cursor = input.cursor("packages.crate.advisory_catalog_search")?;
         let selected = cursor
             .as_ref()
             .and_then(|v| v.snapshot.as_deref())
@@ -335,7 +335,7 @@ impl AdvisoryResearch {
         let offset=offset.min(matches.len());
         let next = offset.saturating_add(limit).min(matches.len());
         let next_cursor = if next < matches.len() {
-            Some(encode_cursor(Cursor { version:2, fingerprint:input.fingerprint("advisory.catalog_search")?,
+            Some(encode_cursor(Cursor { version:2, fingerprint:input.fingerprint("packages.crate.advisory_catalog_search")?,
                 snapshot:Some(snapshot.id.clone()), cutoff:None, after:next as i64, within:0 })?)
         } else { None };
         let items = matches[offset..next].iter().map(|record| record_summary(&snapshot,record)).collect::<Vec<_>>();
@@ -385,7 +385,7 @@ impl AdvisoryResearch {
                 "Advisory snapshot kind must be refs or commits.",
             ));
         }
-        let cursor = input.cursor("advisory.snapshots")?;
+        let cursor = input.cursor("packages.crate.advisory_snapshots")?;
         let cutoff = self.view(input, cursor.as_ref()).await?;
         let mut after = cursor.as_ref().map_or(0, |v| v.after);
         let mut skip = input.offset;
@@ -459,7 +459,7 @@ impl AdvisoryResearch {
         let next_cursor = if more {
             Some(encode_cursor(Cursor {
                 version: 2,
-                fingerprint: input.fingerprint("advisory.snapshots")?,
+                fingerprint: input.fingerprint("packages.crate.advisory_snapshots")?,
                 snapshot: None,
                 cutoff: Some(cutoff),
                 after,
@@ -478,7 +478,7 @@ impl AdvisoryResearch {
         let id = input.id()?;
         let format = input.format()?;
         let limit = input.limit(false)?;
-        let cursor = input.cursor("advisory.history")?;
+        let cursor = input.cursor("packages.crate.advisory_history")?;
         let cutoff = self.view(input, cursor.as_ref()).await?;
         let mut after = cursor.as_ref().map_or(0, |v| v.after);
         let mut within = cursor.as_ref().map_or(0, |v| v.within);
@@ -544,7 +544,7 @@ impl AdvisoryResearch {
         let next_cursor = if more {
             Some(encode_cursor(Cursor {
                 version: 2,
-                fingerprint: input.fingerprint("advisory.history")?,
+                fingerprint: input.fingerprint("packages.crate.advisory_history")?,
                 snapshot: None,
                 cutoff: Some(cutoff),
                 after,
@@ -955,31 +955,31 @@ pub(crate) fn schemas() -> Vec<Value> {
         "date_through":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}},"additionalProperties":false});
     let definitions = [
         (
-            "advisory.get",
+            "packages.crate.advisory_get",
             "Read original advisory text and structured metadata from one immutable local snapshot.",
             json!({"id":canonical,"format":format,"snapshot":snapshot,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32768,"default":32768}}),
             vec!["id"],
         ),
         (
-            "advisory.catalog_search",
+            "packages.crate.advisory_catalog_search",
             "Browse local advisory snapshots with conjunctive metadata filters. Platform filters include unrestricted advisories.",
             json!({"query":{"type":"string","maxLength":256,"default":""},"filters":filters,"format":format,"snapshot":snapshot,"offset":offset,"limit":limit,"cursor":cursor}),
             vec![],
         ),
         (
-            "advisory.history",
+            "packages.crate.advisory_history",
             "Read parent-relative changes across retained Git history. History views and cursors freeze imported coverage.",
             json!({"id":canonical,"format":format,"ref":reference,"history_snapshot":history,"offset":offset,"limit":limit,"cursor":cursor}),
             vec!["id"],
         ),
         (
-            "advisory.snapshots",
+            "packages.crate.advisory_snapshots",
             "Discover immutable commit snapshots and observed refs from retained branches and tags.",
             json!({"kind":{"enum":["refs","commits"],"default":"commits"},"format":{"enum":["rustsec","osv"]},"ref":reference,"history_snapshot":history,"offset":offset,"limit":limit,"cursor":cursor}),
             vec![],
         ),
         (
-            "advisory.corpus_status",
+            "packages.crate.advisory_corpus_status",
             "Inspect aggregate advisory acquisition, processing, freshness and history coverage without administrative controls.",
             json!({}),
             vec![],
@@ -1193,14 +1193,14 @@ mod tests {
             .await
             .unwrap();
         let research = AdvisoryResearch::new(store);
-        let result=research.call("advisory.catalog_search",json!({"query":"CVE-2024-1234","filters":{"os":"windows","category":"memory-corruption","date_from":"2024-02-29","date_through":"2024-02-29"}})).await.unwrap();
+        let result=research.call("packages.crate.advisory_catalog_search",json!({"query":"CVE-2024-1234","filters":{"os":"windows","category":"memory-corruption","date_from":"2024-02-29","date_through":"2024-02-29"}})).await.unwrap();
         assert_eq!(result["total"], 1);
         assert_eq!(result["items"][0]["id"], "RUSTSEC-2024-0001");
         assert!(result["items"][0].get("original").is_none());
         assert!(
             research
                 .call(
-                    "advisory.catalog_search",
+                    "packages.crate.advisory_catalog_search",
                     json!({"filters":{"date_from":"2023-02-29"}})
                 )
                 .await
@@ -1225,36 +1225,39 @@ mod tests {
             .unwrap();
         let research = AdvisoryResearch::new(store.clone());
         let first = research
-            .call("advisory.catalog_search", json!({"limit":1}))
+            .call("packages.crate.advisory_catalog_search", json!({"limit":1}))
             .await
             .unwrap();
         assert_eq!(first["items"][0]["id"], "RUSTSEC-2024-0001");
-        let mut legacy_cursor: Cursor = serde_json::from_slice(
-            &URL_SAFE_NO_PAD
-                .decode(first["next_cursor"].as_str().unwrap())
-                .unwrap(),
-        )
-        .unwrap();
-        legacy_cursor.fingerprint = Input::default()
-            .fingerprint("advisory_catalog_search")
+        for old_tool in ["advisory_catalog_search", "advisory.catalog_search"] {
+            let mut legacy_cursor: Cursor = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(first["next_cursor"].as_str().unwrap())
+                    .unwrap(),
+            )
             .unwrap();
-        let legacy_cursor = encode_cursor(legacy_cursor).unwrap();
-        let rejected = research
-            .call("advisory.catalog_search", json!({"cursor":legacy_cursor}))
-            .await
-            .unwrap_err();
-        assert_eq!(rejected.code, "invalid_input");
-        assert_eq!(
-            rejected.message,
-            "Advisory cursor belongs to a different query or snapshot."
-        );
+            legacy_cursor.fingerprint = Input::default().fingerprint(old_tool).unwrap();
+            let legacy_cursor = encode_cursor(legacy_cursor).unwrap();
+            let rejected = research
+                .call(
+                    "packages.crate.advisory_catalog_search",
+                    json!({"cursor":legacy_cursor}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(rejected.code, "invalid_input");
+            assert_eq!(
+                rejected.message,
+                "Advisory cursor belongs to a different query or snapshot."
+            );
+        }
         store
             .publish_advisory_snapshot(&snapshot('b', vec![]), true)
             .await
             .unwrap();
         let next = research
             .call(
-                "advisory.catalog_search",
+                "packages.crate.advisory_catalog_search",
                 json!({"cursor":first["next_cursor"],"limit":2,"snapshot":original.id}),
             )
             .await
@@ -1265,7 +1268,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "advisory.catalog_search",
+                    "packages.crate.advisory_catalog_search",
                     json!({"cursor":first["next_cursor"],"query":"changed"})
                 )
                 .await
@@ -1274,7 +1277,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "advisory.catalog_search",
+                    "packages.crate.advisory_catalog_search",
                     json!({"cursor":first["next_cursor"],"offset":1})
                 )
                 .await
@@ -1295,7 +1298,10 @@ mod tests {
         let research = AdvisoryResearch::new(store);
         assert_eq!(
             research
-                .call("advisory.get", json!({"id":"RUSTSEC-2024-0001"}))
+                .call(
+                    "packages.crate.advisory_get",
+                    json!({"id":"RUSTSEC-2024-0001"})
+                )
                 .await
                 .unwrap_err()
                 .code,
@@ -1303,7 +1309,7 @@ mod tests {
         );
         let result = research
             .call(
-                "advisory.get",
+                "packages.crate.advisory_get",
                 json!({"id":"RUSTSEC-2024-0001","snapshot":historical.id,"limit":2}),
             )
             .await
@@ -1328,7 +1334,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "advisory.get",
+                    "packages.crate.advisory_get",
                     json!({"id":"RUSTSEC-2024-0001","format":"osv","snapshot":historical.id})
                 )
                 .await
@@ -1337,7 +1343,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "advisory.get",
+                    "packages.crate.advisory_get",
                     json!({"id":"RUSTSEC-2024-0001","snapshot":historical.id,"offset":1})
                 )
                 .await
@@ -1362,7 +1368,7 @@ mod tests {
         let research = AdvisoryResearch::new(store);
         let first = research
             .call(
-                "advisory.history",
+                "packages.crate.advisory_history",
                 json!({"id":"RUSTSEC-2024-0001","limit":3}),
             )
             .await
@@ -1372,7 +1378,7 @@ mod tests {
         assert_eq!(first["items"][2]["parent_index"], 0);
         let next = research
             .call(
-                "advisory.history",
+                "packages.crate.advisory_history",
                 json!({"id":"RUSTSEC-2024-0001","limit":10,"cursor":first["next_cursor"]}),
             )
             .await
@@ -1394,12 +1400,15 @@ mod tests {
         add_commit(&store, &b, &[&a.revision]).await;
         let research = AdvisoryResearch::new(store.clone());
         let first = research
-            .call("advisory.snapshots", json!({"limit":1}))
+            .call("packages.crate.advisory_snapshots", json!({"limit":1}))
             .await
             .unwrap();
         add_commit(&store, &c, &[&b.revision]).await;
         let next = research
-            .call("advisory.snapshots", json!({"cursor":first["next_cursor"]}))
+            .call(
+                "packages.crate.advisory_snapshots",
+                json!({"cursor":first["next_cursor"]}),
+            )
             .await
             .unwrap();
         assert_eq!(next["history_snapshot"], first["history_snapshot"]);
@@ -1408,7 +1417,7 @@ mod tests {
         assert!(next["next_cursor"].is_null());
         let history = research
             .call(
-                "advisory.history",
+                "packages.crate.advisory_history",
                 json!({"id":"RUSTSEC-2024-0001","history_snapshot":first["history_snapshot"]}),
             )
             .await
@@ -1435,7 +1444,10 @@ mod tests {
             .unwrap();
         let research = AdvisoryResearch::new(store);
         let result = research
-            .call("advisory.snapshots", json!({"ref":"refs/heads/main"}))
+            .call(
+                "packages.crate.advisory_snapshots",
+                json!({"ref":"refs/heads/main"}),
+            )
             .await
             .unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 2);
@@ -1454,7 +1466,7 @@ mod tests {
         ] {
             assert_eq!(
                 research
-                    .call("advisory.snapshots", input)
+                    .call("packages.crate.advisory_snapshots", input)
                     .await
                     .unwrap_err()
                     .code,
@@ -1464,7 +1476,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "advisory.corpus_status",
+                    "packages.crate.advisory_corpus_status",
                     json!({"lockfile":"private sentinel"})
                 )
                 .await
@@ -1473,7 +1485,7 @@ mod tests {
         assert!(
             research
                 .call(
-                    "advisory.catalog_search",
+                    "packages.crate.advisory_catalog_search",
                     json!({"filters":{"unexpected":"x"}})
                 )
                 .await
@@ -1521,11 +1533,11 @@ mod tests {
         let research = AdvisoryResearch::new(store);
         for (tool, input) in [
             (
-                "advisory.snapshots",
+                "packages.crate.advisory_snapshots",
                 json!({"kind":"refs","format":"osv","offset":1}),
             ),
             (
-                "advisory.history",
+                "packages.crate.advisory_history",
                 json!({"id":"RUSTSEC-2024-0001","offset":1}),
             ),
         ] {
@@ -1551,7 +1563,7 @@ mod tests {
             .unwrap();
         let result = AdvisoryResearch::new(store)
             .call(
-                "advisory.get",
+                "packages.crate.advisory_get",
                 json!({"id":"RUSTSEC-2024-0001","snapshot":fixture.id}),
             )
             .await
@@ -1582,12 +1594,12 @@ mod tests {
         add_commit(&store, &child_v1, &[&parent_v1.revision]).await;
         let research = AdvisoryResearch::new(store.clone());
         let old_discovery = research
-            .call("advisory.snapshots", json!({"limit":1}))
+            .call("packages.crate.advisory_snapshots", json!({"limit":1}))
             .await
             .unwrap();
         let old_history = research
             .call(
-                "advisory.history",
+                "packages.crate.advisory_history",
                 json!({"id":"RUSTSEC-2024-0001","limit":1}),
             )
             .await
@@ -1616,7 +1628,7 @@ mod tests {
 
         let frozen_discovery = research
             .call(
-                "advisory.snapshots",
+                "packages.crate.advisory_snapshots",
                 json!({"cursor":old_discovery["next_cursor"]}),
             )
             .await
@@ -1629,7 +1641,7 @@ mod tests {
         assert_eq!(frozen_discovery["items"][0]["sequence"], 2);
         let frozen_history = research
             .call(
-                "advisory.history",
+                "packages.crate.advisory_history",
                 json!({"id":"RUSTSEC-2024-0001","cursor":old_history["next_cursor"]}),
             )
             .await
@@ -1638,7 +1650,7 @@ mod tests {
         assert_eq!(frozen_history["items"][0]["parent_snapshot"], parent_v1.id);
 
         let latest_discovery = research
-            .call("advisory.snapshots", json!({}))
+            .call("packages.crate.advisory_snapshots", json!({}))
             .await
             .unwrap();
         assert_eq!(latest_discovery["items"].as_array().unwrap().len(), 2);
@@ -1653,7 +1665,10 @@ mod tests {
         assert_eq!(latest_discovery["items"][1]["processor_version"], 2);
         assert_eq!(latest_discovery["items"][1]["sequence"], 2);
         let latest_history = research
-            .call("advisory.history", json!({"id":"RUSTSEC-2024-0001"}))
+            .call(
+                "packages.crate.advisory_history",
+                json!({"id":"RUSTSEC-2024-0001"}),
+            )
             .await
             .unwrap();
         assert_eq!(latest_history["items"][0]["snapshot"], parent_v2.id);
@@ -1675,7 +1690,10 @@ mod tests {
             .await
             .unwrap();
         let result = AdvisoryResearch::new(store)
-            .call("advisory.history", json!({"id":"RUSTSEC-2024-0001"}))
+            .call(
+                "packages.crate.advisory_history",
+                json!({"id":"RUSTSEC-2024-0001"}),
+            )
             .await
             .unwrap();
         assert!(result["items"].as_array().unwrap().is_empty());

@@ -190,15 +190,15 @@ mod tests {
                 .unwrap();
         }
         for name in [
-            "crate.versions",
-            "crate.catalog_search",
-            "crate.document_get",
-            "crate.dependencies",
-            "crate.compare",
-            "crate.content_search",
-            "crate.api_search",
-            "crate.api_get",
-            "crate.corpus_status",
+            "packages.crate.versions",
+            "packages.crate.catalog_search",
+            "packages.crate.document_get",
+            "packages.crate.dependencies",
+            "packages.crate.compare",
+            "packages.crate.content_search",
+            "packages.crate.api_search",
+            "packages.crate.api_get",
+            "packages.crate.corpus_status",
         ] {
             assert!(registry.tools.contains_key(name));
             assert!(
@@ -250,7 +250,16 @@ mod tests {
                         );
                     }
                 }
-                families.insert(name.split('.').next().unwrap().to_owned());
+                let family = if name.starts_with("packages.crate.advisory_") {
+                    "advisory"
+                } else {
+                    name.strip_prefix("packages.")
+                        .unwrap_or(name)
+                        .split('.')
+                        .next()
+                        .unwrap()
+                };
+                families.insert(family.to_owned());
             }
         }
         for family in [
@@ -275,13 +284,42 @@ mod tests {
             serde_json::from_str(include_str!("../tests/tool-names.json")).unwrap();
         assert_eq!(expected.len(), 88);
         assert_eq!(registry.tools.keys().cloned().collect::<Vec<_>>(), expected);
+        for (namespace, count) in [("packages.crate.", 20), ("packages.npm.", 18)] {
+            assert_eq!(
+                registry
+                    .tools
+                    .keys()
+                    .filter(|name| name.starts_with(namespace))
+                    .count(),
+                count
+            );
+        }
         for name in registry.tools.keys() {
-            if let Some((group, operation)) = name.split_once('.') {
-                assert!(!operation.contains('.'));
-                assert!(!registry.tools.contains_key(&format!("{group}_{operation}")));
+            if let Some((group, operation)) = name.rsplit_once('.') {
+                assert!(!operation.is_empty());
+                assert!(matches!(
+                    group,
+                    "packages.crate"
+                        | "packages.npm"
+                        | "server"
+                        | "rfc"
+                        | "mdn"
+                        | "whatwg"
+                        | "w3c"
+                        | "chromium"
+                ));
+                assert!(!registry.tools.contains_key(&name.replacen('.', "_", 1)));
             } else {
                 assert!(matches!(name.as_str(), "search" | "fetch"));
             }
+        }
+        let obsolete: Vec<String> =
+            serde_json::from_str(include_str!("../tests/obsolete-package-tool-names.json"))
+                .unwrap();
+        assert_eq!(obsolete.len(), 38);
+        for name in obsolete {
+            assert!(!registry.tools.contains_key(&name));
+            assert!(!registry.tools.contains_key(&name.replacen('.', "_", 1)));
         }
     }
     #[test]

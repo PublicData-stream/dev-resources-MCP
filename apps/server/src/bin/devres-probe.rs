@@ -127,21 +127,14 @@ async fn main() -> Result<(), ServerError> {
             let tools = value["result"]["tools"]
                 .as_array()
                 .ok_or("missing tool list")?;
-            for tool in tools {
-                let name = tool["name"].as_str().ok_or("missing tool name")?;
-                if !matches!(name, "search" | "fetch")
-                    && !name.split_once('.').is_some_and(|(group, operation)| {
-                        [
-                            "server", "audit", "rfc", "crate", "advisory", "mdn", "whatwg", "w3c",
-                            "chromium", "npm",
-                        ]
-                        .contains(&group)
-                            && !operation.is_empty()
-                            && !operation.contains('.')
-                    })
-                {
-                    return Err("unexpected public tool namespace".into());
-                }
+            let expected: Vec<String> =
+                serde_json::from_str(include_str!("../../tests/tool-names.json"))?;
+            let actual = tools
+                .iter()
+                .map(|tool| tool["name"].as_str().ok_or("missing tool name"))
+                .collect::<Result<Vec<_>, _>>()?;
+            if actual != expected {
+                return Err("unexpected public tool inventory".into());
             }
             has_rfc_corpus = value["result"]["tools"]
                 .as_array()
@@ -149,7 +142,7 @@ async fn main() -> Result<(), ServerError> {
             has_crate_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 tools
                     .iter()
-                    .any(|tool| tool["name"] == "crate.corpus_status")
+                    .any(|tool| tool["name"] == "packages.crate.corpus_status")
             });
             has_mdn_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 [
@@ -216,16 +209,16 @@ async fn main() -> Result<(), ServerError> {
             has_advisory_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 tools
                     .iter()
-                    .any(|tool| tool["name"] == "advisory.corpus_status")
+                    .any(|tool| tool["name"] == "packages.crate.advisory_corpus_status")
             });
             has_npm_corpus = value["result"]["tools"].as_array().is_some_and(|tools| {
                 [
-                    "npm.metadata",
-                    "npm.source_read",
-                    "npm.content_search",
-                    "npm.contract_get",
-                    "npm.audit_lockfile",
-                    "npm.corpus_status",
+                    "packages.npm.metadata",
+                    "packages.npm.source_read",
+                    "packages.npm.content_search",
+                    "packages.npm.contract_get",
+                    "packages.npm.audit_lockfile",
+                    "packages.npm.corpus_status",
                 ]
                 .iter()
                 .all(|name| tools.iter().any(|tool| tool["name"] == *name))
@@ -250,12 +243,25 @@ async fn main() -> Result<(), ServerError> {
             }
         }
     }
-    for (id, name) in [
-        (200, "server_info"),
-        (201, "rfc_catalog_search"),
-        (202, "crate_compare"),
-        (203, "rfc.catalog.search"),
-    ] {
+    let obsolete: Vec<String> =
+        serde_json::from_str(include_str!("../../tests/obsolete-package-tool-names.json"))?;
+    let rejected_names = obsolete
+        .iter()
+        .cloned()
+        .chain(obsolete.iter().map(|name| name.replacen('.', "_", 1)))
+        .chain(
+            [
+                "server_info",
+                "rfc_catalog_search",
+                "rfc.catalog.search",
+                "packages.crate.api.search",
+                "packages.npm.advisory.get",
+                "packages.crates.search",
+            ]
+            .map(str::to_owned),
+        );
+    for (index, name) in rejected_names.enumerate() {
+        let id = 200 + index;
         let mut params = json!({"name":name,"arguments":{}});
         if revision == "2026-07-28" {
             params["_meta"] = metadata(revision);
@@ -288,7 +294,7 @@ async fn main() -> Result<(), ServerError> {
         }
     }
     if has_crate_corpus {
-        let mut params = json!({"name":"crate.corpus_status","arguments":{}});
+        let mut params = json!({"name":"packages.crate.corpus_status","arguments":{}});
         if revision == "2026-07-28" {
             params["_meta"] = metadata(revision);
         }
@@ -304,7 +310,7 @@ async fn main() -> Result<(), ServerError> {
         }
     }
     if has_advisory_corpus {
-        let mut params = json!({"name":"advisory.corpus_status","arguments":{}});
+        let mut params = json!({"name":"packages.crate.advisory_corpus_status","arguments":{}});
         if revision == "2026-07-28" {
             params["_meta"] = metadata(revision);
         }
@@ -324,7 +330,7 @@ async fn main() -> Result<(), ServerError> {
                 return Err("invalid explicit advisory fixture snapshot".into());
             }
             let lockfile = "# devres-smoke-private-comment-4d1a8e7c\nversion = 4\n[[package]]\nname = \"example\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-            let mut params = json!({"name":"audit.lockfile","arguments":{"lockfile":lockfile,"advisory_snapshot":&snapshot}});
+            let mut params = json!({"name":"packages.crate.audit_lockfile","arguments":{"lockfile":lockfile,"advisory_snapshot":&snapshot}});
             if revision == "2026-07-28" {
                 params["_meta"] = metadata(revision);
             }
@@ -720,7 +726,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             90,
-            "npm.corpus_status",
+            "packages.npm.corpus_status",
             json!({}),
         )
         .await?;
@@ -738,7 +744,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             91,
-            "npm.versions",
+            "packages.npm.versions",
             json!({"name":"npm-fixture"}),
         )
         .await?;
@@ -752,7 +758,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             92,
-            "npm.document_get",
+            "packages.npm.document_get",
             json!({"name":"npm-fixture","version":"1.0.0","snapshot":snapshot,"path":"README.md"}),
         )
         .await?;
@@ -782,7 +788,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             94,
-            "npm.content_search",
+            "packages.npm.content_search",
             json!({"snapshot":snapshot,"query":"FixtureToken"}),
         )
         .await?;
@@ -795,7 +801,7 @@ async fn main() -> Result<(), ServerError> {
             &budget,
             revision,
             95,
-            "npm.advisory_lookup",
+            "packages.npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         )
         .await?;
@@ -805,7 +811,7 @@ async fn main() -> Result<(), ServerError> {
         let lockfile = serde_json::to_string(
             &json!({"lockfileVersion":3,"name":"PRIVATE_NPM_PROBE_MARKER","packages":{"node_modules/npm-fixture":{"version":"1.0.0"}}}),
         )?;
-        let audit = tool_exchange(&mut send,&mut reader,&budget,revision,96,"npm.audit_lockfile",json!({"lockfile":lockfile,"lockfile_format":"npm","advisory_snapshot":advisory["snapshot"]["id"],"registry_context":{"default":"npmjs"}})).await?;
+        let audit = tool_exchange(&mut send,&mut reader,&budget,revision,96,"packages.npm.audit_lockfile",json!({"lockfile":lockfile,"lockfile_format":"npm","advisory_snapshot":advisory["snapshot"]["id"],"registry_context":{"default":"npmjs"}})).await?;
         if audit["vulnerability_count"] != 1
             || audit.to_string().contains("PRIVATE_NPM_PROBE_MARKER")
         {

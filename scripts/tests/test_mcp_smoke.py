@@ -32,6 +32,44 @@ class ToolInventoryTests(unittest.TestCase):
                 smoke.assert_tool_inventory(invalid)
 
 
+class ObsoleteToolNameTests(unittest.TestCase):
+    def test_all_package_names_and_underscore_variants_are_rejected_in_both_revisions(self):
+        class RejectingClient:
+            def __init__(self):
+                self.calls = []
+
+            def exchange(self, method, params, revision):
+                self.calls.append((method, params["name"], revision))
+                return (400 if revision == smoke.MODERN else 200), {
+                    "error": {"code": -32602, "message": "unknown tool"}}
+
+        client = RejectingClient()
+        for revision in (smoke.MODERN, smoke.LEGACY):
+            smoke.assert_obsolete_tool_names_rejected(client, revision)
+        self.assertEqual(len(smoke.OBSOLETE_PACKAGE_TOOLS), 38)
+        for name in smoke.OBSOLETE_PACKAGE_TOOLS:
+            for rejected in (name, name.replace(".", "_", 1)):
+                for revision in (smoke.MODERN, smoke.LEGACY):
+                    self.assertIn(("tools/call", rejected, revision), client.calls)
+
+    def test_former_name_alias_or_validation_error_cannot_pass_acceptance(self):
+        class AcceptingClient:
+            def exchange(self, _method, _params, _revision):
+                return 200, {"result": {"structuredContent": {}}}
+
+        for revision in (smoke.MODERN, smoke.LEGACY):
+            with self.subTest(revision=revision), self.assertRaises(AssertionError):
+                smoke.assert_obsolete_tool_names_rejected(AcceptingClient(), revision)
+
+        class InvalidArgumentsClient:
+            def exchange(self, _method, _params, revision):
+                return (400 if revision == smoke.MODERN else 200), {
+                    "error": {"code": -32602, "message": "invalid arguments"}}
+
+        with self.assertRaisesRegex(AssertionError, "tool lookup"):
+            smoke.assert_obsolete_tool_names_rejected(InvalidArgumentsClient(), smoke.MODERN)
+
+
 class StoredIdentityTests(unittest.TestCase):
     def test_fresh_storage_identity_requires_tagged_lowercase_blake3(self):
         value = "blake3:" + "a" * 64
@@ -137,21 +175,21 @@ class SyntheticClient:
 
     def tool(self, name, arguments, revision=smoke.MODERN):
         self.calls.append((name, revision))
-        if name != "advisory.corpus_status":
+        if name != "packages.crate.advisory_corpus_status":
             selected = arguments.get("snapshot", arguments.get("advisory_snapshot"))
             if selected != smoke.SYNTHETIC_SNAPSHOT:
                 raise AssertionError("synthetic request did not pin the fixture")
-        if name == "advisory.get":
+        if name == "packages.crate.advisory_get":
             return {"id": smoke.SYNTHETIC_ADVISORY, "snapshot": self.snapshot,
                     "source_url": "https://fixtures.invalid/devres/storage-probe/advisory",
                     "page": {"text": self.text},
                     "resource_uri": f"devres://advisory/rustsec/{smoke.SYNTHETIC_ADVISORY}/{smoke.SYNTHETIC_SNAPSHOT}"}
-        if name == "advisory.catalog_search":
+        if name == "packages.crate.advisory_catalog_search":
             return {"total": 1}
-        if name == "advisory.lookup":
+        if name == "packages.crate.advisory_lookup":
             total = int(arguments["version"] == "1.0.0")
             return {"complete": True, "total": total, "items": [{"id": smoke.SYNTHETIC_ADVISORY}] if total else []}
-        if name == "audit.lockfile":
+        if name == "packages.crate.audit_lockfile":
             self.private_comment_seen |= arguments["lockfile"].startswith("# " + smoke.AUDIT_PRIVACY_MARKER)
             report = {"complete": True, "snapshot": self.snapshot, "package_count": 1,
                       "assessed_count": 1, "unassessed_count": 0, "input_retention": "request_lifetime_only",
@@ -160,7 +198,7 @@ class SyntheticClient:
             if self.leak:
                 report["diagnostic"] = smoke.AUDIT_PRIVACY_MARKER
             return report
-        if name == "advisory.corpus_status":
+        if name == "packages.crate.advisory_corpus_status":
             return {"counts": {"snapshots": 1}}
         raise AssertionError("unexpected synthetic fixture tool")
 
@@ -173,7 +211,7 @@ class SyntheticClient:
         raise AssertionError("unexpected synthetic fixture RPC")
 
     def exchange(self, method, params, revision=smoke.MODERN):
-        if method != "tools/call" or params["name"] != "audit.lockfile":
+        if method != "tools/call" or params["name"] != "packages.crate.audit_lockfile":
             raise AssertionError("unexpected synthetic fixture exchange")
         self.calls.append(("invalid_audit", revision))
         message = smoke.AUDIT_PRIVACY_MARKER if self.leak_invalid else "Invalid Cargo.lock."
@@ -186,7 +224,7 @@ class SyntheticAdvisoryTests(unittest.TestCase):
         client = SyntheticClient()
         smoke.synthetic_advisory(client)
         self.assertTrue(client.private_comment_seen)
-        self.assertEqual({revision for name, revision in client.calls if name == "audit.lockfile"},
+        self.assertEqual({revision for name, revision in client.calls if name == "packages.crate.audit_lockfile"},
                          {smoke.MODERN, smoke.LEGACY})
         self.assertEqual(sum(name == "resources/read" for name, _revision in client.calls), 2)
         self.assertEqual({revision for name, revision in client.calls if name == "invalid_audit"},

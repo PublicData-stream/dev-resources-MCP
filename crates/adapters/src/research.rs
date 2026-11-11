@@ -250,7 +250,7 @@ impl Research {
         if !output.is_object() {
             return Err(Error::integrity("Invalid public tool representation."));
         }
-        if tool.ends_with(".corpus_status") {
+        if tool.ends_with(".corpus_status") || tool == "packages.crate.advisory_corpus_status" {
             output["attribution"] = gate.status().await?;
             return Ok(output);
         }
@@ -258,7 +258,10 @@ impl Research {
             output["attribution"] = json!({"status":"metadata_only","copied_content":false});
             return Ok(output);
         }
-        let attribution = if matches!(tool, "audit.lockfile" | "npm.audit_lockfile") {
+        let attribution = if matches!(
+            tool,
+            "packages.crate.audit_lockfile" | "packages.npm.audit_lockfile"
+        ) {
             self.qualify_audit(tool, &output, gate.as_ref()).await?
         } else {
             gate.qualify(provider, &output).await?
@@ -288,7 +291,7 @@ impl Research {
             })?;
         let mut records = Vec::with_capacity(ids.len());
         for id in ids {
-            let record = if tool == "audit.lockfile" {
+            let record = if tool == "packages.crate.audit_lockfile" {
                 let format = output
                     .pointer("/snapshot/format")
                     .and_then(Value::as_str)
@@ -299,7 +302,7 @@ impl Research {
                         Error::unavailable("Public advisory source storage is unavailable.")
                     })?
                     .call(
-                        "advisory.get",
+                        "packages.crate.advisory_get",
                         json!({"id":id,"snapshot":snapshot,"format":format,"limit":1}),
                     )
                     .await?
@@ -310,7 +313,7 @@ impl Research {
                         Error::unavailable("Public npm advisory source storage is unavailable.")
                     })?
                     .call(
-                        "npm.advisory_get",
+                        "packages.npm.advisory_get",
                         json!({"id":id,"snapshot":snapshot,"limit":1}),
                     )
                     .await?
@@ -320,7 +323,7 @@ impl Research {
         // audit:* is read-only: no matching subset, inventory or report may
         // create persistent targets, repairs, or caller-to-advisory associations.
         gate.qualify(
-            if tool == "audit.lockfile" {
+            if tool == "packages.crate.audit_lockfile" {
                 "audit:rustsec"
             } else {
                 "audit:npm"
@@ -337,7 +340,7 @@ impl Research {
         {
             return self.npm.call(tool, input).await;
         }
-        if tool == "npm.audit_lockfile" {
+        if tool == "packages.npm.audit_lockfile" {
             return crate::npm::audit::audit(
                 input,
                 self.npm_corpus
@@ -420,7 +423,7 @@ impl Research {
                 .crate_corpus
                 .as_ref()
                 .ok_or_else(|| Error::unavailable("Crate corpus storage is not configured."))?;
-            if tool == "crate.corpus_status" {
+            if tool == "packages.crate.corpus_status" {
                 let _: EmptyInput = decode(input)?;
                 return corpus.status().await;
             }
@@ -448,15 +451,19 @@ impl Research {
         match tool {
             "rfc.search" => rfc::search(&self.retrieval, decode(input)?).await,
             "rfc.get" => rfc::get(&self.retrieval, decode(input)?).await,
-            "crate.search" => cargo::search(&self.retrieval, decode(input)?).await,
-            "crate.metadata" => cargo::metadata(&self.retrieval, decode(input)?).await,
-            "crate.source_list" => cargo::source_list(&self.retrieval, decode(input)?).await,
-            "crate.source_read" => cargo::source_read(&self.retrieval, decode(input)?).await,
-            "advisory.lookup" => {
+            "packages.crate.search" => cargo::search(&self.retrieval, decode(input)?).await,
+            "packages.crate.metadata" => cargo::metadata(&self.retrieval, decode(input)?).await,
+            "packages.crate.source_list" => {
+                cargo::source_list(&self.retrieval, decode(input)?).await
+            }
+            "packages.crate.source_read" => {
+                cargo::source_read(&self.retrieval, decode(input)?).await
+            }
+            "packages.crate.advisory_lookup" => {
                 self.advisory_summary_sources(self.advisory.lookup(decode(input)?).await?)
                     .await
             }
-            "audit.lockfile" => self.advisory.audit(decode(input)?).await,
+            "packages.crate.audit_lockfile" => self.advisory.audit(decode(input)?).await,
             "search" => self.search(decode(input)?).await,
             "fetch" => self.fetch(decode(input)?).await,
             _ => Err(Error::not_found("Unknown research tool.")),
@@ -493,7 +500,7 @@ impl Research {
                     .to_owned();
                 let record = research
                     .call(
-                        "advisory.get",
+                        "packages.crate.advisory_get",
                         json!({"id":id,"snapshot":snapshot,"format":format,"limit":1}),
                     )
                     .await?;
@@ -534,7 +541,7 @@ impl Research {
             "npm" => {
                 self.npm
                     .call(
-                        "npm.search",
+                        "packages.npm.search",
                         json!({"query":query,"offset":page.offset,"limit":page.limit}),
                     )
                     .await
@@ -630,7 +637,10 @@ impl Research {
                 .ok_or_else(|| Error::invalid("npm IDs use npm:<name>@<version>."))?;
             return self
                 .npm
-                .call("npm.metadata", json!({"name":name,"version":version}))
+                .call(
+                    "packages.npm.metadata",
+                    json!({"name":name,"version":version}),
+                )
                 .await;
         }
         if let Some(id) = input.id.strip_prefix("chromium:") {
@@ -809,7 +819,10 @@ impl Research {
         if url.host_str() == Some("npm-source") {
             let mut output = self
                 .npm
-                .call("npm.source_read", crate::npm::source_input_from_uri(uri)?)
+                .call(
+                    "packages.npm.source_read",
+                    crate::npm::source_input_from_uri(uri)?,
+                )
                 .await?;
             // The direct adapter historically returned source_read fields here.
             // Retain them while adding the valid MCP resource envelope.
@@ -1131,7 +1144,7 @@ fn metadata_only_discovery(tool: &str, output: &Value) -> bool {
     if copied(output, 0) {
         return false;
     }
-    if matches!(tool, "npm.versions" | "crate.versions") {
+    if matches!(tool, "packages.npm.versions" | "packages.crate.versions") {
         if !output.as_object().is_some_and(|headers| {
             headers
                 .iter()
@@ -1183,7 +1196,12 @@ fn metadata_only_discovery(tool: &str, output: &Value) -> bool {
         || tool.ends_with(".api_search")
         || tool.ends_with(".symbol_search")
         || tool.ends_with(".compat_search")
-        || matches!(tool, "advisory.lookup" | "npm.advisory_lookup"))
+        || matches!(
+            tool,
+            "packages.crate.advisory_lookup"
+                | "packages.crate.advisory_catalog_search"
+                | "packages.npm.advisory_lookup"
+        ))
     {
         return false;
     }
@@ -1273,9 +1291,17 @@ fn audit_advisory_ids(output: &Value) -> Result<Vec<String>> {
 }
 
 fn provider_for_tool(tool: &str) -> &str {
+    if let Some(operation) = tool.strip_prefix("packages.crate.") {
+        return if operation.starts_with("advisory_") || operation == "audit_lockfile" {
+            "rustsec"
+        } else {
+            "crates"
+        };
+    }
+    if tool.starts_with("packages.npm.") {
+        return "npm";
+    }
     match tool.split('.').next().unwrap_or(tool) {
-        "crate" => "crates",
-        "advisory" | "audit" => "rustsec",
         "search" => "mixed",
         provider => provider,
     }
@@ -1441,37 +1467,37 @@ fn schemas() -> Vec<Value> {
         vec!["number"],
     );
     add(
-        "crate.search",
+        "packages.crate.search",
         "Search crates.io packages. Reuse capture for the same bounded upstream result page.",
         json!({"query":text,"offset":offset,"limit":limit,"capture":capture}),
         vec!["query"],
     );
     add(
-        "crate.metadata",
+        "packages.crate.metadata",
         "Inspect an exact crates.io version including dependency declarations, features, yanked state and archive checksum.",
         json!({"name":text,"version":text,"capture":capture}),
         vec!["name", "version"],
     );
     add(
-        "crate.source_list",
+        "packages.crate.source_list",
         "List verified published source archive files. Capture IDs bind the index and archive for stable paging.",
         json!({"name":text,"version":text,"metadata_capture":capture,"archive_capture":capture,"offset":offset,"limit":limit}),
         vec!["name", "version"],
     );
     add(
-        "crate.source_read",
+        "packages.crate.source_read",
         "Read a verified published source file without executing or extracting it. Offsets count UTF-8 bytes.",
         json!({"name":text,"version":text,"path":{"type":"string","minLength":1,"maxLength":4096},"metadata_capture":capture,"archive_capture":capture,"offset":text_offset,"limit":text_limit}),
         vec!["name", "version", "path"],
     );
     add(
-        "advisory.lookup",
+        "packages.crate.advisory_lookup",
         "Match RustSec advisories to a crates.io package/version. Reports stale, withdrawn and informational advisory state explicitly.",
         json!({"name":text,"version":text,"advisory_snapshot":capture,"format":{"enum":["rustsec","osv"],"default":"rustsec"},"offset":offset,"limit":limit}),
         vec!["name", "version"],
     );
     add(
-        "audit.lockfile",
+        "packages.crate.audit_lockfile",
         "Audit supplied Cargo.lock against a captured RustSec database. Input, dependency lists and results remain request-local. Resubmit input and advisory_snapshot for pagination.",
         json!({"lockfile":{"type":"string","minLength":1,"maxLength":1048576},"advisory_snapshot":capture,"format":{"enum":["rustsec","osv"],"default":"rustsec"},"offset":offset,"limit":limit}),
         vec!["lockfile"],
@@ -1496,22 +1522,156 @@ struct EmptyInput {}
 mod attribution_boundary_tests {
     use super::*;
 
+    struct NoRetrieval;
+    #[async_trait::async_trait]
+    impl devres_application::Store for NoRetrieval {
+        async fn latest(&self, _: &str) -> Result<Option<devres_application::Cached>> {
+            Err(Error::integrity(
+                "Qualification must not retrieve source data.",
+            ))
+        }
+        async fn capture(&self, _: &str) -> Result<StoredCapture> {
+            Err(Error::integrity(
+                "Qualification must not retrieve source data.",
+            ))
+        }
+        async fn publish(
+            &self,
+            _: &devres_domain::FetchRequest,
+            _: devres_domain::FetchResponse,
+            _: i64,
+        ) -> Result<StoredCapture> {
+            Err(Error::integrity(
+                "Qualification must not persist request data.",
+            ))
+        }
+        async fn revalidate(
+            &self,
+            _: &str,
+            _: &str,
+            _: devres_domain::Validators,
+            _: i64,
+        ) -> Result<StoredCapture> {
+            Err(Error::integrity(
+                "Qualification must not persist request data.",
+            ))
+        }
+    }
+    #[async_trait::async_trait]
+    impl devres_application::Fetcher for NoRetrieval {
+        async fn fetch(
+            &self,
+            _: &devres_domain::FetchRequest,
+            _: Option<&devres_domain::Validators>,
+        ) -> Result<devres_domain::FetchResponse> {
+            Err(Error::integrity("Qualification must not access providers."))
+        }
+    }
+    #[derive(Default)]
+    struct RecordingGate(std::sync::Mutex<Vec<(String, Value)>>);
+    #[async_trait::async_trait]
+    impl AttributionGate for RecordingGate {
+        async fn qualify(&self, provider: &str, evidence: &Value) -> Result<Value> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((provider.into(), evidence.clone()));
+            Ok(json!({"provider":provider}))
+        }
+        async fn bundle(&self, _: &str, _: usize, _: usize) -> Result<Value> {
+            Err(Error::integrity(
+                "Qualification must not read a notice resource.",
+            ))
+        }
+        async fn status(&self) -> Result<Value> {
+            Ok(json!({"ready":1,"pending":2}))
+        }
+    }
+
+    #[tokio::test]
+    async fn package_qualification_preserves_status_sources_and_request_only_audits() {
+        let gate = Arc::new(RecordingGate::default());
+        let research = Research::new(Arc::new(Retrieval::new(
+            Arc::new(NoRetrieval),
+            Arc::new(NoRetrieval),
+        )))
+        .await
+        .unwrap()
+        .with_attribution_gate(gate.clone());
+        let tool = "packages.crate.advisory_corpus_status";
+        let output = research
+            .qualify_output(tool, provider_for_tool(tool), json!({"rows":3}))
+            .await
+            .unwrap();
+        assert_eq!(output["attribution"], json!({"ready":1,"pending":2}));
+        assert!(gate.0.lock().unwrap().is_empty());
+        for (tool, provider) in [
+            ("packages.crate.document_get", "crates"),
+            ("packages.crate.advisory_get", "rustsec"),
+            ("packages.npm.document_get", "npm"),
+            ("packages.npm.advisory_get", "npm"),
+        ] {
+            let output = research
+                .qualify_output(
+                    tool,
+                    provider_for_tool(tool),
+                    json!({"page":{"text":"public original source"}}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output["attribution"]["provider"], provider);
+        }
+        gate.0.lock().unwrap().clear();
+        for tool in [
+            "packages.crate.audit_lockfile",
+            "packages.npm.audit_lockfile",
+        ] {
+            let private =
+                json!({"findings":[],"entry_count":1,"lockfile":"private-lockfile-marker"});
+            let output = research
+                .qualify_output(tool, provider_for_tool(tool), private)
+                .await
+                .unwrap();
+            assert_eq!(output["attribution"]["status"], "metadata_only");
+            // A copied advisory requires public source reselection. Without its
+            // corpus this must fail, never pass the private report to the gate.
+            let private = json!({"snapshot":{"id":"a".repeat(64)},"findings":[{"package":"private-package-marker","advisory":{"id":"GHSA-2345-6789-cfgh","summary":"public original source"}}]});
+            assert_eq!(
+                research
+                    .qualify_output(tool, provider_for_tool(tool), private)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "unavailable"
+            );
+            assert!(gate.0.lock().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn only_empty_discovery_and_version_facts_bypass_content_qualification() {
         assert!(metadata_only_discovery(
-            "npm.versions",
+            "packages.npm.versions",
             &json!({"items":[{"name":"fixture","version":"1.0.0","description":null,"license":"ISC"}],"total":1})
         ));
         assert!(!metadata_only_discovery(
-            "npm.versions",
+            "packages.npm.versions",
             &json!({"items":[{"name":"fixture","version":"1.0.0","description":"copied upstream prose"}],"total":1})
         ));
         assert!(metadata_only_discovery(
-            "advisory.lookup",
+            "packages.crate.advisory_lookup",
             &json!({"items":[],"total":0,"snapshot":{"id":"public"}})
         ));
         assert!(!metadata_only_discovery(
-            "advisory.lookup",
+            "packages.crate.advisory_lookup",
+            &json!({"items":[{"summary":"copied advisory"}],"total":1})
+        ));
+        assert!(metadata_only_discovery(
+            "packages.crate.advisory_catalog_search",
+            &json!({"items":[],"total":0,"snapshot":{"id":"public"}})
+        ));
+        assert!(!metadata_only_discovery(
+            "packages.crate.advisory_catalog_search",
             &json!({"items":[{"summary":"copied advisory"}],"total":1})
         ));
         assert!(!metadata_only_discovery(
@@ -1519,19 +1679,19 @@ mod attribution_boundary_tests {
             &json!({"items":[],"total":0})
         ));
         assert!(!metadata_only_discovery(
-            "audit.lockfile",
+            "packages.crate.audit_lockfile",
             &json!({"items":[],"total":0})
         ));
         assert!(!metadata_only_discovery(
-            "npm.versions",
+            "packages.npm.versions",
             &json!({"items":[{"name":"fixture","version":"1","unknown_copy":"upstream content"}]})
         ));
         assert!(!metadata_only_discovery(
-            "advisory.lookup",
+            "packages.crate.advisory_lookup",
             &json!({"items":[],"total":0,"snapshot":{"unrecognized_copy":"Original upstream prose"}})
         ));
         assert!(!metadata_only_discovery(
-            "npm.versions",
+            "packages.npm.versions",
             &json!({"items":[{"name":"fixture","version":"1.0.0"}],"snapshot":{"message":"Original upstream prose"}})
         ));
         for row in [
@@ -1540,7 +1700,7 @@ mod attribution_boundary_tests {
             json!({"name":"fixture","version":"1.0.0","dist":{"notice":"copied upstream prose"}}),
         ] {
             assert!(!metadata_only_discovery(
-                "npm.versions",
+                "packages.npm.versions",
                 &json!({"items":[row]})
             ));
         }
@@ -1593,13 +1753,13 @@ mod attribution_boundary_tests {
     #[test]
     fn source_and_fetch_aliases_use_the_same_provider_policy() {
         for (tool, id, provider) in [
-            ("crate.source_read", "crate:itoa@1.0.15", "crates"),
+            ("packages.crate.source_read", "crate:itoa@1.0.15", "crates"),
             ("mdn.get", "mdn:Web/API", "mdn"),
             ("rfc.get", "rfc:9000", "rfc"),
             ("whatwg.get", "whatwg:html", "whatwg"),
             ("w3c.get", "w3c:fixture", "w3c"),
             ("chromium.get", "chromium:src/docs/example.md", "chromium"),
-            ("npm.document_get", "npm:fixture@1.0.0", "npm"),
+            ("packages.npm.document_get", "npm:fixture@1.0.0", "npm"),
         ] {
             assert_eq!(provider_for_tool(tool), provider);
             assert_eq!(provider_for_identifier(id), provider);
@@ -1607,7 +1767,18 @@ mod attribution_boundary_tests {
         assert_eq!(provider_for_resource("source"), "crates");
         assert_eq!(provider_for_resource("npm-source"), "npm");
         assert_eq!(provider_for_resource("advisory"), "rustsec");
-        assert_eq!(provider_for_tool("advisory.get"), "rustsec");
+        for tool in [
+            "packages.crate.advisory_get",
+            "packages.crate.advisory_lookup",
+            "packages.crate.advisory_catalog_search",
+            "packages.crate.advisory_corpus_status",
+            "packages.crate.advisory_history",
+            "packages.crate.advisory_snapshots",
+            "packages.crate.audit_lockfile",
+        ] {
+            assert_eq!(provider_for_tool(tool), "rustsec");
+        }
+        assert_eq!(provider_for_tool("packages.npm.audit_lockfile"), "npm");
         assert_eq!(provider_for_identifier("mdn-compat:api.fetch"), "mdn");
     }
 }

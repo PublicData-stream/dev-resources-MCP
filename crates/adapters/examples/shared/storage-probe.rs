@@ -870,7 +870,7 @@ async fn check_npm(
     let corpus = npm_fixture_corpus(store, root)?;
     let research = devres_adapters::npm::research::NpmResearch::new(corpus.clone());
     let versions = research
-        .call("npm.versions", json!({"name":"npm-fixture"}))
+        .call("packages.npm.versions", json!({"name":"npm-fixture"}))
         .await?;
     if versions["total"] != 2 || versions["items"][0]["version"] != "2.0.0" {
         return Err("npm inventory changed after restart/restore".into());
@@ -878,7 +878,7 @@ async fn check_npm(
     let snapshot = versions["snapshot"]["id"].clone();
     let document = research
         .call(
-            "npm.document_get",
+            "packages.npm.document_get",
             json!({"name":"npm-fixture","version":"1.0.0","path":"README.md","snapshot":snapshot}),
         )
         .await?;
@@ -890,7 +890,7 @@ async fn check_npm(
     }
     let matches = research
         .call(
-            "npm.advisory_lookup",
+            "packages.npm.advisory_lookup",
             json!({"name":"npm-fixture","version":"1.0.0"}),
         )
         .await?;

@@ -495,7 +495,7 @@ async fn inspect_metadata_observations(
         let pin = pins.get(&key).ok_or_else(integrity)?;
         let selected = packages
             .call(
-                "npm.metadata",
+                "packages.npm.metadata",
                 json!({"name":name,"version":version,"capture":pin}),
             )
             .await?;
@@ -503,12 +503,12 @@ async fn inspect_metadata_observations(
         // wall time and are deliberately outside deterministic replay evidence.
         records.push(json!({"name":name,"version":version,"metadata":selected["metadata"],"dist_tags":selected["dist_tags"],"time":selected["time"],"capture":observations[key]}));
     }
-    let search = packages.call("npm.search",json!({"query":SEARCH_QUERY,"limit":3,"capture":pins.get("search:TLS").ok_or_else(integrity)?})).await?;
+    let search = packages.call("packages.npm.search",json!({"query":SEARCH_QUERY,"limit":3,"capture":pins.get("search:TLS").ok_or_else(integrity)?})).await?;
     if offline.0.load(Ordering::SeqCst) != 0 {
         return Err(integrity());
     }
     Ok(
-        json!({"packages":records,"search":{"query":SEARCH_QUERY,"items":search["items"],"total":search["total"],"capture":observations["search:TLS"]},"foreground_tools":["npm.metadata","npm.search"],"inspection_network_attempts":0}),
+        json!({"packages":records,"search":{"query":SEARCH_QUERY,"items":search["items"],"total":search["total"],"capture":observations["search:TLS"]},"foreground_tools":["packages.npm.metadata","packages.npm.search"],"inspection_network_attempts":0}),
     )
 }
 

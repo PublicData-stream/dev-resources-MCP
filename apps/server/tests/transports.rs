@@ -235,28 +235,62 @@ async fn dotted_tools_are_discovered_and_legacy_names_rejected_in_both_http_revi
             .map(|tool| tool["name"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(actual, expected);
-        for name in &expected {
-            if name.contains('.') {
-                let old = name.replacen('.', "_", 1);
-                let rejected = request("tools/call", json!({"name":old,"arguments":{}}))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    rejected.status(),
-                    if revision == "2026-07-28" { 400 } else { 200 }
-                );
-                let value = response_json(rejected).await;
-                assert_eq!(value["error"]["code"], -32602, "{old}");
-                assert_eq!(value["error"]["message"], "unknown tool", "{old}");
-            }
+        let obsolete: Vec<String> =
+            serde_json::from_str(include_str!("obsolete-package-tool-names.json")).unwrap();
+        let rejected_names = obsolete
+            .iter()
+            .cloned()
+            .chain(obsolete.iter().map(|name| name.replacen('.', "_", 1)))
+            .chain(
+                expected
+                    .iter()
+                    .filter(|name| name.contains('.'))
+                    .map(|name| name.replacen('.', "_", 1)),
+            )
+            .chain(
+                [
+                    "packages.crate.api.search",
+                    "packages.npm.advisory.get",
+                    "packages.crates.search",
+                    "rfc.catalog.search",
+                ]
+                .map(str::to_owned),
+            );
+        for old in rejected_names {
+            let rejected = request("tools/call", json!({"name":old,"arguments":{}}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                rejected.status(),
+                if revision == "2026-07-28" { 400 } else { 200 }
+            );
+            let value = response_json(rejected).await;
+            assert_eq!(value["error"]["code"], -32602, "{old}");
+            assert_eq!(value["error"]["message"], "unknown tool", "{old}");
         }
         for (name, arguments) in [
             ("server.info", json!({})),
             ("rfc.catalog_search", json!({})),
             (
-                "crate.compare",
+                "packages.crate.compare",
                 json!({"name":"example","from_version":"1.0.0","to_version":"2.0.0","kind":"metadata"}),
+            ),
+            (
+                "packages.npm.metadata",
+                json!({"name":"example","version":"1.0.0"}),
+            ),
+            (
+                "packages.crate.advisory_lookup",
+                json!({"name":"example","version":"1.0.0"}),
+            ),
+            (
+                "packages.crate.audit_lockfile",
+                json!({"lockfile":"version = 4"}),
+            ),
+            (
+                "packages.npm.audit_lockfile",
+                json!({"lockfile":"{}","lockfile_format":"npm"}),
             ),
         ] {
             let value = response_json(
@@ -516,11 +550,17 @@ async fn native_webtransport_probe_both_revisions_and_origin_rejection() {
     drop(socket);
     let authority = format!("127.0.0.1:{}", bind.port());
     let source = SourceOffer::new("https://source.test/revision").unwrap();
-    let mut builder = ServerBuilder::new(
-        server_info_registry(source.clone()).unwrap(),
-        Limits::default(),
-        source,
-    );
+    let mut registry = server_info_registry(source.clone()).unwrap();
+    // The native probe verifies complete discovery, including corpus status calls.
+    // These schema-backed handlers keep this transport fixture entirely offline.
+    for descriptor in devres_adapters::Research::tool_schemas() {
+        registry
+            .register(descriptor, |_, _| async {
+                Ok(json!({"collection_enabled":false,"counts":{}}))
+            })
+            .unwrap();
+    }
+    let mut builder = ServerBuilder::new(registry, Limits::default(), source);
     builder
         .register_endpoint(WebTransportEndpoint {
             bind,

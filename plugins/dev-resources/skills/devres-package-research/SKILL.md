@@ -5,11 +5,11 @@ description: "Research exact Rust/npm releases, verified sources, documentation,
 
 # Rust and npm package research
 
-Use the connected dev-resources-MCP server for the user's package question.
-Discover available tools and authoritative schemas before calling; hosts may
-prefix names or normalize dots in `crate.source_read` or `npm.contract_get`.
-Call the discovered host identifier rather than mechanically renaming it.
-If the required connection or tools are missing, state that limitation.
+Use the connected dev-resources-MCP server for the user's package question. Discover
+available tools and authoritative schemas before calling; hosts may prefix names or
+normalize dots in `packages.crate.source_read` or `packages.npm.contract_get`. Call the
+discovered host identifier rather than mechanically renaming it. If the required
+connection or tools are missing, state that limitation.
 
 Establish ecosystem, exact package identity and version. For comparisons, establish
 both releases; for Rust API questions, establish the target when ambiguous. Do not
@@ -19,22 +19,21 @@ source inspection, API research or comparison.
 
 Choose tools according to the needed evidence:
 
-- Discover public names using `crate.search` or `npm.search`; use
-  `crate.metadata`/`npm.metadata` for exact-release metadata.
+- Discover public names using `packages.crate.search` or `packages.npm.search`; use
+  `packages.crate.metadata`/`packages.npm.metadata` for exact-release metadata.
 - Inspect verified published files through `*.source_list` and `*.source_read`.
   Carry both `metadata_capture` and `archive_capture` into later calls.
 - Search retained local evidence through `*.catalog_search`, `*.versions`,
   `*.content_search` and `*.document_get`. For Rust API items use
-  `crate.api_search`/`crate.api_get`; for npm contracts use `npm.contract_get`.
+  `packages.crate.api_search`/`packages.crate.api_get`; for npm contracts use `packages.npm.contract_get`.
 - Use `*.dependencies` for declarations and `*.compare` for qualified differences.
 
-Generic `search` defaults to all eight source families, including Cargo and npm.
-Select sources explicitly to narrow discovery; ranking, paging and errors remain
-source-specific.
-Request-driven metadata/source retrieval and local corpus research are distinct:
-fetching a release does not guarantee it appears in the research index. Check
-`crate.corpus_status` or `npm.corpus_status` when missing coverage matters. Empty
-results do not establish that a release, document or API does not exist.
+Generic `search` defaults to all eight source families, including Cargo and npm. Select
+sources explicitly to narrow discovery; ranking, paging and errors remain
+source-specific. Request-driven metadata/source retrieval and local corpus research are
+distinct: fetching a release does not guarantee it appears in the research index. Check
+`packages.crate.corpus_status` or `packages.npm.corpus_status` when missing coverage
+matters. Empty results do not establish that a release, document or API does not exist.
 
 Keep evidence fixed across pages and related reads. Reuse returned snapshot and
 query-bound cursor selections; follow returned `next_offset` for text. Lists

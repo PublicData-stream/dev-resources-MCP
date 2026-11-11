@@ -302,7 +302,7 @@ def main():
             assert info['version']==RELEASE
             assert info['sourceUrl']=='https://github.com/PublicData-stream/dev-resources-MCP/releases/download/'+RELEASE+'/source.tar.gz'
             for provider in ('rfc','crate','mdn','whatwg','w3c','chromium','npm'):
-                name={'crate':'crate.corpus_status','advisory':'advisory.corpus_status'}.get(provider,provider+'.corpus_status')
+                name={'crate':'packages.crate.corpus_status','advisory':'packages.crate.advisory_corpus_status','npm':'packages.npm.corpus_status'}.get(provider,provider+'.corpus_status')
                 assert client.tool(name,{},revision)['collection_enabled'] is False
         result=verify(client,aliases)
         assert result['mdn_retained'] is True

@@ -13,21 +13,21 @@ MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
 MAX_RESPONSE = 8 * 1024 * 1024
 EXPECTED_TOOLS = frozenset("""
-advisory.catalog_search advisory.corpus_status advisory.get advisory.history advisory.lookup
-advisory.snapshots
-audit.lockfile
+packages.crate.advisory_catalog_search packages.crate.advisory_corpus_status packages.crate.advisory_get packages.crate.advisory_history packages.crate.advisory_lookup
+packages.crate.advisory_snapshots
+packages.crate.audit_lockfile
 chromium.catalog_search chromium.compare chromium.corpus_status chromium.get chromium.history
 chromium.references chromium.search chromium.snapshots chromium.symbol_get chromium.symbol_search
-crate.api_get crate.api_search crate.catalog_search crate.compare crate.content_search
-crate.corpus_status crate.dependencies crate.document_get crate.metadata crate.search
-crate.source_list crate.source_read crate.versions
+packages.crate.api_get packages.crate.api_search packages.crate.catalog_search packages.crate.compare packages.crate.content_search
+packages.crate.corpus_status packages.crate.dependencies packages.crate.document_get packages.crate.metadata packages.crate.search
+packages.crate.source_list packages.crate.source_read packages.crate.versions
 fetch
 mdn.browser_get mdn.compat_get mdn.compat_search mdn.corpus_status mdn.get mdn.history mdn.search
 mdn.snapshots
-npm.advisory_catalog_search npm.advisory_get npm.advisory_lookup npm.audit_lockfile
-npm.catalog_search npm.compare npm.content_search npm.contract_get npm.corpus_status
-npm.dependencies npm.document_get npm.history npm.metadata npm.search npm.snapshots npm.source_list
-npm.source_read npm.versions
+packages.npm.advisory_catalog_search packages.npm.advisory_get packages.npm.advisory_lookup packages.npm.audit_lockfile
+packages.npm.catalog_search packages.npm.compare packages.npm.content_search packages.npm.contract_get packages.npm.corpus_status
+packages.npm.dependencies packages.npm.document_get packages.npm.history packages.npm.metadata packages.npm.search packages.npm.snapshots packages.npm.source_list
+packages.npm.source_read packages.npm.versions
 rfc.catalog_search rfc.corpus_status rfc.errata rfc.format_get rfc.fulltext_search rfc.get
 rfc.metadata rfc.search rfc.series_get
 search
@@ -36,6 +36,18 @@ w3c.catalog_search w3c.compare w3c.corpus_status w3c.get w3c.history w3c.referen
 w3c.snapshots w3c.symbol_get w3c.symbol_search
 whatwg.catalog_search whatwg.compare whatwg.corpus_status whatwg.get whatwg.history
 whatwg.references whatwg.search whatwg.snapshots whatwg.symbol_get whatwg.symbol_search
+""".split())
+OBSOLETE_PACKAGE_TOOLS = frozenset("""
+advisory.catalog_search advisory.corpus_status advisory.get advisory.history
+advisory.lookup advisory.snapshots audit.lockfile crate.api_get
+crate.api_search crate.catalog_search crate.compare crate.content_search
+crate.corpus_status crate.dependencies crate.document_get crate.metadata
+crate.search crate.source_list crate.source_read crate.versions
+npm.advisory_catalog_search npm.advisory_get npm.advisory_lookup npm.audit_lockfile
+npm.catalog_search npm.compare npm.content_search npm.contract_get
+npm.corpus_status npm.dependencies npm.document_get npm.history
+npm.metadata npm.search npm.snapshots npm.source_list
+npm.source_read npm.versions
 """.split())
 # Fixed BLAKE3 vectors for storage-probe fixture-ids; no Python hashing dependency.
 SYNTHETIC_MDN_CONTENT = "blake3:ea99837f59ecf2413ea4baaa21a57b8e734546e5510ce47fdabf194d36809918"
@@ -143,6 +155,18 @@ def assert_tool_inventory(tools):
     assert len(tools) == len(names) == 88 and names == EXPECTED_TOOLS, "unexpected public tool inventory"
 
 
+def assert_obsolete_tool_names_rejected(client, revision):
+    rejected_names = (OBSOLETE_PACKAGE_TOOLS
+                      | {name.replace(".", "_", 1) for name in OBSOLETE_PACKAGE_TOOLS}
+                      | {"server_info", "rfc_catalog_search", "rfc.catalog.search",
+                         "packages.crate.api.search", "packages.npm.advisory.get", "packages.crates.search"})
+    for old_name in sorted(rejected_names):
+        code, rejected = client.exchange("tools/call", {"name": old_name, "arguments": {}}, revision)
+        assert code == (400 if revision == MODERN else 200), "unexpected unknown-tool HTTP status"
+        assert rejected.get("error", {}).get("code") == -32602, "obsolete or nested tool name was accepted"
+        assert rejected.get("error", {}).get("message") == "unknown tool", "obsolete name did not fail tool lookup"
+
+
 def smoke(client, negative=True):
     for revision in (MODERN, LEGACY):
         if revision == MODERN:
@@ -153,13 +177,10 @@ def smoke(client, negative=True):
         tools = client.call("tools/list", revision=revision)["tools"]
         assert_tool_inventory(tools)
         if negative:
-            for old_name in ("server_info", "rfc_catalog_search", "crate_compare", "rfc.catalog.search"):
-                code, rejected = client.exchange("tools/call", {"name": old_name, "arguments": {}}, revision)
-                assert code == (400 if revision == MODERN else 200), "unexpected unknown-tool HTTP status"
-                assert rejected.get("error", {}).get("code") == -32602, "obsolete or nested tool name was accepted"
-        npm = client.tool("npm.corpus_status", {}, revision)
+            assert_obsolete_tool_names_rejected(client, revision)
+        npm = client.tool("packages.npm.corpus_status", {}, revision)
         assert isinstance(npm.get("collection_enabled"), bool), "npm collection status missing"
-        code, rejected = client.exchange("tools/call", {"name": "npm.metadata", "arguments": {"name": "fixture", "version": "1.0.0", "url": "https://untrusted.invalid"}}, revision)
+        code, rejected = client.exchange("tools/call", {"name": "packages.npm.metadata", "arguments": {"name": "fixture", "version": "1.0.0", "url": "https://untrusted.invalid"}}, revision)
         assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "npm schema admitted an arbitrary destination"
         whatwg = client.tool("whatwg.corpus_status", {}, revision)
         assert isinstance(whatwg.get("collection_enabled"), bool), "WHATWG collection status missing"
@@ -179,10 +200,10 @@ def smoke(client, negative=True):
         assert mdn_schema.get("additionalProperties") is False and len(mdn_schema.get("oneOf", [])) == 2, "MDN document selector schema missing"
         code, rejected = client.exchange("tools/call", {"name": "mdn.get", "arguments": {"slug": "Web/Fixture", "url": "https://untrusted.invalid"}}, revision)
         assert code == (400 if revision == MODERN else 200) and rejected.get("error", {}).get("code") == -32602, "MDN schema admitted an arbitrary destination"
-        advisories = client.call("tools/call", {"name": "advisory.corpus_status", "arguments": {}}, revision)
+        advisories = client.call("tools/call", {"name": "packages.crate.advisory_corpus_status", "arguments": {}}, revision)
         assert not advisories.get("isError"), "advisory corpus status failed"
         assert isinstance(advisories.get("structuredContent", {}).get("counts"), dict), "missing advisory corpus counts"
-        corpus = client.call("tools/call", {"name": "crate.corpus_status", "arguments": {}}, revision)
+        corpus = client.call("tools/call", {"name": "packages.crate.corpus_status", "arguments": {}}, revision)
         assert not corpus.get("isError"), "crate corpus status failed"
         assert isinstance(corpus.get("structuredContent", {}).get("collection_enabled"), bool)
         info = client.call("tools/call", {"name": "server.info", "arguments": {}}, revision)
@@ -223,30 +244,30 @@ def synthetic_advisory(client):
                 'name = "example"\nversion = "1.0.0"\n'
                 'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
     for revision in (MODERN, LEGACY):
-        detail = client.tool("advisory.get", {"id": SYNTHETIC_ADVISORY, "snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        detail = client.tool("packages.crate.advisory_get", {"id": SYNTHETIC_ADVISORY, "snapshot": SYNTHETIC_SNAPSHOT}, revision)
         assert detail.get("id") == SYNTHETIC_ADVISORY, "wrong synthetic advisory identity"
         assert detail.get("snapshot", {}).get("id") == SYNTHETIC_SNAPSHOT, "synthetic advisory snapshot changed"
         assert detail["snapshot"].get("coverage", {}).get("synthetic") is True, "synthetic evidence lost its fixture label"
         assert detail.get("source_url") == "https://fixtures.invalid/devres/storage-probe/advisory", "synthetic evidence invented upstream provenance"
         text = detail.get("page", {}).get("text", "")
         assert "Synthetic storage-probe advisory" in text, "synthetic advisory body missing"
-        catalog = client.tool("advisory.catalog_search", {"snapshot": SYNTHETIC_SNAPSHOT,
+        catalog = client.tool("packages.crate.advisory_catalog_search", {"snapshot": SYNTHETIC_SNAPSHOT,
                               "filters": {"name": "example", "id": SYNTHETIC_ADVISORY}}, revision)
         assert catalog.get("total") == 1, "synthetic catalog membership changed"
-        lookup = client.tool("advisory.lookup", {"name": "example", "version": "1.0.0",
+        lookup = client.tool("packages.crate.advisory_lookup", {"name": "example", "version": "1.0.0",
                              "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
         assert lookup.get("complete") is True and lookup.get("total") == 1, "synthetic vulnerable version was not matched"
         assert lookup.get("items", [{}])[0].get("id") == SYNTHETIC_ADVISORY, "synthetic lookup matched the wrong advisory"
-        patched = client.tool("advisory.lookup", {"name": "example", "version": "1.0.1",
+        patched = client.tool("packages.crate.advisory_lookup", {"name": "example", "version": "1.0.1",
                               "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
         assert patched.get("complete") is True and patched.get("total") == 0, "synthetic patched version still matched"
-        report = client.tool("audit.lockfile", {"lockfile": lockfile, "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
+        report = client.tool("packages.crate.audit_lockfile", {"lockfile": lockfile, "advisory_snapshot": SYNTHETIC_SNAPSHOT}, revision)
         require_audit(report, detail["snapshot"]["revision"], allow_synthetic=True)
         assert report.get("snapshot", {}).get("id") == SYNTHETIC_SNAPSHOT, "audit changed its pinned synthetic snapshot"
         assert report.get("vulnerability_count") == 1 and report.get("total_findings") == 1, "audit helper did not produce the synthetic finding"
         assert report.get("findings", [{}])[0].get("advisory", {}).get("id") == SYNTHETIC_ADVISORY, "audit helper returned the wrong advisory"
         assert AUDIT_PRIVACY_MARKER not in json.dumps(report), "audit response reflected the private comment"
-        status_code, invalid = client.exchange("tools/call", {"name": "audit.lockfile", "arguments": {
+        status_code, invalid = client.exchange("tools/call", {"name": "packages.crate.audit_lockfile", "arguments": {
                               "lockfile": f"# {AUDIT_PRIVACY_MARKER}\nnot a Cargo.lock",
                               "advisory_snapshot": SYNTHETIC_SNAPSHOT}}, revision)
         # http_status::preserve_invalid_params_status rewrites modern errors;
@@ -265,7 +286,7 @@ def synthetic_advisory(client):
                 result = result.get("structuredContent", result)
             assert result.get("contents", [{}])[0].get("text") == text, "typed advisory content changed"
             assert AUDIT_PRIVACY_MARKER not in json.dumps(result), "advisory resource reflected audit input"
-        status = client.tool("advisory.corpus_status", {}, revision)
+        status = client.tool("packages.crate.advisory_corpus_status", {}, revision)
         assert AUDIT_PRIVACY_MARKER not in json.dumps(status), "advisory status reflected audit input"
 
 
@@ -469,19 +490,19 @@ def require_audit(report, revision, allow_synthetic=False):
 def synthetic_npm(client):
     """Retained package/advisory evidence and request-only audits; no providers."""
     for revision in (MODERN, LEGACY):
-        versions = client.tool("npm.versions", {"name": "npm-fixture"}, revision)
+        versions = client.tool("packages.npm.versions", {"name": "npm-fixture"}, revision)
         assert versions["total"] == 2 and versions["items"][0]["version"] == "2.0.0", "npm fixture inventory changed"
         snapshot = versions["snapshot"]["id"]
         selection = {"name": "npm-fixture", "version": "1.0.0", "snapshot": snapshot}
-        document = client.tool("npm.document_get", {**selection, "path": "README.md"}, revision)
+        document = client.tool("packages.npm.document_get", {**selection, "path": "README.md"}, revision)
         assert "Synthetic npm storage fixture" in document["page"]["text"], "npm fixture document changed"
         resource = client.call("resources/read", {"uri": document["resource_uri"]}, revision)
         assert resource["contents"][0]["text"] == document["page"]["text"], "npm resource lost snapshot binding"
-        found = client.tool("npm.content_search", {"snapshot": snapshot, "query": "FixtureToken"}, revision)
+        found = client.tool("packages.npm.content_search", {"snapshot": snapshot, "query": "FixtureToken"}, revision)
         assert found["total"] > 0, "npm captured content index missing"
-        contracts = client.tool("npm.contract_get", selection, revision)
+        contracts = client.tool("packages.npm.contract_get", selection, revision)
         assert "index.d.ts" in json.dumps(contracts), "npm published types contract missing"
-        advisory = client.tool("npm.advisory_lookup", {"name": "npm-fixture", "version": "1.0.0"}, revision)
+        advisory = client.tool("packages.npm.advisory_lookup", {"name": "npm-fixture", "version": "1.0.0"}, revision)
         assert advisory["total"] == 1, "npm public advisory fixture missing"
         advisory_snapshot = advisory["snapshot"]["id"]
         for format_name, text in (
@@ -490,11 +511,11 @@ def synthetic_npm(client):
             ("yarn_classic", '# yarn lockfile v1\n\nnpm-fixture@^1:\n  version "1.0.0"\n'),
             ("yarn_berry", '__metadata:\n  version: 10\n\n"npm-fixture@npm:^1":\n  version: 1.0.0\n  resolution: "npm-fixture@npm:1.0.0"\n'),
         ):
-            report = client.tool("npm.audit_lockfile", {"lockfile": text, "lockfile_format": format_name,
+            report = client.tool("packages.npm.audit_lockfile", {"lockfile": text, "lockfile_format": format_name,
                 "advisory_snapshot": advisory_snapshot, "registry_context": {"default": "npmjs"}}, revision)
             assert report["vulnerability_count"] == 1 and report["input_retention"] == "request_lifetime_only", "npm isolated fixture assessment failed"
             assert AUDIT_PRIVACY_MARKER not in json.dumps(report), "npm audit reflected private metadata"
-        code, rejected = client.exchange("tools/call", {"name": "npm.audit_lockfile", "arguments": {
+        code, rejected = client.exchange("tools/call", {"name": "packages.npm.audit_lockfile", "arguments": {
             "lockfile": AUDIT_PRIVACY_MARKER, "lockfile_format": "npm", "advisory_snapshot": advisory_snapshot}}, revision)
         assert code == (400 if revision == MODERN else 200), "malformed npm input changed its HTTP error mapping"
         assert isinstance(rejected, dict) and rejected.get("error", {}).get("code") == -32602, "malformed npm input did not return sanitized invalid params"
@@ -508,7 +529,7 @@ def live(client, rfc_text_only=False):
     signal.alarm(300)
     status = client.tool("rfc.corpus_status", {})
     assert status.get("collection_enabled") is False, "bounded live smoke requires paused automatic RFC collection"
-    assert client.tool("crate.corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused crate collection"
+    assert client.tool("packages.crate.corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused crate collection"
     assert client.tool("mdn.corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused MDN collection"
     assert client.tool("w3c.corpus_status", {}).get("collection_enabled") is False, "bounded live smoke requires paused W3C collection"
     rfc_search = client.tool("rfc.search", {"query": "QUIC", "offset": 0, "limit": 3})
@@ -532,26 +553,26 @@ def live(client, rfc_text_only=False):
     assert errata_rfc.get("capture", {}).get("source_url") == "https://www.rfc-editor.org/api/v1/errata.json"
     fulltext_rfc = client.tool("rfc.fulltext_search", {"query": "multiplexed", "limit": 3})
     assert fulltext_rfc.get("snapshot") and any(item.get("number") == 9000 for item in fulltext_rfc.get("items", [])), "fixed RFC text did not enter the partial search snapshot"
-    crate_search = client.tool("crate.search", {"query": "itoa", "offset": 0, "limit": 3})
+    crate_search = client.tool("packages.crate.search", {"query": "itoa", "offset": 0, "limit": 3})
     assert crate_search.get("items") and crate_search.get("total", 0) > 0, "crate discovery returned no packages"
-    metadata = client.tool("crate.metadata", {"name": "itoa", "version": "1.0.15"})
+    metadata = client.tool("packages.crate.metadata", {"name": "itoa", "version": "1.0.15"})
     assert metadata.get("id") == "crate:itoa@1.0.15"
     assert metadata.get("metadata", {}).get("name") == "itoa" and metadata["metadata"].get("vers") == "1.0.15", "wrong published package version"
     checksum = metadata["metadata"].get("cksum", "")
     assert len(checksum) == 64 and all(char in "0123456789abcdef" for char in checksum), "missing published archive checksum"
-    listing = client.tool("crate.source_list", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
+    listing = client.tool("packages.crate.source_list", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
     assert listing.get("checksum_verified") is True, "published SHA256 archive checksum was not verified"
     archive = listing.get("archive_capture", {})
     require_blake3(archive.get("id"), "archive capture")
     require_blake3(archive.get("body_hash"), "archive body digest")
     assert any(item.get("path") == "src/lib.rs" for item in listing.get("files", [])), "published source listing lacks the selected member"
-    source = client.tool("crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
+    source = client.tool("packages.crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
                                                "offset": 0, "limit": 1024})
     assert source.get("path") == "src/lib.rs" and source.get("page", {}).get("text"), "source member was not retrieved"
     assert source.get("checksum_verified") is True, "published SHA256 archive checksum was not verified"
     assert source.get("archive_capture") == archive, "source listing and selected member changed archive evidence"
     assert source.get("metadata_capture", {}).get("id") == metadata.get("capture", {}).get("id"), "source projection changed its metadata capture"
-    pinned = client.tool("crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
+    pinned = client.tool("packages.crate.source_read", {"name": "itoa", "version": "1.0.15", "path": "src/lib.rs",
                          "metadata_capture": source["metadata_capture"]["id"],
                          "archive_capture": source["archive_capture"]["id"], "offset": 0, "limit": 1024})
     assert pinned == source, "capture-fixed source changed"
@@ -562,11 +583,11 @@ def live(client, rfc_text_only=False):
             assert not value.get("isError"), "pinned source fetch failed"
             value = value.get("structuredContent", value)
         assert value.get("contents", [{}])[0].get("text") == source["page"]["text"], "source resource content changed"
-    lookup = client.tool("advisory.lookup", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
+    lookup = client.tool("packages.crate.advisory_lookup", {"name": "itoa", "version": "1.0.15", "offset": 0, "limit": 20})
     revision = require_snapshot(lookup)
     lockfile = ('version = 4\n[[package]]\nname = "itoa"\nversion = "1.0.15"\n'
                 'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
-    audit = client.tool("audit.lockfile", {"lockfile": lockfile, "offset": 0, "limit": 20})
+    audit = client.tool("packages.crate.audit_lockfile", {"lockfile": lockfile, "offset": 0, "limit": 20})
     require_audit(audit, revision)
     # A repeated fetch proves the public API still resolves the same record; request
     # counters/storage tests separately establish zero upstream calls for warm hits.

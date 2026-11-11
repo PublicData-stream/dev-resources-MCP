@@ -6,17 +6,17 @@ description: "Assess Cargo/npm/pnpm/Yarn lockfiles and RustSec or npm OSV adviso
 # Lockfile and advisory assessment
 
 Use the connected dev-resources-MCP server to assess the supplied lockfile or
-investigate a public advisory. Discover available tools and schemas; hosts may
-prefix names or normalize dots in `audit.lockfile` or `npm.audit_lockfile`.
-Call the discovered host identifier rather than mechanically renaming it.
-If the server or required tools are unavailable, report that limitation. Do not
-substitute an external audit service.
+investigate a public advisory. Discover available tools and schemas; hosts may prefix
+names or normalize dots in `packages.crate.audit_lockfile` or
+`packages.npm.audit_lockfile`. Call the discovered host identifier rather than
+mechanically renaming it. If the server or required tools are unavailable, report that
+limitation. Do not substitute an external audit service.
 
-Identify the ecosystem and lockfile format from the supplied artifact. Ask for
-missing input that affects interpretation. Use `audit.lockfile` for Cargo.lock;
-use `npm.audit_lockfile` with explicit `lockfile_format` for npm, pnpm and Yarn.
-Read [formats and advisory selection](references/assessment.md) before auditing
-or selecting historical/alternative advisory evidence.
+Identify the ecosystem and lockfile format from the supplied artifact. Ask for missing
+input that affects interpretation. Use `packages.crate.audit_lockfile` for Cargo.lock;
+use `packages.npm.audit_lockfile` with explicit `lockfile_format` for npm, pnpm and
+Yarn. Read [formats and advisory selection](references/assessment.md) before auditing or
+selecting historical/alternative advisory evidence.
 
 Pass lockfile contents only to the appropriate MCP audit tool. Keep request
 arguments out of shell command lines, client logs, fixtures, issue comments and
@@ -42,13 +42,14 @@ project is secure. Stale/historical evidence, unsupported identities and patched
 artifacts can make an assessment incomplete even when some matches are available.
 Do not infer installed runtime reachability from a lockfile inventory.
 
-For public advisory detail use `advisory.lookup`, `advisory.get`,
-`advisory.catalog_search` and history/snapshot tools for Rust; use
-`npm.advisory_lookup`, `npm.advisory_get` and `npm.advisory_catalog_search` for npm.
-Cite returned public advisory source URLs and immutable evidence, preserving
-notices. If necessary, supplement advisory explanations with official public
-sources and label the fallback separately; never transmit the lockfile, private
-dependency inventory or audit report to those sources.
+For public advisory detail use `packages.crate.advisory_lookup`,
+`packages.crate.advisory_get`, `packages.crate.advisory_catalog_search` and
+history/snapshot tools for Rust; use `packages.npm.advisory_lookup`,
+`packages.npm.advisory_get` and `packages.npm.advisory_catalog_search` for npm. Cite
+returned public advisory source URLs and immutable evidence, preserving notices. If
+necessary, supplement advisory explanations with official public sources and label the
+fallback separately; never transmit the lockfile, private dependency inventory or audit
+report to those sources.
 
 Explain typed input, unavailable, capacity or integrity failures without echoing
 private source text. Do not retry indefinitely, silently change snapshots or

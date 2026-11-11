@@ -95,16 +95,23 @@ drain; SIGINT/SIGTERM stop admission and perform bounded shutdown.
 
 ## Tools
 
-Tools use one dot between the group and operation: `rfc.catalog_search`,
-`crate.compare`, `server.info`, `audit.lockfile`, and `npm.audit_lockfile`.
-Remaining underscores belong to the operation name. Generic `search` and `fetch`
-keep their names. Both transports and supported MCP revisions expose this same set.
+Package registry tools use `packages.<registry>.<operation>`, with `crate` for crates.io
+and its RustSec research/audits, and `npm` for public npm packages and npm/pnpm/Yarn
+audits. Examples are `packages.crate.versions`, `packages.npm.search`,
+`packages.crate.advisory_lookup`, and `packages.crate.audit_lockfile`. Other groups
+retain `group.operation` names such as `rfc.catalog_search` and `server.info`.
+Underscores belong to the operation name. Generic `search` and `fetch` keep their names.
+Both transports and supported MCP revisions expose this same set of 88 tools.
 
-This is a breaking rename of the former underscore names: replace only their first
-underscore with a dot. Old names are neither advertised nor callable; clients must
-refresh discovery and update saved calls. Restart pagination when upgrading because
-tool-bound cursor fingerprints change. Captures, snapshots and immutable resource
-references remain valid.
+This is a breaking rename: `crate.<operation>` and `npm.<operation>` gain the
+`packages.` prefix, `advisory.<operation>` becomes
+`packages.crate.advisory_<operation>`, and `audit.lockfile` becomes
+`packages.crate.audit_lockfile`. Former dotted names and their earlier underscore
+variants are neither advertised nor callable. Clients must refresh discovery, update
+saved calls, and restart pagination when upgrading because tool-bound cursor
+fingerprints change. Captures, snapshots and immutable resource references remain valid.
+Source selectors, fetch identifiers and configuration retain their existing names and
+behavior.
 
 | Tool | Inputs and result |
 | --- | --- |
@@ -120,26 +127,26 @@ references remain valid.
 | `rfc.errata` | RFC number, optional status/type and snapshot; original errata records |
 | `rfc.series_get` | STD/BCP/FYI number and snapshot; constituent RFC metadata |
 | `rfc.corpus_status` | Aggregate collection, freshness, failures and snapshot coverage; no administrative controls |
-| `crate.search` | Query and page; bounded upstream crate search |
-| `crate.metadata` | Exact crate name/version; dependency declarations, features, yanked state, checksum |
-| `crate.source_list` | Exact crate version; verified source file listing |
-| `crate.source_read` | Exact crate version and archive-relative file path; UTF-8 text page |
-| `crate.versions` | Captured exact versions for a crate in semantic-version order; snapshot paging |
-| `crate.catalog_search` | Local version metadata and conjunctive license/keyword/category/MSRV/yanked filters |
-| `crate.document_get` | Exact captured source, manifest, README, license or rustdoc text; bounded byte page |
-| `crate.dependencies` | Forward declarations or reverse package-name references; no constraint solving |
-| `crate.compare` | Metadata/dependency changes, qualified text/API release changes, or an exact public path |
-| `crate.content_search` | Local source and documentation search with snapshot-wide BM25 |
-| `crate.api_search` | Observed rustdoc API items across captured versions and targets |
-| `crate.api_get` | Exact public path, normalized signature, relationships and capture provenance |
-| `crate.corpus_status` | Aggregate acquisition, processing, storage and snapshot coverage; no public controls |
-| `advisory.lookup` | Crate/version; matched advisories, withdrawals and informational state |
-| `audit.lockfile` | Supplied Cargo.lock text; supported matches, unassessed entries, completeness/freshness |
-| `advisory.get` | Canonical advisory ID, representation and optional snapshot; structured metadata and original source byte page |
-| `advisory.catalog_search` | Local query, conjunctive metadata/platform filters, representation and snapshot/cursor paging |
-| `advisory.history` | Canonical ID, optional exact Git ref and frozen history view; parent-relative changes |
-| `advisory.snapshots` | Paginated immutable ref observations or commit snapshots; optional exact ref/representation |
-| `advisory.corpus_status` | Aggregate collection, freshness, parsing, storage and history coverage; no administrative controls |
+| `packages.crate.search` | Query and page; bounded upstream crate search |
+| `packages.crate.metadata` | Exact crate name/version; dependency declarations, features, yanked state, checksum |
+| `packages.crate.source_list` | Exact crate version; verified source file listing |
+| `packages.crate.source_read` | Exact crate version and archive-relative file path; UTF-8 text page |
+| `packages.crate.versions` | Captured exact versions for a crate in semantic-version order; snapshot paging |
+| `packages.crate.catalog_search` | Local version metadata and conjunctive license/keyword/category/MSRV/yanked filters |
+| `packages.crate.document_get` | Exact captured source, manifest, README, license or rustdoc text; bounded byte page |
+| `packages.crate.dependencies` | Forward declarations or reverse package-name references; no constraint solving |
+| `packages.crate.compare` | Metadata/dependency changes, qualified text/API release changes, or an exact public path |
+| `packages.crate.content_search` | Local source and documentation search with snapshot-wide BM25 |
+| `packages.crate.api_search` | Observed rustdoc API items across captured versions and targets |
+| `packages.crate.api_get` | Exact public path, normalized signature, relationships and capture provenance |
+| `packages.crate.corpus_status` | Aggregate acquisition, processing, storage and snapshot coverage; no public controls |
+| `packages.crate.advisory_lookup` | Crate/version; matched advisories, withdrawals and informational state |
+| `packages.crate.audit_lockfile` | Supplied Cargo.lock text; supported matches, unassessed entries, completeness/freshness |
+| `packages.crate.advisory_get` | Canonical advisory ID, representation and optional snapshot; structured metadata and original source byte page |
+| `packages.crate.advisory_catalog_search` | Local query, conjunctive metadata/platform filters, representation and snapshot/cursor paging |
+| `packages.crate.advisory_history` | Canonical ID, optional exact Git ref and frozen history view; parent-relative changes |
+| `packages.crate.advisory_snapshots` | Paginated immutable ref observations or commit snapshots; optional exact ref/representation |
+| `packages.crate.advisory_corpus_status` | Aggregate collection, freshness, parsing, storage and history coverage; no administrative controls |
 | `mdn.search` | Local English document search, conjunctive metadata filters, technical/English query mode and pinned cursor |
 | `mdn.get` | Exactly one slug or repository path; projected text, original source or bytes, optional immutable snapshot and explicit compatibility snapshot |
 | `mdn.compat_search` | Local compatibility feature search with browser/status filters and pinned cursor |
@@ -220,10 +227,10 @@ Explicit historical snapshots remain fixed evidence. Defaults whose inventory ha
 not been validated within seven days are unavailable;
 historical selection does not imply current freshness.
 
-`crate.corpus_status` exposes `pending_inventory` as an inventory object or null.
-Its cursor marks the last durably staged record or coverage gap, including oversized
-registry entries. Pending data is not visible to research until publication; the
-checkpoint is not a completion percentage. Published `inventory` and `snapshot`
+`packages.crate.corpus_status` exposes `pending_inventory` as an inventory object or
+null. Its cursor marks the last durably staged record or coverage gap, including
+oversized registry entries. Pending data is not visible to research until publication;
+the checkpoint is not a completion percentage. Published `inventory` and `snapshot`
 remain separate states.
 
 Research defaults to all captured versions. List pages default to 20 and cap at 100;
