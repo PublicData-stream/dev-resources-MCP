@@ -477,3 +477,69 @@ No actual production non-null version was tested, and no overall production
 receipt or runtime Secret was emitted. Runtime rotation,
 multipart acceptance under the reduced IAM policy and public activation remain
 separate gates. PostgreSQL remains ready; writer/backend remain stopped.
+
+## Current storage admission on 2026-11-11
+
+The user retained the permanent-deletion prohibition. The writer IAM rule was
+restored to its previously reviewed four permission sets so multipart abort works;
+the bucket allowlist still omits ordinary and version deletion. No serving grant,
+source-IP condition, project scope or bucket-policy statement was broadened.
+
+A fresh 35-request trial used the actual operating reader/writer pairs. It proved
+read/list, reader mutation rejection, conditional-write collision handling,
+17 MiB multipart completion and abort, ordinary deletion rejection, and both
+roles' out-of-prefix read/list rejection. Its two exact disposable objects were
+removed through 14 administrative requests after ownership checks. The final
+prefix and multipart inventories were empty. Trial result SHA-256 is
+`25ff56da90380c6beb2faa70da3dec9609507b0db25a2487dbc2688ebe0e3c03`;
+cleanup result SHA-256 is
+`41d900d568c5fc29df0aac87fca34b80265d1748fcc6c013b35cde395477d492`.
+
+Both apps rejected a same-value PATCH of a known existing policy with native
+HTTP 403 `permissions_denied`. Four administrative GETs confirmed the complete
+policy/rule metadata stayed unchanged. This representative mutation rejection
+and the complete effective-permission review support the administration gate;
+the earlier absent-resource HTTP 404 remains inconclusive. The verified PATCH
+receipt SHA-256 is
+`391d36e7f11c0adaac2d1ad55c7a8e53d38c55e84ab8795c7043e05f97fa4eef`.
+
+The dedicated project contains only the archive bucket. Current project-scoped
+IAM and fresh prefix denials combine with the dated cross-project canary evidence
+for the finite other-bucket boundary. This is not a guarantee about future
+unmanaged buckets. IAM, bucket-policy or credential changes invalidate the
+admission assumptions. Permanent-version deletion admission preserves the earlier
+actual versioned-canary evidence and explicitly reviews equivalent current rules;
+no non-null version was created in the unversioned production bucket.
+
+The separately approved two-key continuation then completed against the retained
+isolated PostgreSQL/archive. Each temporary SDK role started once. Phase 1 was
+preserved, only phase 2 was published, final process identities stayed unchanged
+across revocation, and cold readers recovered both captures before and after
+revocation. IAM confirmed both trial keys absent at least 751 seconds before
+expiry; their actual S3 GET/list denials occurred at least 719 seconds before
+expiry. This proves explicit revocation rather than natural expiry. It is
+synthetic SDK evidence, separate from production writer-RPC delegation.
+
+The continuation has 51 explicit native requests plus 19 carried requests. Ten
+new control responses retain native request IDs; 41 inherited observer records
+retain status/body hashes without request IDs. Original failed attempts remain
+preserved. All owned continuation containers and its exact empty private network
+were removed. The final nine objects, including integrity sidecars and bindings,
+totalled 1,557 bytes. Exact cleanup used 42 calls, or 52 of the 64-call ceiling
+including all preflight reads, with no uncertain response. The prefix and upload
+inventory were empty, and the revoked trial credential copies were removed.
+Runtime completion SHA-256 is
+`bb62a65d19ae3af17ac2d3286fd70c1d958b197ee0ca7288bf7f1c695090b636`;
+exact-cleanup completion SHA-256 is
+`2c1fd1d9b2cf06f769af6091055f55c1ae1bd6a6726b154a944c83ab9ec63126`.
+
+After cleanup, ten fresh IAM reads and six S3 metadata reads matched the preceding
+identity, full effective IAM, bucket state and binding. A separate server-only
+calculation confirmed the actual operating files still match that binding.
+Independent method and actual-evidence reviews closed all eight storage checks.
+The admitted receipt SHA-256 is
+`c63b888a5e7a39f2c2be0e8f03a613a37e96e783c8febd45919108eb057d79c2`;
+the final metadata snapshot SHA-256 is
+`3cd2f9f7918c4320d4a7dfa8d23c47fc57cf3106b4349ef55fd8112337a90bb2`.
+This storage receipt alone does not establish public transport, attribution,
+collector activation or complete production readiness.
