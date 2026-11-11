@@ -38,6 +38,12 @@ reuse_port = true
 [quic.downstream.transport]
 idle_timeout_ms = 210000
 keep_alive_interval_ms = 15000
+gso = false
+initial_mtu = 1200
+min_mtu = 1200
+max_udp_payload_size = 1200
+[quic.downstream.transport.mtu_discovery]
+enabled = false
 [quic.upstream.transport]
 idle_timeout_ms = 210000
 keep_alive_interval_ms = 15000
