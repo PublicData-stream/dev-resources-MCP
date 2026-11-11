@@ -1294,3 +1294,6 @@ separate evidence, and keep unresolved source-coverage gaps explicit. Local
 fixtures, minikube, fixed live comparisons, hosted native architecture CI and
 production activation are separate claims. This probe changes no production
 workload and performs no full-corpus acceptance.
+
+See the [implementation verification record](html-transport-evidence.md) for the
+bounded 2026-11-11 comparison and its unresolved production boundary.
