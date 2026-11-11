@@ -1159,6 +1159,10 @@ with state.locked():
 
 class AttributionQualifierTests(unittest.TestCase):
     def setUp(self):
+        # Exercise the historical operation without extending its real deadline.
+        wall_clock = patch.object(upgrade.time, 'time', return_value=upgrade.SUPERSESSION_DEADLINE - 3600)
+        wall_clock.start()
+        self.addCleanup(wall_clock.stop)
         self.helper = UpgradeTests()
         self.helper.setUp()
         self.addCleanup(self.helper.doCleanups)
@@ -1274,6 +1278,18 @@ class AttributionQualifierTests(unittest.TestCase):
         self.assertIn('--network', creates[0])
         self.assertNotIn('/etc/devres/tls', ' '.join(creates[0]))
 
+    def test_expiry_refuses_before_attribution_attempt_or_container_creation(self):
+        before = (self.u.root / 'state.json').read_bytes()
+        for now in (upgrade.SUPERSESSION_DEADLINE, upgrade.SUPERSESSION_DEADLINE + 1):
+            with self.subTest(now=now), patch.object(upgrade.time, 'time', return_value=now):
+                with self.assertRaisesRegex(upgrade.UpgradeError, 'upgrade_deadline_exceeded'):
+                    self.u.qualify_attribution(self.drill)
+                self.assertEqual((self.u.root / 'state.json').read_bytes(), before)
+                self.assertIsNone(self.u.record.get('attribution_attempt'))
+                self.assertIsNone(self.u.record.get('attribution_receipt'))
+                self.assertIsNone(self.container)
+                self.assertFalse(self.commands)
+
     def test_create_response_loss_cannot_restart_or_issue_a_new_request_budget(self):
         self.create_failure = True
         with self.assertRaisesRegex(upgrade.UpgradeError, 'create_response_lost'):
@@ -1334,6 +1350,10 @@ class AttributionQualifierTests(unittest.TestCase):
 
 class SupersessionTests(unittest.TestCase):
     def setUp(self):
+        # Keep real monotonic waits and process identities around this fixed wall clock.
+        wall_clock = patch.object(upgrade.time, 'time', return_value=upgrade.SUPERSESSION_DEADLINE - 3600)
+        wall_clock.start()
+        self.addCleanup(wall_clock.stop)
         self.helper = UpgradeTests()
         self.helper.setUp()
         self.addCleanup(self.helper.doCleanups)
@@ -1584,9 +1604,14 @@ path.write_text(json.dumps(value,sort_keys=True)+'\n');print('locked',flush=True
             lifecycle.eligible(record)
 
     def test_expiry_and_wrong_image_fail_before_any_driver_or_container_signal(self):
-        with patch.object(upgrade.time, 'time', return_value=upgrade.SUPERSESSION_DEADLINE):
-            with self.assertRaisesRegex(upgrade.UpgradeError, 'direct_owner_required'):
-                self.supersede()
+        calls_before = list(self.calls)
+        for now in (upgrade.SUPERSESSION_DEADLINE, upgrade.SUPERSESSION_DEADLINE + 1):
+            with self.subTest(now=now), patch.object(upgrade.time, 'time', return_value=now):
+                with self.assertRaisesRegex(upgrade.UpgradeError, 'direct_owner_required'):
+                    self.supersede()
+                self.assertEqual((self.u.root / 'state.json').read_bytes(), self.before)
+                self.assertEqual(self.calls, calls_before)
+                self.assertIsNone(self.driver.poll())
         self.containers['a' * 64]['Config']['Image'] = 'unreviewed:image'
         with self.assertRaisesRegex(upgrade.UpgradeError, 'container_image_changed'):
             self.supersede()
