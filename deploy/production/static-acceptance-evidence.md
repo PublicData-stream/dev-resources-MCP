@@ -1,4 +1,4 @@
-# Static authentication preparation
+# Static authentication deployment
 
 Checkpoint recorded on 2026-11-10 for `0.1.0-build.a938112b`. This supersedes the
 target release and authentication choice in the [earlier checkpoint](acceptance-evidence.md),
@@ -543,3 +543,142 @@ the final metadata snapshot SHA-256 is
 `3cd2f9f7918c4320d4a7dfa8d23c47fc57cf3106b4349ef55fd8112337a90bb2`.
 This storage receipt alone does not establish public transport, attribution,
 collector activation or complete production readiness.
+
+## Public deployment and operational acceptance on 2026-11-11
+
+The immutable `0.1.0-build.a938112b` server image was deployed with
+static reader/writer credentials and schema 13. The matching released probe was
+used for qualification. The existing PostgreSQL system
+identifier, archive binding/epoch and permanent captures were preserved. The
+broker is not part of this static runtime. The public endpoints are
+`https://dev-resources.mcp.publicdata.stream/mcp` and
+`https://dev-resources.mcp.publicdata.stream/mcp-wt/v1`.
+
+Real operating-pair storage admission above was followed by authenticated private
+and public acceptance. The actual `devres_reader` connection proved SELECT-only
+permissions, no writer membership and read-only default; attempted no-op writes
+failed with SQLSTATE 25006 and 42501 in rolled-back transactions. Both private
+HTTP protocol revisions exposed the exact 88-tool inventory through mTLS. Missing
+or wrong client certificates and missing/invalid writer authorization were denied.
+The deployed serving Secret matched the probed reader pair, while the writer S3
+Secret was absent from the backend mounts. A bounded second writer process was
+refused by the existing single-writer fence; the original owner and workloads
+remained unchanged throughout that test.
+
+One actual foreground RFC 9000 text acquisition delegated through the writer and
+published a permanent capture. An authenticated reader S3 GET returned its
+403,442 bytes in ONEZONE_IA with the exact qualified source digest. The initial
+public read remained unavailable while all collectors were disabled because
+required attribution work could not be claimed. The receipt admitted actual
+writer publication and S3 readback only; it did not relabel this withheld content
+as a successful public read.
+
+### IPv6 WebTransport and edge isolation
+
+Unmodified released probes initially reproduced intermittent incomplete IPv6
+WebTransport `tools/list` frames on both native KVM and rootless Docker paths.
+The TLS handshake itself passed. A bounded diagnostic preserved those failures;
+a conservative 1200-byte packetization trial passed. This supported mitigation,
+without proving a particular kernel, GSO or MTU cause.
+
+For this transport mitigation, the tracked deployment change sets downstream
+QUIC GSO off, initial/minimum MTU and maximum UDP payload to 1200, and MTU discovery off in
+[the edge TLS profile](edge-conf/10-tls.toml). Upstream transport, timeouts, TLS,
+authorization and private boundaries were preserved. The pinned edge binary
+accepted the entire configuration natively before one guarded edge-only recreation.
+The installed and live profile SHA-256 is
+`99babcd17bef83cb21d96fb2e13fbe8b96bc4e1d5c638939ff9dc719f2706c97`.
+The fix received independent source, native-prepare and applied-state review.
+
+After application, the unmodified released client passed WebTransport discovery,
+full tool listing and identity on IPv4 and IPv6 for 2025-11-25 and 2026-07-28.
+Both formerly failing rootless IPv6 cases also passed. Full public HTTP smoke and
+negative cases passed for both families and protocol revisions with 88 tools.
+Old failure records remain retained. This is bounded deployment acceptance, not
+proof about every client network or packetization mechanism.
+
+Public clients could not obtain private NodePort, PostgreSQL, writer or health
+protocol responses. Bare TCP connection establishment through the local KVM's
+intermediate gateway was inconclusive and was not counted as direct reachability.
+Protocol negatives, actual host listeners and the existing pre-DNAT host guard
+were checked together. After the edge recreation, its own backend NodePort
+positive control passed and direct Pod/CNI private-service attempts remained
+blocked. The earlier real boot-guard receipt retained six refused daemon starts
+and successful recovery; the protected boot settings were unchanged.
+
+### Certificates, activation and representative licensed read
+
+One real certificate renewal retained the original key and SANs. External
+verified TCP and QUIC readbacks over IPv4 and IPv6 all observed the new leaf
+while the same edge process remained running. The normal renewal configuration
+was restored unchanged. This actual hot-reload proof predates the later,
+intentional transport-only recreation. Certificate and capacity timers remained
+active.
+
+Independent integrated review closed all 12 edge admission checks. The unchanged
+frozen operator then admitted real source, storage and edge receipts and enabled
+all eight normal collectors at 2026-11-11T06:49:38Z. It stopped the backend before
+the sole writer and restarted writer before backend. No attribution SQL repair,
+provider-budget reset, custom runtime build or content-policy bypass was used.
+
+The enabled worker qualified the already queued RFC capture. Its public
+capture-pinned read returned the same capture
+`blake3:f561023b34507798258530bff923c41bab5d092d71b2cae7da484e6d5ce6d0e0`
+and body
+`blake3:58f50168dc03a034edf54305bbf7dd71e1e1f91cb942d5e8e401ab8939890c1a`.
+The ready epoch 1 attribution generation was
+`blake3:254338b7453b0764ba106f0298fd5113f4d90f9aca8028761372660e1614ec81`.
+Read-only SQL confirmed the exact subject, generation, policy and nonempty
+notice/evidence receipts. Public `resources/read` and `fetch` of its immutable
+notice URI returned identical 735-byte readable notices, SHA-256
+`e3023e4c9c26222fad0449a77d6d7243849a819d3d9ab7af4d2d20a277740156`.
+The original capture-fixed content resource returned the same first page.
+No second unpinned foreground acquisition was issued.
+
+The formal postactivation observation spanned 2026-11-11T06:56:49Z through
+07:06:50Z, after the initial licensed read and full public protocol matrix passed.
+Ten recorded samples covered 600.883 monotonic seconds. Both roles stayed Ready
+with unchanged Pod/container identities, restart counts and exclusive writer
+owner. PostgreSQL retained its original system identifier, container and zero
+restarts. The archive binding/epoch, pinned RFC capture and ready attribution
+generation, edge process/profile, enabled collectors and active timers remained
+unchanged. SQL capture inventory increased from 1,108 to 2,640; free space stayed
+above 931 GB, exceeding the 128 GiB reserve. Full public HTTP/WebTransport and
+capture-pinned content/notice checks passed again at the end, including both
+protocol revisions for the content and immutable notice.
+
+Each writer/backend Pod had one failed initial storage startup before its formal
+Ready baseline, both during the earlier start and after the authorized activation
+rollout. The generic error does not identify its cause; no intentional warm-up
+failure is implemented and no root cause was proved. Kubernetes recovered each
+process. The formal window had no additional restart; this is not a clean-first-
+start or long-term reliability claim.
+
+Independent review closed the bounded operational evidence. The final acceptance
+receipt SHA-256 is
+`42b83ed82a586b52b835fef6e6c2c6b3c1f069db8fb1bdc07f1ae69ef09d1750`.
+The 15-record raw server evidence export SHA-256 is
+`8fde36030d7fb440d1b195834554c7bcee25a24de51db081e5fbbcb9ac1b81ec`;
+all twelve exported observations matched their authenticated SSH records.
+
+### Verification boundaries
+
+`cargo fmt --all -- --check` passed. Local deployment Python checks passed
+64 tests with two existing skips. The actual isolated minikube suite passed NodePort TCP/UDP, CNI isolation, PVC restart and
+coordinated restore checks. The pinned OxiBelt Docker fixture suite passed in a
+fresh, owned local Docker daemon after an existing shared PostgreSQL image cache
+proved incomplete; shared images and unrelated containers were preserved. These
+fixture runs are distinct from the actual provider, server and public checks.
+Hosted native amd64/arm64 release qualification remains the separate publication
+evidence above. Agent review is not human GitHub approval.
+
+Actual version deletion remains deliberately denied with HTTP 403 AccessDenied.
+This deployment establishes representative licensed public retrieval and bounded
+operational readiness. The observed background state includes pending/blocked
+attribution, RFC HTML representation integrity errors, W3C current-lane integrity failures with no
+published standards, and Chromium current-lane unavailable failures with no
+published components. These are unresolved source-coverage gaps. The sanitized
+status codes do not identify a particular validation or storage failure; current
+writer logs supplied no further diagnostic lines. This acceptance does not
+establish a complete corpus, universal provider readiness, arbitrary
+client-network compatibility or native ChatGPT UI acceptance.
