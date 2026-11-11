@@ -423,3 +423,57 @@ The production operator's current private-input fingerprint calculation also
 matched this binding. No all-check storage receipt or runtime Secret was emitted.
 The separately pending runtime rotation/revocation trial still requires its two
 replacement-key approval; writer/backend and public activation remain stopped.
+
+## Requested retry under reduced writer IAM on 2026-11-11
+
+The user requested another actual version-deletion trial. Fresh IAM metadata
+showed that the writer's `ObjectStorageObjectsDelete` permission set had been
+removed; its Read, Write and ReadOnly sets and the serving role's two read sets
+remained. The first preparation stopped before any S3 request because the helper
+had required the broader writer permission. Independently reviewed continuation
+made that previously allowed set optional, retained the required sets and rejected
+any other permission. Nine successful IAM responses were preserved and reused
+with their original times and spending. The current writer policy fingerprint
+differs from the previous admission, which remains unchanged historical evidence.
+
+Two administrator S3 GETs produced no HTTP result. Their original intents remain
+unresolved and charged. Each was followed by one separately journaled manual
+read with its own label and known native HTTP200 response; neither result was
+assigned to the unanswered request. Reviewed continuations retained all file
+hashes, counters and original observation times, without replaying a mutation.
+The acknowledged bucket creation, private owner ACL, Paris location and separately
+verified creation timestamp established ownership before only the unattempted
+seed tail resumed. The final continuation used direct verified TLS for
+administrator S3 with a 30-second socket timeout; IAM kept its original route
+and 20-second timeout. The existing
+45-second elapsed response checks remain cooperative checks, not a hard wall-clock
+kill. No automatic retry, redirect or TLS verification relaxation was introduced.
+
+Both applications again completed GET200, exact-prefix LIST200, actual non-null
+version DELETE403 `AccessDenied`, and GET200 with the unchanged latest body.
+All eight native request IDs were captured: six reads and two denied deletion
+attempts. This is the intended deletion-confinement success. Before the trial,
+authenticated server-side comparisons confirmed the operating credential files
+unchanged; no secret values were exported. The current policy and canary
+equivalence, source changes and actual target evidence received independent
+review. The final helper's 30 offline tests also passed separately.
+
+Administrator post-checks verified both versions and their exact hashes remained.
+Both exact version deletions then returned 204 with typed `NoSuchVersion` GET404
+readback. Whole-bucket version, object and upload inventories were empty; canary
+policy removal and bucket deletion were confirmed by typed policy absence,
+HEAD404 and qualified project inventory absence. Fresh final IAM, key inventories
+and production bucket metadata matched this retry's before-state. Authenticated
+server-side checks also confirmed both operating credential files unchanged.
+
+Total spending was 20 read-only IAM requests, 63 administrator S3 reads and nine
+administrator S3 mutations, plus six workload reads and two denied DELETEs.
+All 100 attempts were charged: 90 administrator and eight workload HTTP responses
+were recorded, with the two unanswered GET intents explicitly retained. Payload
+PUTs totaled 164 bytes. Independent final composite review passed; a separate
+immutable admission records only `permanent_deletion_denied` for this retry's
+current binding and preserves the original producer and historical admission.
+No actual production non-null version was tested, and no overall production
+receipt or runtime Secret was emitted. Runtime rotation,
+multipart acceptance under the reduced IAM policy and public activation remain
+separate gates. PostgreSQL remains ready; writer/backend remain stopped.
