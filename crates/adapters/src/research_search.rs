@@ -18,16 +18,24 @@ where
 {
     let mut unique = HashSet::new();
     if sources.is_empty()
-        || sources.len() > 8
+        || sources.len() > 9
         || sources.iter().any(|source| {
             !matches!(
                 source.as_str(),
-                "rfc" | "cargo" | "rustsec" | "mdn" | "whatwg" | "w3c" | "chromium" | "npm"
+                "rfc"
+                    | "cargo"
+                    | "rustsec"
+                    | "mdn"
+                    | "whatwg"
+                    | "w3c"
+                    | "chromium"
+                    | "npm"
+                    | "wikipedia"
             ) || !unique.insert(source)
         })
     {
         return Err(Error::invalid(
-            "Select one to eight distinct supported search sources.",
+            "Select one to nine distinct supported search sources.",
         ));
     }
     let remaining = deadline.saturating_duration_since(Instant::now());

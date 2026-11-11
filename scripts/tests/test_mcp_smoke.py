@@ -22,7 +22,7 @@ class ToolInventoryTests(unittest.TestCase):
     def test_exact_dotted_inventory(self):
         tools = [{"name": name} for name in smoke.EXPECTED_TOOLS]
         smoke.assert_tool_inventory(tools)
-        self.assertEqual(len(tools), 88)
+        self.assertEqual(len(tools), 98)
 
     def test_legacy_alias_extra_missing_and_duplicate_are_rejected(self):
         tools = [{"name": name} for name in sorted(smoke.EXPECTED_TOOLS)]

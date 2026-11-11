@@ -4,7 +4,7 @@
 url = "https://github.com/PublicData-stream/dev-resources-MCP/releases/download/0.1.0-build.78c2e9c5/source.tar.gz"
 
 # First qualify transport, live fixed records, and coordinated restore with all
-# collectors paused. Activation changes only these eight booleans to true.
+# collectors paused. Activation changes only these nine booleans to true.
 [rfc]
 enabled = false
 [crates]
@@ -18,6 +18,8 @@ enabled = false
 [w3c]
 enabled = false
 [chromium]
+enabled = false
+[wikipedia]
 enabled = false
 [npm]
 enabled = false

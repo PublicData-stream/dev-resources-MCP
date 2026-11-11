@@ -24,7 +24,7 @@ APPARMOR_SHA256 = '4375146629c956b8e63cc4b358ef52c6bcda458621b7dcf8601b0f3d922b3
 POSTGRES = 'postgres:18.6-alpine3.24@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395'
 HOST = 'dev-resources.mcp.publicdata.stream'
 NAMESPACE = 'devres'
-PROVIDERS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
+PROVIDERS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm', 'wikipedia')
 HERE = Path(__file__).resolve().parent
 RESERVED_IPV4 = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
                  '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24',
@@ -141,6 +141,8 @@ def deployment(name, image, command, requests, limits, volumes, mounts, ports, s
            'securityContext': {'runAsNonRoot': True, 'runAsUser': uid, 'runAsGroup': uid,
                                'fsGroup': uid, 'seccompProfile': {'type': 'RuntimeDefault'}},
            'containers': [container], 'volumes': volumes}
+    if name == 'writer':
+        pod['terminationGracePeriodSeconds'] = 120
     if 'apparmor_profile' in settings:
         pod['securityContext']['appArmorProfile'] = {
             'type': 'Localhost', 'localhostProfile': settings['apparmor_profile']}

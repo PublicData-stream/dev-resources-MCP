@@ -116,7 +116,7 @@ impl BackupReceipt {
     fn validate(&self) -> Result<()> {
         if self.version != 1
             || self.kind != "devres-object-archive-backup"
-            || !matches!(self.schema, 12 | 13)
+            || !matches!(self.schema, 12..=14)
             || self.store_id.is_empty()
             || self.store_id.len() > 128
             || self.store_id.chars().any(char::is_control)

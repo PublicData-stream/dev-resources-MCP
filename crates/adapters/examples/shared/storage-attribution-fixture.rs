@@ -65,10 +65,20 @@ pub(super) async fn seed(
     )?);
     let chromium = Arc::new(devres_adapters::ChromiumCorpus::new(
         store.clone(),
-        broker,
+        broker.clone(),
         root,
         devres_adapters::ChromiumConfig {
             enabled: false,
+            ..Default::default()
+        },
+    )?);
+    let wikipedia = Arc::new(devres_adapters::WikipediaCorpus::new_reader(
+        store.clone(),
+        broker,
+        root,
+        devres_adapters::WikipediaConfig {
+            enabled: false,
+            min_free_bytes: 64 * 1024 * 1024,
             ..Default::default()
         },
     )?);
@@ -80,6 +90,7 @@ pub(super) async fn seed(
         .with_whatwg_corpus(whatwg)
         .with_w3c_corpus(w3c)
         .with_chromium_corpus(chromium)
+        .with_wikipedia_corpus(wikipedia)
         .with_npm_corpus(npm);
     let mdn_content = fixture_hash(MDN_CONTENT_IDENTITY);
     let mdn_compat = fixture_hash(MDN_COMPAT_IDENTITY);
@@ -226,6 +237,37 @@ pub(super) async fn seed(
         calls.push((provider, symbol, symbol_args));
     }
     let mut targets = BTreeMap::new();
+    for representation in ["text", "markdown", "html", "wikitext"] {
+        calls.push(("wikipedia","wikipedia.get",json!({"page_id":777,"snapshot":fixture_hash(WIKIPEDIA_IDENTITY),"representation":representation})));
+    }
+    for (tool, args) in [
+        (
+            "wikipedia.metadata",
+            json!({"page_id":777,"snapshot":fixture_hash(WIKIPEDIA_IDENTITY)}),
+        ),
+        (
+            "wikipedia.references",
+            json!({"page_id":777,"snapshot":fixture_hash(WIKIPEDIA_IDENTITY)}),
+        ),
+        (
+            "wikipedia.history",
+            json!({"page_id":777,"snapshot":fixture_hash(WIKIPEDIA_IDENTITY)}),
+        ),
+        (
+            "wikipedia.catalog_search",
+            json!({"snapshot":fixture_hash(WIKIPEDIA_IDENTITY)}),
+        ),
+        (
+            "wikipedia.search",
+            json!({"query":"CPU","snapshot":fixture_hash(WIKIPEDIA_IDENTITY)}),
+        ),
+        (
+            "wikipedia.rg",
+            json!({"pattern":"CPU|fixture_opcode","snapshot":fixture_hash(WIKIPEDIA_IDENTITY)}),
+        ),
+    ] {
+        calls.push(("wikipedia", tool, args));
+    }
     collect(
         "rfc",
         &research
@@ -273,7 +315,15 @@ async fn qualify_fixtures(
     mut pending: BTreeMap<String, AttributionTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let enabled = [
-        "rfc", "crates", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+        "rfc",
+        "crates",
+        "rustsec",
+        "mdn",
+        "whatwg",
+        "w3c",
+        "chromium",
+        "npm",
+        "wikipedia",
     ]
     .map(str::to_owned);
     let mut deferred = 0;

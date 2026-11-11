@@ -379,3 +379,13 @@ TokenReview/live identity and Scaleway IAM destinations only through operator
 configuration; they do not extend public request URL authority. Dependency versions
 remain locked. Advisory, license, source and generated notice checks still apply to
 the integrated graph; successful compilation is not current dependency admission.
+
+## Wikipedia regex dependency
+
+Wikipedia promotes the already locked `regex` 1.13.1 to a direct adapter dependency
+for bounded in-process literal/regex matching. Shelling out to ripgrep would add
+process/argument boundaries; hand-written regex matching would duplicate a mature
+parser and engine. The existing maintained MIT/Apache-2.0 Rust regex graph and
+feature selection remain locked, with no new package or build script. Compilation
+and scan budgets, cancellation and result caps remain application responsibilities.
+Current advisory/license checks are required independently of this rationale.

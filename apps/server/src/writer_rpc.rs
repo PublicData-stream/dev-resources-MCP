@@ -31,11 +31,25 @@ const RESPONSE_LIMIT: usize = 64 * 1024;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
-    Acquire { source: Acquisition },
-    Effect { effect: WriterEffect },
+    Acquire {
+        source: Acquisition,
+    },
+    Effect {
+        effect: WriterEffect,
+    },
     RfcSnapshot,
+    WikipediaRequest {
+        title: Option<String>,
+        page_id: Option<u64>,
+    },
+    WikipediaSearch {
+        query: String,
+        limit: usize,
+    },
     AttributionStatus,
-    SourceStatus { source: SourceStatus },
+    SourceStatus {
+        source: SourceStatus,
+    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -43,6 +57,7 @@ enum Reply {
     Capture { capture: Capture },
     Complete,
     Snapshot { id: String },
+    WikipediaSearch { result: serde_json::Value },
     AttributionStatus { status: serde_json::Value },
     SourceStatus { status: serde_json::Value },
     Failure { error: Error },
@@ -139,6 +154,25 @@ impl WriterClient {
 }
 #[async_trait]
 impl AcquisitionDelegate for WriterClient {
+    async fn wikipedia_request(&self, title: Option<String>, page_id: Option<u64>) -> Result<()> {
+        match self
+            .call(Operation::WikipediaRequest { title, page_id })
+            .await?
+        {
+            Reply::Complete => Ok(()),
+            _ => Err(unavailable()),
+        }
+    }
+    async fn wikipedia_search(&self, query: String, limit: usize) -> Result<serde_json::Value> {
+        match self
+            .call(Operation::WikipediaSearch { query, limit })
+            .await?
+        {
+            Reply::WikipediaSearch { result } => Ok(result),
+            _ => Err(unavailable()),
+        }
+    }
+
     async fn acquire(&self, source: Acquisition) -> Result<Capture> {
         match self.call(Operation::Acquire { source }).await? {
             Reply::Capture { capture } => Ok(capture),
@@ -261,7 +295,7 @@ async fn acquire(State(state): State<Arc<RpcState>>, request: Request) -> Respon
             biased;
             _=state.context.shutdown.cancelled()=>Reply::Failure {error:unavailable()},
             result=tokio::time::timeout(Duration::from_secs(state.context.limits.search_timeout_secs),async {
-                match operation {Operation::Acquire {source}=>state.coordinator.acquire(source).await.map(|capture|Reply::Capture {capture}),Operation::Effect {effect}=>state.coordinator.effect(effect).await.map(|()|Reply::Complete),Operation::RfcSnapshot=>state.coordinator.rfc_snapshot().await.map(|id|Reply::Snapshot {id}),Operation::AttributionStatus=>state.coordinator.attribution_status().await.map(|status|Reply::AttributionStatus {status}),Operation::SourceStatus {source}=>state.coordinator.source_status(source).await.map(|status|Reply::SourceStatus {status})}
+                match operation {Operation::WikipediaRequest{title,page_id}=>state.coordinator.wikipedia_request(title,page_id).await.map(|()|Reply::Complete),Operation::WikipediaSearch{query,limit}=>state.coordinator.wikipedia_search(query,limit).await.map(|result|Reply::WikipediaSearch{result}),Operation::Acquire {source}=>state.coordinator.acquire(source).await.map(|capture|Reply::Capture {capture}),Operation::Effect {effect}=>state.coordinator.effect(effect).await.map(|()|Reply::Complete),Operation::RfcSnapshot=>state.coordinator.rfc_snapshot().await.map(|id|Reply::Snapshot {id}),Operation::AttributionStatus=>state.coordinator.attribution_status().await.map(|status|Reply::AttributionStatus {status}),Operation::SourceStatus {source}=>state.coordinator.source_status(source).await.map(|status|Reply::SourceStatus {status})}
             })=>match result {Ok(Ok(reply))=>reply,Ok(Err(error))=>Reply::Failure {error},Err(_)=>Reply::Failure {error:unavailable()}}
         };
         let mut bytes = serde_json::to_vec(&reply).unwrap_or_default();

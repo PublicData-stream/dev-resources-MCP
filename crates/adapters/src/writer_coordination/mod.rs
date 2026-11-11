@@ -13,6 +13,7 @@ pub struct WriterCoordinator {
     rfc: Arc<crate::rfc::RfcCorpus>,
     crates: Arc<crate::crates_io::CrateCorpus>,
     attribution: Arc<AttributionRuntime>,
+    wikipedia: Option<Arc<crate::wikipedia::WikipediaCorpus>>,
 }
 impl WriterCoordinator {
     pub fn new(
@@ -26,7 +27,12 @@ impl WriterCoordinator {
             rfc,
             crates,
             attribution,
+            wikipedia: None,
         }
+    }
+    pub fn with_wikipedia(mut self, corpus: Arc<crate::wikipedia::WikipediaCorpus>) -> Self {
+        self.wikipedia = Some(corpus);
+        self
     }
     pub async fn acquire(&self, operation: Acquisition) -> Result<Capture> {
         let stored = match &operation {
@@ -151,6 +157,21 @@ impl WriterCoordinator {
 
 #[async_trait::async_trait]
 impl devres_application::acquisition::AcquisitionDelegate for WriterCoordinator {
+    async fn wikipedia_request(&self, title: Option<String>, page_id: Option<u64>) -> Result<()> {
+        self.wikipedia
+            .as_ref()
+            .ok_or_else(|| Error::unavailable("Wikipedia writer is unavailable."))?
+            .request_selector(title, page_id, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+    async fn wikipedia_search(&self, query: String, limit: usize) -> Result<serde_json::Value> {
+        self.wikipedia
+            .as_ref()
+            .ok_or_else(|| Error::unavailable("Wikipedia writer is unavailable."))?
+            .upstream_search(&query, limit, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
     async fn acquire(&self, operation: Acquisition) -> Result<Capture> {
         WriterCoordinator::acquire(self, operation).await
     }

@@ -17,6 +17,8 @@ enabled = false
 enabled = false
 [chromium]
 enabled = false
+[wikipedia]
+enabled = false
 [npm]
 enabled = false
 [http]

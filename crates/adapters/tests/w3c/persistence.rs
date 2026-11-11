@@ -284,7 +284,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("schema"),
-        13
+        14
     );
     // Recognized opaque acceptance evidence can migrate without invented provider graph variants.
     // Exercise the actual version-six migration branch with retained older-provider evidence.
@@ -334,7 +334,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
     let legacy_capture =
         seed_legacy_capture(&inspection, root.path(), &canonical_capture, legacy_body).await;
     // Drop only new-provider tables in this task-created fixture database; earlier captures remain.
-    sqlx_core::raw_sql::raw_sql("DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; DROP TABLE devres_w3c_statistics; DROP TABLE devres_w3c_state; DROP TABLE devres_w3c_evidence; UPDATE devres_schema SET version=6 WHERE singleton").execute(&inspection).await.expect("prepare isolated schema-six fixture");
+    sqlx_core::raw_sql::raw_sql("DROP TABLE devres_wikipedia_state; DROP TABLE devres_wikipedia_evidence; DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; DROP TABLE devres_w3c_statistics; DROP TABLE devres_w3c_state; DROP TABLE devres_w3c_evidence; UPDATE devres_schema SET version=6 WHERE singleton").execute(&inspection).await.expect("prepare isolated schema-six fixture");
     assert!(
         PgBlobStore::connect(url.as_str(), root.path())
             .await
@@ -377,7 +377,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("upgraded schema"),
-        13
+        14
     );
     assert_eq!(
         store

@@ -744,6 +744,7 @@ impl PgBlobStore {
         execution.report("verification", 0, 0, 0, 0);
         self.fence().await?;
         super::sequence_integrity::backfill(self, &cancel, true, execution).await?;
+        self.verify_wikipedia_storage(&cancel).await?;
         self.qualify_sql(&cancel, true, execution).await?;
         payload_integrity::backfill_specialized(self, &cancel, true, execution).await?;
         self.backfill_events(&cancel, true, execution).await?;

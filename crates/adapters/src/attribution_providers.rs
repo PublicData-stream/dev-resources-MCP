@@ -166,6 +166,7 @@ fn provider(value: &str) -> Result<&'static str> {
         "w3c" => Ok("w3c"),
         "chromium" => Ok("chromium"),
         "npm" => Ok("npm"),
+        "wikipedia" => Ok("wikipedia"),
         _ => Err(invalid()),
     }
 }
@@ -182,6 +183,7 @@ fn inferred_provider(value: &Value) -> Option<&'static str> {
         "www.rfc-editor.org" | "rfc-editor.org" => Some("rfc"),
         "crates.io" | "index.crates.io" | "static.crates.io" | "docs.rs" => Some("crates"),
         "registry.npmjs.org" | "osv-vulnerabilities.storage.googleapis.com" => Some("npm"),
+        "en.wikipedia.org" => Some("wikipedia"),
         "www.w3.org" | "w3.org" | "api.w3.org" => Some("w3c"),
         "chromium.googlesource.com" | "www.chromium.org" | "developer.chrome.com" => {
             Some("chromium")
@@ -208,6 +210,11 @@ fn inferred_provider(value: &Value) -> Option<&'static str> {
 /// Extract only exact public provenance. Request text, snippets, dependency
 /// inventories, result shapes and audit associations never become repair keys.
 pub fn targets(source: &str, value: &Value) -> Result<Vec<AttributionTarget>> {
+    if matches!(source, "wikipedia" | "mixed")
+        && crate::wikipedia::attribution::is_metadata_only_discovery(value)
+    {
+        return Ok(Vec::new());
+    }
     targets_v1(source, value)
 }
 
@@ -579,6 +586,9 @@ fn visit(
 }
 
 fn target_from(p: &str, value: &Value, license: &Value) -> Result<Option<AttributionTarget>> {
+    if p == "wikipedia" {
+        return crate::wikipedia::attribution::target(value);
+    }
     let url = string(value, "source_url")
         .or_else(|| {
             value
@@ -776,6 +786,13 @@ fn candidate_v1(
         return Err(invalid());
     }
     let p = provider(source)?;
+    if p == "wikipedia" {
+        return if namespace == "captures" {
+            crate::wikipedia::attribution::target(data)
+        } else {
+            Ok(None)
+        };
+    }
     let mut value = normalize_candidate(p, data, None)?;
     if let Some(v) = value.as_object_mut()
         && !v.contains_key("id")
@@ -2296,6 +2313,29 @@ async fn repair_chromium(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wikipedia_exact_article_evidence_covers_only_its_own_copied_content() {
+        let capture = json!({"id":crate::integrity::hash(b"wiki capture"),"page_id":12,"revision_id":34,"representation":"html","source_url":"https://en.wikipedia.org/w/rest.php/v1/page/RISC-V/with_html?redirect=no","body_hash":crate::integrity::hash(b"wiki raw")});
+        let document = json!({"title":"RISC-V","capture":capture,"page":{"text":"captured article"},"source_evidence":{"provider":"wikipedia","wikipedia_evidence":capture}});
+        let targets = targets("wikipedia", &document).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].subject.provider, "wikipedia");
+        let mixed = json!({"results":[{"source":"wikipedia","result":document}]});
+        assert_eq!(super::targets("mixed", &mixed).unwrap(), targets);
+        let unbound = json!({"items":[document,{"title":"unbound copied title"}]});
+        assert!(super::targets("wikipedia", &unbound).is_err());
+        let retained = candidate("wikipedia", "captures", "fixture", &capture)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, targets[0]);
+    }
+    #[test]
+    fn wikipedia_discovery_exception_rejects_copied_titles() {
+        let mut value = json!({"metadata_only_discovery":true,"source":"wikipedia","coverage":"upstream_discovery","items":[{"page_id":12,"fetch_id":"wikipedia:RISC-V","url":"https://en.wikipedia.org/wiki/RISC-V"}]});
+        assert!(targets("wikipedia", &value).unwrap().is_empty());
+        value["items"][0]["title"] = json!("unqualified copied title");
+        assert!(targets("wikipedia", &value).is_err());
+    }
     #[test]
     fn exact_git_destinations_reject_traversal_and_moving_revisions() {
         for revision in ["main".into(), "a".repeat(40)] {

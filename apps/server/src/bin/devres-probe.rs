@@ -105,6 +105,7 @@ async fn main() -> Result<(), ServerError> {
     let mut has_w3c_corpus = false;
     let mut has_chromium_corpus = false;
     let mut has_npm_corpus = false;
+    let mut has_wikipedia_corpus = false;
     for (id, method, mut params) in [
         (2, "tools/list", json!({})),
         (
@@ -136,6 +137,9 @@ async fn main() -> Result<(), ServerError> {
             if actual != expected {
                 return Err("unexpected public tool inventory".into());
             }
+            has_wikipedia_corpus = tools
+                .iter()
+                .any(|tool| tool["name"] == "wikipedia.corpus_status");
             has_rfc_corpus = value["result"]["tools"]
                 .as_array()
                 .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "rfc.corpus_status"));
@@ -954,6 +958,175 @@ async fn main() -> Result<(), ServerError> {
             return Err("Immutable CHROMIUM bytes or notices changed through WebTransport".into());
         }
     }
+    if has_wikipedia_corpus {
+        let status = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            60,
+            "wikipedia.corpus_status",
+            json!({}),
+        )
+        .await?;
+        if !status["coverage"].is_string() {
+            return Err("Wikipedia corpus status missing through WebTransport".into());
+        }
+    }
+    if std::env::var_os("DEVRES_PROBE_WIKIPEDIA_FIXTURE").is_some() {
+        if !has_wikipedia_corpus {
+            return Err("Wikipedia discovery missing through WebTransport".into());
+        }
+        let snapshot = "blake3:c5ee72b3887673dbe6e11e14111592a490149a0cfc7e7d4373bb5888183c0358";
+        let selection = json!({"page_id":777,"snapshot":snapshot});
+        let detail = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            61,
+            "wikipedia.get",
+            selection.clone(),
+        )
+        .await?;
+        let text = detail["page"]["text"]
+            .as_str()
+            .ok_or("Wikipedia text missing through WebTransport")?;
+        if !text.contains("Synthetic Wikipedia storage fixture")
+            || text.contains("fixture_hidden_script")
+            || detail["capture"]["license"]["synthetic"] != true
+            || !detail["attribution"]["readable_notice"]
+                .as_str()
+                .is_some_and(|s| s.contains("First-party synthetic acceptance fixture"))
+        {
+            return Err(
+                "Wikipedia synthetic projection or first-party notice changed through WebTransport"
+                    .into(),
+            );
+        }
+        let markdown = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            62,
+            "wikipedia.get",
+            json!({"page_id":777,"snapshot":snapshot,"representation":"markdown"}),
+        )
+        .await?;
+        if !markdown["page"]["text"]
+            .as_str()
+            .is_some_and(|s| s.contains("E=mc^2") && !s.contains("fixture_hidden_script"))
+        {
+            return Err("Wikipedia Markdown/math changed through WebTransport".into());
+        }
+        let source = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            63,
+            "wikipedia.get",
+            json!({"page_id":777,"snapshot":snapshot,"representation":"wikitext"}),
+        )
+        .await?;
+        if !source["page"]["text"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("= Synthetic Wikipedia"))
+        {
+            return Err("Wikipedia wikitext changed through WebTransport".into());
+        }
+        let found = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            64,
+            "wikipedia.rg",
+            json!({"snapshot":snapshot,"pattern":"CPU|fixture_opcode"}),
+        )
+        .await?;
+        if !found["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            return Err("Wikipedia regex fixture missing through WebTransport".into());
+        }
+        let history = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            65,
+            "wikipedia.history",
+            selection,
+        )
+        .await?;
+        if history["items"].as_array().map(Vec::len) != Some(2) {
+            return Err("Wikipedia observed history changed through WebTransport".into());
+        }
+        let uri = detail["resource_uri"]
+            .as_str()
+            .ok_or("Wikipedia immutable resource missing")?;
+        let mut params = json!({"uri":uri});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let resource = exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":66,"method":"resources/read","params":params}),
+        )
+        .await?;
+        if resource["result"]["contents"][0]["text"] != text {
+            return Err("Wikipedia immutable resource changed through WebTransport".into());
+        }
+        let fetched = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            67,
+            "fetch",
+            json!({"id":uri}),
+        )
+        .await?;
+        if fetched["contents"][0]["text"] != text {
+            return Err("Wikipedia immutable generic fetch changed through WebTransport".into());
+        }
+        let natural = tool_exchange(
+            &mut send,
+            &mut reader,
+            &budget,
+            revision,
+            68,
+            "fetch",
+            json!({"id":"wikipedia:Devres synthetic STEM fixture"}),
+        )
+        .await?;
+        if natural["page"]["text"] != text {
+            return Err("Wikipedia title generic fetch changed through WebTransport".into());
+        }
+        let id = detail["capture"]["id"]
+            .as_str()
+            .ok_or("Wikipedia capture identity missing")?;
+        let mut params =
+            json!({"name":"fetch","arguments":{"id":format!("devres://capture/{id}")}});
+        if revision == "2026-07-28" {
+            params["_meta"] = metadata(revision);
+        }
+        let rejected = exchange_response(
+            &mut send,
+            &mut reader,
+            &budget,
+            json!({"jsonrpc":"2.0","id":69,"method":"tools/call","params":params}),
+        )
+        .await?;
+        if rejected["result"]["isError"] != true {
+            return Err("Wikipedia raw capture bypass accepted through WebTransport".into());
+        }
+    }
     connection.close(0_u32.into(), b"probe complete");
     endpoint.close(0_u32.into(), b"probe complete");
     timeout(Duration::from_secs(2), endpoint.wait_idle()).await?;
@@ -991,12 +1164,60 @@ async fn exchange(
     budget: &Arc<Semaphore>,
     request: Value,
 ) -> Result<Value, ServerError> {
+    let label = operation_label(&request);
     let value = exchange_response(send, reader, budget, request).await?;
-    if value.get("error").is_some() || value["result"]["isError"] == true {
-        return Err("MCP operation failed".into());
+    if let Some(failure) = operation_failure(&label, &value) {
+        return Err(failure.into());
     }
     Ok(value)
 }
+
+/// Labels come exclusively from protocol constants and the compiled tool inventory.
+/// Never copy arguments, resource URIs, upstream messages, or error data to logs.
+fn operation_label(request: &Value) -> String {
+    match request["method"].as_str() {
+        Some("initialize") => "initialize".into(),
+        Some("server/discover") => "server/discover".into(),
+        Some("tools/list") => "tools/list".into(),
+        Some("resources/read") => "resources/read".into(),
+        Some("tools/call") => {
+            let name = request["params"]["name"].as_str().unwrap_or_default();
+            let inventory: Vec<String> =
+                serde_json::from_str(include_str!("../../tests/tool-names.json"))
+                    .unwrap_or_default();
+            if inventory.iter().any(|allowed| allowed == name) {
+                format!("tools/call {name}")
+            } else {
+                "tools/call unlisted-tool".into()
+            }
+        }
+        _ => "unlisted-method".into(),
+    }
+}
+fn operation_failure(label: &str, response: &Value) -> Option<String> {
+    if response.get("error").is_some() {
+        return Some(match response["error"]["code"].as_i64() {
+            Some(code) => format!("MCP operation failed: {label}; JSON-RPC code {code}"),
+            None => format!("MCP operation failed: {label}; JSON-RPC error"),
+        });
+    }
+    if response["result"]["isError"] == true {
+        let code = match response["result"]["structuredContent"]["code"].as_str() {
+            Some("invalid_input") => "invalid_input",
+            Some("unavailable") => "unavailable",
+            Some("not_found") => "not_found",
+            Some("capacity") => "capacity",
+            Some("integrity") => "integrity",
+            Some("wikipedia_withheld") => "wikipedia_withheld",
+            Some("attribution_blocked") => "attribution_blocked",
+            Some("cancelled") => "cancelled",
+            _ => "tool_error",
+        };
+        return Some(format!("MCP operation failed: {label}; {code}"));
+    }
+    None
+}
+
 async fn exchange_response(
     send: &mut wtransport::SendStream,
     reader: &mut FrameReader<wtransport::RecvStream>,
@@ -1011,5 +1232,35 @@ async fn exchange_response(
         if value["id"] == id {
             return Ok(value);
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn fixed_tool_diagnostics_exclude_request_and_response_payloads() {
+        let request = json!({"method":"tools/call","params":{"name":"packages.crate.audit_lockfile","arguments":{"lockfile":"private-inventory-unique"}}});
+        let response = json!({"result":{"isError":true,"structuredContent":{"code":"capacity","message":"private-upstream-message-unique","details":{"credential":"private-credential-unique"}}}});
+        let message = operation_failure(&operation_label(&request), &response).unwrap();
+        assert_eq!(
+            message,
+            "MCP operation failed: tools/call packages.crate.audit_lockfile; capacity"
+        );
+        assert!(!message.contains("private-"));
+        let unlisted =
+            json!({"method":"private-method-unique","params":{"name":"private-tool-unique"}});
+        assert_eq!(operation_label(&unlisted), "unlisted-method");
+    }
+    #[test]
+    fn expected_wikipedia_rejection_is_a_raw_response_assertion() {
+        let request = json!({"id":69,"method":"tools/call","params":{"name":"fetch","arguments":{"id":"devres://capture/private-resource-unique"}}});
+        let rejected = json!({"id":69,"result":{"isError":true,"structuredContent":{"code":"not_found","message":"private-body-unique"}}});
+        assert_eq!(
+            operation_failure(&operation_label(&request), &rejected).as_deref(),
+            Some("MCP operation failed: tools/call fetch; not_found")
+        );
+        assert_eq!(rejected["result"]["isError"], true);
+        assert!(operation_failure("tools/list", &json!({"result":{"tools":[]}})).is_none());
     }
 }

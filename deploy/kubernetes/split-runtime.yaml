@@ -52,6 +52,7 @@ spec:
     spec:
       automountServiceAccountToken: false
       serviceAccountName: devres-writer
+      terminationGracePeriodSeconds: 120
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

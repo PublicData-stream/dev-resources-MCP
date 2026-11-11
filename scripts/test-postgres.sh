@@ -47,6 +47,7 @@ cargo test --locked -p devres-adapters --lib storage::payload_integrity -- --ign
 cargo test --locked -p devres-adapters --lib storage::sequence_integrity -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::corpus_storage::snapshot_batch_tests -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::acceptance -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib storage::wikipedia_storage -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::reader -- --ignored --skip s3_ --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::visibility -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib attribution_storage -- --ignored --test-threads=1

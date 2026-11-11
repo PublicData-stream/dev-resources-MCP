@@ -270,7 +270,7 @@ def prepare_tls(bundle, storage_auth="broker"):
 
 
 def collector_config(text, enabled):
-    """Change only the eight explicit admission switches, preserving all budgets."""
+    """Change only the explicit provider admission switches, preserving all budgets."""
     before = tomllib.loads(text)
     for name in COLLECTORS:
         if type(before.get(name, {}).get('enabled')) is not bool:

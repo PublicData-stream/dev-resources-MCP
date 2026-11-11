@@ -12,6 +12,7 @@ const TABLES: &[&str] = &[
     "devres_chromium_evidence",
     "devres_npm_evidence",
     "devres_advisory_rows",
+    "devres_wikipedia_evidence",
 ];
 fn failure() -> Error {
     Error::integrity("Retained occurrence ordering integrity failed.")
@@ -160,6 +161,26 @@ pub(super) async fn backfill(
     use super::payload_integrity::pipeline::{SealData, SealRecord, SealWindow};
     use super::payload_integrity::{SealBatch, SealTarget, seal_not_cancelled};
     for &table in TABLES {
+        if table == "devres_wikipedia_evidence" {
+            let required: bool = sqlx_core::query_scalar::query_scalar(
+                "SELECT version>=14 FROM devres_schema WHERE singleton",
+            )
+            .fetch_one(&store.pool)
+            .await
+            .map_err(|_| failure())?;
+            let exists: bool = sqlx_core::query_scalar::query_scalar(
+                "SELECT to_regclass('devres_wikipedia_evidence') IS NOT NULL",
+            )
+            .fetch_one(&store.pool)
+            .await
+            .map_err(|_| failure())?;
+            if !exists {
+                if required {
+                    return Err(failure());
+                }
+                continue;
+            }
+        }
         // Include invalid sequence values rather than silently skipping corrupt rows.
         seal_not_cancelled(cancel)?;
         let sql = format!(

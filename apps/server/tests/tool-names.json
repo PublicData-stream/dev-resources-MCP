@@ -86,5 +86,15 @@
   "whatwg.search",
   "whatwg.snapshots",
   "whatwg.symbol_get",
-  "whatwg.symbol_search"
+  "whatwg.symbol_search",
+  "wikipedia.catalog_search",
+  "wikipedia.compare",
+  "wikipedia.corpus_status",
+  "wikipedia.get",
+  "wikipedia.history",
+  "wikipedia.metadata",
+  "wikipedia.references",
+  "wikipedia.rg",
+  "wikipedia.search",
+  "wikipedia.snapshots"
 ]

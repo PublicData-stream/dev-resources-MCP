@@ -10,10 +10,22 @@ use tokio_util::sync::CancellationToken;
 pub struct AttributionAdapter {
     broker: Arc<crate::bulk::BulkBroker>,
     store: Arc<dyn AttributionStore>,
+    wikipedia: Option<Arc<dyn devres_application::wikipedia::WikipediaStore>>,
 }
 impl AttributionAdapter {
     pub fn new(broker: Arc<crate::bulk::BulkBroker>, store: Arc<dyn AttributionStore>) -> Self {
-        Self { broker, store }
+        Self {
+            broker,
+            store,
+            wikipedia: None,
+        }
+    }
+    pub fn with_wikipedia(
+        mut self,
+        store: Arc<dyn devres_application::wikipedia::WikipediaStore>,
+    ) -> Self {
+        self.wikipedia = Some(store);
+        self
     }
     fn repair_source<'a>(
         &'a self,
@@ -29,6 +41,20 @@ impl AttributionAdapter {
             }
             if let Some(ready) = self.store.attribution_ready(&target.subject).await? {
                 return Ok(ready.generation);
+            }
+            if target.subject.provider == "wikipedia"
+                && target.evidence.get("dependencies").is_none()
+            {
+                return crate::wikipedia::attribution::repair(
+                    self.wikipedia.as_deref().ok_or_else(|| {
+                        devres_domain::Error::unavailable(
+                            "Wikipedia attribution store unavailable.",
+                        )
+                    })?,
+                    target,
+                    cancel,
+                )
+                .await;
             }
             let Some(dependencies) = target
                 .evidence
@@ -96,6 +122,18 @@ impl AttributionAdapter {
 impl AttributionAcquirer for AttributionAdapter {
     fn targets(&self, provider: &str, value: &Value) -> Result<Vec<AttributionTarget>> {
         crate::attribution_providers::targets(provider, value)
+    }
+    async fn ensure_public(&self, subject: &AttributionSubject) -> Result<()> {
+        if subject.provider != "wikipedia" {
+            return Ok(());
+        }
+        crate::wikipedia::attribution::ensure_public(
+            self.wikipedia.as_deref().ok_or_else(|| {
+                devres_domain::Error::unavailable("Wikipedia visibility store unavailable.")
+            })?,
+            subject,
+        )
+        .await
     }
     async fn repair(
         &self,

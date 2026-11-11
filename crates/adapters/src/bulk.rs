@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -301,6 +301,30 @@ pub struct AttemptPermit {
     _documentation: Option<OwnedSemaphorePermit>,
 }
 
+/// An aborted Action transfer still incurs Wikimedia's five-second pause.
+/// The guard owns timing/policy only, never response bytes or a transfer task.
+struct WikipediaActionAttempt<'a> {
+    started: Instant,
+    active: bool,
+    floor: Arc<AtomicI64>,
+    observed: &'a AtomicI64,
+    observer: Option<crate::wikipedia::source::PolicyObserver>,
+}
+impl Drop for WikipediaActionAttempt<'_> {
+    fn drop(&mut self) {
+        if self.active && self.started.elapsed() > Duration::from_secs(1) {
+            let until = devres_domain::unix_now().saturating_add(5);
+            self.floor.fetch_max(until, Ordering::AcqRel);
+            self.observed.fetch_max(until, Ordering::AcqRel);
+            if let Some(observe) = &self.observer {
+                // Enqueue is synchronous. Dropping only the acknowledgement
+                // leaves the bounded storage worker responsible for the write.
+                let _ = observe(until);
+            }
+        }
+    }
+}
+
 pub struct BulkBroker {
     client: reqwest::Client,
     w3c_client: reqwest::Client,
@@ -314,6 +338,11 @@ pub struct BulkBroker {
     chromium_slots: Arc<Semaphore>,
     npm_slots: Arc<Semaphore>,
     osv_slots: Arc<Semaphore>,
+    wikipedia_slots: Arc<Semaphore>,
+    wikipedia_action_slots: Arc<Semaphore>,
+    wikipedia_stream_slots: Arc<Semaphore>,
+    wikipedia_requests_per_second: u32,
+    wikipedia_policy_floor: Arc<AtomicI64>,
     npm_registry_rate: u32,
     npm_advisory_rate: u32,
     attempt_budget: Option<usize>,
@@ -375,6 +404,11 @@ impl BulkBroker {
             chromium_slots: Arc::new(Semaphore::new(1)),
             npm_slots: Arc::new(Semaphore::new(1)),
             osv_slots: Arc::new(Semaphore::new(1)),
+            wikipedia_slots: Arc::new(Semaphore::new(2)),
+            wikipedia_action_slots: Arc::new(Semaphore::new(1)),
+            wikipedia_stream_slots: Arc::new(Semaphore::new(1)),
+            wikipedia_requests_per_second: 1,
+            wikipedia_policy_floor: Arc::new(AtomicI64::new(0)),
             npm_registry_rate: 1,
             npm_advisory_rate: 1,
             rates: Mutex::new(HashMap::new()),
@@ -892,6 +926,1153 @@ impl BulkBroker {
         Err(Error::unavailable("Bulk source unavailable."))
     }
 }
+impl BulkBroker {
+    pub(crate) fn wikipedia_policy_floor(&self) -> Arc<AtomicI64> {
+        self.wikipedia_policy_floor.clone()
+    }
+    fn wikipedia_policy_receipt(
+        &self,
+        until: i64,
+        observer: &Option<crate::wikipedia::source::PolicyObserver>,
+    ) -> Result<Option<crate::wikipedia::source::PolicyReceipt>> {
+        self.wikipedia_policy_floor
+            .fetch_max(until, Ordering::AcqRel);
+        observer.as_ref().map(|observe| observe(until)).transpose()
+    }
+    /// Wikimedia's current anonymous 200/minute ceiling also applies across APIs.
+    /// The default is one; three remains below that ceiling with burst size one.
+    pub fn with_wikipedia_rate(mut self, rate: u32) -> Result<Self> {
+        if !(1..=3).contains(&rate) {
+            return Err(Error::invalid("Invalid Wikipedia request rate."));
+        }
+        self.wikipedia_requests_per_second = rate;
+        Ok(self)
+    }
+
+    fn record_wikipedia_attempt(&self) -> Result<()> {
+        let previous = self
+            .attempts
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                if self.attempt_budget.is_some_and(|limit| count >= limit) {
+                    None
+                } else {
+                    count.checked_add(1)
+                }
+            })
+            .map_err(|_| Error::capacity("Source attempt budget exhausted."))?;
+        if let Some(observer) = &self.attempt_observer {
+            observer(previous + 1)?;
+        }
+        Ok(())
+    }
+
+    async fn pace_wikipedia(&self) -> Result<()> {
+        loop {
+            let wait = {
+                let mut clocks = self.rates.lock().await;
+                let now = Instant::now();
+                let floor = self
+                    .wikipedia_policy_floor
+                    .load(Ordering::Acquire)
+                    .saturating_sub(devres_domain::unix_now())
+                    .max(0) as u64;
+                let policy_until = now + Duration::from_secs(floor.min(365 * 24 * 60 * 60));
+                let scheduled = clocks
+                    .get("wikipedia-api")
+                    .copied()
+                    .unwrap_or(now)
+                    .max(policy_until);
+                if scheduled > now {
+                    Some(scheduled)
+                } else {
+                    clocks.insert(
+                        "wikipedia-api".into(),
+                        now + Duration::from_secs_f64(
+                            1.0 / f64::from(self.wikipedia_requests_per_second),
+                        ),
+                    );
+                    None
+                }
+            };
+            let Some(wait) = wait else {
+                return self.record_wikipedia_attempt();
+            };
+            // Recheck after sleeping: a different in-flight request can extend a cooldown.
+            tokio::time::sleep_until(wait).await;
+        }
+    }
+
+    async fn wikipedia_not_before(&self, unix_time: i64) {
+        let seconds = unix_time.saturating_sub(devres_domain::unix_now()).max(0) as u64;
+        // Tokio Instant cannot represent arbitrary remote timestamps. A very
+        // distant Retry-After is still returned exactly for durable admission.
+        let until = Instant::now() + Duration::from_secs(seconds.min(365 * 24 * 60 * 60));
+        let mut clocks = self.rates.lock().await;
+        let old = clocks.get("wikipedia-api").copied().unwrap_or(until);
+        clocks.insert("wikipedia-api".into(), old.max(until));
+    }
+
+    #[cfg(test)]
+    fn wikipedia_fixture_url(&self, value: &str) -> Result<String> {
+        if let Some(origin) = &self.test_origin {
+            let original = url::Url::parse(value)
+                .map_err(|_| Error::invalid("Invalid Wikipedia fixture URL."))?;
+            let mut destination = origin.clone();
+            destination.set_path(original.path());
+            destination.set_query(original.query());
+            return Ok(destination.into());
+        }
+        Ok(value.into())
+    }
+
+    pub(crate) async fn fetch_wikipedia(
+        &self,
+        operation: crate::wikipedia::source::Operation,
+        validators: Validators,
+        shutdown: CancellationToken,
+    ) -> Result<crate::wikipedia::source::Response> {
+        self.fetch_wikipedia_with_admission(operation, validators, shutdown, || async { Ok(()) })
+            .await
+    }
+
+    pub(crate) async fn fetch_wikipedia_with_admission<F, Fut>(
+        &self,
+        operation: crate::wikipedia::source::Operation,
+        validators: Validators,
+        shutdown: CancellationToken,
+        before_attempt: F,
+    ) -> Result<crate::wikipedia::source::Response>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        self.fetch_wikipedia_with_observer(operation, validators, shutdown, before_attempt, None)
+            .await
+    }
+    pub(crate) async fn fetch_wikipedia_with_observer<F, Fut>(
+        &self,
+        operation: crate::wikipedia::source::Operation,
+        validators: Validators,
+        shutdown: CancellationToken,
+        before_attempt: F,
+        observer: Option<crate::wikipedia::source::PolicyObserver>,
+    ) -> Result<crate::wikipedia::source::Response>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        let observed_retry_at = AtomicI64::new(0);
+        let result = async {
+            use crate::wikipedia::{cache::CacheMetadata, source::Response};
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut operation = operation;
+            let mut validators = validators;
+            let maximum = operation.max_bytes();
+            for hop in 0..=5 {
+                let effective_url = operation.url()?;
+                let action = operation.is_action();
+                let _action = if action {
+                    Some(
+                        bounded(&shutdown, deadline, async {
+                            self.wikipedia_action_slots
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| {
+                                    Error::unavailable("Wikipedia Action admission stopped.")
+                                })
+                        })
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let _api = bounded(&shutdown, deadline, async {
+                    self.wikipedia_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::unavailable("Wikipedia admission stopped."))
+                })
+                .await?;
+                let _transfer = bounded(&shutdown, deadline, async {
+                    self.bulk_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::unavailable("HTTP admission stopped."))
+                })
+                .await?;
+                bounded(&shutdown, deadline, self.pace_wikipedia()).await?;
+                bounded(&shutdown, deadline, before_attempt()).await?;
+                #[cfg(test)]
+                let destination = self.wikipedia_fixture_url(&effective_url)?;
+                #[cfg(not(test))]
+                let destination = effective_url.clone();
+                let mut builder = self
+                    .client
+                    .get(destination)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .header(
+                        reqwest::header::USER_AGENT,
+                        crate::wikipedia::source::USER_AGENT,
+                    )
+                    .header(reqwest::header::ACCEPT_ENCODING, "gzip");
+                if let Some(etag) = &validators.etag {
+                    if etag.len() > 8192 {
+                        return Err(Error::invalid("Invalid Wikipedia validator."));
+                    }
+                    builder = builder.header(reqwest::header::IF_NONE_MATCH, etag);
+                }
+                if let Some(modified) = &validators.last_modified {
+                    if modified.len() > 8192 {
+                        return Err(Error::invalid("Invalid Wikipedia validator."));
+                    }
+                    builder = builder.header(reqwest::header::IF_MODIFIED_SINCE, modified);
+                }
+                let sent_at = devres_domain::unix_now();
+                let started = Instant::now();
+                let mut action_attempt = WikipediaActionAttempt {
+                    started,
+                    active: action,
+                    floor: self.wikipedia_policy_floor.clone(),
+                    observed: &observed_retry_at,
+                    observer: observer.clone(),
+                };
+                let response = bounded(&shutdown, deadline, async {
+                    builder
+                        .send()
+                        .await
+                        .map_err(|_| Error::unavailable("Wikipedia source connection failed."))
+                })
+                .await;
+                let received_at = devres_domain::unix_now();
+                let initial_action_slow_until = (action
+                    && started.elapsed() > Duration::from_secs(1))
+                .then(|| received_at.saturating_add(5));
+                let mut retry_at = response.as_ref().ok().and_then(|response| {
+                    wikipedia_retry_at(response.headers(), response.status().as_u16(), received_at)
+                });
+                // Observe every policy already available from these headers before
+                // the first await: dropping during a short Action receipt must not
+                // discard a longer Retry-After on the same response.
+                if let Some(until) = retry_at.into_iter().chain(initial_action_slow_until).max() {
+                    observed_retry_at.fetch_max(until, Ordering::AcqRel);
+                    let receipt = self.wikipedia_policy_receipt(until, &observer)?;
+                    self.wikipedia_not_before(until).await;
+                    if let Some(receipt) = receipt {
+                        receipt.await?;
+                    }
+                }
+                let response = response?;
+                let status = response.status().as_u16();
+                let cache =
+                    match CacheMetadata::from_headers(response.headers(), sent_at, received_at) {
+                        Ok(cache) => cache,
+                        Err(_) => {
+                            // Cache corruption must not erase a valid throttling delay.
+                            // Return only status/policy failure evidence, never body bytes.
+                            let until = retry_at.unwrap_or_else(|| received_at.saturating_add(5));
+                            observed_retry_at.fetch_max(until, Ordering::AcqRel);
+                            let receipt = self.wikipedia_policy_receipt(until, &observer)?;
+                            action_attempt.active = false;
+                            self.wikipedia_not_before(until).await;
+                            if let Some(receipt) = receipt {
+                                receipt.await?;
+                            }
+                            return Ok(Response {
+                                effective_url,
+                                status,
+                                body: Vec::new(),
+                                validators: Validators::default(),
+                                cache: CacheMetadata {
+                                    request_sent_at: sent_at,
+                                    received_at,
+                                    ..CacheMetadata::default()
+                                },
+                                retry_at: Some(until),
+                                action_slow_until: initial_action_slow_until,
+                                api_error: Some("malformed_cache_metadata".into()),
+                            });
+                        }
+                    };
+                if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                    if hop == 5 {
+                        return Err(Error::unavailable("Wikipedia redirect limit exceeded."));
+                    }
+                    let location = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .ok_or_else(|| Error::integrity("Invalid Wikipedia redirect."))?;
+                    operation = wikipedia_redirect(&operation, &effective_url, location)?;
+                    // Validators identify a representation URL and never cross a redirect.
+                    validators = Validators::default();
+                    action_attempt.active = false;
+                    continue;
+                }
+                if status == 200 && !cache.retention_allowed()? {
+                    // Preserve policy evidence, but never expose forbidden body bytes
+                    // to any durable-capture caller.
+                    action_attempt.active = false;
+                    return Ok(Response {
+                        effective_url,
+                        status,
+                        body: Vec::new(),
+                        validators: cache.validators(),
+                        cache,
+                        retry_at,
+                        action_slow_until: initial_action_slow_until,
+                        api_error: None,
+                    });
+                }
+                let mut body = Vec::new();
+                if status == 200 {
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > maximum as u64)
+                    {
+                        return Err(Error::capacity(
+                            "Wikipedia response exceeds its byte budget.",
+                        ));
+                    }
+                    let mut decoder = WikipediaDecoder::new(response.headers())?;
+                    let mut input = response.bytes_stream();
+                    let mut received = 0usize;
+                    while let Some(chunk) =
+                        bounded(&shutdown, deadline, async {
+                            input.next().await.transpose().map_err(|_| {
+                                Error::unavailable("Wikipedia source transfer failed.")
+                            })
+                        })
+                        .await?
+                    {
+                        received = received
+                            .checked_add(chunk.len())
+                            .filter(|bytes| *bytes <= maximum)
+                            .ok_or_else(|| {
+                                Error::capacity("Wikipedia transfer exceeds its byte budget.")
+                            })?;
+                        for part in chunk.chunks(16 * 1024) {
+                            let decoded =
+                                decoder.decode(part, maximum.saturating_sub(body.len()))?;
+                            body.extend_from_slice(&decoded);
+                        }
+                    }
+                    body.extend(decoder.finish(maximum.saturating_sub(body.len()))?);
+                }
+                let api_error = if action && status == 200 {
+                    serde_json::from_slice::<serde_json::Value>(&body)
+                        .map_err(|_| Error::integrity("Invalid Wikipedia Action response."))
+                        .map(|parsed| {
+                            parsed.get("error").map(|error| {
+                                match error.get("code").and_then(serde_json::Value::as_str) {
+                                    Some("maxlag") => "maxlag",
+                                    Some("ratelimited") => "ratelimited",
+                                    Some("readonly") => "readonly",
+                                    _ => "upstream_error",
+                                }
+                                .to_owned()
+                            })
+                        })
+                } else {
+                    Ok(None)
+                };
+                if let Some(code) = api_error.as_ref().ok().and_then(|code| code.as_deref()) {
+                    let fallback = if code == "ratelimited" { 60 } else { 5 };
+                    let until = retry_at
+                        .unwrap_or_else(|| devres_domain::unix_now().saturating_add(fallback));
+                    retry_at = Some(until);
+                    // Do not retain upstream diagnostic messages in resources or state.
+                    body.clear();
+                }
+                let action_slow_until = (action && started.elapsed() > Duration::from_secs(1))
+                    .then(|| devres_domain::unix_now().saturating_add(5));
+                if let Some(until) = retry_at.into_iter().chain(action_slow_until).max() {
+                    observed_retry_at.fetch_max(until, Ordering::AcqRel);
+                    let receipt = self.wikipedia_policy_receipt(until, &observer)?;
+                    action_attempt.active = false;
+                    self.wikipedia_not_before(until).await;
+                    if let Some(receipt) = receipt {
+                        receipt.await?;
+                    }
+                }
+                action_attempt.active = false;
+                let api_error = api_error?;
+                return Ok(Response {
+                    effective_url,
+                    status,
+                    body,
+                    validators: cache.validators(),
+                    cache,
+                    retry_at,
+                    action_slow_until,
+                    api_error,
+                });
+            }
+            Err(Error::unavailable("Wikipedia source unavailable."))
+        }
+        .await;
+        result.map_err(|error| {
+            wikipedia_error_with_retry(error, observed_retry_at.load(Ordering::Acquire))
+        })
+    }
+
+    /// The long-lived stream has its own permit and never occupies a transfer
+    /// slot while idle. A caller-owned durable lease coordinates replicas.
+    pub(crate) async fn open_wikipedia_stream(
+        &self,
+        last_event_id: Option<String>,
+        shutdown: CancellationToken,
+    ) -> Result<crate::wikipedia::events::Connection> {
+        self.open_wikipedia_stream_with_observer(last_event_id, shutdown, None)
+            .await
+    }
+    pub(crate) async fn open_wikipedia_stream_with_observer(
+        &self,
+        last_event_id: Option<String>,
+        shutdown: CancellationToken,
+        observer: Option<crate::wikipedia::source::PolicyObserver>,
+    ) -> Result<crate::wikipedia::events::Connection> {
+        let observed_retry_at = AtomicI64::new(0);
+        let result = async {
+            use crate::wikipedia::{
+                events::{Connection, validate_resume_id},
+                source::STREAM_URL,
+            };
+            if let Some(id) = &last_event_id {
+                validate_resume_id(id)?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let permit = bounded(&shutdown, deadline, async {
+                self.wikipedia_stream_slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::unavailable("Wikipedia stream admission stopped."))
+            })
+            .await?;
+            self.record_wikipedia_attempt()?;
+            #[cfg(test)]
+            let destination = self.wikipedia_fixture_url(STREAM_URL)?;
+            #[cfg(not(test))]
+            let destination = STREAM_URL;
+            let mut builder = self
+                .client
+                .get(destination)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .header(
+                    reqwest::header::USER_AGENT,
+                    crate::wikipedia::source::USER_AGENT,
+                )
+                .header(reqwest::header::ACCEPT_ENCODING, "gzip");
+            if let Some(id) = last_event_id.filter(|id| !id.is_empty()) {
+                builder = builder.header("Last-Event-ID", id);
+            }
+            let response = bounded(&shutdown, deadline, async {
+                builder
+                    .send()
+                    .await
+                    .map_err(|_| Error::unavailable("Wikipedia stream connection failed."))
+            })
+            .await?;
+            let status = response.status().as_u16();
+            let retry_at =
+                wikipedia_retry_at(response.headers(), status, devres_domain::unix_now());
+            if let Some(until) = retry_at {
+                observed_retry_at.fetch_max(until, Ordering::AcqRel);
+                let receipt = self.wikipedia_policy_receipt(until, &observer)?;
+                if let Some(receipt) = receipt {
+                    receipt.await?;
+                }
+            }
+            if status != 200 {
+                return Ok(Connection {
+                    status,
+                    retry_at,
+                    stream: Box::pin(futures::stream::empty()),
+                });
+            }
+            if !response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
+                })
+            {
+                return Err(Error::integrity("Invalid Wikipedia stream content type."));
+            }
+            let decoder = WikipediaDecoder::new(response.headers())?;
+            let input: BulkStream = Box::pin(response.bytes_stream().map(|result| {
+                result
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|_| Error::unavailable("Wikipedia stream transfer failed."))
+            }));
+            let state = WikipediaStreamState {
+                input,
+                decoder,
+                _permit: permit,
+                shutdown,
+                deadline: Instant::now() + Duration::from_secs(16 * 60),
+                pending: std::collections::VecDeque::new(),
+                ended: false,
+                retry_at,
+            };
+            let stream = futures::stream::try_unfold(state, |mut state| async move {
+                let retry_at = state.retry_at.unwrap_or(0);
+                let result = async {
+                    loop {
+                        if let Some(chunk) = state.pending.pop_front() {
+                            return Ok(Some((chunk, state)));
+                        }
+                        if state.ended {
+                            return Ok(None);
+                        }
+                        let idle_deadline =
+                            state.deadline.min(Instant::now() + Duration::from_secs(90));
+                        let next = bounded(&state.shutdown, idle_deadline, async {
+                            state.input.next().await.transpose()
+                        })
+                        .await?;
+                        let decoded = if let Some(input) = next {
+                            if input.len() > 1024 * 1024 {
+                                return Err(Error::capacity(
+                                    "Wikipedia stream chunk exceeds its bound.",
+                                ));
+                            }
+                            let mut decoded = Vec::new();
+                            for part in input.chunks(16 * 1024) {
+                                let output = state.decoder.decode(
+                                    part,
+                                    (8 * 1024 * 1024usize).saturating_sub(decoded.len()),
+                                )?;
+                                decoded.extend(output);
+                            }
+                            decoded
+                        } else {
+                            state.ended = true;
+                            state.decoder.finish(8 * 1024 * 1024)?
+                        };
+                        state
+                            .pending
+                            .extend(decoded.chunks(CHUNK_BYTES).map(<[u8]>::to_vec));
+                    }
+                }
+                .await;
+                result.map_err(|error| wikipedia_error_with_retry(error, retry_at))
+            });
+            Ok(Connection {
+                status,
+                retry_at,
+                stream: Box::pin(stream),
+            })
+        }
+        .await;
+        result.map_err(|error| {
+            wikipedia_error_with_retry(error, observed_retry_at.load(Ordering::Acquire))
+        })
+    }
+}
+
+fn wikipedia_error_with_retry(error: Error, retry_at: i64) -> Error {
+    if retry_at > 0 {
+        error.with_details(serde_json::json!({"retry_at":retry_at}))
+    } else {
+        error
+    }
+}
+
+fn wikipedia_retry_at(headers: &reqwest::header::HeaderMap, status: u16, now: i64) -> Option<i64> {
+    if let Some(value) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(now.saturating_add(seconds.min(i64::MAX as u64) as i64));
+        }
+        if let Ok(date) = httpdate::parse_http_date(value) {
+            return Some(
+                date.duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_secs().min(i64::MAX as u64) as i64)
+                    .unwrap_or(now)
+                    .max(now),
+            );
+        }
+    }
+    match status {
+        429 => Some(now.saturating_add(60)),
+        500..=599 => Some(now.saturating_add(5)),
+        _ => None,
+    }
+}
+
+fn wikipedia_redirect(
+    operation: &crate::wikipedia::source::Operation,
+    base: &str,
+    location: &str,
+) -> Result<crate::wikipedia::source::Operation> {
+    use crate::wikipedia::source::Operation;
+    let invalid = || Error::integrity("Wikipedia redirect destination is not permitted.");
+    if location.len() > 8192 || location.chars().any(char::is_control) || location.contains('\\') {
+        return Err(invalid());
+    }
+    let destination = url::Url::parse(base)
+        .map_err(|_| invalid())?
+        .join(location)
+        .map_err(|_| invalid())?;
+    if destination.scheme() != "https"
+        || destination.host_str() != Some("en.wikipedia.org")
+        || destination.port().is_some()
+        || !destination.username().is_empty()
+        || destination.password().is_some()
+        || destination.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    let parts: Vec<_> = destination.path_segments().ok_or_else(invalid)?.collect();
+    if parts.len() < 5 || parts[..4] != ["w", "rest.php", "v1", "page"] {
+        return Err(invalid());
+    }
+    let title = percent_encoding::percent_decode_str(parts[4])
+        .decode_utf8()
+        .map_err(|_| invalid())?
+        .into_owned();
+    crate::wikipedia::source::validate_title(&title).map_err(|_| invalid())?;
+    if destination
+        .query_pairs()
+        .any(|(key, value)| key != "redirect" || value != "no")
+    {
+        return Err(invalid());
+    }
+    match operation {
+        Operation::ArticleHtml { .. } if parts.len() == 6 && parts[5] == "with_html" => {
+            Ok(Operation::ArticleHtml { title })
+        }
+        Operation::ArticleSource { .. } if parts.len() == 5 => {
+            Ok(Operation::ArticleSource { title })
+        }
+        _ => Err(invalid()),
+    }
+}
+
+struct WikipediaBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl std::io::Write for WikipediaBuffer {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if input.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(
+                "Wikipedia decoded byte budget exceeded.",
+            ));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct WikipediaDecoder {
+    gzip: Option<flate2::write::MultiGzDecoder<WikipediaBuffer>>,
+}
+impl WikipediaDecoder {
+    fn new(headers: &reqwest::header::HeaderMap) -> Result<Self> {
+        let encoding = headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .map(|value| value.to_str().map(str::trim))
+            .transpose()
+            .map_err(|_| Error::integrity("Invalid Wikipedia content encoding."))?
+            .unwrap_or("identity");
+        match encoding {
+            "identity" => Ok(Self { gzip: None }),
+            "gzip" => Ok(Self {
+                gzip: Some(flate2::write::MultiGzDecoder::new(WikipediaBuffer {
+                    bytes: Vec::new(),
+                    limit: 0,
+                })),
+            }),
+            _ => Err(Error::integrity("Unsupported Wikipedia content encoding.")),
+        }
+    }
+    fn decode(&mut self, input: &[u8], limit: usize) -> Result<Vec<u8>> {
+        use std::io::Write;
+        if let Some(decoder) = &mut self.gzip {
+            decoder.get_mut().limit = limit;
+            decoder.write_all(input).map_err(|_| {
+                Error::capacity("Wikipedia gzip response is invalid or exceeds its bound.")
+            })?;
+            decoder.flush().map_err(|_| {
+                Error::capacity("Wikipedia gzip response is invalid or exceeds its bound.")
+            })?;
+            Ok(std::mem::take(&mut decoder.get_mut().bytes))
+        } else if input.len() <= limit {
+            Ok(input.to_vec())
+        } else {
+            Err(Error::capacity(
+                "Wikipedia response exceeds its byte budget.",
+            ))
+        }
+    }
+    fn finish(&mut self, limit: usize) -> Result<Vec<u8>> {
+        if let Some(mut decoder) = self.gzip.take() {
+            decoder.get_mut().limit = limit;
+            decoder.try_finish().map_err(|_| {
+                Error::integrity("Wikipedia gzip response is incomplete or invalid.")
+            })?;
+            Ok(std::mem::take(&mut decoder.get_mut().bytes))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+struct WikipediaStreamState {
+    input: BulkStream,
+    decoder: WikipediaDecoder,
+    _permit: OwnedSemaphorePermit,
+    shutdown: CancellationToken,
+    deadline: Instant,
+    pending: std::collections::VecDeque<Vec<u8>>,
+    ended: bool,
+    retry_at: Option<i64>,
+}
+
+#[cfg(test)]
+mod wikipedia_tests {
+    use super::*;
+    use crate::wikipedia::{
+        events::SseParser,
+        source::{Operation, WikipediaSource},
+    };
+    use axum::{
+        Router,
+        body::Body,
+        http::{HeaderMap, Response, StatusCode},
+        routing::get,
+    };
+    use std::io::Write;
+
+    async fn broker(app: Router) -> (Arc<BulkBroker>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture bind");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fixture server");
+        });
+        let origin = url::Url::parse(&format!("http://{address}")).expect("fixture URL");
+        (
+            Arc::new(BulkBroker::fixture(origin).expect("fixture broker")),
+            server,
+        )
+    }
+    fn gzip(value: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(value).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+    #[tokio::test]
+    async fn wikipedia_identified_gzip_fetch_retains_cache_evidence() {
+        let app = Router::new().route(
+            "/w/rest.php/v1/page/Rust/with_html",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers.get("accept-encoding").and_then(|v| v.to_str().ok()),
+                    Some("gzip")
+                );
+                assert!(
+                    headers
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v
+                            .contains("https://github.com/PublicData-stream/dev-resources-MCP"))
+                );
+                assert_eq!(
+                    headers.get("if-none-match").and_then(|v| v.to_str().ok()),
+                    Some("\"old\"")
+                );
+                Response::builder()
+                    .status(200)
+                    .header("content-encoding", "gzip")
+                    .header("cache-control", "public,max-age=600")
+                    .header("etag", "\"new\"")
+                    .body(Body::from(gzip(br#"{"id":1,"html":"Rust"}"#)))
+                    .expect("response")
+            }),
+        );
+        let (broker, server) = broker(app).await;
+        let source = WikipediaSource::new(broker.clone());
+        let response = source
+            .fetch(
+                Operation::ArticleHtml {
+                    title: "Rust".into(),
+                },
+                Validators {
+                    etag: Some("\"old\"".into()),
+                    last_modified: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(response.body, br#"{"id":1,"html":"Rust"}"#);
+        assert_eq!(response.validators.etag.as_deref(), Some("\"new\""));
+        assert!(response.cache.retention_allowed().expect("retention"));
+        assert_eq!(broker.attempt_count(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_retry_after_is_returned_without_internal_retry() {
+        let app = Router::new().fallback(|| async {
+            Response::builder()
+                .status(429)
+                .header("retry-after", "3600")
+                .body(Body::from("diagnostics must not escape"))
+                .expect("response")
+        });
+        let (broker, server) = broker(app).await;
+        let before = devres_domain::unix_now();
+        let response = WikipediaSource::new(broker.clone())
+            .fetch(
+                Operation::ArticleSource {
+                    title: "Rust".into(),
+                },
+                Validators::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("429");
+        assert_eq!(response.status, 429);
+        assert!(
+            response
+                .retry_at
+                .is_some_and(|until| until >= before + 3600)
+        );
+        assert!(response.body.is_empty());
+        assert_eq!(broker.attempt_count(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_private_response_cannot_expose_body_for_retention() {
+        let app = Router::new().fallback(|| async {
+            Response::builder()
+                .status(200)
+                .header("cache-control", "private, no-store")
+                .body(Body::from("forbidden bytes"))
+                .expect("response")
+        });
+        let (broker, server) = broker(app).await;
+        let response = WikipediaSource::new(broker)
+            .fetch(
+                Operation::ArticleSource {
+                    title: "Rust".into(),
+                },
+                Validators::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("policy response");
+        assert!(response.body.is_empty());
+        assert!(!response.cache.retention_allowed().expect("policy"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_malformed_cache_cannot_erase_retry_after() {
+        let app = Router::new().fallback(|| async {
+            Response::builder()
+                .status(429)
+                .header("retry-after", "3600")
+                .header("age", "malformed")
+                .body(Body::from("diagnostic body"))
+                .expect("response")
+        });
+        let (broker, server) = broker(app).await;
+        let before = devres_domain::unix_now();
+        let response = WikipediaSource::new(broker.clone())
+            .fetch(
+                Operation::ArticleSource {
+                    title: "Rust".into(),
+                },
+                Validators::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("throttling evidence");
+        assert_eq!(response.status, 429);
+        assert_eq!(
+            response.api_error.as_deref(),
+            Some("malformed_cache_metadata")
+        );
+        assert!(
+            response
+                .retry_at
+                .is_some_and(|until| until >= before + 3600)
+        );
+        assert!(response.body.is_empty());
+        assert_eq!(broker.attempt_count(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_post_header_gzip_and_stream_type_errors_preserve_retry_after() {
+        let app = Router::new().fallback(|| async {
+            Response::builder()
+                .status(200)
+                .header("retry-after", "3600")
+                .header("content-type", "application/json")
+                .header("content-encoding", "gzip")
+                .body(Body::from("invalid-gzip"))
+                .expect("response")
+        });
+        let (broker, server) = broker(app).await;
+        let before = devres_domain::unix_now();
+        let source = WikipediaSource::new(broker);
+        let error = source
+            .fetch(
+                Operation::ArticleSource {
+                    title: "Rust".into(),
+                },
+                Validators::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("bad gzip");
+        assert!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details["retry_at"].as_i64())
+                .is_some_and(|until| until >= before + 3600)
+        );
+        let error = source
+            .stream(None, CancellationToken::new())
+            .await
+            .err()
+            .expect("bad stream content type");
+        assert!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details["retry_at"].as_i64())
+                .is_some_and(|until| until >= before + 3600)
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_redirect_cancellation_preserves_a_long_observed_retry_after() {
+        let app = Router::new().fallback(|| async {
+            Response::builder()
+                .status(301)
+                .header("retry-after", "3600")
+                .header("location", "/w/rest.php/v1/page/Rust/with_html")
+                .body(Body::empty())
+                .expect("redirect")
+        });
+        let (broker, server) = broker(app).await;
+        let source = WikipediaSource::new(broker.clone());
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let before = devres_domain::unix_now();
+        let task = tokio::spawn(async move {
+            source
+                .fetch(
+                    Operation::ArticleHtml {
+                        title: "Alias".into(),
+                    },
+                    Validators::default(),
+                    token,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if broker
+                    .rates
+                    .lock()
+                    .await
+                    .get("wikipedia-api")
+                    .is_some_and(|until| *until > Instant::now() + Duration::from_secs(3000))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("observed header before cancellation");
+        cancel.cancel();
+        let error = task
+            .await
+            .expect("source task")
+            .err()
+            .expect("canceled redirect wait");
+        assert!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details["retry_at"].as_i64())
+                .is_some_and(|until| until >= before + 3600)
+        );
+        assert_eq!(broker.attempt_count(), 1);
+        assert!(
+            !serde_json::to_string(&error)
+                .expect("sanitized error")
+                .contains("/page/")
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_stream_has_an_independent_permit_and_projects_only_public_fields() {
+        let app = Router::new().route("/v2/stream/recentchange", get(|| async {
+            let value = serde_json::json!({"meta":{"domain":"en.wikipedia.org"},"wiki":"enwiki","server_name":"en.wikipedia.org","title":"Rust","namespace":0,"timestamp":100,"type":"edit","user":"private-editor"});
+            Response::builder().header("content-type", "text/event-stream").header("content-encoding", "gzip").body(Body::from(gzip(format!("data: {value}\n\n").as_bytes()))).expect("response")
+        }));
+        let (broker, server) = broker(app).await;
+        let _occupied = broker
+            .bulk_slots
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .expect("occupy transfer slots");
+        let mut connection = WikipediaSource::new(broker.clone())
+            .stream(None, CancellationToken::new())
+            .await
+            .expect("stream independent");
+        assert_eq!(connection.status, 200);
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        while let Some(chunk) = connection.stream.next().await {
+            events.extend(parser.push(&chunk.expect("chunk")).expect("events"));
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change.as_ref().expect("change").title, "Rust");
+        assert_eq!(broker.wikipedia_stream_slots.available_permits(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_off_origin_redirect_is_rejected_without_following() {
+        let app = Router::new().fallback(|| async {
+            Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(
+                    "location",
+                    "https://evil.invalid/w/rest.php/v1/page/Rust/with_html",
+                )
+                .body(Body::empty())
+                .expect("response")
+        });
+        let (broker, server) = broker(app).await;
+        assert!(
+            WikipediaSource::new(broker.clone())
+                .fetch(
+                    Operation::ArticleHtml {
+                        title: "Rust".into()
+                    },
+                    Validators::default(),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(broker.attempt_count(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_each_canonical_redirect_hop_requires_durable_admission() {
+        let app = Router::new()
+            .route(
+                "/w/rest.php/v1/page/Alias/with_html",
+                get(|| async {
+                    Response::builder()
+                        .status(307)
+                        .header("location", "/w/rest.php/v1/page/Rust/with_html")
+                        .body(Body::empty())
+                        .expect("redirect")
+                }),
+            )
+            .route(
+                "/w/rest.php/v1/page/Rust/with_html",
+                get(|| async { "{\"id\":1,\"html\":\"Rust\"}" }),
+            );
+        let (broker, server) = broker(app).await;
+        let reservations = AtomicUsize::new(0);
+        let result = WikipediaSource::new(broker.clone())
+            .fetch_with_admission(
+                Operation::ArticleHtml {
+                    title: "Alias".into(),
+                },
+                Validators::default(),
+                CancellationToken::new(),
+                || async {
+                    reservations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("canonical redirect");
+        assert_eq!(result.status, 200);
+        assert!(result.effective_url.contains("/page/Rust/with_html"));
+        assert_eq!(reservations.load(Ordering::SeqCst), 2);
+        assert_eq!(broker.attempt_count(), 2);
+        server.abort();
+    }
+    #[test]
+    fn wikipedia_gzip_bombs_and_redirect_query_injection_are_bounded() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().expect("header"));
+        let input = gzip(&vec![b'x'; 1024 * 1024]);
+        assert!(
+            WikipediaDecoder::new(&headers)
+                .expect("decoder")
+                .decode(&input, 1024)
+                .is_err()
+        );
+        let op = Operation::ArticleHtml {
+            title: "Rust".into(),
+        };
+        let base = op.url().expect("base");
+        assert!(
+            wikipedia_redirect(&op, &base, "/w/rest.php/v1/page/Rust/with_html?url=evil").is_err()
+        );
+        assert!(
+            wikipedia_redirect(&op, &base, "/w/rest.php/v1/page/Rust%20language/with_html").is_ok()
+        );
+    }
+    #[test]
+    fn wikipedia_gzip_sse_survives_arbitrarily_fragmented_transport_bytes() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().expect("header"));
+        let wire = b":ok\n\nevent: message\ndata: {\"meta\":{\"domain\":\"canary\"}}\n\n";
+        let compressed = gzip(wire);
+        let mut decoder = WikipediaDecoder::new(&headers).expect("decoder");
+        let mut decoded = Vec::new();
+        for byte in compressed {
+            decoded.extend(decoder.decode(&[byte], 1024).expect("fragmented gzip"));
+        }
+        decoded.extend(decoder.finish(1024).expect("gzip trailer"));
+        assert_eq!(decoded, wire);
+        assert_eq!(SseParser::new().push(&decoded).expect("SSE").len(), 1);
+        let mut members = gzip(wire);
+        members.extend(gzip(wire));
+        let mut decoder = WikipediaDecoder::new(&headers).expect("multi-member decoder");
+        let mut decoded = decoder
+            .decode(&members, 4096)
+            .expect("concatenated gzip members");
+        decoded.extend(decoder.finish(4096).expect("concatenated trailers"));
+        assert_eq!(
+            SseParser::new()
+                .push(&decoded)
+                .expect("two member SSE")
+                .len(),
+            2
+        );
+    }
+}
+
 type ByteReader = Pin<Box<dyn tokio::io::AsyncRead + Send>>;
 struct StreamState {
     reader: ByteReader,

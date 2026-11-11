@@ -13,7 +13,15 @@ use tokio_util::sync::CancellationToken;
 const MAX_VALUE: usize = 8 * 1024 * 1024;
 const PAGE: i64 = 128;
 const PROVIDERS: &[&str] = &[
-    "rfc", "crates", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+    "rfc",
+    "crates",
+    "rustsec",
+    "mdn",
+    "whatwg",
+    "w3c",
+    "chromium",
+    "npm",
+    "wikipedia",
 ];
 static CLAIM: AtomicU64 = AtomicU64::new(0);
 static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
@@ -173,14 +181,14 @@ async fn promote_control_for(
     if epoch == required.epoch {
         return Ok(());
     }
-    let rows=sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 9").fetch_all(&mut **tx).await.map_err(|_|invalid())?;
+    let rows=sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 10").fetch_all(&mut **tx).await.map_err(|_|invalid())?;
     for row in rows {
         let p: String = row.try_get("provider").map_err(|_| invalid())?;
         provider(&p)?;
         let _: Sweep = serde_json::from_value(checked("devres_attribution_sweeps", &p, &row)?)
             .map_err(|_| invalid())?;
     }
-    // Only eight small sweep checkpoints reset; retained generations and old jobs
+    // Only nine small sweep checkpoints reset; retained generations and old jobs
     // remain sealed and addressable. No corpus backfill occurs in startup.
     sqlx_core::query::query("DELETE FROM devres_attribution_sweeps")
         .execute(&mut **tx)
@@ -855,7 +863,7 @@ impl AttributionStore for PgBlobStore {
         for r in rows {
             counts.push(json!({"provider":r.try_get::<String,_>("provider").map_err(|_|invalid())?,"status":r.try_get::<String,_>("status").map_err(|_|invalid())?,"count":r.try_get::<i64,_>("count").map_err(|_|invalid())?}));
         }
-        let rows=sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 9").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        let rows=sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 10").fetch_all(&self.pool).await.map_err(|_|storage_error())?;
         let mut sweeps = Vec::new();
         for row in rows {
             let name: String = row.try_get("provider").map_err(|_| invalid())?;
@@ -1003,6 +1011,13 @@ fn sources(name: &str) -> Result<Vec<Source>> {
         filter: capture_filter,
     }];
     match name {
+        "wikipedia" => {
+            list.push(Source {
+                table: "devres_wikipedia_evidence",
+                select: "t.*,to_jsonb(t)-'data' AS metadata",
+                filter: "kind='captures'",
+            });
+        }
         "rfc" => {
             list.push(Source {
                 table: "devres_rfc_datasets",
@@ -1094,6 +1109,12 @@ fn compact_identity(value: &Value, depth: usize) -> Value {
                         | "metadata"
                         | "source_url"
                         | "revision"
+                        | "revision_id"
+                        | "page_id"
+                        | "representation"
+                        | "observed_at"
+                        | "acquisition_policy_epoch"
+                        | "acquisition_policy_fingerprint"
                         | "repository"
                         | "component"
                         | "source_path"
@@ -1176,6 +1197,7 @@ fn candidate(name: &str, table: &str, row: &PgRow, oversized: bool) -> Result<At
             Some("whatwg") => "whatwg",
             Some("w3c") => "w3c",
             Some("chromium") => "chromium",
+            Some("wikipedia") => "wikipedia",
             _ => "rfc",
         }
     } else {
@@ -1666,7 +1688,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         let request = FetchRequest {
             key: "rfc:9000".into(),
             url: "https://www.rfc-editor.org/rfc/rfc9000.txt".into(),
@@ -2140,7 +2162,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
             .attribution_claim(&["rfc".into()], now)

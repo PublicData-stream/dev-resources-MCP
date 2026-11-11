@@ -11,6 +11,7 @@ pub mod mdn;
 pub mod npm;
 pub mod w3c;
 pub mod whatwg;
+pub mod wikipedia;
 use async_trait::async_trait;
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture, Validators};
 use std::{

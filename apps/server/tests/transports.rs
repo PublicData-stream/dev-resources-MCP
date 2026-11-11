@@ -556,7 +556,7 @@ async fn native_webtransport_probe_both_revisions_and_origin_rejection() {
     for descriptor in devres_adapters::Research::tool_schemas() {
         registry
             .register(descriptor, |_, _| async {
-                Ok(json!({"collection_enabled":false,"counts":{}}))
+                Ok(json!({"collection_enabled":false,"counts":{},"coverage":"partial"}))
             })
             .unwrap();
     }

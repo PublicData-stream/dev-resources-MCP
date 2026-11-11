@@ -7,6 +7,23 @@ if [[ ${1:-} != --live ]]; then
   exit 2
 fi
 shift
+if [[ ${1:-} == --wikipedia ]]; then
+  shift
+  if (( $# == 0 )); then
+    root=$(mktemp -d /tmp/devres-wikipedia-live.XXXXXX)
+    printf 'devres-wikipedia-live-v1\n' > "$root/owner-v1"
+    chmod 600 "$root/owner-v1"
+  elif (( $# == 1 )); then
+    root=$1
+  else
+    echo 'usage: scripts/live-smoke.sh --live --wikipedia [OWNED_ROOT]' >&2
+    exit 2
+  fi
+  printf 'Retained bounded Wikipedia evidence (reuse this root to resume): %s\n' "$root" >&2
+  export CARGO_TARGET_DIR=/tmp/rust/target
+  export TMPDIR=/tmp
+  exec cargo run --locked -p devres-adapters --example wikipedia-live-probe -- --live "$root"
+fi
 if [[ ${1:-} == --html-transport ]]; then
   shift
   if (( $# == 0 )); then

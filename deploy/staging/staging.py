@@ -32,7 +32,7 @@ SERVER = 'ghcr.io/publicdata-stream/dev-resources-server@sha256:b317a2c87ea6ce33
 PROBE = 'ghcr.io/publicdata-stream/dev-resources-probe@sha256:820b235d1b267bd934f85a07d020762a234975a52745bccfe80648a69a1ff05b'
 SNIPPETS = ('52-upstream-devres-staging.toml', '62-route-devres-staging.toml')
 OWNER = 'devres-staging-v1'
-COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm')
+COLLECTORS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm', 'wikipedia')
 
 
 class OperatorError(RuntimeError):
@@ -475,14 +475,14 @@ def collectors_on():
         if any(parsed[c]['enabled'] for c in COLLECTORS):
             raise OperatorError('collectors_already_or_partially_enabled')
         changed = text.replace('enabled = false', 'enabled = true')
-        if sum(tomllib.loads(changed)[c]['enabled'] for c in COLLECTORS) != 8:
+        if sum(tomllib.loads(changed)[c]['enabled'] for c in COLLECTORS) != len(COLLECTORS):
             raise OperatorError('collector_update_invalid')
         tool.scale('backend', 0)
         tool.stopped('backend')
         write(PRIVATE / 'backend.toml', changed)
         config_secret()
         tool.start('backend', 1)
-    print('all eight collector families activated with unchanged provider limits')
+    print('all nine collector families activated with unchanged provider limits')
 
 
 def backup():

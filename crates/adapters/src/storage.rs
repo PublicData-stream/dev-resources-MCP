@@ -99,6 +99,8 @@ mod visibility;
 mod w3c_storage;
 #[path = "whatwg/storage.rs"]
 mod whatwg_storage;
+#[path = "wikipedia/storage.rs"]
+mod wikipedia_storage;
 
 const MAX_BLOB: usize = 128 * 1024 * 1024;
 static STAGE: AtomicU64 = AtomicU64::new(0);
@@ -271,7 +273,7 @@ impl PgBlobStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| storage_error())?;
-        if !matches!(version, 11..=13) {
+        if !matches!(version, 11..=14) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
             ));
@@ -405,6 +407,19 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
+        let schema_upgrade_lock = version < 14 && mode == OpenMode::Serve;
+        if schema_upgrade_lock {
+            let exclusive: bool =
+                sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490, 2)")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| storage_error())?;
+            if !exclusive {
+                return Err(Error::capacity(
+                    "Stop serving readers before the Wikipedia storage schema upgrade.",
+                ));
+            }
+        }
         if version == 1 {
             sqlx_core::raw_sql::raw_sql(corpus_storage::SCHEMA_V2)
                 .execute(&mut *tx)
@@ -416,7 +431,7 @@ impl PgBlobStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        } else if !(2..=13).contains(&version) {
+        } else if !(2..=14).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -538,11 +553,25 @@ impl PgBlobStore {
                 return Err(Error::unavailable("Object archive configuration required."));
             }
         }
+        if version < 14
+            && matches!(
+                mode,
+                OpenMode::Serve
+                    | OpenMode::Maintenance
+                    | OpenMode::Transfer
+                    | OpenMode::RestoreCheck
+            )
+        {
+            sqlx_core::raw_sql::raw_sql(wikipedia_storage::SCHEMA_V14)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
         if matches!(
             mode,
             OpenMode::Serve | OpenMode::Maintenance | OpenMode::Transfer | OpenMode::RestoreCheck
         ) {
-            sqlx_core::query::query("UPDATE devres_schema SET version=13 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=14 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
@@ -562,6 +591,16 @@ impl PgBlobStore {
             .map_err(|_| storage_error())?;
         }
         tx.commit().await.map_err(|_| storage_error())?;
+        if schema_upgrade_lock {
+            let released: bool =
+                sqlx_core::query_scalar::query_scalar("SELECT pg_advisory_unlock(1835365490, 2)")
+                    .fetch_one(&mut owner)
+                    .await
+                    .map_err(|_| storage_error())?;
+            if !released {
+                return Err(storage_error());
+            }
+        }
         if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
             tokio::fs::create_dir_all(root.as_ref())
                 .await

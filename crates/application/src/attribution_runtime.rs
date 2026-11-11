@@ -21,10 +21,22 @@ pub trait AttributionAcquirer: Send + Sync {
         target: &AttributionTarget,
         cancel: CancellationToken,
     ) -> Result<AttributionGeneration>;
+    /// Current source visibility is independent of immutable qualification.
+    async fn ensure_public(&self, _subject: &AttributionSubject) -> Result<()> {
+        Ok(())
+    }
 }
 
-pub const ATTRIBUTION_PROVIDERS: [&str; 8] = [
-    "rfc", "crates", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+pub const ATTRIBUTION_PROVIDERS: [&str; 9] = [
+    "rfc",
+    "crates",
+    "rustsec",
+    "mdn",
+    "whatwg",
+    "w3c",
+    "chromium",
+    "npm",
+    "wikipedia",
 ];
 
 /// A single supervised repair lane bounds work; SQL claims coalesce readers/sweeps.
@@ -238,8 +250,10 @@ impl AttributionGate for AttributionRuntime {
             if !seen.insert(identity) {
                 continue;
             }
+            self.acquirer.ensure_public(&target.subject).await?;
             match self.store.attribution_ready(&target.subject).await? {
                 Some(generation) if current(&generation, &target.subject) => {
+                    self.acquirer.ensure_public(&target.subject).await?;
                     generations.push(generation)
                 }
                 _ => {
@@ -273,6 +287,11 @@ impl AttributionGate for AttributionRuntime {
             .iter()
             .map(|g| format!("devres://attribution/{}", g.id))
             .collect();
+        for generation in &generations {
+            self.acquirer
+                .ensure_public(&generation.generation.subject)
+                .await?;
+        }
         Ok(
             json!({"status":"ready","policy_epoch":ATTRIBUTION_POLICY_EPOCH,
             "policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT,
@@ -285,6 +304,9 @@ impl AttributionGate for AttributionRuntime {
             return Err(Error::invalid("Invalid attribution resource page."));
         }
         let generation = self.store.attribution_bundle(id).await?;
+        self.acquirer
+            .ensure_public(&generation.generation.subject)
+            .await?;
         if !current(&generation, &generation.generation.subject) {
             return Err(Error::unavailable("Attribution policy is obsolete."));
         }
@@ -301,6 +323,9 @@ impl AttributionGate for AttributionRuntime {
                 "Attribution page limit cannot contain the next UTF-8 character.",
             ));
         }
+        self.acquirer
+            .ensure_public(&generation.generation.subject)
+            .await?;
         Ok(
             json!({"contents":[{"uri":format!("devres://attribution/{id}"),
             "mimeType":"text/plain","text":&text[offset..end],

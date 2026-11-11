@@ -27,6 +27,7 @@ pub struct Research {
     whatwg_research: Option<Arc<crate::whatwg::research::WhatwgResearch>>,
     w3c_research: Option<Arc<crate::w3c::research::W3cResearch>>,
     chromium_research: Option<Arc<crate::chromium::research::ChromiumResearch>>,
+    wikipedia_research: Option<Arc<crate::wikipedia::research::WikipediaResearch>>,
     npm: crate::npm::NpmPackages,
     npm_corpus: Option<Arc<crate::npm::NpmCorpus>>,
     npm_research: Option<Arc<crate::npm::research::NpmResearch>>,
@@ -128,6 +129,7 @@ impl Research {
             whatwg_research: None,
             w3c_research: None,
             chromium_research: None,
+            wikipedia_research: None,
         })
     }
 
@@ -177,6 +179,12 @@ impl Research {
         self
     }
 
+    pub fn with_wikipedia_corpus(mut self, corpus: Arc<crate::wikipedia::WikipediaCorpus>) -> Self {
+        self.wikipedia_research = Some(Arc::new(
+            crate::wikipedia::research::WikipediaResearch::new(corpus),
+        ));
+        self
+    }
     pub fn with_chromium_corpus(mut self, corpus: Arc<crate::chromium::ChromiumCorpus>) -> Self {
         self.chromium_research = Some(Arc::new(crate::chromium::research::ChromiumResearch::new(
             corpus,
@@ -200,6 +208,20 @@ impl Research {
         cancel: tokio_util::sync::CancellationToken,
         deadline: tokio::time::Instant,
     ) -> Result<Value> {
+        if tool.starts_with("wikipedia.") {
+            let token = cancel.child_token();
+            let _guard = token.clone().drop_guard();
+            let work = async {
+                let research = self.wikipedia_research.as_ref().ok_or_else(|| {
+                    Error::unavailable("Wikipedia corpus storage is not configured.")
+                })?;
+                let output = research.call(tool, input, token).await?;
+                let output = self.qualify_output(tool, "wikipedia", output).await?;
+                research.ensure_output_visible(&output).await?;
+                Ok(output)
+            };
+            return tokio::select! {biased;_=cancel.cancelled()=>Err(Error::new("cancelled","Request cancelled.")),result=tokio::time::timeout_at(deadline,work)=>result.map_err(|_|Error::unavailable("Wikipedia tool deadline exceeded."))?};
+        }
         if tool == "search" {
             let output = self
                 .search_with_context(decode(input)?, cancel.clone(), deadline)
@@ -267,6 +289,11 @@ impl Research {
             gate.qualify(provider, &output).await?
         };
         output["attribution"] = attribution;
+        if matches!(provider, "wikipedia" | "mixed")
+            && let Some(research) = &self.wikipedia_research
+        {
+            research.ensure_output_visible(&output).await?;
+        }
         Ok(output)
     }
 
@@ -334,6 +361,15 @@ impl Research {
     }
 
     async fn call_unqualified(&self, tool: &str, input: Value) -> Result<Value> {
+        if tool.starts_with("wikipedia.") {
+            return self
+                .wikipedia_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Wikipedia corpus storage is not configured."))?
+                .call(tool, input, tokio_util::sync::CancellationToken::new())
+                .await;
+        }
+
         if crate::npm::schemas()
             .iter()
             .any(|schema| schema["name"] == tool)
@@ -575,6 +611,19 @@ impl Research {
                 self.advisory_summary_sources(self.advisory.search(&query, page).await?)
                     .await
             }
+            "wikipedia" => {
+                self.wikipedia_research
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::unavailable("Wikipedia corpus storage is not configured.")
+                    })?
+                    .call(
+                        "wikipedia.search",
+                        json!({"query":query,"offset":page.offset,"limit":page.limit}),
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            }
             "chromium" => match self.chromium_research.as_ref() {
                 Some(research) => {
                     research
@@ -624,7 +673,7 @@ impl Research {
                 None => Err(Error::unavailable("MDN corpus storage is not configured.")),
             },
             _ => Err(Error::invalid(
-                "Search sources are rfc, cargo, rustsec, mdn, whatwg, w3c, chromium, and npm.",
+                "Search sources are rfc, cargo, rustsec, mdn, whatwg, w3c, chromium, npm, and wikipedia.",
             )),
         }
     }
@@ -642,6 +691,9 @@ impl Research {
                     json!({"name":name,"version":version}),
                 )
                 .await;
+        }
+        if let Some(title) = input.id.strip_prefix("wikipedia:") {
+            return self.wikipedia_research.as_ref().ok_or_else(||Error::unavailable("Wikipedia corpus storage is not configured."))?.call("wikipedia.get",json!({"title":title,"offset":input.offset.unwrap_or(0),"limit":input.limit.unwrap_or(32768)}),tokio_util::sync::CancellationToken::new()).await;
         }
         if let Some(id) = input.id.strip_prefix("chromium:") {
             let (document, anchor) = id.split_once('#').map_or((id, None), |(s, a)| (s, Some(a)));
@@ -792,7 +844,13 @@ impl Research {
         };
         let provider = provider_for_resource(url.host_str().unwrap_or("unknown"));
         let attribution = gate.qualify(provider, &output).await?;
-        attach_resource_attribution(output, attribution)
+        let output = attach_resource_attribution(output, attribution)?;
+        if matches!(provider, "wikipedia" | "mixed")
+            && let Some(research) = &self.wikipedia_research
+        {
+            research.ensure_output_visible(&output).await?;
+        }
+        Ok(output)
     }
 
     async fn read_resource_unqualified(&self, uri: &str) -> Result<Value> {
@@ -807,6 +865,14 @@ impl Research {
             || url.fragment().is_some()
         {
             return Err(Error::invalid("Invalid capture resource URI."));
+        }
+        if url.host_str() == Some("wikipedia") {
+            return self
+                .wikipedia_research
+                .as_ref()
+                .ok_or_else(|| Error::unavailable("Wikipedia corpus storage is not configured."))?
+                .resource(uri, tokio_util::sync::CancellationToken::new())
+                .await;
         }
         if url.host_str() == Some("chromium") {
             return self
@@ -921,6 +987,16 @@ impl Research {
             }
         }
         let stored = self.retrieval.read_capture(capture_id).await?;
+        if stored.capture.key.starts_with("wikipedia:")
+            || stored
+                .capture
+                .source_url
+                .starts_with("https://en.wikipedia.org/")
+        {
+            return Err(Error::unavailable(
+                "Wikipedia raw captures require visibility-checked typed resources.",
+            ));
+        }
         if matches!(
             stored.capture.media_type.as_str(),
             "application/pdf" | "application/gzip" | "application/zip"
@@ -974,6 +1050,35 @@ pub(crate) fn resource_evidence(output: &Value) -> Value {
 /// Empty search pages and natural version facts do not reproduce upstream
 /// prose. This is a narrow schema-aware exception, never targets-empty success.
 fn metadata_only_discovery(tool: &str, output: &Value) -> bool {
+    if tool == "wikipedia.snapshots"
+        && output
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| {
+                rows.iter().all(|r| {
+                    r.as_object().is_some_and(|o| {
+                        o.keys().all(|k| {
+                            matches!(
+                                k.as_str(),
+                                "id" | "cutoff"
+                                    | "published_at"
+                                    | "coverage"
+                                    | "language"
+                                    | "category_roots"
+                            )
+                        })
+                    })
+                })
+            })
+    {
+        return true;
+    }
+    if tool == "wikipedia.search"
+        && crate::wikipedia::attribution::is_metadata_only_discovery(output)
+    {
+        return true;
+    }
+
     fn copied(value: &Value, depth: usize) -> bool {
         if depth > 24 {
             return true;
@@ -1400,7 +1505,15 @@ struct SearchInput {
 }
 fn default_sources() -> Vec<String> {
     [
-        "rfc", "cargo", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+        "rfc",
+        "cargo",
+        "rustsec",
+        "mdn",
+        "whatwg",
+        "w3c",
+        "chromium",
+        "npm",
+        "wikipedia",
     ]
     .map(str::to_owned)
     .to_vec()
@@ -1444,13 +1557,13 @@ fn schemas() -> Vec<Value> {
     };
     add(
         "search",
-        "Search all eight developer source families by default: RFC metadata, Cargo and npm package discovery, RustSec advisories, and retained MDN, WHATWG, W3C and Chromium content. Select sources to narrow the search. Results, ranking, paging and errors remain source-specific. Use dedicated research tools for package full-text, compatibility, symbols and history.",
-        json!({"query":text,"sources":{"type":"array","description":"Omitted sources search rfc, cargo, rustsec, mdn, whatwg, w3c, chromium and npm in that order. Explicit selection searches only those families in the requested order.","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium","npm"]},"minItems":1,"maxItems":8,"uniqueItems":true},"offset":offset,"limit":limit}),
+        "Search all nine developer source families by default: RFC metadata, Cargo and npm package discovery, RustSec advisories, and retained MDN, WHATWG, W3C, Chromium and English Wikipedia content. Select sources to narrow the search. Results, ranking, paging and errors remain source-specific. Use dedicated research tools for package full-text, compatibility, symbols and history.",
+        json!({"query":text,"sources":{"type":"array","description":"Omitted sources search rfc, cargo, rustsec, mdn, whatwg, w3c, chromium, npm and wikipedia in that order. Explicit selection searches only those families in the requested order.","items":{"enum":["rfc","cargo","rustsec","mdn","whatwg","w3c","chromium","npm","wikipedia"]},"minItems":1,"maxItems":9,"uniqueItems":true},"offset":offset,"limit":limit}),
         vec!["query"],
     );
     add(
         "fetch",
-        "Retrieve rfc:<number>, crate:<name>@<version>, npm:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, w3c:<shortname>#<anchor>, chromium:<component>/<path>#<anchor>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
+        "Retrieve rfc:<number>, crate:<name>@<version>, npm:<name>@<version>, mdn:<slug>, mdn-compat:<feature>, whatwg:<standard>#<anchor>, w3c:<shortname>#<anchor>, chromium:<component>/<path>#<anchor>, wikipedia:<title>, or an immutable devres resource URI. Text offsets count UTF-8 bytes.",
         json!({"id":{"type":"string","minLength":1,"maxLength":16384},"offset":text_offset,"limit":text_limit}),
         vec!["id"],
     );
@@ -1509,6 +1622,7 @@ fn schemas() -> Vec<Value> {
     tools.extend(crate::whatwg::research::schemas());
     tools.extend(crate::w3c::research::schemas());
     tools.extend(crate::chromium::research::schemas());
+    tools.extend(crate::wikipedia::research::schemas());
     tools.extend(crate::npm::schemas());
     tools.extend(crate::npm::research::schemas());
     tools.extend(crate::npm::audit::schemas());

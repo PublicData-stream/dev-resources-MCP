@@ -35,6 +35,7 @@ pub mod rfc;
 pub mod rustsec;
 pub mod w3c;
 pub mod whatwg;
+pub mod wikipedia;
 
 // Compatibility aliases retain the original public module paths.
 pub use chromium::corpus as chromium_corpus;
@@ -90,3 +91,4 @@ pub use rustsec::{AdvisoryCorpus, RustSecConfig};
 pub use storage::PgBlobStore;
 pub use w3c::{W3cConfig, W3cCorpus};
 pub use whatwg::{WhatwgConfig, WhatwgCorpus};
+pub use wikipedia::{WikipediaConfig, WikipediaCorpus};

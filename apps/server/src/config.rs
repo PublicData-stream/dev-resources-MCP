@@ -391,6 +391,8 @@ pub struct Config {
     #[serde(default)]
     pub chromium: devres_adapters::chromium::ChromiumConfig,
     #[serde(default)]
+    pub wikipedia: devres_adapters::wikipedia::WikipediaConfig,
+    #[serde(default)]
     pub npm: devres_adapters::npm::NpmConfig,
 }
 impl Config {
@@ -406,6 +408,7 @@ impl Config {
         self.whatwg.validate()?;
         self.w3c.validate()?;
         self.chromium.validate()?;
+        self.wikipedia.validate()?;
         self.npm.validate()?;
         for access in [
             AccessPolicy {

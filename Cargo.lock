@@ -1262,6 +1262,7 @@ dependencies = [
  "quick-xml",
  "rcgen",
  "redb",
+ "regex",
  "reqwest",
  "ring",
  "rustsec",

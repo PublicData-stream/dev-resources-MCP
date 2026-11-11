@@ -84,6 +84,10 @@ const MDN_PATH: &str = "files/en-us/web/fixture/index.md";
 const MDN_TEXT: &str =
     "Synthetic MDN storage fixture\n\nOffline acceptance text about fetch network.\n";
 const MDN_SOURCE: &str = "---\ntitle: Synthetic MDN storage fixture\nslug: Web/Fixture\npage-type: guide\nbrowser-compat: api.fixtureFetch\n---\n\nSynthetic MDN storage fixture\n\nOffline acceptance text about fetch network.\n";
+const WIKIPEDIA_IDENTITY: &[u8] = b"devres:storage-probe:wikipedia:v1";
+const WIKIPEDIA_TITLE: &str = "Devres synthetic STEM fixture";
+const WIKIPEDIA_HTML: &str = "<h1>Synthetic Wikipedia storage fixture</h1><p>Offline STEM CPU instruction fixture only.</p><pre><code>fixture_opcode</code></pre><script>fixture_hidden_script()</script><p><math alttext=\"E=mc^2\"><mi>E</mi></math></p>";
+const WIKIPEDIA_SOURCE: &str = "= Synthetic Wikipedia storage fixture =\nOffline STEM CPU instruction fixture only.\n<syntaxhighlight>fixture_opcode</syntaxhighlight>\n";
 fn fixture_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
@@ -97,7 +101,183 @@ fn fixture_git_oid(bytes: &[u8]) -> String {
 fn fixture_ids() -> serde_json::Value {
     json!({"mdn_content":fixture_hash(MDN_CONTENT_IDENTITY),"mdn_compat":fixture_hash(MDN_COMPAT_IDENTITY),
         "whatwg":fixture_hash(WHATWG_IDENTITY),"w3c":fixture_hash(W3C_IDENTITY),
-        "chromium":fixture_hash(CHROMIUM_IDENTITY),"rustsec":fixture_hash(FIXTURE_IDENTITY)})
+        "chromium":fixture_hash(CHROMIUM_IDENTITY),"rustsec":fixture_hash(FIXTURE_IDENTITY),"wikipedia":fixture_hash(WIKIPEDIA_IDENTITY)})
+}
+
+async fn seed_wikipedia(
+    store: &PgBlobStore,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use devres_adapters::wikipedia::{
+        cache::CacheMetadata, corpus::ArticleCapture, source::Operation,
+    };
+    use devres_application::wikipedia::{State, WikipediaStore, Write};
+    use tokio_util::sync::CancellationToken;
+    let snapshot_id = fixture_hash(WIKIPEDIA_IDENTITY);
+    if store.wiki_get("snapshots", &snapshot_id).await?.is_some() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(root.join("wikipedia/raw-artifacts"))?;
+    let raw = devres_adapters::bulk::BulkArtifactStore::new(
+        root.join("wikipedia/raw-artifacts"),
+        64 * 1024 * 1024,
+    )?;
+    let now = devres_domain::unix_now();
+    let cache = CacheMetadata {
+        cache_control: Some("public, max-age=86400".into()),
+        date: Some(now),
+        request_sent_at: now,
+        received_at: now,
+        ..Default::default()
+    };
+    let projection = devres_adapters::wikipedia::processing::process_html(
+        WIKIPEDIA_HTML.as_bytes(),
+        CancellationToken::new(),
+    )?;
+    let projected = raw
+        .capture_bytes(serde_json::to_vec(&projection)?, CancellationToken::new())
+        .await?;
+    let mut writes = Vec::new();
+    let mut states = Vec::new();
+    let mut ids = Vec::new();
+    for (representation, body, operation) in [
+        (
+            "html",
+            WIKIPEDIA_HTML,
+            Operation::ArticleHtml {
+                title: WIKIPEDIA_TITLE.into(),
+            },
+        ),
+        (
+            "wikitext",
+            WIKIPEDIA_SOURCE,
+            Operation::ArticleSource {
+                title: WIKIPEDIA_TITLE.into(),
+            },
+        ),
+    ] {
+        let artifact = raw
+            .capture_bytes(body.as_bytes().to_vec(), CancellationToken::new())
+            .await?;
+        let id = fixture_hash(format!("devres:synthetic:wikipedia:{representation}:v1").as_bytes());
+        let capture = ArticleCapture {
+            id: id.clone(),
+            page_id: 777,
+            revision_id: 1,
+            title: WIKIPEDIA_TITLE.into(),
+            representation: representation.into(),
+            source_url: operation.url()?,
+            artifact,
+            projection: (representation == "html").then(|| projected.clone()),
+            processing_gaps: Vec::new(),
+            observed_at: now,
+            validated_at: now,
+            expires_at: now + 86400,
+            current: Some(false),
+            cache: cache.clone(),
+            categories: vec!["Category:Science".into()],
+            license: json!({"synthetic":true,"url":"https://fixtures.invalid/devres/storage-probe/license","title":"First-party synthetic AGPL-3.0-only fixture; not Wikimedia content"}),
+            acquisition_policy_epoch: 0,
+            acquisition_policy_fingerprint: "synthetic-fixture-not-upstream".into(),
+        };
+        writes.push(Write {
+            kind: "captures".into(),
+            key: id.clone(),
+            data: serde_json::to_value(capture)?,
+        });
+        states.push(State {
+            key: format!(
+                "endpoint:{}",
+                fixture_hash(format!("{representation}:{WIKIPEDIA_TITLE}").as_bytes())
+            ),
+            data: json!({"cache":cache,"capture":id}),
+            due_at: None,
+        });
+        ids.push(id);
+    }
+    let metadata = json!({"query":{"pages":[{"pageid":777,"ns":0,"title":WIKIPEDIA_TITLE,"lastrevid":1,"revisions":[{"revid":1}],"categories":[{"title":"Category:Science"}]}]}});
+    let metadata = raw
+        .capture_bytes(serde_json::to_vec(&metadata)?, CancellationToken::new())
+        .await?;
+    for operation in [
+        Operation::Metadata {
+            titles: vec![WIKIPEDIA_TITLE.into()],
+            page_ids: vec![],
+        },
+        Operation::Metadata {
+            titles: vec![],
+            page_ids: vec![777],
+        },
+    ] {
+        states.push(State {
+            key: format!(
+                "metadata-cache:{}",
+                fixture_hash(operation.url()?.as_bytes())
+            ),
+            data: json!({"cache":cache,"artifact":metadata}),
+            due_at: None,
+        });
+    }
+    states.extend([
+        State{key:"visibility:epoch".into(),data:json!(0),due_at:None},
+        State{key:"aliases".into(),data:json!({"titles":["Template:Current"],"complete":true}),due_at:None},
+        State{key:"page:777".into(),data:json!({"page_id":777,"title":WIKIPEDIA_TITLE,"html":ids[0],"wikitext":ids[1],"current_revision":1,"current":false,"synthetic":true}),due_at:None},
+        State{key:format!("title:{}",fixture_hash(WIKIPEDIA_TITLE.as_bytes())),data:json!(777),due_at:None},
+        State{key:"status".into(),data:json!({"enabled":false,"synthetic":true,"articles":1,"coverage":"synthetic_fixture"}),due_at:None},
+    ]);
+    store.wiki_commit(&writes, &states).await?;
+    let view = json!({"id":snapshot_id,"cutoff":store.wiki_cutoff().await?,"published_at":now,"synthetic":true,"coverage":"synthetic_fixture"});
+    store
+        .wiki_commit(
+            &[Write {
+                kind: "snapshots".into(),
+                key: snapshot_id,
+                data: view.clone(),
+            }],
+            &[State {
+                key: "snapshot:default".into(),
+                data: view,
+                due_at: None,
+            }],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn check_wikipedia(
+    store: std::sync::Arc<PgBlobStore>,
+    root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let corpus = devres_adapters::WikipediaCorpus::new_reader(
+        store,
+        std::sync::Arc::new(devres_adapters::bulk::BulkBroker::new(Default::default())?),
+        root,
+        devres_adapters::WikipediaConfig {
+            enabled: false,
+            min_free_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        },
+    )?;
+    for representation in ["text", "markdown", "html", "wikitext"] {
+        let result = corpus
+            .research_document(
+                &json!({"page_id":777,"snapshot":fixture_hash(WIKIPEDIA_IDENTITY)}),
+                representation,
+            )
+            .await?;
+        let text = result["text"]
+            .as_str()
+            .ok_or("Wikipedia fixture text missing")?;
+        if !text.contains("Synthetic Wikipedia storage fixture")
+            || result["capture"]["license"]["synthetic"] != true
+        {
+            return Err("Wikipedia synthetic fixture changed".into());
+        }
+        if matches!(representation, "text" | "markdown") && text.contains("fixture_hidden_script") {
+            return Err("Wikipedia projected active content leaked".into());
+        }
+    }
+    Ok(())
 }
 async fn fixture_projection(
     store: &PgBlobStore,
@@ -946,6 +1126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|error| format!("Synthetic W3C fixture seeding failed: {error}"))?;
             seed_chromium(&store, std::path::Path::new(&root)).await?;
+            seed_wikipedia(&store, std::path::Path::new(&root)).await?;
             seed_npm(store.clone(), std::path::Path::new(&root)).await?;
             store
                 .publish(
@@ -979,6 +1160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_whatwg(store.clone(), std::path::Path::new(&root)).await?;
     check_w3c(store.clone(), std::path::Path::new(&root)).await?;
     check_chromium(store.clone(), std::path::Path::new(&root)).await?;
+    check_wikipedia(store.clone(), std::path::Path::new(&root)).await?;
     check_npm(store.clone(), std::path::Path::new(&root)).await?;
     println!("{} {}", stored.capture.id, stored.capture.body_hash);
     Ok(())

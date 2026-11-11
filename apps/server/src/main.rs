@@ -266,10 +266,12 @@ async fn main() -> Result<(), ServerError> {
         .await?
     });
     let broker = Arc::new(
-        devres_adapters::bulk::BulkBroker::new(config.crates.bulk_config())?.with_npm_rates(
-            config.npm.registry_requests_per_second,
-            config.npm.advisory_requests_per_second,
-        )?,
+        devres_adapters::bulk::BulkBroker::new(config.crates.bulk_config())?
+            .with_npm_rates(
+                config.npm.registry_requests_per_second,
+                config.npm.advisory_requests_per_second,
+            )?
+            .with_wikipedia_rate(config.wikipedia.requests_per_second)?,
     );
     let fetcher = Arc::new(devres_adapters::HttpFetcher::with_broker(broker.clone())?);
     let mut retrieval = devres_application::Retrieval::new(store.clone(), fetcher);
@@ -411,6 +413,22 @@ async fn main() -> Result<(), ServerError> {
     if writer_role {
         chromium_corpus.initialize_status().await?;
     }
+    let wikipedia_corpus = Arc::new(
+        (if writer_role {
+            devres_adapters::wikipedia::WikipediaCorpus::new
+        } else {
+            devres_adapters::wikipedia::WikipediaCorpus::new_reader
+        })(
+            store.clone(),
+            broker.clone(),
+            &config.storage.blob_dir,
+            config.wikipedia.clone(),
+        )?
+        .with_delegate(delegate.clone()),
+    );
+    if writer_role {
+        wikipedia_corpus.initialize_status().await?;
+    }
     if chromium_rebuild {
         let shutdown = CancellationToken::new();
         let signal = shutdown.clone();
@@ -473,6 +491,7 @@ async fn main() -> Result<(), ServerError> {
         ("w3c", config.w3c.enabled),
         ("chromium", config.chromium.enabled),
         ("npm", config.npm.enabled),
+        ("wikipedia", config.wikipedia.enabled),
     ]
     .into_iter()
     .filter(|(_, enabled)| *enabled)
@@ -480,10 +499,10 @@ async fn main() -> Result<(), ServerError> {
     .collect();
     let mut attribution = devres_application::attribution_runtime::AttributionRuntime::new(
         store.clone(),
-        Arc::new(devres_adapters::AttributionAdapter::new(
-            broker.clone(),
-            store.clone(),
-        )),
+        Arc::new(
+            devres_adapters::AttributionAdapter::new(broker.clone(), store.clone())
+                .with_wikipedia(store.clone()),
+        ),
         enabled_attribution,
     )?;
     if let Some(delegate) = &delegate {
@@ -501,6 +520,7 @@ async fn main() -> Result<(), ServerError> {
             .with_w3c_corpus(w3c_corpus.clone())
             .with_chromium_corpus(chromium_corpus.clone())
             .with_npm_corpus(npm_corpus.clone())
+            .with_wikipedia_corpus(wikipedia_corpus.clone())
             .with_attribution_gate(attribution.clone()),
     );
     if let Some((command, manifest)) = crate_command {
@@ -550,7 +570,8 @@ async fn main() -> Result<(), ServerError> {
             corpus.clone(),
             crate_corpus.clone(),
             attribution.clone(),
-        ),
+        )
+        .with_wikipedia(wikipedia_corpus.clone()),
     );
     let mut registry = server_info_registry(config.source.url.clone())?;
     if !writer_role {
@@ -567,8 +588,24 @@ async fn main() -> Result<(), ServerError> {
             coordinator,
         })?;
     }
+    let wikipedia_shutdown = wikipedia_corpus.clone();
     let recover_archive_worker = store.has_object_archive();
     if writer_role {
+        let wikipedia_events = wikipedia_corpus.clone();
+        server.register_worker("wikipedia-events", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |token| {
+                wikipedia_events.run_events(token)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
+        server.register_worker("wikipedia-collector", move |shutdown| async move {
+            storage_worker::run(recover_archive_worker, shutdown, |token| {
+                wikipedia_corpus.run(token)
+            })
+            .await
+            .map_err(Into::into)
+        })?;
         server.register_worker("attribution-repair", move |shutdown| async move {
             storage_worker::run(recover_archive_worker, shutdown, |shutdown| {
                 attribution.run(shutdown)
@@ -732,9 +769,17 @@ async fn main() -> Result<(), ServerError> {
         signal.cancel();
     });
     let result = server.run(shutdown).await;
+    // Workers and request bodies have stopped; queued upstream policy receipts
+    // retain storage ownership until this bounded barrier completes.
+    let policy_result = wikipedia_shutdown.drain_policy_receipts().await;
+    if let Err(error) = &policy_result {
+        tracing::error!(code=%error.code, "Wikipedia policy receipt drain failed");
+    }
     signal_task.abort();
     let _ = signal_task.await;
-    result
+    result?;
+    policy_result?;
+    Ok(())
 }
 
 async fn migrate_storage_graphs(

@@ -18,6 +18,8 @@ packages.crate.advisory_snapshots
 packages.crate.audit_lockfile
 chromium.catalog_search chromium.compare chromium.corpus_status chromium.get chromium.history
 chromium.references chromium.search chromium.snapshots chromium.symbol_get chromium.symbol_search
+wikipedia.search wikipedia.catalog_search wikipedia.get wikipedia.metadata wikipedia.references
+wikipedia.history wikipedia.snapshots wikipedia.compare wikipedia.rg wikipedia.corpus_status
 packages.crate.api_get packages.crate.api_search packages.crate.catalog_search packages.crate.compare packages.crate.content_search
 packages.crate.corpus_status packages.crate.dependencies packages.crate.document_get packages.crate.metadata packages.crate.search
 packages.crate.source_list packages.crate.source_read packages.crate.versions
@@ -58,6 +60,8 @@ SYNTHETIC_W3C = "blake3:d0010c2164196909b62ef99e9ef0e149ee452bddb92e925d18aa16aa
 SYNTHETIC_W3C_TEXT = "Synthetic W3C storage fixture"
 SYNTHETIC_CHROMIUM = "blake3:1edf390e9156718f6022c74bc2b6604548987582948e2b19db5f58b619183b6c"
 SYNTHETIC_CHROMIUM_TEXT = "Synthetic CHROMIUM storage fixture"
+SYNTHETIC_WIKIPEDIA = "blake3:c5ee72b3887673dbe6e11e14111592a490149a0cfc7e7d4373bb5888183c0358"
+SYNTHETIC_WIKIPEDIA_TITLE = "Devres synthetic STEM fixture"
 SYNTHETIC_MDN_TEXT = "Synthetic MDN storage fixture"
 SYNTHETIC_ADVISORY = "RUSTSEC-2024-0001"
 SYNTHETIC_SNAPSHOT = "blake3:253b2fc6721b10bef9b167777528c2b72e7b85dce92a3483d095df93167a5763"
@@ -152,7 +156,7 @@ class Client:
 
 def assert_tool_inventory(tools):
     names = {tool["name"] for tool in tools}
-    assert len(tools) == len(names) == 88 and names == EXPECTED_TOOLS, "unexpected public tool inventory"
+    assert len(tools) == len(names) == 98 and names == EXPECTED_TOOLS, "unexpected public tool inventory"
 
 
 def assert_obsolete_tool_names_rejected(client, revision):
@@ -455,6 +459,47 @@ def synthetic_chromium(client):
             assert value["contents"][0].get("_meta", {}).get("source_metadata", {}).get("copyright") == "Synthetic fixture authors", "CHROMIUM resource copyright missing"
 
 
+def synthetic_wikipedia(client):
+    """First-party REST-shaped evidence only; every selection is local and fixed."""
+    for revision in (MODERN, LEGACY):
+        selection = {"page_id": 777, "snapshot": SYNTHETIC_WIKIPEDIA}
+        detail = client.tool("wikipedia.get", selection, revision)
+        capture = detail.get("capture", {})
+        assert capture.get("page_id") == 777 and capture.get("revision_id") == 1, "Wikipedia fixture identity changed"
+        assert capture.get("license", {}).get("synthetic") is True, "Wikipedia fixture must remain explicitly synthetic"
+        assert "First-party synthetic acceptance fixture" in detail.get("attribution", {}).get("readable_notice", ""), "Wikipedia fixture lost its first-party notice"
+        text = detail.get("page", {}).get("text", "")
+        assert "Synthetic Wikipedia storage fixture" in text and "fixture_hidden_script" not in text, "Wikipedia inert projection changed"
+        for representation in ("markdown", "html", "wikitext"):
+            represented = client.tool("wikipedia.get", {**selection, "representation": representation}, revision)
+            assert "Synthetic Wikipedia storage fixture" in represented.get("page", {}).get("text", ""), "Wikipedia format retrieval changed"
+            if representation == "markdown":
+                assert "E=mc^2" in represented["page"]["text"], "Wikipedia mathematical notation lost"
+            if representation == "html":
+                assert "fixture_hidden_script()" in represented["page"]["text"], "Wikipedia HTML evidence was modified"
+        for tool, arguments in (("wikipedia.search", {"query": "CPU"}),
+                                ("wikipedia.rg", {"pattern": "CPU|fixture_opcode"})):
+            result = client.tool(tool, {"snapshot": SYNTHETIC_WIKIPEDIA, **arguments}, revision)
+            assert result.get("items"), "Wikipedia local search fixture missing"
+        catalog = client.tool("wikipedia.catalog_search", {"snapshot": SYNTHETIC_WIKIPEDIA, "category": "Category:Science"}, revision)
+        assert catalog.get("items", [{}])[0].get("page_id") == 777, "Wikipedia category filter changed"
+        history = client.tool("wikipedia.history", selection, revision)
+        assert len(history.get("items", [])) == 2, "Wikipedia observed representation history changed"
+        uri = detail.get("resource_uri", "")
+        assert uri.startswith("devres://wikipedia/"), "Wikipedia resource lost capture binding"
+        for method, params in (("resources/read", {"uri": uri}),
+                               ("tools/call", {"name": "fetch", "arguments": {"id": uri}})):
+            value = client.call(method, params, revision)
+            if method == "tools/call":
+                assert not value.get("isError"), "Wikipedia immutable fetch failed"
+                value = value.get("structuredContent", value)
+            assert value.get("contents", [{}])[0].get("text") == text, "Wikipedia immutable resource changed"
+        natural = client.tool("fetch", {"id": "wikipedia:" + SYNTHETIC_WIKIPEDIA_TITLE}, revision)
+        assert natural.get("page", {}).get("text") == text, "Wikipedia generic title fetch changed"
+        rejected = client.call("tools/call", {"name": "fetch", "arguments": {"id": "devres://capture/" + capture["id"]}}, revision)
+        assert rejected.get("isError"), "Wikipedia generic raw capture bypass was accepted"
+
+
 def wait_ready(client, seconds):
     """Wait only for offline semantic routing readiness, never replay source work."""
     deadline = time.monotonic() + seconds
@@ -634,6 +679,7 @@ def main():
         synthetic_whatwg(client)
         synthetic_w3c(client)
         synthetic_chromium(client)
+        synthetic_wikipedia(client)
         synthetic_npm(client)
     if options.live:
         live(client, options.rfc_text_only)

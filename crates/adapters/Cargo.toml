@@ -50,6 +50,7 @@ lopdf = { version = "=0.46.0", default-features = false }
 zip = { version = "=9.0.0", default-features = false, features = ["deflate", "bzip2"] }
 csv-core = "0.1"
 pulldown-cmark = { version = "0.13.6", default-features = false }
+regex = "=1.13.1"
 yaml-rust2 = { version = "0.13", default-features = false }
 aws-sdk-s3 = { version = "=1.157.0", default-features = false, features = ["rt-tokio", "http-1x"] }
 aws-sdk-sts = { version = "=1.124.0", default-features = false, features = ["rt-tokio"] }
@@ -213,3 +214,7 @@ path = "examples/shared/static-rotation-probe.rs"
 [[example]]
 name = "html-transport-probe"
 path = "examples/shared/html-transport-probe.rs"
+
+[[example]]
+name = "wikipedia-live-probe"
+path = "examples/wikipedia/live-probe.rs"

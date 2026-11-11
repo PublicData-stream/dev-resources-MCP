@@ -263,7 +263,15 @@ mod tests {
             }
         }
         for family in [
-            "rfc", "crate", "advisory", "mdn", "whatwg", "w3c", "chromium", "npm",
+            "rfc",
+            "crate",
+            "advisory",
+            "mdn",
+            "whatwg",
+            "w3c",
+            "chromium",
+            "npm",
+            "wikipedia",
         ] {
             assert!(
                 families.contains(family),
@@ -282,7 +290,7 @@ mod tests {
         }
         let expected: Vec<String> =
             serde_json::from_str(include_str!("../tests/tool-names.json")).unwrap();
-        assert_eq!(expected.len(), 88);
+        assert_eq!(expected.len(), 98);
         assert_eq!(registry.tools.keys().cloned().collect::<Vec<_>>(), expected);
         for (namespace, count) in [("packages.crate.", 20), ("packages.npm.", 18)] {
             assert_eq!(
@@ -307,6 +315,7 @@ mod tests {
                         | "whatwg"
                         | "w3c"
                         | "chromium"
+                        | "wikipedia"
                 ));
                 assert!(!registry.tools.contains_key(&name.replacen('.', "_", 1)));
             } else {

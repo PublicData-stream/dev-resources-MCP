@@ -725,6 +725,7 @@ mod namespace_acceptance {
             ("w3c", "w3c/raw-artifacts"),
             ("chromium", "chromium/raw-artifacts"),
             ("npm", "npm/raw-artifacts"),
+            ("wikipedia", "wikipedia/raw-artifacts"),
         ];
         let git_namespaces = [
             ("crate-index", ""),

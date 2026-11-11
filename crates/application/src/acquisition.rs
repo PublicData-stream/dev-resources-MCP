@@ -71,6 +71,17 @@ pub enum SourceStatus {
 
 #[async_trait]
 pub trait AcquisitionDelegate: Send + Sync {
+    async fn wikipedia_request(&self, _title: Option<String>, _page_id: Option<u64>) -> Result<()> {
+        Err(devres_domain::Error::unavailable(
+            "Wikipedia acquisition is unavailable.",
+        ))
+    }
+    async fn wikipedia_search(&self, _query: String, _limit: usize) -> Result<serde_json::Value> {
+        Err(devres_domain::Error::unavailable(
+            "Wikipedia discovery is unavailable.",
+        ))
+    }
+
     async fn acquire(&self, operation: Acquisition) -> Result<Capture>;
     async fn effect(&self, operation: WriterEffect) -> Result<()>;
     async fn source_status(&self, _source: SourceStatus) -> Result<serde_json::Value> {

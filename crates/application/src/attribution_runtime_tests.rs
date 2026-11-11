@@ -2,6 +2,96 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
+struct VisibilityAcquirer {
+    checks: AtomicUsize,
+    block_at: usize,
+}
+fn wikipedia_subject() -> AttributionSubject {
+    let mut subject = target().subject;
+    subject.provider = "wikipedia".into();
+    subject
+}
+#[async_trait]
+impl AttributionAcquirer for VisibilityAcquirer {
+    fn targets(&self, _: &str, _: &Value) -> Result<Vec<AttributionTarget>> {
+        Ok(vec![AttributionTarget {
+            subject: wikipedia_subject(),
+            evidence: json!({}),
+        }])
+    }
+    async fn repair(
+        &self,
+        _: &AttributionTarget,
+        _: CancellationToken,
+    ) -> Result<AttributionGeneration> {
+        Err(Error::integrity(
+            "Visibility test must use already qualified evidence.",
+        ))
+    }
+    async fn ensure_public(&self, subject: &AttributionSubject) -> Result<()> {
+        assert_eq!(*subject, wikipedia_subject());
+        if self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.block_at {
+            return Err(Error::new("wikipedia_withheld", "Source withdrawn."));
+        }
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn current_visibility_overrides_ready_attribution_and_known_bundle_urls() {
+    for block_at in [1, 2, 3] {
+        let store = Arc::new(Memory::default());
+        let mut generation = generation();
+        generation.subject = wikipedia_subject();
+        *store.ready.lock().await = Some(QualifiedAttribution {
+            id: format!("blake3:{}", "a".repeat(64)),
+            generation,
+        });
+        let runtime = AttributionRuntime::new(
+            store,
+            Arc::new(VisibilityAcquirer {
+                checks: AtomicUsize::new(0),
+                block_at,
+            }),
+            vec!["wikipedia".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .qualify("wikipedia", &json!({}))
+                .await
+                .unwrap_err()
+                .code,
+            "wikipedia_withheld"
+        );
+    }
+    for block_at in [1, 2] {
+        let store = Arc::new(Memory::default());
+        let mut generation = generation();
+        generation.subject = wikipedia_subject();
+        *store.ready.lock().await = Some(QualifiedAttribution {
+            id: format!("blake3:{}", "a".repeat(64)),
+            generation,
+        });
+        let runtime = AttributionRuntime::new(
+            store,
+            Arc::new(VisibilityAcquirer {
+                checks: AtomicUsize::new(0),
+                block_at,
+            }),
+            vec!["wikipedia".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .bundle(&format!("blake3:{}", "a".repeat(64)), 0, 8)
+                .await
+                .unwrap_err()
+                .code,
+            "wikipedia_withheld"
+        );
+    }
+}
+
 #[derive(Default)]
 struct Memory {
     queued: Mutex<Vec<AttributionTarget>>,

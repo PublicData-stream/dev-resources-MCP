@@ -208,7 +208,15 @@ async fn malformed_and_oversized_npm_search_bodies_are_source_local() {
 async fn omitted_sources_match_explicit_all_sources_and_keep_unavailable_corpora_visible() {
     let _serial = SERIAL.lock().await;
     let sources = [
-        "rfc", "cargo", "rustsec", "mdn", "whatwg", "w3c", "chromium", "npm",
+        "rfc",
+        "cargo",
+        "rustsec",
+        "mdn",
+        "whatwg",
+        "w3c",
+        "chromium",
+        "npm",
+        "wikipedia",
     ];
     for explicit in [false, true] {
         let npm = serde_json::to_vec(
@@ -231,7 +239,7 @@ async fn omitted_sources_match_explicit_all_sources_and_keep_unavailable_corpora
         assert_eq!(rows[0]["result"]["items"][0]["id"], "rfc:9000");
         assert_eq!(rows[1]["result"]["items"][0]["name"], "fixture");
         assert_eq!(rows[7]["result"]["items"][0]["id"], "npm:fixture@1.0.0");
-        for row in &rows[2..7] {
+        for row in rows[2..7].iter().chain(&rows[8..]) {
             assert!(row["error"].as_str().unwrap().starts_with("unavailable:"));
             assert!(row.get("result").is_none());
         }
