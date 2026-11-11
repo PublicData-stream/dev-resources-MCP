@@ -57,9 +57,9 @@ jobs:
       - name: Install native HTTPS build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev llvm-dev perl pkg-config
       - run: cargo fmt --all -- --check
+      - run: python3 -m unittest discover -s scripts/tests
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: python3 -m unittest discover -s scripts/tests
       - run: git diff --check
       - name: PostgreSQL persistence
         run: scripts/test-postgres.sh
