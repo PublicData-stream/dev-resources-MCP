@@ -355,3 +355,71 @@ No actual non-null version was available, so version-deletion acceptance remains
 incomplete. A versioned canary would require separate resource/policy/test/cleanup
 authorization, with results explicitly scoped to that canary. Neither production
 bucket versioning nor its policy was changed.
+
+## Approved versioned-canary validation on 2026-11-11
+
+The user separately approved a composite validation method and one new private
+versioned bucket in the same project and Paris region. The canary used one key
+with two fixed synthetic bodies of 82 bytes each. Its workload grants matched the
+production actions, IP and TLS conditions after only bucket/prefix substitution;
+the sole additional principal was the exact, separately verified administrator,
+with authority confined to that canary. No IAM API key or IAM policy was created or
+modified, and production bucket versioning was not enabled.
+
+A read-only preparation initially rejected the actual canonical ACL owner format.
+Scaleway's [pinned canonical-owner helper](https://github.com/scaleway/terraform-provider-scaleway/blob/ec3786444d5378cda13079383530d065001c9d23/internal/services/object/helpers_object.go#L908)
+confirmed `project_id:project_id`,
+independently bound to the approved organization by the Account project response.
+The original proposal's format assumption, original controller, responses and
+counter state remain preserved. A reviewed continuation reused the ten successful
+IAM responses and unchanged policy/ACL bytes with their original observation
+times. It spent only the remaining reads and did not reset the budget. Creation
+dispatched within the bounded inherited-observation age and completed-snapshot
+review deadlines; reconstruction time was not presented as a new IAM fetch.
+
+Native policy installation returned HTTP200 with an empty body. The first helper
+expected 204 and stopped before any object PUT. A separately reviewed continuation, consistent with the [pinned SDK success handling](https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.114.0/service/s3/deserializers.go),
+verified that known acknowledgement and the exact installed policy, then performed
+only the unattempted tail. Bucket creation, versioning and policy installation
+were not repeated. Actual statuses remain recorded; the two compatibility fixes
+did not alter workload permissions or relax the required native denial.
+
+Both actual versions had distinct non-null IDs and exact administrator GET/hash
+verification before and after the workload checks. Using the existing operating
+pairs on the target, both applications returned GET200, prefix LIST200, known
+version DELETE403 `AccessDenied`, then GET200 again. Native request IDs, body
+hashes, ETags and exact version references remain in private evidence. This was
+six workload reads and two denied mutation attempts, with no recreation or retry.
+
+Administrator cleanup used the ordinary exact-version DELETE API without MFA,
+retention or bypass overrides: both returned 204 and their subsequent GETs
+returned 404 `NoSuchVersion`. Complete bucket-wide object, version, delete-marker
+and upload checks were empty. Only the canary policy was removed, with typed
+`NoSuchBucketPolicy` readback, and the verified empty owned bucket was deleted.
+HEAD404 and qualified project inventory absence confirmed removal.
+
+Fresh final identity, normalized IAM memberships/policies/rules/key metadata and production
+policy/ACL/versioning/features matched the before-state. A separate authenticated
+target read also confirmed both operating credential-file fingerprints unchanged.
+The original single-bucket probe's false version-deletion result and bytes remain
+unchanged. Production non-null-version testing is still explicitly unproved;
+the new evidence uses the approved production-policy-audit-plus-versioned-canary
+method, with final independent composite admission recorded separately.
+
+The administrator used 63 S3 reads, nine S3 mutations and 20 read-only IAM/project
+requests, within the respective 64, nine and 24 caps. Data PUTs totaled 164 bytes.
+No secret key values or authorization headers were printed, and administrator
+credentials remained local. Earlier rotation-trial artifacts and captures were
+outside this canary cleanup scope. Actual provider checks, offline helper tests,
+runtime rotation, public edge and production activation remain separate evidence.
+
+
+Final independent source-and-evidence review admitted only the generic
+`permanent_deletion_denied` check for the current unchanged production binding.
+A separate immutable composite admission links all 92 administrator request
+intents/results, eight target requests, final credential-file fingerprints and
+the unchanged original false probe; it does not replace any original result.
+The production operator's current private-input fingerprint calculation also
+matched this binding. No all-check storage receipt or runtime Secret was emitted.
+The separately pending runtime rotation/revocation trial still requires its two
+replacement-key approval; writer/backend and public activation remain stopped.
