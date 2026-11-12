@@ -1,6 +1,8 @@
 //! Network, durable storage, and source-specific research adapters.
 mod archive;
 mod attribution;
+#[cfg(test)]
+mod attribution_cluster_tests;
 pub mod attribution_providers;
 pub use attribution::AttributionAdapter;
 pub mod bulk;

@@ -441,6 +441,14 @@ collector_reads() {
       devres-probe https://edge:30443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
   done
 }
+attribution_readback() {
+  # The receipt contains bounded first-party fixture evidence only. Keep it under
+  # /tmp across maintenance-pod replacement, backend restart and database restore.
+  k exec -i storage-maintenance -- sh -c 'cat > /tmp/attribution-backlog-receipt.json' \
+    < "$scratch/attribution-backlog-receipt.json"
+  k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
+    attribution_backlog_cluster_readback
+}
 s3_capture_state() {
   k exec -i deployment/backend -- python3 - "$capture" "$1" <<'PYS3CAPTURE'
 import http.client, re, runpy, socket, sys, time, types, urllib.error, urllib.request
@@ -532,6 +540,12 @@ PYS3CAPTURE
 }
 stop_backend
 maintenance_start
+k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
+  attribution_backlog_cluster_seed
+k exec storage-maintenance -- cat /tmp/attribution-backlog-receipt.json \
+  > "$scratch/attribution-backlog-receipt.json"
+test "$(wc -c < "$scratch/attribution-backlog-receipt.json")" -le 32768
+attribution_readback
 before=$(k exec storage-maintenance -- storage-probe write)
 for provider in w3c chromium; do
   k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 "${provider}_collector_cluster_seed"
@@ -632,6 +646,7 @@ fi
 stop_backend
 maintenance_start
 test "$(k exec storage-maintenance -- storage-probe read)" = "$before"
+attribution_readback
 k exec deployment/postgres -- pg_dump -U devres -Fc devres > "$scratch/postgres.dump"
 if (( s3 )); then
   # The archive remains authoritative while every disposable local file is lost.
@@ -642,6 +657,7 @@ if (( s3 )); then
   k exec deployment/postgres -- psql -U devres -d postgres -c 'CREATE DATABASE devres OWNER devres_writer'
   k exec -i deployment/postgres -- pg_restore -U devres -d devres < "$scratch/postgres.dump"
   test "$(k exec storage-maintenance -- storage-probe read)" = "$before"
+  attribution_readback
   k exec storage-maintenance -- sh -c 'find /data/blobs -mindepth 1 -delete'
   maintenance_stop
   start_backend
@@ -733,6 +749,7 @@ k exec deployment/postgres -- psql -U devres -d postgres -c 'CREATE DATABASE dev
 k exec -i deployment/postgres -- pg_restore -U devres -d devres < "$scratch/postgres.dump"
 k exec -i storage-maintenance -- tar -C /data -xf - < "$scratch/blobs.tar"
 test "$(k exec storage-maintenance -- storage-probe read)" = "$before"
+attribution_readback
 maintenance_stop
 start_backend
 external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"

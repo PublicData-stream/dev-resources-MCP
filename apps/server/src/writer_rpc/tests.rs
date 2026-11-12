@@ -16,6 +16,7 @@ struct FakeWriter {
     hold: AtomicBool,
     entered: tokio::sync::Notify,
     cancelled: Arc<AtomicUsize>,
+    attribution: Option<Value>,
 }
 struct Cancelled(Arc<AtomicUsize>);
 impl Drop for Cancelled {
@@ -56,7 +57,10 @@ impl AcquisitionDelegate for FakeWriter {
         Ok(json!({"collector":{"index":{"code":"capacity"}}}))
     }
     async fn attribution_status(&self) -> Result<Value> {
-        Ok(json!({"scan_gaps":{"mdn":"capacity"},"complete":false}))
+        Ok(self
+            .attribution
+            .clone()
+            .unwrap_or_else(|| json!({"scan_gaps":{"mdn":"capacity"},"complete":false})))
     }
     async fn rfc_snapshot(&self) -> Result<String> {
         Ok("c".repeat(64))
@@ -97,6 +101,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(allowed: bool) -> Self {
+        Self::with_attribution(allowed, None).await
+    }
+    async fn with_attribution(allowed: bool, attribution: Option<Value>) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
         let cert = directory.path().join("writer.pem");
@@ -135,6 +142,7 @@ impl Fixture {
             hold: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
             cancelled: Arc::new(AtomicUsize::new(0)),
+            attribution,
         });
         let source = SourceOffer::new("https://source.test/revision").unwrap();
         let limits = Limits {
@@ -216,6 +224,110 @@ impl Fixture {
 }
 fn source_request() -> Value {
     json!({"kind":"acquire","source":{"operation":"rfc_representation","number":1,"format":"txt"}})
+}
+
+// Exercise the actual authenticated reply encoder and client decoder with the
+// storage sampler's envelope: two rows per bucket and a 24-KiB samples budget.
+// Storage tests separately check that real SQL samples obey that source bound.
+fn attribution_status_fixture(per_bucket: usize, sample_budget: Option<usize>) -> Value {
+    use devres_application::attribution_runtime::ATTRIBUTION_PROVIDERS;
+    use devres_domain::attribution::{
+        ATTRIBUTION_POLICY_EPOCH, AttributionDisposition, AttributionFailure,
+        AttributionFailureReason, AttributionPhase,
+    };
+    let mut samples = Vec::new();
+    let mut counts = Vec::new();
+    let mut sweeps = Vec::new();
+    let mut progress = serde_json::Map::new();
+    let mut scan_gaps = serde_json::Map::new();
+    for provider in ATTRIBUTION_PROVIDERS {
+        for status in ["pending", "retry", "running", "blocked", "ready"] {
+            counts.push(json!({"provider":provider,"status":status,"count":i64::MAX}));
+            if status == "ready" {
+                continue;
+            }
+            for priority in [0, 1] {
+                for _ in 0..per_bucket {
+                    let classification = AttributionFailure::new(
+                        AttributionPhase::Qualification,
+                        AttributionFailureReason::UpstreamUnavailable,
+                        if status == "blocked" {
+                            AttributionDisposition::Blocked
+                        } else {
+                            AttributionDisposition::Retry
+                        },
+                    );
+                    samples.push(
+                        json!({"provider":provider,"status":status,"priority":priority,
+                        "namespace":"devres_chromium_evidence/projection-references",
+                        "attempts":u32::MAX,"retry_at":i64::MAX,"eligible":false,
+                        "failure":"publication_deferred","classification":classification}),
+                    );
+                }
+            }
+        }
+        sweeps.push(json!({"provider":provider,"completed_passes":u64::MAX,
+            "scan_complete":false,"source":usize::MAX,"membership":"indexed_range_enumeration"}));
+        progress.insert(
+            provider.into(),
+            json!({"enqueued":u64::MAX,"claimed":u64::MAX,
+            "ready":u64::MAX,"retry":u64::MAX,"blocked":u64::MAX}),
+        );
+        scan_gaps.insert(provider.into(), json!("capacity"));
+    }
+    let candidates = samples.len();
+    if let Some(budget) = sample_budget {
+        while serde_json::to_vec(&samples).unwrap().len() > budget {
+            samples.pop().unwrap();
+        }
+        // Fill the budget with real enum/scalar rows, not arbitrary padding.
+        assert!(serde_json::to_vec(&samples).unwrap().len() > budget - 512);
+    }
+    json!({"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"counts":counts,"sweeps":sweeps,
+        "enabled_providers":ATTRIBUTION_PROVIDERS,"disabled_providers":[],
+        "scan_gaps":scan_gaps,"admission_gap":AttributionFailure::new(
+            AttributionPhase::Scheduling,AttributionFailureReason::AdmissionDeferred,AttributionDisposition::Retry),
+        "progress":{"scope":"this_store_process","started_at":i64::MAX,"providers":progress},
+        "diagnostics":{"sampled":true,"limit_per_bucket":per_bucket,"ordering":"retry_at_then_id",
+            "sample_budget_bytes":sample_budget,"truncated":samples.len()<candidates,
+            "omitted_sample_rows":candidates-samples.len(),"omission_scope":"bounded_candidates_only",
+            "observed_at":i64::MAX,"pending_age_available":false,"samples":samples},
+        "repair_complete_for_enqueued_targets":false,"initial_scan_passes_complete":false,
+        "completion_scope":"observed_sweep_cutoffs","complete":false,"corpus_complete":false})
+}
+
+#[tokio::test]
+async fn bounded_attribution_status_survives_authenticated_private_rpc() {
+    let status = attribution_status_fixture(2, Some(24 * 1024));
+    let encoded = serde_json::to_vec(&Reply::AttributionStatus {
+        status: status.clone(),
+    })
+    .unwrap();
+    assert!(encoded.len() <= RESPONSE_LIMIT);
+    let fixture = Fixture::with_attribution(true, Some(status.clone())).await;
+    let client = WriterClient::new(fixture.config.clone(), Duration::from_secs(5)).unwrap();
+    assert_eq!(client.attribution_status().await.unwrap(), status);
+    assert_eq!(fixture.kube.reviews.load(Ordering::SeqCst), 1);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn oversized_attribution_status_is_a_typed_private_rpc_failure() {
+    let status = attribution_status_fixture(4, None);
+    assert!(
+        serde_json::to_vec(&Reply::AttributionStatus {
+            status: status.clone()
+        })
+        .unwrap()
+        .len()
+            > RESPONSE_LIMIT
+    );
+    let fixture = Fixture::with_attribution(true, Some(status)).await;
+    let client = WriterClient::new(fixture.config.clone(), Duration::from_secs(5)).unwrap();
+    let error = client.attribution_status().await.unwrap_err();
+    assert_eq!(error.code, "capacity");
+    assert!(error.details.is_none());
+    fixture.finish().await;
 }
 
 #[tokio::test]
