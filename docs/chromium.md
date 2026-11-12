@@ -48,6 +48,13 @@ captured snapshot membership. Includes require bounded same-snapshot dependencie
 
 ## Research and publication
 
+Traversal accounting includes both admitted documents and explicitly retained
+unsupported-entry obligations. Before publication, their immutable gap manifests
+and counts must verify. `accounted` therefore does not imply complete acquisition:
+`complete` remains false when traversal or projection gaps exist. A partial default
+can expose qualified documents alongside this coverage; an unresolved governing
+notice still withholds every affected body.
+
 The dedicated tool family provides document catalog/search/get, explicit symbols,
 references, snapshots, history, comparisons, and aggregate corpus status. Generic
 `search` includes `chromium` among all nine default source families; an explicit

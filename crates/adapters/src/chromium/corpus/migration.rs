@@ -1449,12 +1449,9 @@ impl ChromiumCorpus {
                                     "Chromium traversal gap coverage root is missing.",
                                 ));
                             }
-                            if gaps > 0
-                                && (snapshot.coverage["accounted"] == true
-                                    || snapshot.coverage["complete"] == true)
-                            {
+                            if gaps > 0 && snapshot.coverage["complete"] == true {
                                 return Err(Error::integrity(
-                                    "Chromium unsupported traversal is marked complete.",
+                                    "Chromium traversal gaps are marked complete.",
                                 ));
                             }
                             if !snapshot.index.is_null() {

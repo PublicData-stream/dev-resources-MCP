@@ -1184,12 +1184,22 @@ impl ChromiumCorpus {
         if !work.stack.is_empty() {
             return Ok(false);
         }
+        if let Some(root) = &work.traversal_gap_root {
+            self.verify_gap_manifest(root, work.traversal_gaps, &cancel)
+                .await
+                .map_err(|error| at_phase(error, Phase::ArtifactVerification))?;
+        } else if work.traversal_gaps != 0 {
+            return Err(at_phase(
+                Error::integrity("Chromium traversal gap coverage root is missing."),
+                Phase::ArtifactVerification,
+            ));
+        }
         let metadata = inventory::node(self.store.as_ref(), &work.inventory).await?;
         let index = self
             .flush_index(std::slice::from_ref(&work.inventory), cancel.clone())
             .await
             .map_err(|error| at_phase(error, Phase::IndexPublication))?;
-        let coverage = json!({"accounted":work.traversal_gaps==0,"usable":metadata.searchable>0,"documents":metadata.members,"projection_gaps":metadata.gaps,"index_gaps":0,"license":{"decision":"approved","scope":"qualified_retained_members_only"},"ancestry":"parent_closure_queued","raw_commit_verification":"https_metadata","classifier_version":chromium_processing::CLASSIFIER_VERSION,"collection_version":COLLECTION_VERSION,"traversal_gaps":work.traversal_gaps,"traversal_gap_root":work.traversal_gap_root,"excluded_subtrees":work.excluded_subtrees,"complete":work.traversal_gaps==0 && metadata.gaps==0});
+        let coverage = json!({"accounted":true,"usable":metadata.searchable>0,"documents":metadata.members,"projection_gaps":metadata.gaps,"index_gaps":0,"license":{"decision":"approved","scope":"qualified_retained_members_only"},"ancestry":"parent_closure_queued","raw_commit_verification":"https_metadata","classifier_version":chromium_processing::CLASSIFIER_VERSION,"collection_version":COLLECTION_VERSION,"traversal_gaps":work.traversal_gaps,"traversal_gap_root":work.traversal_gap_root,"excluded_subtrees":work.excluded_subtrees,"complete":work.traversal_gaps==0 && metadata.gaps==0});
         let id = inventory::digest(
             &serde_json::to_vec(&(
                 component,
@@ -1679,7 +1689,19 @@ impl ChromiumCorpus {
                 let id = value["snapshot"].as_str().ok_or_else(failure)?;
                 let validated = value["validated_at"].as_i64().ok_or_else(failure)?;
                 let snapshot = self.snapshot(id).await?;
-                if snapshot.coverage["usable"] != true
+                let gaps = snapshot.coverage["traversal_gaps"].as_u64().unwrap_or(0);
+                if let Some(root) = snapshot.coverage["traversal_gap_root"].as_str() {
+                    self.verify_gap_manifest(root, gaps, &cancel)
+                        .await
+                        .map_err(|error| at_phase(error, Phase::ArtifactVerification))?;
+                } else if gaps != 0 {
+                    return Err(at_phase(
+                        Error::integrity("Chromium traversal gap coverage root is missing."),
+                        Phase::ArtifactVerification,
+                    ));
+                }
+                if snapshot.coverage["accounted"] != true
+                    || snapshot.coverage["usable"] != true
                     || devres_domain::unix_now().saturating_sub(validated) > 7 * 86400
                 {
                     continue;
@@ -3284,6 +3306,10 @@ mod collector_regressions {
         let commit_route = format!("/chromium/src/+/{revision}");
         let commit: Value =
             serde_json::from_slice(routes.remove(&commit_route).unwrap().as_slice()).unwrap();
+        routes.insert(
+            "/chromium/src/+refs/heads/main".into(),
+            serde_json::to_vec(&json!({"refs/heads/main":{"value":revision}})).unwrap(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3300,14 +3326,12 @@ mod collector_regressions {
             Arc::new(BulkBroker::fixture(format!("http://{address}").parse().unwrap()).unwrap());
         (broker, server, commit)
     }
-    async fn seed_legacy_root(store: &dyn ChromiumStore, revision: &str, commit: &Value) {
+    async fn seed_legacy_root(corpus: &ChromiumCorpus, revision: &str, commit: &Value) {
+        let store = corpus.store();
         let commit = source::parse_commit("src", &serde_json::to_vec(commit).unwrap()).unwrap();
         store.chromium_put("commits", &legacy_job_key("src",revision), &json!({"component":"src","repository":component_base("src").unwrap(),"commit":commit,"source_url":"https://fixtures.invalid/chromium-collector"})).await.unwrap();
-        store
-            .chromium_set_state(
-                &state_key("current-root", "src"),
-                &json!({"revision":revision,"observed_at":devres_domain::unix_now()}),
-            )
+        corpus
+            .observe_refs("src", None, CancellationToken::new())
             .await
             .unwrap();
         store
@@ -3356,7 +3380,7 @@ mod collector_regressions {
             .collect::<Vec<_>>();
         let (broker, server, commit) = fixture_source(&files, &revision).await;
         let (root, store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
-        seed_legacy_root(store.as_ref(), &revision, &commit).await;
+        seed_legacy_root(&corpus, &revision, &commit).await;
         let old_work_key = state_key("work", &format!("src:{revision}:1"));
         let original = json!({"synthetic_legacy_checkpoint":true});
         store
@@ -3413,7 +3437,7 @@ mod collector_regressions {
         assert_eq!(current.coverage["excluded_subtrees"], 2);
         assert_eq!(current.coverage["complete"], false);
         assert_eq!(current.coverage["documents"], 1);
-        assert_eq!(current.coverage["accounted"], false);
+        assert_eq!(current.coverage["accounted"], true);
         let gap_root = current.coverage["traversal_gap_root"].as_str().unwrap();
         corpus
             .verify_gap_manifest(gap_root, 2, &CancellationToken::new())
@@ -3453,7 +3477,7 @@ mod collector_regressions {
         );
         assert_eq!(
             broker.attempt_count(),
-            6,
+            7,
             "one source license, root, docs, third_party and Blink tree plus document reads; no legacy commit refetch or excluded subtree request"
         );
         let mut legacy = current.clone();
@@ -3543,6 +3567,7 @@ mod collector_regressions {
             ("LICENSE",super::tests::BSD),
             ("docs/collector-cluster.md","# Collector cluster fixture\nChromiumCollectorClusterToken is first-party synthetic evidence."),
             ("third_party/other/README.md","Excluded synthetic subtree."),
+            ("docs/unsupported#path.md","Unrequestable synthetic metadata gap."),
         ],&revision).await;
         let corpus = Arc::new(
             ChromiumCorpus::new(
@@ -3557,7 +3582,7 @@ mod collector_regressions {
             )
             .unwrap(),
         );
-        seed_legacy_root(store.as_ref(), &revision, &commit).await;
+        seed_legacy_root(&corpus, &revision, &commit).await;
         for _ in 0..4 {
             store
                 .chromium_set_state(&scheduling_key("current-offset"), &json!(0))
@@ -3578,6 +3603,9 @@ mod collector_regressions {
         }
         let snapshot = corpus.select("src", None, None).await.unwrap();
         assert_eq!(snapshot.revision, revision);
+        assert_eq!(snapshot.coverage["accounted"], true);
+        assert_eq!(snapshot.coverage["complete"], false);
+        assert_eq!(snapshot.coverage["traversal_gaps"], 1);
         // Force a sibling source observation against the local-only HTTP failure fixture.
         store
             .chromium_set_state(
@@ -3744,8 +3772,8 @@ mod collector_regressions {
             &revision,
         )
         .await;
-        let (_root, store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
-        seed_legacy_root(store.as_ref(), &revision, &commit).await;
+        let (_root, _store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
+        seed_legacy_root(&corpus, &revision, &commit).await;
         corpus
             .collect_current_once(CancellationToken::new())
             .await
@@ -3757,7 +3785,7 @@ mod collector_regressions {
             .unwrap();
         assert_eq!(snapshot.coverage["usable"], false);
         assert_eq!(snapshot.coverage["traversal_gaps"], 1);
-        assert_eq!(snapshot.coverage["accounted"], false);
+        assert_eq!(snapshot.coverage["accounted"], true);
         let member = corpus
             .member(&snapshot, "docs/guide.md")
             .await
@@ -3773,7 +3801,7 @@ mod collector_regressions {
         );
         assert_eq!(
             broker.attempt_count(),
-            3,
+            4,
             "only root/tree and approved source notice; no unsafe notice or document body fetch"
         );
         server.abort();
@@ -3842,5 +3870,138 @@ mod collector_regressions {
                 .active
         );
         assert_eq!(broker.attempt_count(), 0);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+    async fn chromium_collector_postgres_publication_with_accounted_gaps() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL");
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let database = format!("devres_chromium_collector_{}_{nonce}", std::process::id());
+        assert!(
+            database
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        );
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {database}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path(&format!("/{database}"));
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = Arc::new(
+            crate::PgBlobStore::connect(url.as_str(), root.path())
+                .await
+                .unwrap(),
+        );
+        let revision = "9e".repeat(20);
+        let (broker, server, commit) = fixture_source(
+            &[
+                ("LICENSE", super::tests::BSD),
+                (
+                    "docs/qualified.md",
+                    "# Qualified\nChromiumPostgresCollectorToken retained content.",
+                ),
+                (
+                    "docs/unsupported#path.md",
+                    "Unrequestable metadata-only path.",
+                ),
+            ],
+            &revision,
+        )
+        .await;
+        let corpus = ChromiumCorpus::new(
+            store.clone(),
+            broker.clone(),
+            root.path(),
+            ChromiumConfig {
+                enabled: false,
+                min_free_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        seed_legacy_root(&corpus, &revision, &commit).await;
+        corpus
+            .collect_current_once(CancellationToken::new())
+            .await
+            .unwrap();
+        let snapshot = corpus.select("src", None, None).await.unwrap();
+        assert_eq!(snapshot.coverage["accounted"], true);
+        assert_eq!(snapshot.coverage["complete"], false);
+        assert_eq!(snapshot.coverage["usable"], true);
+        assert_eq!(snapshot.coverage["traversal_gaps"], 1);
+        let view = corpus.view(None).await.unwrap();
+        let observations = store
+            .chromium_rows("observations", 0, 100, None)
+            .await
+            .unwrap();
+        assert!(observations.iter().any(|row| row.data["component"] == "src"
+            && row.data["current_revision"] == revision
+            && row.data["observed_at"] == view.validations["src"]));
+        let member = corpus
+            .member(&snapshot, "docs/qualified.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(member.raw.is_some());
+        assert!(member.projection.is_some());
+        let before = store.chromium_state("default").await.unwrap();
+        let current = store
+            .chromium_state(&state_key("current", "src"))
+            .await
+            .unwrap()
+            .unwrap();
+        // Test-only missing evidence injection into this owned disposable store:
+        // an actual online observation and qualified member cannot excuse a broken DAG.
+        let mut broken = snapshot.clone();
+        broken.id = inventory::digest(b"synthetic missing Chromium gap root snapshot");
+        broken.coverage["traversal_gap_root"] =
+            json!(inventory::digest(b"missing Chromium gap manifest"));
+        store
+            .chromium_put("snapshots", &broken.id, &encode(&broken).unwrap())
+            .await
+            .unwrap();
+        store
+            .chromium_set_state(
+                &state_key("current", "src"),
+                &json!({"snapshot":broken.id,"validated_at":view.validations["src"]}),
+            )
+            .await
+            .unwrap();
+        let error = corpus
+            .publish_default(CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "integrity");
+        assert_eq!(
+            devres_application::collection::context(&error)
+                .unwrap()
+                .phase,
+            Phase::ArtifactVerification
+        );
+        assert_eq!(store.chromium_state("default").await.unwrap(), before);
+        store
+            .chromium_set_state(&state_key("current", "src"), &current)
+            .await
+            .unwrap();
+        assert!(corpus.select("src", None, None).await.is_ok());
+        server.abort();
+        drop(corpus);
+        drop(store);
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "DROP DATABASE {database} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
+        admin.close().await;
     }
 }
