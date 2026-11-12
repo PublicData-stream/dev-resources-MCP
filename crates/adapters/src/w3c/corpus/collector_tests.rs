@@ -259,7 +259,7 @@ async fn disabled_writer_restart_resets_activity_without_reader_writes_or_histor
     assert_eq!(broker.attempt_count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires stopped disposable minikube roles and DATABASE_URL/BLOB_DIR"]
 async fn w3c_collector_cluster_seed() {
     use devres_application::attribution::AttributionStore;

@@ -352,6 +352,12 @@ have immutable 4 MiB range proofs so byte pages verify bounded local blocks.
 
 ## W3C acquisition and research
 
+Catalog discovery retains immutable page evidence before advancing a versioned
+candidate checkpoint. Candidate pages are not research membership. Final catalog
+and capture companions precede the catalog pointer update; incomplete discovery
+preserves the previous default. The existing evidence/state tables hold these
+records, and offline graph verification/migration understands their typed references.
+
 W3C has separate application contracts, source admission, durable state and local
 research. Schema 7 adds owner-fenced immutable evidence, processing inventories,
 statistics and atomic published views. Existing provider schemas/capture identities
@@ -396,6 +402,14 @@ context. Versioned inert projections and selected-membership search remain isola
 from earlier providers. Chromium-specific link handling does not relax the shared
 standards parser's existing behavior. Raw acquisition, processing, indexing, and
 publication have separate failure/coverage states.
+
+Collection generation 2 keys traversal work, derived inventories, snapshots and
+aliases independently of unchanged projection/classifier version 1. Old work and
+pinned snapshots remain retained. Exact Git-tree identity validation precedes
+operation-safe path admission; unsupported acquisition paths have durable gap
+evidence and cannot trigger outbound requests. Proven classifier exclusions avoid
+descending unrelated test/vendor/generated trees. A failed component does not
+prevent another qualified component from forming a usable default.
 
 Current and historical lanes share source admission and publication fencing. Partial
 views freeze each effective component snapshot and validation observation. Archived

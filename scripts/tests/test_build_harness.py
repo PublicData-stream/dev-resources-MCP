@@ -12,7 +12,7 @@ import unittest
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 BINARIES = ("devres-server", "devres-probe", "devres-credential-broker", "storage-probe",
-            "devres-audit-worker", "devres-pdf-worker", "oxibelt")
+            "devres-audit-worker", "devres-pdf-worker", "oxibelt", "devres-collector-tests")
 DEBUG = b"\n# fixture debug information\n"
 
 
@@ -27,6 +27,7 @@ class BuildHarnessTests(unittest.TestCase):
         scripts.mkdir()
         shutil.copy2(SCRIPTS / "build-harness.sh", scripts / "build-harness.sh")
         (scripts / "mcp_smoke.py").write_text("# smoke fixture\n")
+        (scripts / "collector-smoke.py").write_text("# collector fixture\n")
         (scripts / "kube-identity-fixture.py").write_text("# identity fixture\n")
         for name in ('scaleway-iam-fixture.py', 'credential-broker-fixture.py', 'credential-broker-probe.py', 'broker-pod-probe.py', 'static-s3-fixture.py'):
             (scripts / name).write_text('# broker fixture\n')
@@ -51,6 +52,9 @@ class BuildHarnessTests(unittest.TestCase):
         self.executable("cargo", '''
 if sys.argv[1] == "metadata":
     print(json.dumps({"target_directory": os.environ["TEST_TARGET"]}))
+elif sys.argv[1] == "test":
+    print(json.dumps({"reason":"compiler-artifact","target":{"name":"devres_adapters"},
+                      "profile":{"test":True},"executable":str(Path(os.environ["TEST_TARGET"]) / 'debug/devres-collector-tests')}))
 ''')
         self.executable("docker", '''
 if sys.argv[1:3] == ["image", "inspect"]:

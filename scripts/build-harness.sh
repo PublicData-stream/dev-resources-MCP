@@ -17,6 +17,24 @@ identity=next((json.loads(line.split("=",1)[1]) for line in sys.stdin.read().spl
 assert identity and identity.get("revision")=="4f3154d8db0e0a49bce7a528c0a0f4c36d169040" and identity.get("dirty")=="clean", "wrong edge binary"
 '
 mkdir -p "$scratch/build/bin" "$scratch/build/scripts"
+# Compile fixture transport only into the acceptance test executable, never server images.
+cargo test --locked -p devres-adapters --lib --no-run --message-format=json > "$scratch/collector-test-build.jsonl"
+collector_tests=$(python3 - "$scratch/collector-test-build.jsonl" <<'PYTESTBIN'
+import json, sys
+executables = []
+with open(sys.argv[1]) as source:
+    for line in source:
+        item = json.loads(line)
+        if (item.get('reason') == 'compiler-artifact'
+                and item.get('target', {}).get('name') == 'devres_adapters'
+                and item.get('profile', {}).get('test') is True
+                and item.get('executable')):
+            executables.append(item['executable'])
+if len(executables) != 1:
+    raise SystemExit('collector fixture executable missing or ambiguous')
+print(executables[0])
+PYTESTBIN
+)
 if docker image inspect "$image" >/dev/null 2>&1; then
   echo 'Refusing to overwrite an existing harness image tag' >&2; exit 1
 fi
@@ -27,11 +45,13 @@ cp "$target_dir/debug/examples/storage-probe" "$scratch/build/bin/storage-probe"
 cp "$target_dir/debug/devres-audit-worker" "$scratch/build/bin/devres-audit-worker"
 cp "$target_dir/debug/devres-pdf-worker" "$scratch/build/bin/devres-pdf-worker"
 cp "$edge_binary" "$scratch/build/bin/oxibelt"
+cp "$collector_tests" "$scratch/build/bin/devres-collector-tests"
 # Remove debug information only from disposable copies, preserving shared builds.
-for binary in devres-server devres-probe devres-credential-broker storage-probe devres-audit-worker devres-pdf-worker oxibelt; do
+for binary in devres-server devres-probe devres-credential-broker storage-probe devres-audit-worker devres-pdf-worker oxibelt devres-collector-tests; do
   strip --strip-debug "$scratch/build/bin/$binary"
 done
 cp scripts/mcp_smoke.py "$scratch/build/scripts/"
+cp scripts/collector-smoke.py "$scratch/build/scripts/"
 cp scripts/kube-identity-fixture.py "$scratch/build/scripts/"
 cp scripts/scaleway-iam-fixture.py scripts/credential-broker-fixture.py scripts/credential-broker-probe.py "$scratch/build/scripts/"
 cp scripts/static-s3-fixture.py scripts/broker-pod-probe.py "$scratch/build/scripts/"

@@ -638,6 +638,35 @@ source freshness without logging request bodies or package lists.
 
 ## Bounded live sources
 
+### Collector recovery checks
+
+W3C/Chromium/crate status exposes finite phase and limiter diagnostics, progress,
+latest success and retained failure separately. Compare observations over time;
+`paused` after capacity is a retryable last result, not a disabled collector.
+Absent catalog/default evidence is distinct from a failed status read. W3C API raw
+artifacts are retained outside generic capture rows, so zero capture rows do not
+prove no API body was retained. Crate staged enrichment remains invisible until
+the whole dump validates and an enrichment head is published.
+
+The minikube harness additionally runs a test-only collector executable with local
+HTTP fixtures against the disposable PostgreSQL/filesystem or static-S3 archive.
+Production server builds contain no fixture-origin override. The tests collect,
+qualify and publish exact synthetic W3C/Chromium documents, then check pinned tool
+and resource reads with readable attribution through both HTTP and WebTransport
+revisions after restart and coordinated restore. These are first-party fixture
+notices, never evidence of upstream rights or complete provider coverage.
+
+The local PostgreSQL readiness probe uses loopback TCP so image initialization's
+temporary Unix-socket server cannot admit role bootstrap before the final server.
+
+Use `scripts/test-minikube.sh` and `scripts/test-minikube.sh --s3` with temporary
+state below `/tmp`, shared Cargo overrides after `scripts/with-tmp-state.sh`, and
+`CARGO_TARGET_DIR=/tmp/rust/target`. Live smoke remains a separate fixed-record
+budget of at most 20 attempts/provider; do not download a full dump/index or start
+whole-corpus acceptance as a retry. Code/fixture acceptance does not establish
+the production incident cause or authorize activation, queue edits or storage
+permission changes.
+
 Against an already running local test service:
 
 ```sh

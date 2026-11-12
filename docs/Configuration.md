@@ -132,6 +132,12 @@ bounded batches of at most 1,000 rows/8 MiB through a two-batch queue. Imports h
 SQL files remain inert archive evidence. Only complete validated imports become
 metadata enrichment.
 
+The 8 MiB batch bound includes the complete persisted JSON envelope, escaped
+identities, integrity digests and array separators. Import progress describes
+staged rows/batches and expanded bytes; it is not published metadata or a completion
+percentage. Retrying the same retained dump replays bounded gzip/tar validation
+and idempotent staging, without exposing partial enrichment.
+
 Crate search uses one writer with a 64 MiB per-thread indexing budget, immutable
 shards of at most 50,000 documents, at most 4,096 shards and 10,000 files/32 GiB per
 shard, with a 2 MiB integrity manifest. These are processing limits, not process RSS
@@ -361,6 +367,12 @@ projections, inventories, state and search indexes together. Reprocessing and
 restoration never advance upstream validation. Unknown-license content is metadata
 only until its scope is established, including mixed historical Git packs.
 
+Catalog discovery checkpoints one API page per normal current turn. Committed
+pages are reused after restart, within the unchanged 8 MiB/page, 1,000-page and
+10,000-standard bounds. Only the complete validated candidate replaces the catalog;
+its freshness remains the oldest page observation. Failed refresh preserves the
+preceding catalog/default and the normal retry delay.
+
 ## Chromium defaults
 
 Omitting `[chromium]` enables current-first collection and resumable historical
@@ -393,6 +405,13 @@ a fixed total-history cutoff. See [Chromium](chromium.md) for coverage and prove
 Schema 8 adds isolated Chromium evidence and state. Back up raw artifacts, immutable
 inventories/projections, checkpoints, and indexes together. Rebuild/restore does not
 advance source validation times.
+
+Chromium collection generation 2 separates traversal accounting from projection
+and classifier version 1. Verified trees retain exact Git names; paths that cannot
+be fetched safely become explicit traversal gaps without relaxing destination
+admission. Subtrees are pruned only when existing classification excludes every
+descendant. Prior snapshots/work remain retained; new traversal starts from the
+same immutable root and reuses verified source/projection evidence where present.
 
 ## npm defaults
 

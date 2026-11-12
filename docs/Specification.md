@@ -256,6 +256,16 @@ observations, not semantic-version or security certifications.
 
 ## Audits and failure
 
+W3C, Chromium and crate corpus status include additive collector diagnostics.
+`active`, `phase`, bounded `progress`, `last_success_at` and an observed `retry_at`
+separate current activity from historical failures. Failures may include an exact
+phase, HTTP status or `limit` with a fixed kind and numeric observed/maximum values.
+Unknown details are omitted. A recorded failure is not proof that a worker remains
+inactive after a later success. Chromium reports components separately; crate
+inventory and metadata remain independent operations. These public-source-only
+fields contain no source bodies, URLs, runtime configuration or raw error text.
+Catalog/default read failures remain explicit rather than appearing as zero coverage.
+
 RustSec collection runs independently of public requests: current main metadata and
 immutable archives refresh hourly, and full official Git branch/tag ancestry
 synchronizes daily. These are scheduling targets. All advisory tools read published

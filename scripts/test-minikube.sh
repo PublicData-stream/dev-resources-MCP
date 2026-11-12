@@ -433,6 +433,14 @@ seeded_webtransport() {
       /fixture/cert/edge-client.pem /fixture/cert/edge-client-key.pem
   done
 }
+collector_reads() {
+  external python3 /harness/collector-smoke.py --url https://edge:30443/mcp \
+    --ca /fixture/cert/ca.pem --receipts /fixture/collector-receipts.json
+  for revision in 2026-07-28 2025-11-25; do
+    external env DEVRES_PROBE_COLLECTOR_RECEIPTS=/fixture/collector-receipts.json \
+      devres-probe https://edge:30443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example
+  done
+}
 s3_capture_state() {
   k exec -i deployment/backend -- python3 - "$capture" "$1" <<'PYS3CAPTURE'
 import http.client, re, runpy, socket, sys, time, types, urllib.error, urllib.request
@@ -525,11 +533,27 @@ PYS3CAPTURE
 stop_backend
 maintenance_start
 before=$(k exec storage-maintenance -- storage-probe write)
+for provider in w3c chromium; do
+  k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 "${provider}_collector_cluster_seed"
+  k exec storage-maintenance -- cat "/tmp/${provider}-collector-receipt.json" > "$scratch/$provider-collector.json"
+done
+python3 - "$scratch" <<'PYCOLLECTOR'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+receipts = []
+for provider in ('w3c', 'chromium'):
+    with (root / (provider + '-collector.json')).open('rb') as source:
+        raw = source.read(32769)
+    assert len(raw) <= 32768, 'collector receipt exceeds bound'
+    receipts.append(json.loads(raw))
+(root / 'fixture/collector-receipts.json').write_text(json.dumps(receipts))
+PYCOLLECTOR
 capture=${before%% *}
 maintenance_stop
 start_backend
 external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
 seeded_webtransport
+collector_reads
 if (( s3 )); then
   # A warm cache cannot mask loss of the authoritative archive. The same backend
   # process must become ready again when storage recovers.
@@ -623,6 +647,7 @@ if (( s3 )); then
   start_backend
   external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
   seeded_webtransport
+  collector_reads
   if (( credential_broker )); then
     # Rehearse credential-method changes against one committed binding. Serving's
     # emptyDir cache is lost with each stopped Pod; no archive or journal is pruned.
@@ -712,6 +737,7 @@ maintenance_stop
 start_backend
 external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
 seeded_webtransport
+collector_reads
 if (( live )); then
   external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --live "${live_rfc_args[@]}"
 fi

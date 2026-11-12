@@ -5,7 +5,7 @@ use devres_server::{
 };
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
-use tokio::{sync::Semaphore, time::timeout};
+use tokio::{io::AsyncReadExt, sync::Semaphore, time::timeout};
 use wtransport::{
     ClientConfig, Endpoint, Identity,
     endpoint::ConnectOptions,
@@ -1127,11 +1127,111 @@ async fn main() -> Result<(), ServerError> {
             return Err("Wikipedia raw capture bypass accepted through WebTransport".into());
         }
     }
+    if let Ok(path) = std::env::var("DEVRES_PROBE_COLLECTOR_RECEIPTS") {
+        let mut raw = Vec::new();
+        tokio::fs::File::open(path)
+            .await?
+            .take(65537)
+            .read_to_end(&mut raw)
+            .await?;
+        let receipts = collector_receipts(&raw)?;
+        for (offset, receipt) in receipts.iter().enumerate() {
+            let id = 500 + offset as u64 * 2;
+            let detail = tool_exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                revision,
+                id,
+                &receipt.tool,
+                receipt.arguments.clone(),
+            )
+            .await?;
+            if detail["selection"]["snapshot"] != receipt.arguments["snapshot"]
+                || !detail["page"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&receipt.expected))
+                || !detail["attribution"]["readable_notice"]
+                    .as_str()
+                    .is_some_and(|notice| !notice.is_empty())
+            {
+                return Err(
+                    "Collector-produced pinned content or attribution changed through WebTransport"
+                        .into(),
+                );
+            }
+            let mut params = json!({"uri": receipt.resource});
+            if revision == "2026-07-28" {
+                params["_meta"] = metadata(revision);
+            }
+            let resource = exchange(
+                &mut send,
+                &mut reader,
+                &budget,
+                json!({"jsonrpc":"2.0","id":id+1,"method":"resources/read","params":params}),
+            )
+            .await?;
+            let contents = resource["result"]["contents"]
+                .as_array()
+                .ok_or("Collector resource contents missing")?;
+            if !contents.iter().skip(1).any(|item| {
+                item["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty())
+            }) || !contents[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&receipt.expected))
+                || contents[0]["_meta"]["license"].is_null()
+            {
+                return Err(
+                    "Collector resource content or attribution changed through WebTransport".into(),
+                );
+            }
+        }
+    }
     connection.close(0_u32.into(), b"probe complete");
     endpoint.close(0_u32.into(), b"probe complete");
     timeout(Duration::from_secs(2), endpoint.wait_idle()).await?;
     println!("WebTransport {revision}: discovery, tool listing, and server identity verified.");
     Ok(())
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollectorReceipt {
+    provider: String,
+    tool: String,
+    arguments: Value,
+    resource: String,
+    expected: String,
+}
+fn collector_receipts(raw: &[u8]) -> Result<Vec<CollectorReceipt>, ServerError> {
+    if raw.len() > 65536 {
+        return Err("Collector receipts exceed bound".into());
+    }
+    let receipts: Vec<CollectorReceipt> = serde_json::from_slice(raw)?;
+    if receipts.len() != 2
+        || !["w3c", "chromium"]
+            .iter()
+            .all(|provider| receipts.iter().filter(|r| r.provider == *provider).count() == 1)
+    {
+        return Err("Two distinct collector fixture providers required".into());
+    }
+    for receipt in &receipts {
+        if receipt.tool != format!("{}.get", receipt.provider)
+            || !receipt.arguments["snapshot"]
+                .as_str()
+                .is_some_and(devres_domain::valid_content_id)
+            || !receipt
+                .resource
+                .starts_with(&format!("devres://{}/", receipt.provider))
+            || receipt.resource.len() > 8192
+            || receipt.expected.is_empty()
+            || receipt.expected.len() > 256
+        {
+            return Err("Invalid capture-fixed collector fixture receipt".into());
+        }
+    }
+    Ok(receipts)
 }
 async fn tool_exchange(
     send: &mut wtransport::SendStream,
@@ -1238,6 +1338,15 @@ async fn exchange_response(
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+    #[test]
+    fn collector_receipts_require_distinct_pinned_provider_selections() {
+        let rows = ["w3c", "chromium"].map(|provider| json!({"provider":provider,"tool":format!("{provider}.get"),"arguments":{"snapshot":format!("blake3:{}","1".repeat(64))},"resource":format!("devres://{provider}/fixture"),"expected":"synthetic"}));
+        assert!(collector_receipts(&serde_json::to_vec(&rows).unwrap()).is_ok());
+        let mut rows = rows;
+        rows[0]["arguments"] = json!({});
+        assert!(collector_receipts(&serde_json::to_vec(&rows).unwrap()).is_err());
+        assert!(collector_receipts(&vec![b' '; 65537]).is_err());
+    }
     #[test]
     fn fixed_tool_diagnostics_exclude_request_and_response_payloads() {
         let request = json!({"method":"tools/call","params":{"name":"packages.crate.audit_lockfile","arguments":{"lockfile":"private-inventory-unique"}}});
