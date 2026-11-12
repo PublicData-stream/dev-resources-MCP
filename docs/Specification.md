@@ -70,6 +70,22 @@ changed moving URL as the old representation. Disappeared, unsupported or unqual
 evidence remains retained but publicly withheld. Request-only audits cannot enqueue
 work derived from caller inventories.
 
+Repair admission gives foreground work four turns and background work one turn in
+each five-turn cycle, rotating enabled providers and pending, due-retry and expired
+claim queues within each priority. With `P` enabled providers, every continuously
+eligible queue receives a head admission within `15 * P` successful claims during
+uninterrupted ownership. Empty queues yield to other eligible work; disabled
+providers and future retries remain excluded. SQL admission deadlines defer work
+without turning a temporary scheduling gap into worker termination.
+
+Operational attribution failures retain finite phase, reason and retry disposition
+metadata; upstream messages and bodies are excluded. Existing coarse failure fields
+remain compatible, and unclassified historical failures remain unknown. Exact
+evidence identity, notice completeness and policy checks remain qualification gates;
+transient access failures can retry, while deterministic unsupported evidence or
+payload bounds remain withheld. Status counters describe target transitions within
+the current process and do not establish unique-document counts or corpus completion.
+
 ## MCP and transport
 
 Streamable HTTP uses `/mcp`. WebTransport `/mcp-wt/v1` is a custom binding: one

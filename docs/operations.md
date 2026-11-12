@@ -18,6 +18,34 @@ history remains permanently stored and explicitly unavailable.
 Completion counters describe enqueued targets and observed sweep cutoffs. They do
 not certify all currently arriving source rows or universal historical notice scope.
 
+Admission uses a four-foreground/one-background cycle and rotates provider/status
+queues; a continuously eligible queue gets a head claim within `15 * P` successful
+claims for `P` enabled providers under uninterrupted ownership. This is an admission
+bound, not a wall-clock completion deadline. Due retries and expired running leases
+receive turns even while new pending work arrives. Temporary bounded SQL admission
+failures back off without restarting the repair worker; integrity failures still
+fail closed. Changing worker concurrency is not a substitute for this guarantee.
+
+Use finite failure phase/reason/disposition metadata and process-scoped transition
+counters for diagnosis. Legacy `blocked`/`retryable` labels alone cannot distinguish
+missing notices, upstream access, payload bounds or integrity failures. Old rows
+without classification remain unknown; repeated sweeps preserve their state and
+existing ready generations. Do not reset such rows by SQL or silently reinterpret
+them as recoverable. Normal eligibility and fenced claims recover due retries and
+expired leases; permanently unsupported evidence stays stored and unavailable.
+
+The [2026-11-12 investigation](attribution-backlog-investigation-2026-11-12.md)
+records the bounded production observations and their limits. Any later operational
+acceptance requires separate deployment authority: record the activated revision,
+owner and policy; compare two bounded observations over ten minutes; require a
+successful claim and completion for representative due-retry and expired-lease
+subjects with unchanged exact identity, plus background/provider progress and no
+extra publication owner. Compare reason counts and transition deltas without adding
+repeated global status sections. Check the pinned historical RFC and complete paged
+notices again. Keep provider traffic within approved budgets; stop and investigate
+integrity errors, owner changes or unbounded traffic. Legitimate blocks need not
+disappear, and these checks do not certify the whole corpus.
+
 Back up PostgreSQL, the complete blob tree and `.devres-integrity` together. Restore
 acceptance includes attribution generations, queue/control seals, sweep progress and
 notice-resource readback. `verify-storage` checks attribution without network or repair
@@ -25,11 +53,25 @@ writes; pending/blocked work is an operational gap, not storage corruption. An o
 schema-10 binary rejects schema 11. Rollback requires the coordinated pre-upgrade
 database/blob backup, never lowering the schema number or dropping tables.
 
+The attribution backlog patch leaves schema and rights-policy identities unchanged,
+but can add optional classification fields to sealed queue payloads. Older binaries
+that reject unknown payload fields are not safe mixed-version participants. Update
+serving, writer and maintenance binaries together. A downgrade after new classified
+state is written requires the coordinated pre-change database/blob backup; do not
+strip fields, reseal rows or lower an epoch to make an older binary accept them.
+
 Local acceptance uses the disposable PostgreSQL/OxiBelt/minikube harness with fresh
 binaries and owned state under `/tmp`; Cargo output is `/tmp/rust/target`. Synthetic
 qualification is seeded only by the private fixture utility; production acquisition
 never accepts a synthetic hostname as upstream proof. Fixed-target live probes use
 at most 20 broker requests per provider without unrestricted collectors or sweeps.
+The minikube attribution backlog fixture mixes pending work, a due background retry,
+an expired foreground claim and a future retry using sealed storage APIs. Exact RFC
+repair reaches only a loopback HTTP fixture compiled into the test executable;
+published qualification is explicitly synthetic. Representative generation identities
+and UTF-8 notice pages are compared after backend restart and coordinated restore,
+including the S3 cache-loss branch. These checks are separate from live-source,
+native-architecture CI and production acceptance.
 
 The [npm module](npm.md) adds schema 9, public catalog/advisory acquisition and
 local npm/pnpm/Yarn assessment. Include npm evidence and search data in coordinated
