@@ -2711,7 +2711,18 @@ mod tests {
             "new process-local store counters start empty"
         );
         // The bootstrap is additive and preserves capture identities and bytes.
-        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control;UPDATE devres_schema SET version=10 WHERE singleton").execute(&store.pool).await.unwrap();
+        let mut fixture = store.pool.begin().await.unwrap();
+        let later_evidence: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT (SELECT count(*) FROM devres_crate_enrichment_v2)+(SELECT count(*) FROM devres_crate_enrichment_heads_v2)+(SELECT count(*) FROM devres_crate_dump_failures)"
+        ).fetch_one(&mut *fixture).await.unwrap();
+        assert_eq!(
+            later_evidence, 0,
+            "synthetic downgrade must preserve retained v2 crate evidence"
+        );
+        sqlx_core::raw_sql::raw_sql(
+            "DROP VIEW devres_crate_enrichment_all; DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures; DROP FUNCTION devres_crate_enrichment_v2_immutable(); DROP FUNCTION devres_crate_enrichment_head_immutable(); DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control; UPDATE devres_schema SET version=10 WHERE singleton"
+        ).execute(&mut *fixture).await.unwrap();
+        fixture.commit().await.unwrap();
         drop(store);
         let direct = sqlx_postgres::PgPool::connect(url.as_str()).await.unwrap();
         sqlx_core::query::query("UPDATE devres_integrity_control SET active=false WHERE singleton")

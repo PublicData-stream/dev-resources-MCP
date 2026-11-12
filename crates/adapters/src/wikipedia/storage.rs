@@ -638,7 +638,27 @@ mod tests {
         let old_reader = PgBlobStore::connect_reader(url.as_str(), root.path(), None)
             .await
             .unwrap();
-        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_wikipedia_evidence; DROP TABLE devres_wikipedia_state; UPDATE devres_schema SET version=13 WHERE singleton").execute(&store.pool).await.unwrap();
+        let mut legacy = store.pool.begin().await.unwrap();
+        let later_evidence: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT (SELECT count(*) FROM devres_crate_enrichment_v2)+(SELECT count(*) FROM devres_crate_enrichment_heads_v2)+(SELECT count(*) FROM devres_crate_dump_failures)"
+        ).fetch_one(&mut *legacy).await.unwrap();
+        assert_eq!(
+            later_evidence, 0,
+            "synthetic downgrade must preserve any retained v2 crate evidence"
+        );
+        // Simulate the actual schema thirteen in this disposable database. The
+        // additive schema-fifteen objects must be absent too; do not use CASCADE
+        // or discard retained v1/capture/provider evidence.
+        sqlx_core::raw_sql::raw_sql(
+            "DROP VIEW devres_crate_enrichment_all;
+             DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures;
+             DROP FUNCTION devres_crate_enrichment_v2_immutable();
+             DROP FUNCTION devres_crate_enrichment_head_immutable();
+             DROP TABLE devres_wikipedia_evidence;
+             DROP TABLE devres_wikipedia_state;
+             UPDATE devres_schema SET version=13 WHERE singleton"
+        ).execute(&mut *legacy).await.unwrap();
+        legacy.commit().await.unwrap();
         assert!(
             PgBlobStore::connect_reader(url.as_str(), root.path(), None)
                 .await
