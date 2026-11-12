@@ -1,5 +1,6 @@
 //! Private fixed-source streaming I/O. Public capture reads retain their smaller limits.
 use crate::html_transport::{HtmlClient, ProxyPolicy, Response};
+use devres_application::collection::{LimitKind, Phase, limited};
 use devres_domain::{Error, Result, Validators};
 use futures::{Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -610,7 +611,15 @@ impl BulkBroker {
                     count.checked_add(1)
                 }
             })
-            .map_err(|_| Error::capacity("Source attempt budget exhausted."))?;
+            .map_err(|_| {
+                limited(
+                    Error::capacity("Source attempt budget exhausted."),
+                    Phase::HttpAcquisition,
+                    LimitKind::ProviderAttempts,
+                    None,
+                    self.attempt_budget.map(|limit| limit as u64),
+                )
+            })?;
         if let Some(observer) = &self.attempt_observer {
             observer(previous + 1)?;
         }
@@ -870,7 +879,13 @@ impl BulkBroker {
                 });
             }
             if content_length.is_some_and(|length| length > request.max_bytes) {
-                return Err(Error::capacity("Bulk source exceeds its byte budget."));
+                return Err(limited(
+                    Error::capacity("Bulk source exceeds its byte budget."),
+                    Phase::HttpBody,
+                    LimitKind::CompressedBytes,
+                    content_length,
+                    Some(request.max_bytes),
+                ));
             }
             let input = response
                 .bytes_stream()
@@ -909,7 +924,15 @@ impl BulkBroker {
                     .received
                     .checked_add(read as u64)
                     .filter(|length| *length <= state.max_bytes)
-                    .ok_or_else(|| Error::capacity("Bulk source exceeds its byte budget."))?;
+                    .ok_or_else(|| {
+                        limited(
+                            Error::capacity("Bulk source exceeds its byte budget."),
+                            Phase::HttpBody,
+                            LimitKind::CompressedBytes,
+                            state.received.checked_add(read as u64),
+                            Some(state.max_bytes),
+                        )
+                    })?;
                 chunk.truncate(read);
                 Ok(Some((chunk, state)))
             });
@@ -2091,7 +2114,7 @@ pub(crate) async fn bounded<T>(
 ) -> Result<T> {
     tokio::select! { biased;
         _ = shutdown.cancelled() => Err(Error::unavailable("Bulk operation canceled.")),
-        result = tokio::time::timeout_at(deadline, future) => result.map_err(|_| Error::capacity("Bulk operation deadline exceeded."))?,
+        result = tokio::time::timeout_at(deadline, future) => result.map_err(|_| limited(Error::capacity("Bulk operation deadline exceeded."), Phase::BulkOperation, LimitKind::Deadline, None, None))?,
     }
 }
 fn response_validators(headers: &reqwest::header::HeaderMap) -> Validators {
@@ -2222,7 +2245,15 @@ impl ArtifactReservation {
             used.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(bytes).filter(|next| *next <= limit)
             })
-            .map_err(|_| Error::capacity("Bulk archive quota exhausted; history is preserved."))?;
+            .map_err(|_| {
+                limited(
+                    Error::capacity("Bulk archive quota exhausted; history is preserved."),
+                    Phase::ArtifactRetention,
+                    LimitKind::ArchiveQuota,
+                    used.load(Ordering::Acquire).checked_add(bytes),
+                    Some(limit),
+                )
+            })?;
             self.bytes += bytes;
         }
         Ok(())
@@ -2494,8 +2525,12 @@ impl BulkArtifactStore {
         shutdown: CancellationToken,
     ) -> Result<BulkArtifact> {
         if max_bytes == 0 || max_bytes > 256 * 1024 * 1024 || bytes.len() as u64 > max_bytes {
-            return Err(Error::capacity(
-                "In-memory artifact exceeds its byte budget.",
+            return Err(limited(
+                Error::capacity("In-memory artifact exceeds its byte budget."),
+                Phase::ArtifactRetention,
+                LimitKind::ArtifactBytes,
+                Some(bytes.len() as u64),
+                Some(max_bytes),
             ));
         }
         let stream = futures::stream::unfold((bytes, 0), |(bytes, offset)| async move {
@@ -2550,12 +2585,23 @@ impl BulkArtifactStore {
             bytes = bytes
                 .checked_add(chunk.len() as u64)
                 .filter(|length| *length <= max_bytes)
-                .ok_or_else(|| Error::capacity("Artifact exceeds byte budget."))?;
-            if fs2::available_space(&self.root).map_err(|_| storage_error())?
-                < self.min_free_bytes.saturating_add(chunk.len() as u64)
-            {
-                return Err(Error::capacity(
-                    "Insufficient archive space; history is preserved.",
+                .ok_or_else(|| {
+                    limited(
+                        Error::capacity("Artifact exceeds byte budget."),
+                        Phase::ArtifactRetention,
+                        LimitKind::ArtifactBytes,
+                        bytes.checked_add(chunk.len() as u64),
+                        Some(max_bytes),
+                    )
+                })?;
+            let free = fs2::available_space(&self.root).map_err(|_| storage_error())?;
+            if free < self.min_free_bytes.saturating_add(chunk.len() as u64) {
+                return Err(limited(
+                    Error::capacity("Insufficient archive space; history is preserved."),
+                    Phase::ArtifactRetention,
+                    LimitKind::FreeReserve,
+                    Some(free),
+                    Some(self.min_free_bytes.saturating_add(chunk.len() as u64)),
                 ));
             }
             reservation.reserve(

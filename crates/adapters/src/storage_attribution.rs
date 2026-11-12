@@ -1077,12 +1077,20 @@ fn sources(name: &str) -> Result<Vec<Source>> {
             list.push(Source {
                 table,
                 select: "t.*,to_jsonb(t)-'data' AS metadata",
-                filter: "true",
+                filter: match name {
+                    "w3c" => "kind NOT IN ('catalog-pages','catalog-failures')",
+                    "chromium" => "kind NOT IN ('traversal-gaps','traversal-gap-manifests')",
+                    _ => "true",
+                },
             });
             list.push(Source {
                 table: state,
                 select: "t.*,''::text AS kind,to_jsonb(t)-'data' AS metadata",
-                filter: "true",
+                filter: if name == "w3c" {
+                    "key <> 'catalog-work' AND NOT starts_with(key,'collector-')"
+                } else {
+                    "true"
+                },
             });
         }
     }

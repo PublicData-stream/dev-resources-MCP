@@ -1,6 +1,7 @@
 //! Backend-owned immutable archive bindings and disposable, leased local materialization.
 //! No request-only input reaches this module. Remote bytes precede SQL publication.
 use crate::object_storage::{S3Archive, S3Config};
+use devres_application::collection::{LimitKind, Phase, limited};
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sqlx_core::{connection::Connection, row::Row};
@@ -55,6 +56,15 @@ fn integrity() -> Error {
 fn capacity() -> Error {
     Error::capacity("Local archive working set exceeds its capacity.")
 }
+fn materialization_deadline() -> Error {
+    limited(
+        Error::capacity("Archive materialization deadline exceeded."),
+        Phase::Materialization,
+        LimitKind::Deadline,
+        None,
+        None,
+    )
+}
 
 // A dedicated runtime permits synchronous filesystem consumers on both Tokio and
 // blocking threads. It is process-owned, never dropped from an asynchronous task.
@@ -93,16 +103,14 @@ fn run_bounded<T: Send>(
     future: impl Future<Output = Result<T>> + Send,
 ) -> Result<T> {
     if Instant::now() >= deadline {
-        return Err(Error::capacity(
-            "Archive materialization deadline exceeded.",
-        ));
+        return Err(materialization_deadline());
     }
     run(async {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::new("cancelled", "Archive materialization canceled.")),
             result = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), future) => {
-                result.map_err(|_| Error::capacity("Archive materialization deadline exceeded."))?
+                result.map_err(|_| materialization_deadline())?
             }
         }
     })
@@ -130,9 +138,7 @@ fn lock_materialization<'a>(
                 return Err(Error::new("cancelled", "Archive materialization canceled."));
             }
             if Instant::now() >= deadline {
-                return Err(Error::capacity(
-                    "Archive materialization deadline exceeded.",
-                ));
+                return Err(materialization_deadline());
             }
             match archive.cache.try_lock() {
                 Ok(cache) => return Ok(cache),
@@ -539,8 +545,23 @@ fn admit_local_until(
     }
     if fits(cache) && has_space()? {
         Ok(())
+    } else if !fits(cache) {
+        Err(limited(
+            capacity(),
+            Phase::Materialization,
+            LimitKind::CacheWorkingSet,
+            cache.used_bytes.checked_add(extra),
+            Some(limit),
+        ))
     } else {
-        Err(capacity())
+        let free = fs2::available_space(root).map_err(|_| unavailable())?;
+        Err(limited(
+            capacity(),
+            Phase::Materialization,
+            LimitKind::FreeReserve,
+            Some(free),
+            Some(extra.saturating_add(64 * 1024 * 1024)),
+        ))
     }
 }
 
@@ -548,6 +569,28 @@ fn admit_local_until(
 mod cache_budget_tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn pinned_cache_pressure_reports_the_exact_bound_without_removing_evidence() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let retained = root.path().join("retained");
+        std::fs::write(&retained, [7; 64]).unwrap();
+        let mut cache = Cache::scan(root.path()).unwrap();
+        let error = admit_local(
+            root.path(),
+            &mut cache,
+            1,
+            64,
+            std::slice::from_ref(&retained),
+        )
+        .unwrap_err();
+        let context = devres_application::collection::context(&error).unwrap();
+        assert_eq!(context.phase, Phase::Materialization);
+        let limit = context.limit.unwrap();
+        assert_eq!(limit.kind, LimitKind::CacheWorkingSet);
+        assert_eq!((limit.observed, limit.maximum), (Some(65), Some(64)));
+        assert_eq!(std::fs::read(retained).unwrap(), [7; 64]);
+    }
 
     #[test]
     fn aliases_and_renamed_generations_keep_one_physical_charge() {

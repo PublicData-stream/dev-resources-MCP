@@ -786,6 +786,14 @@ fn candidate_v1(
         return Err(invalid());
     }
     let p = provider(source)?;
+    if matches!(
+        (p, namespace),
+        ("w3c", "catalog-pages" | "catalog-failures")
+            | ("chromium", "traversal-gaps" | "traversal-gap-manifests")
+    ) {
+        // Discovery/checkpoint descriptors contain no publicly copied document.
+        return Ok(None);
+    }
     if p == "wikipedia" {
         return if namespace == "captures" {
             crate::wikipedia::attribution::target(data)
@@ -2328,6 +2336,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retained, targets[0]);
+    }
+    #[test]
+    fn collector_metadata_does_not_become_document_repair_work() {
+        for (provider, namespace) in [
+            ("w3c", "catalog-pages"),
+            ("w3c", "catalog-failures"),
+            ("chromium", "traversal-gaps"),
+            ("chromium", "traversal-gap-manifests"),
+        ] {
+            let descriptor = json!({"generation":crate::integrity::hash(b"candidate"),"page":1,"artifact":{"body_hash":crate::integrity::hash(b"raw metadata"),"bytes":9},"standards":[],"code":"unavailable"});
+            assert!(
+                candidate(
+                    provider,
+                    namespace,
+                    &crate::integrity::hash(b"descriptor"),
+                    &descriptor
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
     }
     #[test]
     fn wikipedia_discovery_exception_rejects_copied_titles() {
