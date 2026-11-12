@@ -35,6 +35,8 @@ fn known_evidence_kind(kind: &str) -> bool {
             | "snapshot-keys"
             | "snapshots"
             | "tags"
+            | "traversal-gaps"
+            | "traversal-gap-manifests"
             | "tree-pages"
             | "trees"
             | "views"
@@ -701,26 +703,36 @@ impl ChromiumCorpus {
                     .chromium_put("snapshots", &id, &encode(&snapshot)?)
                     .await?;
                 record(mappings, &mut aliases, "snapshots", &row.key, &id)?;
-                let alias = inventory::digest(
-                    &serde_json::to_vec(&(
+                let collection_version = snapshot.coverage["collection_version"]
+                    .as_u64()
+                    .unwrap_or(1) as u32;
+                let alias = alias_for_collection(
+                    &snapshot.component,
+                    &snapshot.repository,
+                    &snapshot.revision,
+                    &snapshot.representation,
+                    collection_version,
+                )?;
+                let old_alias_bytes = if collection_version == 1 {
+                    serde_json::to_vec(&(
                         &snapshot.component,
                         &snapshot.repository,
                         &snapshot.revision,
                         &snapshot.representation,
                         snapshot.processor_version,
                     ))
-                    .map_err(|_| failure())?,
-                );
-                let old_alias = crate::integrity::legacy_hash(
-                    &serde_json::to_vec(&(
+                } else {
+                    serde_json::to_vec(&(
                         &snapshot.component,
                         &snapshot.repository,
                         &snapshot.revision,
                         &snapshot.representation,
                         snapshot.processor_version,
+                        collection_version,
                     ))
-                    .map_err(|_| failure())?,
-                );
+                }
+                .map_err(|_| failure())?;
+                let old_alias = crate::integrity::legacy_hash(&old_alias_bytes);
                 record(mappings, &mut aliases, "snapshot-keys", &old_alias, &alias)?;
                 self.store
                     .chromium_put("snapshot-keys", &alias, &json!(id))
@@ -910,6 +922,8 @@ impl ChromiumCorpus {
             "sitemaps",
             "snapshot-keys",
             "tags",
+            "traversal-gaps",
+            "traversal-gap-manifests",
             "tree-pages",
             "trees",
             "web-map-jobs",
@@ -1231,6 +1245,8 @@ impl ChromiumCorpus {
         }
 
         for kind in [
+            "traversal-gaps",
+            "traversal-gap-manifests",
             "nodes",
             "projection-chunks",
             "projection-sequences",
@@ -1255,6 +1271,53 @@ impl ChromiumCorpus {
                     check(&cancel)?;
                     after = row.sequence;
                     match kind {
+                        "traversal-gaps" => self.verify_traversal_gap(&row.key, &row.data).await?,
+                        "traversal-gap-manifests" => {
+                            crate::integrity::verify(
+                                &row.key,
+                                &serde_json::to_vec(&row.data).map_err(|_| failure())?,
+                            )?;
+                            let count = row.data["count"]
+                                .as_u64()
+                                .filter(|count| *count > 0)
+                                .ok_or_else(failure)?;
+                            if row.data["gap"].is_string() {
+                                self.verify_gap_manifest(&row.key, count, &cancel).await?;
+                            } else {
+                                if row.data.as_object().is_none_or(|object| object.len() != 3) {
+                                    return Err(Error::integrity(
+                                        "Invalid Chromium traversal gap branch.",
+                                    ));
+                                }
+                                let mut total = 0_u64;
+                                for side in ["left", "right"] {
+                                    let child = row.data[side].as_str().ok_or_else(failure)?;
+                                    let retained = self
+                                        .store
+                                        .chromium_get("traversal-gap-manifests", child)
+                                        .await?
+                                        .ok_or_else(|| {
+                                            Error::integrity(
+                                                "Chromium traversal gap child is missing.",
+                                            )
+                                        })?;
+                                    total = total
+                                        .checked_add(
+                                            retained.data["count"].as_u64().ok_or_else(failure)?,
+                                        )
+                                        .ok_or_else(|| {
+                                            Error::integrity(
+                                                "Chromium traversal gap count overflow.",
+                                            )
+                                        })?;
+                                }
+                                if total != count {
+                                    return Err(Error::integrity(
+                                        "Chromium traversal gap branch count mismatch.",
+                                    ));
+                                }
+                            }
+                        }
                         "nodes" => {
                             let node = inventory::node(self.store.as_ref(), &row.key).await?;
                             for id in node.children.values().chain(node.buckets.values()) {
@@ -1378,6 +1441,22 @@ impl ChromiumCorpus {
                                 ));
                             }
                             self.verify_edge("nodes", &snapshot.inventory).await?;
+                            let gaps = snapshot.coverage["traversal_gaps"].as_u64().unwrap_or(0);
+                            if let Some(root) = snapshot.coverage["traversal_gap_root"].as_str() {
+                                self.verify_gap_manifest(root, gaps, &cancel).await?;
+                            } else if gaps != 0 {
+                                return Err(Error::integrity(
+                                    "Chromium traversal gap coverage root is missing.",
+                                ));
+                            }
+                            if gaps > 0
+                                && (snapshot.coverage["accounted"] == true
+                                    || snapshot.coverage["complete"] == true)
+                            {
+                                return Err(Error::integrity(
+                                    "Chromium unsupported traversal is marked complete.",
+                                ));
+                            }
                             if !snapshot.index.is_null() {
                                 self.verify_frozen_index(&snapshot.index, &cancel).await?;
                             }
@@ -1445,6 +1524,166 @@ impl ChromiumCorpus {
                             ));
                         }
                     }
+                }
+            }
+        }
+        self.verify_gap_checkpoints(&cancel).await?;
+        Ok(())
+    }
+    async fn verify_gap_coverage(&self, data: &Value, cancel: &CancellationToken) -> Result<()> {
+        let count = data["traversal_gaps"].as_u64().unwrap_or(0);
+        if let Some(root) = data["traversal_gap_root"].as_str() {
+            self.verify_gap_manifest(root, count, cancel).await
+        } else if count != 0 {
+            Err(Error::integrity(
+                "Chromium checkpoint traversal gap root is missing.",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) async fn verify_gap_checkpoints(&self, cancel: &CancellationToken) -> Result<()> {
+        let mut after = 0;
+        loop {
+            check(cancel)?;
+            let rows = self
+                .store
+                .chromium_migration_rows("derived-inventories", after, 100)
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                after = row.sequence;
+                if row.data.is_object() {
+                    self.verify_gap_coverage(&row.data, cancel).await?;
+                    self.verify_edge("nodes", row.data["inventory"].as_str().ok_or_else(failure)?)
+                        .await?;
+                } else {
+                    self.verify_edge("nodes", row.data.as_str().ok_or_else(failure)?)
+                        .await?;
+                }
+            }
+        }
+        let mut after = String::new();
+        loop {
+            check(cancel)?;
+            let keys = self
+                .store
+                .chromium_migration_state_keys(&after, 100)
+                .await?;
+            if keys.is_empty() {
+                break;
+            }
+            for key in keys {
+                after = key.clone();
+                if !key.starts_with("work:") {
+                    continue;
+                }
+                let work = self.store.chromium_state(&key).await?.ok_or_else(failure)?;
+                self.verify_gap_coverage(&work, cancel).await?;
+                self.verify_edge("nodes", work["inventory"].as_str().ok_or_else(failure)?)
+                    .await?;
+                let frames = work["stack"].as_array().ok_or_else(failure)?;
+                if frames.len() > 64 {
+                    return Err(Error::capacity(
+                        "Chromium retained checkpoint depth exceeds its bound.",
+                    ));
+                }
+                for frame in frames {
+                    self.verify_gap_coverage(frame, cancel).await?;
+                    self.verify_edge("nodes", frame["inventory"].as_str().ok_or_else(failure)?)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn verify_traversal_gap(&self, id: &str, data: &Value) -> Result<()> {
+        crate::integrity::verify(id, &serde_json::to_vec(data).map_err(|_| failure())?)?;
+        if !data["component"]
+            .as_str()
+            .is_some_and(|value| COMPONENTS.contains(&value))
+            || !data["revision"].as_str().is_some_and(source::valid_oid)
+            || !data["parent_tree"].as_str().is_some_and(source::valid_oid)
+            || !data["member_oid"].as_str().is_some_and(source::valid_oid)
+            || !data["path_hash"]
+                .as_str()
+                .is_some_and(crate::integrity::valid_hash)
+            || !matches!(
+                data["code"].as_str(),
+                Some("unsupported_path" | "tree_depth_exceeded")
+            )
+            || data["collection_version"] != COLLECTION_VERSION
+        {
+            return Err(Error::integrity("Invalid retained Chromium traversal gap."));
+        }
+        self.verify_edge("trees", data["parent_tree"].as_str().ok_or_else(failure)?)
+            .await
+    }
+    pub(super) async fn verify_gap_manifest(
+        &self,
+        root: &str,
+        count: u64,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let mut pending = vec![(root.to_owned(), count)];
+        let mut visited = BTreeSet::new();
+        while let Some((id, expected)) = pending.pop() {
+            check(cancel)?;
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if visited.len() > MAX_MEMBERS.saturating_mul(2) {
+                return Err(Error::capacity(
+                    "Chromium traversal gap graph exceeds its verification bound.",
+                ));
+            }
+            let row = self
+                .store
+                .chromium_get("traversal-gap-manifests", &id)
+                .await?
+                .ok_or_else(|| Error::integrity("Chromium traversal gap manifest is missing."))?;
+            crate::integrity::verify(&id, &serde_json::to_vec(&row.data).map_err(|_| failure())?)?;
+            if expected == 0 || row.data["count"].as_u64() != Some(expected) {
+                return Err(Error::integrity("Chromium traversal gap count mismatch."));
+            }
+            if let Some(gap) = row.data["gap"].as_str() {
+                if expected != 1 || row.data.as_object().is_none_or(|object| object.len() != 2) {
+                    return Err(Error::integrity("Invalid Chromium traversal gap leaf."));
+                }
+                let retained = self
+                    .store
+                    .chromium_get("traversal-gaps", gap)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::integrity("Chromium traversal gap evidence is missing.")
+                    })?;
+                self.verify_traversal_gap(gap, &retained.data).await?;
+            } else {
+                if row.data.as_object().is_none_or(|object| object.len() != 3) {
+                    return Err(Error::integrity("Invalid Chromium traversal gap branch."));
+                }
+                let mut total = 0_u64;
+                for side in ["left", "right"] {
+                    let child = row.data[side].as_str().ok_or_else(failure)?;
+                    let retained = self
+                        .store
+                        .chromium_get("traversal-gap-manifests", child)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::integrity("Chromium traversal gap child is missing.")
+                        })?;
+                    let count = retained.data["count"].as_u64().ok_or_else(failure)?;
+                    total = total.checked_add(count).ok_or_else(|| {
+                        Error::integrity("Chromium traversal gap count overflow.")
+                    })?;
+                    pending.push((child.to_owned(), count));
+                }
+                if total != expected {
+                    return Err(Error::integrity(
+                        "Chromium traversal gap branch count mismatch.",
+                    ));
                 }
             }
         }

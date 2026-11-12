@@ -8,9 +8,49 @@ pub(super) struct Memory {
     rows: Mutex<BTreeMap<(String, String), Row>>,
     state: Mutex<BTreeMap<String, Value>>,
     pub(super) fail_index_markers: std::sync::atomic::AtomicBool,
+    pub(super) fail_catalog_read: std::sync::atomic::AtomicBool,
+}
+impl Memory {
+    pub(super) fn remove_test_row(&self, kind: &str, key: &str) -> Option<Row> {
+        self.rows.lock().unwrap().remove(&(kind.into(), key.into()))
+    }
 }
 #[async_trait]
 impl ChromiumStore for Memory {
+    async fn chromium_migration_rows(
+        &self,
+        kind: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Row>> {
+        self.chromium_rows(kind, after, limit, None).await
+    }
+    async fn chromium_migration_kinds(&self) -> Result<Vec<String>> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(kind, _)| kind.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+    async fn chromium_migration_state_keys(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| key.as_str() > after)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
     async fn chromium_cutoff(&self) -> Result<i64> {
         Ok(self
             .rows
@@ -85,6 +125,15 @@ impl ChromiumStore for Memory {
         Ok(rows)
     }
     async fn chromium_state(&self, key: &str) -> Result<Option<Value>> {
+        if key == "catalog"
+            && self
+                .fail_catalog_read
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::integrity(
+                "Synthetic private catalog storage failure.",
+            ));
+        }
         Ok(self.state.lock().unwrap().get(key).cloned())
     }
     async fn chromium_set_state(&self, key: &str, data: &Value) -> Result<()> {

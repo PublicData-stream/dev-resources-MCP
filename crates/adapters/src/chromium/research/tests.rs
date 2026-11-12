@@ -497,3 +497,55 @@ async fn approved_path_comparison_ignores_unrelated_metadata_only_license_gap() 
     );
     assert!(research.call("chromium.compare",json!({"component":"src","before":mixed.id,"after":mixed.id,"path":"blocked.md","mode":"source"})).await.is_err());
 }
+
+#[tokio::test]
+async fn historical_parent_selection_stays_in_its_collection_generation() {
+    let _gate = crate::mdn::index::TEST_GATE.lock().await;
+    let (_root, store, corpus, snapshot) = fixture().await;
+    let mut legacy_parent = snapshot.clone();
+    legacy_parent.id = digest(&"legacy-generation-parent").unwrap();
+    legacy_parent.revision = "c".repeat(40);
+    store
+        .chromium_put("snapshots", &legacy_parent.id, &json!(legacy_parent))
+        .await
+        .unwrap();
+    let mut current_parent = legacy_parent.clone();
+    current_parent.id = digest(&"current-generation-parent").unwrap();
+    current_parent.coverage["collection_version"] = json!(2);
+    store
+        .chromium_put("snapshots", &current_parent.id, &json!(current_parent))
+        .await
+        .unwrap();
+    let research = ChromiumResearch::new(corpus);
+    let cutoff = store.chromium_cutoff().await.unwrap();
+    assert_eq!(
+        research
+            .parent_snapshot(
+                &snapshot,
+                &legacy_parent.revision,
+                cutoff,
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        legacy_parent.id
+    );
+    let mut selected = snapshot;
+    selected.coverage["collection_version"] = json!(2);
+    assert_eq!(
+        research
+            .parent_snapshot(
+                &selected,
+                &legacy_parent.revision,
+                cutoff,
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        current_parent.id
+    );
+}

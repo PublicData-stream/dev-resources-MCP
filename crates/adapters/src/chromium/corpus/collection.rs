@@ -1,4 +1,7 @@
 use super::*;
+use devres_application::collection::{
+    CollectorStatus, LimitKind, Phase, ProgressKind, at_phase, http_failure, limited,
+};
 use quick_xml::{Reader, events::Event};
 
 fn collection_failure(stage: &'static str, error: &Error) {
@@ -18,6 +21,20 @@ struct Frame {
     offset: usize,
     inventory: String,
     license: Value,
+    #[serde(default)]
+    traversal_gaps: u64,
+    #[serde(default)]
+    traversal_gap_root: Option<String>,
+    #[serde(default)]
+    excluded_subtrees: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DerivedInventory {
+    inventory: String,
+    traversal_gaps: u64,
+    #[serde(default)]
+    traversal_gap_root: Option<String>,
+    excluded_subtrees: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Work {
@@ -26,6 +43,14 @@ struct Work {
     stack: Vec<Frame>,
     inventory: String,
     observed_at: i64,
+    #[serde(default)]
+    traversal_gaps: u64,
+    #[serde(default)]
+    traversal_gap_root: Option<String>,
+    #[serde(default)]
+    excluded_subtrees: u64,
+    #[serde(default)]
+    processed_members: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TreeHeader {
@@ -42,21 +67,40 @@ struct WebWork {
     page_after: i64,
     inventory: String,
     discovery_complete: bool,
+    #[serde(default)]
+    processed_pages: u64,
+    #[serde(default)]
+    processed_maps: u64,
 }
 
 fn work_key(component: &str, revision: &str) -> String {
     state_key(
         "work",
-        &format!("{component}:{revision}:{PROCESSOR_VERSION}"),
+        &format!("{component}:{revision}:{PROCESSOR_VERSION}:{COLLECTION_VERSION}"),
     )
 }
 fn job_key(component: &str, revision: &str) -> String {
-    crate::integrity::legacy_hash(format!("{component}:{revision}:{PROCESSOR_VERSION}").as_bytes())
+    crate::integrity::legacy_hash(
+        format!("{component}:{revision}:{PROCESSOR_VERSION}:{COLLECTION_VERSION}").as_bytes(),
+    )
+}
+fn legacy_job_key(component: &str, revision: &str) -> String {
+    crate::integrity::legacy_hash(format!("{component}:{revision}:1").as_bytes())
+}
+fn scheduling_key(name: &str) -> String {
+    format!("{name}-collection-{COLLECTION_VERSION}")
 }
 fn derived_key(component: &str, tree: &str, path: &str, license: &Value) -> Result<String> {
     Ok(inventory::digest(
-        &serde_json::to_vec(&(component, tree, path, license, PROCESSOR_VERSION))
-            .map_err(|_| failure())?,
+        &serde_json::to_vec(&(
+            component,
+            tree,
+            path,
+            license,
+            PROCESSOR_VERSION,
+            COLLECTION_VERSION,
+        ))
+        .map_err(|_| failure())?,
     ))
 }
 fn join_path(path: &str, name: &str) -> String {
@@ -81,11 +125,106 @@ fn document_candidate(component: &str, path: &str) -> bool {
     }
     chromium_processing::candidate(path)
 }
+fn subtree_candidate(component: &str, path: &str) -> bool {
+    if !chromium_processing::may_contain_documents(path) {
+        return false;
+    }
+    let parts = path.split('/').collect::<Vec<_>>();
+    if component == "site"
+        && (parts.first() != Some(&"site") || parts.iter().any(|part| part.starts_with('_')))
+    {
+        return false;
+    }
+    !(component == "chrome-archive"
+        && parts.first() == Some(&"site")
+        && parts.get(1).is_some_and(|part| *part != "en"))
+}
 fn valid_component(value: &str) -> bool {
     COMPONENTS.contains(&value)
 }
 
 impl ChromiumCorpus {
+    pub(super) async fn collector_status(
+        &self,
+        component: &str,
+        lane: &str,
+    ) -> Result<CollectorStatus> {
+        self.store
+            .chromium_state(&state_key("collector", &format!("{component}:{lane}")))
+            .await?
+            .map(decode)
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    }
+    pub(super) async fn save_collector(
+        &self,
+        component: &str,
+        lane: &str,
+        status: &CollectorStatus,
+    ) -> Result<()> {
+        self.store
+            .chromium_set_state(
+                &state_key("collector", &format!("{component}:{lane}")),
+                &encode(status)?,
+            )
+            .await
+    }
+    async fn put_gap_manifest(&self, data: &Value) -> Result<String> {
+        let id = inventory::digest(&serde_json::to_vec(data).map_err(|_| failure())?);
+        self.store
+            .chromium_put("traversal-gap-manifests", &id, data)
+            .await?;
+        Ok(id)
+    }
+    async fn merge_gap_roots(
+        &self,
+        left: Option<String>,
+        right: Option<String>,
+    ) -> Result<Option<String>> {
+        let (Some(left), Some(right)) = (left.clone(), right.clone()) else {
+            return Ok(left.or(right));
+        };
+        let a = self
+            .store
+            .chromium_get("traversal-gap-manifests", &left)
+            .await?
+            .ok_or_else(failure)?;
+        let b = self
+            .store
+            .chromium_get("traversal-gap-manifests", &right)
+            .await?
+            .ok_or_else(failure)?;
+        let count = a.data["count"]
+            .as_u64()
+            .and_then(|count| count.checked_add(b.data["count"].as_u64()?))
+            .ok_or_else(|| Error::capacity("Chromium traversal gap count exceeds its bound."))?;
+        self.put_gap_manifest(&json!({"left":left,"right":right,"count":count}))
+            .await
+            .map(Some)
+    }
+    async fn traversal_progress(&self, work: &Work, lane: &str) -> Result<()> {
+        let mut status = self.collector_status(&work.component, lane).await?;
+        status.progress(ProgressKind::Members, work.processed_members);
+        status.progress(
+            ProgressKind::TraversalGaps,
+            work.traversal_gaps.saturating_add(
+                work.stack
+                    .iter()
+                    .map(|frame| frame.traversal_gaps)
+                    .sum::<u64>(),
+            ),
+        );
+        status.progress(
+            ProgressKind::ExcludedSubtrees,
+            work.excluded_subtrees.saturating_add(
+                work.stack
+                    .iter()
+                    .map(|frame| frame.excluded_subtrees)
+                    .sum::<u64>(),
+            ),
+        );
+        self.save_collector(&work.component, lane, &status).await
+    }
     async fn request(
         &self,
         operation: &Operation,
@@ -107,6 +246,7 @@ impl ChromiumCorpus {
             .source
             .fetch(operation, cancel)
             .await
+            .map_err(|error| at_phase(error, Phase::PublicationAcquisition))
             .inspect_err(|error| collection_failure("source_acquisition", error))?;
         if let Some(retry_at) = response.retry_at {
             self.store
@@ -118,17 +258,32 @@ impl ChromiumCorpus {
         }
         if !matches!(response.status, 200 | 404) {
             tracing::warn!(target: "devres_server::collection", provider = "chromium", stage = "source_http_status", status = response.status, "Public collection stage failed");
-            return Err(Error::unavailable(
-                "Chromium provider response is unavailable; absence is unconfirmed.",
+            return Err(http_failure(
+                Error::unavailable(
+                    "Chromium provider response is unavailable; absence is unconfirmed.",
+                ),
+                Phase::PublicationAcquisition,
+                response.status,
             ));
         }
         Ok(response)
     }
     async fn ensure_catalog(&self) -> Result<Catalog> {
-        if let Ok(catalog) = self.catalog().await {
-            return Ok(catalog);
+        if self
+            .store
+            .chromium_state("catalog")
+            .await
+            .map_err(|error| at_phase(error, Phase::CatalogLookup))?
+            .is_some()
+        {
+            return self
+                .catalog()
+                .await
+                .map_err(|error| at_phase(error, Phase::CatalogLookup));
         }
-        self.publish_catalog().await
+        self.publish_catalog()
+            .await
+            .map_err(|error| at_phase(error, Phase::CatalogPublication))
     }
     async fn publish_catalog(&self) -> Result<Catalog> {
         let observed_at = devres_domain::unix_now();
@@ -161,7 +316,7 @@ impl ChromiumCorpus {
             return Err(Error::integrity("Invalid Chromium ancestry obligation."));
         }
         let key = job_key(component, revision);
-        self.store.chromium_put("jobs",&key,&json!({"component":component,"revision":revision,"processor_version":PROCESSOR_VERSION})).await?;
+        self.store.chromium_put("jobs",&key,&json!({"component":component,"revision":revision,"processor_version":PROCESSOR_VERSION,"collection_version":COLLECTION_VERSION})).await?;
         Ok(())
     }
     async fn observe_refs(
@@ -200,7 +355,11 @@ impl ChromiumCorpus {
                 && component != "chrome-archive"
                 && matches!(namespace, Some("tags" | "branch-heads"));
             if response.status != 200 && !absent_optional {
-                return Err(Error::unavailable("Chromium ref inventory is unavailable."));
+                return Err(http_failure(
+                    Error::unavailable("Chromium ref inventory is unavailable."),
+                    Phase::PublicationAcquisition,
+                    response.status,
+                ));
             }
             exposed &= !absent_optional;
             observed_at = observed_at.min(response.observed_at);
@@ -208,12 +367,14 @@ impl ChromiumCorpus {
                 BTreeMap::new()
             } else {
                 source::parse_refs(component, &response.bytes)
+                    .map_err(|error| at_phase(error, Phase::SourceValidation))
                     .inspect_err(|error| collection_failure("source_validation", error))?
             };
             let tags = if absent_optional {
                 BTreeMap::new()
             } else {
                 source::annotated_tags(component, &response.bytes)
+                    .map_err(|error| at_phase(error, Phase::SourceValidation))
                     .inspect_err(|error| collection_failure("source_validation", error))?
             };
             for (name, original) in tags {
@@ -233,6 +394,7 @@ impl ChromiumCorpus {
                         return Err(Error::unavailable("Chromium annotated tag is unavailable."));
                     }
                     let tag = source::parse_tag(component, &response.bytes)
+                        .map_err(|error| at_phase(error, Phase::SourceValidation))
                         .inspect_err(|error| collection_failure("source_validation", error))?;
                     if tag.revision != revision {
                         return Err(Error::integrity(
@@ -370,6 +532,7 @@ impl ChromiumCorpus {
             ));
         }
         let directory: Directory = source::parse_tree(component, &response.bytes)
+            .map_err(|error| at_phase(error, Phase::SourceValidation))
             .inspect_err(|error| collection_failure("source_validation", error))?;
         if directory.id != tree {
             return Err(Error::integrity(
@@ -440,6 +603,7 @@ impl ChromiumCorpus {
             return Err(Error::not_found("Chromium document body is unavailable."));
         }
         let bytes = source::decode_blob(component, &response.bytes, oid)
+            .map_err(|error| at_phase(error, Phase::SourceValidation))
             .inspect_err(|error| collection_failure("source_validation", error))?;
         Ok((bytes, response.source_url))
     }
@@ -452,6 +616,11 @@ impl ChromiumCorpus {
         parent: &Value,
         cancel: CancellationToken,
     ) -> Result<Value> {
+        // An uninspectable governing notice cannot be overridden by inheriting
+        // some other convenient terms while traversing the same affected scope.
+        if parent["gap"] == "unsupported_notice_path" {
+            return Ok(parent.clone());
+        }
         let cache_key = inventory::digest(
             &serde_json::to_vec(&(component, path, &header.id, parent)).map_err(|_| failure())?,
         );
@@ -469,6 +638,11 @@ impl ChromiumCorpus {
                 continue;
             }
             let full = join_path(path, &entry.name);
+            if !source::valid_path(&full) || !inventory::valid_path(&full) {
+                license = licensing::unresolved(component, "unrequestable_notice");
+                license["gap"] = json!("unsupported_notice_path");
+                break;
+            }
             let notice_key = inventory::digest(
                 &serde_json::to_vec(&(component, &full, &entry.oid)).map_err(|_| failure())?,
             );
@@ -491,7 +665,8 @@ impl ChromiumCorpus {
                 let artifact = self
                     .raw
                     .capture_bytes_bounded(bytes, MAX_SOURCE as u64, cancel.clone())
-                    .await?;
+                    .await
+                    .map_err(|error| at_phase(error, Phase::RawRetention))?;
                 license["artifact"] = encode(&artifact)?;
                 self.store
                     .chromium_put(
@@ -543,6 +718,24 @@ impl ChromiumCorpus {
                 .directory("site", revision, &path, &entry.oid, cancel.clone())
                 .await?;
         }
+        // Check all possible governing footer names before accepting an earlier
+        // readable footer; an unrequestable sibling remains unresolved evidence.
+        for offset in 0..header.entries {
+            let entry = self
+                .tree_entry(&header, offset)
+                .await?
+                .ok_or_else(failure)?;
+            let full = join_path(&path, &entry.name);
+            if entry.kind == "blob"
+                && (entry.name.to_ascii_lowercase().contains("footer")
+                    || entry.name.to_ascii_lowercase().contains("sidebar"))
+                && (!source::valid_path(&full) || !inventory::valid_path(&full))
+            {
+                let mut license = licensing::unresolved("site", "unrequestable_footer");
+                license["gap"] = json!("unsupported_notice_path");
+                return Ok(license);
+            }
+        }
         for offset in 0..header.entries {
             let entry = self
                 .tree_entry(&header, offset)
@@ -553,6 +746,11 @@ impl ChromiumCorpus {
                     || entry.name.to_ascii_lowercase().contains("sidebar"))
             {
                 let full = join_path(&path, &entry.name);
+                if !source::valid_path(&full) || !inventory::valid_path(&full) {
+                    let mut license = licensing::unresolved("site", "unrequestable_footer");
+                    license["gap"] = json!("unsupported_notice_path");
+                    return Ok(license);
+                }
                 let notice_key = inventory::digest(
                     &serde_json::to_vec(&("site", &full, &entry.oid)).map_err(|_| failure())?,
                 );
@@ -574,7 +772,8 @@ impl ChromiumCorpus {
                     let artifact = self
                         .raw
                         .capture_bytes_bounded(bytes, MAX_SOURCE as u64, cancel.clone())
-                        .await?;
+                        .await
+                        .map_err(|error| at_phase(error, Phase::RawRetention))?;
                     license["artifact"] = encode(&artifact)?;
                     license["notice_oid"] = json!(entry.oid);
                     self.store
@@ -594,7 +793,20 @@ impl ChromiumCorpus {
         cancel: CancellationToken,
     ) -> Result<Option<Work>> {
         let key = job_key(component, revision);
-        let commit: Commit = if let Some(row) = self.store.chromium_get("commits", &key).await? {
+        let retained = match self.store.chromium_get("commits", &key).await? {
+            Some(row) => Some(row),
+            None => {
+                self.store
+                    .chromium_get("commits", &legacy_job_key(component, revision))
+                    .await?
+            }
+        };
+        let commit: Commit = if let Some(row) = retained {
+            if row.data["component"] != component {
+                return Err(Error::integrity(
+                    "Chromium retained commit component mismatch.",
+                ));
+            }
             decode(row.data["commit"].clone())?
         } else {
             let response = self
@@ -614,6 +826,7 @@ impl ChromiumCorpus {
                 return Ok(None);
             }
             let commit = source::parse_commit(component, &response.bytes)
+                .map_err(|error| at_phase(error, Phase::SourceValidation))
                 .inspect_err(|error| collection_failure("source_validation", error))?;
             if commit.revision != revision {
                 return Err(Error::integrity("Chromium commit identity mismatch."));
@@ -621,6 +834,11 @@ impl ChromiumCorpus {
             self.store.chromium_put("commits",&key,&json!({"component":component,"repository":component_base(component)?,"commit":commit,"source_url":response.source_url,"verification":"https_metadata"})).await?;
             commit
         };
+        if commit.revision != revision {
+            return Err(Error::integrity(
+                "Chromium retained commit revision mismatch.",
+            ));
+        }
         for parent in &commit.parents {
             self.enqueue(component, parent).await?;
         }
@@ -645,9 +863,16 @@ impl ChromiumCorpus {
                 offset: 0,
                 inventory: inventory.clone(),
                 license,
+                traversal_gaps: 0,
+                traversal_gap_root: None,
+                excluded_subtrees: 0,
             }],
             inventory,
             observed_at,
+            traversal_gaps: 0,
+            traversal_gap_root: None,
+            excluded_subtrees: 0,
+            processed_members: 0,
         }))
     }
     async fn retain_member(
@@ -670,6 +895,9 @@ impl ChromiumCorpus {
         };
         if license["decision"] != "approved" {
             member.gaps.push("license_scope_unresolved".into());
+            if license["gap"] == "unsupported_notice_path" {
+                member.gaps.push("license_notice_unrequestable".into());
+            }
             return Ok(member);
         }
         let cache_key = inventory::digest(
@@ -706,7 +934,8 @@ impl ChromiumCorpus {
         let artifact = self
             .raw
             .capture_bytes_bounded(bytes.clone(), MAX_SOURCE as u64, cancel.clone())
-            .await?;
+            .await
+            .map_err(|error| at_phase(error, Phase::RawRetention))?;
         let chunks = self.publication_chunks(&artifact, cancel.clone()).await?;
         member.raw = Some(
             json!({"artifact":artifact,"source_url":url,"license":license,"chunk_hashes":chunks,"revision":revision}),
@@ -714,6 +943,7 @@ impl ChromiumCorpus {
         match self
             .project(&super::component(component)?, path, "git", bytes, cancel)
             .await
+            .map_err(|error| at_phase(error, Phase::Projection))
         {
             Ok((projection, gaps)) => {
                 member.projection = Some(projection);
@@ -740,6 +970,7 @@ impl ChromiumCorpus {
         component: &str,
         revision: &str,
         observed_at: i64,
+        lane: &str,
         cancel: CancellationToken,
     ) -> Result<bool> {
         let key = job_key(component, revision);
@@ -776,9 +1007,18 @@ impl ChromiumCorpus {
                     .chromium_get("derived-inventories", &derived)
                     .await?
             {
-                let root = row.data.as_str().ok_or_else(failure)?.to_owned();
+                let cached: DerivedInventory = decode(row.data)?;
+                let root = cached.inventory;
                 work.stack.pop();
                 if let Some(parent) = work.stack.last_mut() {
+                    parent.traversal_gaps += cached.traversal_gaps;
+                    parent.traversal_gap_root = self
+                        .merge_gap_roots(
+                            parent.traversal_gap_root.clone(),
+                            cached.traversal_gap_root.clone(),
+                        )
+                        .await?;
+                    parent.excluded_subtrees += cached.excluded_subtrees;
                     let name = frame.path.rsplit('/').next().ok_or_else(failure)?;
                     parent.inventory = inventory::graft_cached(
                         self.store.as_ref(),
@@ -790,6 +1030,9 @@ impl ChromiumCorpus {
                     .await?;
                 } else {
                     work.inventory = root;
+                    work.traversal_gaps = cached.traversal_gaps;
+                    work.traversal_gap_root = cached.traversal_gap_root;
+                    work.excluded_subtrees = cached.excluded_subtrees;
                 }
                 continue;
             }
@@ -804,10 +1047,27 @@ impl ChromiumCorpus {
                 .await?;
             let Some(entry) = self.tree_entry(&header, frame.offset).await? else {
                 self.store
-                    .chromium_put("derived-inventories", &derived, &json!(frame.inventory))
+                    .chromium_put(
+                        "derived-inventories",
+                        &derived,
+                        &encode(&DerivedInventory {
+                            inventory: frame.inventory.clone(),
+                            traversal_gaps: frame.traversal_gaps,
+                            traversal_gap_root: frame.traversal_gap_root.clone(),
+                            excluded_subtrees: frame.excluded_subtrees,
+                        })?,
+                    )
                     .await?;
                 work.stack.pop();
                 if let Some(parent) = work.stack.last_mut() {
+                    parent.traversal_gaps += frame.traversal_gaps;
+                    parent.traversal_gap_root = self
+                        .merge_gap_roots(
+                            parent.traversal_gap_root.clone(),
+                            frame.traversal_gap_root.clone(),
+                        )
+                        .await?;
+                    parent.excluded_subtrees += frame.excluded_subtrees;
                     let name = frame.path.rsplit('/').next().ok_or_else(failure)?;
                     parent.inventory = inventory::graft_cached(
                         self.store.as_ref(),
@@ -819,24 +1079,51 @@ impl ChromiumCorpus {
                     .await?;
                 } else {
                     work.inventory = frame.inventory;
+                    work.traversal_gaps = frame.traversal_gaps;
+                    work.traversal_gap_root = frame.traversal_gap_root;
+                    work.excluded_subtrees = frame.excluded_subtrees;
                 }
                 continue;
             };
             let path = join_path(&frame.path, &entry.name);
-            if !inventory::valid_path(&path) {
-                return Err(Error::integrity(
-                    "Chromium tree contains an unsupported path.",
-                ));
+            if entry.kind == "tree" && !subtree_candidate(component, &path) {
+                if let Some(last) = work.stack.last_mut() {
+                    last.offset += 1;
+                    last.excluded_subtrees += 1;
+                }
+                self.store
+                    .chromium_set_state(&checkpoint, &encode(&work)?)
+                    .await?;
+                continue;
+            }
+            if !inventory::valid_path(&path)
+                || !source::valid_path(&path)
+                || (entry.kind == "tree" && work.stack.len() >= 64)
+            {
+                let gap = json!({"component":component,"revision":revision,"parent_tree":frame.tree,"member_oid":entry.oid,"path_hash":inventory::digest(path.as_bytes()),"code":if entry.kind == "tree" && work.stack.len() >= 64 {"tree_depth_exceeded"} else {"unsupported_path"},"collection_version":COLLECTION_VERSION});
+                let gap_id = inventory::digest(&serde_json::to_vec(&gap).map_err(|_| failure())?);
+                self.store
+                    .chromium_put("traversal-gaps", &gap_id, &gap)
+                    .await?;
+                let leaf = self
+                    .put_gap_manifest(&json!({"gap":gap_id,"count":1}))
+                    .await?;
+                if let Some(last) = work.stack.last_mut() {
+                    last.offset += 1;
+                    last.traversal_gaps += 1;
+                    last.traversal_gap_root = self
+                        .merge_gap_roots(last.traversal_gap_root.clone(), Some(leaf))
+                        .await?;
+                }
+                self.store
+                    .chromium_set_state(&checkpoint, &encode(&work)?)
+                    .await?;
+                continue;
             }
             if let Some(last) = work.stack.last_mut() {
                 last.offset += 1;
             }
             if entry.kind == "tree" {
-                if work.stack.len() >= 64 {
-                    return Err(Error::capacity(
-                        "Chromium directory nesting exceeds its bound.",
-                    ));
-                }
                 let header = self
                     .directory(component, revision, &path, &entry.oid, cancel.clone())
                     .await?;
@@ -856,11 +1143,15 @@ impl ChromiumCorpus {
                     offset: 0,
                     inventory: inventory::empty(self.store.as_ref()).await?,
                     license,
+                    traversal_gaps: 0,
+                    traversal_gap_root: None,
+                    excluded_subtrees: 0,
                 });
             } else if entry.kind == "blob"
                 && entry.mode & 0o170000 == 0o100000
                 && document_candidate(component, &path)
             {
+                work.processed_members += 1;
                 let member = self
                     .retain_member(
                         component,
@@ -889,20 +1180,24 @@ impl ChromiumCorpus {
         self.store
             .chromium_set_state(&checkpoint, &encode(&work)?)
             .await?;
+        self.traversal_progress(&work, lane).await?;
         if !work.stack.is_empty() {
             return Ok(false);
         }
         let metadata = inventory::node(self.store.as_ref(), &work.inventory).await?;
         let index = self
             .flush_index(std::slice::from_ref(&work.inventory), cancel.clone())
-            .await?;
-        let coverage = json!({"accounted":true,"usable":metadata.searchable>0,"documents":metadata.members,"projection_gaps":metadata.gaps,"index_gaps":0,"license":{"decision":"approved","scope":"qualified_retained_members_only"},"ancestry":"parent_closure_queued","raw_commit_verification":"https_metadata","classifier_version":PROCESSOR_VERSION});
+            .await
+            .map_err(|error| at_phase(error, Phase::IndexPublication))?;
+        let coverage = json!({"accounted":work.traversal_gaps==0,"usable":metadata.searchable>0,"documents":metadata.members,"projection_gaps":metadata.gaps,"index_gaps":0,"license":{"decision":"approved","scope":"qualified_retained_members_only"},"ancestry":"parent_closure_queued","raw_commit_verification":"https_metadata","classifier_version":chromium_processing::CLASSIFIER_VERSION,"collection_version":COLLECTION_VERSION,"traversal_gaps":work.traversal_gaps,"traversal_gap_root":work.traversal_gap_root,"excluded_subtrees":work.excluded_subtrees,"complete":work.traversal_gaps==0 && metadata.gaps==0});
         let id = inventory::digest(
             &serde_json::to_vec(&(
                 component,
                 revision,
                 &work.inventory,
                 PROCESSOR_VERSION,
+                COLLECTION_VERSION,
+                &work.traversal_gap_root,
                 &index,
             ))
             .map_err(|_| failure())?,
@@ -1074,7 +1369,7 @@ impl ChromiumCorpus {
     async fn begin_web(&self) -> Result<()> {
         let observed_at = devres_domain::unix_now();
         let id = inventory::digest(
-            &serde_json::to_vec(&("chrome", observed_at, PROCESSOR_VERSION))
+            &serde_json::to_vec(&("chrome", observed_at, PROCESSOR_VERSION, COLLECTION_VERSION))
                 .map_err(|_| failure())?,
         );
         let work = WebWork {
@@ -1085,6 +1380,8 @@ impl ChromiumCorpus {
             page_after: 0,
             inventory: inventory::empty(self.store.as_ref()).await?,
             discovery_complete: false,
+            processed_pages: 0,
+            processed_maps: 0,
         };
         self.store
             .chromium_put(
@@ -1094,15 +1391,28 @@ impl ChromiumCorpus {
             )
             .await?;
         self.store
-            .chromium_set_state("web-work", &encode(&work)?)
+            .chromium_set_state(&scheduling_key("web-work"), &encode(&work)?)
             .await?;
         Ok(())
     }
     async fn web_step(&self, cancel: CancellationToken) -> Result<bool> {
-        let Some(value) = self.store.chromium_state("web-work").await? else {
+        let Some(value) = self
+            .store
+            .chromium_state(&scheduling_key("web-work"))
+            .await?
+        else {
             return Ok(true);
         };
         let mut work: WebWork = decode(value)?;
+        let mut status = self.collector_status("chrome", "current").await?;
+        status.phase = Some(if work.discovery_complete {
+            Phase::PublicationAcquisition
+        } else {
+            Phase::SitemapDiscovery
+        });
+        status.progress(ProgressKind::Pages, work.processed_pages);
+        status.progress(ProgressKind::Batches, work.processed_maps);
+        self.save_collector("chrome", "current", &status).await?;
         if !work.discovery_complete {
             let rows = self
                 .store
@@ -1114,8 +1424,12 @@ impl ChromiumCorpus {
                     let path = row.data["path"].as_str().ok_or_else(failure)?;
                     let depth = row.data["depth"].as_u64().ok_or_else(failure)?;
                     if depth > 16 {
-                        return Err(Error::capacity(
-                            "Chromium sitemap recursion exceeds its bound.",
+                        return Err(limited(
+                            Error::capacity("Chromium sitemap recursion exceeds its bound."),
+                            Phase::SitemapDiscovery,
+                            LimitKind::TreeDepth,
+                            Some(depth),
+                            Some(16),
                         ));
                     }
                     let response = self
@@ -1127,6 +1441,7 @@ impl ChromiumCorpus {
                         ));
                     }
                     let (maps, pages) = sitemap_locations(&response.bytes)
+                        .map_err(|error| at_phase(error, Phase::SourceValidation))
                         .inspect_err(|error| collection_failure("source_validation", error))?;
                     for path in maps {
                         let id = inventory::digest(format!("{}:{path}", work.id).as_bytes());
@@ -1148,17 +1463,18 @@ impl ChromiumCorpus {
                             )
                             .await?;
                     }
+                    work.processed_maps += 1;
                     let id = inventory::digest(&response.bytes);
                     self.store.chromium_put("sitemaps",&id,&json!({"source_url":response.source_url,"observed_at":response.observed_at,"body_hash":id,"work":work.id})).await?;
                 }
                 self.store
-                    .chromium_set_state("web-work", &encode(&work)?)
+                    .chromium_set_state(&scheduling_key("web-work"), &encode(&work)?)
                     .await?;
                 return Ok(false);
             }
             work.discovery_complete = true;
             self.store
-                .chromium_set_state("web-work", &encode(&work)?)
+                .chromium_set_state(&scheduling_key("web-work"), &encode(&work)?)
                 .await?;
         }
         let rows = self
@@ -1197,7 +1513,8 @@ impl ChromiumCorpus {
                                 MAX_SOURCE as u64,
                                 cancel.clone(),
                             )
-                            .await?;
+                            .await
+                            .map_err(|error| at_phase(error, Phase::RawRetention))?;
                         let chunks = self.publication_chunks(&artifact, cancel.clone()).await?;
                         member.raw = Some(
                             json!({"artifact":artifact,"source_url":response.source_url,"license":license,"chunk_hashes":chunks,"observed_at":response.observed_at}),
@@ -1269,10 +1586,11 @@ impl ChromiumCorpus {
                 work.inventory =
                     inventory::update(self.store.as_ref(), &work.inventory, path, Some(member))
                         .await?;
+                work.processed_pages += 1;
             }
             work.page_after = row.sequence;
             self.store
-                .chromium_set_state("web-work", &encode(&work)?)
+                .chromium_set_state(&scheduling_key("web-work"), &encode(&work)?)
                 .await?;
             return Ok(false);
         }
@@ -1284,7 +1602,8 @@ impl ChromiumCorpus {
         }
         let index = self
             .flush_index(std::slice::from_ref(&work.inventory), cancel.clone())
-            .await?;
+            .await
+            .map_err(|error| at_phase(error, Phase::IndexPublication))?;
         let revision = inventory::digest(
             &serde_json::to_vec(&(&work.id, &work.inventory)).map_err(|_| failure())?,
         );
@@ -1300,6 +1619,7 @@ impl ChromiumCorpus {
                 &revision,
                 &work.inventory,
                 PROCESSOR_VERSION,
+                COLLECTION_VERSION,
                 &index,
             ))
             .map_err(|_| failure())?,
@@ -1315,7 +1635,7 @@ impl ChromiumCorpus {
             inventory: work.inventory,
             index,
             processor_version: PROCESSOR_VERSION,
-            coverage: json!({"accounted":true,"usable":inventory_node.searchable>0,"documents":inventory_node.members,"projection_gaps":inventory_node.gaps,"index_gaps":0,"license":{"decision":"approved","scope":"qualified_retained_members_only"},"observation":observation_id,"history_gap":"unexposed_migrated_history"}),
+            coverage: json!({"accounted":true,"usable":inventory_node.searchable>0,"collection_version":COLLECTION_VERSION,"documents":inventory_node.members,"projection_gaps":inventory_node.gaps,"index_gaps":0,"license":{"decision":"approved","scope":"qualified_retained_members_only"},"observation":observation_id,"history_gap":"unexposed_migrated_history"}),
             source_url: component_base("chrome")?.into(),
             representation: "html".into(),
             validated_at: work.validation_min,
@@ -1332,14 +1652,14 @@ impl ChromiumCorpus {
                 .await?;
         }
         self.store
-            .chromium_set_state("web-completed", &json!(work.id))
+            .chromium_set_state(&scheduling_key("web-completed"), &json!(work.id))
             .await?;
         self.store
-            .chromium_set_state("web-work", &Value::Null)
+            .chromium_set_state(&scheduling_key("web-work"), &Value::Null)
             .await?;
         self.store
             .chromium_set_state(
-                &state_key("publication-validated", "chrome"),
+                &state_key("publication-validated-v2", "chrome"),
                 &json!(work.observed_at),
             )
             .await?;
@@ -1372,7 +1692,10 @@ impl ChromiumCorpus {
         if snapshots.is_empty() {
             return Ok(());
         }
-        let index = self.flush_index(&roots, cancel).await?;
+        let index = self
+            .flush_index(&roots, cancel)
+            .await
+            .map_err(|error| at_phase(error, Phase::IndexPublication))?;
         let validated_at = validations
             .values()
             .copied()
@@ -1393,6 +1716,7 @@ impl ChromiumCorpus {
                 validated_at,
             })
             .await
+            .map_err(|error| at_phase(error, Phase::ViewPublication))
     }
     pub async fn collect_current_once(&self, cancel: CancellationToken) -> Result<bool> {
         let _guard = self.processing.lock().await;
@@ -1408,13 +1732,16 @@ impl ChromiumCorpus {
         }
         let offset = self
             .store
-            .chromium_state("current-offset")
+            .chromium_state(&scheduling_key("current-offset"))
             .await?
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
         let selected = COMPONENTS[offset % COMPONENTS.len()];
         self.store
-            .chromium_set_state("current-offset", &json!((offset + 1) % COMPONENTS.len()))
+            .chromium_set_state(
+                &scheduling_key("current-offset"),
+                &json!((offset + 1) % COMPONENTS.len()),
+            )
             .await?;
         let host = match selected {
             "chrome" => "developer.chrome.com",
@@ -1428,18 +1755,77 @@ impl ChromiumCorpus {
             .and_then(|value| value["retry_at"].as_i64())
             .is_some_and(|retry| retry > now)
         {
+            let mut status = self.collector_status(selected, "current").await?;
+            status.active = false;
+            status.retry_at = self
+                .store
+                .chromium_state(&state_key("deferred", host))
+                .await?
+                .and_then(|value| value["retry_at"].as_i64());
+            self.save_collector(selected, "current", &status).await?;
             self.update_status().await?;
             return self.current_complete().await;
         }
+        let mut status = self.collector_status(selected, "current").await?;
+        status.begin(if selected == "chrome" {
+            Phase::SitemapDiscovery
+        } else {
+            Phase::Traversal
+        });
+        self.save_collector(selected, "current", &status).await?;
+        let result = self
+            .current_component_step(selected, refresh, now, cancel)
+            .await;
+        let mut status = self.collector_status(selected, "current").await?;
+        if selected == "chrome"
+            && let Some(value) = self
+                .store
+                .chromium_state(&scheduling_key("web-work"))
+                .await?
+                .filter(|value| !value.is_null())
+        {
+            let work: WebWork = decode(value)?;
+            status.progress(ProgressKind::Pages, work.processed_pages);
+            status.progress(ProgressKind::Batches, work.processed_maps);
+        }
+        let retry_at = self
+            .store
+            .chromium_state(&state_key("deferred", host))
+            .await?
+            .and_then(|value| value["retry_at"].as_i64())
+            .unwrap_or(0)
+            .max(devres_domain::unix_now() + 60);
+        match &result {
+            Ok(_) => status.succeed(devres_domain::unix_now()),
+            Err(error) => status.fail(
+                error,
+                Phase::Traversal,
+                devres_domain::unix_now(),
+                Some(retry_at),
+            ),
+        }
+        self.save_collector(selected, "current", &status).await?;
+        self.update_status()
+            .await
+            .map_err(|error| at_phase(error, Phase::StatusRead))?;
+        result
+    }
+    async fn current_component_step(
+        &self,
+        selected: &str,
+        refresh: bool,
+        now: i64,
+        cancel: CancellationToken,
+    ) -> Result<bool> {
         if selected == "chrome" {
             let state = self
                 .store
-                .chromium_state("web-work")
+                .chromium_state(&scheduling_key("web-work"))
                 .await?
                 .filter(|v| !v.is_null());
             let validated = self
                 .store
-                .chromium_state(&state_key("publication-validated", "chrome"))
+                .chromium_state(&state_key("publication-validated-v2", "chrome"))
                 .await?
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
@@ -1451,7 +1837,7 @@ impl ChromiumCorpus {
             }
             if self
                 .store
-                .chromium_state("web-work")
+                .chromium_state(&scheduling_key("web-work"))
                 .await?
                 .is_some_and(|v| !v.is_null())
             {
@@ -1491,7 +1877,7 @@ impl ChromiumCorpus {
                 let revision = root["revision"].as_str().ok_or_else(failure)?;
                 let observed = root["observed_at"].as_i64().ok_or_else(failure)?;
                 if self
-                    .commit_step(selected, revision, observed, cancel.clone())
+                    .commit_step(selected, revision, observed, "current", cancel.clone())
                     .await?
                     && selected != "chrome-archive"
                     && let Some(snapshot) = self
@@ -1533,10 +1919,14 @@ impl ChromiumCorpus {
         }
         Ok(self
             .store
-            .chromium_state("web-work")
+            .chromium_state(&scheduling_key("web-work"))
             .await?
             .is_none_or(|v| v.is_null())
-            && self.store.chromium_state("web-completed").await?.is_some())
+            && self
+                .store
+                .chromium_state(&scheduling_key("web-completed"))
+                .await?
+                .is_some())
     }
     pub async fn collect_history_once(&self, cancel: CancellationToken) -> Result<bool> {
         let _guard = self.processing.lock().await;
@@ -1546,7 +1936,45 @@ impl ChromiumCorpus {
         let component = data["component"].as_str().ok_or_else(failure)?;
         let revision = data["revision"].as_str().ok_or_else(failure)?;
         let key = job_key(component, revision);
-        match self.commit_step(component, revision, 0, cancel).await {
+        let mut status = self.collector_status(component, "history").await?;
+        status.begin(Phase::Traversal);
+        self.save_collector(component, "history", &status).await?;
+        let result = self
+            .commit_step(component, revision, 0, "history", cancel)
+            .await;
+        let mut status = self.collector_status(component, "history").await?;
+        let delay = if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| matches!(error.code.as_str(), "capacity" | "integrity"))
+        {
+            self.config.ref_refresh_secs as i64
+        } else {
+            60
+        };
+        let host = if component == "chrome-archive" {
+            "api.github.com"
+        } else {
+            "chromium.googlesource.com"
+        };
+        let retry_at = self
+            .store
+            .chromium_state(&state_key("deferred", host))
+            .await?
+            .and_then(|value| value["retry_at"].as_i64())
+            .unwrap_or(0)
+            .max(devres_domain::unix_now() + delay);
+        match &result {
+            Ok(_) => status.succeed(devres_domain::unix_now()),
+            Err(error) => status.fail(
+                error,
+                Phase::Traversal,
+                devres_domain::unix_now(),
+                Some(retry_at),
+            ),
+        }
+        self.save_collector(component, "history", &status).await?;
+        match result {
             Ok(true) => {
                 self.store
                     .chromium_set_state(&state_key("blocked", &key), &json!({"done":true}))
@@ -1576,7 +2004,7 @@ impl ChromiumCorpus {
                         (error.code, retry)
                     }
                 };
-                self.store.chromium_put("blocked-jobs", &key, data).await?;
+                self.store.chromium_put("blocked-jobs", &key, &json!({"component":component,"revision":revision,"processor_version":PROCESSOR_VERSION,"collection_version":COLLECTION_VERSION})).await?;
                 self.store
                     .chromium_set_state(
                         &state_key("blocked", &key),
@@ -1591,7 +2019,7 @@ impl ChromiumCorpus {
         if discover {
             let offset = self
                 .store
-                .chromium_state("namespace-offset")
+                .chromium_state(&scheduling_key("namespace-offset"))
                 .await?
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
@@ -1606,7 +2034,10 @@ impl ChromiumCorpus {
             ];
             let (component, namespace) = namespaces[offset % namespaces.len()];
             self.store
-                .chromium_set_state("namespace-offset", &json!((offset + 1) % namespaces.len()))
+                .chromium_set_state(
+                    &scheduling_key("namespace-offset"),
+                    &json!((offset + 1) % namespaces.len()),
+                )
                 .await?;
             let key = state_key("namespace-validated", &format!("{component}:{namespace}"));
             let validated = self
@@ -1640,7 +2071,7 @@ impl ChromiumCorpus {
         }
         let after = self
             .store
-            .chromium_state("history-after")
+            .chromium_state(&scheduling_key("history-after"))
             .await?
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
@@ -1648,17 +2079,17 @@ impl ChromiumCorpus {
         if let Some(row) = rows.first() {
             self.process_history_job(&row.data, cancel).await?;
             self.store
-                .chromium_set_state("history-after", &json!(row.sequence))
+                .chromium_set_state(&scheduling_key("history-after"), &json!(row.sequence))
                 .await?;
             self.store
-                .chromium_set_state("history-exhausted", &json!(false))
+                .chromium_set_state(&scheduling_key("history-exhausted"), &json!(false))
                 .await?;
             self.update_status().await?;
             return Ok(false);
         }
         let after = self
             .store
-            .chromium_state("blocked-after")
+            .chromium_state(&scheduling_key("blocked-after"))
             .await?
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
@@ -1667,36 +2098,47 @@ impl ChromiumCorpus {
             .chromium_rows("blocked-jobs", after, 100, None)
             .await?;
         if rows.is_empty() {
-            let pending =
-                self.store.chromium_state("blocked-cycle-pending").await? == Some(json!(true));
+            let pending = self
+                .store
+                .chromium_state(&scheduling_key("blocked-cycle-pending"))
+                .await?
+                == Some(json!(true));
             self.store
-                .chromium_set_state("blocked-after", &json!(0))
+                .chromium_set_state(&scheduling_key("blocked-after"), &json!(0))
                 .await?;
             self.store
-                .chromium_set_state("blocked-cycle-pending", &json!(false))
+                .chromium_set_state(&scheduling_key("blocked-cycle-pending"), &json!(false))
                 .await?;
             self.store
-                .chromium_set_state("history-exhausted", &json!(!pending))
+                .chromium_set_state(&scheduling_key("history-exhausted"), &json!(!pending))
                 .await?;
             self.update_status().await?;
             return Ok(!pending);
         }
         for row in rows {
             self.store
-                .chromium_set_state("blocked-after", &json!(row.sequence))
+                .chromium_set_state(&scheduling_key("blocked-after"), &json!(row.sequence))
                 .await?;
-            let status = self
+            let component = row.data["component"].as_str().ok_or_else(failure)?;
+            let revision = row.data["revision"].as_str().ok_or_else(failure)?;
+            let status = match self
                 .store
-                .chromium_state(&state_key("blocked", &row.key))
+                .chromium_state(&state_key("blocked", &job_key(component, revision)))
                 .await?
-                .ok_or_else(failure)?;
+            {
+                Some(status) => status,
+                None => self
+                    .store
+                    .chromium_state(&state_key("blocked", &row.key))
+                    .await?
+                    .ok_or_else(failure)?,
+            };
             if status["done"] == true {
                 continue;
             }
             self.store
-                .chromium_set_state("blocked-cycle-pending", &json!(true))
+                .chromium_set_state(&scheduling_key("blocked-cycle-pending"), &json!(true))
                 .await?;
-            let component = row.data["component"].as_str().ok_or_else(failure)?;
             let host = if component == "chrome-archive" {
                 "api.github.com"
             } else {
@@ -1714,23 +2156,53 @@ impl ChromiumCorpus {
             }
         }
         self.store
-            .chromium_set_state("history-exhausted", &json!(false))
+            .chromium_set_state(&scheduling_key("history-exhausted"), &json!(false))
             .await?;
         self.update_status().await?;
         Ok(false)
     }
     async fn record_failure(&self, lane: &str, error: &Error) -> Result<()> {
         self.store
-            .chromium_set_state(
-                "failure",
-                &json!({"lane":lane,"code":error.code,"observed_at":devres_domain::unix_now()}),
-            )
+            .chromium_set_state("failure", &{
+                let mut status = CollectorStatus::default();
+                status.fail(
+                    error,
+                    Phase::Traversal,
+                    devres_domain::unix_now(),
+                    Some(devres_domain::unix_now() + 60),
+                );
+                let mut failure = encode(&status.failure)?;
+                failure["lane"] = json!(lane);
+                failure
+            })
             .await?;
         self.update_status().await
     }
     pub(super) async fn update_status(&self) -> Result<()> {
-        let catalog = self.catalog().await.ok();
-        let view = self.view(None).await.ok();
+        let catalog = if self
+            .store
+            .chromium_state("catalog")
+            .await
+            .map_err(|error| at_phase(error, Phase::CatalogLookup))?
+            .is_some()
+        {
+            Some(
+                self.catalog()
+                    .await
+                    .map_err(|error| at_phase(error, Phase::CatalogLookup))?,
+            )
+        } else {
+            None
+        };
+        let view = if self.store.chromium_state("default").await?.is_some() {
+            Some(
+                self.view(None)
+                    .await
+                    .map_err(|error| at_phase(error, Phase::StatusRead))?,
+            )
+        } else {
+            None
+        };
         let statistics = self.store.chromium_statistics().await?;
         let mut components = BTreeMap::new();
         for component in COMPONENTS {
@@ -1742,9 +2214,9 @@ impl ChromiumCorpus {
                 .as_ref()
                 .and_then(|v| v.validations.get(component))
                 .copied();
-            components.insert(component,json!({"selected_snapshot":selected,"validated_at":validated,"missing":selected.is_none(),"historical_only":component=="chrome-archive","stale":validated.is_none_or(|v|devres_domain::unix_now().saturating_sub(v)>86400)}));
+            components.insert(component,json!({"selected_snapshot":selected,"validated_at":validated,"missing":selected.is_none(),"historical_only":component=="chrome-archive","collector":{"current":self.collector_status(component,"current").await?,"history":self.collector_status(component,"history").await?},"stale":validated.is_none_or(|v|devres_domain::unix_now().saturating_sub(v)>86400)}));
         }
-        self.store.chromium_set_state("status",&json!({"processor_version":PROCESSOR_VERSION,"classifier_version":PROCESSOR_VERSION,"collection_enabled":self.config.enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_components":catalog.as_ref().map_or(0,|c|c.components.len()),"components":components,"statistics":statistics,"snapshots":statistics["snapshots"],"projection_gaps":statistics["projection_gaps"],"index_gaps":statistics["index_gaps"],"gap_scope":"all_retained_snapshot_generations","view":view.as_ref().map(|v|&v.id),"published_components":view.as_ref().map_or(0,|v|v.snapshots.len()),"history_queue_exhausted":self.store.chromium_state("history-exhausted").await?.unwrap_or(json!(false)),"history_gap":"unexposed_migrated_history","failure":self.store.chromium_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes()})).await
+        self.store.chromium_set_state("status",&json!({"processor_version":PROCESSOR_VERSION,"classifier_version":chromium_processing::CLASSIFIER_VERSION,"collection_version":COLLECTION_VERSION,"collection_enabled":self.config.enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_components":catalog.as_ref().map_or(0,|c|c.components.len()),"components":components,"statistics":statistics,"snapshots":statistics["snapshots"],"projection_gaps":statistics["projection_gaps"],"index_gaps":statistics["index_gaps"],"gap_scope":"all_retained_snapshot_generations","view":view.as_ref().map(|v|&v.id),"published_components":view.as_ref().map_or(0,|v|v.snapshots.len()),"history_queue_exhausted":self.store.chromium_state(&scheduling_key("history-exhausted")).await?.unwrap_or(json!(false)),"history_gap":"unexposed_migrated_history","failure":self.store.chromium_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes()})).await
     }
     pub async fn run_current(&self, cancel: CancellationToken) -> Result<()> {
         if let Err(error) = self.recover(cancel.clone()).await {
@@ -1862,11 +2334,14 @@ impl ChromiumCorpus {
                 self.store
                     .chromium_put("snapshots", &successor.id, &encode(&successor)?)
                     .await?;
-                let revision_alias = alias(
+                let revision_alias = alias_for_collection(
                     &successor.component,
                     &successor.repository,
                     &successor.revision,
                     &successor.representation,
+                    successor.coverage["collection_version"]
+                        .as_u64()
+                        .unwrap_or(1) as u32,
                 )?;
                 self.store
                     .chromium_set_state(
@@ -1948,7 +2423,7 @@ impl ChromiumCorpus {
                     .ok_or_else(failure)?,
             );
         }
-        let evidence = json!({"version":1,"processor_version":PROCESSOR_VERSION,"mode":if full{"full"}else{"current"},"catalog":self.catalog().await?.id,"roots":roots,"namespaces":namespaces,"web":self.store.chromium_state("web-completed").await?,"cutoff":self.store.chromium_cutoff().await?});
+        let evidence = json!({"version":1,"processor_version":PROCESSOR_VERSION,"collection_version":COLLECTION_VERSION,"mode":if full{"full"}else{"current"},"catalog":self.catalog().await?.id,"roots":roots,"namespaces":namespaces,"web":self.store.chromium_state(&scheduling_key("web-completed")).await?,"cutoff":self.store.chromium_cutoff().await?});
         let id = inventory::digest(&serde_json::to_vec(&evidence).map_err(|_| failure())?);
         self.store.chromium_put("freezes", &id, &evidence).await?;
         Ok(json!({"id":id,"evidence":evidence}))
@@ -1962,6 +2437,11 @@ impl ChromiumCorpus {
             .chromium_get("freezes", id)
             .await?
             .ok_or_else(failure)?;
+        if row.data["collection_version"].as_u64().unwrap_or(1) != u64::from(COLLECTION_VERSION) {
+            return Err(Error::invalid(
+                "Chromium frozen collection generation is unsupported; retain the original observation.",
+            ));
+        }
         if row.data != frozen["evidence"]
             || crate::integrity::verify(id, &serde_json::to_vec(&row.data).map_err(|_| failure())?)
                 .is_err()
@@ -2014,6 +2494,7 @@ impl ChromiumCorpus {
                 snapshot
             };
             if snapshot.coverage["usable"] != true
+                || snapshot.coverage["traversal_gaps"].as_u64().unwrap_or(0) != 0
                 || snapshot.coverage["projection_gaps"].as_u64().unwrap_or(0) != 0
                 || snapshot.coverage["index_gaps"].as_u64().unwrap_or(0) != 0
             {
@@ -2081,7 +2562,11 @@ impl ChromiumCorpus {
         self.validate_frozen(frozen).await?;
         let mut value = self.status().await?;
         let current = self.current_qualified(CancellationToken::new()).await?;
-        let exhausted = self.store.chromium_state("history-exhausted").await? == Some(json!(true));
+        let exhausted = self
+            .store
+            .chromium_state(&scheduling_key("history-exhausted"))
+            .await?
+            == Some(json!(true));
         let stats = self.store.chromium_statistics().await?;
         let has_history_gaps = self.unresolved_history_gaps(frozen).await?;
         let gaps = stats["projection_gaps"].as_u64().unwrap_or(0)
@@ -2211,7 +2696,7 @@ mod tests {
         response::IntoResponse,
         routing::get,
     };
-    const BSD: &str = "Copyright 2026 Synthetic Authors. Redistribution and use in source and binary forms, with or without modification, are permitted. Neither the name of the authors nor contributors may be used to endorse products. THIS SOFTWARE IS PROVIDED AS IS.";
+    pub(super) const BSD: &str = "Copyright 2026 Synthetic Authors. Redistribution and use in source and binary forms, with or without modification, are permitted. Neither the name of the authors nor contributors may be used to endorse products. THIS SOFTWARE IS PROVIDED AS IS.";
     type Routes = Arc<BTreeMap<String, Vec<u8>>>;
     fn build_tree(
         files: &BTreeMap<String, Vec<u8>>,
@@ -2270,7 +2755,7 @@ mod tests {
         );
         id
     }
-    fn repository(
+    pub(super) fn repository(
         routes: &mut BTreeMap<String, Vec<u8>>,
         component: &str,
         revision: &str,
@@ -2598,7 +3083,7 @@ mod tests {
         );
         let repaired_id = repaired.id.clone();
         store
-            .chromium_set_state("current-offset", &json!(0))
+            .chromium_set_state(&scheduling_key("current-offset"), &json!(0))
             .await
             .unwrap();
         corpus.collect_current_once(cancel.clone()).await.unwrap();
@@ -2705,5 +3190,657 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits["total"], 1);
+    }
+}
+
+#[cfg(test)]
+mod collector_regressions {
+    use super::*;
+
+    #[test]
+    fn pruning_only_excludes_existing_classifier_subtrees() {
+        for (component, prefix) in [
+            ("src", "third_party/other"),
+            ("src", "third_party/blink/web_tests"),
+            ("src", "components/example/testdata"),
+            ("site", "site/_assets"),
+            ("site", "build"),
+            ("chrome-archive", "site/ko"),
+        ] {
+            assert!(!subtree_candidate(component, prefix));
+            for leaf in ["README.md", "docs/index.html", "guide.markdown"] {
+                assert!(!document_candidate(component, &format!("{prefix}/{leaf}")));
+            }
+        }
+        for (component, prefix) in [
+            ("src", "third_party"),
+            ("src", "third_party/blink"),
+            ("src", "components/example"),
+            ("site", "site"),
+            ("chrome-archive", "site"),
+            ("chrome-archive", "site/en"),
+        ] {
+            assert!(subtree_candidate(component, prefix));
+        }
+    }
+
+    #[test]
+    fn git_identity_accepts_unrequestable_names_without_expanding_operations() {
+        let mut entries = Vec::new();
+        let oid = source::object_oid("blob", b"synthetic");
+        for name in ["literal%20.md", "query?.md", "anchor#.md", "back\\slash.md"] {
+            entries.push(json!({"name":name,"id":oid,"type":"blob","mode":0o100644}));
+            assert!(!source::valid_path(name));
+            assert!(
+                Operation::Blob {
+                    component: "src".into(),
+                    revision: "a".repeat(40),
+                    path: name.into()
+                }
+                .url()
+                .is_err()
+            );
+        }
+        entries.sort_by_key(|entry| entry["name"].as_str().unwrap().to_owned());
+        let mut bytes = Vec::new();
+        for entry in &entries {
+            bytes.extend_from_slice(
+                format!("100644 {}\0", entry["name"].as_str().unwrap()).as_bytes(),
+            );
+            bytes.extend_from_slice(&hex::decode(&oid).unwrap());
+        }
+        let id = source::object_oid("tree", &bytes);
+        let encoded = serde_json::to_vec(&json!({"id":id,"entries":entries})).unwrap();
+        let tree = source::parse_tree("src", &encoded).unwrap();
+        assert_eq!(tree.id, id);
+        assert_eq!(tree.entries.len(), 4);
+        let mut corrupt: Value = serde_json::from_slice(&encoded).unwrap();
+        corrupt["entries"][0]["name"] = json!("changed.md");
+        assert_eq!(
+            source::parse_tree("src", &serde_json::to_vec(&corrupt).unwrap())
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+    }
+    async fn fixture_reply(
+        axum::extract::State(routes): axum::extract::State<Arc<BTreeMap<String, Vec<u8>>>>,
+        axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    ) -> impl axum::response::IntoResponse {
+        match routes.get(uri.path()) {
+            Some(bytes) => (axum::http::StatusCode::OK, bytes.clone()),
+            None if uri.path().starts_with("/website/") => {
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new())
+            }
+            None => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+        }
+    }
+    async fn fixture_source(
+        files: &[(&str, &str)],
+        revision: &str,
+    ) -> (Arc<BulkBroker>, tokio::task::JoinHandle<()>, Value) {
+        let mut routes = BTreeMap::new();
+        super::tests::repository(&mut routes, "src", revision, &[], files);
+        let commit_route = format!("/chromium/src/+/{revision}");
+        let commit: Value =
+            serde_json::from_slice(routes.remove(&commit_route).unwrap().as_slice()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .fallback(axum::routing::get(fixture_reply))
+                    .with_state(Arc::new(routes)),
+            )
+            .await
+            .unwrap();
+        });
+        let broker =
+            Arc::new(BulkBroker::fixture(format!("http://{address}").parse().unwrap()).unwrap());
+        (broker, server, commit)
+    }
+    async fn seed_legacy_root(store: &dyn ChromiumStore, revision: &str, commit: &Value) {
+        let commit = source::parse_commit("src", &serde_json::to_vec(commit).unwrap()).unwrap();
+        store.chromium_put("commits", &legacy_job_key("src",revision), &json!({"component":"src","repository":component_base("src").unwrap(),"commit":commit,"source_url":"https://fixtures.invalid/chromium-collector"})).await.unwrap();
+        store
+            .chromium_set_state(
+                &state_key("current-root", "src"),
+                &json!({"revision":revision,"observed_at":devres_domain::unix_now()}),
+            )
+            .await
+            .unwrap();
+        store
+            .chromium_set_state(&scheduling_key("current-offset"), &json!(0))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn generation_two_restarts_with_old_source_preserving_old_work_and_gaps() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let revision = "9a".repeat(20);
+        let mut owned = (0..80)
+            .map(|n| {
+                (
+                    format!("docs/file-{n:03}.data"),
+                    format!("# Guide {n}\nCollectorRegressionToken inert documentation."),
+                )
+            })
+            .collect::<Vec<_>>();
+        owned.extend([
+            ("LICENSE".into(), super::tests::BSD.into()),
+            (
+                "docs/guide.md".into(),
+                "# Guide\nCollectorRegressionToken inert documentation.".into(),
+            ),
+            (
+                "docs/url#sample.md".into(),
+                "Unsupported operation path.".into(),
+            ),
+            (
+                "docs/url?sample.md".into(),
+                "Another unsupported operation path.".into(),
+            ),
+            (
+                "third_party/other/README.md".into(),
+                "Excluded third-party tree.".into(),
+            ),
+            (
+                "third_party/blink/web_tests/example%20/README.md".into(),
+                "Excluded browser test tree.".into(),
+            ),
+        ]);
+        let files = owned
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect::<Vec<_>>();
+        let (broker, server, commit) = fixture_source(&files, &revision).await;
+        let (root, store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
+        seed_legacy_root(store.as_ref(), &revision, &commit).await;
+        let old_work_key = state_key("work", &format!("src:{revision}:1"));
+        let original = json!({"synthetic_legacy_checkpoint":true});
+        store
+            .chromium_set_state(&old_work_key, &original)
+            .await
+            .unwrap();
+        assert!(
+            !corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .chromium_state(&work_key("src", &revision))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(corpus);
+        let corpus = ChromiumCorpus::new(
+            store.clone(),
+            broker.clone(),
+            root.path(),
+            ChromiumConfig {
+                enabled: false,
+                min_free_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..10 {
+            store
+                .chromium_set_state(&scheduling_key("current-offset"), &json!(0))
+                .await
+                .unwrap();
+            corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .unwrap();
+            if corpus
+                .snapshot_for_revision("src", component_base("src").unwrap(), &revision, "git")
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        let current = corpus.select("src", None, None).await.unwrap();
+        assert_eq!(current.coverage["collection_version"], 2);
+        assert_eq!(current.processor_version, 1);
+        assert_eq!(current.coverage["traversal_gaps"], 2);
+        assert_eq!(current.coverage["excluded_subtrees"], 2);
+        assert_eq!(current.coverage["complete"], false);
+        assert_eq!(current.coverage["documents"], 1);
+        assert_eq!(current.coverage["accounted"], false);
+        let gap_root = current.coverage["traversal_gap_root"].as_str().unwrap();
+        corpus
+            .verify_gap_manifest(gap_root, 2, &CancellationToken::new())
+            .await
+            .unwrap();
+        let manifest = store
+            .chromium_get("traversal-gap-manifests", gap_root)
+            .await
+            .unwrap()
+            .unwrap();
+        let leaf = store
+            .chromium_get(
+                "traversal-gap-manifests",
+                manifest.data["left"].as_str().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let gap_id = leaf.data["gap"].as_str().unwrap();
+        let removed = store.remove_test_row("traversal-gaps", gap_id).unwrap();
+        assert_eq!(
+            corpus
+                .verify_gap_manifest(gap_root, 2, &CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        store
+            .chromium_put("traversal-gaps", &removed.key, &removed.data)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.chromium_state(&old_work_key).await.unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            broker.attempt_count(),
+            6,
+            "one source license, root, docs, third_party and Blink tree plus document reads; no legacy commit refetch or excluded subtree request"
+        );
+        let mut legacy = current.clone();
+        legacy.id = inventory::digest(b"synthetic preserved generation-one snapshot");
+        legacy
+            .coverage
+            .as_object_mut()
+            .unwrap()
+            .remove("collection_version");
+        store
+            .chromium_put("snapshots", &legacy.id, &encode(&legacy).unwrap())
+            .await
+            .unwrap();
+        let legacy_alias =
+            alias_for_collection("src", &legacy.repository, &revision, "git", 1).unwrap();
+        store
+            .chromium_put("snapshot-keys", &legacy_alias, &json!(legacy.id))
+            .await
+            .unwrap();
+        let before = broker.attempt_count();
+        corpus
+            .rebuild_index(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(broker.attempt_count(), before);
+        assert_eq!(corpus.snapshot(&legacy.id).await.unwrap().id, legacy.id);
+        let legacy_successor = store
+            .chromium_state(&state_key("revision-alias", &legacy_alias))
+            .await
+            .unwrap()
+            .unwrap();
+        let successor = corpus
+            .snapshot(legacy_successor.as_str().unwrap())
+            .await
+            .unwrap();
+        assert!(successor.coverage.get("collection_version").is_none());
+        assert_eq!(
+            corpus
+                .snapshot_for_revision("src", &legacy.repository, &revision, "git")
+                .await
+                .unwrap()
+                .unwrap()
+                .coverage["collection_version"],
+            2
+        );
+        // The next component fails, but cannot remove the healthy published source.
+        store
+            .chromium_set_state(&scheduling_key("current-offset"), &json!(1))
+            .await
+            .unwrap();
+        assert!(
+            corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let failed = corpus.collector_status("site", "current").await.unwrap();
+        assert_eq!(failed.failure.unwrap().phase, Phase::PublicationAcquisition);
+        assert!(corpus.select("src", None, None).await.is_ok());
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires stopped disposable cluster writer, PostgreSQL and optional fixture S3"]
+    async fn chromium_collector_cluster_seed() {
+        use devres_application::attribution::AttributionStore;
+        use devres_domain::attribution::*;
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let database = std::env::var("DATABASE_URL").expect("disposable cluster PostgreSQL");
+        let root = std::path::PathBuf::from(
+            std::env::var("BLOB_DIR").expect("disposable cluster blob root"),
+        );
+        let s3 = std::env::var_os("DEVRES_TEST_S3_CONFIG").map(|path| {
+            toml::from_str::<crate::object_storage::S3Config>(
+                &std::fs::read_to_string(path).unwrap(),
+            )
+            .unwrap()
+        });
+        let store = Arc::new(
+            crate::PgBlobStore::connect_archive_for_maintenance(&database, &root, s3)
+                .await
+                .unwrap(),
+        );
+        let revision = "9c".repeat(20);
+        let expected = "ChromiumCollectorClusterToken";
+        let (broker,server,commit)=fixture_source(&[
+            ("LICENSE",super::tests::BSD),
+            ("docs/collector-cluster.md","# Collector cluster fixture\nChromiumCollectorClusterToken is first-party synthetic evidence."),
+            ("third_party/other/README.md","Excluded synthetic subtree."),
+        ],&revision).await;
+        let corpus = Arc::new(
+            ChromiumCorpus::new(
+                store.clone(),
+                broker,
+                &root,
+                ChromiumConfig {
+                    enabled: false,
+                    min_free_bytes: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        seed_legacy_root(store.as_ref(), &revision, &commit).await;
+        for _ in 0..4 {
+            store
+                .chromium_set_state(&scheduling_key("current-offset"), &json!(0))
+                .await
+                .unwrap();
+            corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .unwrap();
+            if corpus
+                .snapshot_for_revision("src", component_base("src").unwrap(), &revision, "git")
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        let snapshot = corpus.select("src", None, None).await.unwrap();
+        assert_eq!(snapshot.revision, revision);
+        // Force a sibling source observation against the local-only HTTP failure fixture.
+        store
+            .chromium_set_state(
+                &state_key("current-root", "site"),
+                &json!({"revision":"8c".repeat(20),"observed_at":devres_domain::unix_now()}),
+            )
+            .await
+            .unwrap();
+        store
+            .chromium_set_state(&scheduling_key("current-offset"), &json!(1))
+            .await
+            .unwrap();
+        assert!(
+            corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(corpus.select("src", None, None).await.is_ok());
+        let research = crate::chromium::research::ChromiumResearch::new(corpus.clone());
+        let arguments =
+            json!({"component":"src","path":"docs/collector-cluster.md","snapshot":snapshot.id});
+        let output = research
+            .call("chromium.get", arguments.clone())
+            .await
+            .unwrap();
+        let resource = output["resource_uri"]
+            .as_str()
+            .expect("immutable synthetic resource")
+            .to_owned();
+        assert!(serde_json::to_string(&output).unwrap().contains(expected));
+        let resource_output = research.read_resource(&resource).await.unwrap();
+        let mut targets = BTreeMap::new();
+        for output in [&output, &resource_output] {
+            for target in crate::attribution_providers::targets("chromium", output).unwrap() {
+                targets.insert(serde_json::to_string(&target.subject).unwrap(), target);
+            }
+        }
+        assert!(!targets.is_empty());
+        for target in targets.values() {
+            store.attribution_enqueue(target, 255).await.unwrap();
+        }
+        const NOTICE: &str = "First-party synthetic Chromium collector cluster acceptance by dev-resources-MCP contributors; AGPL-3.0-only. This fixture is not upstream acquisition evidence.";
+        for _ in 0..1024 {
+            if targets.is_empty() {
+                break;
+            }
+            let job = store
+                .attribution_claim(&["chromium".into()], devres_domain::unix_now())
+                .await
+                .unwrap()
+                .expect("synthetic qualification claim");
+            let identity = serde_json::to_string(&job.target.subject).unwrap();
+            if targets.remove(&identity).is_none() {
+                store
+                    .attribution_fail(
+                        &job,
+                        Some(devres_domain::unix_now() + 300),
+                        "fixture_deferred",
+                    )
+                    .await
+                    .unwrap();
+                continue;
+            }
+            let generation = AttributionGeneration {
+                subject: job.target.subject.clone(),
+                policy_epoch: ATTRIBUTION_POLICY_EPOCH,
+                policy_fingerprint: ATTRIBUTION_POLICY_FINGERPRINT.into(),
+                notices: vec![AttributionNotice {
+                    source_url: "https://fixtures.invalid/devres/chromium-collector".into(),
+                    license: Some("AGPL-3.0-only".into()),
+                    copyright: Some("dev-resources-MCP synthetic fixture authors".into()),
+                    text: NOTICE.into(),
+                    evidence: json!({"synthetic":true,"fixture":"chromium-collector-cluster-v2","body_hash":crate::integrity::hash(NOTICE.as_bytes())}),
+                }],
+                receipts: vec![
+                    json!({"kind":"synthetic_fixture_validation","synthetic":true,"status":200,"source_url":"https://fixtures.invalid/devres/chromium-collector","body_hash":crate::integrity::hash(NOTICE.as_bytes()),"validated_at":devres_domain::unix_now(),"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT,"source_fingerprint":job.target.subject.fingerprint}),
+                ],
+            };
+            store.attribution_complete(&job, &generation).await.unwrap();
+        }
+        assert!(
+            targets.is_empty(),
+            "bounded synthetic qualification completed"
+        );
+        std::fs::write("/tmp/chromium-collector-receipt.json",serde_json::to_vec_pretty(&json!({"provider":"chromium","tool":"chromium.get","arguments":arguments,"resource":resource,"expected":expected})).unwrap()).unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn catalog_storage_failures_are_not_replaced_by_empty_catalogs() {
+        let broker = Arc::new(BulkBroker::new(Default::default()).unwrap());
+        let (_root, store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
+        store
+            .fail_catalog_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = corpus.ensure_catalog().await.unwrap_err();
+        assert_eq!(error.code, "integrity");
+        assert_eq!(
+            devres_application::collection::context(&error)
+                .unwrap()
+                .phase,
+            Phase::CatalogLookup
+        );
+        assert_eq!(broker.attempt_count(), 0);
+        store
+            .fail_catalog_read
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store
+                .chromium_rows("catalogs", 0, 1, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn unpublished_checkpoint_and_cache_gap_closure_is_verified() {
+        let broker = Arc::new(BulkBroker::new(Default::default()).unwrap());
+        let (_root, store, corpus) = super::super::tests::corpus_fixture(broker).await;
+        let empty = inventory::empty(store.as_ref()).await.unwrap();
+        let missing = inventory::digest(b"missing sole unpublished gap root");
+        let key = state_key("work", "synthetic-unpublished-root");
+        store.chromium_set_state(&key,&json!({"inventory":empty,"traversal_gaps":1,"traversal_gap_root":missing,"stack":[]})).await.unwrap();
+        assert!(
+            corpus
+                .verify_gap_checkpoints(&CancellationToken::new())
+                .await
+                .is_err()
+        );
+        store
+            .chromium_set_state(&key, &json!({"inventory":empty,"stack":[]}))
+            .await
+            .unwrap();
+        corpus
+            .verify_gap_checkpoints(&CancellationToken::new())
+            .await
+            .unwrap();
+        store
+            .chromium_put(
+                "derived-inventories",
+                "synthetic-unpublished-cache",
+                &json!({"inventory":empty,"traversal_gaps":1,"traversal_gap_root":missing}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            corpus
+                .verify_gap_checkpoints(&CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn unrequestable_notice_is_a_rights_gap_without_an_unsafe_request() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let revision = "9d".repeat(20);
+        let (broker, server, commit) = fixture_source(
+            &[
+                ("LICENSE", super::tests::BSD),
+                ("LICENSE.%20", "Unrequestable governing notice."),
+                ("docs/guide.md", "Must remain metadata-only."),
+            ],
+            &revision,
+        )
+        .await;
+        let (_root, store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
+        seed_legacy_root(store.as_ref(), &revision, &commit).await;
+        corpus
+            .collect_current_once(CancellationToken::new())
+            .await
+            .unwrap();
+        let snapshot = corpus
+            .snapshot_for_revision("src", component_base("src").unwrap(), &revision, "git")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.coverage["usable"], false);
+        assert_eq!(snapshot.coverage["traversal_gaps"], 1);
+        assert_eq!(snapshot.coverage["accounted"], false);
+        let member = corpus
+            .member(&snapshot, "docs/guide.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(member.raw.is_none());
+        assert!(member.projection.is_none());
+        assert!(
+            member
+                .gaps
+                .iter()
+                .any(|gap| gap == "license_notice_unrequestable")
+        );
+        assert_eq!(
+            broker.attempt_count(),
+            3,
+            "only root/tree and approved source notice; no unsafe notice or document body fetch"
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn writer_restart_clears_activity_without_erasing_retained_diagnostics() {
+        let broker = Arc::new(BulkBroker::new(Default::default()).unwrap());
+        let (root, store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
+        let mut status = CollectorStatus::default();
+        status.fail(
+            &at_phase(
+                Error::unavailable("Synthetic source failure."),
+                Phase::PublicationAcquisition,
+            ),
+            Phase::Traversal,
+            100,
+            Some(200),
+        );
+        status.progress(ProgressKind::Members, 7);
+        status.begin(Phase::Traversal);
+        corpus
+            .save_collector("src", "current", &status)
+            .await
+            .unwrap();
+        corpus.initialize_status().await.unwrap();
+        let restarted = corpus.collector_status("src", "current").await.unwrap();
+        assert!(!restarted.active);
+        assert_eq!(restarted.progress[&ProgressKind::Members], 7);
+        assert_eq!(
+            restarted.failure.unwrap().phase,
+            Phase::PublicationAcquisition
+        );
+        corpus
+            .save_collector("src", "current", &status)
+            .await
+            .unwrap();
+        let public_before = store.chromium_state("status").await.unwrap();
+        let component_before = store
+            .chromium_state(&state_key("collector", "src:current"))
+            .await
+            .unwrap();
+        let reader = ChromiumCorpus::new_reader(
+            store.clone(),
+            broker.clone(),
+            root.path(),
+            corpus.config().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reader.initialize_status().await.unwrap_err().code,
+            "integrity"
+        );
+        assert_eq!(store.chromium_state("status").await.unwrap(), public_before);
+        assert_eq!(
+            store
+                .chromium_state(&state_key("collector", "src:current"))
+                .await
+                .unwrap(),
+            component_before
+        );
+        assert!(
+            corpus
+                .collector_status("src", "current")
+                .await
+                .unwrap()
+                .active
+        );
+        assert_eq!(broker.attempt_count(), 0);
     }
 }

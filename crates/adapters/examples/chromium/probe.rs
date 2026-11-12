@@ -6,7 +6,7 @@ use devres_adapters::{
     bulk::{BulkBroker, BulkConfig},
     chromium::ChromiumCorpus,
 };
-use devres_application::chromium::{ChromiumConfig, PROCESSOR_VERSION};
+use devres_application::chromium::{COLLECTION_VERSION, ChromiumConfig, PROCESSOR_VERSION};
 use devres_domain::{Error, Result};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path, sync::Arc, time::Duration};
@@ -162,6 +162,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         if manifest["version"] != 1
             || manifest["mode"] != "full"
             || manifest["processor_version"] != PROCESSOR_VERSION
+            || manifest["collection_version"].as_u64().unwrap_or(1) != u64::from(COLLECTION_VERSION)
         {
             return Err("Unsupported frozen Chromium observation".into());
         }
@@ -180,7 +181,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         save_immutable(
             &root,
             "frozen.json",
-            &json!({"version":1,"mode":if full{"full"}else{"current"},"processor_version":PROCESSOR_VERSION,"frozen":frozen}),
+            &json!({"version":1,"mode":if full{"full"}else{"current"},"processor_version":PROCESSOR_VERSION,"collection_version":COLLECTION_VERSION,"frozen":frozen}),
         )?;
         frozen
     };
@@ -190,7 +191,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 save(
                     &root,
                     "acceptance.json",
-                    &json!({"complete":false,"interrupted":true,"processor_version":PROCESSOR_VERSION,"status":corpus.frozen_status(&frozen).await?}),
+                    &json!({"complete":false,"interrupted":true,"processor_version":PROCESSOR_VERSION,"collection_version":COLLECTION_VERSION,"status":corpus.frozen_status(&frozen).await?}),
                 )?;
                 return Err(
                     "Chromium acceptance interrupted; retained evidence can be resumed".into(),
@@ -203,7 +204,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     save(
                         &root,
                         "acceptance.json",
-                        &json!({"complete":false,"failure_code":error.code,"processor_version":PROCESSOR_VERSION,"status":corpus.frozen_status(&frozen).await?}),
+                        &json!({"complete":false,"failure_code":error.code,"processor_version":PROCESSOR_VERSION,"collection_version":COLLECTION_VERSION,"status":corpus.frozen_status(&frozen).await?}),
                     )?;
                     return Err(error.into());
                 }
@@ -219,7 +220,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }]
     .as_bool()
     .unwrap_or(false);
-    let receipt = json!({"version":1,"mode":if full{"full"}else{"current"},"processor_version":PROCESSOR_VERSION,"complete":complete,"status":status,"proof_boundary":"Retained frozen observation only; no production, hosted architecture or native client UI claim."});
+    let receipt = json!({"version":1,"mode":if full{"full"}else{"current"},"processor_version":PROCESSOR_VERSION,"collection_version":COLLECTION_VERSION,"complete":complete,"status":status,"proof_boundary":"Retained frozen observation only; no production, hosted architecture or native client UI claim."});
     save(&root, "acceptance.json", &receipt)?;
     signal.abort();
     println!("{}", serde_json::to_string_pretty(&receipt)?);

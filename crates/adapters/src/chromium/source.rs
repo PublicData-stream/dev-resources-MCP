@@ -2,6 +2,7 @@
 //! never executable instructions or permission to admit another destination.
 use crate::bulk::{BulkBroker, BulkRequest, BulkSource};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use devres_application::collection::{LimitKind, Phase, at_phase, limited};
 use devres_domain::{Error, Result, Validators};
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -386,21 +387,26 @@ impl ChromiumSource {
                 },
                 cancel.clone(),
             )
-            .await?;
+            .await
+            .map_err(|error| at_phase(error, Phase::HttpAcquisition))?;
         let mut stream = response.stream;
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             if cancel.is_cancelled() {
                 return Err(Error::new("cancelled", "Chromium acquisition canceled."));
             }
-            let chunk = chunk?;
+            let chunk = chunk.map_err(|error| at_phase(error, Phase::HttpBody))?;
             if bytes
                 .len()
                 .checked_add(chunk.len())
                 .is_none_or(|n| n > MAX_METADATA_BYTES)
             {
-                return Err(Error::capacity(
-                    "Chromium source response exceeds its byte bound.",
+                return Err(limited(
+                    Error::capacity("Chromium source response exceeds its byte bound."),
+                    Phase::HttpBody,
+                    LimitKind::MetadataBytes,
+                    Some(bytes.len().saturating_add(chunk.len()) as u64),
+                    Some(MAX_METADATA_BYTES as u64),
                 ));
             }
             bytes.extend_from_slice(&chunk);
@@ -614,12 +620,19 @@ pub fn parse_tree(component: &str, bytes: &[u8]) -> Result<Directory> {
         ));
     }
     let mut entries = Vec::with_capacity(list.len());
+    let mut names = std::collections::BTreeSet::new();
     for item in list {
         let name = item[if archive { "path" } else { "name" }]
             .as_str()
-            .filter(|n| valid_path(n) && !n.is_empty() && !n.contains('/'))
+            // Git identity is independent of the much narrower URL-operation
+            // admission policy. Hash every exact name, including test fixtures
+            // containing URL punctuation; collection decides what it can fetch.
+            .filter(|n| !n.is_empty() && !n.contains(['/', '\0']))
             .ok_or_else(malformed)?
             .to_owned();
+        if !names.insert(name.clone()) {
+            return Err(malformed());
+        }
         let mode = if archive {
             u32::from_str_radix(item["mode"].as_str().ok_or_else(malformed)?, 8)
                 .map_err(|_| malformed())?

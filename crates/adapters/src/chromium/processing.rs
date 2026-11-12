@@ -22,15 +22,11 @@ pub const CLASSIFIER_VERSION: u32 = 1;
 pub const PROCESSOR_VERSION: u32 = 1;
 const MAX_ITEMS: usize = 100_000;
 
-/// File type alone cannot turn a browser test vector or vendored source into
-/// documentation. Explicit source mappings can separately qualify such a path.
-pub fn candidate(path: &str) -> bool {
-    if !crate::chromium::source::valid_path(path) || path.is_empty() {
-        return false;
-    }
+/// False only when the existing classifier excludes every descendant.
+pub(crate) fn may_contain_documents(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let parts: Vec<_> = lower.split('/').collect();
-    if parts.iter().any(|p| {
+    !parts.iter().any(|p| {
         matches!(
             *p,
             "testdata"
@@ -46,7 +42,19 @@ pub fn candidate(path: &str) -> bool {
                 | "_includes"
                 | "_stylesheets"
         )
-    }) {
+    }) && !(parts.first() == Some(&"third_party")
+        && parts.get(1).is_some_and(|part| *part != "blink"))
+}
+
+/// File type alone cannot turn a browser test vector or vendored source into
+/// documentation. Explicit source mappings can separately qualify such a path.
+pub fn candidate(path: &str) -> bool {
+    if !crate::chromium::source::valid_path(path) || path.is_empty() {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    let parts: Vec<_> = lower.split('/').collect();
+    if !may_contain_documents(path) {
         return false;
     }
     // Blink is a first-party documentation source despite its repository path.

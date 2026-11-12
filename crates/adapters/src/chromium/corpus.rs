@@ -8,7 +8,8 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use devres_application::chromium::{
-    Catalog, ChromiumConfig, ChromiumStore, Component, Member, PROCESSOR_VERSION, Snapshot, View,
+    COLLECTION_VERSION, Catalog, ChromiumConfig, ChromiumStore, Component, Member,
+    PROCESSOR_VERSION, Snapshot, View,
 };
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,34 @@ fn alias(
     revision: &str,
     representation: &str,
 ) -> Result<String> {
+    alias_for_collection(
+        component,
+        repository,
+        revision,
+        representation,
+        COLLECTION_VERSION,
+    )
+}
+fn alias_for_collection(
+    component: &str,
+    repository: &str,
+    revision: &str,
+    representation: &str,
+    collection_version: u32,
+) -> Result<String> {
+    // Preserve the exact original encoding for existing immutable aliases.
+    if collection_version == 1 {
+        return Ok(inventory::digest(
+            &serde_json::to_vec(&(
+                component,
+                repository,
+                revision,
+                representation,
+                PROCESSOR_VERSION,
+            ))
+            .map_err(|_| failure())?,
+        ));
+    }
     Ok(inventory::digest(
         &serde_json::to_vec(&(
             component,
@@ -94,6 +123,7 @@ fn alias(
             revision,
             representation,
             PROCESSOR_VERSION,
+            collection_version,
         ))
         .map_err(|_| failure())?,
     ))
@@ -219,6 +249,16 @@ impl ChromiumCorpus {
         &self.config
     }
     pub async fn initialize_status(&self) -> Result<()> {
+        self.raw.require_writable()?;
+        for component in COMPONENTS {
+            for lane in ["current", "history"] {
+                let mut status = self.collector_status(component, lane).await?;
+                if status.active {
+                    status.active = false;
+                    self.save_collector(component, lane, &status).await?;
+                }
+            }
+        }
         self.update_status().await
     }
     async fn publication_chunks(

@@ -2041,6 +2041,12 @@ impl ChromiumResearch {
                     && candidate.revision == revision
                     && candidate.representation == selected.representation
                     && candidate.processor_version == selected.processor_version
+                    && candidate.coverage["collection_version"]
+                        .as_u64()
+                        .unwrap_or(1)
+                        == selected.coverage["collection_version"]
+                            .as_u64()
+                            .unwrap_or(1)
                 {
                     found = Some(candidate);
                 }

@@ -6,6 +6,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const PROCESSOR_VERSION: u32 = 1;
+/// Traversal and coverage generation; projections and classification remain v1.
+pub const COLLECTION_VERSION: u32 = 2;
 pub const CHROMIUM_WRITE_BATCH_ROWS: usize = 1000;
 pub const CHROMIUM_WRITE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
