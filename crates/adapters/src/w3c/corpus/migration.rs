@@ -925,6 +925,7 @@ impl W3cCorpus {
                                 )?;
                             }
                         } else if *kind == "catalog-failures" {
+                            super::catalog_failure::CatalogFailure::decode(data.clone())?;
                             rewrite_catalog_work(&mut data["work"], mappings)?;
                         }
                         if *kind == "snapshot-keys" && data.is_string() {
@@ -980,6 +981,9 @@ impl W3cCorpus {
                                 continue;
                             }
                             return Err(error);
+                        }
+                        if *kind == "catalog-failures" {
+                            super::catalog_failure::CatalogFailure::decode(data.clone())?;
                         }
                         let self_id = data["id"].as_str() == Some(&row.key);
                         if self_id {
@@ -1487,5 +1491,60 @@ impl W3cCorpus {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod catalog_failure_tests {
+    use super::*;
+
+    #[test]
+    fn failed_attempt_migration_rewrites_artifact_and_ancestry_without_reinterpreting_reason() {
+        let old_body = "a".repeat(64);
+        let old_page = "b".repeat(64);
+        let old_catalog = "c".repeat(64);
+        let new_body = inventory::digest(b"body");
+        let new_page = inventory::digest(b"page");
+        let new_catalog = inventory::digest(b"catalog");
+        let mut mappings = crate::migration_map::MigrationMap::new();
+        for (role, old, new) in [
+            ("body", &old_body, &new_body),
+            ("w3c:catalog-pages", &old_page, &new_page),
+            ("w3c:catalogs", &old_catalog, &new_catalog),
+        ] {
+            crate::migration_map::insert(&mut mappings, format!("{role}:{old}"), new.clone())
+                .unwrap();
+        }
+        let mut retained = json!({
+            "version":2,
+            "work":{"version":1,"generation":"d".repeat(64),"started_at":1,"predecessor":old_catalog,"pages":[old_page],"standards":1,"complete":false},
+            "code":"integrity","context":{"phase":"catalog_validation"},"observed_at":3,
+            "attempt":{"version":1,"operation":"page_validation","reason":{"kind":"parse_page","reason":"title"},"page":2,"row":1,"observed_at":2,"artifact":{"body_hash":old_body,"bytes":4,"relative_path":old_body}}
+        });
+        super::super::catalog_failure::CatalogFailure::decode(retained.clone()).unwrap();
+        let original = retained.clone();
+        rewrite_catalog_work(&mut retained["work"], &mappings).unwrap();
+        crate::mdn::corpus::migration::rewrite_operational("w3c", &mut retained, &mappings, 0)
+            .unwrap();
+        super::super::catalog_failure::CatalogFailure::decode(retained.clone()).unwrap();
+        assert_eq!(retained["work"]["pages"][0], new_page);
+        assert_eq!(retained["work"]["predecessor"], new_catalog);
+        assert_eq!(retained["attempt"]["artifact"]["body_hash"], new_body);
+        assert_eq!(
+            retained["attempt"]["artifact"]["relative_path"],
+            json!(
+                crate::integrity::relative_path(&new_body)
+                    .unwrap()
+                    .to_string_lossy()
+            )
+        );
+        assert_eq!(retained["attempt"]["reason"], original["attempt"]["reason"]);
+        assert_eq!(retained["attempt"]["observed_at"], 2);
+        assert_eq!(retained["attempt"]["row"], 1);
+        assert_eq!(
+            retained["work"]["generation"],
+            original["work"]["generation"]
+        );
+        assert_eq!(original["attempt"]["artifact"]["body_hash"], old_body);
     }
 }

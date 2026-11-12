@@ -35,6 +35,7 @@ const MAX_MEMBERS: usize = 1_000_000;
 
 mod acquisition;
 mod catalog_acquisition;
+mod catalog_failure;
 #[cfg(test)]
 mod collector_tests;
 mod discovery;
@@ -43,6 +44,15 @@ mod frozen_editions;
 #[path = "corpus/migration.rs"]
 mod migration;
 mod recovery;
+
+/// Closed private diagnosis; source bodies and artifact paths never enter the summary.
+pub(crate) fn diagnose_catalog_failure(value: Value) -> Result<(Value, Option<BulkArtifact>)> {
+    catalog_failure::diagnose(value)
+}
+
+pub(crate) fn verify_diagnostic_catalog_page(value: Value, body: &[u8]) -> Result<()> {
+    catalog_acquisition::verify_diagnostic_page(value, body)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Publication {

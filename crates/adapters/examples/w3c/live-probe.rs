@@ -392,6 +392,280 @@ fn live_lock(root: &Path) -> Result<std::fs::File> {
     Ok(lock)
 }
 
+fn catalog_page_number(value: &str) -> Result<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::invalid(
+            "Catalog diagnosis page must be an integer from 1 through 1000.",
+        ));
+    }
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|page| (1..=1000).contains(page))
+        .ok_or_else(|| {
+            Error::invalid("Catalog diagnosis page must be an integer from 1 through 1000.")
+        })
+}
+
+async fn fetch_catalog_page(
+    broker: &BulkBroker,
+    page: u32,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>> {
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let work = async {
+        let response = broker
+            .open(
+                BulkRequest {
+                    source: BulkSource::W3cApi(ApiOperation::Catalog { page }),
+                    validators: Validators::default(),
+                    max_bytes: MAX_BYTES as u64,
+                    deadline,
+                    body: Vec::new(),
+                },
+                cancel.clone(),
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(devres_application::collection::http_failure(
+                Error::unavailable("Catalog diagnosis request did not return 200."),
+                devres_application::collection::Phase::CatalogAcquisition,
+                response.status,
+            ));
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_BYTES {
+                return Err(Error::capacity("Catalog diagnosis body exceeds its bound."));
+            }
+            bytes.extend(chunk);
+        }
+        Ok(bytes)
+    };
+    tokio::select! { biased;
+        _ = cancel.cancelled() => Err(Error::new("cancelled", "Catalog diagnosis canceled.")),
+        result = tokio::time::timeout_at(deadline, work) => result
+            .map_err(|_| Error::capacity("Catalog diagnosis deadline exceeded."))?,
+    }
+}
+
+fn write_catalog_receipt(root: &Path, name: &str, receipt: &Value) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(root.join(name))
+        .map_err(|_| Error::unavailable("Catalog diagnosis receipt unavailable."))?;
+    let bytes = serde_json::to_vec_pretty(receipt)
+        .map_err(|_| Error::integrity("Catalog diagnosis receipt encoding failed."))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(Error::capacity(
+            "Catalog diagnosis receipt exceeds its bound.",
+        ));
+    }
+    file.write_all(&bytes)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .map_err(|_| Error::unavailable("Catalog diagnosis receipt unavailable."))?;
+    std::fs::File::open(root)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| Error::unavailable("Catalog diagnosis receipt unavailable."))
+}
+
+async fn retain_catalog_diagnosis(
+    root: &Path,
+    page: u32,
+    bytes: Vec<u8>,
+    observed_at: i64,
+    attempts_before: usize,
+    attempts_after: usize,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    if !(1..=1000).contains(&page) || bytes.len() > 8 * 1024 * 1024 {
+        return Err(Error::invalid("Invalid bounded catalog diagnosis input."));
+    }
+    let artifacts = BulkArtifactStore::new(root, 64 * 1024 * 1024)?;
+    let validation = w3c_catalog::page_validation_diagnosis(&bytes, observed_at);
+    let artifact = artifacts.capture_bytes(bytes, cancel.clone()).await?;
+    if !artifact.body_hash.starts_with("blake3:")
+        || artifacts
+            .verify(&artifact.body_hash, 8 * 1024 * 1024, cancel.clone())
+            .await?
+            != artifact
+    {
+        return Err(Error::integrity("Retained catalog diagnosis body differs."));
+    }
+    let receipt = json!({"version":1,"evidence":"fresh_catalog_page_diagnosis",
+        "page":page,"observed_at":observed_at,"body_hash":artifact.body_hash,"bytes":artifact.bytes,
+        "validation":validation,"attempts":attempts_after.saturating_sub(attempts_before),
+        "attempts_before_invocation":attempts_before,"budget_used":attempts_after,"attempt_limit_per_provider":20,
+        "whole_catalog":false,"publication":false,"production_failure_reproduced":false});
+    write_catalog_receipt(
+        root,
+        &format!("catalog-diagnosis-{page}-{attempts_after}.json"),
+        &receipt,
+    )?;
+    Ok(receipt)
+}
+
+async fn diagnose_catalog_page(input: &Path, page: u32) -> Result<(std::path::PathBuf, Value)> {
+    if !(1..=1000).contains(&page) {
+        return Err(Error::invalid("Invalid catalog diagnosis page."));
+    }
+    let root = root::owned_root(input, b"devres-w3c-live-v1\n")?;
+    let _lock = live_lock(&root)?;
+    let (broker, attempts_before) = counted_broker(&root, "attempt-count")?;
+    let cancel = CancellationToken::new();
+    let signal = cancel.clone();
+    let task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        signal.cancel();
+    });
+    let result = async {
+        let bytes = fetch_catalog_page(&broker, page, &cancel).await?;
+        retain_catalog_diagnosis(
+            &root,
+            page,
+            bytes,
+            devres_domain::unix_now(),
+            attempts_before,
+            broker.attempt_count(),
+            &cancel,
+        )
+        .await
+    }
+    .await;
+    task.abort();
+    let _ = task.await;
+    Ok((root, result?))
+}
+
+fn original_catalog_diagnosis(root: &Path, page: u32, digest: &str, bytes: usize) -> Result<Value> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let invalid =
+        || Error::integrity("Retained catalog diagnosis has no matching original receipt.");
+    for (examined, entry) in std::fs::read_dir(root)
+        .map_err(|_| invalid())?
+        .take(129)
+        .enumerate()
+    {
+        if examined >= 128 {
+            return Err(Error::capacity(
+                "Retained catalog diagnosis metadata exceeds its bound.",
+            ));
+        }
+        let entry = entry.map_err(|_| invalid())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("catalog-diagnosis-") || !name.ends_with(".json") {
+            continue;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(entry.path())
+            .map_err(|_| invalid())?;
+        let metadata = file.metadata().map_err(|_| invalid())?;
+        if !metadata.is_file() || metadata.len() > 64 * 1024 {
+            return Err(invalid());
+        }
+        let mut body = Vec::new();
+        file.take(64 * 1024 + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| invalid())?;
+        if body.len() > 64 * 1024 {
+            return Err(invalid());
+        }
+        let original: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+        if original["page"].as_u64() != Some(page as u64)
+            || original["body_hash"].as_str() != Some(digest)
+        {
+            continue;
+        }
+        let before = original["attempts_before_invocation"]
+            .as_u64()
+            .ok_or_else(invalid)?;
+        let after = original["budget_used"].as_u64().ok_or_else(invalid)?;
+        let observed = original["observed_at"].as_i64().ok_or_else(invalid)?;
+        if original["version"] != 1
+            || original["evidence"] != "fresh_catalog_page_diagnosis"
+            || original["bytes"].as_u64() != Some(bytes as u64)
+            || after > 20
+            || before >= after
+            || original["attempts"].as_u64() != Some(after - before)
+            || original["attempt_limit_per_provider"] != 20
+            || name != format!("catalog-diagnosis-{page}-{after}.json")
+            || original["whole_catalog"] != false
+            || original["publication"] != false
+        {
+            return Err(invalid());
+        }
+        return Ok(
+            json!({"observed_at":observed,"attempts_before_invocation":before,
+            "budget_used":after,"attempts":after-before,"receipt_digest":integrity::hash(&body)}),
+        );
+    }
+    Err(invalid())
+}
+
+async fn replay_catalog_page(
+    input: &Path,
+    page: u32,
+    digest: &str,
+) -> Result<(std::path::PathBuf, Value)> {
+    use tokio::io::AsyncReadExt;
+    if !(1..=1000).contains(&page)
+        || !digest.starts_with("blake3:")
+        || !integrity::valid_hash(digest)
+    {
+        return Err(Error::invalid(
+            "Invalid retained catalog diagnosis selection.",
+        ));
+    }
+    let root = root::owned_root(input, b"devres-w3c-live-v1\n")?;
+    let _lock = live_lock(&root)?;
+    let artifacts = BulkArtifactStore::new(&root, 64 * 1024 * 1024)?;
+    let cancel = CancellationToken::new();
+    let mut bytes = Vec::new();
+    artifacts
+        .open(digest, 8 * 1024 * 1024, cancel)
+        .await?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| Error::unavailable("Retained catalog diagnosis body unavailable."))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(Error::capacity(
+            "Retained catalog diagnosis body exceeds its bound.",
+        ));
+    }
+    integrity::verify(digest, &bytes)?;
+    let original = original_catalog_diagnosis(&root, page, digest, bytes.len())?;
+    let observed_at = original["observed_at"]
+        .as_i64()
+        .ok_or_else(|| Error::integrity("Original catalog diagnosis time is invalid."))?;
+    let receipt = json!({"version":1,"evidence":"retained_catalog_page_diagnosis","page":page,
+        "body_hash":digest,"bytes":bytes.len(),"validation":w3c_catalog::page_validation_diagnosis(&bytes, observed_at),
+        "observed_at":observed_at,"original":original,"upstream_revalidated":false,"attempts":0,"whole_catalog":false,
+        "publication":false,"production_failure_reproduced":false});
+    write_catalog_receipt(
+        &root,
+        &format!(
+            "catalog-replay-{page}-{}.json",
+            digest.trim_start_matches("blake3:")
+        ),
+        &receipt,
+    )?;
+    Ok((root, receipt))
+}
+
 async fn accept(input: &Path) -> Result<(std::path::PathBuf, Value)> {
     use std::io::Write;
     let root = root::owned_root(input, b"devres-w3c-live-v1\n")?;
@@ -431,8 +705,20 @@ async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
         [flag, root] if flag == "--live" => accept(Path::new(root)).await,
+        [flag, page, root] if flag == "--diagnose-catalog-page" => {
+            match catalog_page_number(page) {
+                Ok(page) => diagnose_catalog_page(Path::new(root), page).await,
+                Err(error) => Err(error),
+            }
+        }
+        [flag, page, digest, root] if flag == "--replay-catalog-page" => {
+            match catalog_page_number(page) {
+                Ok(page) => replay_catalog_page(Path::new(root), page, digest).await,
+                Err(error) => Err(error),
+            }
+        }
         _ => Err(Error::invalid(
-            "usage: w3c-live-probe --live OWNED_TMP_ROOT",
+            "usage: w3c-live-probe --live OWNED_TMP_ROOT | --diagnose-catalog-page PAGE OWNED_TMP_ROOT | --replay-catalog-page PAGE BLAKE3_HASH OWNED_TMP_ROOT",
         )),
     };
     match result {
@@ -450,6 +736,132 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_catalog_diagnosis_page_options_are_bounded() {
+        for value in ["1", "12", "1000"] {
+            assert!((1..=1000).contains(&catalog_page_number(value).unwrap()));
+        }
+        for value in [
+            "",
+            "0",
+            "1001",
+            "-1",
+            "+1",
+            "1.0",
+            " 12",
+            "12/../1",
+            "999999999999999999999",
+        ] {
+            assert!(catalog_page_number(value).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_catalog_probe_retains_exact_bytes_and_replays_offline_without_attempts() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let root = temporary.path();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(root.join("owner-v1"), b"devres-w3c-live-v1\n").unwrap();
+        std::fs::set_permissions(
+            root.join("owner-v1"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(root.join("attempt-count"), b"5\n").unwrap();
+        assert_eq!(
+            root::owned_root(root, b"devres-w3c-live-v1\n").unwrap(),
+            root
+        );
+        let bytes = br#"{"_links":{"specifications":[{"shortname":"fixture","title":""}]},"unselected":"PRIVATE SOURCE MARKER"}"#.to_vec();
+        let digest = integrity::hash(&bytes);
+        let receipt =
+            retain_catalog_diagnosis(root, 12, bytes.clone(), 42, 4, 5, &CancellationToken::new())
+                .await
+                .unwrap();
+        assert_eq!(receipt["body_hash"], digest);
+        assert_eq!(receipt["bytes"], bytes.len());
+        assert_eq!(receipt["validation"]["accepted"], false);
+        assert_eq!(receipt["validation"]["reason"], "title");
+        assert_eq!(receipt["validation"]["row"], 1);
+        assert_eq!(receipt["attempts"], 1);
+        assert_eq!(receipt["budget_used"], 5);
+        assert_eq!(receipt["production_failure_reproduced"], false);
+        assert!(
+            !serde_json::to_string(&receipt)
+                .unwrap()
+                .contains("PRIVATE SOURCE MARKER")
+        );
+        let path = root.join(integrity::relative_path(&digest).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            root::owned_root(root, b"devres-w3c-live-v1\n").unwrap(),
+            root
+        );
+        assert_eq!(
+            replay_catalog_page(root, 999, &digest)
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        let (_, replay) = replay_catalog_page(root, 12, &digest).await.unwrap();
+        assert_eq!(replay["attempts"], 0);
+        assert_eq!(replay["validation"], receipt["validation"]);
+        assert_eq!(replay["upstream_revalidated"], false);
+        assert_eq!(replay["observed_at"], 42);
+        assert_eq!(replay["original"]["budget_used"], 5);
+        assert_eq!(std::fs::read(root.join("attempt-count")).unwrap(), b"5\n");
+        assert_eq!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("catalog-diagnosis-"))
+                .count(),
+            1
+        );
+        std::fs::write(&path, b"changed bytes").unwrap();
+        assert!(replay_catalog_page(root, 12, &digest).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn canceled_catalog_probe_makes_no_provider_attempt_and_oversized_fixture_is_rejected() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(root.path().join("attempt-count"), b"20\n").unwrap();
+        let (broker, before) = counted_broker(root.path(), "attempt-count").unwrap();
+        assert_eq!(before, 20);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            fetch_catalog_page(&broker, 12, &cancel)
+                .await
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
+        assert_eq!(broker.attempt_count(), 20);
+        assert_eq!(
+            std::fs::read(root.path().join("attempt-count")).unwrap(),
+            b"20\n"
+        );
+        assert!(
+            retain_catalog_diagnosis(
+                root.path(),
+                12,
+                vec![b'x'; 8 * 1024 * 1024 + 1],
+                42,
+                20,
+                20,
+                &CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[test]
     fn fixed_catalog_receipt_requires_parsed_dotted_identities_and_keeps_page_scope() {
         let bytes = br#"{"_links":{"specifications":[{"href":"https://api.w3.org/specifications/core-aam-1.1","title":"Core AAM"}],"next":{"href":"https://api.w3.org/specifications?page=2&items=100"}}}"#;

@@ -2347,6 +2347,46 @@ mod tests;
 mod cursor_digest_tests {
     use super::*;
     #[test]
+    fn literal_plus_resource_paths_and_cursor_selection_never_become_form_spaces() {
+        let snapshot = Snapshot {
+            id: digest(&"literal-plus-snapshot").unwrap(),
+            standard: "XHTML+Voice".into(),
+            repository: String::new(),
+            revision: String::new(),
+            tree: String::new(),
+            parents: vec![],
+            committed_at: 0,
+            inventory: String::new(),
+            processor_version: 1,
+            index: Value::Null,
+            coverage: Value::Null,
+            source_url: "https://www.w3.org/TR/XHTML+Voice/".into(),
+            representation: "html".into(),
+            validated_at: 0,
+        };
+        let uri = resource(&snapshot, "text", "index.html", Some(1));
+        let parsed = url::Url::parse(&uri).unwrap();
+        assert_eq!(parsed.path_segments().unwrap().next(), Some("XHTML+Voice"));
+        assert!(uri.contains("/XHTML+Voice/"));
+        assert_eq!(parsed.query(), Some("section_index=1"));
+        let selector = Selector {
+            standard: Some("XHTML+Voice".into()),
+            snapshot: Some(snapshot.id),
+            view: None,
+        };
+        let selected = fingerprint(&selector, None).unwrap();
+        let result = page(vec![json!(1), json!(2)], selected.clone(), 0, 1).unwrap();
+        let cursor = result["next_cursor"].as_str().unwrap();
+        assert_eq!(position(&selected, 0, Some(cursor), 1).unwrap(), 1);
+        let space = Selector {
+            standard: Some("XHTML Voice".into()),
+            ..selector
+        };
+        assert_ne!(fingerprint(&space, None).unwrap(), selected);
+        assert!(position(&fingerprint(&space, None).unwrap(), 0, Some(cursor), 1).is_err());
+    }
+
+    #[test]
     fn cursor_versions_bind_the_original_query_algorithm() {
         let selected = ("history", "frozen-snapshot", "path");
         let bytes = serde_json::to_vec(&selected).expect("query");

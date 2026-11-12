@@ -197,6 +197,227 @@ async fn invalid_catalog_preserves_failed_generation_and_published_catalog() {
             .is_null()
     );
     assert!(store.w3c_state("catalog").await.unwrap().is_none());
+    let failures = store
+        .w3c_rows("catalog-failures", 0, 100, None)
+        .await
+        .unwrap();
+    let retained = &failures[0].data;
+    assert_eq!(retained["version"], 2);
+    assert_eq!(retained["attempt"]["operation"], "page_validation");
+    assert_eq!(
+        retained["attempt"]["reason"],
+        json!({"kind":"parse_page","reason":"shortname"})
+    );
+    assert_eq!(retained["attempt"]["page"], 1);
+    assert_eq!(retained["attempt"]["row"], 1);
+    assert!(
+        retained["attempt"]["artifact"]["body_hash"]
+            .as_str()
+            .is_some()
+    );
+    corpus
+        .verify_catalog_discovery(CancellationToken::new())
+        .await
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejected_second_page_retains_exact_attempt_and_legacy_failure_stays_verifiable() {
+    for conflict in [false, true] {
+        let bad = if conflict {
+            json!({"_links":{"specifications":[{"shortname":"first","title":"Conflicting observation"}]}})
+        } else {
+            json!({"_links":{"specifications":[{"shortname":"second","title":""}]}})
+        };
+        let rejected_bytes = serde_json::to_vec(&bad).unwrap();
+        let rejected_hash = inventory::digest(&rejected_bytes);
+        let app = Router::new().route("/specifications", get(move |Query(query): Query<BTreeMap<String,String>>| {
+            let bad = bad.clone();
+            async move {
+                if query.get("page").map(String::as_str) == Some("1") {
+                    Json(json!({"_links":{"specifications":[{"shortname":"first","title":"First"}],"next":{"href":"https://api.w3.org/specifications?page=2&items=100"}}}))
+                } else { Json(bad) }
+            }
+        }));
+        let (broker, server) = crate::w3c::git::tests::serve_fixture(app).await;
+        let (_root, store, corpus) = super::tests::corpus_fixture(broker).await;
+        assert!(
+            corpus
+                .catalog_step(CancellationToken::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let checkpoint = store.w3c_state("catalog-work").await.unwrap().unwrap();
+        assert_eq!(
+            corpus
+                .catalog_step(CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
+        let failures = store
+            .w3c_rows("catalog-failures", 0, 100, None)
+            .await
+            .unwrap();
+        let failure = failures[0].data.clone();
+        assert_eq!(failure["work"], checkpoint);
+        assert_eq!(failure["attempt"]["page"], 2);
+        assert_eq!(failure["attempt"]["artifact"]["body_hash"], rejected_hash);
+        assert_eq!(
+            failure["attempt"]["artifact"]["bytes"],
+            rejected_bytes.len()
+        );
+        assert_eq!(failure["attempt"]["operation"], "page_validation");
+        if conflict {
+            assert_eq!(
+                failure["attempt"]["reason"],
+                json!({"kind":"duplicate_identity"})
+            );
+            assert!(failure["attempt"].get("row").is_none());
+        } else {
+            assert_eq!(
+                failure["attempt"]["reason"],
+                json!({"kind":"parse_page","reason":"title"})
+            );
+            assert_eq!(failure["attempt"]["row"], 1);
+        }
+        assert!(
+            store
+                .w3c_state("catalog-work")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_null()
+        );
+        assert!(store.w3c_state("catalog").await.unwrap().is_none());
+        corpus
+            .verify_catalog_discovery(CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Legacy generations remain immutable and are accepted without invented attempted evidence.
+        let mut legacy = failure.clone();
+        legacy["version"] = json!(1);
+        legacy.as_object_mut().unwrap().remove("attempt");
+        let legacy_id = inventory::digest(&serde_json::to_vec(&legacy).unwrap());
+        store
+            .w3c_put("catalog-failures", &legacy_id, &legacy)
+            .await
+            .unwrap();
+        corpus
+            .verify_catalog_discovery(CancellationToken::new())
+            .await
+            .unwrap();
+
+        // A structurally valid reference to missing bytes must fail graph closure verification.
+        let mut missing = failure.clone();
+        let absent = inventory::digest(b"absent W3C attempted response");
+        missing["attempt"]["artifact"]["body_hash"] = json!(absent);
+        missing["attempt"]["artifact"]["relative_path"] = json!(
+            crate::integrity::relative_path(&absent)
+                .unwrap()
+                .to_string_lossy()
+        );
+        let missing_id = inventory::digest(&serde_json::to_vec(&missing).unwrap());
+        store
+            .w3c_put("catalog-failures", &missing_id, &missing)
+            .await
+            .unwrap();
+        assert!(
+            corpus
+                .verify_catalog_discovery(CancellationToken::new())
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn eleven_page_failure_preserves_generation_and_restarts_without_partial_publication() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    let app = Router::new().route("/specifications", get(move |Query(query): Query<BTreeMap<String,String>>| {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let page = query.get("page").unwrap().parse::<u32>().unwrap();
+            let rows = if page <= 11 {
+                (0..100).map(|row| json!({"shortname":format!("fixture-{page}-{row}"),"title":"Synthetic standard"})).collect::<Vec<_>>()
+            } else { vec![json!({"shortname":"rejected","title":""})] };
+            Json(json!({"_links":{"specifications":rows,"next":{"href":format!("https://api.w3.org/specifications?page={}&items=100",page+1)}}}))
+        }
+    }));
+    let (broker, server) = crate::w3c::git::tests::serve_fixture(app).await;
+    let (root, store, corpus) = super::tests::corpus_fixture(broker.clone()).await;
+    for _ in 0..11 {
+        assert!(
+            corpus
+                .catalog_step(CancellationToken::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        corpus
+            .catalog_step(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code,
+        "integrity"
+    );
+    let failures = store
+        .w3c_rows("catalog-failures", 0, 100, None)
+        .await
+        .unwrap();
+    let failed = failures[0].clone();
+    assert_eq!(failed.data["work"]["pages"].as_array().unwrap().len(), 11);
+    assert_eq!(failed.data["work"]["standards"], 1100);
+    assert_eq!(failed.data["work"]["complete"], false);
+    assert_eq!(failed.data["attempt"]["page"], 12);
+    assert_eq!(requests.load(Ordering::SeqCst), 12);
+    assert!(store.w3c_state("catalog").await.unwrap().is_none());
+    drop(corpus);
+    let restarted = W3cCorpus::new(
+        store.clone(),
+        broker,
+        root.path(),
+        W3cConfig {
+            min_free_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    restarted
+        .verify_catalog_discovery(CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        restarted
+            .catalog_step(CancellationToken::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let next = store.w3c_state("catalog-work").await.unwrap().unwrap();
+    assert_ne!(next["generation"], failed.data["work"]["generation"]);
+    assert_eq!(next["pages"].as_array().unwrap().len(), 1);
+    assert_eq!(next["standards"], 100);
+    assert_eq!(
+        store
+            .w3c_get("catalog-failures", &failed.key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        failed.data
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 13);
+    assert!(store.w3c_state("catalog").await.unwrap().is_none());
     server.abort();
 }
 

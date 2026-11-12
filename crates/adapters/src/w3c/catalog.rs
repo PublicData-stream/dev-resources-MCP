@@ -19,7 +19,7 @@ pub(crate) fn valid_shortname(value: &str) -> bool {
         && !value.contains("..")
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
 }
 
 #[derive(Clone, Debug)]
@@ -288,35 +288,116 @@ fn rows<'a>(data: &'a Value, kind: &str) -> Result<&'a Vec<Value>> {
         })
         .ok_or_else(|| Error::integrity("W3C API page has no expected collection."))
 }
-pub fn parse_page(bytes: &[u8], observed_at: i64) -> Result<Catalog> {
-    if bytes.len() > 8 * 1024 * 1024 {
-        return Err(Error::capacity("W3C catalog page exceeds bounds."));
+/// Private validation discriminators; never include upstream field names or values.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CatalogParseReason {
+    BodyLimit,
+    MalformedJson,
+    CollectionShape,
+    StandardLimit,
+    Shortname,
+    DuplicateIdentity,
+    Title,
+    PublicationDestination,
+    IdentityEncoding,
+}
+
+#[derive(Debug)]
+pub(crate) struct CatalogParseFailure {
+    pub error: Error,
+    pub reason: CatalogParseReason,
+    /// One-based row position, independent of upstream row content.
+    pub row: Option<u32>,
+}
+
+impl CatalogParseFailure {
+    fn new(error: Error, reason: CatalogParseReason, row: Option<u32>) -> Self {
+        Self { error, reason, row }
     }
-    let data: Value =
-        serde_json::from_slice(bytes).map_err(|_| Error::integrity("Malformed W3C catalog."))?;
+}
+
+pub fn parse_page(bytes: &[u8], observed_at: i64) -> Result<Catalog> {
+    parse_page_diagnostic(bytes, observed_at).map_err(|failure| failure.error)
+}
+
+/// Private operator probes can report a closed parser result without source text.
+pub fn page_validation_diagnosis(bytes: &[u8], observed_at: i64) -> Value {
+    match parse_page_diagnostic(bytes, observed_at) {
+        Ok(parsed) => json!({"accepted":true,"standards":parsed.standards.len(),
+            "has_next":page_has_next(bytes).ok(),"reason":null,"row":null}),
+        Err(failure) => json!({"accepted":false,"standards":null,"has_next":null,
+            "reason":failure.reason,"row":failure.row}),
+    }
+}
+
+pub(crate) fn parse_page_diagnostic(
+    bytes: &[u8],
+    observed_at: i64,
+) -> std::result::Result<Catalog, CatalogParseFailure> {
+    use CatalogParseReason as Reason;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(CatalogParseFailure::new(
+            Error::capacity("W3C catalog page exceeds bounds."),
+            Reason::BodyLimit,
+            None,
+        ));
+    }
+    let data: Value = serde_json::from_slice(bytes).map_err(|_| {
+        CatalogParseFailure::new(
+            Error::integrity("Malformed W3C catalog."),
+            Reason::MalformedJson,
+            None,
+        )
+    })?;
     let mut standards = Vec::new();
     let mut seen = BTreeSet::new();
-    for row in rows(&data, "specifications")? {
+    let items = rows(&data, "specifications")
+        .map_err(|error| CatalogParseFailure::new(error, Reason::CollectionShape, None))?;
+    for (position, row) in items.iter().enumerate() {
         if standards.len() >= MAX_CATALOG {
-            return Err(Error::capacity("W3C catalog count exceeds bounds."));
+            return Err(CatalogParseFailure::new(
+                Error::capacity("W3C catalog count exceeds bounds."),
+                Reason::StandardLimit,
+                None,
+            ));
         }
+        let position = Some(position as u32 + 1);
         let derived_id = link(row, "self")
             .or_else(|| text(row, "href"))
             .and_then(|u| u.trim_end_matches('/').rsplit('/').next());
         let id = text(row, "shortname")
             .or(derived_id)
             .filter(|value| valid_shortname(value))
-            .ok_or_else(|| Error::integrity("W3C specification shortname missing."))?;
+            .ok_or_else(|| {
+                CatalogParseFailure::new(
+                    Error::integrity("W3C specification shortname missing."),
+                    Reason::Shortname,
+                    position,
+                )
+            })?;
         if !seen.insert(id) {
-            return Err(Error::integrity("Duplicate W3C specification identity."));
+            return Err(CatalogParseFailure::new(
+                Error::integrity("Duplicate W3C specification identity."),
+                Reason::DuplicateIdentity,
+                position,
+            ));
         }
         let title = text(row, "title")
             .filter(|v| !v.is_empty() && v.len() <= 4096)
-            .ok_or_else(|| Error::integrity("W3C specification title missing."))?;
+            .ok_or_else(|| {
+                CatalogParseFailure::new(
+                    Error::integrity("W3C specification title missing."),
+                    Reason::Title,
+                    position,
+                )
+            })?;
         let url = text(row, "shortlink")
             .map(str::to_owned)
             .unwrap_or_else(|| format!("https://www.w3.org/TR/{id}/"));
-        PublicationUrl::new(&url)?;
+        PublicationUrl::new(&url).map_err(|error| {
+            CatalogParseFailure::new(error, Reason::PublicationDestination, position)
+        })?;
         let mut metadata =
             json!({"shortname":id,"title":title,"shortlink":url,"status":row["status"]});
         metadata["api_url"] = json!(format!("https://api.w3.org/specifications/{id}"));
@@ -336,10 +417,15 @@ pub fn parse_page(bytes: &[u8], observed_at: i64) -> Result<Catalog> {
         });
     }
     standards.sort_by(|a, b| a.id.cmp(&b.id));
-    let id = crate::w3c::inventory::digest(
-        &serde_json::to_vec(&(bytes, observed_at))
-            .map_err(|_| Error::integrity("W3C catalog identity failed."))?,
-    );
+    let id = crate::w3c::inventory::digest(&serde_json::to_vec(&(bytes, observed_at)).map_err(
+        |_| {
+            CatalogParseFailure::new(
+                Error::integrity("W3C catalog identity failed."),
+                Reason::IdentityEncoding,
+                None,
+            )
+        },
+    )?);
     Ok(Catalog {
         id,
         observed_at,
@@ -690,6 +776,117 @@ mod edition_root_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn literal_plus_catalog_identity_from_official_href_preserves_case_and_path_semantics() {
+        // Minimized inert shape from the retained page-12 candidate's rejected row.
+        for shortname in ["xhtml+voice", "XHTML+Voice"] {
+            let body = serde_json::to_vec(&json!({"_links":{"specifications":[{
+                "href":format!("https://api.w3.org/specifications/{shortname}"),
+                "title":"Synthetic XHTML and voice report"
+            }]}}))
+            .unwrap();
+            let parsed = parse_page(&body, 42).unwrap();
+            let standard = &parsed.standards[0];
+            assert_eq!(standard.id, shortname);
+            assert_eq!(standard.metadata["shortname"], shortname);
+            assert_eq!(standard.url, format!("https://www.w3.org/TR/{shortname}/"));
+            let publication = PublicationUrl::new(&standard.url).unwrap();
+            assert_eq!(
+                url::Url::parse(publication.as_str()).unwrap().path(),
+                format!("/TR/{shortname}/")
+            );
+            for operation in [
+                ApiOperation::Specification {
+                    shortname: shortname.into(),
+                },
+                ApiOperation::Versions {
+                    shortname: shortname.into(),
+                    page: 2,
+                },
+                ApiOperation::Version {
+                    shortname: shortname.into(),
+                    version: "20260101".into(),
+                },
+            ] {
+                let target = operation.url().unwrap();
+                let url = url::Url::parse(&target).unwrap();
+                assert_eq!(url.path_segments().unwrap().nth(1), Some(shortname));
+                assert!(target.contains(shortname));
+                assert!(!target.contains("%2B"));
+                assert!(!target.contains("%20"));
+            }
+        }
+        for invalid in [
+            "xhtml voice",
+            "xhtml+ voice",
+            "xhtml%2Bvoice",
+            "xhtml%2bvoice",
+            "xhtml%20voice",
+            "xhtml%252Bvoice",
+            "xhtml+/voice",
+            "xhtml+\\voice",
+            "xhtml+voice?query",
+            "xhtml+voice#fragment",
+            "xhtml+\nvoice",
+            "xhtml+\0voice",
+        ] {
+            assert!(!valid_shortname(invalid));
+            let body = serde_json::to_vec(&json!({"_links":{"specifications":[{
+                "shortname":invalid,"href":format!("https://api.w3.org/specifications/{invalid}"),"title":"Synthetic report"
+            }]}})).unwrap();
+            assert!(parse_page(&body, 42).is_err(), "{invalid:?}");
+            assert!(
+                ApiOperation::Specification {
+                    shortname: invalid.into()
+                }
+                .url()
+                .is_err()
+            );
+        }
+        for encoded in [
+            "xhtml%2Bvoice",
+            "xhtml%2bvoice",
+            "xhtml%20voice",
+            "xhtml%252Bvoice",
+        ] {
+            let body = serde_json::to_vec(&json!({"_links":{"specifications":[{
+                "href":format!("https://api.w3.org/specifications/{encoded}"),"title":"Synthetic report"
+            }]}})).unwrap();
+            assert!(parse_page(&body, 42).is_err());
+        }
+        assert!(
+            ApiOperation::Version {
+                shortname: "xhtml+voice".into(),
+                version: "2026+01".into()
+            }
+            .url()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostic_reasons_select_exact_branch_without_changing_parser_errors() {
+        let cases = [
+            (b"{".to_vec(), CatalogParseReason::MalformedJson, None),
+            (b"{}".to_vec(), CatalogParseReason::CollectionShape, None),
+            (serde_json::to_vec(&json!({"_links":{"specifications":[{"shortname":"../bad","title":"private marker"}]}})).unwrap(), CatalogParseReason::Shortname, Some(1)),
+            (serde_json::to_vec(&json!({"_links":{"specifications":[{"shortname":"valid","title":""}]}})).unwrap(), CatalogParseReason::Title, Some(1)),
+            (serde_json::to_vec(&json!({"_links":{"specifications":[{"shortname":"valid","title":"Valid","shortlink":"https://unqualified.example.org/a"}]}})).unwrap(), CatalogParseReason::PublicationDestination, Some(1)),
+            (serde_json::to_vec(&json!({"_links":{"specifications":[{"shortname":"valid","title":"Valid"},{"shortname":"valid","title":"Other"}]}})).unwrap(), CatalogParseReason::DuplicateIdentity, Some(2)),
+        ];
+        for (bytes, reason, row) in cases {
+            let diagnostic = parse_page_diagnostic(&bytes, 42).unwrap_err();
+            let ordinary = parse_page(&bytes, 42).unwrap_err();
+            assert_eq!(diagnostic.reason, reason);
+            assert_eq!(diagnostic.row, row);
+            assert_eq!(diagnostic.error.code, ordinary.code);
+            assert_eq!(diagnostic.error.message, ordinary.message);
+            let safe = serde_json::to_string(&diagnostic.reason).unwrap();
+            assert!(!safe.contains("private marker"));
+            assert!(!safe.contains("unqualified.example.org"));
+        }
+    }
+
     #[test]
     fn dotted_shortnames_preserve_hal_identities_and_canonical_api_paths() {
         let names = ["core-aam-1.1", "accname-1.1", "CSS22"];

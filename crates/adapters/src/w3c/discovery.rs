@@ -505,11 +505,11 @@ mod tests {
     #[test]
     fn dotted_reports_reconcile_with_exact_catalog_and_browser_spec_identities() {
         let mut catalog = catalog();
-        catalog.standards = ["core-aam-1.1", "accname-1.1", "CSS22"]
+        catalog.standards = ["core-aam-1.1", "accname-1.1", "CSS22", "xhtml+voice"]
             .into_iter()
             .map(specification)
             .collect();
-        let html = b"<a href='/TR/core-aam-1.1/'>Core AAM</a><a href='/TR/accname-1.1/'>Accessible Name</a><a href='/TR/CSS22/'>CSS 2.2</a>";
+        let html = b"<a href='/TR/core-aam-1.1/'>Core AAM</a><a href='/TR/accname-1.1/'>Accessible Name</a><a href='/TR/CSS22/'>CSS 2.2</a><a href='/TR/xhtml+voice/'>Synthetic voice report</a>";
         reconcile_tr(&mut catalog, html, &evidence(), &CancellationToken::new()).unwrap();
         assert!(catalog.gaps.is_empty());
         let rows: Vec<_> = catalog
@@ -540,6 +540,8 @@ mod tests {
             "https://www.w3.org/TR/.hidden/",
             "https://www.w3.org/TR/a..b/",
             "https://www.w3.org/TR/a%2eb/",
+            "https://www.w3.org/TR/xhtml%2Bvoice/",
+            "https://www.w3.org/TR/xhtml+ voice/",
         ] {
             assert!(canonical_report(report).is_none());
         }

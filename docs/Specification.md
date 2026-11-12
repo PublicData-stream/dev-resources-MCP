@@ -509,6 +509,8 @@ Attribution repair for retained evidence follows the separate policy above.
 
 W3C tools use `specification` for the report shortname. `snapshot` and `view`
 selectors are exclusive; use snapshots to select editor drafts or Git sources.
+Shortnames preserve their exact case and literal punctuation, including the `+`
+in `xhtml+voice`; it is a path character and never a form-encoded space.
 Lists default to 20/max100, offsets cap at 10,000 and bound cursors continue beyond
 that window. History continuations preserve their frozen cutoff, including across
 empty filtered pages. Text/byte pages cap at 32 KiB; text offsets are UTF-8 byte
