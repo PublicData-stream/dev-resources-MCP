@@ -27,6 +27,8 @@ mod advisory_storage;
 mod attribution_storage;
 #[path = "chromium/storage.rs"]
 mod chromium_storage;
+#[path = "collection_diagnostics.rs"]
+pub(crate) mod collection_diagnostics;
 #[path = "rfc/storage.rs"]
 mod corpus_storage;
 #[path = "crates_io/storage.rs"]

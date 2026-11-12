@@ -682,6 +682,12 @@ source freshness without logging request bodies or package lists.
 
 ### Collector recovery checks
 
+Use the [private bounded provider inspector](provider-diagnostics.md) to inspect
+retained W3C/Chromium validation evidence or the crates dump without starting
+collection. It preserves public status schemas and production archive caches.
+The [2026-11-12 repair evidence](provider-validation-2026-11-12.md) separates the
+observed source failures, compatibility probes and remaining publication gates.
+
 W3C/Chromium/crate status exposes finite phase and limiter diagnostics, progress,
 latest success and retained failure separately. Compare observations over time;
 `paused` after capacity is a retryable last result, not a disabled collector.

@@ -1,3 +1,4 @@
+mod diagnose_cli;
 mod offline_cli;
 mod storage_worker;
 use devres_server::{
@@ -25,6 +26,47 @@ async fn main() -> Result<(), ServerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::new("devres_server=info"))
         .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|command| command == "diagnose-collection")
+    {
+        let arguments = diagnose_cli::parse(&args)?;
+        let output = diagnose_cli::open_output(&arguments.output)?;
+        let config = Config::load(&arguments.config)
+            .await
+            .map_err(|_| "Collection diagnosis configuration unavailable.")?;
+        let cancel = CancellationToken::new();
+        let stopping = cancel.clone();
+        let signal = tokio::spawn(async move {
+            shutdown_signal().await;
+            stopping.cancel();
+        });
+        let result = devres_adapters::diagnose_collection(
+            &config.storage.database_url,
+            &config.storage.blob_dir,
+            config.storage.s3.clone(),
+            arguments.options,
+            cancel,
+        )
+        .await;
+        signal.abort();
+        let _ = signal.await;
+        let report = result?;
+        diagnose_cli::write_report(output, &report)?;
+        println!(
+            "collection_diagnosis outcome={:?} complete={} bytes_read={} evidence_rows={}",
+            report.outcome,
+            report.complete,
+            report.bytes_read,
+            report.evidence.len()
+        );
+        if report.outcome == devres_adapters::DiagnosisOutcome::IntegrityFailed {
+            return Err(
+                "Collection evidence verification failed; see the private bounded report.".into(),
+            );
+        }
+        return Ok(());
+    }
     if matches!(
         args.first().map(String::as_str),
         Some("migrate-object-storage" | "verify-object-storage" | "activate-object-storage")

@@ -91,6 +91,10 @@ pub use rfc::{RfcConfig, RfcCorpus};
 pub use rustsec::audit_worker_main;
 pub use rustsec::{AdvisoryCorpus, RustSecConfig};
 pub use storage::PgBlobStore;
+pub use storage::collection_diagnostics::{
+    CollectionDiagnosis, DiagnosisOptions, DiagnosisOutcome, DiagnosisProvider,
+    create_diagnosis_output, diagnose_collection,
+};
 pub use w3c::{W3cConfig, W3cCorpus};
 pub use whatwg::{WhatwgConfig, WhatwgCorpus};
 pub use wikipedia::{WikipediaConfig, WikipediaCorpus};

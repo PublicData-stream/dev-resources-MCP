@@ -1,0 +1,94 @@
+# Private provider diagnosis
+
+`devres-server diagnose-collection` inspects existing evidence without starting
+collectors or listeners, acquiring writer authority, or making provider requests.
+Supply reader-only database/S3 credentials through a private configuration file.
+Neither configuration nor arbitrary upstream text enters the report. This command
+supports active schema 14 and 15 so diagnosis can precede a rollout.
+
+```sh
+devres-server diagnose-collection /etc/devres/reader.toml \
+  --provider w3c --latest-failure \
+  --max-total-bytes 67108864 --timeout-secs 300 \
+  --output /tmp/devres-provider-diagnosis/w3c.json
+```
+
+The output parent must be a private directory owned by the current user below
+`/tmp`; the command can create that final directory, but never replaces a report.
+Directory/file permissions are 0700/0600. Symlinks and traversal are rejected.
+Console output contains fixed outcome metadata and counts, never evidence bodies.
+
+The default and maximum metadata/evidence budget is 64 MiB and five minutes.
+SQL payloads are size-admitted before loading and checked with existing payload
+and occurrence seals. Inspection freezes a sequence cutoff, selects only the
+latest failure and referenced candidate pages, and verifies their ancestry.
+S3 reads check committed archive bindings and object identities without attaching
+the archive cache. Filesystem reads never materialize remote objects. Reports
+are limited to 1 MiB and contain closed classifications and public evidence IDs.
+Budget exhaustion and unavailable attempted bytes are explicit incomplete outcomes.
+An incomplete report does not establish parser compatibility or corpus integrity.
+
+Use `--provider chromium` for the component/lane collector states and latest
+private validation observation. These observations contain operation/reason,
+digest/size, and validated Git IDs. Rejected blob contents are not retained;
+an observation alone cannot replay their parser. Public MCP diagnostics retain
+their existing phase/limit/HTTP-status schema.
+
+Use `--provider crates` to identify the existing database-dump capture. Explicit
+`--scan-retained-dump` allows one legacy-admission diagnostic pass, without
+staging or publishing enrichment. The scan caps the artifact at 4 GiB compressed,
+expansion at 8 GiB, and the whole operation at thirty minutes. It stops at the
+first rejection and reports only a fixed table, numeric row/column, selection
+flag, and finite reason/limits. A local prefix scan does not reverify the complete
+artifact. A cold S3 object may be downloaded once into private disposable `/tmp`
+storage and fully digest-checked before parsing. No provider dump is downloaded.
+
+For missing parser bytes, separately authorized fixed-operation probes must use
+the existing broker destination policy and retained attempt accounting. Count
+all attempts against the shared twenty-request per-provider ceiling. Chromium's
+`chromium-live-probe --diagnose-validation OWNED_ROOT --component src` checks refs,
+selected commit metadata and root tree for one component (`src` or `site`). Each
+invocation admits at most six attempts, including retries, within the same root's
+twenty-attempt total. Five-token Gitiles dates omit their timezone; the collector
+verifies the exact raw Git commit object and uses its committer epoch instead of
+guessing a zone. That additional bounded request uses the existing host budget
+and retry owner. Only safe identities, counts, digests and timestamp proof metadata
+are retained. HTTP 500/403 remain acquisition failures with existing retry
+ownership; alternative official routes require a separate reviewed decision.
+
+On 2026-11-12, GitHub's repository API identified
+[GoogleChrome/developer.chrome.com](https://github.com/GoogleChrome/developer.chrome.com)
+as archived. Its [official migration notice](https://github.com/GoogleChrome/developer.chrome.com/blob/main/README.md)
+directs current content issues to the migrated site's issue tracker; it does not
+identify a replacement public content repository. This supports preserving the
+historical-only archive distinction, not substituting it for current Chrome
+content. Authenticated connector reads do not prove the anonymous collector can
+access GitHub. No replacement route or account credentials are admitted here.
+
+Schema 15 adds immutable crates v2 derivations and private failure evidence.
+Selected metadata values and downstream read bounds stay unchanged. Internal snapshot
+and index bindings select the exact processor generation; the public enrichment
+capture remains the original raw capture. Legacy rows, snapshots and resources
+remain retained. Older binaries cannot participate after this schema upgrade;
+rollback requires the coordinated pre-upgrade database/blob backup. This document
+does not authorize production schema activation or deployment.
+
+For an operator-identified local dump, the standalone `crates-dump-inspect`
+example needs no configuration, database or archive client:
+
+```sh
+crates-dump-inspect --retained-file /tmp/evidence/BODY_HEX \
+  --capture blake3:CAPTURE_HEX --body blake3:BODY_HEX \
+  --expected-bytes BYTE_COUNT --measure-first-rejection \
+  --output /tmp/devres-dump-diagnosis/report.json
+```
+
+Replace the placeholders with validated identities. The file basename must equal
+the body digest's hexadecimal part. Without `--measure-first-rejection`, inspection
+stops at the first rejection. With it, only that rejected record continues under
+the existing 2 MiB raw and decoded row bounds and grammar checks. The report keeps
+the original rejection, selected field kind, exact or lower-bound byte counts,
+and record completion/validity flags. It never emits field values, stages rows or
+changes runtime admission. A stopped prefix scan proves neither the complete
+dump's digest nor its gzip trailer, subsequent rows or import completion. Remote
+binary transfer and execution require their own explicit operational authority.

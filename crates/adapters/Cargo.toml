@@ -218,3 +218,7 @@ path = "examples/shared/html-transport-probe.rs"
 [[example]]
 name = "wikipedia-live-probe"
 path = "examples/wikipedia/live-probe.rs"
+
+[[example]]
+name = "crates-dump-inspect"
+path = "examples/crates_io/dump-inspect.rs"
