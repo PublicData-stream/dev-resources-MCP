@@ -49,7 +49,7 @@ impl Drop for TemporaryRoot {
     }
 }
 impl W3cCorpus {
-    async fn api(
+    pub(super) async fn api(
         &self,
         operation: catalog::ApiOperation,
         cancel: CancellationToken,
@@ -68,123 +68,40 @@ impl W3cCorpus {
                 cancel.clone(),
             )
             .await
-            .inspect_err(|error| collection_failure("metadata_acquisition", error))?;
+            .map_err(|error| collection::at_phase(error, Phase::CatalogAcquisition))?;
         if response.status != 200 {
             tracing::warn!(target: "devres_server::collection", provider = "w3c", stage = "metadata_http_status", status = response.status, "Public collection stage failed");
-            return Err(Error::unavailable("W3C metadata API request failed."));
+            return Err(collection::http_failure(
+                Error::unavailable("W3C metadata API request failed."),
+                Phase::CatalogAcquisition,
+                response.status,
+            ));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = bulk::bounded(&cancel, deadline, async {
             Ok(response.stream.next().await)
         })
-        .await?
+        .await
+        .map_err(|error| collection::at_phase(error, Phase::CatalogBody))?
         {
-            let chunk = chunk?;
+            let chunk = chunk.map_err(|error| collection::at_phase(error, Phase::CatalogBody))?;
             if bytes.len().saturating_add(chunk.len()) > 8 * 1024 * 1024 {
-                return Err(Error::capacity("W3C metadata API body exceeds bounds."));
+                return Err(collection::limited(
+                    Error::capacity("W3C metadata API body exceeds bounds."),
+                    Phase::CatalogBody,
+                    LimitKind::MetadataBytes,
+                    Some(bytes.len().saturating_add(chunk.len()) as u64),
+                    Some(8 * 1024 * 1024),
+                ));
             }
             bytes.extend(chunk);
         }
-        let artifact = self.raw.capture_bytes(bytes.clone(), cancel).await?;
-        Ok((bytes, artifact))
-    }
-    pub(super) async fn acquire_catalog(&self, cancel: CancellationToken) -> Result<Catalog> {
-        let observed_at = devres_domain::unix_now();
-        let mut standards = BTreeMap::new();
-        let mut captures = Vec::new();
-        let previous = self
-            .catalog()
+        let artifact = self
+            .raw
+            .capture_bytes(bytes.clone(), cancel)
             .await
-            .ok()
-            .map(|c| {
-                c.standards
-                    .into_iter()
-                    .map(|s| (s.id.clone(), s))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let mut page = 1;
-        loop {
-            let (bytes, artifact) = self
-                .api(catalog::ApiOperation::Catalog { page }, cancel.clone())
-                .await?;
-            let catalog = catalog::parse(&bytes, observed_at)
-                .inspect_err(|error| collection_failure("catalog_validation", error))?;
-            for mut standard in catalog.standards {
-                // Retain discovered source associations across catalog refreshes, never invent them.
-                standard.metadata["api_catalog_capture"] = json!(artifact.body_hash);
-                if let Some(old) = previous.get(&standard.id) {
-                    standard.repository = old.repository.clone();
-                    for key in [
-                        "repository_admission",
-                        "repository_license",
-                        "source_mapping",
-                        "editor_draft",
-                        "latest_tr_url",
-                        "publication_url",
-                        "versions",
-                        "versions_complete",
-                        "versions_root",
-                        "versions_count",
-                        "version_inventory_observed_at",
-                        "latest_version_api",
-                        "versions_next_page",
-                        "versions_pending_count",
-                        "versions_has_next",
-                        "detail_observed_at",
-                    ] {
-                        if let Some(v) = old.metadata.get(key) {
-                            standard.metadata[key] = v.clone();
-                        }
-                    }
-                }
-                if standards.insert(standard.id.clone(), standard).is_some() {
-                    return Err(Error::integrity(
-                        "Duplicate W3C specification across API pages.",
-                    ));
-                }
-            }
-            if standards.len() > catalog::MAX_CATALOG {
-                return Err(Error::capacity("W3C catalog count exceeds bounds."));
-            }
-            captures.push(artifact);
-            if !catalog::page_has_next(&bytes)? {
-                break;
-            }
-            page += 1;
-            if page > 1000 {
-                return Err(Error::capacity(
-                    "W3C API catalog pagination exceeds bounds.",
-                ));
-            }
-        }
-        if standards.is_empty() {
-            return Err(Error::integrity("W3C catalog is empty."));
-        }
-        let catalog = Catalog {
-            id: String::new(),
-            observed_at,
-            standards: standards.into_values().collect(),
-            gaps: Vec::new(),
-        };
-        let mut catalog = self.reconcile_catalog(catalog, cancel.clone()).await?;
-        let id = inventory::digest(
-            &serde_json::to_vec(&(&catalog.standards, &catalog.gaps, &captures, observed_at))
-                .map_err(|_| failure())?,
-        );
-        catalog.id = id.clone();
-        self.store
-            .w3c_put("catalogs", &id, &encode(&catalog)?)
-            .await?;
-        self.store
-            .w3c_put(
-                "catalog-captures",
-                &id,
-                &json!({"api_pages":captures,"observed_at":observed_at}),
-            )
-            .await?;
-        self.store.w3c_set_state("catalog", &json!(id)).await?;
-        Ok(catalog)
+            .map_err(|error| collection::at_phase(error, Phase::CatalogRetention))?;
+        Ok((bytes, artifact))
     }
     pub(super) async fn hydrate_standard(
         &self,
@@ -575,7 +492,8 @@ impl W3cCorpus {
                 cancel.clone(),
             )
             .await
-            .inspect_err(|error| collection_failure("publication_acquisition", error))?;
+            .inspect_err(|error| collection_failure("publication_acquisition", error))
+            .map_err(|e| collection::at_phase(e, Phase::PublicationAcquisition))?;
         let status = response.status;
         let observed_at = devres_domain::unix_now();
         let temporary = TemporaryRoot::new()?;
@@ -594,8 +512,9 @@ impl W3cCorpus {
             })
             .await?
             {
-                let chunk =
-                    chunk.inspect_err(|error| collection_failure("publication_body", error))?;
+                let chunk = chunk
+                    .inspect_err(|error| collection_failure("publication_body", error))
+                    .map_err(|e| collection::at_phase(e, Phase::PublicationAcquisition))?;
                 total = total.checked_add(chunk.len() as u64).ok_or_else(failure)?;
                 if total > bulk::MAX_ARTIFACT_BYTES
                     || self.raw.quota_bytes().is_some_and(|limit| {
@@ -691,7 +610,8 @@ impl W3cCorpus {
                 .raw
                 .ingest_file(&spool, bulk::MAX_ARTIFACT_BYTES, cancel.clone())
                 .await
-                .inspect_err(|error| collection_failure("publication_storage", error))?;
+                .inspect_err(|error| collection_failure("publication_storage", error))
+                .map_err(|e| collection::at_phase(e, Phase::RawRetention))?;
             if a.body_hash != body_hash || a.bytes != total {
                 return Err(Error::integrity(
                     "W3C preflight/full capture hash mismatch.",
@@ -742,7 +662,8 @@ impl W3cCorpus {
         self.store
             .w3c_put("publications", &id, &encode(&publication)?)
             .await
-            .inspect_err(|error| collection_failure("publication_storage", error))?;
+            .inspect_err(|error| collection_failure("publication_storage", error))
+            .map_err(|e| collection::at_phase(e, Phase::RawRetention))?;
         if publish_head
             && publication.status == 200
             && publication.artifact.is_some()
@@ -767,14 +688,34 @@ impl W3cCorpus {
     }
     pub(super) async fn current_step(&self, cancel: CancellationToken) -> Result<()> {
         let _guard = self.processing.lock().await;
-        let mut catalog = match self.catalog().await {
-            Ok(c)
-                if devres_domain::unix_now().saturating_sub(c.observed_at)
-                    < self.config.catalog_refresh_secs as i64 =>
-            {
-                c
+        let previous = self.catalog_optional().await?;
+        let refresh = previous.as_ref().is_none_or(|c| {
+            devres_domain::unix_now().saturating_sub(c.observed_at)
+                >= self.config.catalog_refresh_secs as i64
+        }) || self
+            .store
+            .w3c_state("catalog-work")
+            .await?
+            .is_some_and(|v| !v.is_null());
+        let retry_due = self
+            .collector_status("catalog")
+            .await?
+            .retry_at
+            .is_none_or(|at| at <= devres_domain::unix_now());
+        let acquired = if refresh && retry_due {
+            match self.catalog_step(cancel.clone()).await {
+                Ok(catalog) => catalog,
+                Err(error) if !cancel.is_cancelled() && previous.is_some() => {
+                    self.record_failure("catalog", &error).await?;
+                    None
+                }
+                Err(error) => return Err(error),
             }
-            _ => self.acquire_catalog(cancel.clone()).await?,
+        } else {
+            None
+        };
+        let Some(mut catalog) = acquired.or(previous) else {
+            return self.update_status().await;
         };
         let offset = self
             .store
@@ -790,7 +731,12 @@ impl W3cCorpus {
                 &json!({"attempted_at":devres_domain::unix_now()}),
             )
             .await?;
-        let hydrated = self.hydrate_standard(&original, cancel.clone()).await?;
+        self.collector_begin("current", Phase::PublicationAcquisition)
+            .await?;
+        let hydrated = self
+            .hydrate_standard(&original, cancel.clone())
+            .await
+            .map_err(|e| collection::at_phase(e, Phase::SourceValidation))?;
         let url = catalog::current_publication(&hydrated)?;
         let previous = self
             .store
@@ -825,7 +771,8 @@ impl W3cCorpus {
         standard.metadata["licensed_chapters"] = json!(licensed_chapters(&standard, &publication));
         if let Some(snapshot) = self
             .process_publication(&standard, &publication, cancel.clone())
-            .await?
+            .await
+            .map_err(|e| collection::at_phase(e, Phase::Projection))?
             && self.usable(&snapshot).await?
         {
             self.store.w3c_set_state(&state_key("current",&standard.id),&json!({"snapshot":snapshot.id,"validated_at":publication.observed_at,"latest_publication":standard.metadata["latest_tr_url"],"effective_publication":snapshot.source_url,"fallback":false})).await?;
@@ -888,7 +835,10 @@ impl W3cCorpus {
                 &json!((offset + 1) % catalog.standards.len()),
             )
             .await?;
-        self.publish_default(&catalog, cancel).await?;
+        self.publish_default(&catalog, cancel)
+            .await
+            .map_err(|e| collection::at_phase(e, Phase::ViewPublication))?;
+        self.collector_success("current").await?;
         self.update_status().await
     }
 }

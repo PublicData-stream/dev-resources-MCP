@@ -7,6 +7,8 @@ fn known_evidence_kind(kind: &str) -> bool {
         kind,
         "acceptance"
             | "catalog-captures"
+            | "catalog-pages"
+            | "catalog-failures"
             | "catalogs"
             | "discovery-captures"
             | "edition-nodes"
@@ -855,6 +857,8 @@ impl W3cCorpus {
         const AUX: &[&str] = &[
             "acceptance",
             "catalog-captures",
+            "catalog-pages",
+            "catalog-failures",
             "discovery-captures",
             "edition-nodes",
             "editions",
@@ -911,6 +915,18 @@ impl W3cCorpus {
                             continue;
                         }
                         let mut data = row.data;
+                        if *kind == "catalog-pages" {
+                            if data["previous"].is_string() {
+                                reference_aux(
+                                    "w3c",
+                                    &mut data["previous"],
+                                    mappings,
+                                    "catalog-pages",
+                                )?;
+                            }
+                        } else if *kind == "catalog-failures" {
+                            rewrite_catalog_work(&mut data["work"], mappings)?;
+                        }
                         if *kind == "snapshot-keys" && data.is_string() {
                             reference_aux("w3c", &mut data, mappings, "snapshots")?;
                         }
@@ -981,6 +997,9 @@ impl W3cCorpus {
                             })?,
                         );
                         let id = match *kind {
+                            "catalog-pages" | "catalog-failures" => inventory::digest(
+                                &serde_json::to_vec(&data).map_err(|_| failure())?,
+                            ),
                             "catalog-captures" => crate::integrity::migration_lookup(
                                 mappings,
                                 "w3c:catalogs",
@@ -1050,6 +1069,9 @@ impl W3cCorpus {
                 else {
                     continue;
                 };
+                if key == "catalog-work" && !data.is_null() {
+                    rewrite_catalog_work(&mut data, mappings)?;
+                }
                 let mut references = Vec::new();
                 crate::mdn::corpus::migration::collect_index_references(&data, 0, &mut references)?;
                 for reference in references {
@@ -1150,10 +1172,27 @@ fn reference_aux(
     Ok(())
 }
 
+fn rewrite_catalog_work(
+    value: &mut Value,
+    mappings: &crate::migration_map::MigrationMap,
+) -> Result<()> {
+    if value["predecessor"].is_string() {
+        reference_aux("w3c", &mut value["predecessor"], mappings, "catalogs")?;
+    }
+    let pages = value["pages"]
+        .as_array_mut()
+        .ok_or_else(|| Error::integrity("Invalid W3C catalog checkpoint pages."))?;
+    for page in pages {
+        reference_aux("w3c", page, mappings, "catalog-pages")?;
+    }
+    Ok(())
+}
+
 impl W3cCorpus {
     /// Read-only closure/integrity verification for every retained generation.
     /// Missing descendants are errors even when all remaining rows hash correctly.
     pub async fn verify_blake3_graph(&self, cancel: CancellationToken) -> Result<()> {
+        self.verify_catalog_discovery(cancel.clone()).await?;
         for kind in self.store.w3c_migration_kinds().await? {
             if !known_evidence_kind(&kind) {
                 return Err(Error::integrity("Unknown retained w3c evidence kind."));

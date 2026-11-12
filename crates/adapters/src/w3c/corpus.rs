@@ -8,6 +8,7 @@ use crate::{
     w3c::processing as w3c_processing,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use devres_application::collection::{self, CollectorStatus, LimitKind, Phase, ProgressKind};
 use devres_application::w3c::{
     Catalog, Member, PROCESSOR_VERSION, Snapshot, Standard, View, W3cConfig, W3cStore,
 };
@@ -33,6 +34,9 @@ const MAX_PUBLICATIONS: usize = 100_000;
 const MAX_MEMBERS: usize = 1_000_000;
 
 mod acquisition;
+mod catalog_acquisition;
+#[cfg(test)]
+mod collector_tests;
 mod discovery;
 mod editions;
 mod frozen_editions;
@@ -705,22 +709,41 @@ impl W3cCorpus {
         .with_shared_budget(&self.raw)
     }
     pub async fn initialize_status(&self) -> Result<()> {
+        // Reader construction and published status reads never acquire write authority.
+        self.raw.require_writable()?;
+        for lane in ["catalog", "current", "history", "recovery"] {
+            let mut status = self.collector_status(lane).await?;
+            if status.active {
+                status.active = false;
+                self.store
+                    .w3c_set_state(&format!("collector-{lane}"), &encode(&status)?)
+                    .await?;
+            }
+        }
         self.update_status().await
     }
-    pub async fn catalog(&self) -> Result<Catalog> {
-        let id = self
+    async fn catalog_optional(&self) -> Result<Option<Catalog>> {
+        let Some(value) = self.store.w3c_state("catalog").await? else {
+            return Ok(None);
+        };
+        let id = value
+            .as_str()
+            .ok_or_else(|| Error::integrity("Invalid W3C catalog selector."))?;
+        let row = self
             .store
-            .w3c_state("catalog")
+            .w3c_get("catalogs", id)
             .await?
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .ok_or_else(failure)?;
-        decode(
-            self.store
-                .w3c_get("catalogs", &id)
-                .await?
-                .ok_or_else(failure)?
-                .data,
-        )
+            .ok_or_else(|| Error::integrity("W3C selected catalog is missing."))?;
+        let catalog: Catalog = decode(row.data)?;
+        if catalog.standards.is_empty() || catalog.standards.len() > catalog::MAX_CATALOG {
+            return Err(Error::integrity(
+                "Invalid W3C published catalog membership.",
+            ));
+        }
+        Ok(Some(catalog))
+    }
+    pub async fn catalog(&self) -> Result<Catalog> {
+        self.catalog_optional().await?.ok_or_else(failure)
     }
     pub async fn snapshot(&self, id: &str) -> Result<Snapshot> {
         let mut snapshot: Snapshot = decode(
@@ -2023,13 +2046,24 @@ impl W3cCorpus {
             .await
     }
     async fn update_status(&self) -> Result<()> {
-        let catalog = self.catalog().await.ok();
+        let catalog = self
+            .catalog_optional()
+            .await
+            .map_err(|e| collection::at_phase(e, Phase::StatusRead))?;
         let statistics = self.store.w3c_statistics().await?;
         let snapshots = statistics["snapshots"].as_u64().unwrap_or(0);
         let projections = statistics["projection_gaps"].as_u64().unwrap_or(0);
         let publications = statistics["publications"].as_u64().unwrap_or(0);
-        let view = self.view(None).await.ok();
-        self.store.w3c_set_state("status",&json!({"processor_version":PROCESSOR_VERSION,"gap_scope":"all_retained_snapshot_generations","collection_enabled":self.config.enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_standards":catalog.as_ref().map_or(0,|c|c.standards.len()),"snapshots":snapshots,"publications":publications,"projection_gaps":projections,"index_gaps":statistics["index_gaps"],"published_standards":view.as_ref().map_or(0,|v|v.snapshots.len()),"view":view.as_ref().map(|v|&v.id),"validated_at":view.as_ref().map(|v|v.validated_at),"stale":view.as_ref().is_none_or(|v|devres_domain::unix_now().saturating_sub(v.validated_at)>86400),"failure":self.store.w3c_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes(),"historical_rendering":"source_snapshots_do_not_imply_rendered_publication_coverage"})).await
+        let view = match self.store.w3c_state("default").await? {
+            Some(_) => Some(
+                self.view(None)
+                    .await
+                    .map_err(|e| collection::at_phase(e, Phase::StatusRead))?,
+            ),
+            None => None,
+        };
+        let collector = json!({"catalog":self.collector_status("catalog").await?,"current":self.collector_status("current").await?,"history":self.collector_status("history").await?});
+        self.store.w3c_set_state("status",&json!({"collector":collector,"processor_version":PROCESSOR_VERSION,"gap_scope":"all_retained_snapshot_generations","collection_enabled":self.config.enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_standards":catalog.as_ref().map_or(0,|c|c.standards.len()),"snapshots":snapshots,"publications":publications,"projection_gaps":projections,"index_gaps":statistics["index_gaps"],"published_standards":view.as_ref().map_or(0,|v|v.snapshots.len()),"view":view.as_ref().map(|v|&v.id),"validated_at":view.as_ref().map(|v|v.validated_at),"stale":view.as_ref().is_none_or(|v|devres_domain::unix_now().saturating_sub(v.validated_at)>86400),"failure":self.store.w3c_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes(),"historical_rendering":"source_snapshots_do_not_imply_rendered_publication_coverage"})).await
     }
     pub async fn status(&self) -> Result<Value> {
         self.store.w3c_state("status").await?.ok_or_else(failure)
@@ -2590,13 +2624,43 @@ impl W3cCorpus {
             .await?;
         self.update_status().await
     }
-    async fn record_failure(&self, lane: &str, error: &Error) -> Result<()> {
+    async fn collector_status(&self, lane: &str) -> Result<CollectorStatus> {
         self.store
-            .w3c_set_state(
-                "failure",
-                &json!({"lane":lane,"code":error.code,"observed_at":devres_domain::unix_now()}),
-            )
+            .w3c_state(&format!("collector-{lane}"))
+            .await?
+            .map(decode)
+            .transpose()
+            .map(|v| v.unwrap_or_default())
+    }
+    async fn collector_begin(&self, lane: &str, phase: Phase) -> Result<()> {
+        let mut status = self.collector_status(lane).await?;
+        status.begin(phase);
+        self.store
+            .w3c_set_state(&format!("collector-{lane}"), &encode(&status)?)
+            .await
+    }
+    async fn collector_success(&self, lane: &str) -> Result<()> {
+        let mut status = self.collector_status(lane).await?;
+        status.succeed(devres_domain::unix_now());
+        self.store
+            .w3c_set_state(&format!("collector-{lane}"), &encode(&status)?)
+            .await
+    }
+    async fn record_failure(&self, lane: &str, error: &Error) -> Result<()> {
+        let now = devres_domain::unix_now();
+        let mut status = self.collector_status(lane).await?;
+        status.fail(
+            error,
+            Phase::PublicationAcquisition,
+            now,
+            Some(now.saturating_add(60)),
+        );
+        self.store
+            .w3c_set_state(&format!("collector-{lane}"), &encode(&status)?)
             .await?;
+        let mut value = encode(status.failure.as_ref().ok_or_else(failure)?)?;
+        value["lane"] = json!(lane);
+        self.store.w3c_set_state("failure", &value).await?;
         self.update_status().await
     }
     pub async fn run_current(&self, cancel: CancellationToken) -> Result<()> {
