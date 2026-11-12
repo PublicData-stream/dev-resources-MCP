@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use devres_application::collection::{self, Phase};
 use devres_domain::{Error, Result, Validators};
 use futures::StreamExt;
 use nix::{
@@ -162,7 +163,14 @@ impl GitRegistry {
         let transfer = self
             .wait_fetch(&mut child, &shutdown, &failure, deadline)
             .await;
-        child.terminate().await?;
+        // Snapshot the source failure before our cleanup cancellation can cause
+        // a secondary relay error that would hide a deadline/process failure.
+        let primary = relay
+            .failure_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone());
+        let terminated = child.terminate().await;
         relay_stop.cancel();
         let mut relay_task = relay.task.take().ok_or_else(git_error)?;
         let relay_result = tokio::time::timeout(Duration::from_secs(5), &mut relay_task).await;
@@ -170,12 +178,14 @@ impl GitRegistry {
             relay_task.abort();
             let _ = relay_task.await;
         }
-        if !matches!(relay_result, Ok(Ok(Ok(())))) {
-            return Err(Error::unavailable(
-                "Registry Git relay did not stop cleanly.",
-            ));
-        }
-        transfer?;
+        // Finish cleanup before reporting the primary transfer error. Teardown
+        // failures must not erase the source operation that failed first.
+        finish_transfer(
+            transfer,
+            primary,
+            terminated,
+            matches!(relay_result, Ok(Ok(Ok(())))),
+        )?;
         let observed_at = devres_domain::unix_now();
         let revision = self
             .run(
@@ -204,7 +214,8 @@ impl GitRegistry {
                 &shutdown,
                 deadline,
             )
-            .await?;
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::GitEvidence))?;
         self.run(
             &["update-ref", "refs/devres/current", &revision],
             128,
@@ -599,6 +610,26 @@ impl GitRegistry {
         });
         Ok(receiver)
     }
+}
+
+fn finish_transfer(
+    transfer: Result<()>,
+    primary: Option<Error>,
+    terminated: Result<()>,
+    relay_clean: bool,
+) -> Result<()> {
+    if let Some(error) = primary {
+        return Err(error);
+    }
+    transfer.map_err(|error| collection::at_phase(error, Phase::GitProcess))?;
+    terminated.map_err(|error| collection::at_phase(error, Phase::GitProcess))?;
+    if !relay_clean {
+        return Err(collection::at_phase(
+            Error::unavailable("Registry Git relay did not stop cleanly."),
+            Phase::GitProcess,
+        ));
+    }
+    Ok(())
 }
 
 fn ownership_marker(root: &Path, repository_exists: bool) -> Result<()> {
@@ -1111,22 +1142,27 @@ async fn forward_git(state: RelayState, operation: GitOperation, body: Vec<u8>) 
         GitOperation::Advertisement => "advertisement",
         GitOperation::UploadPack => "upload-pack",
     };
+    let phase = match operation {
+        GitOperation::Advertisement => Phase::GitAdvertisement,
+        GitOperation::UploadPack => Phase::GitUploadPack,
+    };
     let result = state.broker.open(request, state.shutdown.clone()).await;
     let response = match result {
         Ok(response) if response.status == 200 => response,
         other => {
             let error = match other {
-                Ok(response) => Error::unavailable(format!(
-                    "Git {operation_name} upstream returned HTTP {}.",
-                    response.status
-                )),
-                Err(error) => Error::new(
-                    &error.code,
-                    format!("Git {operation_name}: {}", error.message),
+                Ok(response) => collection::http_failure(
+                    Error::unavailable(format!(
+                        "Git {operation_name} upstream returned HTTP {}.",
+                        response.status
+                    )),
+                    phase,
+                    response.status,
                 ),
+                Err(error) => collection::at_phase(error, phase),
             };
             if let Ok(mut reason) = state.failure_reason.lock() {
-                *reason = Some(error);
+                reason.get_or_insert(error);
             }
             state.failure.cancel();
             return StatusCode::BAD_GATEWAY.into_response();
@@ -1137,10 +1173,8 @@ async fn forward_git(state: RelayState, operation: GitOperation, body: Vec<u8>) 
     let stream = response.stream.map(move |item| {
         item.map_err(|error| {
             if let Ok(mut reason) = reason.lock() {
-                *reason = Some(Error::new(
-                    &error.code,
-                    format!("Git {operation_name} stream: {}", error.message),
-                ));
+                reason
+                    .get_or_insert_with(|| collection::at_phase(error.clone(), Phase::GitTransfer));
             }
             failure.cancel();
             std::io::Error::other(error.message)
@@ -1651,6 +1685,25 @@ fn git_error() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn primary_typed_relay_error_survives_process_and_cleanup_failures() {
+        let primary = collection::limited(
+            Error::capacity("bounded source"),
+            Phase::GitTransfer,
+            devres_application::collection::LimitKind::CompressedBytes,
+            Some(11),
+            Some(10),
+        );
+        let error =
+            finish_transfer(Err(git_error()), Some(primary), Err(git_error()), false).unwrap_err();
+        assert_eq!(error.code, "capacity");
+        let context = collection::context(&error).unwrap();
+        assert_eq!(context.phase, Phase::GitTransfer);
+        assert_eq!(context.limit.unwrap().maximum, Some(10));
+        assert!(finish_transfer(Ok(()), None, Ok(()), true).is_ok());
+        assert!(finish_transfer(Ok(()), None, Err(git_error()), true).is_err());
+        assert!(finish_transfer(Ok(()), None, Ok(()), false).is_err());
+    }
     async fn fixture_transport(router: Router) -> (Arc<BulkBroker>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2290,10 +2343,16 @@ mod tests {
         let artifacts = Arc::new(BulkArtifactStore::new(archive.path(), 64 * 1024 * 1024).unwrap());
         let worker = target.clone();
         let token = shutdown.clone();
-        let task = tokio::spawn(async move { worker.sync(broker, artifacts, token).await });
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        let mut task = tokio::spawn(async move { worker.sync(broker, artifacts, token).await });
+        tokio::select! {
+            _ = entered.notified() => {},
+            result = &mut task => panic!("Git fixture acquisition ended before advertisement entry: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                shutdown.cancel();
+                let cleanup = tokio::time::timeout(Duration::from_secs(5), task).await;
+                panic!("Git fixture did not reach advertisement entry within its startup budget; cleanup: {cleanup:?}");
+            }
+        }
         shutdown.cancel();
         assert!(
             tokio::time::timeout(Duration::from_secs(5), task)

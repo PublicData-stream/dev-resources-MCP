@@ -20,6 +20,7 @@ use crate::{
 };
 use devres_application::{
     Retrieval,
+    collection::{self, CollectorStatus, Phase, ProgressKind},
     crate_corpus::{
         Artifact, CollectionJob, ContentRecord, CrateCorpusStore, Snapshot, VersionRecord,
     },
@@ -123,6 +124,8 @@ pub struct CrateCorpus {
     root: PathBuf,
     config: CrateConfig,
     state: Mutex<Value>,
+    metadata_diagnostics: super::dump::Diagnostics,
+    inventory_diagnostics: super::dump::Diagnostics,
     publication: Mutex<()>,
     running: Mutex<()>,
     last_publication: AtomicI64,
@@ -156,6 +159,8 @@ impl CrateCorpus {
             root,
             config,
             state: Mutex::new(json!({})),
+            metadata_diagnostics: Arc::new(std::sync::Mutex::new(CollectorStatus::default())),
+            inventory_diagnostics: Arc::new(std::sync::Mutex::new(CollectorStatus::default())),
             publication: Mutex::new(()),
             running: Mutex::new(()),
             last_publication: AtomicI64::new(0),
@@ -191,6 +196,8 @@ impl CrateCorpus {
             root,
             config,
             state: Mutex::new(json!({})),
+            metadata_diagnostics: Arc::new(std::sync::Mutex::new(CollectorStatus::default())),
+            inventory_diagnostics: Arc::new(std::sync::Mutex::new(CollectorStatus::default())),
             publication: Mutex::new(()),
             running: Mutex::new(()),
             last_publication: AtomicI64::new(0),
@@ -217,6 +224,24 @@ impl CrateCorpus {
         let mut status = self.store.status().await?;
         status["collection_enabled"] = json!(self.config.enabled);
         status["collector"] = self.state.lock().await.clone();
+        for (kind, diagnostics) in [
+            ("metadata", &self.metadata_diagnostics),
+            ("inventory", &self.inventory_diagnostics),
+        ] {
+            if let Ok(diagnostics) = diagnostics.lock() {
+                if status["collector"][kind].is_null() {
+                    status["collector"][kind] = json!({});
+                }
+                if let Some(fields) = serde_json::to_value(&*diagnostics)
+                    .ok()
+                    .and_then(|value| value.as_object().cloned())
+                {
+                    for (key, value) in fields {
+                        status["collector"][kind][key] = value;
+                    }
+                }
+            }
+        }
         Ok(status)
     }
     pub async fn recover_stages(&self) -> Result<()> {
@@ -318,6 +343,7 @@ impl CrateCorpus {
             if stop.is_cancelled() {
                 return Ok(());
             }
+            self.begin_diagnostics("metadata", Phase::RetainedLookup);
             let result = async {
                 let captured = self
                     .fetch_artifact(
@@ -327,14 +353,19 @@ impl CrateCorpus {
                         self.config.metadata_refresh_secs,
                         stop.child_token(),
                     )
-                    .await?;
-                crate::crates_io::dump::import_dump(
+                    .await
+                    .map_err(|error| collection::at_phase(error, Phase::HttpAcquisition))?;
+                if let Ok(mut status) = self.metadata_diagnostics.lock() {
+                    status.progress(ProgressKind::Bytes, captured.bytes);
+                }
+                crate::crates_io::dump::import_dump_observed(
                     self.root.join(crate::integrity::relative_path(
                         &captured.capture.body_hash,
                     )?),
                     captured.capture.id.clone(),
                     self.store.clone(),
                     stop.child_token(),
+                    Some(self.metadata_diagnostics.clone()),
                 )
                 .await?;
                 Ok(())
@@ -345,6 +376,25 @@ impl CrateCorpus {
         }
     }
     async fn record_state(&self, kind: &str, result: &Result<()>) {
+        let now = unix_now();
+        let diagnostics = match kind {
+            "metadata" => Some((&self.metadata_diagnostics, Phase::CsvParsing)),
+            "inventory" => Some((&self.inventory_diagnostics, Phase::InventoryImport)),
+            _ => None,
+        };
+        if let Some((diagnostics, phase)) = diagnostics
+            && let Ok(mut status) = diagnostics.lock()
+        {
+            match result {
+                Ok(()) => status.succeed(now),
+                Err(error) => {
+                    status.fail(error, phase, now, Some(now.saturating_add(60)));
+                    tracing::warn!(target: "devres_server::collection", provider = "crates", lane = kind,
+                        code = collection::safe_code(&error.code), phase = ?status.phase,
+                        context = ?collection::context(error), "Public collection stage failed");
+                }
+            }
+        }
         self.state.lock().await[kind] = match result {
             Ok(()) => json!({"state":"ready","observed_at":unix_now()}),
             Err(e) => {
@@ -352,14 +402,39 @@ impl CrateCorpus {
             }
         };
     }
+    fn begin_diagnostics(&self, kind: &str, phase: Phase) {
+        let diagnostics = if kind == "metadata" {
+            &self.metadata_diagnostics
+        } else {
+            &self.inventory_diagnostics
+        };
+        if let Ok(mut status) = diagnostics.lock() {
+            if phase == Phase::RetainedLookup {
+                status.progress.clear();
+            }
+            status.begin(phase);
+        }
+    }
     pub async fn sync_inventory(&self, stop: CancellationToken) -> Result<()> {
-        let pending = self.store.pending_inventory().await?;
+        self.begin_diagnostics("inventory", Phase::RetainedLookup);
+        let pending = self
+            .store
+            .pending_inventory()
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::RetainedLookup))?;
         let snapshot = if let Some(pending) = &pending {
+            self.begin_diagnostics("inventory", Phase::InventoryRestore);
             let saved = self
                 .store
                 .latest_artifact(&format!("cargo:git-manifest:{}", pending.revision))
-                .await?
-                .ok_or_else(|| Error::integrity("Pending registry evidence is absent."))?;
+                .await
+                .map_err(|error| collection::at_phase(error, Phase::InventoryRestore))?
+                .ok_or_else(|| {
+                    collection::at_phase(
+                        Error::integrity("Pending registry evidence is absent."),
+                        Phase::InventoryRestore,
+                    )
+                })?;
             let manifest = BulkArtifact {
                 relative_path: crate::integrity::relative_path(&saved.capture.body_hash)?
                     .to_string_lossy()
@@ -369,17 +444,23 @@ impl CrateCorpus {
             };
             self.git
                 .restore(self.artifacts.clone(), manifest, stop.child_token())
-                .await?
+                .await
+                .map_err(|error| collection::at_phase(error, Phase::InventoryRestore))?
         } else {
+            self.begin_diagnostics("inventory", Phase::InventoryAcquisition);
             self.git
                 .sync(
                     self.broker.clone(),
                     self.artifacts.clone(),
                     stop.child_token(),
                 )
-                .await?
+                .await
+                .map_err(|error| collection::at_phase(error, Phase::InventoryAcquisition))?
         };
-        self.ingest_snapshot(snapshot, stop).await
+        self.begin_diagnostics("inventory", Phase::InventoryImport);
+        self.ingest_snapshot(snapshot, stop)
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::InventoryImport))
     }
     async fn ingest_snapshot(&self, snapshot: GitSnapshot, stop: CancellationToken) -> Result<()> {
         let previous = self.store.latest_inventory().await?;
@@ -410,6 +491,7 @@ impl CrateCorpus {
                 stop.child_token(),
             )
             .await?;
+        let mut staged_records = 0u64;
         while let Some(record) = records.recv().await {
             let record = record?;
             if epoch.cursor.as_ref().is_some_and(|c| record.path <= *c) {
@@ -475,11 +557,19 @@ impl CrateCorpus {
                     .stage_crate(&epoch.id, &record.name, &[], &record.path)
                     .await?;
             }
+            staged_records = staged_records.saturating_add(1);
+            if let Ok(mut status) = self.inventory_diagnostics.lock() {
+                status.progress(ProgressKind::Rows, staged_records);
+            }
         }
+        self.begin_diagnostics("inventory", Phase::InventoryPublication);
         self.store
             .commit_inventory(&epoch.id, &manifest.capture.id)
-            .await?;
-        self.publish(stop).await?;
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::InventoryPublication))?;
+        self.publish(stop)
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::InventoryPublication))?;
         Ok(())
     }
     pub async fn publish(&self, stop: CancellationToken) -> Result<Snapshot> {
@@ -680,17 +770,25 @@ impl CrateCorpus {
         ttl: u64,
         stop: CancellationToken,
     ) -> Result<Artifact> {
-        let previous = self.store.latest_artifact(key).await?;
+        let previous = self
+            .store
+            .latest_artifact(key)
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::RetainedLookup))?;
         if let Some(old) = &previous
             && unix_now().saturating_sub(old.capture.validated_at) as u64 <= ttl
         {
+            if key == "cargo:database-dump" {
+                self.begin_diagnostics("metadata", Phase::ArtifactVerification);
+            }
             self.artifacts
                 .verify(
                     &old.capture.body_hash,
                     MAX_ARTIFACT_BYTES,
                     stop.child_token(),
                 )
-                .await?;
+                .await
+                .map_err(|error| collection::at_phase(error, Phase::ArtifactVerification))?;
             return Ok(old.clone());
         }
         let source = if matches!(source, BulkSource::DatabaseDump)
@@ -712,6 +810,9 @@ impl CrateCorpus {
                 etag: a.provenance["etag"].as_str().map(str::to_owned),
                 last_modified: a.provenance["last_modified"].as_str().map(str::to_owned),
             });
+        if dump_source {
+            self.begin_diagnostics("metadata", Phase::HttpAcquisition);
+        }
         let response = self
             .broker
             .open(
@@ -724,7 +825,8 @@ impl CrateCorpus {
                 },
                 stop.child_token(),
             )
-            .await?;
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::HttpAcquisition))?;
         if response.status == 304 {
             let mut old =
                 previous.ok_or_else(|| Error::integrity("Bulk 304 lacks prior capture."))?;
@@ -734,7 +836,8 @@ impl CrateCorpus {
                     MAX_ARTIFACT_BYTES,
                     stop.child_token(),
                 )
-                .await?;
+                .await
+                .map_err(|error| collection::at_phase(error, Phase::ArtifactVerification))?;
             old.capture.validated_at = unix_now();
             if old.capture.id.starts_with("blake3:")
                 && old.capture.body_hash.starts_with("blake3:")
@@ -743,7 +846,10 @@ impl CrateCorpus {
                 old.provenance["request_url"] = json!(url);
                 old.provenance["effective_url"] = json!(response.effective_url);
             }
-            self.store.save_artifact(&old, true).await?;
+            self.store
+                .save_artifact(&old, true)
+                .await
+                .map_err(|error| collection::at_phase(error, Phase::ArtifactPublication))?;
             return Ok(old);
         }
         if response.status == 404 {
@@ -760,9 +866,20 @@ impl CrateCorpus {
         } else {
             "application/gzip"
         };
-        let artifact = self.artifacts.capture(response, expected, stop).await?;
+        if dump_source {
+            self.begin_diagnostics("metadata", Phase::ArtifactRetention);
+        }
+        let artifact = self
+            .artifacts
+            .capture(response, expected, stop)
+            .await
+            .map_err(|error| collection::at_phase(error, Phase::ArtifactRetention))?;
+        if dump_source {
+            self.begin_diagnostics("metadata", Phase::ArtifactPublication);
+        }
         self.persist_artifact(key, &effective_url, media_type, artifact, provenance, true)
             .await
+            .map_err(|error| collection::at_phase(error, Phase::ArtifactPublication))
     }
     async fn persist_artifact(
         &self,
@@ -1298,7 +1415,9 @@ pub(super) async fn finish_parser<T>(
     match (consumer, parsed) {
         (Ok(()), parsed) => parsed,
         (Err(error), Err(parser))
-            if error.code == "unavailable" && parser.code != "unavailable" =>
+            if error.code == "unavailable"
+                && parser.code != "unavailable"
+                && parser.code != "cancelled" =>
         {
             Err(parser)
         }

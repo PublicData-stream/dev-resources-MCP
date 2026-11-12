@@ -121,3 +121,22 @@ async fn blocking_parser_panic_is_fatal_during_outage_cleanup() {
         "integrity"
     );
 }
+
+#[tokio::test]
+async fn storage_failure_is_not_replaced_by_the_parser_cancellation_it_causes() {
+    let worker = tokio::task::spawn_blocking(|| -> Result<()> {
+        Err(Error::new("cancelled", "Consumer stopped parser."))
+    });
+    let primary = collection::at_phase(
+        Error::unavailable("Storage rejected batch."),
+        Phase::MetadataStaging,
+    );
+    let error = finish_parser(Err(primary), worker, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "unavailable");
+    assert_eq!(
+        collection::context(&error).unwrap().phase,
+        Phase::MetadataStaging
+    );
+}

@@ -2,6 +2,7 @@
 pub(crate) mod corpus;
 pub mod docs;
 pub mod dump;
+pub(crate) mod enrichment;
 pub mod git;
 pub(crate) mod index;
 pub(crate) mod packages;

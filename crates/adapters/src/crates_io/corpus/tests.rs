@@ -283,6 +283,101 @@ fn source(name: &str, version: &str, operation: DocsOperation) -> BulkSource {
         operation,
     }
 }
+
+async fn metadata_envelope_regression(corpus: &CrateCorpus) {
+    let mut csv = String::from("id,name,description\n");
+    for id in 1..=1000 {
+        csv.push_str(&format!("{id},synthetic{id},{}\n", "x".repeat(8300)));
+    }
+    let mut tar = tar::Builder::new(Vec::new());
+    for (path, bytes) in [
+        ("data/crates.csv", csv.as_bytes()),
+        (
+            "data/versions.csv",
+            b"id,crate_id,num\n1,1000,1.2.3\n".as_slice(),
+        ),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, bytes).unwrap();
+    }
+    let bytes = gzip(&tar.into_inner().unwrap());
+    let artifact = seed(
+        corpus,
+        "cargo:database-dump",
+        BulkSource::DatabaseDump,
+        "application/gzip",
+        bytes.clone(),
+    )
+    .await;
+    for _ in 0..2 {
+        let diagnostics = Arc::new(std::sync::Mutex::new(CollectorStatus::default()));
+        super::super::dump::import_dump_observed(
+            corpus
+                .root
+                .join(crate::integrity::relative_path(&artifact.capture.body_hash).unwrap()),
+            artifact.capture.id.clone(),
+            corpus.store.clone(),
+            CancellationToken::new(),
+            Some(diagnostics.clone()),
+        )
+        .await
+        .unwrap();
+        let status = diagnostics.lock().unwrap();
+        assert_eq!(status.progress[&ProgressKind::Rows], 1001);
+        assert!(status.progress[&ProgressKind::Batches] >= 3);
+    }
+    let enrichment = corpus
+        .store
+        .enrichment(Some(&artifact.capture.id), "synthetic1000", "1.2.3")
+        .await
+        .unwrap();
+    assert_eq!(
+        enrichment["crate"]["description"].as_str().unwrap().len(),
+        8300
+    );
+    let inventory = corpus.store.latest_inventory().await.unwrap().unwrap();
+    let before = corpus
+        .store
+        .prepare_snapshot(&inventory.id, unix_now())
+        .await
+        .unwrap()
+        .enrichment;
+    let mut corrupt = bytes;
+    let n = corrupt.len();
+    corrupt[n - 8] ^= 0x40;
+    let bad = seed(
+        corpus,
+        "cargo:database-dump",
+        BulkSource::DatabaseDump,
+        "application/gzip",
+        corrupt,
+    )
+    .await;
+    assert!(
+        super::super::dump::import_dump(
+            corpus
+                .root
+                .join(crate::integrity::relative_path(&bad.capture.body_hash).unwrap()),
+            bad.capture.id,
+            corpus.store.clone(),
+            CancellationToken::new()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        corpus
+            .store
+            .prepare_snapshot(&inventory.id, unix_now())
+            .await
+            .unwrap()
+            .enrichment,
+        before
+    );
+}
 async fn process_claim(corpus: &CrateCorpus, kind: &str) -> CollectionJob {
     let job = corpus
         .store
@@ -700,6 +795,7 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     );
     assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
     assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
+    metadata_envelope_regression(&corpus).await;
     drop(research);
     drop(corpus);
     drop(retrieval);

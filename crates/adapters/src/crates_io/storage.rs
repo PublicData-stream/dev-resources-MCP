@@ -867,7 +867,7 @@ impl CrateCorpusStore for PgBlobStore {
     ) -> Result<()> {
         self.owner_fence().await?;
         checked_id(artifact)?;
-        if rows.len() > 1000
+        if rows.len() > crate::crates_io::enrichment::MAX_ROWS
             || !matches!(
                 kind,
                 "crates"
@@ -884,10 +884,33 @@ impl CrateCorpusStore for PgBlobStore {
         }
         let values: Vec<_> = rows
             .iter()
-            .map(|(id,value)|Ok(json!({"id":id,"value":value,"integrity":payload_integrity::digest("devres_crate_enrichment",&format!("{artifact}:{kind}"),id,value)?})))
-            .collect::<Result<Vec<_>>>()?.into_iter()
+            .map(|(id, value)| {
+                crate::crates_io::enrichment::row(
+                    id,
+                    value,
+                    &payload_integrity::digest(
+                        "devres_crate_enrichment",
+                        &format!("{artifact}:{kind}"),
+                        id,
+                        value,
+                    )?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .collect();
-        let value = json_limit(&values, 8 * 1024 * 1024)?;
+        let value =
+            json_limit(&values, crate::crates_io::enrichment::MAX_BYTES).map_err(|error| {
+                devres_application::collection::limited(
+                    error,
+                    devres_application::collection::Phase::MetadataStaging,
+                    devres_application::collection::LimitKind::StorageBatchBytes,
+                    serde_json::to_vec(&values)
+                        .ok()
+                        .map(|bytes| bytes.len() as u64),
+                    Some(crate::crates_io::enrichment::MAX_BYTES as u64),
+                )
+            })?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;

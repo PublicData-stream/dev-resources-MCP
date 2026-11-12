@@ -2,6 +2,7 @@
 //!
 //! Raw artifacts are retained by the caller. Rows are staged under their artifact
 //! and become enrichment only after the complete tar/gzip stream passes checks.
+use devres_application::collection::{self, CollectorStatus, LimitKind, Phase, ProgressKind};
 use devres_application::crate_corpus::CrateCorpusStore;
 use devres_domain::{Error, Result};
 use flate2::read::MultiGzDecoder;
@@ -11,7 +12,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -21,21 +22,36 @@ const MAX_EXPANDED: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_ROW: usize = 2 * 1024 * 1024;
 const MAX_FIELD: usize = 1024 * 1024;
 const MAX_COLUMNS: usize = 128;
-const MAX_BATCH: usize = 8 * 1024 * 1024;
+const MAX_BATCH: usize = super::enrichment::MAX_BYTES;
 const CHUNK: usize = 64 * 1024;
 const MAX_MEMBERS: usize = 1000;
 
 fn malformed() -> Error {
     Error::integrity("Malformed public crates.io database dump.")
 }
-fn bounds() -> Error {
-    Error::capacity("Database dump processing bounds exceeded.")
+fn bounds(kind: LimitKind, observed: u64, maximum: u64) -> Error {
+    collection::limited(
+        Error::capacity("Database dump processing bounds exceeded."),
+        Phase::CsvParsing,
+        kind,
+        Some(observed),
+        Some(maximum),
+    )
 }
+pub(crate) type Diagnostics = Arc<Mutex<CollectorStatus>>;
 struct Budget {
     cancel: CancellationToken,
     deadline: Instant,
+    diagnostics: Option<Diagnostics>,
 }
 impl Budget {
+    fn progress(&self, kind: ProgressKind, value: u64) {
+        if let Some(diagnostics) = &self.diagnostics
+            && let Ok(mut status) = diagnostics.lock()
+        {
+            status.progress(kind, value);
+        }
+    }
     fn check(&self) -> Result<()> {
         if self.cancel.is_cancelled() {
             return Err(Error::new(
@@ -44,7 +60,13 @@ impl Budget {
             ));
         }
         if Instant::now() >= self.deadline {
-            return Err(bounds());
+            return Err(collection::limited(
+                Error::capacity("Database dump processing deadline exceeded."),
+                Phase::CsvParsing,
+                LimitKind::Deadline,
+                None,
+                None,
+            ));
         }
         Ok(())
     }
@@ -67,8 +89,10 @@ impl<R: Read> Read for Expanded<'_, R> {
             .min(MAX_EXPANDED.saturating_sub(self.bytes).saturating_add(1) as usize);
         let n = self.inner.read(&mut out[..max])?;
         self.bytes += n as u64;
+        self.budget
+            .progress(ProgressKind::ExpandedBytes, self.bytes);
         if self.bytes > MAX_EXPANDED {
-            self.failed = Some(bounds());
+            self.failed = Some(bounds(LimitKind::ExpandedBytes, self.bytes, MAX_EXPANDED));
             return Err(io::Error::other("dump expansion"));
         }
         Ok(n)
@@ -99,7 +123,11 @@ impl Grammar {
         for &b in bytes {
             self.raw += 1;
             if self.raw > MAX_ROW {
-                return Err(bounds());
+                return Err(bounds(
+                    LimitKind::CsvRowBytes,
+                    self.raw as u64,
+                    MAX_ROW as u64,
+                ));
             }
             match (self.state, b) {
                 (QuoteState::Start, b'"') => self.state = QuoteState::Quoted,
@@ -302,18 +330,37 @@ fn csv<R: Read>(
         input.consume(nin);
         written += nout;
         fields += nends;
-        if written > MAX_ROW || fields > MAX_COLUMNS {
-            return Err(bounds());
+        if written > MAX_ROW {
+            return Err(bounds(
+                LimitKind::CsvRowBytes,
+                written as u64,
+                MAX_ROW as u64,
+            ));
+        }
+        if fields > MAX_COLUMNS {
+            return Err(bounds(
+                LimitKind::CsvColumns,
+                fields as u64,
+                MAX_COLUMNS as u64,
+            ));
         }
         let mut start = 0;
         for &end in &ends[..fields] {
             if end < start || end - start > MAX_FIELD {
-                return Err(bounds());
+                return Err(bounds(
+                    LimitKind::CsvFieldBytes,
+                    end.saturating_sub(start) as u64,
+                    MAX_FIELD as u64,
+                ));
             }
             start = end;
         }
         if written.saturating_sub(start) > MAX_FIELD {
-            return Err(bounds());
+            return Err(bounds(
+                LimitKind::CsvFieldBytes,
+                written.saturating_sub(start) as u64,
+                MAX_FIELD as u64,
+            ));
         }
         match status {
             csv_core::ReadRecordResult::End => break,
@@ -366,7 +413,15 @@ fn csv<R: Read>(
                 fields = 0;
             }
             csv_core::ReadRecordResult::OutputFull | csv_core::ReadRecordResult::OutputEndsFull => {
-                return Err(bounds());
+                return Err(if status == csv_core::ReadRecordResult::OutputEndsFull {
+                    bounds(
+                        LimitKind::CsvColumns,
+                        (MAX_COLUMNS + 1) as u64,
+                        MAX_COLUMNS as u64,
+                    )
+                } else {
+                    bounds(LimitKind::CsvRowBytes, (MAX_ROW + 1) as u64, MAX_ROW as u64)
+                });
             }
             csv_core::ReadRecordResult::InputEmpty => {}
         }
@@ -391,11 +446,18 @@ struct Batches<'a> {
 impl Batches<'_> {
     fn push(&mut self, key: String, value: Value) -> Result<()> {
         self.budget.check()?;
-        let size = serde_json::to_vec(&value).map_err(|_| malformed())?.len() + key.len();
-        if size > MAX_BATCH {
-            return Err(bounds());
+        let size = super::enrichment::row_bytes(&key, &value)?;
+        if size > MAX_BATCH - 2 {
+            return Err(bounds(
+                LimitKind::StorageBatchBytes,
+                size as u64 + 2,
+                MAX_BATCH as u64,
+            ));
         }
-        if !self.rows.is_empty() && (self.rows.len() >= 1000 || self.bytes + size > MAX_BATCH) {
+        if !self.rows.is_empty()
+            && (self.rows.len() >= super::enrichment::MAX_ROWS
+                || self.bytes + size + self.rows.len() + 2 > MAX_BATCH)
+        {
             self.flush()?;
         }
         self.bytes += size;
@@ -490,8 +552,13 @@ fn process(
         {
             budget.check()?;
             if count >= MAX_MEMBERS {
-                return Err(bounds());
+                return Err(bounds(
+                    LimitKind::TarMembers,
+                    count as u64 + 1,
+                    MAX_MEMBERS as u64,
+                ));
             }
+            budget.progress(ProgressKind::Members, count as u64 + 1);
             let mut entry = entry.map_err(|_| malformed())?;
             let kind = entry.header().entry_type();
             if !kind.is_file() && !kind.is_dir() {
@@ -539,7 +606,11 @@ fn process(
                 }
             } else if name == "metadata.json" {
                 if entry.size() > MAX_FIELD as u64 {
-                    return Err(bounds());
+                    return Err(bounds(
+                        LimitKind::MetadataBytes,
+                        entry.size(),
+                        MAX_FIELD as u64,
+                    ));
                 }
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).map_err(|_| malformed())?;
@@ -597,24 +668,50 @@ pub async fn import_dump(
     store: Arc<dyn CrateCorpusStore>,
     shutdown: CancellationToken,
 ) -> Result<Value> {
+    import_dump_observed(path, artifact, store, shutdown, None).await
+}
+
+pub(crate) async fn import_dump_observed(
+    path: PathBuf,
+    artifact: String,
+    store: Arc<dyn CrateCorpusStore>,
+    shutdown: CancellationToken,
+    diagnostics: Option<Diagnostics>,
+) -> Result<Value> {
     let cancel = shutdown.child_token();
     let _guard = cancel.clone().drop_guard();
     let (sender, mut receiver) = mpsc::channel::<Batch>(2);
     let worker_artifact = artifact.clone();
     let worker_cancel = cancel.clone();
+    let worker_diagnostics = diagnostics.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let budget = Budget {
             cancel: worker_cancel,
             deadline: Instant::now() + Duration::from_secs(24 * 3600),
+            diagnostics: worker_diagnostics.clone(),
         };
+        if let Some(diagnostics) = &worker_diagnostics
+            && let Ok(mut status) = diagnostics.lock()
+        {
+            status.begin(Phase::Materialization);
+        }
         let _archive_lease = crate::durable_archive::materialize_file(
             &path,
             crate::bulk::MAX_ARTIFACT_BYTES,
             budget.deadline,
             &budget.cancel,
-        )?;
+        )
+        .map_err(|error| collection::at_phase(error, Phase::Materialization))?;
+        if let Some(diagnostics) = &worker_diagnostics
+            && let Ok(mut status) = diagnostics.lock()
+        {
+            status.begin(Phase::CsvParsing);
+        }
         process(path, &worker_artifact, &budget, &sender)
+            .map_err(|error| collection::at_phase(error, Phase::CsvParsing))
     });
+    let mut rows = 0u64;
+    let mut batches = 0u64;
     let staged: Result<()> = async {
         while let Some(batch) = receiver.recv().await {
             if shutdown.is_cancelled() {
@@ -625,7 +722,16 @@ pub async fn import_dump(
             }
             store
                 .put_enrichment(&artifact, &batch.kind, &batch.rows)
-                .await?;
+                .await
+                .map_err(|error| collection::at_phase(error, Phase::MetadataStaging))?;
+            rows = rows.saturating_add(batch.rows.len() as u64);
+            batches = batches.saturating_add(1);
+            if let Some(diagnostics) = &diagnostics
+                && let Ok(mut status) = diagnostics.lock()
+            {
+                status.progress(ProgressKind::Rows, rows);
+                status.progress(ProgressKind::Batches, batches);
+            }
         }
         Ok(())
     }
@@ -638,7 +744,15 @@ pub async fn import_dump(
             "Database dump import was canceled.",
         ));
     }
-    store.commit_enrichment(&artifact).await?;
+    if let Some(diagnostics) = &diagnostics
+        && let Ok(mut status) = diagnostics.lock()
+    {
+        status.begin(Phase::EnrichmentPublication);
+    }
+    store
+        .commit_enrichment(&artifact)
+        .await
+        .map_err(|error| collection::at_phase(error, Phase::EnrichmentPublication))?;
     Ok(summary)
 }
 
@@ -650,6 +764,83 @@ mod tests {
         Budget {
             cancel: CancellationToken::new(),
             deadline: Instant::now() + Duration::from_secs(10),
+            diagnostics: None,
+        }
+    }
+    fn encoded_batch_bytes(batch: &Batch) -> usize {
+        let seal = format!("blake3:{}", "a".repeat(64));
+        let rows: Vec<_> = batch
+            .rows
+            .iter()
+            .map(|(id, value)| super::super::enrichment::row(id, value, &seal).unwrap())
+            .collect();
+        serde_json::to_vec(&rows).unwrap().len()
+    }
+    #[test]
+    fn persisted_envelope_counts_escaping_integrity_and_splits_before_storage_limit() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let budget = budget();
+        let mut batches = Batches {
+            sender: &sender,
+            kind: "crates".into(),
+            rows: Vec::new(),
+            bytes: 0,
+            budget: &budget,
+        };
+        for id in 1..=1000 {
+            batches.push(format!("{id}\"\\\n"), json!({"id":id.to_string(),"name":format!("synthetic{id}"),"description":"x".repeat(8300)})).unwrap();
+        }
+        batches.flush().unwrap();
+        drop(sender);
+        let first = receiver.blocking_recv().unwrap();
+        let second = receiver.blocking_recv().unwrap();
+        assert_eq!(first.rows.len() + second.rows.len(), 1000);
+        assert!(encoded_batch_bytes(&first) <= MAX_BATCH);
+        assert!(encoded_batch_bytes(&second) <= MAX_BATCH);
+        assert!(receiver.blocking_recv().is_none());
+    }
+    #[test]
+    fn exact_envelope_limit_is_admitted_and_one_more_byte_splits() {
+        for extra in [0, 1] {
+            let (sender, mut receiver) = mpsc::channel(2);
+            let budget = budget();
+            let mut batches = Batches {
+                sender: &sender,
+                kind: "crates".into(),
+                rows: Vec::new(),
+                bytes: 0,
+                budget: &budget,
+            };
+            for id in 0..7 {
+                batches
+                    .push(
+                        id.to_string(),
+                        json!({"description":"x".repeat(1024 * 1024)}),
+                    )
+                    .unwrap();
+            }
+            let empty = json!({"description":""});
+            let padding = MAX_BATCH
+                - batches.bytes
+                - 7
+                - 2
+                - super::super::enrichment::row_bytes("last", &empty).unwrap();
+            batches
+                .push(
+                    "last".into(),
+                    json!({"description":"x".repeat(padding + extra)}),
+                )
+                .unwrap();
+            batches.flush().unwrap();
+            drop(sender);
+            let first = receiver.blocking_recv().unwrap();
+            if extra == 0 {
+                assert_eq!(encoded_batch_bytes(&first), MAX_BATCH);
+                assert!(receiver.blocking_recv().is_none());
+            } else {
+                assert_eq!(first.rows.len(), 7);
+                assert!(encoded_batch_bytes(&receiver.blocking_recv().unwrap()) <= MAX_BATCH);
+            }
         }
     }
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -843,6 +1034,7 @@ mod tests {
                 &Budget {
                     cancel: worker_cancel,
                     deadline: Instant::now() + Duration::from_secs(10),
+                    diagnostics: None,
                 },
                 &sender,
             )
@@ -867,6 +1059,7 @@ mod publication_tests {
         committed: Mutex<String>,
         staged: Mutex<usize>,
         fail: bool,
+        gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
     fn unused() -> Error {
         Error::unavailable("Unused fixture port")
@@ -948,7 +1141,16 @@ mod publication_tests {
             Err(unused())
         }
         async fn put_enrichment(&self, _: &str, _: &str, rows: &[(String, Value)]) -> Result<()> {
-            *self.staged.lock().await += rows.len();
+            let first = {
+                let mut staged = self.staged.lock().await;
+                let first = *staged == 0;
+                *staged += rows.len();
+                first
+            };
+            if first && let Some((entered, release)) = &self.gate {
+                entered.notify_one();
+                release.notified().await;
+            }
             if self.fail {
                 Err(Error::unavailable("Fixture storage failure"))
             } else {
@@ -1000,6 +1202,7 @@ mod publication_tests {
                 committed: Mutex::new("previous".into()),
                 staged: Mutex::new(0),
                 fail,
+                gate: None,
             });
             let result = import_dump(
                 file.path().into(),
@@ -1009,6 +1212,14 @@ mod publication_tests {
             )
             .await;
             assert_eq!(result.is_ok(), valid && !fail);
+            if fail {
+                assert_eq!(
+                    collection::context(result.as_ref().unwrap_err())
+                        .unwrap()
+                        .phase,
+                    Phase::MetadataStaging
+                );
+            }
             assert_eq!(
                 *store.committed.lock().await,
                 if valid && !fail {
@@ -1019,5 +1230,49 @@ mod publication_tests {
             );
             assert!(*store.staged.lock().await > 0);
         }
+    }
+    #[tokio::test]
+    async fn import_progress_is_visible_before_the_complete_head_is_published() {
+        let file = tempfile::NamedTempFile::new_in("/tmp").unwrap();
+        std::fs::write(file.path(), dump(true)).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let store = Arc::new(Sink {
+            committed: Mutex::new("previous".into()),
+            staged: Mutex::new(0),
+            fail: false,
+            gate: Some((entered.clone(), release.clone())),
+        });
+        let diagnostics = Arc::new(std::sync::Mutex::new(CollectorStatus::default()));
+        let path = file.path().to_owned();
+        let worker_store = store.clone();
+        let observed = diagnostics.clone();
+        let worker = tokio::spawn(async move {
+            import_dump_observed(
+                path,
+                "new-public-artifact".into(),
+                worker_store,
+                CancellationToken::new(),
+                Some(observed),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(*store.committed.lock().await, "previous");
+        {
+            let status = diagnostics.lock().unwrap();
+            assert!(status.active);
+            assert!(status.progress[&ProgressKind::ExpandedBytes] > 0);
+        }
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(diagnostics.lock().unwrap().progress[&ProgressKind::Rows], 2);
+        assert_eq!(*store.committed.lock().await, "new-public-artifact");
     }
 }
