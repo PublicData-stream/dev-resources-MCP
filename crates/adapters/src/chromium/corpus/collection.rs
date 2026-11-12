@@ -3649,12 +3649,12 @@ mod collector_regressions {
             store.attribution_enqueue(target, 255).await.unwrap();
         }
         const NOTICE: &str = "First-party synthetic Chromium collector cluster acceptance by dev-resources-MCP contributors; AGPL-3.0-only. This fixture is not upstream acquisition evidence.";
-        for _ in 0..1024 {
+        for admission in 0..1024 {
             if targets.is_empty() {
                 break;
             }
             let job = store
-                .attribution_claim(&["chromium".into()], devres_domain::unix_now())
+                .attribution_claim(&["chromium".into()], devres_domain::unix_now(), admission)
                 .await
                 .unwrap()
                 .expect("synthetic qualification claim");

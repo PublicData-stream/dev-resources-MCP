@@ -496,7 +496,7 @@ async fn run(
     }
     let acquirer = Arc::new(AttributionAdapter::new(broker.clone(), store.clone()));
     let providers = vec!["mdn".to_owned(), "rfc".to_owned()];
-    for _ in 0..MAX_TARGETS {
+    for admission in 0..MAX_TARGETS {
         if cancel.is_cancelled() {
             return Err(Error::new("cancelled", "Qualification cancelled."));
         }
@@ -509,7 +509,7 @@ async fn run(
         }
         queue_guard(&store, &pool, &roots, &allowed, cancel).await?;
         let job = store
-            .attribution_claim(&providers, devres_domain::unix_now())
+            .attribution_claim(&providers, devres_domain::unix_now(), admission as u64)
             .await?
             .ok_or_else(invalid)?;
         require(roots.get(&id(&job.target)?) == Some(&job.target))?;

@@ -317,13 +317,13 @@ async fn w3c_collector_cluster_seed() {
     for target in targets.values() {
         store.attribution_enqueue(target, 1).await.unwrap();
     }
-    for _ in 0..1024 {
+    for admission in 0..1024 {
         if targets.is_empty() {
             break;
         }
         let now = devres_domain::unix_now();
         let job = store
-            .attribution_claim(&["w3c".into()], now)
+            .attribution_claim(&["w3c".into()], now, admission)
             .await
             .unwrap()
             .expect("synthetic attribution job");

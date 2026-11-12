@@ -327,11 +327,13 @@ async fn qualify_fixtures(
     ]
     .map(str::to_owned);
     let mut deferred = 0;
+    let mut admission = 0_u64;
     while !pending.is_empty() {
         let job = store
-            .attribution_claim(&enabled, devres_domain::unix_now())
+            .attribution_claim(&enabled, devres_domain::unix_now(), admission)
             .await?
             .ok_or("Synthetic attribution claim absent")?;
+        admission = admission.wrapping_add(1);
         let identity = serde_json::to_string(&job.target.subject)?;
         let Some(target) = pending.remove(&identity) else {
             // Claim fairness also selects unrelated local sweep work. Release
@@ -401,6 +403,7 @@ mod tests {
             &self,
             _: &[String],
             _: i64,
+            _: u64,
         ) -> DomainResult<Option<AttributionJob>> {
             Ok(self.jobs.lock().unwrap().pop_front())
         }

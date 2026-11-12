@@ -136,6 +136,7 @@ pub struct PgBlobStore {
     owner_pid: i32,
     owner_started: String,
     artifact_budget: std::sync::OnceLock<Arc<crate::bulk::BulkArtifactStore>>,
+    attribution_progress: std::sync::Mutex<attribution_storage::Progress>,
 }
 fn storage_error() -> Error {
     Error::unavailable("Durable storage unavailable")
@@ -661,6 +662,7 @@ impl PgBlobStore {
             owner_pid,
             owner_started,
             artifact_budget: std::sync::OnceLock::new(),
+            attribution_progress: std::sync::Mutex::new(attribution_storage::Progress::default()),
         };
         if let Some(config) = s3 {
             let archive = crate::durable_archive::Archive::attach(

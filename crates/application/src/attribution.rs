@@ -14,6 +14,7 @@ pub trait AttributionStore: Send + Sync {
         &self,
         enabled: &[String],
         now: i64,
+        admission: u64,
     ) -> Result<Option<AttributionJob>>;
     async fn attribution_complete(
         &self,
@@ -26,6 +27,16 @@ pub trait AttributionStore: Send + Sync {
         retry_at: Option<i64>,
         code: &str,
     ) -> Result<()>;
+    /// Preserve a finite cause without storing upstream messages or bodies.
+    async fn attribution_fail_classified(
+        &self,
+        job: &AttributionJob,
+        retry_at: Option<i64>,
+        code: &str,
+        _classification: &AttributionFailure,
+    ) -> Result<()> {
+        self.attribution_fail(job, retry_at, code).await
+    }
     /// Atomically queues a bounded source page and advances its durable cutoff/cursor.
     async fn attribution_sweep_page(&self, provider: &str) -> Result<Vec<AttributionTarget>>;
     async fn attribution_bundle(&self, id: &str) -> Result<QualifiedAttribution>;

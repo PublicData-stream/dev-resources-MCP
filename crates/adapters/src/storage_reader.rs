@@ -62,6 +62,7 @@ impl PgBlobStore {
             owner_pid,
             owner_started,
             artifact_budget: std::sync::OnceLock::new(),
+            attribution_progress: std::sync::Mutex::new(attribution_storage::Progress::default()),
         };
         if let Some(config) = s3 {
             let archive = crate::durable_archive::Archive::attach_reader(

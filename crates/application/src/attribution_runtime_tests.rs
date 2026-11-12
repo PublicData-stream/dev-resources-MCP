@@ -99,6 +99,10 @@ struct Memory {
     failures: AtomicUsize,
     attempts: AtomicUsize,
     last_retry: Mutex<Option<i64>>,
+    classifications: Mutex<Vec<AttributionFailure>>,
+    claim_capacity: AtomicUsize,
+    admissions: Mutex<Vec<u64>>,
+    completion_capacity: AtomicUsize,
 }
 #[async_trait]
 impl AttributionStore for Memory {
@@ -119,7 +123,16 @@ impl AttributionStore for Memory {
         &self,
         enabled: &[String],
         _: i64,
+        admission: u64,
     ) -> Result<Option<AttributionJob>> {
+        self.admissions.lock().await.push(admission);
+        if self
+            .claim_capacity
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Error::capacity("Bounded claim deadline."));
+        }
         let mut q = self.queued.lock().await;
         if let Some(i) = q.iter().position(|t| enabled.contains(&t.subject.provider)) {
             Ok(Some(AttributionJob {
@@ -138,6 +151,13 @@ impl AttributionStore for Memory {
         _: &AttributionJob,
         g: &AttributionGeneration,
     ) -> Result<()> {
+        if self
+            .completion_capacity
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Error::capacity("Proof bound exceeded."));
+        }
         *self.ready.lock().await = Some(QualifiedAttribution {
             id: format!("blake3:{}", "a".repeat(64)),
             generation: g.clone(),
@@ -153,6 +173,16 @@ impl AttributionStore for Memory {
         *self.last_retry.lock().await = retry;
         self.failures.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+    async fn attribution_fail_classified(
+        &self,
+        job: &AttributionJob,
+        retry_at: Option<i64>,
+        code: &str,
+        classification: &AttributionFailure,
+    ) -> Result<()> {
+        self.classifications.lock().await.push(*classification);
+        self.attribution_fail(job, retry_at, code).await
     }
     async fn attribution_sweep_page(&self, _: &str) -> Result<Vec<AttributionTarget>> {
         Ok(vec![])
@@ -460,4 +490,183 @@ async fn reader_status_reports_writer_scan_gaps_instead_of_empty_local_state() {
     assert_eq!(status["scan_gaps"]["mdn"], "capacity");
     assert_eq!(status["complete"], false);
     assert_eq!(status["repair_complete_for_enqueued_targets"], false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn claim_capacity_recovers_without_advancing_admission_and_reports_gap() {
+    let store = Arc::new(Memory::default());
+    store.claim_capacity.store(1, Ordering::SeqCst);
+    store.attribution_enqueue(&target(), 1).await.unwrap();
+    let runtime = Arc::new(runtime(
+        store.clone(),
+        Arc::new(Acquirer {
+            calls: AtomicUsize::new(0),
+            stalled: false,
+        }),
+        true,
+    ));
+    let cancel = CancellationToken::new();
+    let worker = runtime.clone();
+    let stop = cancel.clone();
+    let task = tokio::spawn(async move { worker.run(stop).await });
+    while store.admissions.lock().await.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let status = runtime.status().await.unwrap();
+    assert_eq!(status["admission_gap"]["reason"], "admission_deferred");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    while store.ready.lock().await.is_none() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(&store.admissions.lock().await[..2], &[0, 0]);
+    assert!(runtime.status().await.unwrap()["admission_gap"].is_null());
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_interrupts_claim_backoff_without_another_claim() {
+    let store = Arc::new(Memory::default());
+    store.claim_capacity.store(100, Ordering::SeqCst);
+    let runtime = Arc::new(runtime(
+        store.clone(),
+        Arc::new(Acquirer {
+            calls: AtomicUsize::new(0),
+            stalled: false,
+        }),
+        true,
+    ));
+    let cancel = CancellationToken::new();
+    let worker = runtime.clone();
+    let stop = cancel.clone();
+    let task = tokio::spawn(async move { worker.run(stop).await });
+    while store.admissions.lock().await.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+    assert_eq!(store.admissions.lock().await.len(), 1);
+}
+
+struct ClassifiedSource(AttributionFailure);
+#[async_trait]
+impl AttributionAcquirer for ClassifiedSource {
+    fn targets(&self, _: &str, _: &Value) -> Result<Vec<AttributionTarget>> {
+        Ok(vec![target()])
+    }
+    async fn repair(
+        &self,
+        _: &AttributionTarget,
+        _: CancellationToken,
+    ) -> Result<AttributionGeneration> {
+        Err(self.0.attach(Error::capacity("Sanitized source limit.")))
+    }
+}
+
+#[tokio::test]
+async fn typed_permanent_bounds_block_while_temporary_parser_admission_retries() {
+    for (reason, disposition) in [
+        (
+            AttributionFailureReason::PayloadBound,
+            AttributionDisposition::Blocked,
+        ),
+        (
+            AttributionFailureReason::ParserBusy,
+            AttributionDisposition::Retry,
+        ),
+        (
+            AttributionFailureReason::MissingNotice,
+            AttributionDisposition::Blocked,
+        ),
+    ] {
+        let classification =
+            AttributionFailure::new(AttributionPhase::Qualification, reason, disposition);
+        let store = Arc::new(Memory::default());
+        store.attribution_enqueue(&target(), 1).await.unwrap();
+        let runtime = AttributionRuntime::new(
+            store.clone(),
+            Arc::new(ClassifiedSource(classification)),
+            vec!["mdn".into()],
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let task = tokio::spawn(async move { runtime.run(stop).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.failures.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            store.last_retry.lock().await.is_some(),
+            disposition == AttributionDisposition::Retry
+        );
+        assert_eq!(*store.classifications.lock().await, vec![classification]);
+        assert!(store.ready.lock().await.is_none());
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn acquisition_deadline_releases_claim_as_retry_after_cooperative_cancellation() {
+    let store = Arc::new(Memory::default());
+    store.attribution_enqueue(&target(), 1).await.unwrap();
+    let acquirer = Arc::new(Acquirer {
+        calls: AtomicUsize::new(0),
+        stalled: true,
+    });
+    let runtime = runtime(store.clone(), acquirer.clone(), true);
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let task = tokio::spawn(async move { runtime.run(stop).await });
+    while acquirer.calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(240)).await;
+    while store.failures.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert!(store.last_retry.lock().await.is_some());
+    assert!(store.ready.lock().await.is_none());
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn deterministic_publication_capacity_retains_blocked_classification() {
+    let store = Arc::new(Memory::default());
+    store.completion_capacity.store(1, Ordering::SeqCst);
+    store.attribution_enqueue(&target(), 1).await.unwrap();
+    let runtime = runtime(
+        store.clone(),
+        Arc::new(Acquirer {
+            calls: AtomicUsize::new(0),
+            stalled: false,
+        }),
+        true,
+    );
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let task = tokio::spawn(async move { runtime.run(stop).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while store.failures.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(store.last_retry.lock().await.is_none());
+    assert_eq!(
+        store.classifications.lock().await[0],
+        AttributionFailure::new(
+            AttributionPhase::Publication,
+            AttributionFailureReason::PayloadBound,
+            AttributionDisposition::Blocked
+        )
+    );
+    cancel.cancel();
+    task.await.unwrap().unwrap();
 }

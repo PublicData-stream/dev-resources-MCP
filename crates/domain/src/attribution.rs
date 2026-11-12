@@ -69,3 +69,71 @@ pub const ATTRIBUTION_REQUIRED_POLICY: AttributionPolicyManifest = AttributionPo
     epoch: ATTRIBUTION_POLICY_EPOCH,
     fingerprint: ATTRIBUTION_POLICY_FINGERPRINT,
 };
+
+/// Sanitized operational classification, independent of immutable rights policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionPhase {
+    Mapping,
+    Acquisition,
+    Qualification,
+    Publication,
+    Scheduling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionFailureReason {
+    Unclassified,
+    UpstreamUnavailable,
+    SourceGone,
+    UnsupportedSource,
+    MissingNotice,
+    UnqualifiedScope,
+    InvalidEvidence,
+    SourceMismatch,
+    PayloadBound,
+    ParserBusy,
+    PublicationDeferred,
+    AdmissionDeferred,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionDisposition {
+    Retry,
+    Blocked,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttributionFailure {
+    pub phase: AttributionPhase,
+    pub reason: AttributionFailureReason,
+    pub disposition: AttributionDisposition,
+}
+
+impl AttributionFailure {
+    pub const fn new(
+        phase: AttributionPhase,
+        reason: AttributionFailureReason,
+        disposition: AttributionDisposition,
+    ) -> Self {
+        Self {
+            phase,
+            reason,
+            disposition,
+        }
+    }
+
+    /// Only this finite metadata crosses attribution acquisition boundaries.
+    pub fn attach(self, error: crate::Error) -> crate::Error {
+        error.with_details(serde_json::json!({"attribution_failure":self}))
+    }
+
+    pub fn from_error(error: &crate::Error) -> Option<Self> {
+        serde_json::from_value(error.details.as_ref()?.get("attribution_failure")?.clone()).ok()
+    }
+}

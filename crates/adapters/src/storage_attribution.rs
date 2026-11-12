@@ -24,9 +24,44 @@ const PROVIDERS: &[&str] = &[
     "wikipedia",
 ];
 static CLAIM: AtomicU64 = AtomicU64::new(0);
-static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 const TABLE_TARGETS: &str = "devres_attribution_targets";
 const TABLE_GENERATIONS: &str = "devres_attribution_generations";
+
+#[derive(Serialize)]
+pub(super) struct Progress {
+    started_at: i64,
+    providers: std::collections::BTreeMap<String, TransitionCounts>,
+}
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            started_at: devres_domain::unix_now(),
+            providers: std::collections::BTreeMap::new(),
+        }
+    }
+}
+#[derive(Default, Serialize)]
+struct TransitionCounts {
+    enqueued: u64,
+    claimed: u64,
+    ready: u64,
+    retry: u64,
+    blocked: u64,
+}
+impl Progress {
+    fn record(&mut self, provider: &str, event: &str) {
+        let counts = self.providers.entry(provider.into()).or_default();
+        let counter = match event {
+            "enqueued" => &mut counts.enqueued,
+            "claimed" => &mut counts.claimed,
+            "ready" => &mut counts.ready,
+            "retry" => &mut counts.retry,
+            "blocked" => &mut counts.blocked,
+            _ => return,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
 
 pub(super) const SCHEMA: &str = r#"
 CREATE TABLE devres_attribution_control(singleton boolean PRIMARY KEY CHECK(singleton),data jsonb NOT NULL,data_integrity text NOT NULL);
@@ -258,6 +293,8 @@ struct State {
     attempts: u32,
     generation: Option<String>,
     failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    classification: Option<AttributionFailure>,
 }
 impl State {
     fn new(target: AttributionTarget, priority: u8) -> Self {
@@ -271,6 +308,7 @@ impl State {
             attempts: 0,
             generation: None,
             failure: None,
+            classification: None,
         }
     }
 }
@@ -317,7 +355,19 @@ async fn save(conn: &mut PgConnection, value: &State) -> Result<()> {
         .execute(conn).await.map_err(|_| storage_error())?;
     Ok(())
 }
-async fn enqueue(conn: &mut PgConnection, target: &AttributionTarget, priority: u8) -> Result<()> {
+async fn enqueue(
+    conn: &mut PgConnection,
+    target: &AttributionTarget,
+    priority: u8,
+) -> Result<bool> {
+    enqueue_initial(conn, target, priority, false).await
+}
+async fn enqueue_initial(
+    conn: &mut PgConnection,
+    target: &AttributionTarget,
+    priority: u8,
+    oversized: bool,
+) -> Result<bool> {
     let priority = priority.min(1);
     let id = target_id(&target.subject)?;
     checked_target(target)?;
@@ -327,6 +377,7 @@ async fn enqueue(conn: &mut PgConnection, target: &AttributionTarget, priority: 
             .fetch_optional(&mut *conn)
             .await
             .map_err(|_| storage_error())?;
+    let inserted = old.is_none();
     let value = if let Some(row) = old {
         let mut old = state(&row)?;
         if old.target != *target {
@@ -335,9 +386,20 @@ async fn enqueue(conn: &mut PgConnection, target: &AttributionTarget, priority: 
         old.priority = old.priority.max(priority);
         old
     } else {
-        State::new(target.clone(), priority)
+        let mut initial = State::new(target.clone(), priority);
+        if oversized {
+            initial.status = "blocked".into();
+            initial.failure = Some("oversized_evidence".into());
+            initial.classification = Some(AttributionFailure::new(
+                AttributionPhase::Mapping,
+                AttributionFailureReason::PayloadBound,
+                AttributionDisposition::Blocked,
+            ));
+        }
+        initial
     };
-    save(conn, &value).await
+    save(conn, &value).await?;
+    Ok(inserted)
 }
 fn receipt_url(value: &Value) -> bool {
     value.as_str().is_some_and(|value| {
@@ -640,13 +702,20 @@ impl AttributionStore for PgBlobStore {
         let mut owner = self.owner.lock().await;
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let mut inserted = false;
         let result = async {
-            enqueue(&mut tx, target, priority).await?;
+            inserted = enqueue(&mut tx, target, priority).await?;
             self.fence().await
         }
         .await;
         match result {
-            Ok(()) => tx.commit().await.map_err(|_| storage_error()),
+            Ok(()) => {
+                tx.commit().await.map_err(|_| storage_error())?;
+                if inserted {
+                    self.record_attribution(&target.subject.provider, "enqueued");
+                }
+                Ok(())
+            }
             Err(error) => {
                 tx.rollback().await.map_err(|_| storage_error())?;
                 Err(error)
@@ -683,6 +752,7 @@ impl AttributionStore for PgBlobStore {
         &self,
         enabled: &[String],
         now: i64,
+        admission: u64,
     ) -> Result<Option<AttributionJob>> {
         self.owner_fence().await?;
         if enabled.len() > PROVIDERS.len() || now < 0 {
@@ -691,6 +761,11 @@ impl AttributionStore for PgBlobStore {
         for p in enabled {
             provider(p)?;
         }
+        let enabled: Vec<_> = PROVIDERS
+            .iter()
+            .filter(|p| enabled.iter().any(|v| v == **p))
+            .map(|p| (*p).to_owned())
+            .collect();
         self.fence().await?;
         let mut owner = self.owner.lock().await;
         verify_control(&mut owner).await?;
@@ -698,20 +773,26 @@ impl AttributionStore for PgBlobStore {
         let result:Result<Option<AttributionJob>>=async {
             sqlx_core::query::query("SET LOCAL lock_timeout='250ms'").execute(&mut *tx).await.map_err(source_error)?;
             sqlx_core::query::query("SET LOCAL statement_timeout='2s'").execute(&mut *tx).await.map_err(source_error)?;
-            let fair=ADMISSIONS.fetch_add(1,Ordering::Relaxed)%5==4;
-            let mut head:Option<(u8,i64,String)>=None;
-            for p in enabled {for status in ["pending","retry","running"] {for priority in [0i32,1] {
+            let admission=admission%((enabled.len().max(1)*15) as u64);
+            let background=admission%5==4;
+            let turn=if background { admission/5 } else {4*(admission/5)+admission%5};
+            let buckets=enabled.len()*3;
+            let desired=if buckets==0 {0} else {(turn%(buckets as u64)) as usize};
+            let wanted_priority=if background {0} else {1};
+            let mut head:Option<(u8,u8,i64,String)>=None;
+            for (provider_index,p) in enabled.iter().enumerate() {for (status_index,status) in ["pending","retry","running"].into_iter().enumerate() {for priority in [0i32,1] {
                 // Each equality prefix and ordered due range is one bounded seek
                 // into the existing pending index. Never sort the whole queue.
                 let found:Option<(String,i64)>=sqlx_core::query_as::query_as("SELECT id,retry_at FROM devres_attribution_targets WHERE policy_epoch=$1 AND provider=$2 AND status=$3 AND priority=$4 AND retry_at<=$5 ORDER BY retry_at,id LIMIT 1")
                     .bind(ATTRIBUTION_POLICY_EPOCH as i32).bind(p).bind(status).bind(priority).bind(now).fetch_optional(&mut *tx).await.map_err(source_error)?;
                 if let Some((id,retry_at))=found {
-                    let rank=if fair{0}else{1-priority as u8};
-                    let candidate=(rank,retry_at,id);
+                    let priority_rank=u8::from(priority!=wanted_priority);
+                    let bucket_rank=u8::from(provider_index*3+status_index!=desired);
+                    let candidate=(priority_rank,bucket_rank,retry_at,id);
                     if head.as_ref().is_none_or(|old|candidate<*old){head=Some(candidate);}
                 }
             }}}
-            let Some((_,_,id))=head else{return Ok(None)};
+            let Some((_,_,_,id))=head else{return Ok(None)};
             let row=sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await.map_err(source_error)?;
             let mut value=state(&row)?;
             if value.policy_epoch!=ATTRIBUTION_POLICY_EPOCH||!enabled.contains(&value.target.subject.provider)||!matches!(value.status.as_str(),"pending"|"retry"|"running")||value.retry_at>now{return Err(invalid());}
@@ -722,6 +803,9 @@ impl AttributionStore for PgBlobStore {
         match result {
             Ok(job) => {
                 tx.commit().await.map_err(|_| storage_error())?;
+                if let Some(job) = &job {
+                    self.record_attribution(&job.target.subject.provider, "claimed");
+                }
                 Ok(job)
             }
             Err(error) => {
@@ -745,6 +829,8 @@ impl AttributionStore for PgBlobStore {
         let mut owner = self.owner.lock().await;
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let mut newly_ready = Vec::new();
+        let mut newly_enqueued = Vec::new();
         let result: Result<()> = async {
             let row = sqlx_core::query::query(
                 "SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE",
@@ -767,6 +853,7 @@ impl AttributionStore for PgBlobStore {
                 let mut current = if let Some(row) = row {
                     state(&row)?
                 } else {
+                    newly_enqueued.push(target.subject.provider.clone());
                     State::new(target.clone(), 0)
                 };
                 if current.target != target {
@@ -777,11 +864,15 @@ impl AttributionStore for PgBlobStore {
                         "Dependent attribution repair has an active claim.",
                     ));
                 }
+                if current.status != "ready" {
+                    newly_ready.push(target.subject.provider.clone());
+                }
                 let id = publish_generation(&mut tx, &generation).await?;
                 current.status = "ready".into();
                 current.claim = None;
                 current.generation = Some(id);
                 current.failure = None;
+                current.classification = None;
                 current.retry_at = 0;
                 save(&mut tx, &current).await?;
             }
@@ -789,7 +880,16 @@ impl AttributionStore for PgBlobStore {
         }
         .await;
         match result {
-            Ok(()) => tx.commit().await.map_err(|_| storage_error()),
+            Ok(()) => {
+                tx.commit().await.map_err(|_| storage_error())?;
+                for p in newly_enqueued {
+                    self.record_attribution(&p, "enqueued");
+                }
+                for p in newly_ready {
+                    self.record_attribution(&p, "ready");
+                }
+                Ok(())
+            }
             Err(error) => {
                 tx.rollback().await.map_err(|_| storage_error())?;
                 Err(error)
@@ -802,42 +902,17 @@ impl AttributionStore for PgBlobStore {
         retry_at: Option<i64>,
         code: &str,
     ) -> Result<()> {
-        self.owner_fence().await?;
-        if code.is_empty()
-            || code.len() > 64
-            || !code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-            || retry_at.is_some_and(|t| t < 0)
-        {
-            return Err(Error::invalid("Invalid attribution failure state."));
-        }
-        self.fence().await?;
-        let mut owner = self.owner.lock().await;
-        verify_control(&mut owner).await?;
-        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let row = sqlx_core::query::query(
-            "SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE",
-        )
-        .bind(target_id(&job.target.subject)?)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| invalid())?;
-        let mut value = state(&row)?;
-        if let Err(error) = check_claim(&value, job, false) {
-            tx.rollback().await.map_err(|_| storage_error())?;
-            return Err(error);
-        }
-        value.status = if retry_at.is_some() {
-            "retry"
-        } else {
-            "blocked"
-        }
-        .into();
-        value.retry_at = retry_at.unwrap_or(0);
-        value.claim = None;
-        value.failure = Some(code.into());
-        save(&mut tx, &value).await?;
-        self.fence().await?;
-        tx.commit().await.map_err(|_| storage_error())
+        self.fail_attribution(job, retry_at, code, None).await
+    }
+    async fn attribution_fail_classified(
+        &self,
+        job: &AttributionJob,
+        retry_at: Option<i64>,
+        code: &str,
+        classification: &AttributionFailure,
+    ) -> Result<()> {
+        self.fail_attribution(job, retry_at, code, Some(classification))
+            .await
     }
     async fn attribution_bundle(&self, id: &str) -> Result<QualifiedAttribution> {
         if !crate::integrity::valid_hash(id) {
@@ -880,8 +955,55 @@ impl AttributionStore for PgBlobStore {
         });
         let repair_complete_for_enqueued_targets =
             !counts.is_empty() && counts.iter().all(|v| v["status"] == "ready");
+        let observed_at = devres_domain::unix_now();
+        let mut samples = Vec::new();
+        let mut sample_bytes = 2_usize;
+        let mut omitted_sample_rows = 0_usize;
+        const SAMPLE_BUDGET: usize = 24 * 1024;
+        // Each lateral subquery is one bounded seek into the queue index. Only
+        // scalar observations cross this boundary; never target bodies or keys.
+        let rows = sqlx_core::query::query("SELECT p.provider,s.status,q.priority,t.retry_at,t.namespace,t.attempts,t.failure,t.classification FROM unnest($2::text[]) AS p(provider) CROSS JOIN (VALUES ('pending'),('retry'),('running'),('blocked')) AS s(status) CROSS JOIN (VALUES (0),(1)) AS q(priority) CROSS JOIN LATERAL (SELECT retry_at,data#>>'{target,subject,namespace}' AS namespace,data->>'attempts' AS attempts,data->>'failure' AS failure,data->'classification' AS classification FROM devres_attribution_targets WHERE policy_epoch=$1 AND provider=p.provider AND status=s.status AND priority=q.priority ORDER BY retry_at,id LIMIT 2) t")
+            .bind(ATTRIBUTION_POLICY_EPOCH as i32).bind(PROVIDERS)
+            .fetch_all(&self.pool).await.map_err(|_|storage_error())?;
+        for row in rows {
+            let provider: String = row.try_get("provider").map_err(|_| invalid())?;
+            let status: String = row.try_get("status").map_err(|_| invalid())?;
+            let priority: i32 = row.try_get("priority").map_err(|_| invalid())?;
+            let namespace: String = row.try_get("namespace").map_err(|_| invalid())?;
+            let attempts: String = row.try_get("attempts").map_err(|_| invalid())?;
+            let attempts: u32 = attempts.parse().map_err(|_| invalid())?;
+            let retry_at: i64 = row.try_get("retry_at").map_err(|_| invalid())?;
+            let failure: Option<String> = row.try_get("failure").map_err(|_| invalid())?;
+            let classification: Option<Json<AttributionFailure>> =
+                row.try_get("classification").map_err(|_| invalid())?;
+            let sample = json!({"provider":provider,"status":status,"priority":priority,
+                "namespace":diagnostic_namespace(&namespace),"attempts":attempts,"retry_at":retry_at,
+                "eligible":status!="blocked"&&retry_at<=observed_at,
+                "failure":diagnostic_failure(failure.as_deref()),"classification":classification.map(|v|v.0)});
+            let charge = serde_json::to_vec(&sample)
+                .map_err(|_| invalid())?
+                .len()
+                .saturating_add(1);
+            if sample_bytes.saturating_add(charge) <= SAMPLE_BUDGET {
+                sample_bytes += charge;
+                samples.push(sample);
+            } else {
+                omitted_sample_rows += 1;
+            }
+        }
+        let progress = {
+            let progress = self
+                .attribution_progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            json!({"scope":"this_store_process","started_at":progress.started_at,"providers":progress.providers})
+        };
         Ok(
-            json!({"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"counts":counts,"sweeps":sweeps,
+            json!({"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"counts":counts,"sweeps":sweeps,"progress":progress,
+                "diagnostics":{"sampled":true,"limit_per_bucket":2,"ordering":"retry_at_then_id",
+                    "sample_budget_bytes":SAMPLE_BUDGET,"truncated":omitted_sample_rows>0,
+                    "omitted_sample_rows":omitted_sample_rows,"omission_scope":"bounded_candidates_only",
+                    "observed_at":observed_at,"pending_age_available":false,"samples":samples},
                 "repair_complete_for_enqueued_targets":repair_complete_for_enqueued_targets,
                 "initial_scan_passes_complete":all_scanned,
                 "completion_scope":"observed_sweep_cutoffs",
@@ -1000,6 +1122,92 @@ fn source_error(error: sqlx_core::error::Error) -> Error {
         storage_error()
     }
 }
+
+fn diagnostic_namespace(namespace: &str) -> String {
+    let (table, kind) = namespace.split_once('/').unwrap_or((namespace, ""));
+    if table == "source" && kind.is_empty() {
+        return table.into();
+    }
+    if !matches!(
+        table,
+        "devres_captures"
+            | "devres_rfc_datasets"
+            | "devres_rfc_snapshots"
+            | "devres_crate_versions"
+            | "devres_crate_content"
+            | "devres_crate_snapshots"
+            | "devres_advisory_rows"
+            | "devres_advisory_state"
+            | "devres_advisory_records"
+            | "devres_advisory_snapshots"
+            | "devres_mdn_evidence"
+            | "devres_mdn_state"
+            | "devres_whatwg_evidence"
+            | "devres_whatwg_state"
+            | "devres_w3c_evidence"
+            | "devres_w3c_state"
+            | "devres_chromium_evidence"
+            | "devres_chromium_state"
+            | "devres_npm_evidence"
+            | "devres_npm_state"
+            | "devres_wikipedia_evidence"
+    ) {
+        return "other".into();
+    }
+    if kind.is_empty() {
+        return table.into();
+    }
+    let kind = if matches!(
+        kind,
+        "captures"
+            | "catalogs"
+            | "commits"
+            | "nodes"
+            | "trees"
+            | "projections"
+            | "projection-sections"
+            | "projection-chunks"
+            | "projection-headers"
+            | "projection-references"
+            | "index-documents"
+            | "indexed-membership"
+            | "changes"
+            | "snapshots"
+            | "views"
+            | "observations"
+            | "jobs"
+            | "blocked-jobs"
+            | "history-gaps"
+            | "license-scopes"
+            | "processing"
+            | "git-projections"
+            | "advisories"
+            | "advisory-members"
+            | "advisory-packages"
+            | "advisory-raw"
+            | "catalogue"
+            | "errata"
+            | "documents"
+    ) {
+        kind
+    } else {
+        "other"
+    };
+    format!("{table}/{kind}")
+}
+
+fn diagnostic_failure(failure: Option<&str>) -> Option<&'static str> {
+    failure.map(|failure| match failure {
+        "oversized_evidence" => "oversized_evidence",
+        "integrity" => "integrity",
+        "capacity" => "capacity",
+        "blocked" => "blocked",
+        "retryable" => "retryable",
+        "cancelled" => "cancelled",
+        "publication_deferred" => "publication_deferred",
+        _ => "legacy_unknown",
+    })
+}
 fn sources(name: &str) -> Result<Vec<Source>> {
     provider(name)?;
     // Scan the shared capture primary key exactly once. Filtering an id-ordered
@@ -1047,7 +1255,7 @@ fn sources(name: &str) -> Result<Vec<Source>> {
             list.push(Source {
                 table: "devres_advisory_rows",
                 select: "t.*,to_jsonb(t)-'data' AS metadata",
-                filter: "true",
+                filter: "kind <> 'processing'",
             });
             list.push(Source {
                 table: "devres_advisory_state",
@@ -1079,17 +1287,19 @@ fn sources(name: &str) -> Result<Vec<Source>> {
                 select: "t.*,to_jsonb(t)-'data' AS metadata",
                 filter: match name {
                     "w3c" => "kind NOT IN ('catalog-pages','catalog-failures')",
-                    "chromium" => "kind NOT IN ('traversal-gaps','traversal-gap-manifests')",
+                    "chromium" => {
+                        "kind NOT IN ('trees','traversal-gaps','traversal-gap-manifests')"
+                    }
                     _ => "true",
                 },
             });
             list.push(Source {
                 table: state,
                 select: "t.*,''::text AS kind,to_jsonb(t)-'data' AS metadata",
-                filter: if name == "w3c" {
-                    "key <> 'catalog-work' AND NOT starts_with(key,'collector-')"
-                } else {
-                    "true"
+                filter: match name {
+                    "w3c" => "key NOT IN ('status','failure','catalog-work') AND NOT starts_with(key,'collector-')",
+                    "mdn" => "key NOT IN ('status','failure','content-retry','compat-retry')",
+                    _ => "key NOT IN ('status','failure')",
                 },
             });
         }
@@ -1291,6 +1501,59 @@ fn candidate(name: &str, table: &str, row: &PgRow, oversized: bool) -> Result<At
     })
 }
 impl PgBlobStore {
+    fn record_attribution(&self, provider: &str, event: &str) {
+        self.attribution_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(provider, event);
+    }
+    async fn fail_attribution(
+        &self,
+        job: &AttributionJob,
+        retry_at: Option<i64>,
+        code: &str,
+        classification: Option<&AttributionFailure>,
+    ) -> Result<()> {
+        self.owner_fence().await?;
+        if code.is_empty()
+            || code.len() > 64
+            || !code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            || retry_at.is_some_and(|t| t < 0)
+        {
+            return Err(Error::invalid("Invalid attribution failure state."));
+        }
+        self.fence().await?;
+        let mut owner = self.owner.lock().await;
+        verify_control(&mut owner).await?;
+        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let row = sqlx_core::query::query(
+            "SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE",
+        )
+        .bind(target_id(&job.target.subject)?)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| invalid())?;
+        let mut value = state(&row)?;
+        if let Err(error) = check_claim(&value, job, false) {
+            tx.rollback().await.map_err(|_| storage_error())?;
+            return Err(error);
+        }
+        value.status = if retry_at.is_some() {
+            "retry"
+        } else {
+            "blocked"
+        }
+        .into();
+        value.retry_at = retry_at.unwrap_or(0);
+        value.claim = None;
+        value.failure = Some(code.into());
+        value.classification = classification.copied();
+        save(&mut tx, &value).await?;
+        self.fence().await?;
+        tx.commit().await.map_err(|_| storage_error())?;
+        self.record_attribution(&job.target.subject.provider, &value.status);
+        Ok(())
+    }
     async fn historical_attribution_bundle(&self, id: &str) -> Result<QualifiedAttribution> {
         let row =
             sqlx_core::query::query("SELECT * FROM devres_attribution_generations WHERE id=$1")
@@ -1322,6 +1585,7 @@ impl PgBlobStore {
         let mut owner = self.owner.lock().await;
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let mut inserted = Vec::new();
         let result:Result<Vec<AttributionTarget>>=async {
             sqlx_core::query::query("SET LOCAL lock_timeout='250ms'").execute(&mut *tx).await.map_err(source_error)?;
             sqlx_core::query::query("SET LOCAL statement_timeout='2s'").execute(&mut *tx).await.map_err(source_error)?;
@@ -1350,8 +1614,7 @@ impl PgBlobStore {
                 let sql=format!("SELECT * FROM ({base}) s WHERE {exact}");
                 let row=sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(sql)).bind(position).fetch_one(&mut *tx).await.map_err(source_error)?;
                 let target=candidate(name,source.table,&row,oversized)?;
-                enqueue(&mut tx,&target,0).await?;
-                if oversized{let mut blocked=State::new(target.clone(),0);blocked.status="blocked".into();blocked.failure=Some("oversized_evidence".into());save(&mut tx,&blocked).await?;}
+                if enqueue_initial(&mut tx,&target,0,oversized).await? { inserted.push((target.subject.provider.clone(),oversized)); }
                 output.push(target);bytes=bytes.saturating_add(charge);sweep.after=position.clone();
             }
             if positions.is_empty(){sweep.source+=1;sweep.after.clear();sweep.cutoff=None;if sweep.source==sources.len(){sweep.source=0;sweep.passes=sweep.passes.saturating_add(1);sweep.complete=true;}}else{sweep.complete=false;}
@@ -1362,6 +1625,12 @@ impl PgBlobStore {
         match result {
             Ok(output) => {
                 tx.commit().await.map_err(|_| storage_error())?;
+                for (p, oversized) in inserted {
+                    self.record_attribution(&p, "enqueued");
+                    if oversized {
+                        self.record_attribution(&p, "blocked");
+                    }
+                }
                 Ok(output)
             }
             Err(error) => {
@@ -1559,6 +1828,31 @@ mod tests {
         assert!(generation(&no_receipt).is_err());
     }
     #[test]
+    fn diagnostic_metadata_never_echoes_arbitrary_namespace_or_failure_text() {
+        assert_eq!(
+            diagnostic_namespace("devres_mdn_evidence/projections"),
+            "devres_mdn_evidence/projections"
+        );
+        for namespace in [
+            "https://private.example/secret",
+            "source/private-key",
+            "devres_mdn_state/https://private.example",
+            "devres_mdn_evidence/private-input",
+        ] {
+            let safe = diagnostic_namespace(namespace);
+            assert!(!safe.contains("private"));
+            assert!(!safe.contains("https"));
+        }
+        assert_eq!(
+            diagnostic_failure(Some("user_supplied_secret")),
+            Some("legacy_unknown")
+        );
+        assert_eq!(
+            diagnostic_failure(Some("oversized_evidence")),
+            Some("oversized_evidence")
+        );
+    }
+    #[test]
     fn acquisition_receipts_require_successful_exact_policy_bound_evidence() {
         let original = generation_for(&target("receipts"));
         assert!(generation(&original).is_ok());
@@ -1670,6 +1964,225 @@ mod tests {
         assert!(generation_for_registry(&future, &registry).is_ok());
         assert!(generation(&future).is_err());
     }
+    #[tokio::test]
+    #[ignore = "requires disposable DEVRES_TEST_DATABASE_URL PostgreSQL"]
+    async fn attribution_storage_fair_claims_recover_due_work_and_bound_diagnostics() {
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        let name = format!("devres_attribution_fair_{}", std::process::id());
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {name}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path(&format!("/{name}"));
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .unwrap();
+        let now = devres_domain::unix_now();
+        let mut originals = std::collections::BTreeMap::new();
+        {
+            let mut owner = store.owner.lock().await;
+            for provider in ["rfc", "mdn"] {
+                for status in ["pending", "retry", "running"] {
+                    for priority in [0, 1] {
+                        let mut target =
+                            target(&format!("never-emit-{provider}-{status}-{priority}"));
+                        target.subject.provider = provider.into();
+                        let mut value = State::new(target, priority);
+                        value.status = status.into();
+                        if status != "pending" {
+                            value.retry_at = now - 1;
+                            value.attempts = 1;
+                        }
+                        if status == "running" {
+                            value.claim = Some("expired-owner-claim".into());
+                        }
+                        save(&mut owner, &value).await.unwrap();
+                        originals.insert(value.target.subject.key.clone(), value);
+                    }
+                }
+            }
+            let mut future = State::new(target("never-emit-future-retry"), 1);
+            future.status = "retry".into();
+            future.retry_at = now + 600;
+            save(&mut owner, &future).await.unwrap();
+            let mut disabled = State::new(target("never-emit-disabled-provider"), 1);
+            disabled.target.subject.provider = "crates".into();
+            save(&mut owner, &disabled).await.unwrap();
+            for n in 0..7 {
+                let mut value = State::new(target(&format!("never-emit-blocked-{n}")), 0);
+                value.status = "blocked".into();
+                value.target.subject.namespace = "https://never-emit.example/secret".into();
+                value.failure = Some("never_emit_error_text".into());
+                save(&mut owner, &value).await.unwrap();
+            }
+        }
+        // A real row-lock admission timeout must remain retryable scheduling work.
+        let expected = originals.get("never-emit-rfc-pending-1").unwrap();
+        let mut locked = store.pool.begin().await.unwrap();
+        sqlx_core::query::query("SELECT id FROM devres_attribution_targets WHERE id=$1 FOR UPDATE")
+            .bind(target_id(&expected.target.subject).unwrap())
+            .fetch_one(&mut *locked)
+            .await
+            .unwrap();
+        let enabled = vec!["mdn".into(), "rfc".into(), "mdn".into()];
+        assert_eq!(
+            store
+                .attribution_claim(&enabled, now, 0)
+                .await
+                .unwrap_err()
+                .code,
+            "capacity"
+        );
+        locked.rollback().await.unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for admission in 0..30 {
+            let job = store
+                .attribution_claim(&enabled, now, admission)
+                .await
+                .unwrap()
+                .unwrap();
+            let original = originals
+                .get(&job.target.subject.key)
+                .expect("future/disabled work cannot be admitted");
+            seen.insert((
+                original.target.subject.provider.clone(),
+                original.status.clone(),
+                original.priority,
+            ));
+            assert_eq!(job.attempts, original.attempts + 1);
+            if original.status == "running" {
+                let stale = AttributionJob {
+                    target: original.target.clone(),
+                    claim: original.claim.clone().unwrap(),
+                    attempts: original.attempts,
+                };
+                assert!(
+                    store
+                        .attribution_fail(&stale, None, "stale_owner")
+                        .await
+                        .is_err()
+                );
+            }
+            // Keep every bucket nonempty throughout, including perpetual pending
+            // work with retry_at=0; finite fairness must not depend on draining it.
+            let mut owner = store.owner.lock().await;
+            save(&mut owner, original).await.unwrap();
+        }
+        assert_eq!(
+            seen.len(),
+            12,
+            "both priorities and all provider/status buckets must advance in 15P admissions"
+        );
+        let job = store
+            .attribution_claim(&enabled, now, u64::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        let classification = AttributionFailure::new(
+            AttributionPhase::Acquisition,
+            AttributionFailureReason::UpstreamUnavailable,
+            AttributionDisposition::Retry,
+        );
+        store
+            .attribution_fail_classified(&job, Some(now + 60), "retryable", &classification)
+            .await
+            .unwrap();
+        let row = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
+            .bind(target_id(&job.target.subject).unwrap())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(state(&row).unwrap().classification, Some(classification));
+        let status = store.attribution_status().await.unwrap();
+        let diagnostics = &status["diagnostics"];
+        assert_eq!(diagnostics["sampled"], true);
+        assert!(!diagnostics.to_string().contains("never-emit"));
+        assert!(!diagnostics.to_string().contains("never_emit"));
+        let samples = diagnostics["samples"].as_array().unwrap();
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|s| s["provider"] == "rfc"
+                    && s["status"] == "blocked"
+                    && s["priority"] == 0)
+                .count(),
+            2
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|s| s["classification"]["reason"] == "upstream_unavailable")
+        );
+        assert_eq!(status["progress"]["scope"], "this_store_process");
+        assert_eq!(
+            status["progress"]["providers"]["rfc"]["claimed"]
+                .as_u64()
+                .unwrap_or(0)
+                + status["progress"]["providers"]["mdn"]["claimed"]
+                    .as_u64()
+                    .unwrap_or(0),
+            31
+        );
+        {
+            let mut owner = store.owner.lock().await;
+            for provider in PROVIDERS {
+                for status in ["pending", "retry", "running", "blocked"] {
+                    for priority in [0, 1] {
+                        for index in 0..2 {
+                            let mut value = State::new(
+                                target(&format!("bounded-{provider}-{status}-{priority}-{index}")),
+                                priority,
+                            );
+                            value.target.subject.provider = (*provider).into();
+                            value.target.subject.namespace =
+                                "devres_chromium_evidence/projection-references".into();
+                            value.status = status.into();
+                            value.retry_at = now - 1;
+                            value.attempts = u32::MAX;
+                            value.claim = (status == "running").then(|| "fixture-claim".into());
+                            value.classification = Some(AttributionFailure::new(
+                                AttributionPhase::Qualification,
+                                AttributionFailureReason::UnqualifiedScope,
+                                AttributionDisposition::Blocked,
+                            ));
+                            save(&mut owner, &value).await.unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        let maximum = store.attribution_status().await.unwrap();
+        assert_eq!(maximum["diagnostics"]["truncated"], true);
+        assert!(
+            maximum["diagnostics"]["omitted_sample_rows"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            serde_json::to_vec(&maximum["diagnostics"]["samples"])
+                .unwrap()
+                .len()
+                <= 24 * 1024
+        );
+        assert!(
+            serde_json::to_vec(&maximum).unwrap().len() < 48 * 1024,
+            "leave private RPC envelope headroom"
+        );
+        drop(store);
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "DROP DATABASE {name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable DEVRES_TEST_DATABASE_URL PostgreSQL"]
     async fn attribution_storage_upgrade_claims_sweep_restart_and_integrity() {
@@ -1818,7 +2331,7 @@ mod tests {
         // result; unrelated valid same-provider evidence cannot qualify it.
         let now = devres_domain::unix_now();
         let raw_job = store
-            .attribution_claim(&["rfc".into()], now)
+            .attribution_claim(&["rfc".into()], now, 0)
             .await
             .unwrap()
             .unwrap();
@@ -1919,9 +2432,15 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(store.attribution_claim(&[], now).await.unwrap().is_none());
+        assert!(
+            store
+                .attribution_claim(&[], now, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let old = store
-            .attribution_claim(&["rfc".into()], now)
+            .attribution_claim(&["rfc".into()], now, 0)
             .await
             .unwrap()
             .unwrap();
@@ -1932,13 +2451,13 @@ mod tests {
         store.attribution_enqueue(&first, 255).await.unwrap();
         assert!(
             store
-                .attribution_claim(&["rfc".into()], now)
+                .attribution_claim(&["rfc".into()], now, 0)
                 .await
                 .unwrap()
                 .is_none()
         );
         let current = store
-            .attribution_claim(&["rfc".into()], now + 21)
+            .attribution_claim(&["rfc".into()], now + 21, 0)
             .await
             .unwrap()
             .unwrap();
@@ -1962,7 +2481,7 @@ mod tests {
         let expired = target("expired");
         store.attribution_enqueue(&expired, 1).await.unwrap();
         let expired_job = store
-            .attribution_claim(&["rfc".into()], now - 301)
+            .attribution_claim(&["rfc".into()], now - 301, 0)
             .await
             .unwrap()
             .unwrap();
@@ -1980,8 +2499,8 @@ mod tests {
         store.attribution_enqueue(&second, 1).await.unwrap();
         let enabled = vec!["rfc".into()];
         let (a, b) = tokio::join!(
-            store.attribution_claim(&enabled, now),
-            store.attribution_claim(&enabled, now)
+            store.attribution_claim(&enabled, now, 0),
+            store.attribution_claim(&enabled, now, 0)
         );
         let claimed = a.unwrap().into_iter().chain(b.unwrap()).collect::<Vec<_>>();
         assert_eq!(claimed.len(), 1);
@@ -1989,6 +2508,12 @@ mod tests {
             .attribution_fail(&claimed[0], None, "fixture_done")
             .await
             .unwrap();
+        for key in ["status", "failure", "content-retry", "compat-retry"] {
+            store
+                .mdn_set_state(key, &json!({"at":1,"status":"synthetic"}))
+                .await
+                .unwrap();
+        }
         let key = crate::integrity::hash(b"synthetic-mdn-attribution-row");
         store
             .mdn_put(
@@ -2018,6 +2543,20 @@ mod tests {
             .verify_attribution_storage(&CancellationToken::new())
             .await
             .unwrap();
+        for key in ["status", "failure", "content-retry", "compat-retry"] {
+            store
+                .mdn_set_state(key, &json!({"at":2,"status":"changed"}))
+                .await
+                .unwrap();
+        }
+        for _ in 0..12 {
+            store.attribution_sweep_page("mdn").await.unwrap();
+        }
+        let operational:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_attribution_targets WHERE provider='mdn' AND data#>>'{target,subject,namespace}'='devres_mdn_state' AND data#>>'{target,subject,key}' IN ('status','failure','content-retry','compat-retry')").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(
+            operational, 0,
+            "operational updates must not create attribution occurrences"
+        );
         let large = json!({"synthetic":true,"text":"x".repeat(9*1024*1024)});
         let large_key = crate::integrity::canonical_hash(&large).unwrap();
         store
@@ -2046,18 +2585,52 @@ mod tests {
         let blocked = state(&row).unwrap();
         assert_eq!(blocked.status, "blocked");
         assert_eq!(blocked.failure.as_deref(), Some("oversized_evidence"));
+        store.attribution_enqueue(&oversized, 1).await.unwrap();
+        let mut preserved = blocked.clone();
+        preserved.priority = 1;
+        preserved.attempts = 7;
+        preserved.failure = Some("fixture_preserved".into());
+        {
+            let mut owner = store.owner.lock().await;
+            save(&mut owner, &preserved).await.unwrap();
+        }
+        let mut repeated = false;
+        for _ in 0..12 {
+            repeated |= store
+                .attribution_sweep_page("mdn")
+                .await
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate == &oversized);
+            if repeated {
+                break;
+            }
+        }
+        assert!(
+            repeated,
+            "second sweep must revisit the same retained evidence"
+        );
+        let row = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
+            .bind(target_id(&oversized.subject).unwrap())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded(&state(&row).unwrap()).unwrap(),
+            bounded(&preserved).unwrap()
+        );
         let child = target("durable-dependency");
         let child_generation = generation_for(&child);
         let (parent, parent_generation) = composite(&child, &child_generation, "durable-parent");
         store.attribution_enqueue(&child, 1).await.unwrap();
         let child_job = store
-            .attribution_claim(&["rfc".into()], now)
+            .attribution_claim(&["rfc".into()], now, 0)
             .await
             .unwrap()
             .unwrap();
         store.attribution_enqueue(&parent, 0).await.unwrap();
         let parent_job = store
-            .attribution_claim(&["rfc".into()], now)
+            .attribution_claim(&["rfc".into()], now, 0)
             .await
             .unwrap()
             .unwrap();
@@ -2123,6 +2696,20 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let row = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
+            .bind(target_id(&oversized.subject).unwrap())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded(&state(&row).unwrap()).unwrap(),
+            bounded(&preserved).unwrap()
+        );
+        assert_eq!(
+            store.attribution_status().await.unwrap()["progress"]["providers"],
+            json!({}),
+            "new process-local store counters start empty"
+        );
         // The bootstrap is additive and preserves capture identities and bytes.
         sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control;UPDATE devres_schema SET version=10 WHERE singleton").execute(&store.pool).await.unwrap();
         drop(store);
@@ -2173,7 +2760,7 @@ mod tests {
         assert_eq!(version, 14);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
-            .attribution_claim(&["rfc".into()], now)
+            .attribution_claim(&["rfc".into()], now, 0)
             .await
             .unwrap()
             .unwrap();
@@ -2210,7 +2797,12 @@ mod tests {
         .execute(&store.pool)
         .await
         .unwrap();
-        assert!(store.attribution_claim(&["rfc".into()], now).await.is_err());
+        assert!(
+            store
+                .attribution_claim(&["rfc".into()], now, 0)
+                .await
+                .is_err()
+        );
         assert!(store.attribution_ready(&first.subject).await.is_err());
         assert!(store.attribution_bundle(&qualified.id).await.is_err());
         let original = control();

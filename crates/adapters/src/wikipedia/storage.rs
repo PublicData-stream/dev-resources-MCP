@@ -352,7 +352,7 @@ mod tests {
         assert!(generation.notices[0].text.contains("derived"));
         store.attribution_enqueue(&target, 1).await.unwrap();
         let job = store
-            .attribution_claim(&["wikipedia".into()], devres_domain::unix_now())
+            .attribution_claim(&["wikipedia".into()], devres_domain::unix_now(), 0)
             .await
             .unwrap()
             .unwrap();

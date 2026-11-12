@@ -46,6 +46,7 @@ pub struct AttributionRuntime {
     enabled: Vec<String>,
     wake: Notify,
     sweep_gaps: Mutex<BTreeMap<String, String>>,
+    admission_gap: Mutex<Option<AttributionFailure>>,
     delegate: Option<Arc<dyn crate::acquisition::AcquisitionDelegate>>,
 }
 impl AttributionRuntime {
@@ -66,6 +67,7 @@ impl AttributionRuntime {
             enabled,
             wake: Notify::new(),
             sweep_gaps: Mutex::new(BTreeMap::new()),
+            admission_gap: Mutex::new(None),
             delegate: None,
         })
     }
@@ -87,6 +89,7 @@ impl AttributionRuntime {
     }
     pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
         let mut provider = 0;
+        let mut admission = 0_u64;
         loop {
             // Poll one bounded page per turn, including disabled sources: enumeration
             // is local and never grants permission to acquire their evidence.
@@ -104,11 +107,33 @@ impl AttributionRuntime {
                 }
             }
             provider = (provider + 1) % ATTRIBUTION_PROVIDERS.len();
-            let job = self
-                .store
-                .attribution_claim(&self.enabled, devres_domain::unix_now())
-                .await?;
+            let claim = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(()),
+                result = self.store.attribution_claim(&self.enabled, devres_domain::unix_now(), admission) => result,
+            };
+            let job = match claim {
+                Ok(job) => {
+                    *self.admission_gap.lock().await = None;
+                    job
+                }
+                Err(error) if error.code == "capacity" => {
+                    *self.admission_gap.lock().await = Some(AttributionFailure::new(
+                        AttributionPhase::Scheduling,
+                        AttributionFailureReason::AdmissionDeferred,
+                        AttributionDisposition::Retry,
+                    ));
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(job) = job {
+                admission = admission.wrapping_add(1);
                 let acquisition_cancel = cancel.child_token();
                 let acquisition = self
                     .acquirer
@@ -119,7 +144,9 @@ impl AttributionRuntime {
                     _ = cancel.cancelled() => {
                         acquisition_cancel.cancel();
                         let _ = acquisition.await;
-                        self.store.attribution_fail(&job, Some(devres_domain::unix_now()), "cancelled").await?;
+                        self.store.attribution_fail_classified(&job, Some(devres_domain::unix_now()), "cancelled", &AttributionFailure::new(
+                            AttributionPhase::Acquisition, AttributionFailureReason::Cancelled, AttributionDisposition::Cancelled,
+                        )).await?;
                         return Ok(());
                     },
                     _ = tokio::time::sleep(Duration::from_secs(240)) => {
@@ -144,17 +171,33 @@ impl AttributionRuntime {
                         match self.store.attribution_complete(&job, &generation).await {
                             Ok(()) => {}
                             Err(error) if error.code == "capacity" => {
-                                self.store.attribution_fail(&job, None, "capacity").await?;
+                                self.store
+                                    .attribution_fail_classified(
+                                        &job,
+                                        None,
+                                        "capacity",
+                                        &AttributionFailure::new(
+                                            AttributionPhase::Publication,
+                                            AttributionFailureReason::PayloadBound,
+                                            AttributionDisposition::Blocked,
+                                        ),
+                                    )
+                                    .await?;
                             }
                             Err(error) if error.code == "unavailable" => {
                                 // A canonical alias may still have a fenced lease
                                 // from the previous owner. Preserve this job and
                                 // retry after that lease rather than stopping serving.
                                 self.store
-                                    .attribution_fail(
+                                    .attribution_fail_classified(
                                         &job,
                                         Some(devres_domain::unix_now().saturating_add(300)),
                                         "publication_deferred",
+                                        &AttributionFailure::new(
+                                            AttributionPhase::Publication,
+                                            AttributionFailureReason::PublicationDeferred,
+                                            AttributionDisposition::Retry,
+                                        ),
                                     )
                                     .await?;
                             }
@@ -162,11 +205,11 @@ impl AttributionRuntime {
                         }
                     }
                     Err(error) => {
-                        // Source I/O owns finite HTTP retries. Supervised transient
-                        // repairs remain recoverable after a long upstream outage;
-                        // their durable backoff caps at 1,024 minutes.
-                        let retry =
-                            matches!(error.code.as_str(), "unavailable" | "capacity").then(|| {
+                        let classification = repair_failure(&error);
+                        // HTTP attempts remain owned by source I/O; durable retries
+                        // survive outages without reclassifying deterministic gaps.
+                        let retry = (classification.disposition != AttributionDisposition::Blocked)
+                            .then(|| {
                                 devres_domain::unix_now().saturating_add(
                                     60_i64.saturating_mul(1_i64 << job.attempts.min(10)),
                                 )
@@ -178,7 +221,9 @@ impl AttributionRuntime {
                         } else {
                             "blocked"
                         };
-                        self.store.attribution_fail(&job, retry, code).await?;
+                        self.store
+                            .attribution_fail_classified(&job, retry, code, &classification)
+                            .await?;
                     }
                 }
             }
@@ -190,6 +235,39 @@ impl AttributionRuntime {
             }
         }
     }
+}
+
+fn repair_failure(error: &Error) -> AttributionFailure {
+    if let Some(classification) = AttributionFailure::from_error(error) {
+        return classification;
+    }
+    let (reason, disposition) = match error.code.as_str() {
+        "unavailable" => (
+            AttributionFailureReason::Unclassified,
+            AttributionDisposition::Retry,
+        ),
+        "capacity" => (
+            AttributionFailureReason::Unclassified,
+            AttributionDisposition::Retry,
+        ),
+        "not_found" => (
+            AttributionFailureReason::SourceGone,
+            AttributionDisposition::Blocked,
+        ),
+        "integrity" | "invalid_input" => (
+            AttributionFailureReason::InvalidEvidence,
+            AttributionDisposition::Blocked,
+        ),
+        "cancelled" => (
+            AttributionFailureReason::Cancelled,
+            AttributionDisposition::Cancelled,
+        ),
+        _ => (
+            AttributionFailureReason::Unclassified,
+            AttributionDisposition::Blocked,
+        ),
+    };
+    AttributionFailure::new(AttributionPhase::Acquisition, reason, disposition)
 }
 
 fn current(value: &QualifiedAttribution, subject: &AttributionSubject) -> bool {
@@ -347,9 +425,11 @@ impl AttributionGate for AttributionRuntime {
                 .filter(|p| !self.enabled.iter().any(|e| e == **p))
                 .collect::<Vec<_>>()
         );
+        let admission_gap = *self.admission_gap.lock().await;
+        status["admission_gap"] = json!(admission_gap);
         let gaps = self.sweep_gaps.lock().await;
         status["scan_gaps"] = json!(*gaps);
-        if !gaps.is_empty() {
+        if !gaps.is_empty() || admission_gap.is_some() {
             status["complete"] = json!(false);
             status["repair_complete_for_enqueued_targets"] = json!(false);
         }
