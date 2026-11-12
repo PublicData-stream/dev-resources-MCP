@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::{
     io::Write,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -17,6 +18,25 @@ use tokio_util::sync::CancellationToken;
 #[path = "../support/root.rs"]
 mod root;
 const MARKER: &[u8] = b"devres-chromium-live-v1\n";
+const TOTAL_ATTEMPTS: usize = 20;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiagnosticKind {
+    Validation,
+    CommitDate,
+}
+impl DiagnosticKind {
+    fn attempts(self) -> usize {
+        if self == Self::Validation { 6 } else { 4 }
+    }
+    fn name(self) -> &'static str {
+        if self == Self::Validation {
+            "validation"
+        } else {
+            "commit-date"
+        }
+    }
+}
 fn unavailable() -> Error {
     Error::unavailable("Chromium live evidence unavailable.")
 }
@@ -43,6 +63,7 @@ fn persist(root: &Path, name: &str, value: &Value) -> Result<()> {
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&stage)
         .map_err(|_| unavailable())?;
     serde_json::to_writer_pretty(&mut output, value).map_err(|_| unavailable())?;
@@ -56,15 +77,30 @@ fn persist(root: &Path, name: &str, value: &Value) -> Result<()> {
         .map_err(|_| unavailable())
 }
 fn counted_broker(root: &Path) -> Result<(Arc<BulkBroker>, usize)> {
+    counted_broker_with_invocation_limit(root, None)
+}
+fn attempt_ceiling(initial: usize, invocation: Option<usize>) -> Result<usize> {
+    if initial > TOTAL_ATTEMPTS || invocation.is_some_and(|limit| limit == 0 || limit > 6) {
+        return Err(integrity());
+    }
+    Ok(invocation.map_or(TOTAL_ATTEMPTS, |limit| {
+        initial.saturating_add(limit).min(TOTAL_ATTEMPTS)
+    }))
+}
+fn counted_broker_with_invocation_limit(
+    root: &Path,
+    invocation: Option<usize>,
+) -> Result<(Arc<BulkBroker>, usize)> {
     let path = safe_file(root, "attempt-count")?;
     let initial = match std::fs::read_to_string(path) {
         Ok(s) => s.trim().parse::<usize>().map_err(|_| integrity())?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(_) => return Err(unavailable()),
     };
+    let limit = attempt_ceiling(initial, invocation)?;
     let owned = root.to_owned();
     let broker = BulkBroker::new(BulkConfig::default())?
-        .with_attempt_budget(20)?
+        .with_attempt_budget(limit)?
         .with_attempt_observer(
             initial,
             Arc::new(move |count| {
@@ -126,6 +162,34 @@ async fn selected_revision(
         .cloned()
         .ok_or_else(|| Error::integrity("Fixed Chromium main revision unavailable."))
 }
+async fn selected_commit(
+    source: &ChromiumSource,
+    component: &str,
+    revision: &str,
+    cancel: &CancellationToken,
+    observations: &mut Vec<Value>,
+) -> Result<chromium_source::Commit> {
+    let response = checked(
+        source,
+        &Operation::Commit {
+            component: component.into(),
+            revision: revision.into(),
+        },
+        cancel,
+        observations,
+    )
+    .await?;
+    let resolved = chromium_source::resolve_commit(
+        component,
+        revision,
+        &response.bytes,
+        cancel,
+        |operation| async move { checked(source, &operation, cancel, observations).await },
+    )
+    .await?;
+    Ok(resolved.commit)
+}
+
 async fn directory(
     source: &ChromiumSource,
     component: &str,
@@ -207,7 +271,11 @@ async fn src_record(
     observations: &mut Vec<Value>,
 ) -> Result<Value> {
     let revision = selected_revision(source, "src", cancel, observations).await?;
+    let commit = selected_commit(source, "src", &revision, cancel, observations).await?;
     let root = directory(source, "src", &revision, "", cancel, observations).await?;
+    if root.id != commit.tree {
+        return Err(integrity());
+    }
     let notice = root
         .entries
         .iter()
@@ -307,6 +375,7 @@ async fn site_record(
     .await?;
     let decision = license("site", &terms.bytes, &terms.source_url)?;
     let revision = selected_revision(source, "site", cancel, observations).await?;
+    let _commit = selected_commit(source, "site", &revision, cancel, observations).await?;
     let directory = directory(source, "site", &revision, "site/Home", cancel, observations).await?;
     let member = directory
         .entries
@@ -466,7 +535,243 @@ async fn run(root: &Path) -> Result<Value> {
         json!({"version":1,"complete":all_pass,"primary_components_passed":core_pass,"all_named_components_passed":all_pass,"evidence":"bounded_provider_and_parser","whole_corpus":false,"full_history":false,"transport_acceptance":false,"attempt_limit_total":20,"attempts":broker.attempt_count()-initial,"attempts_before_invocation":initial,"budget_used":broker.attempt_count(),"records":records,"observations":observations,"coverage_gap":"Unexposed post-migration Chrome website revisions remain unavailable; bounded observations are not corpus acceptance."}),
     )
 }
-async fn accept(path: &Path) -> Result<Value> {
+
+fn validation_observation<T>(
+    records: &mut Vec<Value>,
+    component: &str,
+    operation: &str,
+    response: &SourceResponse,
+    selected_oid: Option<&str>,
+    result: Result<T>,
+) -> Result<T> {
+    if selected_oid.is_some_and(|oid| !chromium_source::valid_oid(oid)) {
+        return Err(integrity());
+    }
+    let mut record = json!({
+        "component":component,"operation":operation,"observed_at":response.observed_at,
+        "http_status":response.status,"body_bytes":response.bytes.len(),
+        "body_digest":format!("blake3:{}", blake3::hash(&response.bytes).to_hex()),
+        "success":result.is_ok(),
+        "selected_oid":selected_oid,
+    });
+    if let Err(error) = &result {
+        record["failure"] = if response.status == 200 {
+            chromium_source::validation_diagnostic(error)
+        } else {
+            json!({"reason":"http_status"})
+        };
+    }
+    records.push(record);
+    result
+}
+
+async fn diagnose_component(
+    source: &ChromiumSource,
+    component: &str,
+    cancel: &CancellationToken,
+    records: &mut Vec<Value>,
+    kind: DiagnosticKind,
+    broker: &BulkBroker,
+    initial: usize,
+) -> Result<()> {
+    diagnose_component_with(component, records, kind, cancel, |operation| async move {
+        if broker.attempt_count() >= TOTAL_ATTEMPTS
+            || broker.attempt_count().saturating_sub(initial) >= kind.attempts()
+        {
+            return Err(Error::capacity(
+                "Diagnostic invocation attempt budget exhausted.",
+            ));
+        }
+        source.fetch(&operation, cancel.clone()).await
+    })
+    .await
+}
+
+async fn diagnose_component_with<F, Fut>(
+    component: &str,
+    records: &mut Vec<Value>,
+    kind: DiagnosticKind,
+    cancel: &CancellationToken,
+    mut fetch: F,
+) -> Result<()>
+where
+    F: FnMut(Operation) -> Fut,
+    Fut: std::future::Future<Output = Result<SourceResponse>>,
+{
+    let response = fetch(Operation::CurrentRef {
+        component: component.into(),
+    })
+    .await?;
+    let parsed = if response.status == 200 {
+        chromium_source::parse_refs(component, &response.bytes)
+    } else {
+        Err(Error::unavailable("Fixed Chromium refs unavailable."))
+    };
+    let selected = parsed
+        .as_ref()
+        .ok()
+        .and_then(|refs| refs.get("refs/heads/main").or_else(|| refs.get("HEAD")))
+        .cloned();
+    let refs = validation_observation(
+        records,
+        component,
+        "refs",
+        &response,
+        selected.as_deref(),
+        parsed,
+    )?;
+    let revision = refs
+        .get("refs/heads/main")
+        .or_else(|| refs.get("HEAD"))
+        .ok_or_else(integrity)?;
+    let response = fetch(Operation::Commit {
+        component: component.into(),
+        revision: revision.clone(),
+    })
+    .await?;
+    if kind == DiagnosticKind::CommitDate && response.status == 200 {
+        let detail = commit_date_detail(&response.bytes, revision)?;
+        let result = chromium_source::parse_commit(component, &response.bytes);
+        let _ = validation_observation(
+            records,
+            component,
+            "commit",
+            &response,
+            Some(revision),
+            result,
+        );
+        records.last_mut().ok_or_else(integrity)?["commit_date"] = detail;
+        return Ok(());
+    }
+    let resolved = if response.status == 200 {
+        chromium_source::resolve_commit(component, revision, &response.bytes, cancel, &mut fetch)
+            .await
+    } else {
+        Err(Error::unavailable("Fixed Chromium commit unavailable."))
+    };
+    let resolved = validation_observation(
+        records,
+        component,
+        "commit",
+        &response,
+        Some(revision),
+        resolved,
+    )?;
+    if let Some(proof) = resolved.timestamp_proof {
+        records.last_mut().ok_or_else(integrity)?["timestamp_proof"] =
+            serde_json::to_value(proof).map_err(|_| integrity())?;
+    }
+    let commit = resolved.commit;
+    let response = fetch(Operation::Tree {
+        component: component.into(),
+        revision: revision.clone(),
+        path: String::new(),
+    })
+    .await?;
+    let parsed = if response.status == 200 {
+        chromium_source::parse_tree(component, &response.bytes).and_then(|tree| {
+            if tree.id == commit.tree {
+                Ok(tree)
+            } else {
+                Err(integrity())
+            }
+        })
+    } else {
+        Err(Error::unavailable("Fixed Chromium root tree unavailable."))
+    };
+    validation_observation(
+        records,
+        component,
+        "root_tree",
+        &response,
+        Some(&commit.tree),
+        parsed,
+    )?;
+    Ok(())
+}
+
+/// Private operator-only scalar. Never copy commit messages, identities or response bodies.
+fn commit_date_detail(bytes: &[u8], selected: &str) -> Result<Value> {
+    if !chromium_source::valid_oid(selected) {
+        return Err(integrity());
+    }
+    let data = chromium_source::json(bytes)?;
+    if data["commit"].as_str() != Some(selected) {
+        return Err(integrity());
+    }
+    let date = data["committer"]["time"].as_str().ok_or_else(integrity)?;
+    if date.is_empty()
+        || date.len() > 128
+        || !date
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b" +-:.,/()".contains(&byte))
+    {
+        return Err(Error::integrity(
+            "Commit date scalar exceeds its private diagnostic shape.",
+        ));
+    }
+    let fields = date
+        .split_ascii_whitespace()
+        .map(str::len)
+        .collect::<Vec<_>>();
+    if fields.len() > 16 {
+        return Err(integrity());
+    }
+    Ok(
+        json!({"scalar":date,"bytes":date.len(),"token_lengths":fields,
+        "shape":if date.as_bytes().get(4)==Some(&b'-') { "iso_candidate" } else { "gitiles_calendar_candidate" }}),
+    )
+}
+
+async fn diagnose(root: &Path, kind: DiagnosticKind, component: Option<&str>) -> Result<Value> {
+    let (broker, initial) = counted_broker_with_invocation_limit(root, Some(kind.attempts()))?;
+    let source = ChromiumSource::new(broker.clone())?;
+    let cancel = CancellationToken::new();
+    let mut records = Vec::new();
+    let mut components = Vec::new();
+    let selected: &[&str] = match component {
+        None => &["src", "site"],
+        Some("src") => &["src"],
+        Some("site") => &["site"],
+        _ => return Err(integrity()),
+    };
+    for component in selected {
+        let result = diagnose_component(
+            &source,
+            component,
+            &cancel,
+            &mut records,
+            kind,
+            &broker,
+            initial,
+        )
+        .await;
+        components.push(json!({"component":component,"success":result.is_ok(),"code":result.as_ref().err().map(|error| devres_application::collection::safe_code(&error.code))}));
+        persist(
+            root,
+            &format!("{}-progress.json", kind.name()),
+            &json!({"records":records,"components":components,"budget_used":broker.attempt_count()}),
+        )?;
+    }
+    let used = broker.attempt_count();
+    if used < initial || used > TOTAL_ATTEMPTS || used - initial > kind.attempts() {
+        return Err(integrity());
+    }
+    Ok(
+        json!({"version":1,"complete":components.iter().all(|component| component["success"]==true),
+        "evidence":if kind == DiagnosticKind::Validation { "bounded_metadata_validation_diagnostic" } else { "bounded_private_commit_date_diagnostic" },"attempt_limit_total":TOTAL_ATTEMPTS,
+        "attempt_limit_per_invocation":kind.attempts(),"attempts_before_invocation":initial,"selected_component":component,
+        "attempts":broker.attempt_count()-initial,"budget_used":broker.attempt_count(),
+        "records":records,"components":components,"retained_bodies":false,
+        "whole_corpus":false,"full_history":false,"production_recovery":false}),
+    )
+}
+
+async fn accept(
+    path: &Path,
+    diagnostic: Option<DiagnosticKind>,
+    component: Option<&str>,
+) -> Result<Value> {
     let root = root::owned_root(path, MARKER)?;
     let lock_path = safe_file(&root, "live.lock")?;
     let lock = std::fs::OpenOptions::new()
@@ -479,13 +784,29 @@ async fn accept(path: &Path) -> Result<Value> {
     fs2::FileExt::try_lock_exclusive(&lock)
         .map_err(|_| Error::capacity("Chromium live acceptance already owns this root."))?;
     let receipt_path = safe_file(&root, "live-receipt.json")?;
-    if receipt_path.try_exists().map_err(|_| unavailable())? {
+    if diagnostic.is_none() && receipt_path.try_exists().map_err(|_| unavailable())? {
         return Err(Error::invalid(
             "Chromium live receipt already exists; use a new owned root.",
         ));
     }
-    let receipt = run(&root).await?;
-    persist(&root, "live-receipt.json", &receipt)?;
+    let receipt = if let Some(kind) = diagnostic {
+        diagnose(&root, kind, component).await?
+    } else {
+        run(&root).await?
+    };
+    if let Some(kind) = diagnostic {
+        persist_immutable(
+            &root,
+            &format!(
+                "{}-receipt-{}.json",
+                kind.name(),
+                receipt["budget_used"].as_u64().ok_or_else(integrity)?
+            ),
+            &receipt,
+        )?;
+    } else {
+        persist(&root, "live-receipt.json", &receipt)?;
+    }
     Ok(receipt)
 }
 fn read_record(root: &Path, name: &str) -> Result<(Vec<u8>, Value)> {
@@ -567,6 +888,7 @@ fn persist_immutable(root: &Path, name: &str, value: &Value) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&stage)
         .map_err(|_| unavailable())?;
     file.write_all(&bytes)
@@ -694,18 +1016,54 @@ async fn replay(path: &Path) -> Result<Value> {
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    if args.len() != 3 || (args[1] != "--live" && args[1] != "--replay") {
-        eprintln!("usage: chromium-live-probe --live|--replay OWNED_ROOT");
+    if !matches!(args.len(), 3 | 5)
+        || (args[1] != "--live"
+            && args[1] != "--replay"
+            && args[1] != "--diagnose-validation"
+            && args[1] != "--diagnose-commit-date")
+    {
+        eprintln!(
+            "usage: chromium-live-probe --live|--replay|--diagnose-validation|--diagnose-commit-date OWNED_ROOT [--component src|site]"
+        );
         std::process::exit(2);
     }
+    let component = if args.len() == 5 {
+        if args[3] != "--component"
+            || !matches!(
+                args[1].to_str(),
+                Some("--diagnose-validation" | "--diagnose-commit-date")
+            )
+            || !matches!(args[4].to_str(), Some("src" | "site"))
+        {
+            eprintln!("diagnostic component must be src or site");
+            std::process::exit(2);
+        }
+        args[4].to_str()
+    } else {
+        None
+    };
     let result = if args[1] == "--replay" {
         replay(Path::new(&args[2])).await
     } else {
-        accept(Path::new(&args[2])).await
+        let diagnostic = if args[1] == "--diagnose-validation" {
+            Some(DiagnosticKind::Validation)
+        } else if args[1] == "--diagnose-commit-date" {
+            Some(DiagnosticKind::CommitDate)
+        } else {
+            None
+        };
+        accept(Path::new(&args[2]), diagnostic, component).await
     };
     match result {
         Ok(receipt) => {
-            println!("{}", receipt);
+            if args[1] == "--diagnose-commit-date" {
+                println!(
+                    "{}",
+                    json!({"complete":receipt["complete"],"evidence":receipt["evidence"],"attempts":receipt["attempts"],"budget_used":receipt["budget_used"],"private_date_details_retained":true})
+                );
+            } else {
+                println!("{}", receipt);
+            }
             if receipt["complete"] != true {
                 std::process::exit(1);
             }
@@ -720,7 +1078,198 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn diagnostic_attempt_caps_preserve_total_and_invocation_budgets() {
+        assert_eq!(attempt_ceiling(4, Some(6)).unwrap(), 10);
+        assert_eq!(attempt_ceiling(4, Some(4)).unwrap(), 8);
+        assert_eq!(attempt_ceiling(18, Some(6)).unwrap(), 20);
+        assert_eq!(attempt_ceiling(20, Some(4)).unwrap(), 20);
+        assert!(attempt_ceiling(21, Some(4)).is_err());
+        assert!(attempt_ceiling(4, Some(0)).is_err());
+        assert!(attempt_ceiling(4, Some(7)).is_err());
+    }
+
+    #[tokio::test]
+    async fn scoped_validation_shares_raw_proof_and_finishes_with_four_fixed_operations() {
+        let tree = chromium_source::object_oid("tree", b"");
+        let raw = format!(
+            "tree {tree}\nauthor Inert <inert.invalid> 0 +0000\ncommitter Private Synthetic <private-email.invalid> 1794502830 -0700\n\nprivate inert message\n"
+        );
+        let revision = chromium_source::object_oid("commit", raw.as_bytes());
+        let refs = serde_json::to_vec(&json!({"value":revision})).unwrap();
+        let commit=serde_json::to_vec(&json!({"commit":revision,"tree":tree,"parents":[],"committer":{"time":"Thu Nov 12 17:00:30 2026"}})).unwrap();
+        let directory = serde_json::to_vec(&json!({"id":tree,"entries":[]})).unwrap();
+        let proof = STANDARD.encode(raw).into_bytes();
+        let operations = std::sync::Mutex::new(Vec::new());
+        let mut records = Vec::new();
+        diagnose_component_with(
+            "src",
+            &mut records,
+            DiagnosticKind::Validation,
+            &CancellationToken::new(),
+            |operation| {
+                operations.lock().unwrap().push(operation.clone());
+                let bytes = match operation {
+                    Operation::CurrentRef { component } => {
+                        assert_eq!(component, "src");
+                        refs.clone()
+                    }
+                    Operation::Commit {
+                        revision: selected, ..
+                    } => {
+                        assert_eq!(selected, revision);
+                        commit.clone()
+                    }
+                    Operation::RawCommit {
+                        revision: selected, ..
+                    } => {
+                        assert_eq!(selected, revision);
+                        proof.clone()
+                    }
+                    Operation::Tree {
+                        revision: selected,
+                        path,
+                        ..
+                    } => {
+                        assert_eq!(selected, revision);
+                        assert!(path.is_empty());
+                        directory.clone()
+                    }
+                    _ => panic!("unexpected diagnostic operation"),
+                };
+                std::future::ready(Ok(SourceResponse {
+                    status: 200,
+                    bytes,
+                    observed_at: 42,
+                    source_url: "https://untrusted.invalid/private-source".into(),
+                    next: None,
+                    retry_at: None,
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(operations.lock().unwrap().len(), 4);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1]["timestamp_proof"]["selected_oid"], revision);
+        assert_eq!(records[1]["timestamp_proof"]["epoch"], 1_794_502_830i64);
+        assert_eq!(records[2]["operation"], "root_tree");
+        assert!(records.iter().all(|record| record["success"] == true));
+        assert!(!serde_json::to_string(&records).unwrap().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn private_commit_date_probe_stops_before_tree_and_keeps_only_bounded_scalar() {
+        let revision = "ab".repeat(20);
+        let date = "Thu Nov 12 17:11:22 2026 +0000";
+        let refs = serde_json::to_vec(&json!({"value":revision})).unwrap();
+        let commit = serde_json::to_vec(&json!({"commit":revision,"tree":"cd".repeat(20),"parents":[],
+            "committer":{"time":date,"name":"private-name","email":"private-email"},"message":"private-message"})).unwrap();
+        let operations = std::sync::Mutex::new(Vec::new());
+        let mut records = Vec::new();
+        diagnose_component_with(
+            "site",
+            &mut records,
+            DiagnosticKind::CommitDate,
+            &CancellationToken::new(),
+            |operation| {
+                operations.lock().unwrap().push(operation.clone());
+                let bytes = match operation {
+                    Operation::CurrentRef { .. } => refs.clone(),
+                    Operation::Commit {
+                        revision: selected, ..
+                    } => {
+                        assert_eq!(selected, revision);
+                        commit.clone()
+                    }
+                    _ => panic!("date diagnosis must not fetch tree or blob"),
+                };
+                std::future::ready(Ok(SourceResponse {
+                    status: 200,
+                    bytes,
+                    observed_at: 42,
+                    source_url: "https://untrusted.invalid/private-source".into(),
+                    next: None,
+                    retry_at: None,
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(operations.lock().unwrap().len(), 2);
+        assert_eq!(records[1]["commit_date"]["scalar"], date);
+        assert_eq!(records[1]["selected_oid"], revision);
+        assert!(!serde_json::to_string(&records).unwrap().contains("private"));
+        let malicious = serde_json::to_vec(&json!({"commit":revision,"committer":{"time":"<script>arbitrary source text</script>"}})).unwrap();
+        assert!(commit_date_detail(&malicious, &revision).is_err());
+        assert!(commit_date_detail(&commit, &"ff".repeat(20)).is_err());
+    }
+    #[tokio::test]
+    async fn validation_diagnostic_stops_at_exact_failed_operation_without_retaining_text() {
+        let revision = "56".repeat(20);
+        let commit = serde_json::to_vec(
+            &json!({"commit":revision,"tree":"78".repeat(20),"parents":[],
+            "committer":{"time":"private-invalid-date"},"message":"unqualified-private-body"}),
+        )
+        .unwrap();
+        let refs = serde_json::to_vec(&json!({"value":revision})).unwrap();
+        let operations = std::sync::Mutex::new(Vec::new());
+        let mut records = Vec::new();
+        let error = diagnose_component_with(
+            "src",
+            &mut records,
+            DiagnosticKind::Validation,
+            &CancellationToken::new(),
+            |operation| {
+                operations.lock().unwrap().push(operation.clone());
+                let bytes = match operation {
+                    Operation::CurrentRef { component } => {
+                        assert_eq!(component, "src");
+                        refs.clone()
+                    }
+                    Operation::Commit {
+                        component,
+                        revision: selected,
+                    } => {
+                        assert_eq!(component, "src");
+                        assert_eq!(selected, revision);
+                        commit.clone()
+                    }
+                    _ => panic!("diagnosis fetched beyond the rejected commit"),
+                };
+                std::future::ready(Ok(SourceResponse {
+                    status: 200,
+                    bytes,
+                    observed_at: 42,
+                    source_url: "https://untrusted.invalid/private-path".into(),
+                    next: None,
+                    retry_at: None,
+                }))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "integrity");
+        assert_eq!(operations.lock().unwrap().len(), 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["operation"], "commit");
+        assert_eq!(records[1]["selected_oid"], revision);
+        assert_eq!(records[1]["failure"]["reason"], "commit_date");
+        assert!(
+            records[1]["body_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("blake3:")
+        );
+        assert!(!serde_json::to_string(&records).unwrap().contains("private"));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.get("source_url").is_none())
+        );
+    }
     #[test]
     fn current_and_archived_license_terms_are_distinct() {
         let current = b"<footer>Except as otherwise noted, the content of this page is licensed under the <a href='https://creativecommons.org/licenses/by/4.0/'>Creative Commons Attribution 4.0 License</a>, and code samples are licensed under the <a href='https://www.apache.org/licenses/LICENSE-2.0'>Apache 2.0 License</a>.</footer>";

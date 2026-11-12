@@ -1,3 +1,4 @@
+use super::diagnostics::Step;
 use super::*;
 use devres_application::collection::{
     CollectorStatus, LimitKind, Phase, ProgressKind, at_phase, http_failure, limited,
@@ -366,16 +367,42 @@ impl ChromiumCorpus {
             let mut parsed = if absent_optional {
                 BTreeMap::new()
             } else {
-                source::parse_refs(component, &response.bytes)
-                    .map_err(|error| at_phase(error, Phase::SourceValidation))
-                    .inspect_err(|error| collection_failure("source_validation", error))?
+                self.validate_source(
+                    (
+                        component,
+                        if namespace.is_none() {
+                            "current"
+                        } else {
+                            "history"
+                        },
+                    ),
+                    Step::Refs,
+                    &response,
+                    None,
+                    source::parse_refs(component, &response.bytes),
+                )
+                .await
+                .inspect_err(|error| collection_failure("source_validation", error))?
             };
             let tags = if absent_optional {
                 BTreeMap::new()
             } else {
-                source::annotated_tags(component, &response.bytes)
-                    .map_err(|error| at_phase(error, Phase::SourceValidation))
-                    .inspect_err(|error| collection_failure("source_validation", error))?
+                self.validate_source(
+                    (
+                        component,
+                        if namespace.is_none() {
+                            "current"
+                        } else {
+                            "history"
+                        },
+                    ),
+                    Step::AnnotatedTags,
+                    &response,
+                    None,
+                    source::annotated_tags(component, &response.bytes),
+                )
+                .await
+                .inspect_err(|error| collection_failure("source_validation", error))?
             };
             for (name, original) in tags {
                 let mut revision = original.clone();
@@ -393,8 +420,22 @@ impl ChromiumCorpus {
                     if response.status != 200 {
                         return Err(Error::unavailable("Chromium annotated tag is unavailable."));
                     }
-                    let tag = source::parse_tag(component, &response.bytes)
-                        .map_err(|error| at_phase(error, Phase::SourceValidation))
+                    let tag = self
+                        .validate_source(
+                            (
+                                component,
+                                if namespace.is_none() {
+                                    "current"
+                                } else {
+                                    "history"
+                                },
+                            ),
+                            Step::Tag,
+                            &response,
+                            Some(&revision),
+                            source::parse_tag(component, &response.bytes),
+                        )
+                        .await
                         .inspect_err(|error| collection_failure("source_validation", error))?;
                     if tag.revision != revision {
                         return Err(Error::integrity(
@@ -503,12 +544,13 @@ impl ChromiumCorpus {
     }
     async fn directory(
         &self,
-        component: &str,
+        context: (&str, &str),
         revision: &str,
         path: &str,
         tree: &str,
         cancel: CancellationToken,
     ) -> Result<TreeHeader> {
+        let (component, _) = context;
         if let Some(retained) = self.store.chromium_get("trees", tree).await? {
             return decode(retained.data);
         }
@@ -531,14 +573,27 @@ impl ChromiumCorpus {
                 "Chromium historical directory is unavailable.",
             ));
         }
-        let directory: Directory = source::parse_tree(component, &response.bytes)
-            .map_err(|error| at_phase(error, Phase::SourceValidation))
+        let directory: Directory = self
+            .validate_source(
+                context,
+                Step::Tree,
+                &response,
+                Some(tree),
+                source::parse_tree(component, &response.bytes).and_then(|directory| {
+                    if directory.id == tree {
+                        Ok(directory)
+                    } else {
+                        Err(source::validation(
+                            Error::integrity(
+                                "Chromium selected directory differs from its tree identity.",
+                            ),
+                            source::ValidationReason::SelectedIdentity,
+                        ))
+                    }
+                }),
+            )
+            .await
             .inspect_err(|error| collection_failure("source_validation", error))?;
-        if directory.id != tree {
-            return Err(Error::integrity(
-                "Chromium selected directory differs from its tree identity.",
-            ));
-        }
         let mut pages = Vec::new();
         for chunk in directory.entries.chunks(500) {
             let data = encode(&chunk)?;
@@ -583,12 +638,13 @@ impl ChromiumCorpus {
     }
     async fn blob(
         &self,
-        component: &str,
+        context: (&str, &str),
         revision: &str,
         path: &str,
         oid: &str,
         cancel: CancellationToken,
     ) -> Result<(Vec<u8>, String)> {
+        let (component, _) = context;
         let response = self
             .request(
                 &Operation::Blob {
@@ -602,20 +658,28 @@ impl ChromiumCorpus {
         if response.status != 200 {
             return Err(Error::not_found("Chromium document body is unavailable."));
         }
-        let bytes = source::decode_blob(component, &response.bytes, oid)
-            .map_err(|error| at_phase(error, Phase::SourceValidation))
+        let bytes = self
+            .validate_source(
+                context,
+                Step::Blob,
+                &response,
+                Some(oid),
+                source::decode_blob(component, &response.bytes, oid),
+            )
+            .await
             .inspect_err(|error| collection_failure("source_validation", error))?;
         Ok((bytes, response.source_url))
     }
     async fn local_license(
         &self,
-        component: &str,
+        context: (&str, &str),
         revision: &str,
         path: &str,
         header: &TreeHeader,
         parent: &Value,
         cancel: CancellationToken,
     ) -> Result<Value> {
+        let (component, lane) = context;
         // An uninspectable governing notice cannot be overridden by inheriting
         // some other convenient terms while traversing the same affected scope.
         if parent["gap"] == "unsupported_notice_path" {
@@ -655,7 +719,13 @@ impl ChromiumCorpus {
                 continue;
             }
             let (bytes, url) = self
-                .blob(component, revision, &full, &entry.oid, cancel.clone())
+                .blob(
+                    (component, lane),
+                    revision,
+                    &full,
+                    &entry.oid,
+                    cancel.clone(),
+                )
                 .await?;
             license = match std::str::from_utf8(&bytes) {
                 Ok(text) => licensing::qualify(component, text, &url),
@@ -692,6 +762,7 @@ impl ChromiumCorpus {
     }
     async fn site_license(
         &self,
+        lane: &str,
         revision: &str,
         root: &TreeHeader,
         cancel: CancellationToken,
@@ -715,7 +786,7 @@ impl ChromiumCorpus {
             };
             path = join_path(&path, name);
             header = self
-                .directory("site", revision, &path, &entry.oid, cancel.clone())
+                .directory(("site", lane), revision, &path, &entry.oid, cancel.clone())
                 .await?;
         }
         // Check all possible governing footer names before accepting an earlier
@@ -762,7 +833,7 @@ impl ChromiumCorpus {
                     return Ok(row.data);
                 }
                 let (bytes, url) = self
-                    .blob("site", revision, &full, &entry.oid, cancel.clone())
+                    .blob(("site", lane), revision, &full, &entry.oid, cancel.clone())
                     .await?;
                 let Ok(text) = std::str::from_utf8(&bytes) else {
                     continue;
@@ -787,11 +858,12 @@ impl ChromiumCorpus {
     }
     async fn begin_work(
         &self,
-        component: &str,
+        context: (&str, &str),
         revision: &str,
         observed_at: i64,
         cancel: CancellationToken,
     ) -> Result<Option<Work>> {
+        let (component, lane) = context;
         let key = job_key(component, revision);
         let retained = match self.store.chromium_get("commits", &key).await? {
             Some(row) => Some(row),
@@ -807,7 +879,21 @@ impl ChromiumCorpus {
                     "Chromium retained commit component mismatch.",
                 ));
             }
-            decode(row.data["commit"].clone())?
+            let commit: Commit = decode(row.data["commit"].clone())?;
+            if let Some(proof) = row
+                .data
+                .get("timestamp_proof")
+                .filter(|value| !value.is_null())
+            {
+                if !matches!(component, "src" | "site") {
+                    return Err(Error::integrity("Invalid raw timestamp proof component."));
+                }
+                let proof: source::RawTimestampProof = decode(proof.clone())?;
+                proof
+                    .validate(&commit)
+                    .map_err(|error| at_phase(error, Phase::ArtifactVerification))?;
+            }
+            commit
         } else {
             let response = self
                 .request(
@@ -825,13 +911,26 @@ impl ChromiumCorpus {
                     .await?;
                 return Ok(None);
             }
-            let commit = source::parse_commit(component, &response.bytes)
-                .map_err(|error| at_phase(error, Phase::SourceValidation))
+            let proof_cancel = cancel.clone();
+            let resolved = source::resolve_commit(
+                component,
+                revision,
+                &response.bytes,
+                &cancel,
+                |operation| async move { self.request(&operation, proof_cancel).await },
+            )
+            .await;
+            let resolved = self
+                .validate_source(context, Step::Commit, &response, Some(revision), resolved)
+                .await
                 .inspect_err(|error| collection_failure("source_validation", error))?;
-            if commit.revision != revision {
-                return Err(Error::integrity("Chromium commit identity mismatch."));
+            let commit = resolved.commit;
+            let mut evidence = json!({"component":component,"repository":component_base(component)?,"commit":commit,"source_url":response.source_url,"verification":"https_metadata"});
+            if let Some(proof) = resolved.timestamp_proof {
+                evidence["timestamp_proof"] = encode(&proof)?;
+                evidence["verification"] = json!("https_metadata_with_raw_commit_timestamp");
             }
-            self.store.chromium_put("commits",&key,&json!({"component":component,"repository":component_base(component)?,"commit":commit,"source_url":response.source_url,"verification":"https_metadata"})).await?;
+            self.store.chromium_put("commits", &key, &evidence).await?;
             commit
         };
         if commit.revision != revision {
@@ -843,15 +942,22 @@ impl ChromiumCorpus {
             self.enqueue(component, parent).await?;
         }
         let root = self
-            .directory(component, revision, "", &commit.tree, cancel.clone())
+            .directory(
+                (component, lane),
+                revision,
+                "",
+                &commit.tree,
+                cancel.clone(),
+            )
             .await?;
         let inherited = if component == "site" {
-            self.site_license(revision, &root, cancel.clone()).await?
+            self.site_license(lane, revision, &root, cancel.clone())
+                .await?
         } else {
             licensing::unresolved(component, "")
         };
         let license = self
-            .local_license(component, revision, "", &root, &inherited, cancel)
+            .local_license((component, lane), revision, "", &root, &inherited, cancel)
             .await?;
         let inventory = inventory::empty(self.store.as_ref()).await?;
         Ok(Some(Work {
@@ -877,13 +983,14 @@ impl ChromiumCorpus {
     }
     async fn retain_member(
         &self,
-        component: &str,
+        context: (&str, &str),
         revision: &str,
         path: &str,
         entry: &Entry,
         license: &Value,
         cancel: CancellationToken,
     ) -> Result<Member> {
+        let (component, lane) = context;
         let mut member = Member {
             path: path.into(),
             oid: entry.oid.clone(),
@@ -912,7 +1019,13 @@ impl ChromiumCorpus {
             return decode(row.data);
         }
         let (bytes, url) = match self
-            .blob(component, revision, path, &entry.oid, cancel.clone())
+            .blob(
+                (component, lane),
+                revision,
+                path,
+                &entry.oid,
+                cancel.clone(),
+            )
             .await
         {
             Ok(value) => value,
@@ -986,7 +1099,7 @@ impl ChromiumCorpus {
         let mut work: Work = match self.store.chromium_state(&checkpoint).await? {
             Some(value) => decode(value)?,
             None => match self
-                .begin_work(component, revision, observed_at, cancel.clone())
+                .begin_work((component, lane), revision, observed_at, cancel.clone())
                 .await?
             {
                 Some(work) => work,
@@ -1038,7 +1151,7 @@ impl ChromiumCorpus {
             }
             let header = self
                 .directory(
-                    component,
+                    (component, lane),
                     revision,
                     &frame.path,
                     &frame.tree,
@@ -1125,11 +1238,17 @@ impl ChromiumCorpus {
             }
             if entry.kind == "tree" {
                 let header = self
-                    .directory(component, revision, &path, &entry.oid, cancel.clone())
+                    .directory(
+                        (component, lane),
+                        revision,
+                        &path,
+                        &entry.oid,
+                        cancel.clone(),
+                    )
                     .await?;
                 let license = self
                     .local_license(
-                        component,
+                        (component, lane),
                         revision,
                         &path,
                         &header,
@@ -1154,7 +1273,7 @@ impl ChromiumCorpus {
                 work.processed_members += 1;
                 let member = self
                     .retain_member(
-                        component,
+                        (component, lane),
                         revision,
                         &path,
                         &entry,
@@ -1450,8 +1569,15 @@ impl ChromiumCorpus {
                             "Chromium sitemap inventory is unavailable.",
                         ));
                     }
-                    let (maps, pages) = sitemap_locations(&response.bytes)
-                        .map_err(|error| at_phase(error, Phase::SourceValidation))
+                    let (maps, pages) = self
+                        .validate_source(
+                            ("chrome", "current"),
+                            Step::Sitemap,
+                            &response,
+                            None,
+                            sitemap_locations(&response.bytes),
+                        )
+                        .await
                         .inspect_err(|error| collection_failure("source_validation", error))?;
                     for path in maps {
                         let id = inventory::digest(format!("{}:{path}", work.id).as_bytes());
@@ -3806,6 +3932,422 @@ mod collector_regressions {
         );
         server.abort();
     }
+    async fn published_src_fixture() -> (tempfile::TempDir, Arc<super::super::tests::Memory>, Value)
+    {
+        let revision = "45".repeat(20);
+        let files = [
+            ("LICENSE", super::tests::BSD),
+            (
+                "docs/guide.md",
+                "# Qualified inert guide\nPreviousPublicationToken",
+            ),
+        ];
+        let (broker, seed_server, commit) = fixture_source(&files, &revision).await;
+        let (root, store, corpus) = super::super::tests::corpus_fixture(broker).await;
+        seed_legacy_root(&corpus, &revision, &commit).await;
+        for _ in 0..4 {
+            corpus
+                .current_component_step(
+                    "src",
+                    true,
+                    devres_domain::unix_now(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            if store.chromium_state("default").await.unwrap().is_some() {
+                break;
+            }
+        }
+        let previous = store.chromium_state("default").await.unwrap().unwrap();
+        assert!(previous["snapshots"]["src"].is_string());
+        drop(corpus);
+        seed_server.abort();
+        (root, store, previous)
+    }
+    #[tokio::test]
+    async fn acquisition_status_failures_do_not_parse_or_replace_a_published_default() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let (root, store, previous) = published_src_fixture().await;
+        for (status, retry_after, component, offset, host, phase, http_status, attempts) in [
+            // The broker owns one bounded transient retry. Its second 500 response
+            // reaches the collector, retaining the exact HTTP status.
+            (
+                500,
+                "0",
+                "chrome",
+                2,
+                "developer.chrome.com",
+                Phase::PublicationAcquisition,
+                Some(500),
+                2,
+            ),
+            // A delay above the broker's five-second inline limit returns before
+            // SourceResponse construction; preserve that inner acquisition phase.
+            (
+                500,
+                "120",
+                "chrome",
+                2,
+                "developer.chrome.com",
+                Phase::HttpAcquisition,
+                None,
+                1,
+            ),
+            // Chromium's typed 403 policy returns a host deferral without retrying.
+            (
+                403,
+                "120",
+                "chrome-archive",
+                3,
+                "api.github.com",
+                Phase::PublicationAcquisition,
+                Some(403),
+                1,
+            ),
+        ] {
+            let responses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let sent = responses.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().fallback(axum::routing::get(move || {
+                        let sent = sent.clone();
+                        async move {
+                            sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            (
+                                axum::http::StatusCode::from_u16(status).unwrap(),
+                                [("retry-after", retry_after)],
+                                "malformed-private-response",
+                            )
+                        }
+                    })),
+                )
+                .await
+                .unwrap();
+            });
+            let broker = Arc::new(
+                BulkBroker::fixture(format!("http://{address}").parse().unwrap()).unwrap(),
+            );
+            let corpus = ChromiumCorpus::new(
+                store.clone(),
+                broker.clone(),
+                root.path(),
+                ChromiumConfig {
+                    enabled: false,
+                    min_free_bytes: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            store
+                .chromium_set_state(&scheduling_key("current-offset"), &json!(offset))
+                .await
+                .unwrap();
+            let error = corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .unwrap_err();
+            let context = devres_application::collection::context(&error).unwrap();
+            assert_eq!(context.phase, phase);
+            assert_eq!(context.http_status, http_status);
+            assert_eq!(error.code, "unavailable");
+            assert_eq!(broker.attempt_count(), attempts);
+            assert_eq!(
+                responses.load(std::sync::atomic::Ordering::SeqCst),
+                attempts
+            );
+            assert!(
+                store
+                    .chromium_rows("validation-failures", 0, 1, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store.chromium_state("default").await.unwrap(),
+                Some(previous.clone())
+            );
+            let status_record = corpus.collector_status(component, "current").await.unwrap();
+            let failure = status_record.failure.unwrap();
+            assert_eq!(failure.phase, phase);
+            assert_eq!(failure.http_status, http_status);
+            assert!(status_record.retry_at.unwrap() > devres_domain::unix_now());
+            if status == 403 {
+                let deferred = store
+                    .chromium_state(&state_key("deferred", host))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(deferred["retry_at"].as_i64().unwrap() > devres_domain::unix_now());
+                store
+                    .chromium_set_state(&scheduling_key("current-offset"), &json!(offset))
+                    .await
+                    .unwrap();
+                corpus
+                    .collect_current_once(CancellationToken::new())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    broker.attempt_count(),
+                    1,
+                    "host deferral owns the next attempt"
+                );
+                assert_eq!(responses.load(std::sync::atomic::Ordering::SeqCst), 1);
+            } else {
+                assert!(
+                    store
+                        .chromium_state(&state_key("deferred", host))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn verified_raw_timestamp_publishes_and_reuses_only_safe_retained_proof() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let (root, store, previous) = published_src_fixture().await;
+        let old = store
+            .chromium_get("commits", &legacy_job_key("src", &"45".repeat(20)))
+            .await
+            .unwrap()
+            .unwrap();
+        let tree = old.data["commit"]["tree"].as_str().unwrap();
+        let raw = format!(
+            "tree {tree}\nauthor Inert <inert.invalid> 0 +0000\ncommitter Private Synthetic <private-email.invalid> 1794495630 -0700\n\nprivate inert message\n"
+        );
+        let selected = source::object_oid("commit", raw.as_bytes());
+        let encoded = STANDARD.encode(raw).into_bytes();
+        let metadata=serde_json::to_vec(&json!({"commit":selected,"tree":tree,"parents":[],"committer":{"time":"Thu Nov 12 17:00:30 2026"}})).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(axum::routing::get(
+                    move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri| {
+                        let encoded = encoded.clone();
+                        let metadata = metadata.clone();
+                        let sent = sent.clone();
+                        async move {
+                            sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            (
+                                axum::http::StatusCode::OK,
+                                if uri.query() == Some("format=TEXT") {
+                                    encoded
+                                } else {
+                                    metadata
+                                },
+                            )
+                        }
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        });
+        let broker =
+            Arc::new(BulkBroker::fixture(format!("http://{address}").parse().unwrap()).unwrap());
+        let corpus = ChromiumCorpus::new(
+            store.clone(),
+            broker.clone(),
+            root.path(),
+            ChromiumConfig {
+                enabled: false,
+                min_free_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let retained_bytes = corpus.raw.accounted_bytes();
+        store
+            .chromium_set_state(
+                &state_key("current-root", "src"),
+                &json!({"revision":selected,"observed_at":devres_domain::unix_now()}),
+            )
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            store
+                .chromium_set_state(&scheduling_key("current-offset"), &json!(0))
+                .await
+                .unwrap();
+            corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .unwrap();
+            if store
+                .chromium_state("default")
+                .await
+                .unwrap()
+                .as_ref()
+                .is_some_and(|value| value["id"] != previous["id"])
+            {
+                break;
+            }
+        }
+        let current = store.chromium_state("default").await.unwrap().unwrap();
+        assert_ne!(current["id"], previous["id"]);
+        let retained = store
+            .chromium_get("commits", &job_key("src", &selected))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.data["commit"]["committed_at"], 1_794_495_630i64);
+        assert_eq!(retained.data["timestamp_proof"]["selected_oid"], selected);
+        assert!(!retained.data.to_string().contains("private"));
+        assert_eq!(corpus.raw.accounted_bytes(), retained_bytes);
+        assert_eq!(broker.attempt_count(), 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let work = corpus
+            .begin_work(
+                ("src", "current"),
+                &selected,
+                devres_domain::unix_now(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(work.commit.committed_at, 1_794_495_630);
+        assert_eq!(
+            broker.attempt_count(),
+            2,
+            "retained proof replay must not fetch raw contents again"
+        );
+        corpus
+            .verify_blake3_graph(CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .chromium_get("views", previous["id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_timestamp_transport_failure_preserves_default_without_retaining_raw_body() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        for (status, phase, http_status) in [
+            (403, Phase::PublicationAcquisition, Some(403)),
+            (500, Phase::HttpAcquisition, None),
+        ] {
+            let (root, store, previous) = published_src_fixture().await;
+            let revision = "78".repeat(20);
+            let old_revision = "45".repeat(20);
+            let old = store
+                .chromium_get("commits", &legacy_job_key("src", &old_revision))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut metadata = old.data["commit"].clone();
+            metadata["revision"] = json!(revision);
+            let encoded=serde_json::to_vec(&json!({"commit":revision,"tree":metadata["tree"],"parents":[],"committer":{"time":"Thu Nov 12 17:00:30 2026"},"message":"unqualified private JSON message"})).unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let sent = calls.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().fallback(axum::routing::get(
+                        move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri| {
+                            let encoded = encoded.clone();
+                            let sent = sent.clone();
+                            async move {
+                                sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if uri.query() == Some("format=TEXT") {
+                                    (
+                                        axum::http::StatusCode::from_u16(status).unwrap(),
+                                        [("retry-after", "120")],
+                                        b"unqualified private raw body".to_vec(),
+                                    )
+                                } else {
+                                    (
+                                        axum::http::StatusCode::OK,
+                                        [("retry-after", "120")],
+                                        encoded,
+                                    )
+                                }
+                            }
+                        },
+                    )),
+                )
+                .await
+                .unwrap();
+            });
+            let broker = Arc::new(
+                BulkBroker::fixture(format!("http://{address}").parse().unwrap()).unwrap(),
+            );
+            let corpus = ChromiumCorpus::new(
+                store.clone(),
+                broker.clone(),
+                root.path(),
+                ChromiumConfig {
+                    enabled: false,
+                    min_free_bytes: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let retained_bytes = corpus.raw.accounted_bytes();
+            store
+                .chromium_set_state(
+                    &state_key("current-root", "src"),
+                    &json!({"revision":revision,"observed_at":devres_domain::unix_now()}),
+                )
+                .await
+                .unwrap();
+            store
+                .chromium_set_state(&scheduling_key("current-offset"), &json!(0))
+                .await
+                .unwrap();
+            let error = corpus
+                .collect_current_once(CancellationToken::new())
+                .await
+                .unwrap_err();
+            let context = devres_application::collection::context(&error).unwrap();
+            assert_eq!(context.phase, phase);
+            assert_eq!(context.http_status, http_status);
+            assert_eq!(broker.attempt_count(), 2);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(
+                store.chromium_state("default").await.unwrap(),
+                Some(previous)
+            );
+            assert!(
+                store
+                    .chromium_get("commits", &job_key("src", &revision))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(corpus.raw.accounted_bytes(), retained_bytes);
+            let failures = store
+                .chromium_rows("validation-failures", 0, 100, None)
+                .await
+                .unwrap();
+            assert_eq!(failures[0].data["reason"], "raw_commit_acquisition");
+            assert!(!failures[0].data.to_string().contains("private"));
+            corpus
+                .verify_blake3_graph(CancellationToken::new())
+                .await
+                .unwrap();
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn writer_restart_clears_activity_without_erasing_retained_diagnostics() {
         let broker = Arc::new(BulkBroker::new(Default::default()).unwrap());

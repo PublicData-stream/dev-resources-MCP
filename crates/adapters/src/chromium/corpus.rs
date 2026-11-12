@@ -28,6 +28,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 mod collection;
+mod diagnostics;
+pub(crate) use diagnostics::diagnose_validation_failure;
 mod licensing;
 
 /// Reuse the acquisition qualifier during exact attribution revalidation. A

@@ -13,6 +13,11 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_METADATA_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_RAW_COMMIT_ENCODED_BYTES: usize = 1024 * 1024;
+#[path = "source/commit_time.rs"]
+mod commit_time;
+pub use commit_time::{CommitResolution, RawTimestampProof, resolve_commit};
+pub(crate) use commit_time::{RawCommitAttempt, raw_commit_attempt};
 const MAX_ENTRIES: usize = 1_000_000;
 const ARCHIVE_API: &str = "https://api.github.com/repos/GoogleChrome/developer.chrome.com";
 
@@ -34,6 +39,10 @@ pub enum Operation {
         page: u32,
     },
     Commit {
+        component: String,
+        revision: String,
+    },
+    RawCommit {
         component: String,
         revision: String,
     },
@@ -66,6 +75,67 @@ fn invalid() -> Error {
 }
 fn malformed() -> Error {
     Error::integrity("Malformed Chromium source evidence.")
+}
+/// Closed private discriminator, consumed before public collector context sanitization.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ValidationReason {
+    Shape,
+    JsonEnvelope,
+    ObjectIdentity,
+    SelectedIdentity,
+    CommitDate,
+    TreeObjectHash,
+    BlobEncoding,
+    BlobObjectHash,
+    RawCommitAcquisition,
+    RawCommitEncoding,
+    RawCommitObjectHash,
+    RawCommitHeaders,
+    RawCommitIdentity,
+    RawCommitEpoch,
+    Capacity,
+}
+pub(crate) fn validation(mut error: Error, reason: ValidationReason) -> Error {
+    error.details = Some(serde_json::json!({"chromium_validation_reason": reason}));
+    error
+}
+fn hash_mismatch(reason: ValidationReason, claimed: &str, computed: &str) -> Error {
+    Error::integrity("Chromium Git object hash mismatch.").with_details(serde_json::json!({
+        "chromium_validation_reason": reason,
+        "chromium_claimed_oid": claimed,
+        "chromium_computed_oid": computed,
+    }))
+}
+pub(crate) fn diagnostic_oid(error: &Error, field: &str) -> Option<String> {
+    error
+        .details
+        .as_ref()?
+        .get(field)?
+        .as_str()
+        .filter(|value| valid_oid(value))
+        .map(str::to_owned)
+}
+pub(crate) fn validation_reason(error: &Error) -> ValidationReason {
+    error
+        .details
+        .as_ref()
+        .and_then(|value| value.get("chromium_validation_reason"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or(if error.code == "capacity" {
+            ValidationReason::Capacity
+        } else {
+            ValidationReason::Shape
+        })
+}
+/// Closed diagnostic projection for first-party bounded probes. No error text is copied.
+pub fn validation_diagnostic(error: &Error) -> Value {
+    serde_json::json!({
+        "reason": validation_reason(error),
+        "claimed_oid": diagnostic_oid(error, "chromium_claimed_oid"),
+        "computed_oid": diagnostic_oid(error, "chromium_computed_oid"),
+        "raw_commit_attempt": raw_commit_attempt(error),
+    })
 }
 pub fn valid_oid(value: &str) -> bool {
     value.len() == 40
@@ -152,6 +222,18 @@ impl Operation {
                 } else {
                     Ok(format!("{base}/+/{revision}?format=JSON"))
                 }
+            }
+            Self::RawCommit {
+                component,
+                revision,
+            } => {
+                if !matches!(component.as_str(), "src" | "site") || !valid_oid(revision) {
+                    return Err(invalid());
+                }
+                Ok(format!(
+                    "{}/+/{revision}?format=TEXT",
+                    component_base(component)?
+                ))
             }
             Self::Tag {
                 component,
@@ -259,6 +341,7 @@ impl Operation {
     }
     pub fn media_type(&self) -> &'static str {
         match self {
+            Self::RawCommit { .. } => "text/plain",
             Self::Page { .. } | Self::SitePage { .. } => "text/html",
             Self::Sitemap { .. } => "application/xml",
             Self::Blob { component, .. } if component != "chrome-archive" => "text/plain",
@@ -374,6 +457,11 @@ impl ChromiumSource {
         operation: &Operation,
         cancel: CancellationToken,
     ) -> Result<SourceResponse> {
+        let maximum = if matches!(operation, Operation::RawCommit { .. }) {
+            MAX_RAW_COMMIT_ENCODED_BYTES
+        } else {
+            MAX_METADATA_BYTES
+        };
         let source_url = operation.url()?;
         let response = self
             .broker
@@ -381,7 +469,7 @@ impl ChromiumSource {
                 BulkRequest {
                     source: BulkSource::Chromium(operation.clone()),
                     validators: Validators::default(),
-                    max_bytes: MAX_METADATA_BYTES as u64,
+                    max_bytes: maximum as u64,
                     deadline: Instant::now() + Duration::from_secs(120),
                     body: Vec::new(),
                 },
@@ -399,14 +487,14 @@ impl ChromiumSource {
             if bytes
                 .len()
                 .checked_add(chunk.len())
-                .is_none_or(|n| n > MAX_METADATA_BYTES)
+                .is_none_or(|n| n > maximum)
             {
                 return Err(limited(
                     Error::capacity("Chromium source response exceeds its byte bound."),
                     Phase::HttpBody,
                     LimitKind::MetadataBytes,
                     Some(bytes.len().saturating_add(chunk.len()) as u64),
-                    Some(MAX_METADATA_BYTES as u64),
+                    Some(maximum as u64),
                 ));
             }
             bytes.extend_from_slice(&chunk);
@@ -431,14 +519,15 @@ pub fn json(bytes: &[u8]) -> Result<Value> {
     } else {
         bytes
     };
-    serde_json::from_slice(bytes).map_err(|_| malformed())
+    serde_json::from_slice(bytes)
+        .map_err(|_| validation(malformed(), ValidationReason::JsonEnvelope))
 }
 fn oid<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
         .and_then(Value::as_str)
         .filter(|s| valid_oid(s))
-        .ok_or_else(malformed)
+        .ok_or_else(|| validation(malformed(), ValidationReason::ObjectIdentity))
 }
 pub fn parse_refs(component: &str, bytes: &[u8]) -> Result<BTreeMap<String, String>> {
     component_base(component)?;
@@ -550,7 +639,23 @@ pub struct Commit {
     pub parents: Vec<String>,
     pub committed_at: i64,
 }
-pub fn parse_commit(component: &str, bytes: &[u8]) -> Result<Commit> {
+struct CommitFields {
+    revision: String,
+    tree: String,
+    parents: Vec<String>,
+    date: String,
+}
+impl CommitFields {
+    fn with_epoch(self, committed_at: i64) -> Commit {
+        Commit {
+            revision: self.revision,
+            tree: self.tree,
+            parents: self.parents,
+            committed_at,
+        }
+    }
+}
+fn commit_fields(component: &str, bytes: &[u8]) -> Result<CommitFields> {
     component_base(component)?;
     let data = json(bytes)?;
     let archive = component == "chrome-archive";
@@ -584,12 +689,18 @@ pub fn parse_commit(component: &str, bytes: &[u8]) -> Result<Commit> {
         data["committer"]["time"].as_str()
     }
     .ok_or_else(malformed)?;
-    Ok(Commit {
+    Ok(CommitFields {
         revision,
         tree,
         parents,
-        committed_at: parse_date(date)?,
+        date: date.into(),
     })
+}
+pub fn parse_commit(component: &str, bytes: &[u8]) -> Result<Commit> {
+    let fields = commit_fields(component, bytes)?;
+    let epoch = parse_date(&fields.date)
+        .map_err(|error| validation(error, ValidationReason::CommitDate))?;
+    Ok(fields.with_epoch(epoch))
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
@@ -674,8 +785,13 @@ pub fn parse_tree(component: &str, bytes: &[u8]) -> Result<Directory> {
         content.extend_from_slice(format!("{:o} {}\0", entry.mode, entry.name).as_bytes());
         content.extend_from_slice(&hex::decode(&entry.oid).map_err(|_| malformed())?);
     }
-    if object_oid("tree", &content) != id {
-        return Err(Error::integrity("Chromium Git tree object hash mismatch."));
+    let computed = object_oid("tree", &content);
+    if computed != id {
+        return Err(hash_mismatch(
+            ValidationReason::TreeObjectHash,
+            &id,
+            &computed,
+        ));
     }
     Ok(Directory { id, entries })
 }
@@ -705,9 +821,16 @@ pub fn decode_blob(component: &str, bytes: &[u8], expected_oid: &str) -> Result<
         .copied()
         .filter(|b| !b.is_ascii_whitespace())
         .collect();
-    let decoded = STANDARD.decode(compact).map_err(|_| malformed())?;
-    if object_oid("blob", &decoded) != expected_oid {
-        return Err(Error::integrity("Chromium Git blob object hash mismatch."));
+    let decoded = STANDARD
+        .decode(compact)
+        .map_err(|_| validation(malformed(), ValidationReason::BlobEncoding))?;
+    let computed = object_oid("blob", &decoded);
+    if computed != expected_oid {
+        return Err(hash_mismatch(
+            ValidationReason::BlobObjectHash,
+            expected_oid,
+            &computed,
+        ));
     }
     Ok(decoded)
 }

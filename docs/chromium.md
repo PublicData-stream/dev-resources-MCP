@@ -39,6 +39,15 @@ There is no promise to recover already-unreachable objects or a completion deadl
 Gitiles metadata is retained HTTPS evidence. Decoded Git blobs are checked against
 their object IDs; complete representable trees can also be hash-verified. JSON commit
 metadata does not establish cryptographic verification of the original commit object.
+Gitiles can omit the timezone from its five-token committer display when the server
+uses a configured fixed zone. That display is never interpreted as UTC. For `src`
+and `site`, collection obtains one additional selected commit with `format=TEXT`,
+capped at 1 MiB encoded. It verifies the exact Git commit object ID, tree and ordered
+parents against JSON and reads exactly one raw committer epoch. Only that verified
+epoch and bounded proof metadata are retained; raw commit bytes, author/committer
+names, emails and messages are discarded. Explicit-offset six-token dates and UTC ISO dates retain
+their existing path. The extra proof uses the same host, rate and retry owner;
+unavailable, oversized or invalid proof preserves the previous published default.
 
 Markdown, HTML, plain text, and supported documentation syntax are inert projections.
 Sections preserve anchors, code examples remain text, and symbols require explicit
@@ -94,6 +103,14 @@ host admission and the existing single retry owner. Quota and free-space failure
 pause work without deleting archives. Metadata responses, sitemap discovery, parser
 work, queues, and write groups are independently bounded.
 
+Rejected parser observations retain private versioned diagnostics with closed
+component/lane/operation/reason identifiers, response time, byte count and BLAKE3
+digest. Selected, claimed and computed Git object IDs are included where available.
+Rejected bodies, upstream text and URLs are not copied into these records or public
+status. Immutable failure observations and their latest private pointers survive
+restart; retained-graph verification checks their schema, integrity and references.
+HTTP failures remain acquisition failures and retain the existing retry policy.
+
 Schema 8 is forward-only. Coordinated backups include Chromium raw artifacts,
 immutable evidence, inventories, projections, checkpoints, and search indexes.
 `rebuild-chromium-index CONFIG.toml` rebuilds derived state from retained evidence.
@@ -107,6 +124,22 @@ It is separate from the retained frozen
 corpus runner `scripts/accept-chromium.sh`, which accounts for source obligations
 and supports resumption. Neither demonstrates production deployment, hosted native
 ARM64 execution, or native ChatGPT UI behavior.
+
+`chromium-live-probe --diagnose-validation OWNED_ROOT` diagnoses only current
+`src` and `site` ref, selected commit and root-tree validation, with at most six
+attempts per invocation and a persisted total budget of twenty across the same root.
+Broker retries count against both limits. It retains only closed diagnostic metadata,
+validated selected object IDs and body digests; it does not retain response bodies or
+collect documents. `--diagnose-commit-date` fetches only refs and selected commits,
+with at most four attempts per invocation under the same twenty-attempt ledger.
+That private mode retains only a bounded ASCII date scalar/shape alongside its
+validated commit ID and body digest; CLI output omits the scalar. Diagnostic receipts
+remain immutable across invocations. Normal live
+acceptance also validates selected `src`/`site` commit metadata before trees.
+Use `--diagnose-validation OWNED_ROOT --component src` or `--component site` to
+verify each component separately: refs, JSON commit, an ambiguous-date raw proof
+when needed, then the root tree. All attempts, including retries and raw proofs,
+share the root's persisted twenty-attempt limit.
 
 All temporary acceptance state belongs below `/tmp`. Retained public acceptance
 evidence has a separate owner marker and survives cleanup; disposable fixture state

@@ -40,6 +40,7 @@ fn known_evidence_kind(kind: &str) -> bool {
             | "tree-pages"
             | "trees"
             | "views"
+            | "validation-failures"
             | "web-map-jobs"
             | "web-page-jobs"
     )
@@ -926,6 +927,7 @@ impl ChromiumCorpus {
             "traversal-gap-manifests",
             "tree-pages",
             "trees",
+            "validation-failures",
             "web-map-jobs",
             "web-page-jobs",
         ];
@@ -1245,6 +1247,7 @@ impl ChromiumCorpus {
         }
 
         for kind in [
+            "commits",
             "traversal-gaps",
             "traversal-gap-manifests",
             "nodes",
@@ -1259,6 +1262,7 @@ impl ChromiumCorpus {
             "views",
             "publications",
             "observations",
+            "validation-failures",
         ] {
             let mut after = 0;
             loop {
@@ -1271,6 +1275,25 @@ impl ChromiumCorpus {
                     check(&cancel)?;
                     after = row.sequence;
                     match kind {
+                        "commits" => {
+                            if let Some(proof) = row
+                                .data
+                                .get("timestamp_proof")
+                                .filter(|proof| !proof.is_null())
+                            {
+                                if !matches!(row.data["component"].as_str(), Some("src" | "site")) {
+                                    return Err(Error::integrity(
+                                        "Invalid raw timestamp proof component.",
+                                    ));
+                                }
+                                let commit: Commit = decode(row.data["commit"].clone())?;
+                                let proof: source::RawTimestampProof = decode(proof.clone())?;
+                                proof.validate(&commit)?;
+                            }
+                        }
+                        "validation-failures" => {
+                            Self::verify_failed_observation(&row.key, &row.data)?
+                        }
                         "traversal-gaps" => self.verify_traversal_gap(&row.key, &row.data).await?,
                         "traversal-gap-manifests" => {
                             crate::integrity::verify(
@@ -1574,6 +1597,16 @@ impl ChromiumCorpus {
             }
             for key in keys {
                 after = key.clone();
+                if key.starts_with("validation-failure-v1:") {
+                    let value = self.store.chromium_state(&key).await?.ok_or_else(failure)?;
+                    let id = value.as_str().ok_or_else(failure)?;
+                    let row = self
+                        .store
+                        .chromium_get("validation-failures", id)
+                        .await?
+                        .ok_or_else(failure)?;
+                    Self::verify_failed_observation_pointer(&key, id, &row.data)?;
+                }
                 if !key.starts_with("work:") {
                     continue;
                 }
