@@ -17,9 +17,9 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        if version != 14 {
+        if version != 15 {
             return Err(Error::unavailable(
-                "Concurrent serving requires storage schema fourteen.",
+                "Concurrent serving requires storage schema fifteen.",
             ));
         }
         let active: bool = sqlx_core::query_scalar::query_scalar(
@@ -55,6 +55,7 @@ impl PgBlobStore {
             reader: true,
             lifecycle_shared: true,
             visibility: tokio::sync::OnceCell::new(),
+            enrichment_membership: Mutex::new(std::collections::BTreeSet::new()),
             root,
             read_budget: Arc::new(Semaphore::new(128)),
             owner: Arc::new(Mutex::new(owner)),
@@ -77,6 +78,7 @@ impl PgBlobStore {
             store.archive.set(archive).map_err(|_| storage_error())?;
         }
         store.verify_visibility_registry().await?;
+        crate_storage::enrichment_v2::initialize_membership(&store).await?;
         store.check_health().await?;
         Ok(store)
     }
@@ -93,7 +95,7 @@ impl PgBlobStore {
             ));
         }
         if self.reader {
-            let supported: bool = sqlx_core::query_scalar::query_scalar("SELECT version=14 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
+            let supported: bool = sqlx_core::query_scalar::query_scalar("SELECT version=15 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
                 .fetch_one(&self.pool).await.map_err(|_| storage_error())?;
             if !supported {
                 return Err(Error::unavailable(
@@ -289,7 +291,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        sqlx_core::query::query("UPDATE devres_schema SET version=14 WHERE singleton")
+        sqlx_core::query::query("UPDATE devres_schema SET version=15 WHERE singleton")
             .execute(&writer.pool)
             .await
             .unwrap();

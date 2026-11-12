@@ -123,8 +123,7 @@ struct SnapshotSource<'a> {
 }
 
 fn snapshot_identity(snapshot: &Snapshot) -> Result<String> {
-    Ok(hash(serde_json::to_vec(&json!({"inventory":snapshot.inventory.id,"inventory_validated_at":snapshot.inventory.validated_at,"content_sequence":snapshot.content_sequence,"enrichment":snapshot.enrichment,"index":snapshot.index_manifest,"coverage":snapshot.coverage}))
-        .map_err(|_|Error::integrity("Snapshot identity failed."))?.as_slice()))
+    super::snapshot_identity(snapshot)
 }
 
 fn snapshot_base(snapshot: &Snapshot) -> Result<Value> {

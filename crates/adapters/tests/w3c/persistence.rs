@@ -284,7 +284,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("schema"),
-        14
+        15
     );
     // Recognized opaque acceptance evidence can migrate without invented provider graph variants.
     // Exercise the actual version-six migration branch with retained older-provider evidence.
@@ -377,7 +377,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("upgraded schema"),
-        14
+        15
     );
     assert_eq!(
         store
@@ -858,8 +858,25 @@ async fn wait_owner_release(pool: &sqlx_postgres::PgPool) {
 // Remove only schema-ten metadata in this task-owned fixture database. Retained
 // captures, source rows, and permanent filesystem evidence remain untouched.
 async fn remove_integrity_schema(pool: &sqlx_postgres::PgPool) {
+    let mut transaction = pool
+        .begin()
+        .await
+        .expect("begin synthetic legacy-schema fixture");
+    let later_evidence: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT (SELECT count(*) FROM devres_crate_enrichment_v2)+(SELECT count(*) FROM devres_crate_enrichment_heads_v2)+(SELECT count(*) FROM devres_crate_dump_failures)"
+    ).fetch_one(&mut *transaction).await.expect("inspect schema-fifteen fixture evidence");
+    assert_eq!(
+        later_evidence, 0,
+        "synthetic downgrade must preserve any retained v2 crate evidence"
+    );
     sqlx_core::raw_sql::raw_sql(
         r#"
+-- These task-owned schema-fifteen objects are empty. Remove their view dependency
+-- before stripping legacy integrity columns; preserve all earlier evidence.
+DROP VIEW devres_crate_enrichment_all;
+DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures;
+DROP FUNCTION devres_crate_enrichment_v2_immutable();
+DROP FUNCTION devres_crate_enrichment_head_immutable();
 DO $fixture$
 DECLARE retained_column record;
 BEGIN
@@ -882,9 +899,13 @@ DROP TABLE devres_content_aliases;
 DROP TABLE devres_integrity_control;
 "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .expect("remove schema-ten-only fixture metadata");
+    transaction
+        .commit()
+        .await
+        .expect("commit synthetic legacy-schema fixture");
 }
 
 // Simulate the original SHA-only capture representation after removing schema-ten

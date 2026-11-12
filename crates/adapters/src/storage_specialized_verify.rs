@@ -107,6 +107,16 @@ impl PgBlobStore {
         execution: &crate::MigrationExecution,
     ) -> Result<()> {
         self.fence().await?;
+        let schema: i32 = sqlx_core::query_scalar::query_scalar(
+            "SELECT version FROM devres_schema WHERE singleton",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error())?;
+        if schema >= 15 {
+            super::super::crate_storage::enrichment_v2::verify(self, cancel).await?;
+        }
+
         let mut after = (String::new(), String::new());
         loop {
             stop(cancel)?;
@@ -261,6 +271,30 @@ impl PgBlobStore {
             if snapshot.id != key {
                 return Err(invalid());
             }
+            crate::integrity::verify(
+                &key,
+                &super::super::crate_storage::snapshot_identity_bytes(&snapshot)?,
+            )?;
+            if let Some(selection) = snapshot.enrichment_selection() {
+                crate::crates_io::enrichment::validate_selection(&selection)?;
+                if let Some(derivation) = &selection.derivation {
+                    let head = sqlx_core::query::query(
+                        "SELECT * FROM devres_crate_enrichment_heads_v2 WHERE derivation=$1",
+                    )
+                    .bind(derivation)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|_| storage_error())?
+                    .ok_or_else(invalid)?;
+                    if super::super::crate_storage::enrichment_v2::checked_head(&head)? != selection
+                    {
+                        return Err(invalid());
+                    }
+                }
+            } else if snapshot.enrichment_derivation.is_some() {
+                return Err(invalid());
+            }
+            crate::crates_io::index::validate_enrichment_binding(&self.root, &snapshot)?;
             let inventory = sqlx_core::query::query(
                 "SELECT id,sequence,revision,created_at FROM devres_crate_inventories WHERE id=$1",
             )

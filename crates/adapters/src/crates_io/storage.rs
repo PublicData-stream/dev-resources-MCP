@@ -1,11 +1,13 @@
 //! Schema-v3 crate inventories, immutable projections and resumable acquisition.
+#[path = "storage_enrichment.rs"]
+pub(super) mod enrichment_v2;
 #[path = "storage_migration.rs"]
 mod graph_migration;
 use super::{PgBlobStore, hash, payload_integrity, storage_error, valid_hash};
 use async_trait::async_trait;
 use devres_application::crate_corpus::{
     Artifact, CollectionJob, ContentDeltaQuery, ContentFilter, ContentRecord, CrateCorpusStore,
-    Inventory, Snapshot, VersionRecord,
+    EnrichmentSelection, Inventory, Snapshot, VersionRecord,
 };
 use devres_domain::{Capture, Error, Result};
 use serde_json::{Value, json};
@@ -1051,63 +1053,62 @@ impl CrateCorpusStore for PgBlobStore {
         Ok(())
     }
     async fn enrichment(&self, artifact: Option<&str>, name: &str, version: &str) -> Result<Value> {
-        self.fence().await?;
-        let Some(artifact) = artifact else {
-            return Ok(json!({}));
-        };
-        let Some(found)=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind='crates' AND lower(data->>'name')=lower($2) LIMIT 1")
-            .bind(artifact).bind(name).fetch_optional(&self.pool).await.map_err(|_|storage_error())? else{return Ok(json!({}));};
-        let crate_id: String = found.try_get("external_id").map_err(|_| storage_error())?;
-        let crate_data = checked_enrichment(artifact, "crates", &found)?;
-        let version_data=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind='versions' AND data->>'crate_id'=$2 AND data->>'num'=$3 LIMIT 1")
-            .bind(artifact).bind(&crate_id).bind(version).fetch_optional(&self.pool).await.map_err(|_|storage_error())?
-            .map(|row|checked_enrichment(artifact,"versions",&row)).transpose()?.unwrap_or(Value::Null);
-        let mut result = json!({"crate":crate_data,"version":version_data,"artifact":artifact});
-        for (relation, target, reference, field, output) in [
-            (
-                "crates_keywords",
-                "keywords",
-                "keyword_id",
-                "keyword",
-                "keywords",
-            ),
-            (
-                "crates_categories",
-                "categories",
-                "category_id",
-                "slug",
-                "categories",
-            ),
-        ] {
-            let rows=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind=$2 AND data->>'crate_id'=$3 LIMIT 1025")
-                .bind(artifact).bind(relation).bind(&crate_id).fetch_all(&self.pool).await.map_err(|_|storage_error())?;
-            if rows.len() > 1024 {
-                return Err(Error::capacity(
-                    "Metadata enrichment relation bound exceeded.",
-                ));
-            }
-            let mut values = Vec::new();
-            for row in rows {
-                let relation_data = checked_enrichment(artifact, relation, &row)?;
-                let Some(key) = json_text(&relation_data[reference]) else {
-                    continue;
-                };
-                if let Some(found)=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment WHERE artifact=$1 AND kind=$2 AND external_id=$3")
-                    .bind(artifact).bind(target).bind(key).fetch_optional(&self.pool).await.map_err(|_|storage_error())? {
-                    let data=checked_enrichment(artifact,target,&found)?;
-                    values.push(json_text(&data[field]));
-                }
-            }
-            values.sort_by(|a, b| match (a, b) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, _) => std::cmp::Ordering::Greater,
-                (_, None) => std::cmp::Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(b),
-            });
-            result[output] = serde_json::to_value(values).map_err(|_| storage_error())?;
+        let selection = artifact.map(|capture| EnrichmentSelection {
+            capture: capture.to_owned(),
+            derivation: None,
+        });
+        read_selected_enrichment(self, selection.as_ref(), name, version).await
+    }
+    async fn record_dump_failure(&self, artifact: &str, diagnostic: &Value) -> Result<()> {
+        self.save_dump_failure(artifact, diagnostic).await
+    }
+    async fn selected_enrichment(
+        &self,
+        selection: Option<&EnrichmentSelection>,
+        name: &str,
+        version: &str,
+    ) -> Result<Value> {
+        read_selected_enrichment(self, selection, name, version).await
+    }
+    async fn put_selected_enrichment(
+        &self,
+        selection: &EnrichmentSelection,
+        kind: &str,
+        rows: &[(String, Value)],
+    ) -> Result<()> {
+        if selection.derivation.is_none() {
+            return self.put_enrichment(&selection.capture, kind, rows).await;
         }
-        json_limit(&result, 2 * 1024 * 1024)?;
-        Ok(result)
+        self.put_v2_enrichment(selection, kind, rows).await
+    }
+    async fn commit_selected_enrichment_with_cancel(
+        &self,
+        selection: &EnrichmentSelection,
+        summary: &Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        if selection.derivation.is_none() {
+            if cancel.is_cancelled() {
+                return Err(Error::new("cancelled", "Enrichment publication canceled."));
+            }
+            return self.commit_enrichment(&selection.capture).await;
+        }
+        self.commit_v2_enrichment(selection, summary, &cancel).await
+    }
+    async fn commit_selected_enrichment(
+        &self,
+        selection: &EnrichmentSelection,
+        summary: &Value,
+    ) -> Result<()> {
+        if selection.derivation.is_none() {
+            return self.commit_enrichment(&selection.capture).await;
+        }
+        self.commit_v2_enrichment(
+            selection,
+            summary,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
     }
     async fn prepare_snapshot(&self, epoch: &str, now: i64) -> Result<Snapshot> {
         self.owner_fence().await?;
@@ -1132,12 +1133,11 @@ impl CrateCorpusStore for PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        let enrichment: Option<String> = sqlx_core::query_scalar::query_scalar(
-            "SELECT artifact FROM devres_crate_enrichment_heads ORDER BY sequence DESC LIMIT 1",
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?;
+        let selected = enrichment_v2::latest_selection(&mut tx).await?;
+        let enrichment = selected.as_ref().map(|selection| selection.capture.clone());
+        let enrichment_derivation = selected
+            .as_ref()
+            .and_then(|selection| selection.derivation.clone());
         let counts:Json<Value>=sqlx_core::query_scalar::query_scalar("SELECT COALESCE(jsonb_object_agg(kind,stats),'{}'::jsonb) FROM (SELECT kind,jsonb_build_object('total',count(*),'captured',count(artifact),'failed',count(*) FILTER(WHERE last_error IS NOT NULL)) stats FROM devres_crate_jobs GROUP BY kind) q").fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         let versions:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_crate_versions v WHERE valid_from<=$1 AND (valid_to IS NULL OR valid_to>$1) AND ($2=(SELECT id LIKE 'blake3:%' FROM devres_crate_inventories WHERE sequence=v.valid_from))").bind(inv.sequence).bind(inv.id.starts_with("blake3:")).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         let gaps: i64 = sqlx_core::query_scalar::query_scalar(
@@ -1160,15 +1160,17 @@ impl CrateCorpusStore for PgBlobStore {
         let processing:Json<Value>=sqlx_core::query_scalar::query_scalar("SELECT jsonb_build_object('published_generations',count(*),'skipped_binary',COALESCE(sum((summary->>'skipped_binary')::bigint),0),'skipped_oversized',COALESCE(sum((summary->>'skipped_oversized')::bigint),0),'unresolved_references',COALESCE(sum((summary->>'unresolved_references')::bigint),0)) FROM devres_crate_generations g WHERE published_sequence<=$1 AND NOT(g.id=ANY($2::text[]))").bind(cutoff).bind(hidden.as_ref()).fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
         let coverage = json!({"inventory_complete":gaps==0,"inventory_enumeration_complete":true,"metadata_gaps":gaps,"processing_cumulative":processing.0,"versions":versions,"jobs":counts.0,"content_sequence":cutoff,"processor_version":1});
         let id=hash(serde_json::to_vec(&json!({"inventory":inv.id,"inventory_validated_at":inv.validated_at,"content_sequence":cutoff,"enrichment":enrichment,"index":index_manifest,"coverage":coverage})).map_err(|_|Error::integrity("Snapshot identity failed."))?.as_slice());
-        let snapshot = Snapshot {
+        let mut snapshot = Snapshot {
             id: id.clone(),
             inventory: inv,
             content_sequence: cutoff,
             enrichment,
+            enrichment_derivation,
             index_manifest,
             coverage,
             created_at: now,
         };
+        snapshot.id = snapshot_identity(&snapshot)?;
         tx.commit().await.map_err(|_| storage_error())?;
         Ok(snapshot)
     }
@@ -1187,7 +1189,14 @@ impl CrateCorpusStore for PgBlobStore {
                 "Index membership differs from the frozen snapshot.",
             ));
         }
-        snapshot.id=hash(serde_json::to_vec(&json!({"inventory":snapshot.inventory.id,"inventory_validated_at":snapshot.inventory.validated_at,"content_sequence":snapshot.content_sequence,"enrichment":snapshot.enrichment,"index":snapshot.index_manifest,"coverage":snapshot.coverage})).map_err(|_|Error::integrity("Snapshot identity failed."))?.as_slice());
+        snapshot.id = snapshot_identity(&snapshot)?;
+        if let Some(selection) = snapshot.enrichment_selection() {
+            crate::crates_io::enrichment::validate_selection(&selection)?;
+            enrichment_v2::require_published(self, &selection).await?;
+        } else if snapshot.enrichment_derivation.is_some() {
+            return Err(Error::integrity("Enrichment derivation lacks a capture."));
+        }
+        crate::crates_io::index::validate_enrichment_binding(&self.root, &snapshot)?;
         let encoded = json_limit(&snapshot, 4 * 1024 * 1024)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
@@ -1235,7 +1244,7 @@ impl CrateCorpusStore for PgBlobStore {
         let jobs:Json<Value>=sqlx_core::query_scalar::query_scalar("SELECT COALESCE(jsonb_agg(q),'[]'::jsonb) FROM (SELECT kind,state,count(*) AS count,count(artifact) AS retained,min(due_at) AS next_due FROM devres_crate_jobs GROUP BY kind,state ORDER BY kind,state) q").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         let errors:Json<Value>=sqlx_core::query_scalar::query_scalar("SELECT COALESCE(jsonb_agg(q),'[]'::jsonb) FROM (SELECT kind,last_error,count(*) AS count FROM devres_crate_jobs WHERE last_error IS NOT NULL GROUP BY kind,last_error ORDER BY kind,last_error) q").fetch_one(&self.pool).await.map_err(|_|storage_error())?;
         Ok(
-            json!({"jobs":jobs.0,"errors":errors.0,"inventory":self.latest_inventory().await?,"pending_inventory":self.pending_inventory().await?,"snapshot":self.snapshot(None).await?}),
+            json!({"jobs":jobs.0,"errors":errors.0,"inventory":self.latest_inventory().await?,"pending_inventory":self.pending_inventory().await?,"snapshot":self.snapshot(None).await?.map(|snapshot| snapshot.public_value()).transpose()?}),
         )
     }
 }
@@ -1302,7 +1311,7 @@ fn checked_attributes(row: &sqlx_postgres::PgRow) -> Result<Value> {
     )?;
     Ok(attributes)
 }
-fn read_artifact(row: sqlx_postgres::PgRow) -> Result<Artifact> {
+pub(super) fn read_artifact(row: sqlx_postgres::PgRow) -> Result<Artifact> {
     let capture = Capture {
         id: row.try_get("id").map_err(|_| storage_error())?,
         key: row.try_get("source_key").map_err(|_| storage_error())?,
@@ -1445,3 +1454,124 @@ CREATE INDEX devres_crate_enrichment_version ON devres_crate_enrichment(artifact
 CREATE TABLE devres_crate_enrichment_heads(sequence bigserial UNIQUE,artifact text PRIMARY KEY REFERENCES devres_crate_artifacts(capture_id));
 CREATE TABLE devres_crate_snapshots(sequence bigserial UNIQUE,id text PRIMARY KEY,inventory text NOT NULL REFERENCES devres_crate_inventories(id),content_sequence bigint NOT NULL,data jsonb NOT NULL);
 "#;
+
+async fn read_selected_enrichment(
+    store: &PgBlobStore,
+    selection: Option<&EnrichmentSelection>,
+    name: &str,
+    version: &str,
+) -> Result<Value> {
+    store.fence().await?;
+    let Some(selection) = selection else {
+        return Ok(json!({}));
+    };
+    crate::crates_io::enrichment::validate_selection(selection)?;
+    enrichment_v2::require_published(store, selection).await?;
+    let artifact = selection
+        .derivation
+        .as_deref()
+        .unwrap_or(&selection.capture);
+    let Some(found)=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment_all WHERE selection=$1 AND kind='crates' AND lower(data->>'name')=lower($2) LIMIT 1")
+            .bind(artifact).bind(name).fetch_optional(&store.pool).await.map_err(|_|storage_error())? else{return Ok(json!({}));};
+    let crate_id: String = found.try_get("external_id").map_err(|_| storage_error())?;
+    let crate_data = checked_selected_enrichment(selection, "crates", &found)?;
+    let version_data=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment_all WHERE selection=$1 AND kind='versions' AND data->>'crate_id'=$2 AND data->>'num'=$3 LIMIT 1")
+            .bind(artifact).bind(&crate_id).bind(version).fetch_optional(&store.pool).await.map_err(|_|storage_error())?
+            .map(|row|checked_selected_enrichment(selection,"versions",&row)).transpose()?.unwrap_or(Value::Null);
+    let mut result =
+        json!({"crate":crate_data,"version":version_data,"artifact":selection.capture});
+    let mut selected_bytes = serde_json::to_vec(&result)
+        .map_err(|_| storage_error())?
+        .len();
+    if selected_bytes > crate::crates_io::enrichment::MAX_READ_BYTES {
+        return Err(crate::crates_io::enrichment::read_limit("bytes"));
+    }
+
+    for (relation, target, reference, field, output) in [
+        (
+            "crates_keywords",
+            "keywords",
+            "keyword_id",
+            "keyword",
+            "keywords",
+        ),
+        (
+            "crates_categories",
+            "categories",
+            "category_id",
+            "slug",
+            "categories",
+        ),
+    ] {
+        let rows=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment_all WHERE selection=$1 AND kind=$2 AND data->>'crate_id'=$3 LIMIT 1025")
+                .bind(artifact).bind(relation).bind(&crate_id).fetch_all(&store.pool).await.map_err(|_|storage_error())?;
+        if rows.len() > 1024 {
+            return Err(crate::crates_io::enrichment::read_limit("relations"));
+        }
+        let mut values = Vec::new();
+        for row in rows {
+            let relation_data = checked_selected_enrichment(selection, relation, &row)?;
+            let Some(key) = json_text(&relation_data[reference]) else {
+                continue;
+            };
+            if let Some(found)=sqlx_core::query::query("SELECT external_id,data,data_integrity FROM devres_crate_enrichment_all WHERE selection=$1 AND kind=$2 AND external_id=$3")
+                    .bind(artifact).bind(target).bind(key).fetch_optional(&store.pool).await.map_err(|_|storage_error())? {
+                    let data=checked_selected_enrichment(selection,target,&found)?;
+                    let value = json_text(&data[field]);
+                    selected_bytes = selected_bytes.saturating_add(serde_json::to_vec(&value).map_err(|_| storage_error())?.len()).saturating_add(1);
+                    if selected_bytes > crate::crates_io::enrichment::MAX_READ_BYTES { return Err(crate::crates_io::enrichment::read_limit("bytes")); }
+                    values.push(value);
+                }
+        }
+        values.sort_by(|a, b| match (a, b) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Greater,
+            (_, None) => std::cmp::Ordering::Less,
+            (Some(a), Some(b)) => a.cmp(b),
+        });
+        result[output] = serde_json::to_value(values).map_err(|_| storage_error())?;
+    }
+    json_limit(&result, crate::crates_io::enrichment::MAX_READ_BYTES).map_err(|error| {
+        if error.code == "capacity" {
+            crate::crates_io::enrichment::read_limit("bytes")
+        } else {
+            error
+        }
+    })?;
+    Ok(result)
+}
+
+fn checked_selected_enrichment(
+    selection: &EnrichmentSelection,
+    kind: &str,
+    row: &sqlx_postgres::PgRow,
+) -> Result<Value> {
+    if let Some(derivation) = &selection.derivation {
+        payload_integrity::checked(
+            "devres_crate_enrichment_v2",
+            &format!("{derivation}:{kind}"),
+            &row.try_get::<String, _>("external_id")
+                .map_err(|_| storage_error())?,
+            row.try_get::<Json<Value>, _>("data")
+                .map_err(|_| storage_error())?
+                .0,
+            &row.try_get::<String, _>("data_integrity")
+                .map_err(|_| storage_error())?,
+        )
+    } else {
+        checked_enrichment(&selection.capture, kind, row)
+    }
+}
+
+pub(super) fn snapshot_identity_bytes(snapshot: &Snapshot) -> Result<Vec<u8>> {
+    let mut identity = json!({"inventory":snapshot.inventory.id,"inventory_validated_at":snapshot.inventory.validated_at,"content_sequence":snapshot.content_sequence,"enrichment":snapshot.enrichment,"index":snapshot.index_manifest,"coverage":snapshot.coverage});
+    if let Some(derivation) = &snapshot.enrichment_derivation {
+        identity["enrichment_derivation"] = json!(derivation);
+    }
+    serde_json::to_vec(&identity).map_err(|_| Error::integrity("Snapshot identity failed."))
+}
+pub(super) fn snapshot_identity(snapshot: &Snapshot) -> Result<String> {
+    Ok(hash(&snapshot_identity_bytes(snapshot)?))
+}
+
+pub(super) const SCHEMA_V15: &str = enrichment_v2::SCHEMA_V15;

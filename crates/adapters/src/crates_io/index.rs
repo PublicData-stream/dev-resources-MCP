@@ -240,6 +240,8 @@ struct Manifest {
     inventory: String,
     content_sequence: i64,
     enrichment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrichment_derivation: Option<String>,
     shards: Vec<Shard>,
     gaps: u64,
     gap_artifact: Option<Digest>,
@@ -581,6 +583,7 @@ impl Builder {
             inventory: snapshot.inventory.id.clone(),
             content_sequence: snapshot.content_sequence,
             enrichment: snapshot.enrichment.clone(),
+            enrichment_derivation: snapshot.enrichment_derivation.clone(),
             shards: self.shards.clone(),
             gaps: self.gaps,
             gap_samples: self.gap_samples.clone(),
@@ -692,9 +695,35 @@ pub async fn build(
                 return Err(integrity());
             }
             cursor = Some(next);
-            let enrichment = store
-                .enrichment(snapshot.enrichment.as_deref(), &row.name, &row.version)
-                .await?;
+            let enrichment = match store
+                .selected_enrichment(
+                    snapshot.enrichment_selection().as_ref(),
+                    &row.name,
+                    &row.version,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let Some(reason) = super::enrichment::read_gap(&error) else {
+                        return Err(error);
+                    };
+                    let identity = Identity {
+                        name: row.name.clone(),
+                        version: row.version.clone(),
+                        target: String::new(),
+                        path: String::new(),
+                        id: format!("{}@{}", row.name, row.version),
+                    };
+                    builder = tokio::task::spawn_blocking(move || {
+                        builder.skip(&identity, reason)?;
+                        Ok::<_, Error>(builder)
+                    })
+                    .await
+                    .map_err(|_| unavailable())??;
+                    continue;
+                }
+            };
             let metadata = &row.record;
             let mut keys = vec![
                 ("class".into(), "version".into()),
@@ -1068,6 +1097,52 @@ fn open_inner(
     Ok(opened)
 }
 
+/// Check the private processor binding inside the already content-addressed manifest.
+/// Public reference fields continue naming the raw enrichment capture.
+pub(crate) fn validate_enrichment_binding(root: &Path, snapshot: &Snapshot) -> Result<()> {
+    if snapshot.index_manifest.is_null() {
+        return Ok(());
+    }
+    let reference = &snapshot.index_manifest;
+    // Legacy storage fixtures also support unindexed inline manifests.
+    if snapshot.enrichment_derivation.is_none() && reference["path"].is_null() {
+        return Ok(());
+    }
+    let relative = reference["path"].as_str().ok_or_else(integrity)?;
+    let suffix = relative
+        .strip_prefix("crate-indexes/")
+        .ok_or_else(integrity)?;
+    path_id(suffix)?;
+    let base = fs::canonicalize(root).map_err(|_| unavailable())?;
+    let directory = base.join(relative);
+    real_directory(&base.join("crate-indexes"))?;
+    real_directory(&directory)?;
+    let path = directory.join("manifest.json");
+    let token = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let _lease =
+        crate::durable_archive::materialize_file(&path, MAX_MANIFEST as u64, deadline, &token)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_MANIFEST as u64
+    {
+        return Err(integrity());
+    }
+    let bytes = fs::read(&path).map_err(|_| unavailable())?;
+    if bytes.len() > MAX_MANIFEST {
+        return Err(capacity());
+    }
+    crate::integrity::verify(reference_digest(reference)?, &bytes)?;
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| integrity())?;
+    if manifest.enrichment != snapshot.enrichment
+        || manifest.enrichment_derivation != snapshot.enrichment_derivation
+    {
+        return Err(integrity());
+    }
+    Ok(())
+}
+
 pub(crate) type PayloadRewrite = Arc<dyn Fn(&mut Value) -> Result<()> + Send + Sync>;
 
 fn from_frozen_payload(payload: Value, text: String) -> Result<IndexDocument> {
@@ -1264,6 +1339,7 @@ pub(crate) async fn verify_frozen_replay_with_execution(
             let mut equivalent = retained_manifest.inventory == snapshot.inventory.id
                 && retained_manifest.content_sequence == snapshot.content_sequence
                 && retained_manifest.enrichment == snapshot.enrichment
+                && retained_manifest.enrichment_derivation == snapshot.enrichment_derivation
                 && retained_manifest.gaps == source_manifest.gaps;
             let mut expected_samples = source_manifest.gap_samples;
             for sample in &mut expected_samples {

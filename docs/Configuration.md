@@ -125,8 +125,11 @@ encryption. JSON expansion caps at 256 MiB, each index item at 1 MiB, index entr
 64 MiB, normalized signatures at 1 MiB and processing at 15 seconds. The platform
 fragment caps at 1 MiB and 1,000 targets.
 
-Database-dump import caps expanded bytes at 512 GiB, tar members at 1,000, raw CSV
-rows at 2 MiB, fields at 1 MiB and columns at 128. Parsing uses 64 KiB chunks and
+Database-dump import caps expanded bytes at 512 GiB, tar members at 1,000, raw and
+decoded CSV rows at 2 MiB, selected fields at 1 MiB and columns at 128. Ignored
+fields are streamed and validated without retaining their values; they may exceed
+1 MiB within the same raw/decoded row bounds. The separate `metadata.json` member
+remains limited to 1 MiB. Parsing uses 64 KiB chunks and
 bounded batches of at most 1,000 rows/8 MiB through a two-batch queue. Imports have a
 24-hour cancellation/deadline budget. Unknown/non-public columns are not projected;
 SQL files remain inert archive evidence. Only complete validated imports become
@@ -137,6 +140,8 @@ identities, integrity digests and array separators. Import progress describes
 staged rows/batches and expanded bytes; it is not published metadata or a completion
 percentage. Retrying the same retained dump replays bounded gzip/tar validation
 and idempotent staging, without exposing partial enrichment.
+New imports use a capture-bound `crates-dump-v2` derivation. Existing snapshots
+retain their original v1 enrichment; reprocessing never overwrites those rows.
 
 Crate search uses one writer with a 64 MiB per-thread indexing budget, immutable
 shards of at most 50,000 documents, at most 4,096 shards and 10,000 files/32 GiB per

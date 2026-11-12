@@ -116,7 +116,7 @@ impl BackupReceipt {
     fn validate(&self) -> Result<()> {
         if self.version != 1
             || self.kind != "devres-object-archive-backup"
-            || !matches!(self.schema, 12..=14)
+            || !matches!(self.schema, 12..=15)
             || self.store_id.is_empty()
             || self.store_id.len() > 128
             || self.store_id.chars().any(char::is_control)
@@ -854,6 +854,43 @@ async fn bounded_line(reader: &mut BufReader<tokio::fs::File>) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backup_receipts_preserve_legacy_schema_and_accept_fifteen() {
+        for schema in [12, 13, 14, 15] {
+            let receipt = BackupReceipt {
+                version: 1,
+                kind: "devres-object-archive-backup".into(),
+                schema,
+                store_id: "fixture-store".into(),
+                source_binding: crate::integrity::hash(b"source"),
+                destination_binding: crate::integrity::hash(b"destination"),
+                files: 0,
+                database: RetainedFile {
+                    key: DUMP_KEY.into(),
+                    digest: crate::integrity::hash(b"database"),
+                    bytes: 1,
+                },
+                manifest: RetainedFile {
+                    key: MANIFEST_KEY.into(),
+                    digest: crate::integrity::hash(b"manifest"),
+                    bytes: 1,
+                },
+                claim_digest: crate::integrity::hash(b"claim"),
+            };
+            receipt.validate().unwrap();
+            for unsupported in [11, 16] {
+                let mut rejected = serde_json::to_value(&receipt).unwrap();
+                rejected["schema"] = json!(unsupported);
+                assert!(
+                    serde_json::from_value::<BackupReceipt>(rejected)
+                        .unwrap()
+                        .validate()
+                        .is_err()
+                );
+            }
+        }
+    }
+
     #[test]
     fn libpq_environment_preserves_credentials_tls_and_operator_query_overrides() {
         let environment=DatabaseEnvironment::new("postgres://u%40ser:p%2Bass%3Aword@db.example:5544/a%20database?ssl-mode=verify-full&ssl-root-cert=%2Ftmp%2Ffixture-ca.pem&ssl-cert=%2Ftmp%2Ffixture-cert.pem&ssl-key=%2Ftmp%2Ffixture-key.pem&options[search_path]=public").unwrap();

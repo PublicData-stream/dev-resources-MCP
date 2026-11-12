@@ -329,9 +329,10 @@ async fn metadata_envelope_regression(corpus: &CrateCorpus) {
         assert_eq!(status.progress[&ProgressKind::Rows], 1001);
         assert!(status.progress[&ProgressKind::Batches] >= 3);
     }
+    let selection = super::super::enrichment::selection(&artifact.capture.id).unwrap();
     let enrichment = corpus
         .store
-        .enrichment(Some(&artifact.capture.id), "synthetic1000", "1.2.3")
+        .selected_enrichment(Some(&selection), "synthetic1000", "1.2.3")
         .await
         .unwrap();
     assert_eq!(
@@ -344,7 +345,8 @@ async fn metadata_envelope_regression(corpus: &CrateCorpus) {
         .prepare_snapshot(&inventory.id, unix_now())
         .await
         .unwrap()
-        .enrichment;
+        .enrichment_selection();
+    assert_eq!(before, Some(selection));
     let mut corrupt = bytes;
     let n = corrupt.len();
     corrupt[n - 8] ^= 0x40;
@@ -374,7 +376,7 @@ async fn metadata_envelope_regression(corpus: &CrateCorpus) {
             .prepare_snapshot(&inventory.id, unix_now())
             .await
             .unwrap()
-            .enrichment,
+            .enrichment_selection(),
         before
     );
 }

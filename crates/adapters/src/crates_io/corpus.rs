@@ -584,6 +584,7 @@ impl CrateCorpus {
             s.inventory.id == provisional.inventory.id
                 && s.content_sequence == provisional.content_sequence
                 && s.enrichment == provisional.enrichment
+                && s.enrichment_derivation == provisional.enrichment_derivation
                 && !s.index_manifest.is_null()
         });
         let index = if let Some(existing) = reusable {

@@ -80,15 +80,43 @@ pub struct ContentDeltaQuery {
     pub limit: usize,
 }
 
+/// Private immutable processor selection; public citations continue naming the raw capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnrichmentSelection {
+    pub capture: String,
+    pub derivation: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub id: String,
     pub inventory: Inventory,
     pub content_sequence: i64,
     pub enrichment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment_derivation: Option<String>,
     pub index_manifest: Value,
     pub coverage: Value,
     pub created_at: i64,
+}
+
+impl Snapshot {
+    pub fn enrichment_selection(&self) -> Option<EnrichmentSelection> {
+        self.enrichment.as_ref().map(|capture| EnrichmentSelection {
+            capture: capture.clone(),
+            derivation: self.enrichment_derivation.clone(),
+        })
+    }
+
+    /// Preserve the public status shape while persisting the private processor binding.
+    pub fn public_value(&self) -> Result<Value> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|_| devres_domain::Error::integrity("Invalid snapshot serialization."))?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("enrichment_derivation");
+        }
+        Ok(value)
+    }
 }
 
 /// All batches are bounded. Expensive I/O and source parsing happen outside transactions.
@@ -188,6 +216,64 @@ pub trait CrateCorpusStore: Send + Sync {
     ) -> Result<()>;
     async fn commit_enrichment(&self, artifact: &str) -> Result<()>;
     async fn enrichment(&self, artifact: Option<&str>, name: &str, version: &str) -> Result<Value>;
+    /// Private closed parser metadata only; adapters validate its versioned representation.
+    async fn record_dump_failure(&self, _artifact: &str, _diagnostic: &Value) -> Result<()> {
+        Ok(())
+    }
+    async fn put_selected_enrichment(
+        &self,
+        selection: &EnrichmentSelection,
+        kind: &str,
+        rows: &[(String, Value)],
+    ) -> Result<()> {
+        if selection.derivation.is_some() {
+            return Err(devres_domain::Error::unavailable(
+                "Versioned enrichment storage is unavailable.",
+            ));
+        }
+        self.put_enrichment(&selection.capture, kind, rows).await
+    }
+    async fn commit_selected_enrichment(
+        &self,
+        selection: &EnrichmentSelection,
+        _summary: &Value,
+    ) -> Result<()> {
+        if selection.derivation.is_some() {
+            return Err(devres_domain::Error::unavailable(
+                "Versioned enrichment storage is unavailable.",
+            ));
+        }
+        self.commit_enrichment(&selection.capture).await
+    }
+    async fn commit_selected_enrichment_with_cancel(
+        &self,
+        selection: &EnrichmentSelection,
+        summary: &Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        tokio::select! { biased;
+            _ = cancel.cancelled() => Err(devres_domain::Error::new("cancelled", "Enrichment publication canceled.")),
+            result = self.commit_selected_enrichment(selection, summary) => result,
+        }
+    }
+    async fn selected_enrichment(
+        &self,
+        selection: Option<&EnrichmentSelection>,
+        name: &str,
+        version: &str,
+    ) -> Result<Value> {
+        if selection.is_some_and(|selection| selection.derivation.is_some()) {
+            return Err(devres_domain::Error::unavailable(
+                "Versioned enrichment storage is unavailable.",
+            ));
+        }
+        self.enrichment(
+            selection.map(|selection| selection.capture.as_str()),
+            name,
+            version,
+        )
+        .await
+    }
     async fn publish_snapshot(
         &self,
         inventory: &str,

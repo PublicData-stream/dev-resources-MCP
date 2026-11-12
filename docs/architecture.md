@@ -86,7 +86,7 @@ archive capture; checksum verification precedes archive parsing.
 
 ## BLAKE3 enforcement and schema 10
 
-Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 14. Schemas 1–9 require explicit
+Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 15. Schemas 1–9 require explicit
 private offline migration; serving rejects pre-10 schemas or pending migration.
 The maintenance path first excludes readers and writer with the lifecycle fence,
 then acquires the exclusive writer fence before any provider

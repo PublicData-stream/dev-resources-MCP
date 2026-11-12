@@ -16,6 +16,7 @@ pub(crate) struct FixtureStore {
     pub captures: HashMap<String, StoredCapture>,
     pub artifacts: Mutex<HashMap<String, Artifact>>,
     pub artifact_reads: AtomicU64,
+    enrichment_failure: Mutex<Option<Error>>,
 }
 fn unused<T>() -> Result<T> {
     Err(Error::unavailable("Unused fixture operation."))
@@ -164,6 +165,30 @@ impl CrateCorpusStore for FixtureStore {
     async fn commit_enrichment(&self, _: &str) -> Result<()> {
         unused()
     }
+    async fn selected_enrichment(
+        &self,
+        selection: Option<&devres_application::crate_corpus::EnrichmentSelection>,
+        name: &str,
+        version: &str,
+    ) -> Result<Value> {
+        if let Some(error) = self
+            .enrichment_failure
+            .lock()
+            .map_err(|_| unavailable())?
+            .clone()
+        {
+            return Err(error);
+        }
+        if let Some(selection) = selection {
+            crate::crates_io::enrichment::validate_selection(selection)?;
+        }
+        self.enrichment(
+            selection.map(|selection| selection.capture.as_str()),
+            name,
+            version,
+        )
+        .await
+    }
     async fn enrichment(&self, _: Option<&str>, _: &str, _: &str) -> Result<Value> {
         Ok(
             json!({"crate":{"description":"synthetic package transport"},"version":{"license":"MIT"},"keywords":["network"],"categories":["development-tools"]}),
@@ -225,6 +250,7 @@ pub(crate) fn fixture() -> Arc<FixtureStore> {
         inventory,
         content_sequence: 1,
         enrichment: Some("d".repeat(64)),
+        enrichment_derivation: None,
         index_manifest: Value::Null,
         coverage: json!({"inventory_complete":true}),
         created_at: now,
@@ -346,6 +372,7 @@ pub(crate) fn fixture() -> Arc<FixtureStore> {
         captures,
         artifacts: Mutex::new(artifacts),
         artifact_reads: AtomicU64::new(0),
+        enrichment_failure: Mutex::new(None),
     })
 }
 
@@ -903,4 +930,82 @@ async fn active_and_prepared_readers_survive_historical_cache_eviction() {
             .0,
         prepared
     );
+}
+
+#[tokio::test]
+async fn index_manifest_binds_private_derivation_and_status_omits_it() {
+    let _serial = super::TEST_BUILD.lock().await;
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let store = fixture();
+    let mut snapshot = store.snapshot.lock().unwrap().clone();
+    let legacy = serde_json::to_value(&snapshot).unwrap();
+    assert!(legacy.get("enrichment_derivation").is_none());
+    let raw_capture = snapshot.enrichment.clone().unwrap();
+    snapshot.enrichment_derivation = crate::crates_io::enrichment::selection(&raw_capture)
+        .unwrap()
+        .derivation;
+    let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
+    snapshot.index_manifest = build(
+        store,
+        retrieval,
+        root.path().to_path_buf(),
+        snapshot.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    validate_enrichment_binding(root.path(), &snapshot).unwrap();
+    assert_eq!(snapshot.public_value().unwrap()["enrichment"], raw_capture);
+    assert!(
+        snapshot
+            .public_value()
+            .unwrap()
+            .get("enrichment_derivation")
+            .is_none()
+    );
+    assert!(
+        snapshot
+            .index_manifest
+            .get("enrichment_derivation")
+            .is_none()
+    );
+    let mut mismatched = snapshot.clone();
+    mismatched.enrichment_derivation = Some(hash(b"different processor derivation"));
+    assert!(validate_enrichment_binding(root.path(), &mismatched).is_err());
+    mismatched.enrichment_derivation = None;
+    assert!(validate_enrichment_binding(root.path(), &mismatched).is_err());
+}
+
+#[tokio::test]
+async fn only_typed_enrichment_read_capacity_becomes_a_coverage_gap() {
+    let _serial = super::TEST_BUILD.lock().await;
+    for (error, gap) in [
+        (crate::crates_io::enrichment::read_limit("bytes"), true),
+        (Error::capacity("unclassified capacity"), false),
+        (Error::integrity("bad evidence"), false),
+        (Error::unavailable("storage unavailable"), false),
+    ] {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = fixture();
+        *store.enrichment_failure.lock().unwrap() = Some(error);
+        let snapshot = store.snapshot.lock().unwrap().clone();
+        let retrieval = Arc::new(Retrieval::new(store.clone(), Arc::new(NoNetwork)));
+        let result = build(
+            store,
+            retrieval,
+            root.path().to_path_buf(),
+            snapshot,
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.is_ok(), gap);
+        if let Ok(reference) = result {
+            assert_eq!(reference["skipped_documents"], 2);
+            assert_eq!(reference["complete_search_coverage"], false);
+            assert_eq!(
+                reference["gap_samples"][0]["reason"],
+                "metadata_enrichment_exceeds_2MiB"
+            );
+        }
+    }
 }

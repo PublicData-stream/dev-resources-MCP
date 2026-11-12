@@ -128,6 +128,7 @@ pub struct PgBlobStore {
     reader: bool,
     lifecycle_shared: bool,
     visibility: tokio::sync::OnceCell<visibility::VisibilityRegistry>,
+    enrichment_membership: Mutex<std::collections::BTreeSet<String>>,
     root: PathBuf,
     read_budget: Arc<Semaphore>,
     // A dedicated non-reconnecting connection holds the single-server fence.
@@ -274,7 +275,7 @@ impl PgBlobStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| storage_error())?;
-        if !matches!(version, 11..=14) {
+        if !matches!(version, 11..=15) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
             ));
@@ -408,7 +409,7 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        let schema_upgrade_lock = version < 14 && mode == OpenMode::Serve;
+        let schema_upgrade_lock = version < 15 && mode == OpenMode::Serve;
         if schema_upgrade_lock {
             let exclusive: bool =
                 sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490, 2)")
@@ -417,7 +418,7 @@ impl PgBlobStore {
                     .map_err(|_| storage_error())?;
             if !exclusive {
                 return Err(Error::capacity(
-                    "Stop serving readers before the Wikipedia storage schema upgrade.",
+                    "Stop serving readers before the storage schema upgrade.",
                 ));
             }
         }
@@ -432,7 +433,7 @@ impl PgBlobStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        } else if !(2..=14).contains(&version) {
+        } else if !(2..=15).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -568,11 +569,25 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
         }
+        if version < 15
+            && matches!(
+                mode,
+                OpenMode::Serve
+                    | OpenMode::Maintenance
+                    | OpenMode::Transfer
+                    | OpenMode::RestoreCheck
+            )
+        {
+            sqlx_core::raw_sql::raw_sql(crate_storage::SCHEMA_V15)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
         if matches!(
             mode,
             OpenMode::Serve | OpenMode::Maintenance | OpenMode::Transfer | OpenMode::RestoreCheck
         ) {
-            sqlx_core::query::query("UPDATE devres_schema SET version=14 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=15 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
@@ -654,6 +669,7 @@ impl PgBlobStore {
             reader: false,
             lifecycle_shared: !lifecycle_exclusive,
             visibility: tokio::sync::OnceCell::new(),
+            enrichment_membership: Mutex::new(std::collections::BTreeSet::new()),
             pool,
             root,
             read_budget: Arc::new(Semaphore::new(128)),
@@ -685,6 +701,9 @@ impl PgBlobStore {
         }
         if active {
             store.verify_visibility_registry().await?;
+            if mode == OpenMode::Serve {
+                crate_storage::enrichment_v2::initialize_membership(&store).await?;
+            }
         }
         Ok(store)
     }

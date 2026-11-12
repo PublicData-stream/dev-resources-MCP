@@ -2209,7 +2209,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         let request = FetchRequest {
             key: "rfc:9000".into(),
             url: "https://www.rfc-editor.org/rfc/rfc9000.txt".into(),
@@ -2757,7 +2757,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
             .attribution_claim(&["rfc".into()], now, 0)
