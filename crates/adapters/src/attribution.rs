@@ -35,7 +35,7 @@ impl AttributionAdapter {
     ) -> futures::future::BoxFuture<'a, Result<AttributionGeneration>> {
         Box::pin(async move {
             if depth > 8 {
-                return Err(devres_domain::Error::capacity(
+                return Err(crate::attribution_providers::payload_bound(
                     "Attribution dependency depth exceeded.",
                 ));
             }
@@ -64,7 +64,7 @@ impl AttributionAdapter {
                 return crate::attribution_providers::repair(target, &self.broker, cancel).await;
             };
             if dependencies.is_empty() || dependencies.len() > 128 {
-                return Err(devres_domain::Error::capacity(
+                return Err(crate::attribution_providers::payload_bound(
                     "Attribution dependency bound exceeded.",
                 ));
             }
@@ -85,7 +85,14 @@ impl AttributionAdapter {
                 }
                 let child: AttributionTarget =
                     serde_json::from_value(dependency.clone()).map_err(|_| {
-                        devres_domain::Error::integrity("Invalid attribution dependency.")
+                        AttributionFailure::new(
+                            AttributionPhase::Mapping,
+                            AttributionFailureReason::InvalidEvidence,
+                            AttributionDisposition::Blocked,
+                        )
+                        .attach(devres_domain::Error::integrity(
+                            "Invalid attribution dependency.",
+                        ))
                     })?;
                 let proof = self
                     .repair_source(&child, cancel.child_token(), depth + 1)
@@ -97,7 +104,9 @@ impl AttributionAdapter {
                     .checked_add(bytes.saturating_mul(3))
                     .filter(|n| *n <= 8 * 1024 * 1024)
                     .ok_or_else(|| {
-                        devres_domain::Error::capacity("Attribution proof budget exceeded.")
+                        crate::attribution_providers::payload_bound(
+                            "Attribution proof budget exceeded.",
+                        )
                     })?;
                 generation.notices.extend(proof.notices.clone());
                 generation.receipts.extend(
@@ -109,7 +118,7 @@ impl AttributionAdapter {
                 );
                 generation.receipts.push(serde_json::json!({"kind":"dependency_generation","target":child,"generation":proof}));
                 if generation.notices.len() > 128 || generation.receipts.len() > 256 {
-                    return Err(devres_domain::Error::capacity(
+                    return Err(crate::attribution_providers::payload_bound(
                         "Attribution proof count exceeded.",
                     ));
                 }
@@ -152,10 +161,15 @@ impl AttributionAcquirer for AttributionAdapter {
                 target,
             )?
             .ok_or_else(|| {
-                devres_domain::Error::new(
+                AttributionFailure::new(
+                    AttributionPhase::Mapping,
+                    AttributionFailureReason::UnsupportedSource,
+                    AttributionDisposition::Blocked,
+                )
+                .attach(devres_domain::Error::new(
                     "attribution_blocked",
                     "Retained attribution source mapping is incomplete.",
-                )
+                ))
             })?;
             let mut generation = self.repair_source(&compiled, cancel, 0).await?;
             // The original sealed occurrence stays the job identity. The compiler's

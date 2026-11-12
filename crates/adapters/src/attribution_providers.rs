@@ -4,8 +4,9 @@ use crate::bulk::{BulkBroker, BulkRequest, BulkSource};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use devres_application::Fetcher;
 use devres_domain::attribution::{
-    ATTRIBUTION_POLICY_EPOCH, ATTRIBUTION_POLICY_FINGERPRINT, AttributionGeneration,
-    AttributionNotice, AttributionSubject, AttributionTarget,
+    ATTRIBUTION_POLICY_EPOCH, ATTRIBUTION_POLICY_FINGERPRINT, AttributionDisposition,
+    AttributionFailure, AttributionFailureReason, AttributionGeneration, AttributionNotice,
+    AttributionPhase, AttributionSubject, AttributionTarget,
 };
 use devres_domain::{Error, Result, Validators};
 use futures::StreamExt as _;
@@ -82,8 +83,9 @@ impl AttributionSource {
             } => {
                 repository.validate()?;
                 let identity = repository.source_url();
-                let identity = identity.strip_prefix("https://github.com/")
-                    .ok_or_else(|| Error::unavailable("Exact historical Git source requires its qualified repository transport."))?;
+                let identity = identity
+                    .strip_prefix("https://github.com/")
+                    .ok_or_else(unsupported)?;
                 let identity = identity.trim_end_matches(".git");
                 crate::whatwg::git::Repo::new(identity)?;
                 (identity.to_owned(), revision, path)
@@ -143,10 +145,138 @@ impl AttributionSource {
 }
 
 fn invalid() -> Error {
-    Error::invalid("Invalid attribution source identity.")
+    AttributionFailure::new(
+        AttributionPhase::Mapping,
+        AttributionFailureReason::InvalidEvidence,
+        AttributionDisposition::Blocked,
+    )
+    .attach(Error::invalid("Invalid attribution source identity."))
 }
 fn incomplete() -> Error {
-    Error::unavailable("Exact source or applicable notice evidence is unavailable.")
+    AttributionFailure::new(
+        AttributionPhase::Qualification,
+        AttributionFailureReason::MissingNotice,
+        AttributionDisposition::Blocked,
+    )
+    .attach(Error::unavailable(
+        "Exact source or applicable notice evidence is unavailable.",
+    ))
+}
+fn invalid_evidence() -> Error {
+    AttributionFailure::new(
+        AttributionPhase::Qualification,
+        AttributionFailureReason::InvalidEvidence,
+        AttributionDisposition::Blocked,
+    )
+    .attach(Error::integrity(
+        "Attribution source evidence is malformed.",
+    ))
+}
+pub(crate) fn payload_bound(message: impl Into<String>) -> Error {
+    AttributionFailure::new(
+        AttributionPhase::Qualification,
+        AttributionFailureReason::PayloadBound,
+        AttributionDisposition::Blocked,
+    )
+    .attach(Error::capacity(message))
+}
+fn source_mismatch(message: impl Into<String>) -> Error {
+    AttributionFailure::new(
+        AttributionPhase::Qualification,
+        AttributionFailureReason::SourceMismatch,
+        AttributionDisposition::Blocked,
+    )
+    .attach(Error::integrity(message))
+}
+fn unqualified() -> Error {
+    AttributionFailure::new(
+        AttributionPhase::Qualification,
+        AttributionFailureReason::UnqualifiedScope,
+        AttributionDisposition::Blocked,
+    )
+    .attach(Error::unavailable(
+        "Applicable source notice scope is unqualified.",
+    ))
+}
+fn unsupported() -> Error {
+    AttributionFailure::new(
+        AttributionPhase::Mapping,
+        AttributionFailureReason::UnsupportedSource,
+        AttributionDisposition::Blocked,
+    )
+    .attach(Error::unavailable(
+        "Exact attribution source mapping is unsupported.",
+    ))
+}
+fn acquisition_error(error: Error) -> Error {
+    if AttributionFailure::from_error(&error).is_some() {
+        return error;
+    }
+    let payload_limit = devres_application::collection::context(&error)
+        .and_then(|context| context.limit)
+        .is_some_and(|limit| {
+            matches!(
+                limit.kind,
+                devres_application::collection::LimitKind::CompressedBytes
+                    | devres_application::collection::LimitKind::ExpandedBytes
+                    | devres_application::collection::LimitKind::ArtifactBytes
+            )
+        });
+    let (reason, disposition) = match error.code.as_str() {
+        "cancelled" => (
+            AttributionFailureReason::Cancelled,
+            AttributionDisposition::Cancelled,
+        ),
+        "capacity" if payload_limit => (
+            AttributionFailureReason::PayloadBound,
+            AttributionDisposition::Blocked,
+        ),
+        "capacity" => (
+            AttributionFailureReason::Unclassified,
+            AttributionDisposition::Retry,
+        ),
+        "integrity" | "invalid_input" => (
+            AttributionFailureReason::InvalidEvidence,
+            AttributionDisposition::Blocked,
+        ),
+        "not_found" => (
+            AttributionFailureReason::SourceGone,
+            AttributionDisposition::Blocked,
+        ),
+        _ => (
+            AttributionFailureReason::UpstreamUnavailable,
+            AttributionDisposition::Retry,
+        ),
+    };
+    AttributionFailure::new(AttributionPhase::Acquisition, reason, disposition).attach(error)
+}
+pub(crate) fn qualification_error(error: Error) -> Error {
+    if AttributionFailure::from_error(&error).is_some() {
+        return error;
+    }
+    let (reason, disposition) = match error.code.as_str() {
+        "cancelled" => (
+            AttributionFailureReason::Cancelled,
+            AttributionDisposition::Cancelled,
+        ),
+        "capacity" => (
+            AttributionFailureReason::PayloadBound,
+            AttributionDisposition::Blocked,
+        ),
+        "unavailable" => (
+            AttributionFailureReason::Unclassified,
+            AttributionDisposition::Retry,
+        ),
+        "not_found" => (
+            AttributionFailureReason::SourceGone,
+            AttributionDisposition::Blocked,
+        ),
+        _ => (
+            AttributionFailureReason::InvalidEvidence,
+            AttributionDisposition::Blocked,
+        ),
+    };
+    AttributionFailure::new(AttributionPhase::Qualification, reason, disposition).attach(error)
 }
 fn oid(s: &str) -> bool {
     s.len() == 40
@@ -253,9 +383,7 @@ fn targets_v1(source: &str, value: &Value) -> Result<Vec<AttributionTarget>> {
 /// Only an object's own exact source/capture may cover its child fields.
 fn validate_coverage(source: &str, value: &Value, inherited: bool, depth: usize) -> Result<()> {
     if depth > 24 {
-        return Err(Error::capacity(
-            "Attribution content nesting bound exceeded.",
-        ));
+        return Err(payload_bound("Attribution content nesting bound exceeded."));
     }
     match value {
         Value::Object(map) => {
@@ -480,7 +608,7 @@ fn visit(
     out: &mut BTreeMap<String, AttributionTarget>,
 ) -> Result<()> {
     if depth > 24 || out.len() > MAX_TARGETS {
-        return Err(Error::capacity("Attribution subject bound exceeded."));
+        return Err(payload_bound("Attribution subject bound exceeded."));
     }
     match value {
         Value::Object(map) => {
@@ -574,7 +702,7 @@ fn visit(
         }
         Value::Array(items) => {
             if items.len() > 1000 {
-                return Err(Error::capacity("Attribution result bound exceeded."));
+                return Err(payload_bound("Attribution result bound exceeded."));
             }
             for child in items {
                 visit(source, child, inherited, depth + 1, out)?;
@@ -921,7 +1049,7 @@ fn normalize_candidate(p: &str, data: &Value, context: Option<(&str, &str)>) -> 
 }
 
 fn git_source(p: &str, source: &Value, path: &str) -> Result<AttributionSource> {
-    let url = string(source, "source_url").ok_or_else(incomplete)?;
+    let url = string(source, "source_url").ok_or_else(unsupported)?;
     let parsed = url::Url::parse(url).map_err(|_| invalid())?;
     let parts = parsed
         .path()
@@ -930,9 +1058,9 @@ fn git_source(p: &str, source: &Value, path: &str) -> Result<AttributionSource> 
         .collect::<Vec<_>>();
     let revision = string(source, "revision")
         .or_else(|| parts.get(3).copied().filter(|x| oid(x)))
-        .ok_or_else(incomplete)?;
+        .ok_or_else(unsupported)?;
     if !oid(revision) {
-        return Err(incomplete());
+        return Err(unsupported());
     }
     let repository = string(source, "repository")
         .map(str::to_owned)
@@ -943,12 +1071,12 @@ fn git_source(p: &str, source: &Value, path: &str) -> Result<AttributionSource> 
                 None
             }
         })
-        .ok_or_else(incomplete)?;
+        .ok_or_else(unsupported)?;
     match p {
         "mdn" => {
             let compatibility = matches!(repository.as_str(), "compat" | "mdn/browser-compat-data");
             if !compatibility && !matches!(repository.as_str(), "content" | "mdn/content") {
-                return Err(incomplete());
+                return Err(unsupported());
             }
             Ok(AttributionSource::Mdn {
                 compatibility,
@@ -972,14 +1100,14 @@ fn git_source(p: &str, source: &Value, path: &str) -> Result<AttributionSource> 
             revision: revision.into(),
             path: path.into(),
         }),
-        _ => Err(incomplete()),
+        _ => Err(unsupported()),
     }
 }
 fn source_path(source: &Value) -> Result<String> {
     if let Some(path) = string(source, "source_path").or_else(|| string(source, "path")) {
         return Ok(path.into());
     }
-    let url = url::Url::parse(string(source, "source_url").ok_or_else(incomplete)?)
+    let url = url::Url::parse(string(source, "source_url").ok_or_else(unsupported)?)
         .map_err(|_| invalid())?;
     let parts = url
         .path()
@@ -993,7 +1121,7 @@ fn source_path(source: &Value) -> Result<String> {
     {
         return Ok(parts[4..].join("/"));
     }
-    Err(incomplete())
+    Err(unsupported())
 }
 
 async fn acquire(
@@ -1001,21 +1129,7 @@ async fn acquire(
     source: BulkSource,
     cancel: CancellationToken,
 ) -> Result<(Vec<u8>, Value)> {
-    acquire_exact(broker, source, None, cancel).await
-}
-fn expected_hash(source: &Value) -> Option<&str> {
-    string(source, "body_hash")
-        .or_else(|| string(source, "oid"))
-        .or_else(|| string(source, "sha256"))
-}
-async fn acquire_exact(
-    broker: &BulkBroker,
-    source: BulkSource,
-    expected: Option<&str>,
-    cancel: CancellationToken,
-) -> Result<(Vec<u8>, Value)> {
-    let url = source.url()?;
-    let fixed_git_notice = matches!(
+    let validation = if matches!(
         &source,
         BulkSource::Attribution(
             AttributionSource::Mdn { .. }
@@ -1023,13 +1137,104 @@ async fn acquire_exact(
                 | AttributionSource::Whatwg { .. }
                 | AttributionSource::W3c { .. }
         )
-    );
-    let cache_key = expected
-        .map(|hash| format!("{url}#expected={hash}"))
-        .or_else(|| fixed_git_notice.then(|| url.clone()));
+    ) {
+        EvidenceValidation::GitNotice
+    } else {
+        EvidenceValidation::Uncached
+    };
+    acquire_exact(broker, source, validation, cancel).await
+}
+
+/// Validation describes the source representation, separately from its transport
+/// encoding. Only validated bytes enter the current-policy receipt cache.
+enum EvidenceValidation<'a> {
+    Raw(&'a Value),
+    Git(&'a Value),
+    Chromium {
+        component: &'a str,
+        source: &'a Value,
+    },
+    Npm(&'a Value),
+    GitNotice,
+    Uncached,
+}
+impl EvidenceValidation<'_> {
+    fn identity(&self) -> Value {
+        match self {
+            Self::Raw(source) => {
+                json!({"kind":"raw","body_hash":source["body_hash"],"sha256":source["sha256"],"oid":source["oid"]})
+            }
+            Self::Git(source) => {
+                json!({"kind":"git","body_hash":source["body_hash"],"sha256":source["sha256"],"oid":source["oid"]})
+            }
+            Self::Chromium { component, source } => {
+                json!({"kind":"chromium","component":component,"body_hash":source["body_hash"],"oid":source["oid"]})
+            }
+            Self::Npm(manifest) => {
+                json!({"kind":"npm","integrity":manifest["dist"]["integrity"],"shasum":manifest["dist"]["shasum"]})
+            }
+            Self::GitNotice => json!({"kind":"fixed_git_notice"}),
+            Self::Uncached => Value::Null,
+        }
+    }
+    fn check(&self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Raw(source) => verify_hash(bytes, source),
+            Self::Git(source) => {
+                let decoded = decode_git(bytes.to_vec(), string(source, "oid"))?;
+                verify_hash(&decoded, source)
+            }
+            Self::Chromium { component, source } => {
+                let oid = string(source, "oid").ok_or_else(unsupported)?;
+                let decoded = crate::chromium::source::decode_blob(component, bytes, oid)
+                    .map_err(|error| source_mismatch(error.message))?;
+                verify_hash(&decoded, source)
+            }
+            Self::Npm(manifest) => crate::npm::processing::verify_integrity(bytes, manifest)
+                .map(|_| ())
+                .map_err(|error| source_mismatch(error.message)),
+            Self::GitNotice => {
+                let decoded = decode_git(bytes.to_vec(), None)?;
+                notice("", &decoded, None, Value::Null).map(|_| ())
+            }
+            Self::Uncached => Ok(()),
+        }
+    }
+}
+fn acquisition_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(acquisition_error(Error::new(
+            "cancelled",
+            "Attribution acquisition canceled.",
+        )));
+    }
+    Ok(())
+}
+async fn acquire_exact(
+    broker: &BulkBroker,
+    source: BulkSource,
+    validation: EvidenceValidation<'_>,
+    cancel: CancellationToken,
+) -> Result<(Vec<u8>, Value)> {
+    acquisition_cancelled(&cancel)?;
+    let url = source.url().map_err(acquisition_error)?;
+    let cache_key = if matches!(validation, EvidenceValidation::Uncached) {
+        None
+    } else {
+        Some(format!(
+            "{url}#validation={}",
+            crate::integrity::canonical_hash(&validation.identity())?
+        ))
+    };
     if let Some(key) = &cache_key
         && let Some(cached) = broker.attribution_cached(key).await
     {
+        acquisition_cancelled(&cancel)?;
+        if let Err(error) = validation.check(&cached.0).map_err(qualification_error) {
+            broker.attribution_uncache(key).await;
+            return Err(error);
+        }
+        acquisition_cancelled(&cancel)?;
         return Ok(cached);
     }
     let response = broker
@@ -1043,46 +1248,50 @@ async fn acquire_exact(
             },
             cancel.clone(),
         )
-        .await?;
+        .await
+        .map_err(acquisition_error)?;
     // No validators are sent by this path: missing evidence always needs 200.
     if matches!(response.status, 404 | 410) {
-        return Err(Error::not_found(
+        return Err(acquisition_error(Error::not_found(
             "Exact historical source is no longer available upstream.",
-        ));
+        )));
     }
     if response.status != 200 {
-        return Err(incomplete());
+        return Err(acquisition_error(Error::unavailable(
+            "Attribution upstream response is unavailable.",
+        )));
     }
     let mut stream = response.stream;
     let mut bytes = Vec::new();
     while let Some(chunk) = tokio::select! {biased;_=cancel.cancelled()=>return Err(Error::new("cancelled","Attribution acquisition canceled.")),v=stream.next()=>v}
     {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(acquisition_error)?;
         if chunk.len() > MAX_SOURCE.saturating_sub(bytes.len()) {
-            return Err(Error::capacity(
-                "Attribution source exceeds its byte bound.",
-            ));
+            return Err(payload_bound("Attribution source exceeds its byte bound."));
         }
         bytes.extend_from_slice(&chunk);
     }
+    validation.check(&bytes).map_err(qualification_error)?;
+    acquisition_cancelled(&cancel)?;
     let receipt = json!({"version":1,"source_url":url,"status":200,"body_hash":crate::integrity::hash(&bytes),"validated_at":devres_domain::unix_now(),"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT});
     if let Some(key) = cache_key {
         broker.attribution_cache(&key, &bytes, &receipt).await;
     }
+    acquisition_cancelled(&cancel)?;
     Ok((bytes, receipt))
 }
 fn decode_git(bytes: Vec<u8>, expected: Option<&str>) -> Result<Vec<u8>> {
     // GitHub may send its JSON envelope despite the raw-media Accept header.
     let bytes = if let Ok(data) = serde_json::from_slice::<Value>(&bytes) {
         if data["encoding"] == "base64" {
-            let content = data["content"].as_str().ok_or_else(incomplete)?;
+            let content = data["content"].as_str().ok_or_else(invalid_evidence)?;
             let compact = content
                 .bytes()
                 .filter(|b| !b.is_ascii_whitespace())
                 .collect::<Vec<_>>();
-            STANDARD
-                .decode(compact)
-                .map_err(|_| Error::integrity("Malformed Git source encoding."))?
+            STANDARD.decode(compact).map_err(|_| {
+                qualification_error(Error::integrity("Malformed Git source encoding."))
+            })?
         } else {
             bytes
         }
@@ -1092,7 +1301,7 @@ fn decode_git(bytes: Vec<u8>, expected: Option<&str>) -> Result<Vec<u8>> {
     if let Some(expected) = expected
         && (!oid(expected) || crate::chromium::source::object_oid("blob", &bytes) != expected)
     {
-        return Err(Error::integrity(
+        return Err(source_mismatch(
             "Re-requested Git blob does not match retained evidence.",
         ));
     }
@@ -1106,19 +1315,19 @@ fn verify_hash(bytes: &[u8], source: &Value) -> Result<()> {
             crate::archive::sha256(bytes)
         };
         if actual != expected {
-            return Err(Error::integrity(
+            return Err(source_mismatch(
                 "Re-requested source differs from the retained representation.",
             ));
         }
     } else if let Some(expected) = string(source, "sha256") {
         if crate::archive::sha256(bytes) != expected {
-            return Err(Error::integrity(
+            return Err(source_mismatch(
                 "Published package checksum differs from acquired bytes.",
             ));
         }
     } else if let Some(expected) = string(source, "oid") {
         if crate::chromium::source::object_oid("blob", bytes) != expected {
-            return Err(Error::integrity(
+            return Err(source_mismatch(
                 "Re-requested Git object differs from the retained representation.",
             ));
         }
@@ -1133,14 +1342,17 @@ fn notice(
     license: Option<String>,
     evidence: Value,
 ) -> Result<AttributionNotice> {
-    if bytes.is_empty() || bytes.len() > MAX_NOTICE {
-        return Err(Error::capacity(
+    if bytes.is_empty() {
+        return Err(incomplete());
+    }
+    if bytes.len() > MAX_NOTICE {
+        return Err(payload_bound(
             "Required attribution notice exceeds its bound.",
         ));
     }
-    let text = std::str::from_utf8(bytes).map_err(|_| incomplete())?;
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_evidence())?;
     if text.contains('\0') {
-        return Err(incomplete());
+        return Err(invalid_evidence());
     }
     let copyright = text
         .lines()
@@ -1162,9 +1374,18 @@ pub async fn repair(
     broker: &Arc<BulkBroker>,
     cancel: CancellationToken,
 ) -> Result<AttributionGeneration> {
+    repair_inner(target, broker, cancel)
+        .await
+        .map_err(qualification_error)
+}
+async fn repair_inner(
+    target: &AttributionTarget,
+    broker: &Arc<BulkBroker>,
+    cancel: CancellationToken,
+) -> Result<AttributionGeneration> {
     let p = provider(&target.subject.provider)?;
     if target.evidence["version"] != 1 {
-        return Err(incomplete());
+        return Err(unsupported());
     }
     if let Some(dependencies) = target
         .evidence
@@ -1178,7 +1399,7 @@ pub async fn repair(
         let mut receipts = Vec::new();
         for dependency in dependencies {
             let dependency: AttributionTarget =
-                serde_json::from_value(dependency.clone()).map_err(|_| incomplete())?;
+                serde_json::from_value(dependency.clone()).map_err(|_| invalid_evidence())?;
             if dependency.evidence.get("dependencies").is_some() {
                 return Err(incomplete());
             }
@@ -1198,7 +1419,7 @@ pub async fn repair(
             || receipts.len() > 256
             || notices.iter().map(|n| n.text.len()).sum::<usize>() > MAX_NOTICE
         {
-            return Err(Error::capacity("Attribution dependency bound exceeded."));
+            return Err(payload_bound("Attribution dependency bound exceeded."));
         }
         return Ok(AttributionGeneration {
             subject: target.subject.clone(),
@@ -1209,7 +1430,7 @@ pub async fn repair(
         });
     }
     let source = &target.evidence["source"];
-    let source_url = string(source, "source_url").ok_or_else(incomplete)?;
+    let source_url = string(source, "source_url").ok_or_else(unsupported)?;
     if inferred_provider(source).is_some_and(|actual| actual != p) {
         return Err(invalid());
     }
@@ -1222,7 +1443,7 @@ pub async fn repair(
         let (bytes, receipt) = acquire_exact(
             broker,
             BulkSource::Attribution(operation),
-            expected_hash(source),
+            EvidenceValidation::Git(source),
             cancel.clone(),
         )
         .await?;
@@ -1280,7 +1501,7 @@ pub async fn repair(
         }
         notices
     } else if p == "npm" && string(source, "id").is_some_and(valid_advisory_id) {
-        let id = string(source, "id").ok_or_else(incomplete)?;
+        let id = string(source, "id").ok_or_else(unsupported)?;
         let operation = AttributionSource::NpmAdvisory { id: id.into() };
         if operation.url()? != source_url {
             return Err(incomplete());
@@ -1288,15 +1509,15 @@ pub async fn repair(
         let (bytes, receipt) = acquire_exact(
             broker,
             BulkSource::Attribution(operation),
-            expected_hash(source),
+            EvidenceValidation::Raw(source),
             cancel.clone(),
         )
         .await?;
         verify_hash(&bytes, source)?;
         receipts.push(receipt);
-        let original: Value = serde_json::from_slice(&bytes).map_err(|_| incomplete())?;
+        let original: Value = serde_json::from_slice(&bytes).map_err(|_| invalid_evidence())?;
         if original["id"] != id {
-            return Err(Error::integrity(
+            return Err(source_mismatch(
                 "Re-requested advisory identity differs from retained evidence.",
             ));
         }
@@ -1349,7 +1570,7 @@ pub async fn repair(
         let (bytes, receipt) = acquire_exact(
             broker,
             BulkSource::Attribution(operation),
-            expected_hash(source),
+            EvidenceValidation::Raw(source),
             cancel.clone(),
         )
         .await?;
@@ -1380,7 +1601,7 @@ pub async fn repair(
         let (bytes, receipt) = acquire_exact(
             broker,
             BulkSource::W3cPublication(publication.clone()),
-            expected_hash(source),
+            EvidenceValidation::Raw(source),
             cancel.clone(),
         )
         .await?;
@@ -1388,7 +1609,7 @@ pub async fn repair(
         receipts.push(receipt);
         let qualified = crate::w3c::catalog::publication_license(&publication, &bytes);
         if qualified["decision"] != "approved" {
-            return Err(incomplete());
+            return Err(unqualified());
         }
         let text = string(&qualified, "notice").ok_or_else(incomplete)?;
         vec![notice(
@@ -1402,7 +1623,7 @@ pub async fn repair(
         let (bytes, receipt) = acquire_exact(
             broker,
             BulkSource::WhatwgPublication(publication),
-            expected_hash(source),
+            EvidenceValidation::Raw(source),
             cancel.clone(),
         )
         .await?;
@@ -1424,10 +1645,15 @@ pub async fn repair(
         )
         .await?
     } else {
-        return Err(incomplete());
+        return Err(unsupported());
     };
-    if notices.is_empty() || notices.iter().map(|n| n.text.len()).sum::<usize>() > MAX_NOTICE {
+    if notices.is_empty() {
         return Err(incomplete());
+    }
+    if notices.iter().map(|n| n.text.len()).sum::<usize>() > MAX_NOTICE {
+        return Err(payload_bound(
+            "Attribution notices exceed their aggregate bound.",
+        ));
     }
     if cancel.is_cancelled() {
         return Err(Error::new("cancelled", "Attribution repair canceled."));
@@ -1447,7 +1673,7 @@ fn license_paths(p: &str, path: &str, license: &Value) -> Result<Vec<String>> {
         .as_str()
         .is_some_and(|s| s != "approved")
     {
-        return Err(incomplete());
+        return Err(unqualified());
     }
     // Nested scope must name its actual governing path. A root notice is not a
     // substitute for qualified third-party scope.
@@ -1466,7 +1692,7 @@ fn license_paths(p: &str, path: &str, license: &Value) -> Result<Vec<String>> {
             "third_party" | "third-party" | "vendor" | "vendors" | "node_modules"
         )
     }) {
-        return Err(incomplete());
+        return Err(unqualified());
     }
     Ok(vec![
         match p {
@@ -1493,7 +1719,7 @@ fn rfc_source(value: &str) -> Result<AttributionSource> {
     Ok(operation)
 }
 fn rfc_notice(url: &str, bytes: &[u8]) -> Result<AttributionNotice> {
-    let text = std::str::from_utf8(bytes).map_err(|_| incomplete())?;
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_evidence())?;
     let start = text
         .find("Copyright Notice")
         .or_else(|| text.find("Full Copyright Statement"))
@@ -1521,17 +1747,17 @@ fn qualified_retained_notice(
 ) -> Result<AttributionNotice> {
     let evidence = license.get("evidence").unwrap_or(license);
     if evidence["decision"] != "approved" {
-        return Err(incomplete());
+        return Err(unqualified());
     }
     let text = string(evidence, "notice").ok_or_else(incomplete)?;
     // A capped excerpt is never silently accepted as a complete original notice.
     let expected = string(evidence, "notice_hash").ok_or_else(incomplete)?;
     if crate::integrity::hash(text.as_bytes()) != expected {
-        return Err(incomplete());
+        return Err(invalid_evidence());
     }
-    let source_text = std::str::from_utf8(bytes).map_err(|_| incomplete())?;
+    let source_text = std::str::from_utf8(bytes).map_err(|_| invalid_evidence())?;
     if !source_text.contains(text) {
-        return Err(incomplete());
+        return Err(invalid_evidence());
     }
     notice(
         url,
@@ -1553,7 +1779,7 @@ async fn acquire_core(
     broker: &Arc<BulkBroker>,
     cancel: CancellationToken,
 ) -> Result<(Vec<u8>, Value)> {
-    let url = string(source, "source_url").ok_or_else(incomplete)?;
+    let url = string(source, "source_url").ok_or_else(unsupported)?;
     let fetcher = crate::HttpFetcher::with_broker(broker.clone())?;
     let request = devres_domain::FetchRequest {
         key: "attribution:exact-public-source".into(),
@@ -1564,14 +1790,16 @@ async fn acquire_core(
             .unwrap_or("application/json")
             .into(),
     };
-    let response = tokio::select! {biased;_=cancel.cancelled()=>return Err(Error::new("cancelled","Attribution acquisition canceled.")),r=fetcher.fetch(&request,None)=>r?};
+    let response = tokio::select! {biased;_=cancel.cancelled()=>return Err(Error::new("cancelled","Attribution acquisition canceled.")),r=fetcher.fetch(&request,None)=>r.map_err(acquisition_error)?};
     if matches!(response.status, 404 | 410) {
-        return Err(Error::not_found(
+        return Err(acquisition_error(Error::not_found(
             "Exact historical source is no longer available upstream.",
-        ));
+        )));
     }
     if response.status != 200 {
-        return Err(incomplete());
+        return Err(acquisition_error(Error::unavailable(
+            "Attribution upstream response is unavailable.",
+        )));
     }
     let receipt = json!({"version":1,"source_url":url,"status":200,"body_hash":crate::integrity::hash(&response.body),"validated_at":devres_domain::unix_now(),"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT});
     Ok((response.body, receipt))
@@ -1592,7 +1820,12 @@ async fn metadata_dependencies(
     if !matches!(p, "crates" | "npm") {
         return Ok(None);
     }
-    let document = serde_json::from_slice::<Value>(body).ok();
+    let document = match serde_json::from_slice::<Value>(body) {
+        Ok(document) => Some(document),
+        Err(_) if p == "npm" => return Err(invalid_evidence()),
+        // crates.io sparse-index representations are newline-delimited JSON.
+        Err(_) => None,
+    };
     let mut selected = BTreeMap::new();
     if let (Some(name), Some(version)) = (string(source, "name"), string(source, "version")) {
         selected.insert((name.to_owned(), version.to_owned()), ());
@@ -1616,7 +1849,7 @@ async fn metadata_dependencies(
         return Ok(None);
     }
     if selected.len() > 100 {
-        return Err(Error::capacity(
+        return Err(payload_bound(
             "Metadata package dependency count exceeds its bound.",
         ));
     }
@@ -1639,17 +1872,17 @@ async fn metadata_dependencies(
                 let index = json!({"source_url":format!("https://index.crates.io/{}",crate::crates_io::packages::sparse_path(&name)?),"media_type":"text/plain"});
                 let (bytes, receipt) = acquire_core(&index, broker, cancel.clone()).await?;
                 receipts.push(receipt);
-                let text = std::str::from_utf8(&bytes).map_err(|_| incomplete())?;
+                let text = std::str::from_utf8(&bytes).map_err(|_| invalid_evidence())?;
                 for line in text.lines() {
-                    let row: Value = serde_json::from_str(line).map_err(|_| incomplete())?;
+                    let row: Value = serde_json::from_str(line).map_err(|_| invalid_evidence())?;
                     if row["name"] == name && row["vers"] == version {
                         record = Some(row);
                         break;
                     }
                 }
             }
-            let record = record.ok_or_else(incomplete)?;
-            let checksum = string(&record, "cksum").ok_or_else(incomplete)?;
+            let record = record.ok_or_else(unsupported)?;
+            let checksum = string(&record, "cksum").ok_or_else(invalid_evidence)?;
             let archive = json!({"source_url":BulkSource::CrateArchive{name:name.clone(),version:version.clone()}.url()?,"sha256":checksum});
             notices.extend(
                 repair_package("crates", &archive, broker, cancel.clone(), receipts).await?,
@@ -1665,24 +1898,30 @@ async fn metadata_dependencies(
                 let metadata = json!({"source_url":crate::npm::source::Operation::Metadata{name:name.clone()}.url()?,"media_type":"application/json"});
                 let (bytes, receipt) = acquire_core(&metadata, broker, cancel.clone()).await?;
                 receipts.push(receipt);
-                let value: Value = serde_json::from_slice(&bytes).map_err(|_| incomplete())?;
+                let value: Value =
+                    serde_json::from_slice(&bytes).map_err(|_| invalid_evidence())?;
                 manifest = value["versions"].get(&version).cloned();
             }
-            let manifest = manifest.ok_or_else(incomplete)?;
+            let manifest = manifest.ok_or_else(unsupported)?;
             if manifest["name"] != name || manifest["version"] != version {
-                return Err(incomplete());
+                return Err(invalid_evidence());
             }
-            let tarball = string(&manifest["dist"], "tarball").ok_or_else(incomplete)?;
+            let tarball = string(&manifest["dist"], "tarball").ok_or_else(invalid_evidence)?;
             let operation = BulkSource::Npm(crate::npm::source::Operation::Archive {
                 name: name.clone(),
                 version: version.clone(),
                 url: tarball.into(),
             });
-            let expected = string(&manifest["dist"], "integrity")
+            let _expected = string(&manifest["dist"], "integrity")
                 .or_else(|| string(&manifest["dist"], "shasum"))
                 .ok_or_else(incomplete)?;
-            let (bytes, mut receipt) =
-                acquire_exact(broker, operation, Some(expected), cancel.clone()).await?;
+            let (bytes, mut receipt) = acquire_exact(
+                broker,
+                operation,
+                EvidenceValidation::Npm(&manifest),
+                cancel.clone(),
+            )
+            .await?;
             receipt["published_integrity"] =
                 crate::npm::processing::verify_integrity(&bytes, &manifest)?;
             receipts.push(receipt);
@@ -1696,7 +1935,7 @@ async fn metadata_dependencies(
             );
         }
         if notices.len() > 128 || notices.iter().map(|n| n.text.len()).sum::<usize>() > MAX_NOTICE {
-            return Err(Error::capacity(
+            return Err(payload_bound(
                 "Metadata package notices exceed their bound.",
             ));
         }
@@ -1725,15 +1964,15 @@ fn metadata_notice_inner(
     if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
         originals.push(v);
     } else if p == "crates" {
-        let lines = std::str::from_utf8(bytes).map_err(|_| incomplete())?;
+        let lines = std::str::from_utf8(bytes).map_err(|_| invalid_evidence())?;
         for line in lines.lines().filter(|s| !s.trim().is_empty()) {
             if originals.len() >= 100000 {
-                return Err(Error::capacity("Metadata record count bound exceeded."));
+                return Err(payload_bound("Metadata record count bound exceeded."));
             }
-            originals.push(serde_json::from_str(line).map_err(|_| incomplete())?);
+            originals.push(serde_json::from_str(line).map_err(|_| invalid_evidence())?);
         }
     } else if p == "npm" {
-        return Err(incomplete());
+        return Err(invalid_evidence());
     }
     let mut notices = Vec::new();
     for v in &originals {
@@ -1741,7 +1980,7 @@ fn metadata_notice_inner(
     }
     for original in notices {
         if text.len().saturating_add(original.len()) > MAX_NOTICE {
-            return Err(Error::capacity("Metadata notices exceed their byte bound."));
+            return Err(payload_bound("Metadata notices exceed their byte bound."));
         }
         text.push('\n');
         text.push_str(original);
@@ -1761,7 +2000,7 @@ fn metadata_markings<'a>(
     qualified_package: bool,
 ) -> Result<()> {
     if depth > 24 {
-        return Err(Error::capacity("Metadata notice nesting bound exceeded."));
+        return Err(payload_bound("Metadata notice nesting bound exceeded."));
     }
     match value {
         Value::Object(map) => {
@@ -1795,7 +2034,7 @@ fn metadata_markings<'a>(
                 {
                     notices.push(text);
                     if notices.len() > 128 {
-                        return Err(Error::capacity("Metadata notice count bound exceeded."));
+                        return Err(payload_bound("Metadata notice count bound exceeded."));
                     }
                 }
                 if value.is_object() || value.is_array() {
@@ -1819,7 +2058,7 @@ async fn repair_documentation(
     cancel: CancellationToken,
     receipts: &mut Vec<Value>,
 ) -> Result<Vec<AttributionNotice>> {
-    let url = string(source, "source_url").ok_or_else(incomplete)?;
+    let url = string(source, "source_url").ok_or_else(unsupported)?;
     let tail = url
         .strip_prefix("https://docs.rs/crate/")
         .ok_or_else(invalid)?;
@@ -1870,7 +2109,7 @@ async fn repair_documentation(
             version: version.into(),
             operation,
         },
-        expected_hash(source),
+        EvidenceValidation::Raw(source),
         cancel.clone(),
     )
     .await?;
@@ -1891,10 +2130,10 @@ async fn repair_documentation(
         json!({"source_url":format!("https://index.crates.io/{path}"),"media_type":"text/plain"});
     let (index, receipt) = acquire_core(&index, broker, cancel.clone()).await?;
     receipts.push(receipt);
-    let index = std::str::from_utf8(&index).map_err(|_| incomplete())?;
+    let index = std::str::from_utf8(&index).map_err(|_| invalid_evidence())?;
     let mut checksum = None;
     for line in index.lines() {
-        let row: Value = serde_json::from_str(line).map_err(|_| incomplete())?;
+        let row: Value = serde_json::from_str(line).map_err(|_| invalid_evidence())?;
         if row["name"]
             .as_str()
             .is_some_and(|n| n.eq_ignore_ascii_case(name))
@@ -1957,7 +2196,7 @@ async fn repair_package(
     cancel: CancellationToken,
     receipts: &mut Vec<Value>,
 ) -> Result<Vec<AttributionNotice>> {
-    let url = string(source, "source_url").ok_or_else(incomplete)?;
+    let url = string(source, "source_url").ok_or_else(unsupported)?;
     let (operation, root) = if p == "crates" {
         let tail = url
             .strip_prefix("https://static.crates.io/crates/")
@@ -1993,7 +2232,8 @@ async fn repair_package(
             "package".into(),
         )
     };
-    let (bytes, receipt) = acquire_exact(broker, operation, expected_hash(source), cancel).await?;
+    let (bytes, receipt) =
+        acquire_exact(broker, operation, EvidenceValidation::Raw(source), cancel).await?;
     verify_hash(&bytes, source)?;
     receipts.push(receipt);
     let url = url.to_owned();
@@ -2008,38 +2248,48 @@ fn package_notices(
     url: &str,
     selected: Option<&str>,
 ) -> Result<Vec<AttributionNotice>> {
-    let _permit = crate::archive::admit()?;
+    let _permit = crate::archive::admit().map_err(|error| {
+        AttributionFailure::new(
+            AttributionPhase::Qualification,
+            AttributionFailureReason::ParserBusy,
+            AttributionDisposition::Retry,
+        )
+        .attach(error)
+    })?;
     // Existing validation checks every member, path, duplicate, link, expansion
     // and entry bound before a notice is inspected. Nothing is extracted.
-    crate::archive::inspect(bytes, &crate::archive::sha256(bytes), root, None)?;
+    crate::archive::inspect(bytes, &crate::archive::sha256(bytes), root, None)
+        .map_err(qualification_error)?;
     let mut custom = std::collections::BTreeSet::new();
     let mut manifests = tar::Archive::new(flate2::read::MultiGzDecoder::new(bytes));
-    for member in manifests.entries().map_err(|_| incomplete())? {
-        let mut member = member.map_err(|_| incomplete())?;
+    for member in manifests.entries().map_err(|_| invalid_evidence())? {
+        let mut member = member.map_err(|_| invalid_evidence())?;
         let path = member
             .path()
-            .map_err(|_| incomplete())?
+            .map_err(|_| invalid_evidence())?
             .to_str()
-            .ok_or_else(incomplete)?
+            .ok_or_else(invalid_evidence)?
             .to_owned();
         let name = path.rsplit('/').next().unwrap_or_default();
         if !matches!(name, "Cargo.toml" | "Cargo.toml.orig" | "package.json") {
             continue;
         }
         if member.size() > 4 * 1024 * 1024 {
-            return Err(Error::capacity(
+            return Err(payload_bound(
                 "Package manifest exceeds attribution bounds.",
             ));
         }
         let mut text = String::new();
-        member.read_to_string(&mut text).map_err(|_| incomplete())?;
+        member
+            .read_to_string(&mut text)
+            .map_err(|_| invalid_evidence())?;
         let declared = if name == "package.json" {
-            let value: Value = serde_json::from_str(&text).map_err(|_| incomplete())?;
+            let value: Value = serde_json::from_str(&text).map_err(|_| invalid_evidence())?;
             string(&value, "license")
                 .and_then(|s| s.strip_prefix("SEE LICENSE IN "))
                 .map(str::to_owned)
         } else {
-            let value: toml::Value = toml::from_str(&text).map_err(|_| incomplete())?;
+            let value: toml::Value = toml::from_str(&text).map_err(|_| invalid_evidence())?;
             value
                 .get("package")
                 .and_then(|p| p.get("license-file").or_else(|| p.get("license_file")))
@@ -2048,25 +2298,25 @@ fn package_notices(
         };
         if let Some(declared) = declared {
             if !crate::archive::valid_relative_path(&declared) {
-                return Err(incomplete());
+                return Err(invalid_evidence());
             }
             let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or(root);
             custom.insert(format!("{parent}/{declared}"));
             if custom.len() > 128 {
-                return Err(Error::capacity("Package notice path bound exceeded."));
+                return Err(payload_bound("Package notice path bound exceeded."));
             }
         }
     }
     let mut archive = tar::Archive::new(flate2::read::MultiGzDecoder::new(bytes));
     let mut notices = Vec::new();
     let mut total = 0_usize;
-    for member in archive.entries().map_err(|_| incomplete())? {
-        let mut member = member.map_err(|_| incomplete())?;
+    for member in archive.entries().map_err(|_| invalid_evidence())? {
+        let mut member = member.map_err(|_| invalid_evidence())?;
         let path = member
             .path()
-            .map_err(|_| incomplete())?
+            .map_err(|_| invalid_evidence())?
             .to_str()
-            .ok_or_else(incomplete)?
+            .ok_or_else(invalid_evidence)?
             .to_owned();
         let name = path
             .rsplit('/')
@@ -2085,13 +2335,15 @@ fn package_notices(
         if !is_notice && !selected {
             continue;
         }
-        let size = usize::try_from(member.size()).map_err(|_| incomplete())?;
+        let size = usize::try_from(member.size()).map_err(|_| invalid_evidence())?;
         total = total
             .checked_add(size)
             .filter(|n| *n <= MAX_NOTICE)
-            .ok_or_else(|| Error::capacity("Package notices exceed their byte bound."))?;
+            .ok_or_else(|| payload_bound("Package notices exceed their byte bound."))?;
         let mut text = Vec::with_capacity(size);
-        member.read_to_end(&mut text).map_err(|_| incomplete())?;
+        member
+            .read_to_end(&mut text)
+            .map_err(|_| invalid_evidence())?;
         if is_notice {
             notices.push(notice(url,&text,None,json!({"version":1,"archive_hash":crate::integrity::hash(bytes),"path":path,"body_hash":crate::integrity::hash(&text)}))?);
         } else if let Ok(text) = std::str::from_utf8(&text)
@@ -2136,7 +2388,7 @@ fn original_header(text: &str) -> Result<Option<&str>> {
         &start[..end]
     };
     if header.len() > 65536 {
-        return Err(Error::capacity(
+        return Err(payload_bound(
             "Original member notice exceeds its byte bound.",
         ));
     }
@@ -2167,7 +2419,7 @@ fn original_member_notices(text: &str) -> Result<Vec<&str>> {
                 || lower.contains("licensed under")
             {
                 if block.len() > MAX_NOTICE {
-                    return Err(Error::capacity(
+                    return Err(payload_bound(
                         "Original member notice exceeds its byte bound.",
                     ));
                 }
@@ -2186,12 +2438,12 @@ fn original_member_notices(text: &str) -> Result<Vec<&str>> {
             }
             cursor = finish;
             if notices.len() > 128 {
-                return Err(Error::capacity("Original member notice count exceeded."));
+                return Err(payload_bound("Original member notice count exceeded."));
             }
         }
     }
     if notices.iter().map(|n| n.len()).sum::<usize>() > MAX_NOTICE {
-        return Err(Error::capacity(
+        return Err(payload_bound(
             "Original member notices exceed their aggregate bound.",
         ));
     }
@@ -2205,7 +2457,7 @@ async fn repair_chromium(
     cancel: CancellationToken,
     receipts: &mut Vec<Value>,
 ) -> Result<Vec<AttributionNotice>> {
-    let source_url = string(source, "source_url").ok_or_else(incomplete)?;
+    let source_url = string(source, "source_url").ok_or_else(unsupported)?;
     let parsed = url::Url::parse(source_url).map_err(|_| invalid())?;
     if matches!(
         parsed.host_str(),
@@ -2229,16 +2481,16 @@ async fn repair_chromium(
         let (bytes, receipt) = acquire_exact(
             broker,
             BulkSource::Chromium(operation),
-            expected_hash(source),
+            EvidenceValidation::Raw(source),
             cancel,
         )
         .await?;
         verify_hash(&bytes, source)?;
         receipts.push(receipt);
-        let text = std::str::from_utf8(&bytes).map_err(|_| incomplete())?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid_evidence())?;
         let qualified = crate::chromium::corpus::attribution_license(component, text, source_url);
         if qualified["decision"] != "approved" {
-            return Err(incomplete());
+            return Err(unqualified());
         }
         let text = string(&qualified, "notice").ok_or_else(incomplete)?;
         return Ok(vec![notice(
@@ -2248,10 +2500,10 @@ async fn repair_chromium(
             json!({"version":1,"complete_notice_hash":crate::integrity::hash(text.as_bytes()),"source_body_hash":crate::integrity::hash(&bytes),"qualification":qualified}),
         )?]);
     }
-    let component = string(source, "component").ok_or_else(incomplete)?;
-    let revision = string(source, "revision").ok_or_else(incomplete)?;
+    let component = string(source, "component").ok_or_else(unsupported)?;
+    let revision = string(source, "revision").ok_or_else(unsupported)?;
     let path = source_path(source)?;
-    let object = string(source, "oid").ok_or_else(incomplete)?;
+    let object = string(source, "oid").ok_or_else(unsupported)?;
     let operation = crate::chromium::source::Operation::Blob {
         component: component.into(),
         revision: revision.into(),
@@ -2260,7 +2512,7 @@ async fn repair_chromium(
     let (bytes, receipt) = acquire_exact(
         broker,
         BulkSource::Chromium(operation),
-        expected_hash(source),
+        EvidenceValidation::Chromium { component, source },
         cancel.clone(),
     )
     .await?;
@@ -2269,7 +2521,7 @@ async fn repair_chromium(
     receipts.push(receipt);
     let evidence = license.get("evidence").unwrap_or(license);
     if evidence["decision"] != "approved" {
-        return Err(incomplete());
+        return Err(unqualified());
     }
     let notice_url = string(evidence, "source_url").ok_or_else(incomplete)?;
     let parsed = url::Url::parse(notice_url).map_err(|_| invalid())?;
@@ -2302,7 +2554,10 @@ async fn repair_chromium(
     let (bytes, receipt) = acquire_exact(
         broker,
         BulkSource::Chromium(operation),
-        Some(notice_oid),
+        EvidenceValidation::Chromium {
+            component,
+            source: &json!({"oid":notice_oid,"body_hash":evidence["notice_hash"]}),
+        },
         cancel,
     )
     .await?;
@@ -2310,7 +2565,7 @@ async fn repair_chromium(
     if let Some(expected) = string(evidence, "notice_hash")
         && crate::integrity::hash(&bytes) != expected
     {
-        return Err(Error::integrity(
+        return Err(source_mismatch(
             "Re-requested notice differs from retained scope evidence.",
         ));
     }
@@ -2321,6 +2576,317 @@ async fn repair_chromium(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn changing_response(
+        first: Vec<u8>,
+        second: Vec<u8>,
+    ) -> (
+        Arc<BulkBroker>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = axum::Router::new().fallback(move || {
+            let selected = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            async move { selected }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let done = stop.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(done.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        (
+            Arc::new(
+                BulkBroker::fixture(url::Url::parse(&format!("http://{address}")).unwrap())
+                    .unwrap(),
+            ),
+            count,
+            stop,
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn invalid_200_does_not_poison_same_subject_repair_cache() {
+        use std::sync::atomic::Ordering;
+        let original = b"RFC 9000\nCopyright Notice\nCopyright (c) IETF Trust and the persons identified as the document authors. All rights reserved. This document retains its original publication terms and complete required attribution.\nTable of Contents\n";
+        let (broker, count, stop, server) =
+            changing_response(b"wrong historical body".to_vec(), original.to_vec()).await;
+        let target = targets("rfc", &json!({"source_url":"https://www.rfc-editor.org/rfc/rfc9000.txt","body_hash":crate::integrity::hash(original)})).unwrap().pop().unwrap();
+        let error = repair(&target, &broker, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            AttributionFailure::from_error(&error).unwrap().reason,
+            AttributionFailureReason::SourceMismatch
+        );
+        let repaired = repair(&target, &broker, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(repaired.subject, target.subject);
+        assert_eq!(repaired.policy_epoch, ATTRIBUTION_POLICY_EPOCH);
+        assert_eq!(repaired.policy_fingerprint, ATTRIBUTION_POLICY_FINGERPRINT);
+        assert_eq!(
+            repair(&target, &broker, CancellationToken::new())
+                .await
+                .unwrap(),
+            repaired
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_git_envelope_is_not_cached_before_decoded_identity_validation() {
+        use std::sync::atomic::Ordering;
+        let original = b"Original immutable Git document";
+        let encoded =
+            serde_json::to_vec(&json!({"encoding":"base64","content":STANDARD.encode(original)}))
+                .unwrap();
+        let (broker, count, stop, server) = changing_response(
+            br#"{"encoding":"base64","content":"%%%"}"#.to_vec(),
+            encoded.clone(),
+        )
+        .await;
+        let source = json!({"oid":crate::chromium::source::object_oid("blob", original),"body_hash":crate::integrity::hash(original)});
+        let operation = || {
+            BulkSource::Attribution(AttributionSource::Mdn {
+                compatibility: false,
+                revision: "a".repeat(40),
+                path: "files/en-us/example/index.md".into(),
+            })
+        };
+        assert!(
+            acquire_exact(
+                &broker,
+                operation(),
+                EvidenceValidation::Git(&source),
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        let (bytes, receipt) = acquire_exact(
+            &broker,
+            operation(),
+            EvidenceValidation::Git(&source),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, encoded);
+        assert_eq!(decode_git(bytes, string(&source, "oid")).unwrap(), original);
+        assert_eq!(receipt["body_hash"], crate::integrity::hash(&encoded));
+        acquire_exact(
+            &broker,
+            operation(),
+            EvidenceValidation::Git(&source),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn npm_integrity_and_fixed_notice_validation_precede_cache_admission() {
+        use sha1::Digest as _;
+        use std::sync::atomic::Ordering;
+        let original = b"Exact package archive bytes";
+        let (broker, count, stop, server) =
+            changing_response(b"wrong archive".to_vec(), original.to_vec()).await;
+        let manifest = json!({"dist":{"shasum":hex::encode(sha1::Sha1::digest(original))}});
+        let operation = || {
+            BulkSource::Npm(crate::npm::source::Operation::Archive {
+                name: "example".into(),
+                version: "1.0.0".into(),
+                url: "https://registry.npmjs.org/example/-/example-1.0.0.tgz".into(),
+            })
+        };
+        assert!(
+            acquire_exact(
+                &broker,
+                operation(),
+                EvidenceValidation::Npm(&manifest),
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            acquire_exact(
+                &broker,
+                operation(),
+                EvidenceValidation::Npm(&manifest),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap()
+            .0,
+            original
+        );
+        acquire_exact(
+            &broker,
+            operation(),
+            EvidenceValidation::Npm(&manifest),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        stop.cancel();
+        server.await.unwrap();
+
+        let (broker, count, stop, server) =
+            changing_response(Vec::new(), b"Copyright original complete notice".to_vec()).await;
+        let operation = || {
+            BulkSource::Attribution(AttributionSource::Mdn {
+                compatibility: false,
+                revision: "a".repeat(40),
+                path: "LICENSE.md".into(),
+            })
+        };
+        assert!(
+            acquire(&broker, operation(), CancellationToken::new())
+                .await
+                .is_err()
+        );
+        acquire(&broker, operation(), CancellationToken::new())
+            .await
+            .unwrap();
+        acquire(&broker, operation(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn source_hash_modes_and_failure_dispositions_remain_distinct() {
+        let body = b"Exact source";
+        for source in [
+            json!({"body_hash":crate::integrity::hash(body)}),
+            json!({"sha256":crate::archive::sha256(body)}),
+        ] {
+            EvidenceValidation::Raw(&source).check(body).unwrap();
+            let failure = AttributionFailure::from_error(
+                &EvidenceValidation::Raw(&source)
+                    .check(b"changed")
+                    .unwrap_err(),
+            )
+            .unwrap();
+            assert_eq!(failure.reason, AttributionFailureReason::SourceMismatch);
+            assert_eq!(failure.disposition, AttributionDisposition::Blocked);
+        }
+        assert_eq!(
+            AttributionFailure::from_error(
+                &license_paths("whatwg", "third_party/a.idl", &Value::Null).unwrap_err()
+            )
+            .unwrap()
+            .reason,
+            AttributionFailureReason::UnqualifiedScope
+        );
+        let temporary = acquisition_error(Error::unavailable("Source unavailable."));
+        assert_eq!(
+            AttributionFailure::from_error(&temporary)
+                .unwrap()
+                .disposition,
+            AttributionDisposition::Retry
+        );
+        let gone = acquisition_error(Error::not_found("Exact source gone."));
+        assert_eq!(
+            AttributionFailure::from_error(&gone).unwrap().reason,
+            AttributionFailureReason::SourceGone
+        );
+        assert_eq!(
+            AttributionFailure::from_error(&payload_bound("Immutable notice exceeds bound."))
+                .unwrap()
+                .disposition,
+            AttributionDisposition::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_acquisition_cannot_reuse_a_cached_generation_input() {
+        use std::sync::atomic::Ordering;
+        let body = b"Exact immutable bytes";
+        let (broker, count, stop, server) = changing_response(body.to_vec(), body.to_vec()).await;
+        let source = json!({"body_hash":crate::integrity::hash(body)});
+        let operation = || {
+            BulkSource::Attribution(AttributionSource::Rfc {
+                number: 9000,
+                format: "txt".into(),
+            })
+        };
+        acquire_exact(
+            &broker,
+            operation(),
+            EvidenceValidation::Raw(&source),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = acquire_exact(
+            &broker,
+            operation(),
+            EvidenceValidation::Raw(&source),
+            cancel,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            AttributionFailure::from_error(&error).unwrap().disposition,
+            AttributionDisposition::Cancelled
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_advisory_and_invalid_notice_encoding_are_not_missing_notices() {
+        let malformed = b"{";
+        let (broker, _, stop, server) =
+            changing_response(malformed.to_vec(), malformed.to_vec()).await;
+        let target = targets("npm", &json!({"id":"GHSA-aaaa-bbbb-cccc","source_url":"https://osv-vulnerabilities.storage.googleapis.com/npm/GHSA-aaaa-bbbb-cccc.json","body_hash":crate::integrity::hash(malformed),"license":"CC-BY-4.0","url":"https://github.com/advisories/GHSA-aaaa-bbbb-cccc"})).unwrap().pop().unwrap();
+        let error = repair(&target, &broker, CancellationToken::new())
+            .await
+            .unwrap_err();
+        let failure = AttributionFailure::from_error(&error).unwrap();
+        assert_eq!(failure.reason, AttributionFailureReason::InvalidEvidence);
+        assert_eq!(failure.disposition, AttributionDisposition::Blocked);
+        let error =
+            notice("https://example.invalid/notice", &[0xff], None, Value::Null).unwrap_err();
+        assert_eq!(
+            AttributionFailure::from_error(&error).unwrap().reason,
+            AttributionFailureReason::InvalidEvidence
+        );
+        let error = notice("https://example.invalid/notice", b"", None, Value::Null).unwrap_err();
+        assert_eq!(
+            AttributionFailure::from_error(&error).unwrap().reason,
+            AttributionFailureReason::MissingNotice
+        );
+        stop.cancel();
+        server.await.unwrap();
+    }
     #[test]
     fn wikipedia_exact_article_evidence_covers_only_its_own_copied_content() {
         let capture = json!({"id":crate::integrity::hash(b"wiki capture"),"page_id":12,"revision_id":34,"representation":"html","source_url":"https://en.wikipedia.org/w/rest.php/v1/page/RISC-V/with_html?redirect=no","body_hash":crate::integrity::hash(b"wiki raw")});
@@ -2488,6 +3054,78 @@ mod tests {
                 .unwrap();
         }
         archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn package_parser_contention_retries_but_missing_notices_remain_blocked() {
+        const CHILD_GUARD: &str = "DEVRES_ATTRIBUTION_PARSER_FIXTURE_CHILD";
+        if std::env::var_os(CHILD_GUARD).as_deref() != Some(std::ffi::OsStr::new("isolated")) {
+            let module = module_path!().split_once("::").unwrap().1;
+            let test = format!(
+                "{module}::package_parser_contention_retries_but_missing_notices_remain_blocked"
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD_GUARD, "isolated")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated parser fixture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Reserve the actual shared parser slots, waiting for other fixture
+        // parsers to finish rather than depending on test execution order.
+        let mut permits = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while permits.len() < 2 {
+                if let Ok(permit) = crate::archive::admit() {
+                    permits.push(permit);
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let bytes = archive_fixture(&[(
+            "example-1.0.0/README.md",
+            "Source documentation without a required license notice",
+        )]);
+        let error = package_notices(
+            &bytes,
+            "example-1.0.0",
+            "https://static.crates.io/crates/example/example-1.0.0.crate",
+            None,
+        )
+        .unwrap_err();
+        let failure = AttributionFailure::from_error(&error).unwrap();
+        assert_eq!(failure.reason, AttributionFailureReason::ParserBusy);
+        assert_eq!(failure.disposition, AttributionDisposition::Retry);
+        drop(permits);
+        let failure = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let error = package_notices(
+                    &bytes,
+                    "example-1.0.0",
+                    "https://static.crates.io/crates/example/example-1.0.0.crate",
+                    None,
+                )
+                .unwrap_err();
+                let failure = AttributionFailure::from_error(&error).unwrap();
+                if failure.reason != AttributionFailureReason::ParserBusy {
+                    break failure;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failure.reason, AttributionFailureReason::MissingNotice);
+        assert_eq!(failure.disposition, AttributionDisposition::Blocked);
     }
 
     #[test]

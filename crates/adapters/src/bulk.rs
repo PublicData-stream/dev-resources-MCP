@@ -473,6 +473,17 @@ impl BulkBroker {
         cache.push_back((key, body.to_vec(), receipt.clone()));
     }
 
+    pub(crate) async fn attribution_uncache(&self, url: &str) {
+        let key = format!(
+            "{}:{url}",
+            devres_domain::attribution::ATTRIBUTION_POLICY_FINGERPRINT
+        );
+        self.attribution_cache
+            .lock()
+            .await
+            .retain(|(id, _, _)| id != &key);
+    }
+
     /// Configure only npm provider clocks, preserving all existing provider policy.
     pub fn with_npm_rates(mut self, registry: u32, advisory: u32) -> Result<Self> {
         if !(1..=1000).contains(&registry) || !(1..=1000).contains(&advisory) {
