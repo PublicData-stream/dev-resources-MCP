@@ -4,7 +4,7 @@
 collectors or listeners, acquiring writer authority, or making provider requests.
 Supply reader-only database/S3 credentials through a private configuration file.
 Neither configuration nor arbitrary upstream text enters the report. This command
-supports active schema 14 and 15 so diagnosis can precede a rollout.
+supports active schemas 14 through 16 so diagnosis can precede a rollout.
 
 ```sh
 devres-server diagnose-collection /etc/devres/reader.toml \
@@ -25,7 +25,10 @@ latest failure and referenced candidate pages, and verifies their ancestry.
 S3 reads check committed archive bindings and object identities without attaching
 the archive cache. Filesystem reads never materialize remote objects. Reports
 are limited to 1 MiB and contain closed classifications and public evidence IDs.
-Budget exhaustion and unavailable attempted bytes are explicit incomplete outcomes.
+Cooperative byte/time budget exhaustion and unavailable attempted bytes produce
+explicit incomplete outcomes. If initialization cannot finish or a dependency
+cannot stop before the hard deadline, the command instead returns a typed error
+and leaves no completed report; an already-created output file can be empty.
 An incomplete report does not establish parser compatibility or corpus integrity.
 
 Use `--provider chromium` for the component/lane collector states and latest
@@ -92,3 +95,40 @@ and record completion/validity flags. It never emits field values, stages rows o
 changes runtime admission. A stopped prefix scan proves neither the complete
 dump's digest nor its gzip trailer, subsequent rows or import completion. Remote
 binary transfer and execution require their own explicit operational authority.
+
+## Selected RFC metadata
+
+RFC inspection requires an explicit retained snapshot and one or two distinct,
+canonical representation-job keys. Select one failed job and one capture-bearing
+job when comparing an acquisition failure with retained evidence:
+
+```sh
+devres-server diagnose-collection /etc/devres/reader.toml \
+  --provider rfc --snapshot blake3:SNAPSHOT_HEX \
+  --job-key rfc:text:5220 --job-key rfc:text:9000 \
+  --max-total-bytes 67108864 --timeout-secs 300 \
+  --output /tmp/devres-provider-diagnosis/rfc.json
+```
+
+Replace `SNAPSHOT_HEX` with the selected 64-digit hexadecimal identity. RFC does
+not accept `--latest-failure` or `--scan-retained-dump`. HTTPS TXT keys use
+`rfc:text:NUMBER`; other formats use `rfc:format:NUMBER:FORMAT`; rsync jobs retain
+`rfc:rsync:NUMBER:FORMAT`. These are separate job identities, not distinct RFCs.
+
+The report checks selected job identity and closed failure metadata, the sealed
+snapshot payload, bounded manifest shape, and, for S3, committed SQL bindings
+against independent remote binding descriptors. It reads the manifest object,
+not the engine member bodies, and reports the number of member bindings checked.
+A legacy SHA member digest cannot be equated to a canonical BLAKE3 object binding;
+that comparison is explicitly unverified and makes the metadata report incomplete.
+Filesystem manifests report shape and a computed digest without claiming remote
+binding verification. Neither mode verifies engine/schema readability or member
+bytes; these are explicitly `not_checked`, even when metadata inspection completes.
+
+Missing selected jobs/snapshots/bindings, exhausted budgets and invalid integrity
+produce finite incomplete outcomes. The transaction is read-only and does not
+attach or warm serving caches, acquire writer authority, start collection, request
+publication, or enqueue attribution work. Schema 14/15 rows have unknown failure
+phases and attempt times; inspection never migrates them or infers a phase from a
+coarse error code. Schema 16 adds bounded per-job failure context and claim time;
+this does not establish the cause of an older failure or authorize its recovery.

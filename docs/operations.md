@@ -5,7 +5,7 @@
 Writer startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
 without corpus rewrite or provider acquisition. Existing offline schemas 1–9 to 10
 migration and activation remain required; inspection never bootstraps attribution.
-The same normal writer startup records schema 14, retaining the required runtime
+The same normal writer startup records schema 16, retaining the required runtime
 split and adding Wikipedia tables;
 see [split upgrade](#credential-broker-and-split-runtime-upgrade).
 
@@ -569,6 +569,21 @@ public captures as part of image/test cleanup. Roll back a deployment by selecti
 a previously verified digest through a separately authorized deployment operation.
 
 ## Persistent operation and recovery
+
+Schema 16 adds RFC operational failure metadata. Stop serving readers and the old
+writer, preserve a coordinated database/archive backup, then let the sole new
+writer upgrade under the exclusive lifecycle fence before starting new readers.
+Readers require schema 16; older binaries are not a rollback mechanism. The
+migration does not retry failed jobs or rewrite retained public evidence.
+
+RFC job diagnostics distinguish claim time, failure completion time and next due
+time. Historical rows remain phase-unknown. Process-scoped collector activity and
+last success are separate from durable job failures; a successful stale fallback
+retains the existing collection policy and does not prove fresh acquisition.
+See [private provider diagnosis](provider-diagnostics.md) for selected RFC metadata
+inspection without writer/cache effects. Metadata verification does not establish
+engine readability or identify every production failure.
+
 
 RFC collection is enabled when `[rfc]` is omitted. To pause scheduling, set
 `enabled = false` in `[rfc]` and restart; retained jobs/captures remain intact.
@@ -1279,7 +1294,7 @@ authority or provision their prerequisites.
    Give serving SELECT-only PostgreSQL and either a read-only filesystem mount plus
    separate writable scratch, or an RO broker profile and its own S3 cache.
 4. Start the broker, then the sole writer. Its bounded additive startup commits
-   schema 14 and retains the archive format/history; earlier pending BLAKE3 migration
+   schema 16 and retains the archive format/history; earlier pending BLAKE3 migration
    still requires the existing offline procedure. Start serving after the committed
    backend is available. No role split silently transfers filesystem data to S3.
 5. Verify historical capture/resource identities and pagination; a foreground cold

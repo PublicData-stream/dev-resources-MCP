@@ -29,13 +29,14 @@ pub enum DiagnosisProvider {
     W3c,
     Chromium,
     Crates,
+    Rfc,
 }
 impl DiagnosisProvider {
     fn tables(self) -> Result<(&'static str, &'static str)> {
         match self {
             Self::W3c => Ok(("devres_w3c_evidence", "devres_w3c_state")),
             Self::Chromium => Ok(("devres_chromium_evidence", "devres_chromium_state")),
-            Self::Crates => Err(invalid()),
+            Self::Crates | Self::Rfc => Err(invalid()),
         }
     }
 }
@@ -46,6 +47,8 @@ pub struct DiagnosisOptions {
     pub max_total_bytes: u64,
     pub timeout_secs: u64,
     pub scan_retained_dump: bool,
+    pub snapshot: Option<String>,
+    pub job_keys: Vec<String>,
 }
 impl DiagnosisOptions {
     pub fn validate(&self) -> Result<()> {
@@ -55,6 +58,20 @@ impl DiagnosisOptions {
             || self.timeout_secs > 300
             || (self.scan_retained_dump && self.provider != DiagnosisProvider::Crates)
         {
+            return Err(invalid());
+        }
+        if self.provider == DiagnosisProvider::Rfc {
+            if !self.snapshot.as_deref().is_some_and(integrity::valid_hash)
+                || !(1..=2).contains(&self.job_keys.len())
+                || self
+                    .job_keys
+                    .iter()
+                    .any(|key| rfc_job_identity(key).is_err())
+                || self.job_keys.iter().collect::<BTreeSet<_>>().len() != self.job_keys.len()
+            {
+                return Err(invalid());
+            }
+        } else if self.snapshot.is_some() || !self.job_keys.is_empty() {
             return Err(invalid());
         }
         Ok(())
@@ -85,6 +102,7 @@ pub enum DiagnosisOutcome {
     AttemptedPayloadUnlinked,
     BudgetExhausted,
     IntegrityFailed,
+    SelectedEvidenceUnavailable,
 }
 #[derive(Debug, Serialize)]
 pub struct EvidenceSummary {
@@ -242,7 +260,7 @@ impl Reader {
             .map_err(|_| unavailable())?;
         let schema: i32 = sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL")
             .fetch_one(&mut conn).await.map_err(|_| unavailable())?;
-        if !matches!(schema, 14 | 15) {
+        if !matches!(schema, 14..=16) {
             return Err(unavailable());
         }
         let row = sqlx_core::query::query("SELECT backend,binding,store_id FROM devres_archive_control WHERE singleton AND pending_binding IS NULL AND NOT initializing_s3")
@@ -457,6 +475,9 @@ impl Reader {
             let bytes = remote
                 .get_bytes_with_cancel(&key, binding.bytes, &self.budget.cancel)
                 .await?;
+            if bytes.len() as u64 != binding.bytes {
+                return Err(failed());
+            }
             integrity::verify(&digest, &bytes)?;
             Ok(bytes)
         } else {
@@ -731,7 +752,7 @@ async fn inspect_chromium(reader: &mut Reader, report: &mut CollectionDiagnosis)
     Ok(())
 }
 
-/// Inspection accepts schema 14 as well as 15, so diagnostics precede any rollout.
+/// Inspection accepts schemas 14 through 16 without upgrading the selected store.
 pub async fn diagnose_collection(
     database: &str,
     root: &Path,
@@ -753,10 +774,14 @@ pub async fn diagnose_collection(
     let hard_deadline = tokio::time::Instant::now() + limit;
     let stopping = cancel.child_token();
     let worker_cancel = stopping.clone();
+    let internal_deadline = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let work = async {
         let (mut reader, schema) =
             Reader::open(database, root, s3, &options, worker_cancel).await?;
-        let cutoff = if options.provider == DiagnosisProvider::Crates {
+        let cutoff = if matches!(
+            options.provider,
+            DiagnosisProvider::Crates | DiagnosisProvider::Rfc
+        ) {
             0
         } else {
             let (table, _) = options.provider.tables()?;
@@ -784,17 +809,25 @@ pub async fn diagnose_collection(
         let result = match options.provider {
             DiagnosisProvider::W3c => inspect_w3c(&mut reader, &mut report).await,
             DiagnosisProvider::Chromium => inspect_chromium(&mut reader, &mut report).await,
+            DiagnosisProvider::Rfc => inspect_rfc(&mut reader, &mut report, &options).await,
             DiagnosisProvider::Crates => {
                 inspect_crates(&mut reader, &mut report, options.scan_retained_dump).await
             }
         };
         if let Err(error) = result {
-            if error.code == "capacity" {
+            if error.code == "capacity"
+                || error.code == "cancelled"
+                    && internal_deadline.load(std::sync::atomic::Ordering::Acquire)
+                    && !cancel.is_cancelled()
+            {
                 report.complete = false;
                 report.outcome = DiagnosisOutcome::BudgetExhausted;
             } else if error.code == "integrity" {
                 report.complete = false;
                 report.outcome = DiagnosisOutcome::IntegrityFailed;
+            } else if options.provider == DiagnosisProvider::Rfc && error.code == "unavailable" {
+                report.complete = false;
+                report.outcome = DiagnosisOutcome::SelectedEvidenceUnavailable;
             } else {
                 return Err(error);
             }
@@ -813,13 +846,22 @@ pub async fn diagnose_collection(
     tokio::select! {
         result=&mut work=>result,
         _=tokio::time::sleep(limit-cleanup)=>{
-            stopping.cancel();let _=tokio::time::timeout_at(hard_deadline,work).await;Err(capacity())
+            internal_deadline.store(true, std::sync::atomic::Ordering::Release);
+            stopping.cancel();
+            match tokio::time::timeout_at(hard_deadline,work).await {
+                Ok(result) => result,
+                Err(_) => Err(capacity()),
+            }
         },
         _=cancel.cancelled()=>{
             stopping.cancel();let _=tokio::time::timeout_at(hard_deadline.min(tokio::time::Instant::now()+cleanup),work).await;Err(Error::new("cancelled","Collection diagnosis canceled."))
         }
     }
 }
+
+#[path = "rfc/diagnostics.rs"]
+mod rfc_diagnostics;
+use rfc_diagnostics::{inspect_rfc, rfc_job_identity};
 
 async fn inspect_crates(
     reader: &mut Reader,
@@ -960,6 +1002,8 @@ mod tests {
             max_total_bytes: MAX_BYTES,
             timeout_secs: 300,
             scan_retained_dump: false,
+            snapshot: None,
+            job_keys: Vec::new(),
         };
         assert!(options.validate().is_ok());
         options.max_total_bytes += 1;
@@ -1013,6 +1057,8 @@ mod tests {
             max_total_bytes: MAX_BYTES,
             timeout_secs: 30,
             scan_retained_dump: false,
+            snapshot: None,
+            job_keys: Vec::new(),
         };
         let mut latest = String::new();
         for now in [10, 11] {
@@ -1145,6 +1191,8 @@ mod tests {
             max_total_bytes: MAX_BYTES,
             timeout_secs: 1,
             scan_retained_dump: false,
+            snapshot: None,
+            job_keys: Vec::new(),
         };
         let started = Instant::now();
         let result = diagnose_collection(

@@ -16,7 +16,7 @@ pub struct Arguments {
 pub fn parse(args: &[String]) -> Result<Arguments> {
     let invalid = || {
         Error::invalid(
-            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump]",
+            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]]",
         )
     };
     if args.len() < 2 || args[0] != "diagnose-collection" {
@@ -28,6 +28,8 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
     let mut timeout = None;
     let mut latest = false;
     let mut scan = false;
+    let mut snapshot = None;
+    let mut job_keys = Vec::new();
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -48,9 +50,12 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
                     "w3c" => DiagnosisProvider::W3c,
                     "chromium" => DiagnosisProvider::Chromium,
                     "crates" => DiagnosisProvider::Crates,
+                    "rfc" => DiagnosisProvider::Rfc,
                     _ => return Err(invalid()),
                 })
             }
+            "--snapshot" if snapshot.is_none() => snapshot = Some(value.clone()),
+            "--job-key" if job_keys.len() < 2 => job_keys.push(value.clone()),
             "--output" if output.is_none() => output = Some(PathBuf::from(value)),
             "--max-total-bytes" if bytes.is_none() => {
                 bytes = Some(value.parse::<u64>().map_err(|_| invalid())?)
@@ -66,8 +71,13 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
         max_total_bytes: bytes.unwrap_or(64 * 1024 * 1024),
         timeout_secs: timeout.unwrap_or(300),
         scan_retained_dump: scan,
+        snapshot,
+        job_keys,
     };
     options.validate()?;
+    if latest && options.provider == DiagnosisProvider::Rfc {
+        return Err(invalid());
+    }
     let output = output.ok_or_else(invalid)?;
     validate_output_path(&output)?;
     Ok(Arguments {
@@ -143,6 +153,35 @@ mod tests {
         ] {
             assert!(parse(&arguments(&extra)).is_err());
         }
+    }
+    #[test]
+    fn rfc_requires_exact_bounded_selectors() {
+        let mut args = arguments(&[]);
+        args[3] = "rfc".into();
+        assert!(parse(&args).is_err());
+        let id = format!("blake3:{}", "1".repeat(64));
+        args.extend([
+            "--snapshot".into(),
+            id,
+            "--job-key".into(),
+            "rfc:text:9000".into(),
+        ]);
+        assert!(parse(&args).is_ok());
+        for extra in [
+            vec!["--latest-failure"],
+            vec!["--scan-retained-dump"],
+            vec!["--job-key", "rfc:text:9000"],
+            vec!["--job-key", "rfc:text:09001"],
+        ] {
+            let mut invalid = args.clone();
+            invalid.extend(extra.into_iter().map(str::to_owned));
+            assert!(parse(&invalid).is_err());
+        }
+        args.extend(["--job-key".into(), "rfc:format:9000:xml".into()]);
+        assert!(parse(&args).is_ok());
+        args.extend(["--job-key".into(), "rfc:text:9001".into()]);
+        assert!(parse(&args).is_err());
+        assert!(parse(&arguments(&["--job-key", "rfc:text:9000"])).is_err());
     }
     #[test]
     fn output_cannot_overwrite_or_follow_links() {
