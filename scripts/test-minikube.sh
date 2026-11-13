@@ -118,6 +118,21 @@ scripts/make-fixture.sh "$scratch"
 if (( s3 )); then python3 scripts/s3-kubernetes-fixture.py prepare "$scratch"; fi
 if (( credential_broker )); then python3 scripts/credential-broker-fixture.py prepare "$scratch" kubernetes; fi
 python3 scripts/split-runtime-fixture.py "$scratch" kubernetes
+# Exercise mounted Wikipedia credentials without an operator User-Agent: both
+# roles must start and serve retained fixtures while Wikimedia I/O stays paused.
+python3 - "$scratch/fixture" <<'PYWIKIPEDIA'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for name in ('backend.toml', 'writer.toml'):
+    path = root / name
+    text = path.read_text()
+    assert text.count('[wikipedia]') == 1
+    text = text.replace('[wikipedia]', '[wikipedia]\noauth2_token_file = "/run/devres-wikipedia/token"', 1)
+    path.write_text(text)
+token = root / 'wikipedia-token'
+token.write_text('synthetic-wikipedia-token\n')
+token.chmod(0o600)
+PYWIKIPEDIA
 if (( credential_broker )); then python3 scripts/broker-kubernetes-fixture.py configure "$scratch"; fi
 python3 scripts/secrets-encryption-fixture.py prepare "$MINIKUBE_HOME"
 if [[ -z $supplied_image ]]; then
@@ -179,6 +194,7 @@ fi
 k create secret generic devres-config --from-file=backend.toml="$scratch/fixture/backend.toml" \
   --from-literal=postgres-password=fixture-only
 k create secret generic devres-writer-config --from-file=writer.toml="$scratch/fixture/writer.toml"
+k create secret generic devres-wikipedia-identity --from-file=token="$scratch/fixture/wikipedia-token"
 if (( credential_broker )); then
   broker_files=()
   for name in broker.toml database-url keyring.json issuer-key receipt.json; do
@@ -198,6 +214,10 @@ sed -e "s|DEVRES_HARNESS_IMAGE|$image|g" -e "s|DEVRES_AUTH_REVIEWER|$run_id-revi
 if (( s3 && ! credential_broker )); then python3 scripts/s3-kubernetes-fixture.py writer "$scratch/split-runtime.yaml"; fi
 if (( credential_broker )); then python3 scripts/broker-kubernetes-fixture.py workloads "$scratch/split-runtime.yaml"; fi
 k apply -f "$scratch/split-runtime.yaml"
+k patch deployment writer --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"wikipedia-identity","secret":{"secretName":"devres-wikipedia-identity","defaultMode":288}}},
+  {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"wikipedia-identity","mountPath":"/run/devres-wikipedia","readOnly":true}}
+]'
 k rollout status deployment/postgres --timeout=180s
 k exec -i deployment/postgres -- psql -v ON_ERROR_STOP=1 -U devres -d devres < "$scratch/reader-role.sql" >/dev/null
 if (( credential_broker )); then
@@ -222,6 +242,9 @@ k scale deployment/writer --replicas=1
 k rollout status deployment/writer --timeout=180s
 k scale deployment/backend --replicas=1
 for deployment in postgres writer backend edge; do k rollout status deployment/"$deployment" --timeout=180s; done
+k exec deployment/writer -- python3 -I -B -c 'import pathlib; p=pathlib.Path("/run/devres-wikipedia/token"); assert p.is_file() and p.read_text().strip()=="synthetic-wikipedia-token"'
+k exec deployment/backend -- python3 -I -B -c 'import pathlib; assert not pathlib.Path("/run/devres-wikipedia/token").exists()'
+echo 'Wikipedia writer-only Secret mount and startup without User-Agent verified'
 if (( credential_broker )); then
   wait_broker_service() {
     # Pod readiness precedes Service endpoint convergence. Check the same DNS,

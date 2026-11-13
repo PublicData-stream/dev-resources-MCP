@@ -1,12 +1,14 @@
 # English Wikipedia
 
-Wikipedia is an English-only public-source provider. The writer automatically
-collects current STEM articles; serving readers use retained evidence and delegate
+Wikipedia is an English-only public-source provider. With an operator User-Agent
+configured, the writer automatically collects current STEM articles; serving readers use retained evidence and delegate
 new acquisition to the sole writer. No public operation edits Wikipedia.
 
 ## Discovery and coverage
 
-Omitting `[wikipedia]` enables collection. Default category roots are Science,
+Omitting `[wikipedia]` retains collection defaults but pauses all Wikipedia
+network activity until `user_agent` identifies the operator. Default category roots
+are Science,
 Technology, Engineering, Mathematics, Artificial intelligence and Computer
 architecture. Discovery traverses their descendant category graph with cycle
 protection, durable continuation and configurable exclusions. Article bodies are
@@ -101,9 +103,35 @@ admission/cooldown survives writer restart. Observed throttling remains queued f
 durable storage when a caller disconnects. Graceful shutdown drains these receipts
 and reports persistence failures. Set writer termination grace above its configured
 request shutdown timeout plus the 35-second drain; shipped Kubernetes writers use
-120 seconds. The client identifies itself with the
-project/contact URL, requests gzip, observes Retry-After and backs off failures.
+120 seconds. The client uses the configured operator User-Agent, requests gzip,
+observes Retry-After and backs off failures.
 Action requests taking over one second impose the documented five-second pause.
+
+Set `[wikipedia].user_agent` to a product/version plus a parenthesized operator
+contact URL, email or Wikimedia user identity. Use an honest bot identity rather
+than a browser or generic HTTP-library identity. Values are printable ASCII,
+limited to 1024 bytes, and have no built-in fallback. Missing identity leaves
+background workers idle and returns `wikipedia_configuration_required` when the
+writer must acquire data; it does not create demand, admission or failure-backoff
+work. Retained reads preserve existing visibility and freshness rules. Readers
+without identity can still delegate to an identified writer.
+
+Optional `[wikipedia].oauth2_token_file` names an absolute mounted secret path.
+The writer reads at most 16 KiB at startup, accepts a trailing line ending and
+rejects empty or whitespace-containing tokens. Token bytes stay in redacted
+runtime memory; bearer authentication is limited to the fixed API origin and
+validated same-origin API redirects. EventStreams uses the User-Agent without a
+bearer token. No login, token refresh or anonymous retry fallback is implemented.
+Authenticated 401/403 pauses acquisition until writer restart, without inferring
+article deletion or suppression. Rotate credentials externally and restart the
+writer; readers do not require this secret mount.
+
+Authenticated content must be explicitly shareable (`public` or valid `s-maxage`),
+not `private` or `no-store`, and must not vary by Authorization, Cookie or `*`.
+Merged 304 cache policy is checked before extending public freshness. Ineligible
+responses produce no new body or freshness proof and preserve independently
+qualified retained captures. Authentication does not raise the configured rate or
+concurrency limits.
 
 For significant sustained traffic, the operator must also satisfy Wikimedia's
 origin-identification rule: publish its outbound CIDRs as downloadable JSON or
@@ -113,8 +141,12 @@ establish bulk-operation permission or an exemption.
 The API client follows documented API-specific rules. Wikipedia's wildcard
 robots.txt currently disallows the API path prefixes, despite Wikimedia documenting
 these APIs for clients. This interpretation is recorded explicitly; it is not a
-claim that the documents are fully reconciled. Website crawling must respect
-robots directives. The implementation does not recursively fetch website URLs.
+claim of literal compliance with every robots directive or that the documents
+are fully reconciled. No API-path robots exemption is fabricated. Website crawling
+must respect robots directives; this implementation does not crawl website URLs.
+Current REST article operations preserve revision and license metadata together,
+while conditional requests and upstream cache floors avoid unnecessary work.
+Action API requests are used for metadata, never page HTML.
 
 ## Retention, attribution and moderation
 
@@ -150,8 +182,14 @@ attempts including retries, and one stream connection capped at 30 seconds:
 
 ```sh
 scripts/with-tmp-state.sh env CARGO_TARGET_DIR=/tmp/rust/target \
+  DEVRES_WIKIPEDIA_USER_AGENT="ExampleBot/1.0 (https://example.org/bot)" \
   scripts/live-smoke.sh --live --wikipedia
 ```
+
+The probe requires `DEVRES_WIKIPEDIA_USER_AGENT` before creating receipt or budget
+artifacts. Optional `DEVRES_WIKIPEDIA_OAUTH2_TOKEN_FILE` names an absolute secret-file
+path; never pass the token itself in an argument or environment variable. Live
+validation remains explicitly opt-in.
 
 Its owned receipt directory preserves the attempt counter on resume; it cannot be
 reset to replenish a run. Fresh responses are not forcibly revalidated to obtain a
@@ -164,6 +202,8 @@ separate evidence.
 - [MediaWiki REST reference](https://www.mediawiki.org/wiki/API:REST_API/Reference)
 - [REST policies](https://www.mediawiki.org/wiki/API:REST_API/Policies)
 - [Robot policy](https://wikitech.wikimedia.org/wiki/Robot_policy)
+- [User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy)
+- [OAuth2 API authentication](https://www.mediawiki.org/wiki/OAuth/For_Developers#OAuth_2.0)
 - [Cross-API limits](https://www.mediawiki.org/wiki/Wikimedia_APIs/Rate_limits)
 - [Action API etiquette](https://www.mediawiki.org/wiki/API:Etiquette)
 - [EventStreams](https://wikitech.wikimedia.org/wiki/Event_Platform/EventStreams_HTTP_Service)
