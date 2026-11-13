@@ -9,7 +9,10 @@ use crate::{
     rfc::source as rfc,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use devres_application::corpus::{Dataset, Snapshot};
+use devres_application::{
+    collection::{Phase, attach_phase},
+    corpus::{Dataset, Snapshot},
+};
 use devres_domain::{Error, FetchRequest, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -254,9 +257,14 @@ fn attach_snapshot(value: &mut Value, snapshot: &Snapshot) {
 }
 
 pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result<Value> {
-    let _admission = RESEARCH_SLOTS
-        .try_acquire()
-        .map_err(|_| Error::capacity("RFC research capacity exhausted."))?;
+    let _admission = RESEARCH_SLOTS.try_acquire().map_err(|_| {
+        let error = Error::capacity("RFC research capacity exhausted.");
+        if tool == "rfc.fulltext_search" {
+            attach_phase(error, Phase::IndexAdmission)
+        } else {
+            error
+        }
+    })?;
     match tool {
         "rfc.metadata" => {
             let input: MetadataInput = decode(input)?;
@@ -327,10 +335,18 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
                 return Err(Error::invalid("RFC assurance must be https or rsync."));
             }
             if input.snapshot.is_none() {
-                corpus.refresh_partial().await?;
+                corpus
+                    .refresh_partial()
+                    .await
+                    .map_err(|error| attach_phase(error, Phase::IndexPublication))?;
             }
-            let snapshot = corpus.selected_snapshot(input.snapshot.as_deref()).await?;
-            let dataset = dataset_for(corpus, &snapshot, "catalogue").await?;
+            let snapshot = corpus
+                .selected_snapshot(input.snapshot.as_deref())
+                .await
+                .map_err(|error| attach_phase(error, Phase::IndexSelection))?;
+            let dataset = dataset_for(corpus, &snapshot, "catalogue")
+                .await
+                .map_err(|error| attach_phase(error, Phase::IndexSelection))?;
             let selected = select_search_documents(&snapshot.search_documents);
             let allowed = dataset
                 .records
@@ -344,10 +360,12 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
                 })
                 .collect::<Vec<_>>();
             let root = corpus.root.clone();
-            let index = snapshot
-                .index_path
-                .clone()
-                .ok_or_else(|| Error::unavailable("RFC search index is not available."))?;
+            let index = snapshot.index_path.clone().ok_or_else(|| {
+                attach_phase(
+                    Error::unavailable("RFC search index is not available."),
+                    Phase::IndexSelection,
+                )
+            })?;
             let mut value = tokio::task::spawn_blocking(move || {
                 rfc_index::search(
                     &root,
@@ -360,7 +378,12 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
                 )
             })
             .await
-            .map_err(|_| Error::unavailable("RFC search processor failed."))??;
+            .map_err(|_| {
+                attach_phase(
+                    Error::unavailable("RFC search processor failed."),
+                    Phase::IndexSearch,
+                )
+            })??;
             if let Some(items) = value["items"].as_array_mut() {
                 for item in items {
                     let number = item["number"].as_u64().unwrap_or(0) as u32;

@@ -282,6 +282,8 @@ in the queue and its capture-bearing jobs respectively, not search completeness.
 The twenty-error sample is ordered by due time/source key, not a histogram.
 Its nullable failure context and attempt time are unknown for legacy rows.
 Live status `observed_at` is separate from snapshot `created_at` and coverage.
+RFC index failures add closed phase context while preserving existing error codes;
+a missing or unverifiable index never becomes an empty successful search.
 
 ## Audits and failure
 

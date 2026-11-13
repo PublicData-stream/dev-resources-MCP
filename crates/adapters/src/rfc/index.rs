@@ -1,4 +1,5 @@
 //! Immutable, rebuildable RFC search indexes. Source bytes remain in capture storage.
+use devres_application::collection::{Phase, attach_phase};
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -136,9 +137,14 @@ fn selected_directory(
     let id = relative
         .strip_prefix("rfc-indexes/")
         .filter(|id| path_id(id).is_ok())
-        .ok_or_else(|| Error::invalid("Invalid RFC search snapshot path."))?;
+        .ok_or_else(|| {
+            attach_phase(
+                Error::invalid("Invalid RFC search snapshot path."),
+                Phase::IndexSelection,
+            )
+        })?;
     let base = fs::canonicalize(root)
-        .map_err(|_| unavailable())?
+        .map_err(|_| attach_phase(unavailable(), Phase::IndexSelection))?
         .join("rfc-indexes");
     let selected = base.join(id);
     let lease = crate::durable_archive::materialize_directory(
@@ -147,9 +153,10 @@ fn selected_directory(
         MAX_FILES + 1,
         deadline,
         cancel,
-    )?;
-    real_directory(&base)?;
-    real_directory(&selected)?;
+    )
+    .map_err(|error| attach_phase(error, Phase::Materialization))?;
+    real_directory(&base).map_err(|error| attach_phase(error, Phase::IndexSelection))?;
+    real_directory(&selected).map_err(|error| attach_phase(error, Phase::IndexSelection))?;
     Ok((selected, lease))
 }
 
@@ -1175,29 +1182,38 @@ impl FrozenDocuments {
         let permit = if offline {
             None
         } else {
-            Some(
-                READERS
-                    .try_acquire()
-                    .map_err(|_| Error::capacity("RFC index reader capacity exhausted."))?,
-            )
+            Some(READERS.try_acquire().map_err(|_| {
+                attach_phase(
+                    Error::capacity("RFC index reader capacity exhausted."),
+                    Phase::IndexAdmission,
+                )
+            })?)
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         let (path, archive_lease) = selected_directory(root, relative, deadline, cancel)?;
-        let generation = verify_generation(&path, deadline)?;
+        let generation = verify_generation(&path, deadline)
+            .map_err(|error| attach_phase(error, Phase::IndexManifest))?;
         migration_cancel(cancel)?;
-        let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
+        let index = crate::immutable_index::open(&path)
+            .map_err(|_| attach_phase(integrity(), Phase::IndexEngine))?;
         if index.schema() != schema() {
-            return Err(integrity());
+            return Err(attach_phase(integrity(), Phase::IndexEngine));
         }
-        let reader = index.reader().map_err(|_| unavailable())?;
+        let reader = index
+            .reader()
+            .map_err(|_| attach_phase(unavailable(), Phase::IndexReader))?;
         let searcher = reader.searcher();
         if searcher.num_docs() > MAX_DOCUMENTS as u64 {
-            return Err(integrity());
+            return Err(attach_phase(integrity(), Phase::IndexReader));
         }
         let index_schema = index.schema();
-        let text_field = index_schema.get_field(TECHNICAL).map_err(|_| integrity())?;
-        let number_field = index_schema.get_field(NUMBER).map_err(|_| integrity())?;
-        check_deadline(deadline)?;
+        let text_field = index_schema
+            .get_field(TECHNICAL)
+            .map_err(|_| attach_phase(integrity(), Phase::IndexReader))?;
+        let number_field = index_schema
+            .get_field(NUMBER)
+            .map_err(|_| attach_phase(integrity(), Phase::IndexReader))?;
+        check_deadline(deadline).map_err(|error| attach_phase(error, Phase::IndexReader))?;
         Ok(Self {
             _archive_lease: archive_lease,
             _reader: reader,
@@ -1331,9 +1347,12 @@ pub(crate) fn search(
             "RFC metadata filter exceeds document limit.",
         ));
     }
-    let _permit = READERS
-        .try_acquire()
-        .map_err(|_| Error::capacity("RFC search reader capacity exhausted."))?;
+    let _permit = READERS.try_acquire().map_err(|_| {
+        attach_phase(
+            Error::capacity("RFC search reader capacity exhausted."),
+            Phase::IndexAdmission,
+        )
+    })?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let (path, _archive_lease) = selected_directory(
         root,
@@ -1341,21 +1360,24 @@ pub(crate) fn search(
         deadline,
         &tokio_util::sync::CancellationToken::new(),
     )?;
-    verify(&path, deadline)?;
-    let index = crate::immutable_index::open(&path).map_err(|_| integrity())?;
+    verify(&path, deadline).map_err(|error| attach_phase(error, Phase::IndexManifest))?;
+    let index = crate::immutable_index::open(&path)
+        .map_err(|_| attach_phase(integrity(), Phase::IndexEngine))?;
     if index.schema() != schema() {
-        return Err(integrity());
+        return Err(attach_phase(integrity(), Phase::IndexEngine));
     }
-    register(&index)?;
+    register(&index).map_err(|error| attach_phase(error, Phase::IndexEngine))?;
     let schema = index.schema();
     let field = schema
         .get_field(mode)
         .map_err(|_| Error::invalid("RFC search mode must be technical or english."))?;
     let query = query(field, input, mode)?;
-    let reader = index.reader().map_err(|_| unavailable())?;
+    let reader = index
+        .reader()
+        .map_err(|_| attach_phase(unavailable(), Phase::IndexReader))?;
     let searcher = reader.searcher();
     if searcher.num_docs() > MAX_DOCUMENTS as u64 {
-        return Err(integrity());
+        return Err(attach_phase(integrity(), Phase::IndexReader));
     }
     let allowed: Option<HashSet<u64>> =
         allowed_numbers.map(|values| values.iter().map(|n| u64::from(*n)).collect());
@@ -1372,24 +1394,28 @@ pub(crate) fn search(
     );
     let (total, hits) = searcher
         .search(query.as_ref(), &collector)
-        .map_err(|_| unavailable())?;
-    check_deadline(deadline)?;
-    let mut generator =
-        SnippetGenerator::create(&searcher, query.as_ref(), field).map_err(|_| unavailable())?;
+        .map_err(|_| attach_phase(unavailable(), Phase::IndexSearch))?;
+    check_deadline(deadline).map_err(|error| attach_phase(error, Phase::IndexSearch))?;
+    let mut generator = SnippetGenerator::create(&searcher, query.as_ref(), field)
+        .map_err(|_| attach_phase(unavailable(), Phase::IndexSnippet))?;
     generator.set_max_num_chars(256);
-    let text_field = schema.get_field(TECHNICAL).map_err(|_| integrity())?;
+    let text_field = schema
+        .get_field(TECHNICAL)
+        .map_err(|_| attach_phase(integrity(), Phase::IndexSnippet))?;
     let mut items = Vec::new();
     if offset < total {
         for ((score, number), address) in hits {
-            check_deadline(deadline)?;
-            let number = number.ok_or_else(integrity)?;
-            let stored: TantivyDocument = searcher.doc(address).map_err(|_| integrity())?;
+            check_deadline(deadline).map_err(|error| attach_phase(error, Phase::IndexSnippet))?;
+            let number = number.ok_or_else(|| attach_phase(integrity(), Phase::IndexSnippet))?;
+            let stored: TantivyDocument = searcher
+                .doc(address)
+                .map_err(|_| attach_phase(integrity(), Phase::IndexSnippet))?;
             let text = stored
                 .get_first(text_field)
                 .and_then(|value| value.as_str())
-                .ok_or_else(integrity)?;
+                .ok_or_else(|| attach_phase(integrity(), Phase::IndexSnippet))?;
             if text.len() > MAX_TEXT {
-                return Err(integrity());
+                return Err(attach_phase(integrity(), Phase::IndexSnippet));
             }
             let snippet = generator.snippet(text);
             let excerpt = if snippet.is_empty() {
@@ -1400,11 +1426,15 @@ pub(crate) fn search(
             items.push(json!({"number":number,"score":score,"excerpt":excerpt}));
         }
     }
-    check_deadline(deadline)?;
+    check_deadline(deadline).map_err(|error| attach_phase(error, Phase::IndexSnippet))?;
     Ok(
         json!({"items":items,"total":total,"offset":offset,"next_offset":if offset.saturating_add(limit) < total { Some(offset + limit) } else { None }}),
     )
 }
+
+#[cfg(test)]
+#[path = "index_diagnostic_tests.rs"]
+mod diagnostic_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1413,14 +1443,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
     async fn s3_rfc_index_cold_cache_and_reader_pinning_acceptance() {
+        let _test = TEST_SERIAL.lock().await;
         let base =
             std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
-        let config_path =
-            std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 configuration required");
-        let mut config: crate::object_storage::S3Config =
-            toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-        config.prefix.push_str("/rfc-index-acceptance");
-        let cache_limit = config.cache_max_bytes;
+        let load = |name| {
+            let path = std::env::var(name).expect("disposable role configuration required");
+            let mut config: crate::object_storage::S3Config =
+                toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            config.prefix.push_str("/rfc-index-acceptance");
+            config
+        };
+        let writer_config = load("DEVRES_TEST_S3_CONFIG");
+        let reader_config = load("DEVRES_TEST_S3_READER_CONFIG");
+        assert_eq!(
+            crate::durable_archive::config_binding(&writer_config).unwrap(),
+            crate::durable_archive::config_binding(&reader_config).unwrap(),
+        );
+        let cache_limit = reader_config.cache_max_bytes;
         let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
         sqlx_core::query::query("CREATE DATABASE devres_s3_rfc_index_fixture")
             .execute(&admin)
@@ -1428,48 +1467,163 @@ mod tests {
             .unwrap();
         let mut database = url::Url::parse(&base).unwrap();
         database.set_path("/devres_s3_rfc_index_fixture");
-        let root = tempfile::tempdir_in("/tmp").unwrap();
-        let store = crate::PgBlobStore::connect_archive(
+        let writer_root = tempfile::tempdir_in("/tmp").unwrap();
+        let writer = crate::PgBlobStore::connect_archive(
             database.as_str(),
-            root.path(),
-            Some(config.clone()),
+            writer_root.path(),
+            Some(writer_config),
         )
         .await
         .unwrap();
+        sqlx_core::query::query(
+            "CREATE ROLE devres_s3_rfc_reader_fixture LOGIN PASSWORD 'disposable-reader'",
+        )
+        .execute(&admin)
+        .await
+        .unwrap();
+        sqlx_core::raw_sql::raw_sql(
+            "GRANT CONNECT ON DATABASE devres_s3_rfc_index_fixture TO devres_s3_rfc_reader_fixture; GRANT USAGE ON SCHEMA public TO devres_s3_rfc_reader_fixture; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_s3_rfc_reader_fixture;",
+        ).execute(&writer.pool).await.unwrap();
+        let mut reader_url = database.clone();
+        reader_url
+            .set_username("devres_s3_rfc_reader_fixture")
+            .unwrap();
+        reader_url.set_password(Some("disposable-reader")).unwrap();
         let id = crate::integrity::hash(b"rfc object archive acceptance");
         let relative = build(
-            root.path(),
+            writer_root.path(),
             &id,
             documents(&[
+                (101, "immutable transport evidence"),
                 (100, "immutable transport evidence"),
-                (101, "retained transport history"),
             ]),
         )
         .unwrap();
-        let expected =
-            search(root.path(), &relative, "transport", TECHNICAL, 0, 100, None).unwrap();
+        let original = retained_index_bytes(writer_root.path(), &relative);
+        let expected = search(
+            writer_root.path(),
+            &relative,
+            "transport",
+            TECHNICAL,
+            0,
+            100,
+            None,
+        )
+        .unwrap();
         assert_eq!(expected["total"], 2);
-        let stop = tokio_util::sync::CancellationToken::new();
-        let mut pinned = FrozenDocuments::open(root.path(), &relative, &stop).unwrap();
+        assert_eq!(expected["items"][0]["number"], 100);
+        assert_eq!(expected["items"][1]["number"], 101);
+
+        let cache = tempfile::tempdir_in("/tmp").unwrap();
+        let reader = crate::PgBlobStore::connect_reader(
+            reader_url.as_str(),
+            cache.path(),
+            Some(reader_config.clone()),
+        )
+        .await
+        .unwrap();
         assert!(
-            crate::durable_archive::admit_write(&root.path().join(".index-pressure"), cache_limit)
+            sqlx_core::query::query("UPDATE devres_schema SET version=version")
+                .execute(&reader.pool)
+                .await
                 .is_err()
         );
-        assert!(root.path().join(&relative).join("meta.json").is_file());
+        assert!(!cache.path().join(&relative).join("meta.json").exists());
+        let cold = search(
+            cache.path(),
+            &relative,
+            "transport",
+            TECHNICAL,
+            0,
+            100,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cold, expected);
+        let warm = search(
+            cache.path(),
+            &relative,
+            "transport",
+            TECHNICAL,
+            0,
+            100,
+            None,
+        )
+        .unwrap();
+        assert_eq!(warm, expected);
+        let page = search(cache.path(), &relative, "transport", TECHNICAL, 1, 1, None).unwrap();
+        assert_eq!(page["items"][0]["number"], 101);
+        assert!(page["next_offset"].is_null());
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut pinned = FrozenDocuments::open(cache.path(), &relative, &stop).unwrap();
+        assert!(crate::durable_archive::admit_write(
+            &cache.path().join(".index-pressure"), cache_limit,
+        ).is_err());
         assert_eq!(pinned.next_page(100).unwrap().len(), 2);
         drop(pinned);
-        drop(store);
-        std::fs::remove_dir_all(root.path()).unwrap();
-        let store =
-            crate::PgBlobStore::connect_archive(database.as_str(), root.path(), Some(config))
-                .await
-                .unwrap();
-        assert!(!root.path().join(&relative).join("meta.json").exists());
-        let restored =
-            search(root.path(), &relative, "transport", TECHNICAL, 0, 100, None).unwrap();
-        assert_eq!(restored, expected);
-        assert!(root.path().join(&relative).join("meta.json").is_file());
-        drop(store);
+        drop(reader);
+        // Only this reader's disposable cache is removed. Published writer bytes remain.
+        std::fs::remove_dir_all(cache.path()).unwrap();
+        let reader = crate::PgBlobStore::connect_reader(
+            reader_url.as_str(),
+            cache.path(),
+            Some(reader_config.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            search(
+                cache.path(),
+                &relative,
+                "transport",
+                TECHNICAL,
+                0,
+                100,
+                None
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            retained_index_bytes(writer_root.path(), &relative),
+            original
+        );
+
+        // A corrupt disposable member fails materialization without changing the archive.
+        fs::write(cache.path().join(&relative).join("meta.json"), b"{}").unwrap();
+        let corrupt = search(
+            cache.path(),
+            &relative,
+            "transport",
+            TECHNICAL,
+            0,
+            100,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(corrupt.code, "integrity");
+        assert_eq!(
+            devres_application::collection::context(&corrupt)
+                .unwrap()
+                .phase,
+            Phase::Materialization
+        );
+        let missing = format!("rfc-indexes/{}", "9".repeat(64));
+        let missing =
+            search(cache.path(), &missing, "transport", TECHNICAL, 0, 100, None).unwrap_err();
+        assert_eq!(missing.code, "integrity");
+        assert_eq!(
+            devres_application::collection::context(&missing)
+                .unwrap()
+                .phase,
+            Phase::Materialization
+        );
+        drop(reader);
+        assert_eq!(
+            retained_index_bytes(writer_root.path(), &relative),
+            original
+        );
+        drop(writer);
     }
 
     fn documents(values: &[(u32, &str)]) -> Vec<IndexDocument> {
