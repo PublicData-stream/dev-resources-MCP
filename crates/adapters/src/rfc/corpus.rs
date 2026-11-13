@@ -2,6 +2,7 @@
 use crate::{rfc::index as rfc_index, rfc::source as rfc};
 use devres_application::{
     Retrieval,
+    collection::{self, CollectorStatus, Failure, Phase},
     corpus::{Dataset, Document, JobSpec, RfcCorpusStore, Snapshot},
 };
 use devres_domain::{Error, FetchRequest, Result, unix_now};
@@ -75,6 +76,7 @@ pub struct RfcCorpus {
     dirty: AtomicUsize,
     last_snapshot: AtomicI64,
     last_failure: Mutex<Option<Value>>,
+    collector: Mutex<CollectorStatus>,
 }
 
 // A detached blocking writer must retain the database ownership fence through
@@ -127,6 +129,7 @@ impl RfcCorpus {
             dirty: AtomicUsize::new(0),
             last_snapshot: AtomicI64::new(0),
             last_failure: Mutex::new(None),
+            collector: Mutex::new(CollectorStatus::default()),
         })
     }
 
@@ -245,21 +248,44 @@ impl RfcCorpus {
             if self.config.enabled {
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = shutdown.cancelled() => {
+                        self.collector.lock().await.active = false;
+                        return Ok(());
+                    },
                     result = self.tick() => {
                         // Public provider/capacity failures remain durable, sanitized state.
                         // The serving ownership supervisor independently fails closed on loss.
                         if let Err(error) = result {
-                            *self.last_failure.lock().await = Some(json!({"code":error.code,"observed_at":unix_now()}));
+                            self.record_failure(&error, Phase::BulkOperation, None, None).await;
                         }
                     }
                 }
             }
             tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
+                _ = shutdown.cancelled() => {
+                        self.collector.lock().await.active = false;
+                        return Ok(());
+                    },
                 _ = tokio::time::sleep(Duration::from_secs(self.config.collection_interval_secs)) => {}
             }
         }
+    }
+
+    async fn record_failure(
+        &self,
+        error: &Error,
+        fallback: Phase,
+        retry_at: Option<i64>,
+        source: Option<&str>,
+    ) {
+        let now = unix_now();
+        let failure = Failure::from_error(error, fallback, now);
+        *self.last_failure.lock().await =
+            Some(json!({"source":source,"code":failure.code,"observed_at":now,"failure":failure}));
+        self.collector
+            .lock()
+            .await
+            .fail(error, fallback, now, retry_at);
     }
 
     async fn tick(&self) -> Result<()> {
@@ -269,14 +295,23 @@ impl RfcCorpus {
                 now.saturating_add(self.config.index_refresh_secs.min(3600) as i64),
                 Ordering::Relaxed,
             );
+            self.collector.lock().await.begin(Phase::CatalogAcquisition);
             match self.refresh_catalogue().await {
-                Ok(_) => self.next_catalogue.store(
-                    now.saturating_add(self.config.index_refresh_secs as i64),
-                    Ordering::Relaxed,
-                ),
+                Ok(_) => {
+                    self.next_catalogue.store(
+                        now.saturating_add(self.config.index_refresh_secs as i64),
+                        Ordering::Relaxed,
+                    );
+                    self.collector.lock().await.succeed(unix_now());
+                }
                 Err(error) => {
-                    *self.last_failure.lock().await =
-                        Some(json!({"source":"catalogue","code":error.code,"observed_at":now}))
+                    self.record_failure(
+                        &error,
+                        Phase::CatalogAcquisition,
+                        Some(self.next_catalogue.load(Ordering::Relaxed)),
+                        Some("catalogue"),
+                    )
+                    .await;
                 }
             }
         }
@@ -285,14 +320,26 @@ impl RfcCorpus {
                 now.saturating_add(self.config.errata_refresh_secs.min(3600) as i64),
                 Ordering::Relaxed,
             );
+            self.collector
+                .lock()
+                .await
+                .begin(Phase::PublicationAcquisition);
             match self.refresh_errata().await {
-                Ok(_) => self.next_errata.store(
-                    now.saturating_add(self.config.errata_refresh_secs as i64),
-                    Ordering::Relaxed,
-                ),
+                Ok(_) => {
+                    self.next_errata.store(
+                        now.saturating_add(self.config.errata_refresh_secs as i64),
+                        Ordering::Relaxed,
+                    );
+                    self.collector.lock().await.succeed(unix_now());
+                }
                 Err(error) => {
-                    *self.last_failure.lock().await =
-                        Some(json!({"source":"errata","code":error.code,"observed_at":now}))
+                    self.record_failure(
+                        &error,
+                        Phase::PublicationAcquisition,
+                        Some(self.next_errata.load(Ordering::Relaxed)),
+                        Some("errata"),
+                    )
+                    .await;
                 }
             }
         }
@@ -306,6 +353,10 @@ impl RfcCorpus {
                 max_bytes: BODY_LIMIT,
                 media_type: media_type(&job.spec.format)?.into(),
             };
+            self.collector
+                .lock()
+                .await
+                .begin(Phase::PublicationAcquisition);
             let result = self
                 .retrieval
                 .get_background_validated(request, &rfc::Validator)
@@ -319,17 +370,16 @@ impl RfcCorpus {
                             None,
                             now.saturating_add(self.config.body_refresh_secs as i64),
                         )
-                        .await?
+                        .await?;
+                    self.collector.lock().await.succeed(unix_now());
                 }
                 Err(error) => {
-                    let code = match error.code.as_str() {
-                        "invalid_input" | "unavailable" | "not_found" | "capacity"
-                        | "integrity" | "cancelled" => error.code.as_str(),
-                        _ => "other",
-                    };
+                    let code = collection::safe_code(&error.code);
                     // Retrieval includes source validation and durable publication;
                     // do not infer which of those failed from a generic code.
-                    tracing::warn!(target: "devres_server::collection", provider = "rfc", stage = "validated_acquisition", code, "Public collection stage failed");
+                    let failure =
+                        Failure::from_error(&error, Phase::PublicationAcquisition, unix_now());
+                    tracing::warn!(target: "devres_server::collection", provider = "rfc", phase = ?failure.phase, code, "Public collection stage failed");
                     let delay = if error.code == "not_found" {
                         self.config.body_refresh_secs.max(300)
                     } else {
@@ -341,10 +391,17 @@ impl RfcCorpus {
                         .finish(
                             &job.spec.key,
                             None,
-                            Some(&error.code),
+                            Some(&failure),
                             now.saturating_add(delay as i64),
                         )
                         .await?;
+                    self.record_failure(
+                        &error,
+                        Phase::PublicationAcquisition,
+                        Some(now.saturating_add(delay as i64)),
+                        Some("representation"),
+                    )
+                    .await;
                 }
             }
             self.dirty.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +409,11 @@ impl RfcCorpus {
         if self.dirty.load(Ordering::Relaxed) > 0
             && now.saturating_sub(self.last_snapshot.load(Ordering::Relaxed)) >= 60
         {
-            self.publish_snapshot().await?;
+            self.collector.lock().await.begin(Phase::IndexPublication);
+            self.publish_snapshot()
+                .await
+                .map_err(|error| collection::attach_phase(error, Phase::IndexPublication))?;
+            self.collector.lock().await.succeed(unix_now());
         }
         Ok(())
     }
@@ -649,6 +710,7 @@ impl RfcCorpus {
         value["collection_enabled"] = json!(self.config.enabled);
         value["body_refresh_secs"] = json!(self.config.body_refresh_secs);
         value["last_worker_failure"] = json!(*self.last_failure.lock().await);
+        value["collector"] = json!(*self.collector.lock().await);
         Ok(value)
     }
 
@@ -864,7 +926,7 @@ mod tests {
             &self,
             _: &str,
             _: Option<&devres_domain::Capture>,
-            _: Option<&str>,
+            _: Option<&devres_application::collection::Failure>,
             _: i64,
         ) -> Result<()> {
             Err(Error::unavailable("Unused test port"))

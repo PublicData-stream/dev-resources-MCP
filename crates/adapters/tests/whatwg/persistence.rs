@@ -65,7 +65,7 @@ async fn whatwg_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("schema"),
-        15
+        16
     );
     assert_eq!(
         PgBlobStore::connect(url.as_str(), root.path())

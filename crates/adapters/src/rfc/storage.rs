@@ -1,6 +1,7 @@
 //! Owner-fenced durable RFC jobs, immutable projections, and snapshot manifests.
 use super::{PgBlobStore, payload_integrity, storage_error, valid_hash};
 use async_trait::async_trait;
+use devres_application::collection::{self, Failure};
 use devres_application::corpus::{Dataset, Document, Job, JobSpec, RfcCorpusStore, Snapshot};
 use devres_domain::{Capture, Error, Result};
 use serde::Serialize;
@@ -12,6 +13,31 @@ const MAX_JSON: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 #[path = "storage_snapshot_batch_tests.rs"]
 mod snapshot_batch_tests;
+
+pub(super) fn checked_failure(failure: &Failure) -> Result<Failure> {
+    if failure
+        .http_status
+        .is_some_and(|status| !(100..=599).contains(&status))
+    {
+        return Err(Error::integrity("Invalid RFC failure metadata."));
+    }
+    let mut failure = failure.clone();
+    failure.code = collection::safe_code(&failure.code).into();
+    if serde_json::to_vec(&failure)
+        .map_err(|_| storage_error())?
+        .len()
+        > 4096
+    {
+        return Err(Error::capacity("RFC failure metadata exceeds limit."));
+    }
+    Ok(failure)
+}
+
+pub(super) const SCHEMA_V16: &str = r#"
+ALTER TABLE devres_rfc_jobs ADD COLUMN failure jsonb
+ CHECK(failure IS NULL OR (jsonb_typeof(failure)='object' AND octet_length(failure::text)<=4096));
+ALTER TABLE devres_rfc_jobs ADD COLUMN last_attempt_at bigint;
+"#;
 
 fn kind_checked(kind: &str) -> Result<()> {
     if matches!(kind, "catalogue" | "errata") {
@@ -258,7 +284,7 @@ impl RfcCorpusStore for PgBlobStore {
         self.owner_fence().await?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
-        let row = sqlx_core::query::query("UPDATE devres_rfc_jobs SET status='running',attempts=attempts+1 WHERE source_key=(SELECT source_key FROM devres_rfc_jobs WHERE assurance='https' AND status<>'running' AND due_at<=$1 AND attempts<4294967295 ORDER BY due_at,source_key FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
+        let row = sqlx_core::query::query("UPDATE devres_rfc_jobs SET status='running',attempts=attempts+1,last_attempt_at=$1 WHERE source_key=(SELECT source_key FROM devres_rfc_jobs WHERE assurance='https' AND status<>'running' AND due_at<=$1 AND attempts<4294967295 ORDER BY due_at,source_key FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
             .bind(now).fetch_optional(&mut *owner).await.map_err(|_| storage_error())?;
         row.map(|row| {
             let number: i64 = row.try_get("number").map_err(|_| storage_error())?;
@@ -284,18 +310,18 @@ impl RfcCorpusStore for PgBlobStore {
         &self,
         key: &str,
         capture: Option<&Capture>,
-        error: Option<&str>,
+        error: Option<&Failure>,
         next_due: i64,
     ) -> Result<()> {
         self.owner_fence().await?;
-        if key.len() > 2048
-            || capture.is_some() == error.is_some()
-            || error.is_some_and(|error| {
-                error.is_empty() || error.len() > 512 || error.chars().any(char::is_control)
-            })
-        {
+        if key.len() > 2048 || capture.is_some() == error.is_some() {
             return Err(Error::invalid("Invalid RFC job outcome"));
         }
+        let failure = error.map(checked_failure).transpose()?;
+        let code = failure
+            .as_ref()
+            .map(|failure| collection::safe_code(&failure.code));
+        let diagnostic = failure.as_ref().map(encoded).transpose()?;
         let value = capture.map(encoded).transpose()?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
@@ -313,9 +339,9 @@ impl RfcCorpusStore for PgBlobStore {
                 payload_integrity::digest("devres_rfc_jobs", "capture_metadata", key, value)
             })
             .transpose()?;
-        let result = sqlx_core::query::query("UPDATE devres_rfc_jobs SET status=CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'captured' END,capture_id=COALESCE($2,capture_id),capture_metadata=COALESCE($3,capture_metadata),capture_metadata_integrity=COALESCE($7,capture_metadata_integrity),last_error=$4,due_at=$5 WHERE source_key=$1 AND ($2::text IS NULL OR source_url=$6)")
+        let result = sqlx_core::query::query("UPDATE devres_rfc_jobs SET status=CASE WHEN $2::text IS NULL THEN 'failed' ELSE 'captured' END,capture_id=COALESCE($2,capture_id),capture_metadata=COALESCE($3,capture_metadata),capture_metadata_integrity=COALESCE($7,capture_metadata_integrity),last_error=$4,due_at=$5,failure=$8 WHERE source_key=$1 AND ($2::text IS NULL OR source_url=$6)")
             .bind(key).bind(capture.map(|capture| capture.id.as_str())).bind(value.map(Json))
-            .bind(error).bind(next_due).bind(capture.map(|capture| capture.source_url.as_str())).bind(integrity)
+            .bind(code).bind(next_due).bind(capture.map(|capture| capture.source_url.as_str())).bind(integrity).bind(diagnostic.map(Json))
             .execute(&mut *owner).await.map_err(|_| storage_error())?;
         if result.rows_affected() != 1 {
             return Err(Error::integrity(
@@ -523,6 +549,7 @@ impl RfcCorpusStore for PgBlobStore {
         let mut total_jobs = 0_i64;
         let mut captured_documents = 0_i64;
         let mut outstanding_jobs = 0_i64;
+        let mut failed_jobs = 0_i64;
         for row in rows {
             let status: String = row.try_get("status").map_err(|_| storage_error())?;
             let count: i64 = row.try_get("count").map_err(|_| storage_error())?;
@@ -530,20 +557,41 @@ impl RfcCorpusStore for PgBlobStore {
             let retained: i64 = row.try_get("retained_count").map_err(|_| storage_error())?;
             total_jobs += count;
             captured_documents += retained;
+            if status == "failed" {
+                failed_jobs += count;
+            }
             if status != "captured" {
                 outstanding_jobs += count;
             }
             counts.insert(status, json!({"count":count,"earliest_due":earliest_due}));
         }
-        let errors = sqlx_core::query::query("SELECT source_key,last_error,due_at FROM devres_rfc_jobs WHERE last_error IS NOT NULL ORDER BY due_at,source_key LIMIT 20")
+        let errors = sqlx_core::query::query("SELECT source_key,last_error,due_at,attempts,last_attempt_at,capture_id IS NOT NULL AS has_capture,failure FROM devres_rfc_jobs WHERE last_error IS NOT NULL ORDER BY due_at,source_key LIMIT 20")
             .fetch_all(&self.pool).await.map_err(|_| storage_error())?;
         let errors = errors.into_iter().map(|row| {
-            Ok(json!({"key":row.try_get::<String,_>("source_key").map_err(|_| storage_error())?,"error":row.try_get::<String,_>("last_error").map_err(|_| storage_error())?,"next_due":row.try_get::<i64,_>("due_at").map_err(|_| storage_error())?}))
+            let failure: Option<Json<Value>> = row.try_get("failure").map_err(|_| storage_error())?;
+            let failure = failure.map(|Json(value)| decode::<Failure>(value).and_then(|failure| checked_failure(&failure))).transpose()?;
+            let code: String = row.try_get("last_error").map_err(|_| storage_error())?;
+            Ok(json!({"key":row.try_get::<String,_>("source_key").map_err(|_| storage_error())?,
+                "error":collection::safe_code(&code),
+                "next_due":row.try_get::<i64,_>("due_at").map_err(|_| storage_error())?,
+                "attempts":row.try_get::<i64,_>("attempts").map_err(|_| storage_error())?,
+                "last_attempt_at":row.try_get::<Option<i64>,_>("last_attempt_at").map_err(|_| storage_error())?,
+                "has_capture":row.try_get::<bool,_>("has_capture").map_err(|_| storage_error())?,
+                "failure":failure}))
         }).collect::<Result<Vec<_>>>()?;
+        let distinct = sqlx_core::query::query("SELECT count(DISTINCT number) AS scheduled,count(DISTINCT number) FILTER (WHERE capture_id IS NOT NULL) AS captured FROM devres_rfc_jobs")
+            .fetch_one(&self.pool).await.map_err(|_| storage_error())?;
+        let scheduled_numbers: i64 = distinct.try_get("scheduled").map_err(|_| storage_error())?;
+        let captured_numbers: i64 = distinct.try_get("captured").map_err(|_| storage_error())?;
         let latest = self.snapshot(None).await?;
         let partial = sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,complete,id,id AS key,''::text AS kind,created_at,data,data_integrity FROM devres_rfc_snapshots WHERE NOT complete ORDER BY published_order DESC LIMIT 1").fetch_optional(&self.pool).await.map_err(|_|storage_error())?.map(|row|Ok::<_,Error>(json!({"id":row.try_get::<String,_>("id").map_err(|_|storage_error())?,"created_at":row.try_get::<i64,_>("created_at").map_err(|_|storage_error())?,"coverage":payload_integrity::row("devres_rfc_snapshots",&row)?["coverage"]}))).transpose()?;
         Ok(
-            json!({"jobs":counts,"total_jobs":total_jobs,"captured_documents":captured_documents,"pending_documents":total_jobs-captured_documents,"outstanding_jobs":outstanding_jobs,"errors":errors,"latest_partial":partial,"snapshot":latest.map(|snapshot| json!({"id":snapshot.id,"complete":snapshot.complete,"created_at":snapshot.created_at,"coverage":snapshot.coverage}))}),
+            json!({"observed_at":devres_domain::unix_now(),"jobs":counts,
+                "total_representations":total_jobs,"captured_representations":captured_documents,
+                "missing_representations":total_jobs-captured_documents,
+                "failed_representation_jobs":failed_jobs,"outstanding_representation_jobs":outstanding_jobs,
+                "scheduled_rfc_numbers":scheduled_numbers,"captured_rfc_numbers":captured_numbers,
+                "error_sample":{"limit":20,"order":"due_at_source_key"},"total_jobs":total_jobs,"captured_documents":captured_documents,"pending_documents":total_jobs-captured_documents,"outstanding_jobs":outstanding_jobs,"errors":errors,"latest_partial":partial,"snapshot":latest.map(|snapshot| json!({"id":snapshot.id,"complete":snapshot.complete,"created_at":snapshot.created_at,"coverage":snapshot.coverage}))}),
         )
     }
 }

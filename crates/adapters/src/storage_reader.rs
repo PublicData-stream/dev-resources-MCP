@@ -17,9 +17,9 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        if version != 15 {
+        if version != 16 {
             return Err(Error::unavailable(
-                "Concurrent serving requires storage schema fifteen.",
+                "Concurrent serving requires storage schema sixteen.",
             ));
         }
         let active: bool = sqlx_core::query_scalar::query_scalar(
@@ -95,7 +95,7 @@ impl PgBlobStore {
             ));
         }
         if self.reader {
-            let supported: bool = sqlx_core::query_scalar::query_scalar("SELECT version=15 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
+            let supported: bool = sqlx_core::query_scalar::query_scalar("SELECT version=16 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
                 .fetch_one(&self.pool).await.map_err(|_| storage_error())?;
             if !supported {
                 return Err(Error::unavailable(
@@ -292,6 +292,15 @@ mod tests {
                 .is_err()
         );
         sqlx_core::query::query("UPDATE devres_schema SET version=15 WHERE singleton")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        assert!(
+            PgBlobStore::connect_reader(url.as_str(), root.path(), None)
+                .await
+                .is_err()
+        );
+        sqlx_core::query::query("UPDATE devres_schema SET version=16 WHERE singleton")
             .execute(&writer.pool)
             .await
             .unwrap();

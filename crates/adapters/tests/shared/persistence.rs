@@ -966,7 +966,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
         .await
         .unwrap();
     // Offline BLAKE3 conversion still ends at schema 10. Normal serving then
-    // performs bounded attribution and split-runtime bootstrap to schema 15.
+    // performs bounded attribution and split-runtime bootstrap to schema 16.
     assert_eq!(
         sqlx_core::query_scalar::query_scalar::<_, i32>("SELECT version FROM devres_schema")
             .fetch_one(&fixture_pool)
@@ -981,7 +981,7 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
             .fetch_one(&fixture_pool)
             .await
             .unwrap(),
-        15
+        16
     );
     assert_eq!(
         store.capture(&original_id).await.unwrap().body,
@@ -1135,7 +1135,16 @@ async fn corpus_v1_migration_jobs_snapshots_and_import_provenance() {
     assert!(store.claim(39).await.unwrap().is_none());
     store.claim(40).await.unwrap().unwrap();
     store
-        .finish(&job.key, None, Some("unavailable"), 50)
+        .finish(
+            &job.key,
+            None,
+            Some(&devres_application::collection::Failure::from_error(
+                &devres_domain::Error::unavailable("fixture"),
+                devres_application::collection::Phase::HttpAcquisition,
+                41,
+            )),
+            50,
+        )
         .await
         .unwrap();
     assert_eq!(

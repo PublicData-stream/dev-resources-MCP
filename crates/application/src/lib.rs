@@ -62,6 +62,10 @@ pub trait Fetcher: Send + Sync {
 /// Ownership permits bounded blocking validation without duplicating large bodies.
 #[async_trait]
 pub trait ResponseValidator: Send + Sync {
+    /// Opt in a source to closed diagnostics without changing other retrieval contracts.
+    fn collection_diagnostics(&self) -> bool {
+        false
+    }
     fn acquisition(&self, _request: &FetchRequest) -> Result<Option<acquisition::Acquisition>> {
         Ok(None)
     }
@@ -168,7 +172,12 @@ impl Retrieval {
         validator: &dyn ResponseValidator,
     ) -> Result<StoredCapture> {
         if self.foreground_active() {
-            return Err(Error::capacity("Foreground retrieval has priority"));
+            let error = Error::capacity("Foreground retrieval has priority");
+            return Err(if validator.collection_diagnostics() {
+                collection::attach_phase(error, collection::Phase::RetrievalAdmission)
+            } else {
+                error
+            });
         }
         self.get_inner(request, Some(validator), true, true).await
     }
@@ -180,6 +189,13 @@ impl Retrieval {
         response: FetchResponse,
         validator: &dyn ResponseValidator,
     ) -> Result<StoredCapture> {
+        let diagnose = |error, phase| {
+            if validator.collection_diagnostics() {
+                collection::attach_phase(error, phase)
+            } else {
+                error
+            }
+        };
         if request.key.is_empty()
             || request.key.len() > 2048
             || request.max_bytes == 0
@@ -187,16 +203,25 @@ impl Retrieval {
             || response.status != 200
             || response.body.len() > request.max_bytes
         {
-            return Err(Error::invalid("Invalid public import bounds"));
+            return Err(diagnose(
+                Error::invalid("Invalid public import bounds"),
+                collection::Phase::RetrievalAdmission,
+            ));
         }
-        let _permit = self
-            .admission
-            .try_acquire()
-            .map_err(|_| Error::capacity("Retrieval capacity exhausted"))?;
-        let response = validator.validate(&request, response).await?;
+        let _permit = self.admission.try_acquire().map_err(|_| {
+            diagnose(
+                Error::capacity("Retrieval capacity exhausted"),
+                collection::Phase::RetrievalAdmission,
+            )
+        })?;
+        let response = validator
+            .validate(&request, response)
+            .await
+            .map_err(|error| diagnose(error, collection::Phase::SourceValidation))?;
         self.store
             .publish(&request, response, self.clock.now())
             .await
+            .map_err(|error| diagnose(error, collection::Phase::ArtifactPublication))
     }
     async fn get_inner(
         &self,
@@ -243,6 +268,14 @@ impl Retrieval {
                 body: stored.body,
             });
         }
+        let diagnostics = validator.is_some_and(ResponseValidator::collection_diagnostics);
+        let diagnose = |error, phase| {
+            if diagnostics {
+                collection::attach_phase(error, phase)
+            } else {
+                error
+            }
+        };
         struct Foreground<'a>(Option<&'a AtomicUsize>);
         impl Drop for Foreground<'_> {
             fn drop(&mut self) {
@@ -262,12 +295,17 @@ impl Retrieval {
             || request.max_bytes == 0
             || request.max_bytes > 128 * 1024 * 1024
         {
-            return Err(Error::invalid("Invalid retrieval bounds"));
+            return Err(diagnose(
+                Error::invalid("Invalid retrieval bounds"),
+                collection::Phase::RetrievalAdmission,
+            ));
         }
-        let _permit = self
-            .admission
-            .try_acquire()
-            .map_err(|_| Error::capacity("Retrieval capacity exhausted"))?;
+        let _permit = self.admission.try_acquire().map_err(|_| {
+            diagnose(
+                Error::capacity("Retrieval capacity exhausted"),
+                collection::Phase::RetrievalAdmission,
+            )
+        })?;
         let key_lock = {
             let mut keys = self.keys.lock().await;
             keys.retain(|_, lock| lock.strong_count() > 0);
@@ -275,7 +313,10 @@ impl Retrieval {
                 lock
             } else {
                 if keys.len() >= 1024 {
-                    return Err(Error::capacity("Retrieval key capacity exhausted"));
+                    return Err(diagnose(
+                        Error::capacity("Retrieval key capacity exhausted"),
+                        collection::Phase::RetrievalAdmission,
+                    ));
                 }
                 let lock = Arc::new(Mutex::new(()));
                 keys.insert(request.key.clone(), Arc::downgrade(&lock));
@@ -284,13 +325,18 @@ impl Retrieval {
         };
         let _key_guard = key_lock.lock().await;
         let now = self.clock.now();
-        let existing = self.store.latest(&request.key).await?;
+        let existing = self
+            .store
+            .latest(&request.key)
+            .await
+            .map_err(|error| diagnose(error, collection::Phase::RetainedLookup))?;
         if let Some(cached) = &existing {
             if cached.stored.capture.source_url != request.url
                 || cached.stored.body.len() > request.max_bytes
             {
-                return Err(Error::integrity(
-                    "Capture identity or size does not match request",
+                return Err(diagnose(
+                    Error::integrity("Capture identity or size does not match request"),
+                    collection::Phase::RetainedLookup,
                 ));
             }
             if now
@@ -305,7 +351,10 @@ impl Retrieval {
             let mut negatives = self.negatives.lock().await;
             negatives.retain(|_, until| *until > now);
             if negatives.contains_key(&request.key) {
-                return Err(Error::not_found("Source record not found"));
+                return Err(diagnose(
+                    Error::not_found("Source record not found"),
+                    collection::Phase::HttpAcquisition,
+                ));
             }
         }
         let response = match self
@@ -314,40 +363,77 @@ impl Retrieval {
             .await
         {
             Ok(response) => response,
-            Err(error) => return self.stale_or_error(existing, now, error, allow_stale),
+            Err(error) => {
+                return self.stale_or_error(
+                    existing,
+                    now,
+                    diagnose(error, collection::Phase::HttpAcquisition),
+                    allow_stale,
+                );
+            }
         };
         match response.status {
             200 => {
                 if response.body.len() > request.max_bytes {
-                    return Err(Error::capacity("Source body exceeds limit"));
+                    return Err(diagnose(
+                        Error::capacity("Source body exceeds limit"),
+                        collection::Phase::HttpBody,
+                    ));
                 }
                 let response = match validator {
-                    Some(validator) => validator.validate(&request, response).await?,
+                    Some(validator) => validator
+                        .validate(&request, response)
+                        .await
+                        .map_err(|error| diagnose(error, collection::Phase::SourceValidation))?,
                     None => response,
                 };
                 drop(existing); // Old bytes are no longer needed after a successful replacement.
-                self.store.publish(&request, response, now).await
+                self.store
+                    .publish(&request, response, now)
+                    .await
+                    .map_err(|error| diagnose(error, collection::Phase::ArtifactPublication))
             }
             304 => {
-                let old =
-                    existing.ok_or_else(|| Error::integrity("Unexpected source revalidation"))?;
+                let old = existing.ok_or_else(|| {
+                    diagnose(
+                        Error::integrity("Unexpected source revalidation"),
+                        collection::Phase::Revalidation,
+                    )
+                })?;
                 let id = old.stored.capture.id.clone();
                 drop(old); // Revalidation reloads the body under the same weighted budget.
                 self.store
                     .revalidate(&request.key, &id, response.validators, now)
                     .await
+                    .map_err(|error| diagnose(error, collection::Phase::Revalidation))
             }
             404 => {
                 let mut negatives = self.negatives.lock().await;
                 if negatives.len() < 1024 {
                     negatives.insert(request.key, now.saturating_add(300));
                 }
-                Err(Error::not_found("Source record not found"))
+                Err(if diagnostics {
+                    collection::http_failure(
+                        Error::not_found("Source record not found"),
+                        collection::Phase::HttpAcquisition,
+                        404,
+                    )
+                } else {
+                    Error::not_found("Source record not found")
+                })
             }
             _ => self.stale_or_error(
                 existing,
                 now,
-                Error::unavailable("Source request failed"),
+                if diagnostics {
+                    collection::http_failure(
+                        Error::unavailable("Source request failed"),
+                        collection::Phase::HttpAcquisition,
+                        response.status,
+                    )
+                } else {
+                    Error::unavailable("Source request failed")
+                },
                 allow_stale,
             ),
         }
@@ -584,3 +670,6 @@ mod tests {
 
 #[cfg(test)]
 mod acquisition_tests;
+
+#[cfg(test)]
+mod retrieval_diagnostics_tests;

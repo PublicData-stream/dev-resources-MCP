@@ -60,7 +60,7 @@ pub trait RfcCorpusStore: Send + Sync {
         &self,
         key: &str,
         capture: Option<&Capture>,
-        error: Option<&str>,
+        error: Option<&crate::collection::Failure>,
         next_due: i64,
     ) -> Result<()>;
     async fn documents(&self) -> Result<Vec<Document>>;

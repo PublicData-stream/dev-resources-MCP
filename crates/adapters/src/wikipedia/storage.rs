@@ -650,7 +650,8 @@ mod tests {
         // additive schema-fifteen objects must be absent too; do not use CASCADE
         // or discard retained v1/capture/provider evidence.
         sqlx_core::raw_sql::raw_sql(
-            "DROP VIEW devres_crate_enrichment_all;
+            "ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at;
+             DROP VIEW devres_crate_enrichment_all;
              DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures;
              DROP FUNCTION devres_crate_enrichment_v2_immutable();
              DROP FUNCTION devres_crate_enrichment_head_immutable();

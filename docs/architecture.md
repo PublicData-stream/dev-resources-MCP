@@ -86,7 +86,7 @@ archive capture; checksum verification precedes archive parsing.
 
 ## BLAKE3 enforcement and schema 10
 
-Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 15. Schemas 1–9 require explicit
+Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 16. Schemas 1–9 require explicit
 private offline migration; serving rejects pre-10 schemas or pending migration.
 The maintenance path first excludes readers and writer with the lifecycle fence,
 then acquires the exclusive writer fence before any provider
@@ -152,6 +152,14 @@ rewriting both content and its digest. Existing freshness, provider budgets,
 licensing, request limits and network boundaries remain unchanged.
 
 ## RFC corpus
+
+RFC validated retrieval opts into additive closed failure context; other validators
+and generic writer-delegate errors retain their existing behavior. Error propagation
+preserves existing retry/qualification details, while logs, job persistence and
+status project only typed phase/limit/HTTP metadata and allowlisted codes. Schema
+16 adds bounded nullable job failure metadata and claim timestamps; it never
+assigns phases to old failures or changes sealed captures/snapshot membership.
+
 
 Application-owned corpus ports separate durable scheduling from PostgreSQL and
 source processing. A supervised serving worker owns RFC collection independently

@@ -261,7 +261,16 @@ impl RfcCorpus {
                 }
                 Err(error) => {
                     self.store
-                        .finish(&key, None, Some(&error.code), i64::MAX)
+                        .finish(
+                            &key,
+                            None,
+                            Some(&devres_application::collection::Failure::from_error(
+                                &error,
+                                devres_application::collection::Phase::BulkOperation,
+                                unix_now(),
+                            )),
+                            i64::MAX,
+                        )
                         .await?;
                 }
             }

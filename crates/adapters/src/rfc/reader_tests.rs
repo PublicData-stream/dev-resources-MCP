@@ -87,7 +87,13 @@ impl RfcCorpusStore for ReaderStore {
     async fn claim(&self, _: i64) -> Result<Option<devres_application::corpus::Job>> {
         Err(self.reject())
     }
-    async fn finish(&self, _: &str, _: Option<&Capture>, _: Option<&str>, _: i64) -> Result<()> {
+    async fn finish(
+        &self,
+        _: &str,
+        _: Option<&Capture>,
+        _: Option<&devres_application::collection::Failure>,
+        _: i64,
+    ) -> Result<()> {
         Err(self.reject())
     }
     async fn documents(&self) -> Result<Vec<Document>> {

@@ -500,7 +500,7 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
         .fetch_one(&inspection)
         .await
         .unwrap(),
-        15
+        16
     );
     assert!(
         devres_adapters::PgBlobStore::connect(url.as_str(), root.path())

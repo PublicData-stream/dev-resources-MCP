@@ -6,6 +6,15 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    RetrievalAdmission,
+    Revalidation,
+    IndexSelection,
+    IndexAdmission,
+    IndexManifest,
+    IndexEngine,
+    IndexReader,
+    IndexSearch,
+    IndexSnippet,
     BulkOperation,
     CatalogLookup,
     CatalogAcquisition,
@@ -113,6 +122,23 @@ pub fn at_phase(error: Error, phase: Phase) -> Error {
     )
 }
 
+/// Attach diagnostics without changing metadata used by the original error's callers.
+/// Status and persistence must still read only the typed `context` projection.
+pub fn attach_phase(mut error: Error, phase: Phase) -> Error {
+    let context = context(&error).unwrap_or(Context {
+        phase,
+        limit: None,
+        http_status: None,
+    });
+    if error.details.is_none() {
+        error.details = Some(serde_json::json!({}));
+    }
+    if let Some(serde_json::Value::Object(details)) = error.details.as_mut() {
+        details.insert("collector".into(), serde_json::json!(context));
+    }
+    error
+}
+
 pub fn limited(
     error: Error,
     phase: Phase,
@@ -178,6 +204,23 @@ pub struct Failure {
     pub http_status: Option<u16>,
 }
 
+impl Failure {
+    pub fn from_error(error: &Error, fallback: Phase, observed_at: i64) -> Self {
+        let context = context(error).unwrap_or(Context {
+            phase: fallback,
+            limit: None,
+            http_status: None,
+        });
+        Self {
+            code: safe_code(&error.code).into(),
+            observed_at,
+            phase: context.phase,
+            limit: context.limit,
+            http_status: context.http_status,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorStatus {
@@ -209,21 +252,11 @@ impl CollectorStatus {
         // Historical failure remains distinct from the most recent successful operation.
     }
     pub fn fail(&mut self, error: &Error, fallback: Phase, now: i64, retry_at: Option<i64>) {
-        let context = context(error).unwrap_or(Context {
-            phase: fallback,
-            limit: None,
-            http_status: None,
-        });
+        let failure = Failure::from_error(error, fallback, now);
         self.active = false;
-        self.phase = Some(context.phase);
+        self.phase = Some(failure.phase);
         self.retry_at = retry_at;
-        self.failure = Some(Failure {
-            code: safe_code(&error.code).into(),
-            observed_at: now,
-            phase: context.phase,
-            limit: context.limit,
-            http_status: context.http_status,
-        });
+        self.failure = Some(failure);
     }
 }
 
@@ -242,6 +275,42 @@ pub fn safe_code(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn additive_context_preserves_error_contract_but_failure_projects_only_closed_fields() {
+        let siblings = serde_json::json!({"retry_at":123,"attribution_failure":{"reason":"retained"},"private":"credential","collector":{"phase":"http_body","limit":{"kind":"compressed_bytes","maximum":10}}});
+        let error = attach_phase(
+            Error::new("external", "original message").with_details(siblings.clone()),
+            Phase::ArtifactPublication,
+        );
+        assert_eq!(error.details, Some(siblings));
+        assert_eq!(error.message, "original message");
+        let failure = Failure::from_error(&error, Phase::SourceValidation, 99);
+        assert_eq!(failure.phase, Phase::HttpBody);
+        assert_eq!(failure.code, "other");
+        assert_eq!(failure.observed_at, 99);
+        let encoded = serde_json::to_string(&failure).unwrap();
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("credential"));
+        assert!(!encoded.contains("retry_at"));
+        assert!(!encoded.contains("attribution_failure"));
+    }
+
+    #[test]
+    fn additive_context_replaces_invalid_context_and_preserves_non_object_details() {
+        let error = attach_phase(Error::capacity("bounded").with_details(serde_json::json!({"retry_at":10,"collector":{"phase":"http_body","body":"private"}})), Phase::RetrievalAdmission);
+        assert_eq!(context(&error).unwrap().phase, Phase::RetrievalAdmission);
+        assert_eq!(error.details.as_ref().unwrap()["retry_at"], 10);
+        assert!(
+            error.details.as_ref().unwrap()["collector"]
+                .get("body")
+                .is_none()
+        );
+        let error = attach_phase(
+            Error::unavailable("original").with_details(serde_json::json!([1, 2])),
+            Phase::RetainedLookup,
+        );
+        assert_eq!(error.details, Some(serde_json::json!([1, 2])));
+    }
     #[test]
     fn status_does_not_copy_external_errors_or_stale_activity() {
         let error = Error::new("secret-code", "secret-body").with_details(serde_json::json!({"url":"private-url","collector":{"phase":"csv_parsing","body":"private-row"}}));

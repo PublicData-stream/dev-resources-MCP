@@ -277,7 +277,7 @@ impl PgBlobStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| storage_error())?;
-        if !matches!(version, 11..=15) {
+        if !matches!(version, 11..=16) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
             ));
@@ -411,7 +411,7 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        let schema_upgrade_lock = version < 15 && mode == OpenMode::Serve;
+        let schema_upgrade_lock = version < 16 && mode == OpenMode::Serve;
         if schema_upgrade_lock {
             let exclusive: bool =
                 sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490, 2)")
@@ -435,7 +435,7 @@ impl PgBlobStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        } else if !(2..=15).contains(&version) {
+        } else if !(2..=16).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -585,11 +585,25 @@ impl PgBlobStore {
                 .await
                 .map_err(|_| storage_error())?;
         }
+        if version < 16
+            && matches!(
+                mode,
+                OpenMode::Serve
+                    | OpenMode::Maintenance
+                    | OpenMode::Transfer
+                    | OpenMode::RestoreCheck
+            )
+        {
+            sqlx_core::raw_sql::raw_sql(corpus_storage::SCHEMA_V16)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+        }
         if matches!(
             mode,
             OpenMode::Serve | OpenMode::Maintenance | OpenMode::Transfer | OpenMode::RestoreCheck
         ) {
-            sqlx_core::query::query("UPDATE devres_schema SET version=15 WHERE singleton")
+            sqlx_core::query::query("UPDATE devres_schema SET version=16 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;

@@ -284,7 +284,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("schema"),
-        15
+        16
     );
     // Recognized opaque acceptance evidence can migrate without invented provider graph variants.
     // Exercise the actual version-six migration branch with retained older-provider evidence.
@@ -377,7 +377,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("upgraded schema"),
-        15
+        16
     );
     assert_eq!(
         store
@@ -873,6 +873,7 @@ async fn remove_integrity_schema(pool: &sqlx_postgres::PgPool) {
         r#"
 -- These task-owned schema-fifteen objects are empty. Remove their view dependency
 -- before stripping legacy integrity columns; preserve all earlier evidence.
+ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at;
 DROP VIEW devres_crate_enrichment_all;
 DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures;
 DROP FUNCTION devres_crate_enrichment_v2_immutable();

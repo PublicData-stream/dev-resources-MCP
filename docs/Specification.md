@@ -38,9 +38,10 @@ Active schema-10 stores automatically receive additive schema-11 attribution
 tables at normal startup under the exclusive storage-owner fence. This bounded
 transition does not perform the schema 1–9 BLAKE3 conversion, scan the corpus or
 request upstream data. Pending conversion still requires offline activation.
-Normal writer startup records schema 14 for filesystem and S3, including the
-schema-13 runtime split and schema-14 Wikipedia tables. Older binaries cannot
-reopen the store; serving readers require the committed schema-14 backend. Attribution policy compatibility remains independent
+Normal writer startup records schema 16 for filesystem and S3, including the
+runtime split, Wikipedia tables, crate enrichment and bounded RFC job diagnostics.
+Older binaries cannot reopen the store; serving readers require the committed
+schema-16 backend. Attribution policy compatibility remains independent
 of that private topology marker.
 
 Serving and collection run as separate workloads. Public-source acquisition needed
@@ -270,9 +271,21 @@ IDs from different builds are not stable identities. API comparisons require
 qualified per-side projection coverage and compatible schema versions. Changes are
 observations, not semantic-version or security certifications.
 
+RFC status retains the legacy `captured_documents`, `pending_documents`,
+`total_jobs` and `outstanding_jobs` values. New representation counters count
+source-key jobs (HTTPS and rsync identities separately), not unique RFC numbers
+or every historical capture. `captured_representations` includes failed refreshes
+that retain a capture; `missing_representations` counts jobs without captures.
+`failed_representation_jobs` and `outstanding_representation_jobs` describe queue
+states. `scheduled_rfc_numbers` and `captured_rfc_numbers` count distinct numbers
+in the queue and its capture-bearing jobs respectively, not search completeness.
+The twenty-error sample is ordered by due time/source key, not a histogram.
+Its nullable failure context and attempt time are unknown for legacy rows.
+Live status `observed_at` is separate from snapshot `created_at` and coverage.
+
 ## Audits and failure
 
-W3C, Chromium and crate corpus status include additive collector diagnostics.
+RFC, W3C, Chromium and crate corpus status include additive collector diagnostics.
 `active`, `phase`, bounded `progress`, `last_success_at` and an observed `retry_at`
 separate current activity from historical failures. Failures may include an exact
 phase, HTTP status or `limit` with a fixed kind and numeric observed/maximum values.

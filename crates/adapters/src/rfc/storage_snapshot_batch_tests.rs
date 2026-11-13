@@ -357,3 +357,163 @@ async fn snapshot_capture_batches_preserve_scalar_identity_nulls_boundaries_and_
     .unwrap();
     admin.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+async fn representation_diagnostics_upgrade_counts_and_history() {
+    use devres_application::collection::{Failure, Phase};
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
+    let admin = PgPool::connect(&base).await.unwrap();
+    let database = format!("devres_rfc_diagnostics_{}", devres_domain::unix_now());
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE DATABASE {database}"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    let mut url = url::Url::parse(&base).unwrap();
+    url.set_path(&format!("/{database}"));
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let store = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .unwrap();
+    let pool = PgPool::connect(url.as_str()).await.unwrap();
+    let mut captures = Vec::new();
+    for (number, format) in [(9000, "txt"), (9000, "html"), (9001, "txt")] {
+        let key = crate::rfc::corpus::representation_key(number, format, "https");
+        let source_url = crate::rfc::corpus::representation_url(number, format);
+        store
+            .schedule(&[JobSpec {
+                key: key.clone(),
+                number,
+                format: format.into(),
+                source_url: source_url.clone(),
+                assurance: "https".into(),
+                due_at: 10,
+            }])
+            .await
+            .unwrap();
+        if number == 9000 {
+            let capture = published(
+                &store,
+                key.clone(),
+                source_url,
+                format!("retained {format} fixture").into_bytes(),
+                10,
+            )
+            .await;
+            store.finish(&key, Some(&capture), None, 20).await.unwrap();
+            captures.push(capture);
+        }
+    }
+    sqlx_core::query::query("UPDATE devres_rfc_jobs SET status='failed',last_error='unavailable' WHERE source_key='rfc:text:9000'")
+        .execute(&pool).await.unwrap();
+    drop(store);
+    // This database is disposable. Remove only the additive operational columns
+    // to reproduce a real schema-15 store; retained evidence remains untouched.
+    sqlx_core::raw_sql::raw_sql("ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; UPDATE devres_schema SET version=15 WHERE singleton")
+        .execute(&pool).await.unwrap();
+    let mut lifecycle_reader = pool.acquire().await.unwrap();
+    sqlx_core::query::query("SELECT pg_advisory_lock_shared(1835365490,2)")
+        .execute(&mut *lifecycle_reader)
+        .await
+        .unwrap();
+    let blocked = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(blocked.code, "capacity");
+    assert_eq!(
+        sqlx_core::query_scalar::query_scalar::<_, i32>(
+            "SELECT version FROM devres_schema WHERE singleton"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        15
+    );
+    assert_eq!(sqlx_core::query_scalar::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_name='devres_rfc_jobs' AND column_name IN ('failure','last_attempt_at')").fetch_one(&pool).await.unwrap(), 0);
+    sqlx_core::query::query("SELECT pg_advisory_unlock_shared(1835365490,2)")
+        .execute(&mut *lifecycle_reader)
+        .await
+        .unwrap();
+    drop(lifecycle_reader);
+    let store = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .unwrap();
+    let status = store.status().await.unwrap();
+    assert_eq!(status["total_representations"], 3);
+    assert_eq!(status["captured_representations"], 2);
+    assert_eq!(status["missing_representations"], 1);
+    assert_eq!(status["scheduled_rfc_numbers"], 2);
+    assert_eq!(status["captured_rfc_numbers"], 1);
+    assert_eq!(status["failed_representation_jobs"], 1);
+    assert_eq!(status["outstanding_representation_jobs"], 2);
+    assert_eq!(
+        status["captured_documents"],
+        status["captured_representations"]
+    );
+    assert_eq!(
+        status["pending_documents"],
+        status["missing_representations"]
+    );
+    assert!(status["errors"][0]["failure"].is_null());
+    assert!(status["errors"][0]["last_attempt_at"].is_null());
+    assert_eq!(store.documents().await.unwrap().len(), 2);
+    for capture in &captures {
+        assert_eq!(
+            store.capture(&capture.id).await.unwrap().capture.id,
+            capture.id
+        );
+    }
+    // Only this selected job is made due; the production admission policy is unchanged.
+    sqlx_core::query::query(
+        "UPDATE devres_rfc_jobs SET due_at=100 WHERE source_key<>'rfc:text:9000'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let job = store.claim(40).await.unwrap().unwrap();
+    assert_eq!(job.spec.key, "rfc:text:9000");
+    let failure = Failure::from_error(
+        &Error::unavailable("private sentinel")
+            .with_details(json!({"private":"never report this"})),
+        Phase::HttpAcquisition,
+        45,
+    );
+    store
+        .finish(&job.spec.key, None, Some(&failure), 60)
+        .await
+        .unwrap();
+    drop(store);
+    let store = PgBlobStore::connect(url.as_str(), root.path())
+        .await
+        .unwrap();
+    let status = store.status().await.unwrap();
+    let sample = &status["errors"][0];
+    assert_eq!(sample["last_attempt_at"], 40);
+    assert_eq!(sample["failure"]["observed_at"], 45);
+    assert_eq!(sample["failure"]["phase"], "http_acquisition");
+    assert_eq!(sample["has_capture"], true);
+    assert_eq!(sample["attempts"], 1);
+    assert!(!status.to_string().contains("private"));
+    assert_eq!(store.documents().await.unwrap().len(), 2);
+    let capture = captures
+        .iter()
+        .find(|capture| capture.key == job.spec.key)
+        .unwrap();
+    store
+        .finish(&job.spec.key, Some(capture), None, 100)
+        .await
+        .unwrap();
+    assert!(
+        store.status().await.unwrap()["errors"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.capture(&capture.id).await.unwrap().capture.body_hash,
+        capture.body_hash
+    );
+}

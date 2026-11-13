@@ -2,6 +2,7 @@
 use crate::html_transport::{HtmlClient, ProxyPolicy, Response};
 use async_trait::async_trait;
 use devres_application::Fetcher;
+use devres_application::collection::{Phase, attach_phase};
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, Validators};
 use futures::StreamExt;
 use std::{collections::HashMap, time::Duration};
@@ -65,8 +66,20 @@ impl HttpFetcher {
         validators: Option<&Validators>,
         host: &str,
     ) -> Result<(FetchResponse, u64)> {
+        let diagnose = |error, phase| {
+            if host == "www.rfc-editor.org" {
+                attach_phase(error, phase)
+            } else {
+                error
+            }
+        };
         let _shared_attempt = match &self.broker {
-            Some(broker) => Some(broker.admit_foreground(host).await?),
+            Some(broker) => Some(
+                broker
+                    .admit_foreground(host)
+                    .await
+                    .map_err(|error| diagnose(error, Phase::RetrievalAdmission))?,
+            ),
             None => None,
         };
         let scheduled = if self.broker.is_some() {
@@ -107,22 +120,36 @@ impl HttpFetcher {
         let html = Self::is_html(request, host);
         let deadline = Instant::now() + Duration::from_secs(30);
         let response = if html {
-            let prepared = builder
-                .build()
-                .map_err(|_| Error::unavailable("Source connection failed"))?;
+            let prepared = builder.build().map_err(|_| {
+                diagnose(
+                    Error::unavailable("Source connection failed"),
+                    Phase::HttpAcquisition,
+                )
+            })?;
             tokio::time::timeout_at(
                 deadline,
                 self.html.send(&destination, prepared.headers().clone()),
             )
             .await
-            .map_err(|_| Error::unavailable("Source connection failed"))?
-            .map_err(|_| Error::unavailable("Source connection failed"))?
+            .map_err(|_| {
+                diagnose(
+                    Error::unavailable("Source connection failed"),
+                    Phase::HttpAcquisition,
+                )
+            })?
+            .map_err(|_| {
+                diagnose(
+                    Error::unavailable("Source connection failed"),
+                    Phase::HttpAcquisition,
+                )
+            })?
         } else {
-            builder
-                .send()
-                .await
-                .map(Response::from)
-                .map_err(|_| Error::unavailable("Source connection failed"))?
+            builder.send().await.map(Response::from).map_err(|_| {
+                diagnose(
+                    Error::unavailable("Source connection failed"),
+                    Phase::HttpAcquisition,
+                )
+            })?
         };
         let status = response.status();
         let retry = match response.headers().get("retry-after") {
@@ -168,7 +195,10 @@ impl HttpFetcher {
             .content_length()
             .is_some_and(|v| v > request.max_bytes as u64)
         {
-            return Err(Error::capacity("Source body exceeds limit"));
+            return Err(diagnose(
+                Error::capacity("Source body exceeds limit"),
+                Phase::HttpBody,
+            ));
         }
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
@@ -176,16 +206,29 @@ impl HttpFetcher {
             let next = if html {
                 tokio::time::timeout_at(deadline, stream.next())
                     .await
-                    .map_err(|_| Error::unavailable("Source body transfer failed"))?
+                    .map_err(|_| {
+                        diagnose(
+                            Error::unavailable("Source body transfer failed"),
+                            Phase::HttpBody,
+                        )
+                    })?
             } else {
                 stream.next().await
             };
             let Some(chunk) = next else {
                 break;
             };
-            let chunk = chunk.map_err(|_| Error::unavailable("Source body transfer failed"))?;
+            let chunk = chunk.map_err(|_| {
+                diagnose(
+                    Error::unavailable("Source body transfer failed"),
+                    Phase::HttpBody,
+                )
+            })?;
             if chunk.len() > request.max_bytes.saturating_sub(body.len()) {
-                return Err(Error::capacity("Source body exceeds limit"));
+                return Err(diagnose(
+                    Error::capacity("Source body exceeds limit"),
+                    Phase::HttpBody,
+                ));
             }
             body.extend_from_slice(&chunk);
         }
@@ -319,11 +362,14 @@ impl Fetcher for HttpFetcher {
         } else {
             None
         };
-        let _slot = self
-            .slots
-            .acquire()
-            .await
-            .map_err(|_| Error::capacity("Source admission closed"))?;
+        let _slot = self.slots.acquire().await.map_err(|_| {
+            let error = Error::capacity("Source admission closed");
+            if host == "www.rfc-editor.org" {
+                attach_phase(error, Phase::RetrievalAdmission)
+            } else {
+                error
+            }
+        })?;
         // One retry owner. Each attempt reserves the same provider throttle.
         for attempt in 0..2 {
             let (response, retry) = self.attempt(request, validators, &host).await?;
@@ -414,6 +460,28 @@ mod tests {
         task.abort();
     }
     #[tokio::test]
+    async fn rfc_transport_failure_has_closed_phase_without_exposing_destination() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let mut fetcher = HttpFetcher::new().unwrap();
+        fetcher.html = HtmlClient::fixture().unwrap();
+        fetcher.test_origin = Some(origin.parse().unwrap());
+        let error = fetcher.fetch(&html_request(), None).await.unwrap_err();
+        assert_eq!(error.code, "unavailable");
+        assert_eq!(error.message, "Source connection failed");
+        assert_eq!(
+            devres_application::collection::context(&error)
+                .unwrap()
+                .phase,
+            Phase::HttpAcquisition
+        );
+        let encoded = serde_json::to_string(&error.details).unwrap();
+        assert!(!encoded.contains("127.0.0.1"));
+        assert!(!encoded.contains("http://"));
+    }
+
+    #[tokio::test]
     async fn rfc_html_error_bodies_are_discarded_and_limits_hold() {
         use axum::{Router, routing::get};
         let router = Router::new()
@@ -444,9 +512,13 @@ mod tests {
         assert!(response.body.is_empty());
         let mut oversized = html_request();
         oversized.url = "https://www.rfc-editor.org/rfc/rfc9001.html".into();
+        let error = fetcher.fetch(&oversized, None).await.unwrap_err();
+        assert_eq!(error.code, "capacity");
         assert_eq!(
-            fetcher.fetch(&oversized, None).await.unwrap_err().code,
-            "capacity"
+            devres_application::collection::context(&error)
+                .unwrap()
+                .phase,
+            Phase::HttpBody
         );
         task.abort();
     }

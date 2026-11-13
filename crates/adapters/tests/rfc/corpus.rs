@@ -193,7 +193,7 @@ impl RfcCorpusStore for Memory {
         &self,
         key: &str,
         capture: Option<&Capture>,
-        error: Option<&str>,
+        error: Option<&devres_application::collection::Failure>,
         next_due: i64,
     ) -> Result<()> {
         let mut state = self.0.lock().await;
@@ -203,7 +203,7 @@ impl RfcCorpusStore for Memory {
             .ok_or_else(|| Error::not_found("Synthetic job absent."))?;
         job.running = false;
         job.spec.due_at = next_due;
-        job.error = error.map(str::to_owned);
+        job.error = error.map(|failure| failure.code.clone());
         let spec = job.spec.clone();
         if let Some(capture) = capture {
             state.documents.insert(

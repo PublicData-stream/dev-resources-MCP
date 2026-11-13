@@ -123,7 +123,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         .fetch_one(&inspection)
         .await
         .unwrap(),
-        15
+        16
     );
     assert_eq!(
         store
@@ -302,6 +302,7 @@ async fn remove_integrity_schema(pool: &sqlx_postgres::PgPool) {
         r#"
 -- These task-owned schema-fifteen objects are empty. Remove their view dependency
 -- before stripping legacy integrity columns; preserve all earlier evidence.
+ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at;
 DROP VIEW devres_crate_enrichment_all;
 DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures;
 DROP FUNCTION devres_crate_enrichment_v2_immutable();

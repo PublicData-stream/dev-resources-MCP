@@ -529,6 +529,10 @@ pub async fn get(retrieval: &Retrieval, input: GetInput) -> Result<Value> {
 pub(crate) struct Validator;
 #[async_trait]
 impl ResponseValidator for Validator {
+    fn collection_diagnostics(&self) -> bool {
+        true
+    }
+
     fn acquisition(
         &self,
         request: &FetchRequest,
@@ -566,7 +570,9 @@ impl ResponseValidator for Validator {
         request: &FetchRequest,
         response: FetchResponse,
     ) -> Result<FetchResponse> {
-        let permit = archive::admit()?;
+        use devres_application::collection::{Phase, attach_phase};
+        let permit =
+            archive::admit().map_err(|error| attach_phase(error, Phase::SourceValidation))?;
         let key = request.key.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -587,7 +593,8 @@ impl ResponseValidator for Validator {
             Ok(response)
         })
         .await
-        .map_err(|_| Error::unavailable("RFC validation worker failed."))?
+        .map_err(|_| attach_phase(Error::unavailable("RFC validation worker failed."), Phase::SourceValidation))?
+        .map_err(|error| attach_phase(error, Phase::SourceValidation))
         .inspect_err(|error: &Error| {
             let code = match error.code.as_str() {
                 "invalid_input" | "unavailable" | "not_found" | "capacity" | "integrity" | "cancelled" => error.code.as_str(),
