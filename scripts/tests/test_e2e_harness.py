@@ -1,4 +1,5 @@
 """Exercise cleanup against fake engines, without launching containers or clusters."""
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -94,19 +95,45 @@ k() { minikube "$@"; }
                     shutil.copy2(SCRIPTS / 'with-tmp-state.sh', root / 'scripts' / 'with-tmp-state.sh')
                     for name in ('make-fixture.sh', 'build-harness.sh'):
                         file = root / 'scripts' / name
-                        file.write_text('#!/bin/bash\nprintf "%s\\n" "' + name + ' $*" >> "$CALLS"\n')
+                        body = '#!/bin/bash\nset -euo pipefail\nprintf "%s\\n" "' + name + ' $*" >> "$CALLS"\n'
+                        if name == 'make-fixture.sh':
+                            body += ('mkdir -p "$1/fixture"\n'
+                                     'cp -- "$BACKEND_FIXTURE_SOURCE" "$1/fixture/backend.toml"\n'
+                                     'printf "%s\\n" "$1" > "$FIXTURE_ROOT_FILE"\n')
+                        file.write_text(body)
                         file.chmod(0o755)
-                    for name in ('split-runtime-fixture.py', 'kube-identity-fixture.py', 'secrets-encryption-fixture.py'):
+                    shutil.copy2(SCRIPTS / 'split-runtime-fixture.py', root / 'scripts' / 'split-runtime-fixture.py')
+                    for name in ('kube-identity-fixture.py', 'secrets-encryption-fixture.py'):
                         (root / 'scripts' / name).write_text('import sys\n')
+                    observer = root / 'scripts' / 'observe-preparation.py'
+                    observer.write_text('''import json, os, pathlib, tomllib
+root = pathlib.Path(pathlib.Path(os.environ['FIXTURE_ROOT_FILE']).read_text().strip()) / 'fixture'
+summary = {}
+for name in ('backend.toml', 'writer.toml'):
+    wikipedia = tomllib.loads((root / name).read_text())['wikipedia']
+    summary[name] = {
+        'disabled': wikipedia['enabled'] is False,
+        'mounted_token': wikipedia.get('oauth2_token_file') == '/run/devres-wikipedia/token',
+        'no_user_agent': 'user_agent' not in wikipedia,
+    }
+token = root / 'wikipedia-token'
+summary['synthetic_token_matches'] = token.read_text() == 'synthetic-wikipedia-token\\n'
+summary['token_mode'] = token.stat().st_mode & 0o777
+pathlib.Path(os.environ['PREPARATION_SUMMARY']).write_text(json.dumps(summary))
+''')
                     diagnostic = root / 'scripts' / 'e2e-storage.sh'
                     diagnostic.write_text('#!/bin/bash\nprintf "storage %s\\n" "$1" >> "$CALLS"\nexit 97\n')
                     diagnostic.chmod(0o755)
                     for name in ('docker', 'minikube'):
                         file = root / 'bin' / name
-                        file.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\nif [[ $1 == profile ]]; then echo \'{"valid":[]}\'; fi\n'
+                        file.write_text('#!/bin/bash\nset -euo pipefail\nprintf "%s\\n" "$*" >> "$CALLS"\nif [[ $1 == profile ]]; then echo \'{"valid":[]}\'; fi\n'
+                                        'if [[ ${3:-} == start ]]; then python3 "$STARTUP_OBSERVER"; fi\n'
                                         'if [[ ${3:-} == "${FAIL_PHASE:-unused}" ]]; then exit 43; fi\n')
                         file.chmod(0o755)
                     env = dict(os.environ, CALLS=str(root / 'calls'),
+                               BACKEND_FIXTURE_SOURCE=str(SCRIPTS.parent / 'deploy/oxibelt/backend.toml'),
+                               FIXTURE_ROOT_FILE=str(root / 'fixture-root'),
+                               STARTUP_OBSERVER=str(observer), PREPARATION_SUMMARY=str(root / 'preparation.json'),
                                DEVRES_TMP_ROOT=str(root / 'state'), DEVRES_DOCKER_HOST='fixture://docker',
                                PATH=str(root / 'bin') + ':' + os.environ['PATH'])
                     env.pop('DEVRES_KUBERNETES_VERSION', None)
@@ -117,12 +144,18 @@ k() { minikube "$@"; }
                         args += ['--rfc-text-only', '--live']
                     result = subprocess.run(['bash', str(harness), *args], env=env, capture_output=True, timeout=15)
                     self.assertEqual(result.returncode, 43 if failure else 0, result.stderr.decode())
+                    self.assertFalse(Path((root / 'fixture-root').read_text().strip()).exists())
                     calls = (root / 'calls').read_text()
                     self.assertEqual('build-harness.sh' in calls, not supplied)
                     if supplied:
                         self.assertIn('image inspect supplied:test', calls)
                         self.assertNotIn('image rm supplied:test', calls)
                     if kind == 'minikube':
+                        expected_config = {'disabled': True, 'mounted_token': True, 'no_user_agent': True}
+                        self.assertEqual(json.loads((root / 'preparation.json').read_text()), {
+                            'backend.toml': expected_config, 'writer.toml': expected_config,
+                            'synthetic_token_matches': True, 'token_mode': 0o600,
+                        })
                         self.assertIn('--kubernetes-version=v1.37.0', calls)
                         self.assertIn('storage before-minikube-start', calls)
                         if failure:
