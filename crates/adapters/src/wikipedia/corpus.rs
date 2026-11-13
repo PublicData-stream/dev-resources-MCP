@@ -35,6 +35,12 @@ fn now() -> i64 {
 fn bad() -> Error {
     Error::integrity("Invalid retained Wikipedia evidence.")
 }
+pub(super) fn network_readiness_error(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "wikipedia_configuration_required" | "wikipedia_authentication_failed"
+    )
+}
 fn value<T: Serialize>(v: &T) -> Result<Value> {
     serde_json::to_value(v).map_err(|_| bad())
 }
@@ -312,7 +318,12 @@ impl WikipediaCorpus {
         if !self.writer {
             return Ok(());
         }
-        for title in &self.config.category_roots {
+        for title in self
+            .config
+            .category_roots
+            .iter()
+            .filter(|_| self.source.network_ready())
+        {
             let k = key("category", title);
             match self.store.wiki_state(&k).await? {
                 None=>self.save(&k,json!({"title":title,"roots":[title],"continuation":null,"generation":now()}),Some(now())).await?,
@@ -343,10 +354,13 @@ impl WikipediaCorpus {
                 .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                 .unwrap_or(0)
         }
+        self.source.ensure_network_ready()?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(31);
         loop {
+            self.source.ensure_network_ready()?;
             let delay = {
                 let _guard = self.admission_updates.lock().await;
+                self.source.ensure_network_ready()?;
                 let mut old = self
                     .store
                     .wiki_state("provider:admission")
@@ -426,7 +440,9 @@ impl WikipediaCorpus {
         validators: Validators,
         cancel: CancellationToken,
     ) -> Result<Response> {
+        self.source.ensure_network_ready()?;
         let _guard = self.network.lock().await;
+        self.source.ensure_network_ready()?;
         let cacheable_metadata = !matches!(
             op,
             Operation::ArticleHtml { .. } | Operation::ArticleSource { .. }
@@ -471,7 +487,8 @@ impl WikipediaCorpus {
                 if cacheable_metadata
                     && r.status == 200
                     && r.api_error.is_none()
-                    && r.cache.retention_allowed()?
+                    && r.cache
+                        .public_retention_allowed(self.source.authenticated())?
                 {
                     let artifact = self.raw.capture_bytes(r.body.clone(), cancel).await?;
                     self.save(
@@ -482,6 +499,7 @@ impl WikipediaCorpus {
                     .await?;
                 }
             }
+            Err(error) if network_readiness_error(error) => {}
             Err(error) => {
                 self.failed_attempt(
                     "http",
@@ -516,7 +534,9 @@ impl WikipediaCorpus {
                 .wikipedia_request(title, page_id)
                 .await;
         }
+        self.source.ensure_network_ready()?;
         let _guard = self.processing.lock().await;
+        self.source.ensure_network_ready()?;
         let title = if let Some(t) = title {
             super::source::validate_title(&t)?;
             t
@@ -593,6 +613,7 @@ impl WikipediaCorpus {
                 .wikipedia_search(query.to_owned(), limit)
                 .await;
         }
+        self.source.ensure_network_ready()?;
         let r = self
             .fetch(
                 Operation::Search {
@@ -762,6 +783,11 @@ impl WikipediaCorpus {
             if r.status == 304 {
                 let mut previous = previous.ok_or_else(bad)?;
                 previous.cache = r.cache.merged_after_304(&previous.cache)?;
+                if self.source.authenticated() && !previous.cache.public_retention_allowed(true)? {
+                    return Err(Error::unavailable(
+                        "Wikipedia authenticated response is not eligible for public retention.",
+                    ));
+                }
                 let _guard = self.state_updates.lock().await;
                 if let Some(id) = &previous.capture {
                     self.save(&format!("validation:{id}"),json!({"validated_at":now(),"expires_at":previous.cache.freshness_deadline()?,"cache":previous.cache}),None).await?;
@@ -783,7 +809,15 @@ impl WikipediaCorpus {
                     "Wikipedia article acquisition is unavailable.",
                 ));
             }
-            if !r.cache.retention_allowed()? {
+            if !r
+                .cache
+                .public_retention_allowed(self.source.authenticated())?
+            {
+                if self.source.authenticated() {
+                    return Err(Error::unavailable(
+                        "Wikipedia authenticated response is not eligible for public retention.",
+                    ));
+                }
                 let _guard = self.state_updates.lock().await;
                 if let Some(id) = previous.as_ref().and_then(|v| v.capture.as_ref()) {
                     self.save(&format!("validation:{id}"),json!({"validated_at":now(),"expires_at":r.cache.freshness_deadline()?,"cache":r.cache}),None).await?;
@@ -1351,7 +1385,7 @@ impl WikipediaCorpus {
         self.store.wiki_commit(&[], &states).await
     }
     pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
-        if !self.config.enabled {
+        if !self.config.enabled || !self.source.network_ready() {
             cancel.cancelled().await;
             return Ok(());
         }
@@ -1360,6 +1394,10 @@ impl WikipediaCorpus {
         let mut next_publication = now();
         loop {
             if cancel.is_cancelled() {
+                return Ok(());
+            }
+            if !self.source.network_ready() {
+                cancel.cancelled().await;
                 return Ok(());
             }
             let result = {
@@ -1419,7 +1457,9 @@ impl WikipediaCorpus {
                         self.collect_article(&row.key, row.data, cancel.clone())
                             .await
                     };
-                    if let Err(e) = &r {
+                    if let Err(e) = &r
+                        && !network_readiness_error(e)
+                    {
                         let _guard = self.state_updates.lock().await;
                         let current = self
                             .store
@@ -1445,6 +1485,10 @@ impl WikipediaCorpus {
             if let Err(error) = result {
                 tracing::warn!(code=%error.code,"Wikipedia collection slice deferred");
             }
+            if !self.source.network_ready() {
+                cancel.cancelled().await;
+                return Ok(());
+            }
             if now() >= next_publication {
                 self.publish_snapshot().await?;
                 self.update_aliases(cancel.clone()).await?;
@@ -1455,12 +1499,16 @@ impl WikipediaCorpus {
         }
     }
     pub async fn run_events(&self, cancel: CancellationToken) -> Result<()> {
-        if !self.config.enabled {
+        if !self.config.enabled || !self.source.network_ready() {
             cancel.cancelled().await;
             return Ok(());
         }
         loop {
             if cancel.is_cancelled() {
+                return Ok(());
+            }
+            if !self.source.network_ready() {
+                cancel.cancelled().await;
                 return Ok(());
             }
             let checkpoint = self
@@ -1507,6 +1555,7 @@ impl WikipediaCorpus {
                             self.cooldown(until).await?;
                         }
                     }
+                    (_, _) if result.as_ref().is_err_and(network_readiness_error) => {}
                     (_, retry_at) => self.failed_attempt("stream", retry_at).await?,
                 }
 
@@ -1570,6 +1619,10 @@ impl WikipediaCorpus {
                     .await?
                 }
                 Err(_) => {}
+            }
+            if !self.source.network_ready() {
+                cancel.cancelled().await;
+                return Ok(());
             }
             self.save(
                 "stream:status",

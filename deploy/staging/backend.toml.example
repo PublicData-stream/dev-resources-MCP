@@ -4,7 +4,8 @@
 url = "https://github.com/PublicData-stream/dev-resources-MCP/releases/download/0.1.0-build.78c2e9c5/source.tar.gz"
 
 # First qualify transport, live fixed records, and coordinated restore with all
-# collectors paused. Activation changes only these nine booleans to true.
+# collectors paused. Configure Wikipedia's operator identity before activating
+# its collector; activation then changes these nine booleans to true.
 [rfc]
 enabled = false
 [crates]
@@ -21,6 +22,9 @@ enabled = false
 enabled = false
 [wikipedia]
 enabled = false
+# Configure an honest operator identity before enabling Wikipedia network activity.
+# user_agent = "ExampleBot/1.0 (https://example.org/bot; operator@example.org)"
+# oauth2_token_file = "/run/secrets/wikipedia-oauth2-token"
 [npm]
 enabled = false
 packages = []

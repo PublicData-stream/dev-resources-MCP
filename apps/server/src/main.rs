@@ -258,6 +258,14 @@ async fn main() -> Result<(), ServerError> {
         || npm_rebuild;
     let writer_role =
         runtime_role == devres_server::writer_rpc::RuntimeRole::Collect || maintenance;
+    // Other providers' maintenance commands do not acquire Wikipedia content
+    // and must not depend on its optional credential mount.
+    let wikipedia_network_writer = writer_role && !maintenance;
+    let wikipedia_identity =
+        wikipedia_identity(&config.wikipedia, wikipedia_network_writer).await?;
+    if wikipedia_network_writer && config.wikipedia.user_agent.is_none() {
+        tracing::info!("Wikipedia network acquisition paused; configure wikipedia.user_agent.");
+    }
     let delegate: Option<Arc<dyn devres_application::acquisition::AcquisitionDelegate>> =
         if writer_role {
             None
@@ -313,7 +321,8 @@ async fn main() -> Result<(), ServerError> {
                 config.npm.registry_requests_per_second,
                 config.npm.advisory_requests_per_second,
             )?
-            .with_wikipedia_rate(config.wikipedia.requests_per_second)?,
+            .with_wikipedia_rate(config.wikipedia.requests_per_second)?
+            .with_wikipedia_identity(wikipedia_identity),
     );
     let fetcher = Arc::new(devres_adapters::HttpFetcher::with_broker(broker.clone())?);
     let mut retrieval = devres_application::Retrieval::new(store.clone(), fetcher);
@@ -857,5 +866,75 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Composition reads mounted credentials only in the network executor.
+async fn wikipedia_identity(
+    config: &devres_application::wikipedia::WikipediaConfig,
+    writer: bool,
+) -> Result<devres_adapters::wikipedia::identity::WikipediaIdentity, ServerError> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    if writer && let Some(path) = &config.oauth2_token_file {
+        tokio::fs::File::open(path)
+            .await
+            .map_err(|_| "Wikipedia OAuth2 token file unavailable.")?
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "Wikipedia OAuth2 token file unavailable.")?;
+    }
+    Ok(
+        devres_adapters::wikipedia::identity::WikipediaIdentity::new(
+            config.user_agent.as_deref(),
+            (writer && config.oauth2_token_file.is_some()).then_some(bytes.as_slice()),
+        )?,
+    )
+}
+
+#[cfg(test)]
+mod wikipedia_identity_tests {
+    use super::*;
+    #[tokio::test]
+    async fn reader_does_not_open_writer_token_file() {
+        let config = devres_application::wikipedia::WikipediaConfig {
+            oauth2_token_file: Some("/nonexistent/devres-fixture-token".into()),
+            ..Default::default()
+        };
+        assert!(wikipedia_identity(&config, false).await.is_ok());
+        let error = wikipedia_identity(&config, true)
+            .await
+            .expect_err("missing mounted token");
+        assert_eq!(
+            error.to_string(),
+            "Wikipedia OAuth2 token file unavailable."
+        );
+        assert!(!error.to_string().contains("nonexistent"));
+    }
+    #[tokio::test]
+    async fn writer_token_read_is_bounded_and_validated() {
+        let root = tempfile::tempdir_in("/tmp").expect("temporary");
+        let path = root.path().join("token");
+        let config = devres_application::wikipedia::WikipediaConfig {
+            user_agent: Some("FixtureBot/1.0 (https://example.org/bot)".into()),
+            oauth2_token_file: Some(path.clone()),
+            ..Default::default()
+        };
+        tokio::fs::write(&path, b"synthetic-secret\n")
+            .await
+            .expect("fixture");
+        let identity = wikipedia_identity(&config, true)
+            .await
+            .expect("valid mounted token");
+        assert!(!format!("{identity:?}").contains("synthetic-secret"));
+        tokio::fs::write(&path, vec![b'x'; 16 * 1024 + 1])
+            .await
+            .expect("oversized fixture");
+        assert!(wikipedia_identity(&config, true).await.is_err());
+        tokio::fs::write(&path, b"synthetic secret")
+            .await
+            .expect("invalid fixture");
+        assert!(wikipedia_identity(&config, true).await.is_err());
     }
 }

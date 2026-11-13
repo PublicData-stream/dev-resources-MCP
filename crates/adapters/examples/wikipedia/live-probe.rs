@@ -4,6 +4,7 @@ use devres_adapters::{
     wikipedia::{
         cache::CacheMetadata,
         events::SseParser,
+        identity::WikipediaIdentity,
         processing,
         source::{Operation, Response, WikipediaSource},
     },
@@ -66,14 +67,14 @@ fn persist(root: &Path, name: &str, value: &Value) -> Result<()> {
         .and_then(|directory| directory.sync_all())
         .map_err(|_| unavailable())
 }
-fn counted_broker(root: &Path) -> Result<Arc<BulkBroker>> {
+fn counted_broker(root: &Path, identity: WikipediaIdentity) -> Result<Arc<BulkBroker>> {
     let initial = read(root, "attempt-state.json")?.unwrap_or(json!({"attempts":0,"not_before":0}));
     let count = initial["attempts"]
         .as_u64()
         .filter(|count| *count <= 20)
         .ok_or_else(invalid)? as usize;
     let owned = root.to_owned();
-    Ok(Arc::new(BulkBroker::new(BulkConfig::default())?.with_attempt_budget(20)?.with_attempt_observer(count, Arc::new(move |count| {
+    Ok(Arc::new(BulkBroker::new(BulkConfig::default())?.with_wikipedia_identity(identity).with_attempt_budget(20)?.with_attempt_observer(count, Arc::new(move |count| {
         let old = read(&owned, "attempt-state.json")?.unwrap_or(json!({"attempts":0,"not_before":0}));
         let previous = old["attempts"].as_u64().ok_or_else(invalid)?;
         if count as u64 != previous.saturating_add(1) || count > 20 { return Err(invalid()); }
@@ -371,7 +372,35 @@ fn accepted(receipt: &Value) -> bool {
         receipt["steps"][key]["status"] == 200 && receipt["steps"][key]["api_error"].is_null()
     }) && receipt["steps"]["eventstream"]["complete"] == true
 }
+fn operator_identity() -> Result<WikipediaIdentity> {
+    use std::io::Read;
+    let user_agent = std::env::var("DEVRES_WIKIPEDIA_USER_AGENT").map_err(|_| {
+        Error::new(
+            "wikipedia_configuration_required",
+            "Configure the Wikipedia operator User-Agent.",
+        )
+    })?;
+    // Validate identity before creating receipt or attempt-budget artifacts.
+    let anonymous = WikipediaIdentity::new(Some(&user_agent), None)?;
+    let Some(path) = std::env::var_os("DEVRES_WIKIPEDIA_OAUTH2_TOKEN_FILE") else {
+        return Ok(anonymous);
+    };
+    let path = Path::new(&path);
+    if !path.is_absolute() {
+        return Err(Error::invalid(
+            "Wikipedia OAuth2 token file must be absolute.",
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| unavailable())?
+        .take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unavailable())?;
+    WikipediaIdentity::new(Some(&user_agent), Some(&bytes))
+}
 async fn run(path: &Path) -> Result<Value> {
+    let identity = operator_identity()?;
     let root = root::owned_root(path, MARKER)?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -397,7 +426,7 @@ async fn run(path: &Path) -> Result<Value> {
         }
         return Ok(receipt);
     }
-    let broker = counted_broker(&root)?;
+    let broker = counted_broker(&root, identity)?;
     let source = WikipediaSource::new(broker.clone());
     if let Err(error) = steps(&root, &source, &mut receipt).await {
         receipt["failure_code"] = json!(error.code);
@@ -445,7 +474,7 @@ mod tests {
         )
         .expect("persist");
         assert_eq!(
-            counted_broker(temporary.path())
+            counted_broker(temporary.path(), WikipediaIdentity::default())
                 .expect("resumed")
                 .attempt_count(),
             7
@@ -456,6 +485,6 @@ mod tests {
             &json!({"attempts":21,"not_before":0}),
         )
         .expect("persist");
-        assert!(counted_broker(temporary.path()).is_err());
+        assert!(counted_broker(temporary.path(), WikipediaIdentity::default()).is_err());
     }
 }

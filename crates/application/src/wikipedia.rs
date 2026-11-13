@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 pub const WRITE_ROWS: usize = 100;
 pub const WRITE_BYTES: usize = 32 * 1024 * 1024;
@@ -11,6 +12,10 @@ pub const WRITE_BYTES: usize = 32 * 1024 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub struct WikipediaConfig {
     pub enabled: bool,
+    /// Explicit operator identity; omission pauses Wikipedia network activity.
+    pub user_agent: Option<String>,
+    /// Mounted runtime secret path. Only composition reads the token bytes.
+    pub oauth2_token_file: Option<PathBuf>,
     pub category_roots: Vec<String>,
     pub excluded_categories: Vec<String>,
     pub normal_debounce_secs: u64,
@@ -31,6 +36,8 @@ impl Default for WikipediaConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            user_agent: None,
+            oauth2_token_file: None,
             category_roots: [
                 "Science",
                 "Technology",
@@ -60,6 +67,18 @@ impl Default for WikipediaConfig {
 
 impl WikipediaConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(value) = &self.user_agent {
+            validate_user_agent(value)?;
+        }
+        if self
+            .oauth2_token_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(Error::invalid(
+                "Wikipedia OAuth2 token file must be absolute.",
+            ));
+        }
         if [
             self.normal_debounce_secs,
             self.normal_min_refresh_secs,
@@ -99,6 +118,109 @@ impl WikipediaConfig {
         }
         Ok(())
     }
+}
+
+/// Validate an explicit bot product/version and an operator contact, without I/O.
+pub fn validate_user_agent(value: &str) -> Result<()> {
+    fn token(value: &str) -> bool {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    }
+    fn authority(value: &str) -> bool {
+        let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+            let Some((host, suffix)) = rest.split_once(']') else {
+                return false;
+            };
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return false;
+            }
+            (
+                host,
+                if suffix.is_empty() {
+                    None
+                } else {
+                    let Some(port) = suffix.strip_prefix(':') else {
+                        return false;
+                    };
+                    Some(port)
+                },
+            )
+        } else {
+            let (host, port) = value
+                .split_once(':')
+                .map_or((value, None), |(host, port)| (host, Some(port)));
+            if !host.trim_end_matches('.').split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }) {
+                return false;
+            }
+            (host, port)
+        };
+        !host.is_empty() && port.is_none_or(|port| !port.is_empty() && port.parse::<u16>().is_ok())
+    }
+    let invalid =
+        || Error::invalid("Wikipedia User-Agent requires product/version and operator contact.");
+    if value.is_empty()
+        || value.len() > 1024
+        || !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return Err(invalid());
+    }
+    let product = value.split_ascii_whitespace().next().ok_or_else(invalid)?;
+    let (name, version) = product.split_once('/').ok_or_else(invalid)?;
+    if !token(name) || !token(version) {
+        return Err(invalid());
+    }
+    let mut has_contact = false;
+    for comment in value.split('(').skip(1) {
+        let Some((comment, _)) = comment.split_once(')') else {
+            continue;
+        };
+        for part in comment.split([';', ' ']).filter(|part| !part.is_empty()) {
+            let part = part.strip_prefix('+').unwrap_or(part);
+            let address = part.strip_prefix("mailto:").unwrap_or(part);
+            let email = address.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty()
+                    && !domain.is_empty()
+                    && !domain.contains('@')
+                    && domain.contains('.')
+                    && address.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_`{|}~@".contains(&byte)
+                    })
+            });
+            let url = part
+                .strip_prefix("https://")
+                .or_else(|| part.strip_prefix("http://"))
+                .is_some_and(|rest| {
+                    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+                    authority(host) && !rest.contains(['<', '>', '"', '\\'])
+                });
+            has_contact |= email || url;
+        }
+        let segments: Vec<_> = comment.split(';').map(str::trim).collect();
+        has_contact |= segments.windows(2).any(|parts| {
+            parts[0].split_once(':').is_some_and(|(project, language)| {
+                !project.is_empty()
+                    && !language.is_empty()
+                    && parts[0]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+            }) && parts[1]
+                .strip_prefix("User:")
+                .is_some_and(|name| !name.trim().is_empty())
+        });
+    }
+    if !has_contact {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Application-owned refresh and stale-service policy. Adapters supply HTTP
@@ -255,6 +377,49 @@ mod tests {
         let mut invalid = config;
         invalid.category_roots = vec!["Category:".into()];
         assert!(invalid.validate().is_err());
+    }
+    #[test]
+    fn operator_identity_is_optional_but_supplied_values_are_validated() {
+        let omitted: WikipediaConfig = serde_json::from_str("{}").expect("defaults");
+        assert!(omitted.user_agent.is_none());
+        assert!(omitted.oauth2_token_file.is_none());
+        assert!(omitted.validate().is_ok());
+        for value in [
+            "ResearchBot/1.0 (https://example.org/bot)",
+            "ResearchBot/1.0 (operator@example.org)",
+            "ResearchBot/1.0 (mailto:operator@example.org)",
+            "ResearchBot/1.0 (wikipedia:en; User:Example Bot)",
+        ] {
+            assert!(validate_user_agent(value).is_ok(), "{value}");
+        }
+        for value in [
+            "",
+            "curl/1.0",
+            "Bot (https://example.org)",
+            "Bot/ (https://example.org)",
+            "Bot/1.0 (https://)",
+            "Bot/1.0 (https://:)",
+            "Bot/1.0 (https://example.org:invalid)",
+            "Bot/1.0 (https://example..org)",
+            "Bot/1.0 (operator@)",
+            "Bot/1.0 (https://example.org)\r\nInjected: yes",
+            "Bot/1.0 (https://example.org)\t",
+            "Bot/1.0 (https://예시.org)",
+        ] {
+            assert!(validate_user_agent(value).is_err(), "{value:?}");
+        }
+        assert!(
+            validate_user_agent(&format!(
+                "Bot/1.0 (https://example.org/{})",
+                "x".repeat(1024)
+            ))
+            .is_err()
+        );
+        let mut config = omitted;
+        config.oauth2_token_file = Some("relative-token".into());
+        assert!(config.validate().is_err());
+        config.oauth2_token_file = Some("/run/secrets/wikipedia".into());
+        assert!(config.validate().is_ok());
     }
     #[test]
     fn transaction_bound_applies_to_state_and_evidence_together() {

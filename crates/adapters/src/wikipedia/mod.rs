@@ -3,6 +3,7 @@ pub(crate) mod attribution;
 pub mod cache;
 pub mod corpus;
 pub mod events;
+pub mod identity;
 pub mod processing;
 pub mod research;
 pub(crate) mod scope;

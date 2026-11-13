@@ -344,6 +344,8 @@ pub struct BulkBroker {
     wikipedia_stream_slots: Arc<Semaphore>,
     wikipedia_requests_per_second: u32,
     wikipedia_policy_floor: Arc<AtomicI64>,
+    wikipedia_identity: crate::wikipedia::identity::WikipediaIdentity,
+    wikipedia_auth_failed: std::sync::atomic::AtomicBool,
     npm_registry_rate: u32,
     npm_advisory_rate: u32,
     attempt_budget: Option<usize>,
@@ -372,6 +374,10 @@ impl BulkBroker {
         broker.w3c_client = broker.client.clone();
         broker.html_public = HtmlClient::fixture()?;
         broker.html_direct = HtmlClient::fixture()?;
+        broker.wikipedia_identity = crate::wikipedia::identity::WikipediaIdentity::new(
+            Some("DevresFixtureBot/1.0 (https://github.com/PublicData-stream/dev-resources-MCP)"),
+            None,
+        )?;
         Ok(broker)
     }
     pub fn new(config: BulkConfig) -> Result<Self> {
@@ -410,6 +416,8 @@ impl BulkBroker {
             wikipedia_stream_slots: Arc::new(Semaphore::new(1)),
             wikipedia_requests_per_second: 1,
             wikipedia_policy_floor: Arc::new(AtomicI64::new(0)),
+            wikipedia_identity: crate::wikipedia::identity::WikipediaIdentity::default(),
+            wikipedia_auth_failed: std::sync::atomic::AtomicBool::new(false),
             npm_registry_rate: 1,
             npm_advisory_rate: 1,
             rates: Mutex::new(HashMap::new()),
@@ -961,6 +969,36 @@ impl BulkBroker {
     }
 }
 impl BulkBroker {
+    /// Identity applies only to Wikimedia operations, never shared client defaults.
+    pub fn with_wikipedia_identity(
+        mut self,
+        identity: crate::wikipedia::identity::WikipediaIdentity,
+    ) -> Self {
+        self.wikipedia_identity = identity;
+        self.wikipedia_auth_failed.store(false, Ordering::Release);
+        self
+    }
+    pub(crate) fn wikipedia_authenticated(&self) -> bool {
+        self.wikipedia_identity.authorization.is_some()
+    }
+    pub(crate) fn ensure_wikipedia_network_ready(&self) -> Result<()> {
+        if self.wikipedia_identity.user_agent.is_none() {
+            return Err(Error::new(
+                "wikipedia_configuration_required",
+                "Configure wikipedia.user_agent before Wikipedia acquisition.",
+            ));
+        }
+        if self.wikipedia_auth_failed.load(Ordering::Acquire) {
+            return Err(Self::wikipedia_authentication_error());
+        }
+        Ok(())
+    }
+    fn wikipedia_authentication_error() -> Error {
+        Error::new(
+            "wikipedia_authentication_failed",
+            "Wikipedia API authorization failed; replace the mounted token and restart the writer.",
+        )
+    }
     pub(crate) fn wikipedia_policy_floor(&self) -> Arc<AtomicI64> {
         self.wikipedia_policy_floor.clone()
     }
@@ -1002,6 +1040,7 @@ impl BulkBroker {
 
     async fn pace_wikipedia(&self) -> Result<()> {
         loop {
+            self.ensure_wikipedia_network_ready()?;
             let wait = {
                 let mut clocks = self.rates.lock().await;
                 let now = Instant::now();
@@ -1029,6 +1068,7 @@ impl BulkBroker {
                 }
             };
             let Some(wait) = wait else {
+                self.ensure_wikipedia_network_ready()?;
                 return self.record_wikipedia_attempt();
             };
             // Recheck after sleeping: a different in-flight request can extend a cooldown.
@@ -1095,6 +1135,7 @@ impl BulkBroker {
         F: Fn() -> Fut + Send + Sync,
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
+        self.ensure_wikipedia_network_ready()?;
         let observed_retry_at = AtomicI64::new(0);
         let result = async {
             use crate::wikipedia::{cache::CacheMetadata, source::Response};
@@ -1103,6 +1144,7 @@ impl BulkBroker {
             let mut validators = validators;
             let maximum = operation.max_bytes();
             for hop in 0..=5 {
+                self.ensure_wikipedia_network_ready()?;
                 let effective_url = operation.url()?;
                 let action = operation.is_action();
                 let _action = if action {
@@ -1138,7 +1180,9 @@ impl BulkBroker {
                 })
                 .await?;
                 bounded(&shutdown, deadline, self.pace_wikipedia()).await?;
+                self.ensure_wikipedia_network_ready()?;
                 bounded(&shutdown, deadline, before_attempt()).await?;
+                self.ensure_wikipedia_network_ready()?;
                 #[cfg(test)]
                 let destination = self.wikipedia_fixture_url(&effective_url)?;
                 #[cfg(not(test))]
@@ -1149,9 +1193,17 @@ impl BulkBroker {
                     .header(reqwest::header::ACCEPT, "application/json")
                     .header(
                         reqwest::header::USER_AGENT,
-                        crate::wikipedia::source::USER_AGENT,
+                        self.wikipedia_identity.user_agent.clone().ok_or_else(|| {
+                            Error::new(
+                                "wikipedia_configuration_required",
+                                "Configure wikipedia.user_agent before Wikipedia acquisition.",
+                            )
+                        })?,
                     )
                     .header(reqwest::header::ACCEPT_ENCODING, "gzip");
+                if let Some(authorization) = &self.wikipedia_identity.authorization {
+                    builder = builder.header(reqwest::header::AUTHORIZATION, authorization.clone());
+                }
                 if let Some(etag) = &validators.etag {
                     if etag.len() > 8192 {
                         return Err(Error::invalid("Invalid Wikipedia validator."));
@@ -1180,6 +1232,16 @@ impl BulkBroker {
                         .map_err(|_| Error::unavailable("Wikipedia source connection failed."))
                 })
                 .await;
+                // Reject credentials synchronously with observing the headers:
+                // cancellation while persisting cooldown evidence must not
+                // permit another request with credentials already rejected.
+                let authorization_failed = self.wikipedia_authenticated()
+                    && response
+                        .as_ref()
+                        .is_ok_and(|response| matches!(response.status().as_u16(), 401 | 403));
+                if authorization_failed {
+                    self.wikipedia_auth_failed.store(true, Ordering::Release);
+                }
                 let received_at = devres_domain::unix_now();
                 let initial_action_slow_until = (action
                     && started.elapsed() > Duration::from_secs(1))
@@ -1200,6 +1262,10 @@ impl BulkBroker {
                 }
                 let response = response?;
                 let status = response.status().as_u16();
+                if authorization_failed {
+                    action_attempt.active = false;
+                    return Err(Self::wikipedia_authentication_error());
+                }
                 let cache =
                     match CacheMetadata::from_headers(response.headers(), sent_at, received_at) {
                         Ok(cache) => cache,
@@ -1245,7 +1311,9 @@ impl BulkBroker {
                     action_attempt.active = false;
                     continue;
                 }
-                if status == 200 && !cache.retention_allowed()? {
+                if status == 200
+                    && !cache.public_retention_allowed(self.wikipedia_authenticated())?
+                {
                     // Preserve policy evidence, but never expose forbidden body bytes
                     // to any durable-capture caller.
                     action_attempt.active = false;
@@ -1368,6 +1436,7 @@ impl BulkBroker {
         shutdown: CancellationToken,
         observer: Option<crate::wikipedia::source::PolicyObserver>,
     ) -> Result<crate::wikipedia::events::Connection> {
+        self.ensure_wikipedia_network_ready()?;
         let observed_retry_at = AtomicI64::new(0);
         let result = async {
             use crate::wikipedia::{
@@ -1386,6 +1455,7 @@ impl BulkBroker {
                     .map_err(|_| Error::unavailable("Wikipedia stream admission stopped."))
             })
             .await?;
+            self.ensure_wikipedia_network_ready()?;
             self.record_wikipedia_attempt()?;
             #[cfg(test)]
             let destination = self.wikipedia_fixture_url(STREAM_URL)?;
@@ -1397,7 +1467,12 @@ impl BulkBroker {
                 .header(reqwest::header::ACCEPT, "text/event-stream")
                 .header(
                     reqwest::header::USER_AGENT,
-                    crate::wikipedia::source::USER_AGENT,
+                    self.wikipedia_identity.user_agent.clone().ok_or_else(|| {
+                        Error::new(
+                            "wikipedia_configuration_required",
+                            "Configure wikipedia.user_agent before Wikipedia acquisition.",
+                        )
+                    })?,
                 )
                 .header(reqwest::header::ACCEPT_ENCODING, "gzip");
             if let Some(id) = last_event_id.filter(|id| !id.is_empty()) {
@@ -1708,6 +1783,308 @@ mod wikipedia_tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         encoder.write_all(value).expect("gzip write");
         encoder.finish().expect("gzip finish")
+    }
+    async fn identified_broker(
+        app: Router,
+        identity: crate::wikipedia::identity::WikipediaIdentity,
+    ) -> (Arc<BulkBroker>, tokio::task::JoinHandle<()>) {
+        let (broker, server) = broker(app).await;
+        let broker = Arc::into_inner(broker)
+            .expect("unique fixture broker")
+            .with_wikipedia_identity(identity);
+        (Arc::new(broker), server)
+    }
+    #[tokio::test]
+    async fn wikipedia_missing_identity_blocks_all_transports_before_accounting() {
+        let app = Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let (broker, server) = identified_broker(app, Default::default()).await;
+        let reservations = AtomicUsize::new(0);
+        for operation in [
+            Operation::ArticleHtml {
+                title: "Rust".into(),
+            },
+            Operation::Metadata {
+                titles: vec!["Rust".into()],
+                page_ids: vec![],
+            },
+        ] {
+            let result = WikipediaSource::new(broker.clone())
+                .fetch_with_admission(
+                    operation,
+                    Validators::default(),
+                    CancellationToken::new(),
+                    || async {
+                        reservations.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await;
+            assert_eq!(
+                result.err().expect("blocked").code,
+                "wikipedia_configuration_required"
+            );
+        }
+        let result = WikipediaSource::new(broker.clone())
+            .stream(None, CancellationToken::new())
+            .await;
+        assert_eq!(
+            result.err().expect("blocked stream").code,
+            "wikipedia_configuration_required"
+        );
+        assert_eq!(broker.attempt_count(), 0);
+        assert_eq!(reservations.load(Ordering::SeqCst), 0);
+        assert!(broker.rates.lock().await.is_empty());
+        assert_eq!(broker.wikipedia_slots.available_permits(), 2);
+        assert_eq!(broker.wikipedia_action_slots.available_permits(), 1);
+        assert_eq!(broker.wikipedia_stream_slots.available_permits(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_configured_headers_are_scoped_to_api_and_stream() {
+        const UA: &str = "OperatorBot/2.0 (operator@example.org)";
+        let app =
+            Router::new().fallback(get(|headers: HeaderMap, uri: axum::http::Uri| async move {
+                if uri.path() == "/other-provider" {
+                    assert!(!headers.contains_key("authorization"));
+                    assert!(!headers.contains_key("user-agent"));
+                    return Response::builder()
+                        .body(Body::empty())
+                        .expect("other provider");
+                }
+                assert_eq!(headers["user-agent"], UA);
+                assert_eq!(headers["accept-encoding"], "gzip");
+                if uri.path() == "/v2/stream/recentchange" {
+                    assert!(!headers.contains_key("authorization"));
+                    return Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::empty())
+                        .expect("stream");
+                }
+                assert_eq!(headers["authorization"], "Bearer fixture-token");
+                if uri.path().contains("/Alias/") {
+                    return Response::builder()
+                        .status(307)
+                        .header("location", "/w/rest.php/v1/page/Rust/with_html")
+                        .body(Body::empty())
+                        .expect("redirect");
+                }
+                Response::builder()
+                    .header("cache-control", "public,max-age=600")
+                    .body(Body::from("{}"))
+                    .expect("api")
+            }));
+        let identity =
+            crate::wikipedia::identity::WikipediaIdentity::new(Some(UA), Some(b"fixture-token"))
+                .expect("identity");
+        let (broker, server) = identified_broker(app, identity).await;
+        let source = WikipediaSource::new(broker.clone());
+        for operation in [
+            Operation::ArticleHtml {
+                title: "Alias".into(),
+            },
+            Operation::Metadata {
+                titles: vec!["Rust".into()],
+                page_ids: vec![],
+            },
+        ] {
+            assert_eq!(
+                source
+                    .fetch(operation, Validators::default(), CancellationToken::new())
+                    .await
+                    .expect("API")
+                    .status,
+                200
+            );
+        }
+        assert_eq!(
+            source
+                .stream(None, CancellationToken::new())
+                .await
+                .expect("stream")
+                .status,
+            200
+        );
+        // The shared client's other-provider requests never inherit the token.
+        let destination = broker
+            .test_origin
+            .as_ref()
+            .expect("origin")
+            .join("/other-provider")
+            .expect("URL");
+        assert_eq!(
+            broker
+                .client
+                .get(destination)
+                .send()
+                .await
+                .expect("other provider")
+                .status(),
+            200
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_authorization_failure_latches_without_anonymous_fallback() {
+        for status in [401, 403] {
+            let app = Router::new().fallback(move || async move {
+                Response::builder()
+                    .status(status)
+                    .body(Body::from("fixture-token reflected diagnostics"))
+                    .expect("failure")
+            });
+            let identity = crate::wikipedia::identity::WikipediaIdentity::new(
+                Some("OperatorBot/1.0 (operator@example.org)"),
+                Some(b"fixture-token"),
+            )
+            .expect("identity");
+            let (broker, server) = identified_broker(app, identity).await;
+            let source = WikipediaSource::new(broker.clone());
+            for _ in 0..2 {
+                let error = source
+                    .fetch(
+                        Operation::ArticleSource {
+                            title: "Rust".into(),
+                        },
+                        Validators::default(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .err()
+                    .expect("authorization failure");
+                assert_eq!(error.code, "wikipedia_authentication_failed");
+                assert!(!format!("{error:?}").contains("fixture-token"));
+            }
+            assert!(!source.network_ready());
+            assert_eq!(broker.attempt_count(), 1);
+            assert_eq!(
+                source
+                    .stream(None, CancellationToken::new())
+                    .await
+                    .err()
+                    .expect("blocked stream")
+                    .code,
+                "wikipedia_authentication_failed"
+            );
+            assert_eq!(broker.attempt_count(), 1);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn wikipedia_authentication_pause_survives_dropped_policy_receipt() {
+        let app = Router::new().fallback(|| async {
+            Response::builder()
+                .status(401)
+                .header("retry-after", "3600")
+                .body(Body::from("fixture-token"))
+                .expect("rejected token")
+        });
+        let identity = crate::wikipedia::identity::WikipediaIdentity::new(
+            Some("OperatorBot/1.0 (operator@example.org)"),
+            Some(b"fixture-token"),
+        )
+        .expect("identity");
+        let (broker, server) = identified_broker(app, identity).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let observer: crate::wikipedia::source::PolicyObserver = Arc::new(move |_| {
+            signal.notify_one();
+            Ok(Box::pin(futures::future::pending()))
+        });
+        let caller = broker.clone();
+        let task = tokio::spawn(async move {
+            caller
+                .fetch_wikipedia_with_observer(
+                    Operation::ArticleSource {
+                        title: "Rust".into(),
+                    },
+                    Validators::default(),
+                    CancellationToken::new(),
+                    || async { Ok(()) },
+                    Some(observer),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .expect("receipt handoff");
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            broker
+                .ensure_wikipedia_network_ready()
+                .expect_err("paused")
+                .code,
+            "wikipedia_authentication_failed"
+        );
+        assert_eq!(broker.attempt_count(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn wikipedia_authentication_pause_rechecks_after_waiting_for_admission() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = requests.clone();
+        let app = Router::new().fallback(move || {
+            let received = received.clone();
+            async move {
+                received.fetch_add(1, Ordering::SeqCst);
+                StatusCode::UNAUTHORIZED
+            }
+        });
+        let identity = crate::wikipedia::identity::WikipediaIdentity::new(
+            Some("OperatorBot/1.0 (operator@example.org)"),
+            Some(b"fixture-token"),
+        )
+        .expect("identity");
+        let (broker, server) = identified_broker(app, identity).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let resume = release.clone();
+        let caller = broker.clone();
+        let waiting = tokio::spawn(async move {
+            caller
+                .fetch_wikipedia_with_admission(
+                    Operation::ArticleSource {
+                        title: "Rust".into(),
+                    },
+                    Validators::default(),
+                    CancellationToken::new(),
+                    || async {
+                        signal.notify_one();
+                        resume.notified().await;
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .expect("waiting admission");
+        let failure = broker
+            .fetch_wikipedia(
+                Operation::ArticleSource {
+                    title: "Rust".into(),
+                },
+                Validators::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("auth rejection");
+        assert_eq!(failure.code, "wikipedia_authentication_failed");
+        release.notify_one();
+        let error = waiting
+            .await
+            .expect("waiting caller")
+            .err()
+            .expect("paused caller");
+        assert_eq!(error.code, "wikipedia_authentication_failed");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "waiting caller must never transmit"
+        );
+        server.abort();
     }
     #[tokio::test]
     async fn wikipedia_identified_gzip_fetch_retains_cache_evidence() {

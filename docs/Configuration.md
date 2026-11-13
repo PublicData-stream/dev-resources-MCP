@@ -591,9 +591,36 @@ policy templates, receipt bootstrap, and rotation are documented with the exampl
 
 ## Wikipedia defaults
 
-Omitting `[wikipedia]` enables recursive English STEM acquisition. `enabled=false`
+Omitting `[wikipedia]` retains recursive English STEM collection defaults, but
+network acquisition requires an explicit operator `user_agent`. `enabled=false`
 pauses background acquisition while retaining local evidence. See
 [Wikipedia](wikipedia.md) for API policies, intervals and acceptance boundaries.
+
+```toml
+[wikipedia]
+user_agent = "ExampleBot/1.0 (https://example.org/bot; operator@example.org)"
+# Optional operator-provided OAuth2 access token; never put token bytes in TOML.
+# oauth2_token_file = "/run/secrets/wikipedia-oauth2-token"
+```
+
+There is no built-in Wikipedia User-Agent fallback. A supplied value must contain
+an HTTP product/version and a parenthesized contact URL, email address, or
+`wikipedia:en; User:Example` identity. It must be printable ASCII and at most 1024
+bytes. Invalid supplied values fail configuration validation. Without a value,
+startup and eligible local reads remain available; writer acquisition, upstream
+discovery, and EventStreams remain paused with `wikipedia_configuration_required`.
+Reader processes can delegate acquisition to a configured writer without their
+own Wikipedia identity.
+
+`oauth2_token_file` is optional and must be an absolute path. Only the writer
+reads the mounted file at startup: at most 16 KiB, with an optional trailing line
+ending and no embedded whitespace. Unreadable or invalid configured files fail
+writer startup with sanitized errors; readers do not open this file. Omit it for
+anonymous API requests. The token is sent only to the fixed Wikipedia API origin,
+never EventStreams or other providers. Token acquisition/refresh is external;
+rotation or recovery from an authenticated 401/403 requires writer restart. Keep
+the file in a runtime Secret and never commit populated credentials.
+
 `category_roots` defaults to the six `Category:` roots Science, Technology,
 Engineering, Mathematics, Artificial intelligence and Computer architecture;
 `excluded_categories=[]` prunes configured categories. There is no default depth

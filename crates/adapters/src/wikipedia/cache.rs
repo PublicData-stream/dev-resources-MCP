@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheMetadata {
     pub cache_control: Option<String>,
+    /// Header names only; omitted in evidence written before identity support.
+    #[serde(default)]
+    pub vary: Option<String>,
     pub date: Option<i64>,
     pub age: Option<u64>,
     pub expires: Option<i64>,
@@ -23,7 +26,7 @@ impl CacheMetadata {
     ) -> Result<Self> {
         let text = |key: &str| -> Result<Option<String>> {
             let values: Vec<_> = headers.get_all(key).iter().collect();
-            if values.len() > 1 && key != "cache-control" {
+            if values.len() > 1 && !matches!(key, "cache-control" | "vary") {
                 return Err(Error::integrity("Ambiguous Wikipedia cache metadata."));
             }
             if values.is_empty() {
@@ -32,7 +35,12 @@ impl CacheMetadata {
             let mut output = String::new();
             for value in values {
                 let value = value.to_str().map_err(|_| invalid())?;
-                if output.len().saturating_add(value.len()) > 16 * 1024 {
+                if output
+                    .len()
+                    .saturating_add(usize::from(!output.is_empty()))
+                    .saturating_add(value.len())
+                    > 16 * 1024
+                {
                     return Err(Error::capacity(
                         "Wikipedia cache metadata exceeds its bound.",
                     ));
@@ -58,6 +66,7 @@ impl CacheMetadata {
         };
         let metadata = Self {
             cache_control: text("cache-control")?,
+            vary: text("vary")?,
             date: date(text("date")?)?,
             age: text("age")?
                 .map(|value| value.parse::<u64>().map_err(|_| invalid()))
@@ -69,6 +78,7 @@ impl CacheMetadata {
             received_at,
         };
         metadata.directives()?;
+        metadata.varies_by_identity()?;
         Ok(metadata)
     }
 
@@ -81,8 +91,19 @@ impl CacheMetadata {
 
     /// `private` and `no-store` cannot enter this anonymous shared durable corpus.
     pub fn retention_allowed(&self) -> Result<bool> {
+        self.public_retention_allowed(false)
+    }
+
+    /// Authentication never permits account-specific content into the public
+    /// corpus. Require explicit shared-public permission, stricter than accepting
+    /// `must-revalidate` alone under the general HTTP authenticated-cache rules.
+    pub fn public_retention_allowed(&self, authenticated: bool) -> Result<bool> {
         let directives = self.directives()?;
-        Ok(!directives.private && !directives.no_store)
+        let identity_variant = self.varies_by_identity()?;
+        Ok(!directives.private
+            && !directives.no_store
+            && (!authenticated
+                || (directives.public || directives.shared_max_age.is_some()) && !identity_variant))
     }
 
     pub fn stale_allowed(&self) -> Result<bool> {
@@ -132,6 +153,7 @@ impl CacheMetadata {
                 .cache_control
                 .clone()
                 .or_else(|| previous.cache_control.clone()),
+            vary: self.vary.clone().or_else(|| previous.vary.clone()),
             date: self.date.or(Some(self.received_at)),
             age: self.age,
             expires: self.expires.or(previous.expires),
@@ -144,7 +166,33 @@ impl CacheMetadata {
             received_at: self.received_at,
         };
         merged.directives()?;
+        merged.varies_by_identity()?;
         Ok(merged)
+    }
+
+    fn varies_by_identity(&self) -> Result<bool> {
+        let Some(value) = self.vary.as_deref() else {
+            return Ok(false);
+        };
+        if value.len() > 16 * 1024 {
+            return Err(invalid());
+        }
+        let mut identity_variant = false;
+        for name in value.split(',') {
+            let name = name.trim_matches([' ', '\t']);
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+                || name == "*" && value.trim() != "*"
+            {
+                return Err(invalid());
+            }
+            identity_variant |= name == "*"
+                || name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("cookie");
+        }
+        Ok(identity_variant)
     }
 
     fn directives(&self) -> Result<Directives> {
@@ -190,16 +238,22 @@ impl CacheMetadata {
                     (name.trim(), Some(value.trim()))
                 });
             match name.to_ascii_lowercase().as_str() {
+                "public" => {
+                    if argument.is_some() {
+                        return Err(invalid());
+                    }
+                    parsed.public = true;
+                }
                 "private" => parsed.private = true,
                 "no-store" => parsed.no_store = true,
                 "no-cache" => parsed.no_cache = true,
                 "must-revalidate" | "proxy-revalidate" => parsed.must_revalidate = true,
                 "max-age" | "s-maxage" => {
-                    let number = argument
-                        .ok_or_else(invalid)?
-                        .trim_matches('"')
-                        .parse::<u64>()
-                        .map_err(|_| invalid())?;
+                    let argument = argument.ok_or_else(invalid)?.trim_matches('"');
+                    if argument.is_empty() || !argument.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(invalid());
+                    }
+                    let number = argument.parse::<u64>().map_err(|_| invalid())?;
                     let selected = if name.eq_ignore_ascii_case("s-maxage") {
                         &mut parsed.shared_max_age
                     } else {
@@ -220,6 +274,7 @@ impl CacheMetadata {
 struct Directives {
     max_age: Option<u64>,
     shared_max_age: Option<u64>,
+    public: bool,
     private: bool,
     no_store: bool,
     no_cache: bool,
@@ -328,6 +383,175 @@ mod tests {
             metadata("public,max-age=600")
                 .stale_allowed()
                 .expect("stale allowed")
+        );
+    }
+
+    #[test]
+    fn authenticated_retention_requires_explicit_public_permission() {
+        for control in [
+            "public",
+            "public, max-age=600",
+            "s-maxage=0",
+            "s-maxage=600",
+        ] {
+            assert!(
+                metadata(control)
+                    .public_retention_allowed(true)
+                    .expect("public cache policy")
+            );
+        }
+        for control in ["", "max-age=600", "must-revalidate", "proxy-revalidate"] {
+            let cache = metadata(control);
+            assert!(cache.retention_allowed().expect("anonymous retention"));
+            assert!(!cache.public_retention_allowed(true).expect("permission"));
+        }
+        for control in [
+            "public, private",
+            "public, private=\"authorization\"",
+            "public, no-store",
+            "s-maxage=600, private",
+            "s-maxage=600, no-store",
+        ] {
+            assert!(
+                !metadata(control)
+                    .public_retention_allowed(true)
+                    .expect("prohibited retention")
+            );
+        }
+        for control in [
+            "public=yes",
+            "public=\"\"",
+            "s-maxage=+600",
+            "s-maxage=-1",
+            "s-maxage=600, s-maxage=600",
+        ] {
+            assert!(metadata(control).public_retention_allowed(true).is_err());
+        }
+    }
+
+    #[test]
+    fn authenticated_retention_rejects_identity_dependent_variants() {
+        for vary in [
+            "Authorization",
+            "aUtHoRiZaTiOn",
+            "Cookie",
+            "Accept-Encoding, COOKIE",
+            "*",
+        ] {
+            let cache = CacheMetadata {
+                vary: Some(vary.into()),
+                ..metadata("public, max-age=600")
+            };
+            assert!(!cache.public_retention_allowed(true).expect("vary policy"));
+            assert!(
+                cache
+                    .retention_allowed()
+                    .expect("existing anonymous policy")
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cache-control",
+            "public, max-age=600".parse().expect("header"),
+        );
+        headers.append("vary", "Accept-Encoding".parse().expect("header"));
+        headers.append("vary", " Accept ".parse().expect("header"));
+        let cache = CacheMetadata::from_headers(&headers, 100, 100).expect("combined Vary");
+        assert!(
+            cache
+                .public_retention_allowed(true)
+                .expect("public variant")
+        );
+        headers.append("vary", "Authorization".parse().expect("header"));
+        let cache =
+            CacheMetadata::from_headers(&headers, 100, 100).expect("combined identity Vary");
+        assert!(
+            !cache
+                .public_retention_allowed(true)
+                .expect("identity-dependent variant")
+        );
+    }
+
+    #[test]
+    fn malformed_or_oversized_vary_never_becomes_cache_evidence() {
+        for vary in [
+            "",
+            "Accept,,Cookie",
+            "Accept,",
+            "Accept: Cookie",
+            "\"Cookie\"",
+            "*,Accept",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("vary", vary.parse().expect("header"));
+            assert!(CacheMetadata::from_headers(&headers, 100, 100).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("vary", "a".repeat(16 * 1024).parse().expect("header"));
+        assert!(CacheMetadata::from_headers(&headers, 100, 100).is_ok());
+        headers.append("vary", "b".parse().expect("header"));
+        assert!(CacheMetadata::from_headers(&headers, 100, 100).is_err());
+        let corrupted = CacheMetadata {
+            vary: Some("Cookie\r\nAuthorization".into()),
+            ..metadata("public")
+        };
+        assert!(corrupted.public_retention_allowed(true).is_err());
+    }
+
+    #[test]
+    fn older_evidence_without_vary_remains_readable() {
+        let mut old = serde_json::to_value(metadata("max-age=600")).expect("evidence");
+        old.as_object_mut().expect("object").remove("vary");
+        let cache: CacheMetadata = serde_json::from_value(old).expect("older evidence");
+        assert!(cache.vary.is_none());
+        assert!(cache.retention_allowed().expect("anonymous retention"));
+        assert!(
+            !cache
+                .public_retention_allowed(true)
+                .expect("public permission")
+        );
+        assert_eq!(cache.freshness_deadline().expect("deadline"), 700);
+    }
+
+    #[test]
+    fn validation_304_inherits_and_can_revoke_public_variant_permission() {
+        let old = CacheMetadata {
+            vary: Some("Cookie".into()),
+            ..metadata("public, s-maxage=600")
+        };
+        let fresh = CacheMetadata {
+            request_sent_at: 499,
+            received_at: 500,
+            ..CacheMetadata::default()
+        };
+        let inherited = fresh.merged_after_304(&old).expect("inherit");
+        assert_eq!(inherited.vary, old.vary);
+        assert!(
+            !inherited
+                .public_retention_allowed(true)
+                .expect("inherited variant")
+        );
+        let safe = CacheMetadata {
+            vary: Some("Accept-Encoding".into()),
+            ..fresh.clone()
+        }
+        .merged_after_304(&old)
+        .expect("changed variant");
+        assert!(
+            safe.public_retention_allowed(true)
+                .expect("safe public variant")
+        );
+        assert_eq!(safe.freshness_deadline().expect("shared freshness"), 1099);
+        let revoked = CacheMetadata {
+            cache_control: Some("private, max-age=600".into()),
+            ..fresh
+        }
+        .merged_after_304(&safe)
+        .expect("revoked permission");
+        assert!(
+            !revoked
+                .public_retention_allowed(true)
+                .expect("private validation")
         );
     }
 }

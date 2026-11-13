@@ -408,15 +408,30 @@ impl WikipediaResearch {
                 if !matches!(representation, "text" | "markdown" | "html" | "wikitext") {
                     return Err(invalid());
                 }
-                if input.snapshot.is_none() && input.capture.is_none() {
-                    self.corpus
+                let mut acquisition_error = None;
+                if input.snapshot.is_none()
+                    && input.capture.is_none()
+                    && let Err(error) = self
+                        .corpus
                         .request_selector(input.title.clone(), input.page_id, cancel.clone())
-                        .await?;
+                        .await
+                {
+                    if !super::corpus::network_readiness_error(&error) {
+                        return Err(error);
+                    }
+                    acquisition_error = Some(error);
                 }
                 let mut document = self
                     .corpus
                     .research_document(&selector(&input), representation)
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        if error.code == "not_found" {
+                            acquisition_error.unwrap_or(error)
+                        } else {
+                            error
+                        }
+                    })?;
                 self.visible(&document).await?;
                 let text = document["text"].as_str().ok_or_else(retained)?;
                 let page = text_page(text, input.offset, limit(&input, 32768, 32768)?)?;

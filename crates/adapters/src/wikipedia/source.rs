@@ -9,8 +9,6 @@ use tokio_util::sync::CancellationToken;
 pub const ARTICLE_BYTES: usize = 16 * 1024 * 1024;
 pub const METADATA_BYTES: usize = 8 * 1024 * 1024;
 pub const STREAM_URL: &str = "https://stream.wikimedia.org/v2/stream/recentchange";
-pub const USER_AGENT: &str =
-    "dev-resources-MCP-Wikipedia/0.0.0 (+https://github.com/PublicData-stream/dev-resources-MCP)";
 const ORIGIN: &str = "https://en.wikipedia.org";
 
 /// The observer must hand ownership of persistence off synchronously, before
@@ -206,6 +204,15 @@ pub struct WikipediaSource {
 impl WikipediaSource {
     pub fn new(broker: Arc<BulkBroker>) -> Self {
         Self { broker }
+    }
+    pub fn ensure_network_ready(&self) -> Result<()> {
+        self.broker.ensure_wikipedia_network_ready()
+    }
+    pub fn network_ready(&self) -> bool {
+        self.ensure_network_ready().is_ok()
+    }
+    pub fn authenticated(&self) -> bool {
+        self.broker.wikipedia_authenticated()
     }
     pub(crate) fn policy_floor(&self) -> Arc<std::sync::atomic::AtomicI64> {
         self.broker.wikipedia_policy_floor()

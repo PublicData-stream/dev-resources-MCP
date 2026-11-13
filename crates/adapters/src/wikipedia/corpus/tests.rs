@@ -25,6 +25,7 @@ struct Data {
 struct MemoryStore(Mutex<Data>, CommitGate);
 #[derive(Default)]
 struct CommitGate {
+    commits: AtomicUsize,
     pause_policy: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -149,6 +150,7 @@ impl WikipediaStore for MemoryStore {
     }
     async fn wiki_commit(&self, writes: &[Write], states: &[State]) -> Result<()> {
         validate_writes(writes, states)?;
+        self.1.commits.fetch_add(1, Ordering::SeqCst);
         if states.iter().any(|state| {
             state.key == "provider:admission"
                 && state.data["cooldown"]
@@ -243,6 +245,61 @@ async fn handle(
                 .body(Body::from("forbidden body bytes"))
                 .expect("private");
         }
+        4 | 5 => {
+            let status = if provider.mode.load(Ordering::SeqCst) == 4 {
+                200
+            } else {
+                304
+            };
+            return response
+                .status(status)
+                .header("cache-control", "private")
+                .body(Body::from("forbidden authenticated bytes"))
+                .expect("private response");
+        }
+        6 | 7 => {
+            let status = if provider.mode.load(Ordering::SeqCst) == 6 {
+                200
+            } else {
+                304
+            };
+            return response
+                .status(status)
+                .header("vary", "Authorization")
+                .body(Body::from("forbidden authenticated bytes"))
+                .expect("identity response");
+        }
+        8 => {
+            return response
+                .status(401)
+                .body(Body::from("Bearer synthetic-corpus-token"))
+                .expect("authentication failure");
+        }
+        9 => {
+            return HttpResponse::builder()
+                .status(304)
+                .header("etag", "\"fixture\"")
+                .body(Body::empty())
+                .expect("headerless 304");
+        }
+        10 | 11 => {
+            let status = if provider.mode.load(Ordering::SeqCst) == 10 {
+                200
+            } else {
+                304
+            };
+            return response
+                .status(status)
+                .header("cache-control", "no-store")
+                .body(Body::from("forbidden authenticated bytes"))
+                .expect("no-store response");
+        }
+        12 => {
+            return HttpResponse::builder()
+                .header("cache-control", "max-age=600")
+                .body(Body::from("forbidden authenticated bytes"))
+                .expect("no public permission");
+        }
         _ => {}
     }
     let mut value = json!({"id":1,"title":"Rust","key":"Rust","latest":{"id":10,"timestamp":"2026-11-11T00:00:00Z"},"content_model":"wikitext","license":{"url":"https://creativecommons.org/licenses/by-sa/4.0/","title":"CC BY-SA 4.0"}});
@@ -268,6 +325,18 @@ async fn fixture() -> (
     WikipediaCorpus,
     tokio::task::JoinHandle<()>,
 ) {
+    fixture_with_identity(None).await
+}
+async fn fixture_with_identity(
+    identity: Option<super::super::identity::WikipediaIdentity>,
+) -> (
+    tempfile::TempDir,
+    Arc<MemoryStore>,
+    Arc<Provider>,
+    Arc<BulkBroker>,
+    WikipediaCorpus,
+    tokio::task::JoinHandle<()>,
+) {
     let root = tempfile::Builder::new()
         .prefix("devres-wikipedia-pipeline-")
         .tempdir_in("/tmp")
@@ -282,10 +351,13 @@ async fn fixture() -> (
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("fixture server");
     });
-    let broker = Arc::new(
+    let mut broker =
         BulkBroker::fixture(url::Url::parse(&format!("http://{address}")).expect("origin"))
-            .expect("broker"),
-    );
+            .expect("broker");
+    if let Some(identity) = identity {
+        broker = broker.with_wikipedia_identity(identity);
+    }
+    let broker = Arc::new(broker);
     let config = WikipediaConfig {
         category_roots: vec!["Category:Science".into()],
         min_free_bytes: 64 * 1024 * 1024,
@@ -337,6 +409,285 @@ async fn expire_endpoints(store: &MemoryStore) {
         state.data["cache"]["request_sent_at"] = json!(now() - 1000);
         state.data["cache"]["date"] = json!(now() - 1000);
     }
+}
+
+fn unidentified_broker() -> Arc<BulkBroker> {
+    Arc::new(
+        BulkBroker::fixture(url::Url::parse("http://127.0.0.1:9").expect("loopback"))
+            .expect("fixture broker")
+            .with_wikipedia_identity(super::super::identity::WikipediaIdentity::default()),
+    )
+}
+
+#[tokio::test]
+async fn unidentified_acquisition_never_changes_demand_admission_or_backoff() {
+    let root = tempfile::Builder::new()
+        .prefix("devres-wiki-unidentified-")
+        .tempdir_in("/tmp")
+        .expect("root");
+    let store = Arc::new(MemoryStore::default());
+    let broker = unidentified_broker();
+    let corpus = WikipediaCorpus::new(
+        store.clone(),
+        broker.clone(),
+        root.path(),
+        WikipediaConfig::default(),
+    )
+    .expect("offline corpus starts");
+    corpus.initialize_status().await.expect("offline status");
+    assert!(
+        store
+            .wiki_state("visibility:epoch")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .wiki_states("category:", "", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let commits = store.1.commits.load(Ordering::SeqCst);
+    for result in [
+        corpus.request_article("Rust").await,
+        corpus
+            .request_selector(None, Some(1), CancellationToken::new())
+            .await,
+        corpus
+            .upstream_search("Rust", 1, CancellationToken::new())
+            .await
+            .map(|_| ()),
+        corpus
+            .fetch(
+                Operation::ArticleHtml {
+                    title: "Rust".into(),
+                },
+                Validators::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .map(|_| ()),
+    ] {
+        assert_eq!(result.unwrap_err().code, "wikipedia_configuration_required");
+    }
+    let cancel = CancellationToken::new();
+    let collection = corpus.run(cancel.clone());
+    let events = corpus.run_events(cancel.clone());
+    tokio::pin!(collection, events);
+    tokio::select! {
+        _ = &mut collection => panic!("unidentified collector must remain idle"),
+        _ = &mut events => panic!("unidentified stream must remain idle"),
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        collection.await.expect("collector cancels");
+        events.await.expect("stream cancels");
+    })
+    .await
+    .expect("idle workers cancel promptly");
+    assert_eq!(broker.attempt_count(), 0);
+    assert_eq!(store.1.commits.load(Ordering::SeqCst), commits);
+}
+
+#[tokio::test]
+async fn unidentified_get_serves_retained_title_with_existing_freshness_and_visibility_rules() {
+    let (root, store, provider, _broker, corpus, server) = fixture().await;
+    let document = capture_fixture(&corpus, &store).await;
+    let capture_id = document["capture"]["id"].as_str().unwrap().to_owned();
+    let retained = store
+        .wiki_get("captures", &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let broker = unidentified_broker();
+    let offline = Arc::new(
+        WikipediaCorpus::new(
+            store.clone(),
+            broker.clone(),
+            root.path(),
+            corpus.config.clone(),
+        )
+        .expect("offline writer"),
+    );
+    let research = super::super::research::WikipediaResearch::new(offline.clone());
+    let before_requests = provider.requests.lock().await.len();
+    let before_commits = store.1.commits.load(Ordering::SeqCst);
+    for input in [json!({"title":"Rust"}), json!({"page_id":1})] {
+        let output = research
+            .call("wikipedia.get", input, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(output["capture"]["id"], capture_id);
+    }
+    assert_eq!(store.1.commits.load(Ordering::SeqCst), before_commits);
+    let validation_key = format!("validation:{capture_id}");
+    offline
+        .save(
+            &validation_key,
+            json!({"validated_at":now()-20,"expires_at":now()-10,"cache":retained.data["cache"]}),
+            None,
+        )
+        .await
+        .unwrap();
+    let stale = research
+        .call(
+            "wikipedia.get",
+            json!({"title":"Rust"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale["stale"], true);
+    let mut page = store.wiki_state("page:1").await.unwrap().unwrap();
+    page["current"] = Value::Null;
+    offline.save("page:1", page.clone(), None).await.unwrap();
+    offline.save(&validation_key, json!({"validated_at":now()-1000,"expires_at":now()-901,"cache":retained.data["cache"]}), None).await.unwrap();
+    assert!(
+        research
+            .call(
+                "wikipedia.get",
+                json!({"title":"Rust"}),
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    page["current"] = json!(false);
+    offline.save("page:1", page, None).await.unwrap();
+    offline.save(&validation_key, json!({"validated_at":now()-90000,"expires_at":now()-86401,"cache":retained.data["cache"]}), None).await.unwrap();
+    assert!(
+        research
+            .call(
+                "wikipedia.get",
+                json!({"title":"Rust"}),
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    let frozen = research
+        .call(
+            "wikipedia.get",
+            json!({"capture":capture_id}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(frozen["capture"]["id"], capture_id);
+    let mut forbidden_cache = retained.data["cache"].clone();
+    forbidden_cache["cache_control"] = json!("private,no-store");
+    offline
+        .save(
+            &validation_key,
+            json!({"validated_at":now(),"expires_at":now()+600,"cache":forbidden_cache}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        research
+            .call(
+                "wikipedia.get",
+                json!({"title":"Rust"}),
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        research
+            .call(
+                "wikipedia.get",
+                json!({"title":"Missing"}),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "wikipedia_configuration_required"
+    );
+    assert_eq!(provider.requests.lock().await.len(), before_requests);
+    assert_eq!(broker.attempt_count(), 0);
+    server.abort();
+}
+
+struct ReadinessDelegate {
+    code: &'static str,
+    requests: AtomicUsize,
+    searches: AtomicUsize,
+}
+#[async_trait]
+impl AcquisitionDelegate for ReadinessDelegate {
+    async fn wikipedia_request(&self, _title: Option<String>, _page_id: Option<u64>) -> Result<()> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Err(Error::new(self.code, "Writer acquisition is blocked."))
+    }
+    async fn wikipedia_search(&self, _query: String, _limit: usize) -> Result<Value> {
+        self.searches.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"delegated":true}))
+    }
+    async fn acquire(
+        &self,
+        _operation: devres_application::acquisition::Acquisition,
+    ) -> Result<devres_domain::Capture> {
+        Err(Error::unavailable("Unused fixture operation."))
+    }
+    async fn effect(&self, _effect: devres_application::acquisition::WriterEffect) -> Result<()> {
+        Err(Error::unavailable("Unused fixture operation."))
+    }
+}
+
+#[tokio::test]
+async fn reader_without_identity_delegates_and_only_readiness_errors_allow_local_fallback() {
+    let (root, store, _provider, _broker, corpus, server) = fixture().await;
+    capture_fixture(&corpus, &store).await;
+    for code in [
+        "wikipedia_configuration_required",
+        "wikipedia_authentication_failed",
+        "unavailable",
+    ] {
+        let delegate = Arc::new(ReadinessDelegate {
+            code,
+            requests: AtomicUsize::new(0),
+            searches: AtomicUsize::new(0),
+        });
+        let reader = Arc::new(
+            WikipediaCorpus::new_reader(
+                store.clone(),
+                unidentified_broker(),
+                root.path(),
+                corpus.config.clone(),
+            )
+            .unwrap()
+            .with_delegate(Some(delegate.clone())),
+        );
+        assert_eq!(
+            reader
+                .upstream_search("Rust", 1, CancellationToken::new())
+                .await
+                .unwrap()["delegated"],
+            true
+        );
+        assert_eq!(delegate.searches.load(Ordering::SeqCst), 1);
+        let research = super::super::research::WikipediaResearch::new(reader);
+        let result = research
+            .call(
+                "wikipedia.get",
+                json!({"title":"Rust"}),
+                CancellationToken::new(),
+            )
+            .await;
+        if code == "unavailable" {
+            assert_eq!(result.unwrap_err().code, code);
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(delegate.requests.load(Ordering::SeqCst), 1);
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -976,4 +1327,231 @@ async fn dropping_action_during_slow_body_preserves_the_five_second_pause() {
 #[tokio::test]
 async fn dropping_stream_handshake_after_headers_preserves_policy_across_restart() {
     dropped_policy_receipt_fixture(false, true, true, false).await;
+}
+
+fn authenticated_identity() -> super::super::identity::WikipediaIdentity {
+    super::super::identity::WikipediaIdentity::new(
+        Some("CorpusFixture/1.0 (https://example.org/bot)"),
+        Some(b"synthetic-corpus-token"),
+    )
+    .expect("synthetic identity")
+}
+
+fn raw_artifact_manifest(root: &Path) -> BTreeMap<std::path::PathBuf, String> {
+    let mut pending = vec![root.join("wikipedia/raw-artifacts")];
+    let mut files = BTreeMap::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).expect("artifact directory") {
+            let entry = entry.expect("artifact entry");
+            if entry.file_type().expect("artifact type").is_dir() {
+                pending.push(entry.path());
+            } else {
+                files.insert(
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    crate::integrity::hash(&std::fs::read(entry.path()).expect("artifact bytes")),
+                );
+            }
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn unidentified_get_on_never_published_store_returns_configuration_required() {
+    let root = tempfile::Builder::new()
+        .prefix("devres-wiki-empty-unidentified-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let broker = unidentified_broker();
+    let corpus = Arc::new(
+        WikipediaCorpus::new(
+            store.clone(),
+            broker.clone(),
+            root.path(),
+            WikipediaConfig::default(),
+        )
+        .unwrap(),
+    );
+    let research = super::super::research::WikipediaResearch::new(corpus);
+    let error = research
+        .call(
+            "wikipedia.get",
+            json!({"title":"Rust"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "wikipedia_configuration_required");
+    assert_eq!(broker.attempt_count(), 0);
+    assert_eq!(store.1.commits.load(Ordering::SeqCst), 0);
+    assert!(store.0.lock().await.rows.is_empty());
+    assert!(store.0.lock().await.states.is_empty());
+}
+
+#[tokio::test]
+async fn authenticated_public_200_and_304_publish_then_revalidate_without_new_artifacts() {
+    let (root, store, provider, _broker, corpus, server) =
+        fixture_with_identity(Some(authenticated_identity())).await;
+    let document = capture_fixture(&corpus, &store).await;
+    let capture_id = document["capture"]["id"].as_str().unwrap();
+    assert!(
+        store
+            .wiki_get("captures", capture_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(provider.requests.lock().await.iter().all(|(_, headers)| {
+        headers
+            .get("authorization")
+            .is_some_and(|value| value == "Bearer synthetic-corpus-token")
+    }));
+    let before_artifacts = raw_artifact_manifest(root.path());
+    let before_captures = store
+        .wiki_rows("captures", 0, 100, None)
+        .await
+        .unwrap()
+        .len();
+    expire_endpoints(&store).await;
+    provider.mode.store(1, Ordering::SeqCst);
+    corpus
+        .request_article("Rust")
+        .await
+        .expect("public authenticated 304");
+    assert!(
+        store
+            .wiki_state(&format!("validation:{capture_id}"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .wiki_rows("captures", 0, 100, None)
+            .await
+            .unwrap()
+            .len(),
+        before_captures
+    );
+    assert_eq!(raw_artifact_manifest(root.path()), before_artifacts);
+    assert!(
+        corpus
+            .research_document(&json!({"page_id":1}), "text")
+            .await
+            .is_ok()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn authenticated_forbidden_200_and_304_preserve_endpoints_validation_and_artifacts() {
+    let (root, store, provider, _broker, corpus, server) =
+        fixture_with_identity(Some(authenticated_identity())).await;
+    let document = capture_fixture(&corpus, &store).await;
+    let capture_id = document["capture"]["id"].as_str().unwrap();
+    for mode in [4, 5, 6, 7, 10, 11, 12, 9] {
+        expire_endpoints(&store).await;
+        if mode == 9 {
+            for state in store
+                .0
+                .lock()
+                .await
+                .states
+                .values_mut()
+                .filter(|state| state.key.starts_with("endpoint:"))
+            {
+                state.data["cache"]["cache_control"] = json!("max-age=0");
+            }
+        }
+        let endpoint_key = key("endpoint", "html:Rust");
+        let before_endpoint = store.wiki_state(&endpoint_key).await.unwrap();
+        let before_validation = store
+            .wiki_state(&format!("validation:{capture_id}"))
+            .await
+            .unwrap();
+        let before_rows = serde_json::to_value(&store.0.lock().await.rows).unwrap();
+        let before_view = store.wiki_state("snapshot:default").await.unwrap();
+        let before_artifacts = raw_artifact_manifest(root.path());
+        provider.mode.store(mode, Ordering::SeqCst);
+        assert!(corpus.request_article("Rust").await.is_err(), "mode {mode}");
+        assert_eq!(
+            store.wiki_state(&endpoint_key).await.unwrap(),
+            before_endpoint,
+            "mode {mode}"
+        );
+        assert_eq!(
+            store
+                .wiki_state(&format!("validation:{capture_id}"))
+                .await
+                .unwrap(),
+            before_validation,
+            "mode {mode}"
+        );
+        assert_eq!(
+            serde_json::to_value(&store.0.lock().await.rows).unwrap(),
+            before_rows,
+            "mode {mode}"
+        );
+        assert_eq!(
+            store.wiki_state("snapshot:default").await.unwrap(),
+            before_view,
+            "mode {mode}"
+        );
+        assert_eq!(
+            raw_artifact_manifest(root.path()),
+            before_artifacts,
+            "mode {mode}"
+        );
+        assert!(
+            corpus
+                .research_document(&json!({"capture":capture_id}), "text")
+                .await
+                .is_ok(),
+            "mode {mode}"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn authenticated_401_latches_without_backoff_and_preserves_local_get() {
+    let (_root, store, provider, broker, corpus, server) =
+        fixture_with_identity(Some(authenticated_identity())).await;
+    let document = capture_fixture(&corpus, &store).await;
+    let capture_id = document["capture"]["id"].as_str().unwrap().to_owned();
+    expire_endpoints(&store).await;
+    let before_backoff = store.wiki_state("provider:backoff:http").await.unwrap();
+    provider.mode.store(8, Ordering::SeqCst);
+    let error = corpus.request_article("Rust").await.unwrap_err();
+    assert_eq!(error.code, "wikipedia_authentication_failed");
+    assert!(
+        !serde_json::to_string(&error)
+            .unwrap()
+            .contains("synthetic-corpus-token")
+    );
+    assert_eq!(
+        store.wiki_state("provider:backoff:http").await.unwrap(),
+        before_backoff
+    );
+    let before_attempts = broker.attempt_count();
+    let before_commits = store.1.commits.load(Ordering::SeqCst);
+    assert_eq!(
+        corpus.request_article("Rust").await.unwrap_err().code,
+        "wikipedia_authentication_failed"
+    );
+    assert_eq!(broker.attempt_count(), before_attempts);
+    assert_eq!(store.1.commits.load(Ordering::SeqCst), before_commits);
+    let research = super::super::research::WikipediaResearch::new(Arc::new(corpus));
+    let local = research
+        .call(
+            "wikipedia.get",
+            json!({"title":"Rust"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(local["capture"]["id"], capture_id);
+    assert_eq!(store.1.commits.load(Ordering::SeqCst), before_commits);
+    server.abort();
 }
