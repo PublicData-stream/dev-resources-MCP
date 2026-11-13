@@ -5,3 +5,6 @@ pub(crate) mod index;
 pub(crate) mod source;
 pub(crate) mod tools;
 pub use corpus::{RfcConfig, RfcCorpus};
+
+#[cfg(test)]
+mod cluster_tests;

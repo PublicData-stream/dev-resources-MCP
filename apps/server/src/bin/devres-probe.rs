@@ -12,6 +12,9 @@ use wtransport::{
     tls::{Certificate, rustls},
 };
 const MAX: usize = 8 * 1024 * 1024;
+const RFC_BODY: &str =
+    "First-party synthetic fixturetransport historicalfixturebody. Not official RFC content.\n";
+const RFC_NOTICE: &str = "https://fixtures.invalid/devres/rfc-retained\nFirst-party synthetic retained RFC acceptance by dev-resources-MCP contributors, AGPL-3.0-only. This is not upstream source or upstream licensing evidence.";
 
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
@@ -1136,7 +1139,7 @@ async fn main() -> Result<(), ServerError> {
             .await?;
         let receipts = collector_receipts(&raw)?;
         for (offset, receipt) in receipts.iter().enumerate() {
-            let id = 500 + offset as u64 * 2;
+            let id = 500 + offset as u64 * 10;
             let detail = tool_exchange(
                 &mut send,
                 &mut reader,
@@ -1147,18 +1150,108 @@ async fn main() -> Result<(), ServerError> {
                 receipt.arguments.clone(),
             )
             .await?;
-            if detail["selection"]["snapshot"] != receipt.arguments["snapshot"]
+            if receipt.provider == "rfc" {
+                let capture = receipt
+                    .resource
+                    .rsplit('/')
+                    .next()
+                    .ok_or("RFC fixture capture missing")?;
+                let items = detail["items"]
+                    .as_array()
+                    .ok_or("RFC search items missing")?;
+                if detail["snapshot"] != receipt.arguments["snapshot"]
+                    || detail["coverage"]["acquisition_complete"] != false
+                    || detail["coverage"]["searchable_documents"] != 2
+                    || items
+                        .iter()
+                        .map(|item| item["number"].as_u64())
+                        .collect::<Vec<_>>()
+                        != vec![Some(9000), Some(9001)]
+                    || items[0]["capture"]["id"] != capture
+                    || !items[0]["excerpt"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&receipt.expected))
+                {
+                    return Err(
+                        "RFC pinned partial search order, membership or history changed".into(),
+                    );
+                }
+                let mut unpinned = receipt.arguments.clone();
+                unpinned
+                    .as_object_mut()
+                    .ok_or("RFC fixture arguments missing")?
+                    .remove("snapshot");
+                let current = tool_exchange(
+                    &mut send,
+                    &mut reader,
+                    &budget,
+                    revision,
+                    id + 2,
+                    &receipt.tool,
+                    unpinned,
+                )
+                .await?;
+                let current_capture = current["items"]
+                    .as_array()
+                    .and_then(|items| items.iter().find(|item| item["number"] == 9000))
+                    .and_then(|item| item["capture"]["id"].as_str());
+                if current["snapshot"] == receipt.arguments["snapshot"]
+                    || current["total"] != 2
+                    || current_capture.is_none_or(|id| id == capture)
+                {
+                    return Err(
+                        "RFC unpinned partial search did not select the newer generation".into(),
+                    );
+                }
+                let mut page = receipt.arguments.clone();
+                page["offset"] = json!(1);
+                page["limit"] = json!(1);
+                let page = tool_exchange(
+                    &mut send,
+                    &mut reader,
+                    &budget,
+                    revision,
+                    id + 3,
+                    &receipt.tool,
+                    page,
+                )
+                .await?;
+                if page["items"].as_array().map(Vec::len) != Some(1)
+                    || page["items"][0]["number"] != 9001
+                    || !page["next_offset"].is_null()
+                {
+                    return Err("RFC pinned pagination changed".into());
+                }
+                let historical = tool_exchange(
+                    &mut send,
+                    &mut reader,
+                    &budget,
+                    revision,
+                    id + 4,
+                    "rfc.format_get",
+                    json!({"number":9000,"format":"txt","capture":capture}),
+                )
+                .await?;
+                if historical["page"]["text"] != RFC_BODY
+                    || historical["attribution"]["readable_notice"] != RFC_NOTICE
+                    || detail["attribution"]["readable_notice"] != RFC_NOTICE
+                {
+                    return Err("RFC historical body or notice bytes changed".into());
+                }
+            } else if detail["selection"]["snapshot"] != receipt.arguments["snapshot"]
                 || !detail["page"]["text"]
                     .as_str()
                     .is_some_and(|text| text.contains(&receipt.expected))
-                || !detail["attribution"]["readable_notice"]
-                    .as_str()
-                    .is_some_and(|notice| !notice.is_empty())
             {
                 return Err(
-                    "Collector-produced pinned content or attribution changed through WebTransport"
-                        .into(),
+                    "Collector-produced pinned content changed through WebTransport".into(),
                 );
+            }
+            if !detail["attribution"]["readable_notice"]
+                .as_str()
+                .is_some_and(|notice| !notice.is_empty())
+            {
+                return Err("Fixture attribution missing through WebTransport".into());
             }
             let mut params = json!({"uri": receipt.resource});
             if revision == "2026-07-28" {
@@ -1174,7 +1267,18 @@ async fn main() -> Result<(), ServerError> {
             let contents = resource["result"]["contents"]
                 .as_array()
                 .ok_or("Collector resource contents missing")?;
-            if !contents.iter().skip(1).any(|item| {
+            if receipt.provider == "rfc" {
+                let capture = receipt
+                    .resource
+                    .rsplit('/')
+                    .next()
+                    .ok_or("RFC fixture capture missing")?;
+                if !rfc_resource_matches(contents, capture) {
+                    return Err(
+                        "RFC resource bytes, capture evidence or qualified license changed".into(),
+                    );
+                }
+            } else if !contents.iter().skip(1).any(|item| {
                 item["text"]
                     .as_str()
                     .is_some_and(|text| !text.trim().is_empty())
@@ -1195,6 +1299,31 @@ async fn main() -> Result<(), ServerError> {
     println!("WebTransport {revision}: discovery, tool listing, and server identity verified.");
     Ok(())
 }
+fn rfc_resource_matches(contents: &[Value], capture: &str) -> bool {
+    if contents.len() != 2 || contents[0]["text"] != RFC_BODY || contents[1]["text"] != RFC_NOTICE {
+        return false;
+    }
+    let metadata = &contents[0]["_meta"];
+    if metadata["source_evidence"]["capture"]["id"] != capture
+        || metadata["attribution"]["status"] != "ready"
+    {
+        return false;
+    }
+    metadata["attribution"]["generations"]
+        .as_array()
+        .is_some_and(|generations| {
+            !generations.is_empty()
+                && generations.iter().all(|generation| {
+                    generation["notices"].as_array().is_some_and(|notices| {
+                        !notices.is_empty()
+                            && notices
+                                .iter()
+                                .all(|notice| notice["license"] == "AGPL-3.0-only")
+                    })
+                })
+        })
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CollectorReceipt {
@@ -1209,15 +1338,21 @@ fn collector_receipts(raw: &[u8]) -> Result<Vec<CollectorReceipt>, ServerError> 
         return Err("Collector receipts exceed bound".into());
     }
     let receipts: Vec<CollectorReceipt> = serde_json::from_slice(raw)?;
-    if receipts.len() != 2
+    if !(2..=3).contains(&receipts.len())
         || !["w3c", "chromium"]
             .iter()
             .all(|provider| receipts.iter().filter(|r| r.provider == *provider).count() == 1)
+        || (receipts.len() == 3 && receipts.iter().filter(|r| r.provider == "rfc").count() != 1)
     {
-        return Err("Two distinct collector fixture providers required".into());
+        return Err("Distinct W3C/Chromium fixtures and optional RFC fixture required".into());
     }
     for receipt in &receipts {
-        if receipt.tool != format!("{}.get", receipt.provider)
+        let expected_tool = if receipt.provider == "rfc" {
+            "rfc.fulltext_search".to_owned()
+        } else {
+            format!("{}.get", receipt.provider)
+        };
+        if receipt.tool != expected_tool
             || !receipt.arguments["snapshot"]
                 .as_str()
                 .is_some_and(devres_domain::valid_content_id)
@@ -1229,6 +1364,15 @@ fn collector_receipts(raw: &[u8]) -> Result<Vec<CollectorReceipt>, ServerError> 
             || receipt.expected.len() > 256
         {
             return Err("Invalid capture-fixed collector fixture receipt".into());
+        }
+        if receipt.provider == "rfc"
+            && (receipt.arguments["query"] != "fixturetransport"
+                || !receipt
+                    .resource
+                    .strip_prefix("devres://rfc/9000/txt/")
+                    .is_some_and(devres_domain::valid_content_id))
+        {
+            return Err("Invalid retained RFC fixture selection".into());
         }
     }
     Ok(receipts)
@@ -1340,13 +1484,60 @@ mod diagnostic_tests {
     use super::*;
     #[test]
     fn collector_receipts_require_distinct_pinned_provider_selections() {
-        let rows = ["w3c", "chromium"].map(|provider| json!({"provider":provider,"tool":format!("{provider}.get"),"arguments":{"snapshot":format!("blake3:{}","1".repeat(64))},"resource":format!("devres://{provider}/fixture"),"expected":"synthetic"}));
+        let rows = ["w3c", "chromium", "rfc"].map(|provider| {
+            if provider == "rfc" {
+                json!({"provider":provider,"tool":"rfc.fulltext_search","arguments":{"snapshot":format!("blake3:{}","1".repeat(64)),"query":"fixturetransport"},"resource":format!("devres://rfc/9000/txt/blake3:{}","2".repeat(64)),"expected":"synthetic"})
+            } else {
+                json!({"provider":provider,"tool":format!("{provider}.get"),"arguments":{"snapshot":format!("blake3:{}","1".repeat(64))},"resource":format!("devres://{provider}/fixture"),"expected":"synthetic"})
+            }
+        });
         assert!(collector_receipts(&serde_json::to_vec(&rows).unwrap()).is_ok());
+        assert!(collector_receipts(&serde_json::to_vec(&rows[..2]).unwrap()).is_ok());
+        assert!(collector_receipts(&serde_json::to_vec(&rows[..1]).unwrap()).is_err());
         let mut rows = rows;
         rows[0]["arguments"] = json!({});
         assert!(collector_receipts(&serde_json::to_vec(&rows).unwrap()).is_err());
         assert!(collector_receipts(&vec![b' '; 65537]).is_err());
     }
+    #[test]
+    fn rfc_resources_bind_exact_bytes_to_qualified_capture_and_notice_metadata() {
+        let capture = format!("blake3:{}", "2".repeat(64));
+        let valid = vec![
+            json!({"text":RFC_BODY,"_meta":{"source_evidence":{"capture":{"id":capture}},"attribution":{"status":"ready","generations":[{"notices":[{"license":"AGPL-3.0-only"}]}]}}}),
+            json!({"text":RFC_NOTICE}),
+        ];
+        assert!(valid[0]["_meta"]["license"].is_null());
+        assert!(rfc_resource_matches(&valid, &capture));
+        for (pointer, replacement) in [
+            ("/text", json!(format!("{RFC_BODY}unexpected suffix"))),
+            (
+                "/_meta/source_evidence/capture/id",
+                json!(format!("blake3:{}", "9".repeat(64))),
+            ),
+            ("/_meta/attribution/status", json!("pending")),
+            ("/_meta/attribution/generations", json!([])),
+            ("/_meta/attribution/generations/0/notices", json!([])),
+            (
+                "/_meta/attribution/generations/0/notices/0/license",
+                json!(null),
+            ),
+            (
+                "/_meta/attribution/generations/0/notices/0/license",
+                json!("unexpected-license"),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid[0].pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                !rfc_resource_matches(&invalid, &capture),
+                "accepted mutated metadata at {pointer}"
+            );
+        }
+        let mut invalid = valid;
+        invalid[1]["text"] = json!(format!("{RFC_NOTICE}unexpected suffix"));
+        assert!(!rfc_resource_matches(&invalid, &capture));
+    }
+
     #[test]
     fn fixed_tool_diagnostics_exclude_request_and_response_payloads() {
         let request = json!({"method":"tools/call","params":{"name":"packages.crate.audit_lockfile","arguments":{"lockfile":"private-inventory-unique"}}});

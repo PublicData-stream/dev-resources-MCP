@@ -583,6 +583,7 @@ retains the existing collection policy and does not prove fresh acquisition.
 See [private provider diagnosis](provider-diagnostics.md) for selected RFC metadata
 inspection without writer/cache effects. Metadata verification does not establish
 engine readability or identify every production failure.
+Local fixture and cluster outcomes are recorded in [RFC acceptance evidence](rfc-acceptance-evidence.md).
 
 
 RFC collection is enabled when `[rfc]` is omitted. To pause scheduling, set

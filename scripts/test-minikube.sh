@@ -21,6 +21,9 @@ done
 if (( ! live && ${#live_rfc_args[@]} )); then echo '--rfc-text-only requires --live' >&2; exit 2; fi
 if (( s3 && live )); then echo '--s3 is an isolated fixture scenario and does not accept --live' >&2; exit 2; fi
 if (( credential_broker && ! s3 )); then echo '--credential-broker requires --s3' >&2; exit 2; fi
+# Canonical synthetic RFC captures must never satisfy later live-provider probes.
+collector_providers=(w3c chromium)
+if (( ! live )); then collector_providers+=(rfc); fi
 if [[ ${DEVRES_TMP_STATE:-} != 1 ]]; then
   docker_endpoint=${DEVRES_DOCKER_HOST:-${DOCKER_HOST:-}}
   if [[ -z $docker_endpoint ]]; then
@@ -570,15 +573,17 @@ k exec storage-maintenance -- cat /tmp/attribution-backlog-receipt.json \
 test "$(wc -c < "$scratch/attribution-backlog-receipt.json")" -le 32768
 attribution_readback
 before=$(k exec storage-maintenance -- storage-probe write)
-for provider in w3c chromium; do
+for provider in "${collector_providers[@]}"; do
   k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 "${provider}_collector_cluster_seed"
   k exec storage-maintenance -- cat "/tmp/${provider}-collector-receipt.json" > "$scratch/$provider-collector.json"
 done
-python3 - "$scratch" <<'PYCOLLECTOR'
+python3 - "$scratch" "${collector_providers[@]}" <<'PYCOLLECTOR'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
+providers = tuple(sys.argv[2:])
+assert providers in (('w3c', 'chromium'), ('w3c', 'chromium', 'rfc')), 'unexpected fixture provider selection'
 receipts = []
-for provider in ('w3c', 'chromium'):
+for provider in providers:
     with (root / (provider + '-collector.json')).open('rb') as source:
         raw = source.read(32769)
     assert len(raw) <= 32768, 'collector receipt exceeds bound'
