@@ -20,9 +20,10 @@ The dated [original preparation evidence](acceptance-evidence.md) and
 published releases, local checks, inactive target state and incomplete gates.
 
 The [2026-11-12 production upgrade](upgrade-5196c629-evidence.md) records the
-active `0.1.0-build.5196c629` runtime and schema 14. The generic renderer and
-operator below still describe their original pinned release; use the reviewed
-successor procedure for further lifecycle changes to the upgraded runtime.
+previous schema-14 runtime. The [2026-11-13 upgrade](upgrade-60e10624-evidence.md)
+records the active `0.1.0-build.60e10624` runtime and schema 15. The generic
+renderer and operator below still describe their original pinned release; use
+the reviewed successor procedure for further lifecycle changes.
 
 The [fixed-source helper](../../scripts/deployment-live-probe.sh) starts with
 `--live /tmp/NEW_PRIVATE_ROOT`. It retains public source bytes, parser/rights
