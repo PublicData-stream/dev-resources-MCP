@@ -20,8 +20,9 @@ The dated [original preparation evidence](acceptance-evidence.md) and
 published releases, local checks, inactive target state and incomplete gates.
 
 The [2026-11-12 production upgrade](upgrade-5196c629-evidence.md) records the
-previous schema-14 runtime. The [2026-11-13 upgrade](upgrade-60e10624-evidence.md)
-records the active `0.1.0-build.60e10624` runtime and schema 15. The generic
+previous schema-14 runtime. The [first 2026-11-13 upgrade](upgrade-60e10624-evidence.md)
+records the transition to schema 15. The [subsequent update](upgrade-65236494-evidence.md)
+records the active `0.1.0-build.65236494` runtime with schema 15 preserved. The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
 
