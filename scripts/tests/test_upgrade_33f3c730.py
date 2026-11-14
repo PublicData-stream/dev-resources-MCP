@@ -246,6 +246,27 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(u.Error, 'old_source_url'):
             u.configuration(config().replace('65236494/source', 'wrong/source'), False)
 
+    def test_all_cryptographic_pins_are_complete_sha256_values(self):
+        pins = {name: getattr(u, name) for name in (
+            'OLD_SHA', 'PRIOR_CONTROLLER_SHA', 'SOURCE_SHA', 'PROFILE_SHA', 'STORE_BINDING',
+            'OLD_COMPOSE_SHA', 'NEW_COMPOSE_SHA', 'OLD_EDGE_ID', 'NEW_EDGE_ID',
+            'OLD_COMPOSE_CONFIG', 'NEW_COMPOSE_CONFIG')}
+        pins.update({'network_' + name: value for name, value in u.NETWORK_IDS.items()})
+        pins.update({'endpoint_' + name: value for name, value in u.NETWORK_ENDPOINTS.items()})
+        pins.update({'label_' + name: value for name, value in u.NETWORK_LABEL_HASHES.items()})
+        for name, rule in u.CONF_FILE_RULES.items():
+            for field in ('old_sha', 'new_sha'):
+                pins[name + '_' + field] = rule[field]
+        for name in ('OLD_IMAGE', 'IMAGE', 'PG_IMAGE', 'PROBE_IMAGE', 'EDGE_IMAGE'):
+            pins[name] = getattr(u, name).split('sha256:', 1)[1]
+        for name, value in pins.items():
+            with self.subTest(pin=name):
+                self.assertRegex(value, r'^[a-f0-9]{64}$')
+
+    def test_historical_compression_pin_matches_admitted_original(self):
+        self.assertEqual(u.CONF_FILE_RULES['40-compression.toml']['old_sha'],
+            'ecf63a7dd2284f41786d5fb6e37016a556b92b7a8a8a9f24807e29893a539c5c')
+
     def test_schema18_release_is_exact(self):
         self.assertEqual(u.target_identity()['schema'], 18)
         self.assertEqual(u.target_identity()['revision'], '33f3c730123319625fe3a25713988201eb5d82e0')

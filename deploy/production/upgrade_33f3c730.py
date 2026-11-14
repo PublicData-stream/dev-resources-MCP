@@ -82,7 +82,7 @@ CONF_FILE_RULES = {
         'new_sha': 'bd544f46640edab8890ac677f1d100ab807e9a1d20959c5143ea83db750d89d7',
         'new_mtime': 1794632754921703091},
     '40-compression.toml': {'inode': 13107210, 'old_size': 955, 'new_size': 835,
-        'old_sha': 'ecf63a7dd2284f41786d5fb6e37016a556b92b7a8a9f24807e29893a539c5c',
+        'old_sha': 'ecf63a7dd2284f41786d5fb6e37016a556b92b7a8a8a9f24807e29893a539c5c',
         'new_sha': 'cf0c5b06bd104166990173e6e3abd931b8f80dd2ae19dcb5c839110cbd585a29',
         'new_mtime': 1794632318220912288},
     '62-route-devres.toml': {'inode': 13107219, 'old_size': 759, 'new_size': 763,
