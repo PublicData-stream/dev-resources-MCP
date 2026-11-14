@@ -1380,6 +1380,11 @@ fn rfc_resource_matches(contents: &[Value], capture: &str) -> bool {
         })
 }
 
+const NOTICE_MAX_BYTES: usize = 65_536;
+const NOTICE_PAGE_BYTES: usize = 1_024;
+// A UTF-8 boundary can trim up to three bytes from each non-final page.
+const NOTICE_MAX_PAGES: usize = NOTICE_MAX_BYTES.div_ceil(NOTICE_PAGE_BYTES - 3);
+
 async fn rustsec_notice_resources(
     send: &mut wtransport::SendStream,
     reader: &mut FrameReader<wtransport::RecvStream>,
@@ -1413,8 +1418,9 @@ async fn rustsec_notice_resources(
         let start = combined.len();
         let mut offset = 0usize;
         let mut complete = false;
-        for _ in 0..64 {
-            let mut params = json!({"uri":format!("{uri}?offset={offset}&limit=1024")});
+        for _ in 0..NOTICE_MAX_PAGES {
+            let mut params =
+                json!({"uri":format!("{uri}?offset={offset}&limit={NOTICE_PAGE_BYTES}")});
             if revision == "2026-07-28" {
                 params["_meta"] = metadata(revision);
             }
@@ -1426,37 +1432,13 @@ async fn rustsec_notice_resources(
             )
             .await?;
             id += 1;
-            let contents = response["result"]["contents"]
-                .as_array()
-                .filter(|contents| contents.len() == 1)
-                .ok_or("Notice page missing")?;
-            let text = contents[0]["text"].as_str().ok_or("Notice text missing")?;
-            let meta = &contents[0]["_meta"];
-            let end = offset
-                .checked_add(text.len())
-                .ok_or("Notice offset overflow")?;
-            let total = meta["total_bytes"].as_u64().ok_or("Notice size missing")?;
-            if meta["offset"].as_u64() != Some(offset as u64)
-                || contents[0]["uri"] != uri
-                || !rustsec_notice_identity_matches(meta, original)
-                || total != original.text.len() as u64
-                || end as u64 > total
-                || combined.len() + text.len() > 512 * 1024
-            {
-                return Err("Notice identity or byte bound changed".into());
-            }
-            combined.push_str(text);
-            if meta["next_offset"].is_null() {
-                if end as u64 != total {
-                    return Err("Notice truncated".into());
+            match append_rustsec_notice_page(&response, uri, original, offset, &mut combined)? {
+                Some(next) => offset = next,
+                None => {
+                    complete = true;
+                    break;
                 }
-                complete = true;
-                break;
             }
-            if meta["next_offset"].as_u64() != Some(end as u64) || end <= offset {
-                return Err("Notice pagination failed".into());
-            }
-            offset = end;
         }
         if !complete {
             return Err("Notice pages exceeded fixture bound".into());
@@ -1477,6 +1459,47 @@ async fn rustsec_notice_resources(
         return Err("Original RustSec fixture terms missing".into());
     }
     Ok(())
+}
+
+fn append_rustsec_notice_page(
+    response: &Value,
+    uri: &str,
+    expected: &RustSecNoticeExpectation,
+    offset: usize,
+    combined: &mut String,
+) -> Result<Option<usize>, ServerError> {
+    let contents = response["result"]["contents"]
+        .as_array()
+        .filter(|contents| contents.len() == 1)
+        .ok_or("Notice page missing")?;
+    let text = contents[0]["text"].as_str().ok_or("Notice text missing")?;
+    let meta = &contents[0]["_meta"];
+    let end = offset
+        .checked_add(text.len())
+        .ok_or("Notice offset overflow")?;
+    let total = meta["total_bytes"].as_u64().ok_or("Notice size missing")?;
+    if meta["offset"].as_u64() != Some(offset as u64)
+        || contents[0]["uri"] != uri
+        || !rustsec_notice_identity_matches(meta, expected)
+        || total != expected.text.len() as u64
+        || end as u64 > total
+        || combined.len().saturating_add(text.len()) > 512 * 1024
+    {
+        return Err("Notice identity or byte bound changed".into());
+    }
+    let next = if meta["next_offset"].is_null() {
+        if end as u64 != total {
+            return Err("Notice truncated".into());
+        }
+        None
+    } else {
+        if meta["next_offset"].as_u64() != Some(end as u64) || end <= offset {
+            return Err("Notice pagination failed".into());
+        }
+        Some(end)
+    };
+    combined.push_str(text);
+    Ok(next)
 }
 
 fn current_attribution_matches(attribution: &Value) -> bool {
@@ -1539,7 +1562,7 @@ fn rustsec_expected_notices(
         }
         let text = entries.join("\n\n");
         if text.is_empty()
-            || text.len() > 65536
+            || text.len() > NOTICE_MAX_BYTES
             || expected
                 .insert(
                     format!("devres://attribution/{id}"),
@@ -1745,6 +1768,117 @@ async fn exchange_response(
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+    fn notice_fixture(text: String) -> (String, RustSecNoticeExpectation) {
+        let id = format!("blake3:{}", "a".repeat(64));
+        let uri = format!("devres://attribution/{id}");
+        (
+            uri,
+            RustSecNoticeExpectation {
+                id,
+                subject: json!({"provider":"rustsec","namespace":"source","key":"fixture-source","fingerprint":format!("blake3:{}", "b".repeat(64))}),
+                policy_epoch: devres_domain::attribution::ATTRIBUTION_POLICY_EPOCH,
+                text,
+            },
+        )
+    }
+
+    fn notice_page(uri: &str, expected: &RustSecNoticeExpectation, offset: usize) -> Value {
+        let mut end = (offset + NOTICE_PAGE_BYTES).min(expected.text.len());
+        while !expected.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        json!({"result":{"contents":[{"uri":uri,"text":&expected.text[offset..end],
+            "_meta":{"offset":offset,"total_bytes":expected.text.len(),
+                "next_offset":if end < expected.text.len() {Some(end)} else {None},
+                "attribution":{"id":expected.id,"subject":expected.subject,"policy_epoch":expected.policy_epoch}}}]}})
+    }
+
+    #[test]
+    fn rustsec_notice_pages_reconstruct_maximum_utf8_and_ascii_notices() {
+        let prefix = "https://fixtures.invalid/original\nFirst-party synthetic RustSec fixture notice CC-BY-4.0 GHSA-synthetic-fixture 원문\n";
+        let remaining = NOTICE_MAX_BYTES - prefix.len();
+        let unicode = format!(
+            "{prefix}{}{}",
+            "원".repeat(remaining / 3),
+            "x".repeat(remaining % 3)
+        );
+        for (text, pages) in [
+            (unicode, 65),
+            ("x".repeat(NOTICE_MAX_BYTES), 64),
+            ("원문".into(), 1),
+        ] {
+            let (uri, expected) = notice_fixture(text);
+            let mut combined = String::new();
+            let mut offset = 0;
+            let mut complete = false;
+            for page in 1..=NOTICE_MAX_PAGES {
+                match append_rustsec_notice_page(
+                    &notice_page(&uri, &expected, offset),
+                    &uri,
+                    &expected,
+                    offset,
+                    &mut combined,
+                )
+                .unwrap()
+                {
+                    Some(next) => offset = next,
+                    None => {
+                        assert_eq!(page, pages);
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+            assert!(complete, "valid notice exhausted the page budget");
+            assert_eq!(combined.as_bytes(), expected.text.as_bytes());
+        }
+    }
+
+    #[test]
+    fn rustsec_notice_pages_reject_changed_identity_bounds_and_progress() {
+        let (uri, expected) = notice_fixture("원".repeat(400));
+        let page = notice_page(&uri, &expected, 0);
+        for (pointer, replacement) in [
+            (
+                "/result/contents/0/uri",
+                json!("devres://attribution/changed"),
+            ),
+            ("/result/contents/0/_meta/offset", json!(1)),
+            (
+                "/result/contents/0/_meta/total_bytes",
+                json!(expected.text.len() + 1),
+            ),
+            ("/result/contents/0/_meta/next_offset", json!(0)),
+            ("/result/contents/0/_meta/next_offset", Value::Null),
+            ("/result/contents/0/_meta/attribution/id", json!("changed")),
+            (
+                "/result/contents/0/_meta/attribution/subject/key",
+                json!("changed"),
+            ),
+            (
+                "/result/contents/0/_meta/attribution/policy_epoch",
+                json!(expected.policy_epoch - 1),
+            ),
+        ] {
+            let mut invalid = page.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            let mut combined = String::new();
+            assert!(
+                append_rustsec_notice_page(&invalid, &uri, &expected, 0, &mut combined).is_err(),
+                "accepted changed page at {pointer}"
+            );
+            assert!(combined.is_empty());
+        }
+        let mut stalled = page.clone();
+        stalled["result"]["contents"][0]["text"] = json!("");
+        stalled["result"]["contents"][0]["_meta"]["next_offset"] = json!(0);
+        assert!(
+            append_rustsec_notice_page(&stalled, &uri, &expected, 0, &mut String::new()).is_err()
+        );
+        let mut combined = "x".repeat(512 * 1024);
+        assert!(append_rustsec_notice_page(&page, &uri, &expected, 0, &mut combined).is_err());
+    }
+
     #[test]
     fn rustsec_notice_expectations_preserve_exact_order_and_generation_identity() {
         use devres_domain::attribution::{
@@ -1801,6 +1935,9 @@ mod diagnostic_tests {
             invalid[field] = replacement;
             assert!(rustsec_expected_notices(&invalid).is_err());
         }
+        let mut oversized = attribution.clone();
+        oversized["generations"][0]["notices"] = json!([{"source_url":"https://fixtures.invalid/a","text":"x".repeat(NOTICE_MAX_BYTES)}]);
+        assert!(rustsec_expected_notices(&oversized).is_err());
         for field in ["subject", "notices"] {
             let mut invalid = attribution.clone();
             invalid["generations"][0]

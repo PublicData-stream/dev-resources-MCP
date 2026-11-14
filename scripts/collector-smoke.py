@@ -7,6 +7,11 @@ from mcp_smoke import Client, MODERN, LEGACY
 
 ATTRIBUTION_POLICY_EPOCH = 2
 ATTRIBUTION_POLICY_FINGERPRINT = 'devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices'
+MAX_NOTICE_BYTES = 65536
+NOTICE_PAGE_BYTES = 1024
+# A UTF-8 page can trim up to three bytes from its requested end.
+MIN_NOTICE_PAGE_BYTES = NOTICE_PAGE_BYTES - 3
+MAX_NOTICE_PAGES = (MAX_NOTICE_BYTES + MIN_NOTICE_PAGE_BYTES - 1) // MIN_NOTICE_PAGE_BYTES
 
 RFC_BODY = 'First-party synthetic fixturetransport historicalfixturebody. Not official RFC content.\n'
 RFC_NOTICE = 'https://fixtures.invalid/devres/rfc-retained\nFirst-party synthetic retained RFC acceptance by dev-resources-MCP contributors, AGPL-3.0-only. This is not upstream source or upstream licensing evidence.'
@@ -130,15 +135,15 @@ def verify_rustsec_notices(client, attribution, revision):
                 entries.append(entry)
         text = '\n\n'.join(entries)
         uri = 'devres://attribution/' + generation.get('id', '')
-        assert text and len(text.encode()) <= 65536 and uri not in expected, 'invalid notice generation'
+        assert text and len(text.encode()) <= MAX_NOTICE_BYTES and uri not in expected, 'invalid notice generation'
         expected[uri] = (text, generation['subject'])
     assert set(expected) == set(uris), 'notice generation identity mismatch'
     combined = []
     for uri in uris:
         assert isinstance(uri, str) and uri.startswith('devres://attribution/blake3:') and len(uri) <= 128, 'invalid notice resource'
         offset, text = 0, []
-        for _ in range(64):
-            result = client.call('resources/read', {'uri': uri + '?offset=' + str(offset) + '&limit=1024'}, revision)
+        for _ in range(MAX_NOTICE_PAGES):
+            result = client.call('resources/read', {'uri': uri + '?offset=' + str(offset) + '&limit=' + str(NOTICE_PAGE_BYTES)}, revision)
             page = result.get('contents', [])
             assert len(page) == 1 and isinstance(page[0].get('text'), str), 'notice page missing'
             metadata = page[0].get('_meta', {})

@@ -199,6 +199,9 @@ class CollectorSmokeTests(unittest.TestCase):
         subject = {'provider': 'rustsec', 'namespace': 'source', 'key': 'fixture-source', 'fingerprint': 'blake3:' + '5' * 64}
         class RustsecClient(Client):
             corrupt=False
+            def __init__(self):
+                super().__init__()
+                self.notice_pages = []
             def attribution(self):
                 return {'status':'ready', 'policy_epoch':1 if self.corrupt=='outer_epoch' else 2,
                         'policy_fingerprint':'wrong' if self.corrupt=='fingerprint' else smoke.ATTRIBUTION_POLICY_FINGERPRINT}
@@ -218,15 +221,46 @@ class CollectorSmokeTests(unittest.TestCase):
                         try:chunk=notice.encode()[start:end].decode();break
                         except UnicodeDecodeError:end-=1
                     if self.corrupt=='text':chunk=chunk.replace('First-party','Wrong-party')
+                    if self.corrupt=='no_progress':chunk='';end=start
+                    self.notice_pages.append((revision, chunk))
                     return {'contents':[{'uri':notice_uri,'text':chunk,'_meta':{'offset':start,'total_bytes':len(notice.encode())+(1 if self.corrupt=='total' else 0),
-                            'attribution':{'policy_epoch':1 if self.corrupt=='epoch' else 2,'subject':{} if self.corrupt=='subject' else subject,'id':'wrong' if self.corrupt=='id' else notice_uri.rsplit('/',1)[-1]},'next_offset':0 if self.corrupt is True else end if end<len(notice.encode()) else None}}]}
+                            'attribution':{'policy_epoch':1 if self.corrupt=='epoch' else 2,'subject':{} if self.corrupt=='subject' else subject,'id':'wrong' if self.corrupt=='id' else notice_uri.rsplit('/',1)[-1]},'next_offset':0 if self.corrupt is True else None if self.corrupt=='premature_final' else end if end<len(notice.encode()) else None}}]}
                 if args.get('uri')==uri:
                     return {'contents':[{'text':'rustsecfixturebody','_meta':{'attribution':self.attribution(),'source_evidence':{'snapshot':{'id':snapshot}}}}, {'text':notice}]}
                 return super().call(method,args,revision)
         selected=receipts()+[dict(provider='rustsec',tool='packages.crate.advisory_get',arguments={'snapshot':snapshot,'id':'RUSTSEC-2026-9001'},resource=uri,expected='rustsecfixturebody')]
         smoke.verify(RustsecClient(),self.load(selected))
-        for failure in (True,'id','total','text','epoch','subject','outer_epoch','fingerprint'):
+        for failure in (True,'id','total','text','epoch','subject','outer_epoch','fingerprint',
+                        'no_progress','premature_final'):
             broken=RustsecClient();broken.corrupt=failure
-            with self.subTest(failure=failure),self.assertRaises(AssertionError):smoke.verify(broken,selected)
+            with self.subTest(failure=failure),self.assertRaises(AssertionError):
+                smoke.verify(broken,selected)
+            for revision in (smoke.MODERN, smoke.LEGACY):
+                broken=RustsecClient();broken.corrupt=failure
+                attribution=broken.tool('packages.crate.advisory_get', {}, revision)['attribution']
+                with self.subTest(failure=failure, revision=revision),self.assertRaises(AssertionError):
+                    smoke.verify_rustsec_notices(broken,attribution,revision)
+        required='First-party synthetic RustSec fixture notice CC-BY-4.0 GHSA-synthetic-fixture 원문\n'
+        for kind in ('utf8_maximum', 'ascii_maximum', 'small'):
+            notice_body=required
+            if kind != 'small':
+                remaining=65536-len(('https://fixtures.invalid/original\n'+notice_body).encode())
+                notice_body+=('원'*(remaining//3)+'x'*(remaining%3) if kind=='utf8_maximum' else 'x'*remaining)
+            notice='https://fixtures.invalid/original\n'+notice_body
+            client=RustsecClient()
+            smoke.verify(client,selected)
+            for revision in (smoke.MODERN,smoke.LEGACY):
+                pages=[chunk for actual,chunk in client.notice_pages if actual==revision]
+                with self.subTest(kind=kind,revision=revision):
+                    self.assertEqual(''.join(pages),notice)
+                    self.assertEqual(len(pages),65 if kind=='utf8_maximum' else 64 if kind=='ascii_maximum' else 1)
+        notice_body+='x'*(65537-len(notice.encode()))
+        notice='https://fixtures.invalid/original\n'+notice_body
+        for revision in (smoke.MODERN,smoke.LEGACY):
+            oversized=RustsecClient()
+            attribution=oversized.tool('packages.crate.advisory_get',{},revision)['attribution']
+            with self.subTest(oversized=True,revision=revision),self.assertRaises(AssertionError):
+                smoke.verify_rustsec_notices(oversized,attribution,revision)
+            self.assertEqual(oversized.notice_pages,[])
         wrong=copy.deepcopy(selected);wrong[-1]['arguments']['id']='RUSTSEC-2026-9002'
         with self.assertRaises(ValueError):self.load(wrong)
