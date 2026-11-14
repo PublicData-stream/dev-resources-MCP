@@ -32,6 +32,14 @@ protocol/admission fixtures are required. Image notice collection includes path
 dependencies outside the first-party workspace and preserves their original
 license texts.
 
+Both advisory scanners skip local path identities. After the ordinary fresh
+`cargo audit`, run `python3 scripts/audit-vendored.py --no-fetch`; CI runs both.
+The companion validates the pinned SDK manifest and path lock entry, then restores
+only its original registry name/version/checksum in a private temporary lockfile
+for advisory matching. It leaves the committed graph untouched and rejects
+unknown versions or origins. It offers no ignore/stale-data switches. An upstream
+SDK upgrade must update this exact identity with the source/provenance review.
+
 ## Filesystem advisory admission
 
 The locked transitive `rustix` version is updated from 1.1.5 to 1.1.6 for
