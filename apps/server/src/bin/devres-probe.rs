@@ -1241,7 +1241,7 @@ async fn main() -> Result<(), ServerError> {
             } else if receipt.provider == "rustsec" {
                 if detail["snapshot"]["id"] != receipt.arguments["snapshot"]
                     || detail["resource_uri"] != receipt.resource
-                    || detail["attribution"]["status"] != "ready"
+                    || !current_attribution_matches(&detail["attribution"])
                     || !detail["page"]["text"]
                         .as_str()
                         .is_some_and(|text| text.contains(&receipt.expected))
@@ -1259,7 +1259,7 @@ async fn main() -> Result<(), ServerError> {
                 )
                 .await?;
                 if catalog["snapshot"]["id"] != receipt.arguments["snapshot"]
-                    || catalog["attribution"]["status"] != "ready"
+                    || !current_attribution_matches(&catalog["attribution"])
                     || !catalog["attribution"]["readable_notice"]
                         .as_str()
                         .is_some_and(|text| !text.is_empty())
@@ -1323,7 +1323,7 @@ async fn main() -> Result<(), ServerError> {
                     || !contents[0]["text"]
                         .as_str()
                         .is_some_and(|text| text.contains(&receipt.expected))
-                    || contents[0]["_meta"]["attribution"]["status"] != "ready"
+                    || !current_attribution_matches(&contents[0]["_meta"]["attribution"])
                     || contents[0]["_meta"]["source_evidence"]["snapshot"]["id"]
                         != receipt.arguments["snapshot"]
                     || !contents.iter().skip(1).any(|item| {
@@ -1438,11 +1438,9 @@ async fn rustsec_notice_resources(
             let total = meta["total_bytes"].as_u64().ok_or("Notice size missing")?;
             if meta["offset"].as_u64() != Some(offset as u64)
                 || contents[0]["uri"] != uri
-                || meta["attribution"]["id"]
-                    != uri.rsplit('/').next().ok_or("Notice generation missing")?
-                || total != original.len() as u64
+                || !rustsec_notice_identity_matches(meta, original)
+                || total != original.text.len() as u64
                 || end as u64 > total
-                || meta["attribution"]["policy_epoch"] != 1
                 || combined.len() + text.len() > 512 * 1024
             {
                 return Err("Notice identity or byte bound changed".into());
@@ -1463,7 +1461,7 @@ async fn rustsec_notice_resources(
         if !complete {
             return Err("Notice pages exceeded fixture bound".into());
         }
-        if &combined[start..] != original {
+        if combined[start..] != original.text {
             return Err("Original notice bytes changed".into());
         }
     }
@@ -1481,9 +1479,34 @@ async fn rustsec_notice_resources(
     Ok(())
 }
 
+fn current_attribution_matches(attribution: &Value) -> bool {
+    attribution["status"] == "ready"
+        && attribution["policy_epoch"].as_u64()
+            == Some(u64::from(
+                devres_domain::attribution::ATTRIBUTION_POLICY_EPOCH,
+            ))
+        && attribution["policy_fingerprint"]
+            == devres_domain::attribution::ATTRIBUTION_POLICY_FINGERPRINT
+}
+
+struct RustSecNoticeExpectation {
+    id: String,
+    subject: Value,
+    policy_epoch: u32,
+    text: String,
+}
+fn rustsec_notice_identity_matches(meta: &Value, expected: &RustSecNoticeExpectation) -> bool {
+    meta["attribution"]["id"] == expected.id
+        && meta["attribution"]["subject"] == expected.subject
+        && meta["attribution"]["policy_epoch"].as_u64() == Some(u64::from(expected.policy_epoch))
+}
+
 fn rustsec_expected_notices(
     attribution: &Value,
-) -> Result<std::collections::BTreeMap<String, String>, ServerError> {
+) -> Result<std::collections::BTreeMap<String, RustSecNoticeExpectation>, ServerError> {
+    if !current_attribution_matches(attribution) {
+        return Err("Current RustSec attribution policy changed".into());
+    }
     let generations = attribution["generations"]
         .as_array()
         .filter(|generations| !generations.is_empty() && generations.len() <= 8)
@@ -1494,6 +1517,9 @@ fn rustsec_expected_notices(
             .as_str()
             .filter(|id| devres_domain::valid_content_id(id))
             .ok_or("Invalid notice generation")?;
+        let subject: devres_domain::attribution::AttributionSubject =
+            serde_json::from_value(generation["subject"].clone())
+                .map_err(|_| "Notice generation subject missing or invalid")?;
         let notices = generation["notices"]
             .as_array()
             .filter(|notices| !notices.is_empty() && notices.len() <= 128)
@@ -1515,7 +1541,15 @@ fn rustsec_expected_notices(
         if text.is_empty()
             || text.len() > 65536
             || expected
-                .insert(format!("devres://attribution/{id}"), text)
+                .insert(
+                    format!("devres://attribution/{id}"),
+                    RustSecNoticeExpectation {
+                        id: id.to_owned(),
+                        subject: serde_json::to_value(subject)?,
+                        policy_epoch: devres_domain::attribution::ATTRIBUTION_POLICY_EPOCH,
+                        text,
+                    },
+                )
                 .is_some()
         {
             return Err("Notice fixture bound or identity invalid".into());
@@ -1713,23 +1747,68 @@ mod diagnostic_tests {
     use super::*;
     #[test]
     fn rustsec_notice_expectations_preserve_exact_order_and_generation_identity() {
+        use devres_domain::attribution::{
+            ATTRIBUTION_POLICY_EPOCH, ATTRIBUTION_POLICY_FINGERPRINT,
+        };
         let id = format!("blake3:{}", "a".repeat(64));
+        let subject = json!({"provider":"rustsec","namespace":"source","key":"fixture-source","fingerprint":format!("blake3:{}", "b".repeat(64))});
         let first = json!({"source_url":"https://fixtures.invalid/a","text":"원문\r\n"});
         let second = json!({"source_url":"https://fixtures.invalid/b","text":"Original terms"});
-        let generation = json!({"id":id,"notices":[first.clone(),first,second]});
-        let expected =
-            rustsec_expected_notices(&json!({"generations":[generation.clone()]})).unwrap();
+        let generation = json!({"id":id,"subject":subject,"notices":[first.clone(),first,second]});
+        let attribution = json!({"status":"ready","policy_epoch":ATTRIBUTION_POLICY_EPOCH,"policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT,"generations":[generation.clone()]});
+        let expected = rustsec_expected_notices(&attribution).unwrap();
+        let original = &expected[&format!("devres://attribution/{id}")];
         assert_eq!(
-            expected[&format!("devres://attribution/{id}")],
+            original.text,
             "https://fixtures.invalid/a\n원문\r\n\n\nhttps://fixtures.invalid/b\nOriginal terms"
         );
-        assert!(
-            rustsec_expected_notices(&json!({"generations":[generation.clone(),generation]}))
-                .is_err()
-        );
-        assert!(
-            rustsec_expected_notices(&json!({"generations":[{"id":id,"notices":[]}]})).is_err()
-        );
+        let page = json!({"attribution":{"id":id,"subject":subject,"policy_epoch":ATTRIBUTION_POLICY_EPOCH}});
+        assert!(rustsec_notice_identity_matches(&page, original));
+        for (pointer, replacement) in [
+            (
+                "/attribution/policy_epoch",
+                json!(ATTRIBUTION_POLICY_EPOCH - 1),
+            ),
+            (
+                "/attribution/policy_epoch",
+                json!(ATTRIBUTION_POLICY_EPOCH + 1),
+            ),
+            (
+                "/attribution/id",
+                json!(format!("blake3:{}", "c".repeat(64))),
+            ),
+            ("/attribution/subject/key", json!("different-source")),
+            (
+                "/attribution/subject/fingerprint",
+                json!(format!("blake3:{}", "d".repeat(64))),
+            ),
+        ] {
+            let mut invalid = page.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                !rustsec_notice_identity_matches(&invalid, original),
+                "accepted changed notice metadata at {pointer}"
+            );
+        }
+        for (field, replacement) in [
+            ("status", json!("pending")),
+            ("policy_epoch", json!(ATTRIBUTION_POLICY_EPOCH - 1)),
+            ("policy_epoch", json!(ATTRIBUTION_POLICY_EPOCH + 1)),
+            ("policy_fingerprint", json!("unexpected-policy")),
+            ("generations", json!([generation.clone(), generation])),
+        ] {
+            let mut invalid = attribution.clone();
+            invalid[field] = replacement;
+            assert!(rustsec_expected_notices(&invalid).is_err());
+        }
+        for field in ["subject", "notices"] {
+            let mut invalid = attribution.clone();
+            invalid["generations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(rustsec_expected_notices(&invalid).is_err());
+        }
     }
     #[test]
     fn collector_receipts_require_distinct_pinned_provider_selections() {

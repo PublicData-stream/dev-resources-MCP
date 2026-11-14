@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 from mcp_smoke import Client, MODERN, LEGACY
 
+ATTRIBUTION_POLICY_EPOCH = 2
+ATTRIBUTION_POLICY_FINGERPRINT = 'devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices'
+
 RFC_BODY = 'First-party synthetic fixturetransport historicalfixturebody. Not official RFC content.\n'
 RFC_NOTICE = 'https://fixtures.invalid/devres/rfc-retained\nFirst-party synthetic retained RFC acceptance by dev-resources-MCP contributors, AGPL-3.0-only. This is not upstream source or upstream licensing evidence.'
 
@@ -67,12 +70,13 @@ def verify(client, receipts):
                 assert detail.get('snapshot', {}).get('id') == receipt['arguments']['snapshot'], 'RustSec snapshot changed'
                 assert detail.get('resource_uri') == receipt['resource'], 'RustSec resource changed'
                 assert receipt['expected'] in detail.get('page', {}).get('text', ''), 'RustSec source changed'
-                assert detail.get('attribution', {}).get('status') == 'ready', 'RustSec attribution unqualified'
+                verify_current_policy(detail.get('attribution', {}))
                 catalog = client.tool('packages.crate.advisory_catalog_search',
                                       {'snapshot': receipt['arguments']['snapshot'], 'limit': 1}, revision)
                 assert catalog.get('snapshot', {}).get('id') == receipt['arguments']['snapshot'], 'RustSec catalog snapshot changed'
                 assert [row.get('id') for row in catalog.get('items', [])] == [receipt['arguments']['id']], 'RustSec catalog membership changed'
                 assert catalog.get('attribution', {}).get('status') == 'ready' and catalog['attribution'].get('readable_notice'), 'RustSec catalog attribution missing'
+                verify_current_policy(catalog['attribution'])
                 verify_rustsec_notices(client, detail['attribution'], revision)
             else:
                 assert receipt['expected'] in detail.get('page', {}).get('text', ''), 'collector tool content changed'
@@ -95,7 +99,7 @@ def verify(client, receipts):
                     notices = generation.get('notices', [])
                     assert notices and all(notice.get('license') == 'AGPL-3.0-only' for notice in notices), 'RFC resource fixture license missing'
             elif receipt['provider'] == 'rustsec':
-                assert contents[0].get('_meta', {}).get('attribution', {}).get('status') == 'ready', 'RustSec resource unqualified'
+                verify_current_policy(contents[0].get('_meta', {}).get('attribution', {}))
                 evidence = contents[0].get('_meta', {}).get('source_evidence', {})
                 assert evidence.get('snapshot', {}).get('id') == receipt['arguments']['snapshot'], 'RustSec resource snapshot changed'
             else:
@@ -104,7 +108,14 @@ def verify(client, receipts):
                        for item in contents[1:]), 'collector resource readable attribution missing'
 
 
+def verify_current_policy(attribution):
+    assert attribution.get('status') == 'ready', 'RustSec attribution unqualified'
+    assert attribution.get('policy_epoch') == ATTRIBUTION_POLICY_EPOCH, 'RustSec policy epoch changed'
+    assert attribution.get('policy_fingerprint') == ATTRIBUTION_POLICY_FINGERPRINT, 'RustSec policy fingerprint changed'
+
+
 def verify_rustsec_notices(client, attribution, revision):
+    verify_current_policy(attribution)
     uris = attribution.get('resource_uris', [])
     assert isinstance(uris, list) and 1 <= len(uris) <= 8 and len(set(uris)) == len(uris), 'RustSec notice resources missing'
     generations = attribution.get('generations', [])
@@ -120,7 +131,7 @@ def verify_rustsec_notices(client, attribution, revision):
         text = '\n\n'.join(entries)
         uri = 'devres://attribution/' + generation.get('id', '')
         assert text and len(text.encode()) <= 65536 and uri not in expected, 'invalid notice generation'
-        expected[uri] = text
+        expected[uri] = (text, generation['subject'])
     assert set(expected) == set(uris), 'notice generation identity mismatch'
     combined = []
     for uri in uris:
@@ -134,8 +145,9 @@ def verify_rustsec_notices(client, attribution, revision):
             chunk = page[0]['text']
             end = offset + len(chunk.encode('utf-8'))
             assert page[0].get('uri') == uri and metadata.get('attribution', {}).get('id') == uri.rsplit('/', 1)[-1], 'notice generation changed'
-            assert metadata.get('offset') == offset and metadata.get('total_bytes') == len(expected[uri].encode()) and end <= metadata['total_bytes'], 'notice byte offset changed'
-            assert metadata.get('attribution', {}).get('policy_epoch') == 1, 'notice policy changed'
+            assert metadata.get('offset') == offset and metadata.get('total_bytes') == len(expected[uri][0].encode()) and end <= metadata['total_bytes'], 'notice byte offset changed'
+            assert metadata.get('attribution', {}).get('policy_epoch') == attribution['policy_epoch'], 'notice policy changed'
+            assert metadata.get('attribution', {}).get('subject') == expected[uri][1], 'notice subject changed'
             text.append(chunk)
             next_offset = metadata.get('next_offset')
             if next_offset is None:
@@ -146,7 +158,7 @@ def verify_rustsec_notices(client, attribution, revision):
         else:
             raise AssertionError('notice pagination exceeded fixture bound')
         text = ''.join(text)
-        assert text == expected[uri], 'original notice bytes changed'
+        assert text == expected[uri][0], 'original notice bytes changed'
         combined.append(text)
     text = '\n'.join(combined)
     for required in ('First-party synthetic RustSec fixture notice', 'CC-BY-4.0', 'GHSA-synthetic-fixture', '원문'):

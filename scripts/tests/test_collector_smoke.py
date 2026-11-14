@@ -196,15 +196,19 @@ class CollectorSmokeTests(unittest.TestCase):
         notice_uri='devres://attribution/blake3:'+'4'*64
         notice_body=('First-party synthetic RustSec fixture notice CC-BY-4.0 GHSA-synthetic-fixture 원문\n'*40)
         notice='https://fixtures.invalid/original\n'+notice_body
+        subject = {'provider': 'rustsec', 'namespace': 'source', 'key': 'fixture-source', 'fingerprint': 'blake3:' + '5' * 64}
         class RustsecClient(Client):
             corrupt=False
+            def attribution(self):
+                return {'status':'ready', 'policy_epoch':1 if self.corrupt=='outer_epoch' else 2,
+                        'policy_fingerprint':'wrong' if self.corrupt=='fingerprint' else smoke.ATTRIBUTION_POLICY_FINGERPRINT}
             def tool(self,tool,args,revision):
                 if tool=='packages.crate.advisory_catalog_search':
-                    return {'snapshot':{'id':snapshot},'items':[{'id':'RUSTSEC-2026-9001'}], 'attribution':{'status':'ready','readable_notice':notice}}
+                    return {'snapshot':{'id':snapshot},'items':[{'id':'RUSTSEC-2026-9001'}], 'attribution':dict(self.attribution(), readable_notice=notice)}
                 if tool=='packages.crate.advisory_get':
                     return {'snapshot':{'id':snapshot},'resource_uri':uri,'page':{'text':'rustsecfixturebody'},
-                            'attribution':{'status':'ready','resource_uris':[notice_uri],'readable_notice':notice,
-                                           'generations':[{'id':notice_uri.rsplit('/',1)[-1],'notices':[{'source_url':'https://fixtures.invalid/original','text':notice_body}]}]}}
+                            'attribution':dict(self.attribution(), resource_uris=[notice_uri], readable_notice=notice,
+                                           generations=[{'id':notice_uri.rsplit('/',1)[-1],'subject':subject,'notices':[{'source_url':'https://fixtures.invalid/original','text':notice_body}]}])}
                 return super().tool(tool,args,revision)
             def call(self,method,args,revision):
                 if args.get('uri','').startswith(notice_uri):
@@ -215,13 +219,13 @@ class CollectorSmokeTests(unittest.TestCase):
                         except UnicodeDecodeError:end-=1
                     if self.corrupt=='text':chunk=chunk.replace('First-party','Wrong-party')
                     return {'contents':[{'uri':notice_uri,'text':chunk,'_meta':{'offset':start,'total_bytes':len(notice.encode())+(1 if self.corrupt=='total' else 0),
-                            'attribution':{'policy_epoch':1,'id':'wrong' if self.corrupt=='id' else notice_uri.rsplit('/',1)[-1]},'next_offset':0 if self.corrupt is True else end if end<len(notice.encode()) else None}}]}
+                            'attribution':{'policy_epoch':1 if self.corrupt=='epoch' else 2,'subject':{} if self.corrupt=='subject' else subject,'id':'wrong' if self.corrupt=='id' else notice_uri.rsplit('/',1)[-1]},'next_offset':0 if self.corrupt is True else end if end<len(notice.encode()) else None}}]}
                 if args.get('uri')==uri:
-                    return {'contents':[{'text':'rustsecfixturebody','_meta':{'attribution':{'status':'ready'},'source_evidence':{'snapshot':{'id':snapshot}}}}, {'text':notice}]}
+                    return {'contents':[{'text':'rustsecfixturebody','_meta':{'attribution':self.attribution(),'source_evidence':{'snapshot':{'id':snapshot}}}}, {'text':notice}]}
                 return super().call(method,args,revision)
         selected=receipts()+[dict(provider='rustsec',tool='packages.crate.advisory_get',arguments={'snapshot':snapshot,'id':'RUSTSEC-2026-9001'},resource=uri,expected='rustsecfixturebody')]
         smoke.verify(RustsecClient(),self.load(selected))
-        for failure in (True,'id','total','text'):
+        for failure in (True,'id','total','text','epoch','subject','outer_epoch','fingerprint'):
             broken=RustsecClient();broken.corrupt=failure
             with self.subTest(failure=failure),self.assertRaises(AssertionError):smoke.verify(broken,selected)
         wrong=copy.deepcopy(selected);wrong[-1]['arguments']['id']='RUSTSEC-2026-9002'
