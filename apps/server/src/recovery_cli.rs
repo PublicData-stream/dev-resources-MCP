@@ -128,11 +128,21 @@ mod tests {
             "--policy-epoch",
             "1",
             "--policy-fingerprint",
-            devres_domain::attribution::ATTRIBUTION_POLICY_FINGERPRINT,
+            "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices",
             "--repair-version",
             devres_adapters::RUSTSEC_CAPTURE_REPAIR_VERSION,
         ];
         assert!(parse(&args(&extra)).unwrap().apply);
+        let mut current = extra;
+        current[4] = "2";
+        current[6] = devres_domain::attribution::ATTRIBUTION_POLICY_FINGERPRINT;
+        current[8] = devres_adapters::RUSTSEC_CAPTURE_REPAIR_VERSION_V2;
+        let parsed = parse(&args(&current)).unwrap();
+        assert!(parsed.apply);
+        assert_eq!(parsed.options.policy_epoch, 2);
+        assert_eq!(parsed.options.repair_version, current[8]);
+        current[8] = devres_adapters::RUSTSEC_CAPTURE_REPAIR_VERSION;
+        assert!(parse(&args(&current)).is_err());
         let mut wrong = extra;
         wrong[4] = "--wrong-policy";
         assert!(parse(&args(&wrong)).is_err());

@@ -320,6 +320,9 @@ fn comparison_path(snapshot: &Snapshot, path: &str) -> String {
     }
     path.to_owned()
 }
+pub(crate) fn attribution_member_evidence(snapshot: &Snapshot, member: &Member) -> Value {
+    json!({"source_url":snapshot.source_url,"oid":member.oid,"path":member.path,"revision":snapshot.revision,"license":source_license(snapshot)})
+}
 fn source_license(snapshot: &Snapshot) -> Value {
     json!({"attribution":"Original publication and repository contributors","notice":"Preserve the original notices in this captured publication or repository revision; no blanket license is inferred.","source_url":snapshot.source_url,"revision":snapshot.revision,"service_license_applies_to_source":false})
 }

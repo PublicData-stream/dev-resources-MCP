@@ -2,10 +2,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const ATTRIBUTION_POLICY_EPOCH: u32 = 1;
+pub const ATTRIBUTION_POLICY_EPOCH: u32 = 2;
 /// Named immutable qualification manifest. Changes require a new epoch.
 pub const ATTRIBUTION_POLICY_FINGERPRINT: &str =
-    "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices";
+    "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,11 +60,16 @@ pub struct AttributionPolicyManifest {
     pub epoch: u32,
     pub fingerprint: &'static str,
 }
-pub const ATTRIBUTION_POLICY_MANIFESTS: &[AttributionPolicyManifest] =
-    &[AttributionPolicyManifest {
+pub const ATTRIBUTION_POLICY_MANIFESTS: &[AttributionPolicyManifest] = &[
+    AttributionPolicyManifest {
+        epoch: 1,
+        fingerprint: "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices",
+    },
+    AttributionPolicyManifest {
         epoch: ATTRIBUTION_POLICY_EPOCH,
         fingerprint: ATTRIBUTION_POLICY_FINGERPRINT,
-    }];
+    },
+];
 pub const ATTRIBUTION_REQUIRED_POLICY: AttributionPolicyManifest = AttributionPolicyManifest {
     epoch: ATTRIBUTION_POLICY_EPOCH,
     fingerprint: ATTRIBUTION_POLICY_FINGERPRINT,

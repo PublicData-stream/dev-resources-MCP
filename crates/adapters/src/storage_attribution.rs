@@ -27,6 +27,8 @@ static CLAIM: AtomicU64 = AtomicU64::new(0);
 const TABLE_TARGETS: &str = "devres_attribution_targets";
 const TABLE_GENERATIONS: &str = "devres_attribution_generations";
 
+#[path = "storage_attribution_origins.rs"]
+pub(super) mod origins;
 #[path = "storage_attribution_recovery.rs"]
 pub(crate) mod recovery;
 
@@ -289,6 +291,8 @@ fn checked(table: &str, key: &str, row: &PgRow) -> Result<Value> {
 struct State {
     target: AttributionTarget,
     policy_epoch: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queued_at: Option<i64>,
     status: String,
     priority: u8,
     retry_at: i64,
@@ -304,6 +308,7 @@ impl State {
         Self {
             target,
             policy_epoch: ATTRIBUTION_POLICY_EPOCH,
+            queued_at: Some(devres_domain::unix_now()),
             status: "pending".into(),
             priority,
             retry_at: 0,
@@ -318,6 +323,7 @@ impl State {
 fn validate_state(value: &State, registry: &[AttributionPolicyManifest]) -> Result<()> {
     checked_target(&value.target)?;
     if !registry.iter().any(|p| p.epoch == value.policy_epoch)
+        || value.queued_at.is_some_and(|value| value < 0)
         || !matches!(
             value.status.as_str(),
             "pending" | "running" | "retry" | "blocked" | "ready"
@@ -612,7 +618,7 @@ fn collect_publications(
     let canonical = binding(value)?;
     // A raw occurrence may qualify only the source deterministically compiled
     // from its own sealed evidence. A same-provider proof is not a source link.
-    if target.evidence.get("table").is_some() {
+    if target.evidence.get("table").is_some() || target.evidence.get("origin_witness").is_some() {
         let expected = crate::attribution_providers::retained_target(
             value.policy_epoch,
             &value.policy_fingerprint,
@@ -706,6 +712,11 @@ fn qualified(row: &PgRow) -> Result<QualifiedAttribution> {
 
 #[async_trait]
 impl AttributionStore for PgBlobStore {
+    async fn attribution_verify_target(&self, target: &AttributionTarget) -> Result<()> {
+        self.fence().await?;
+        let mut conn = self.pool.acquire().await.map_err(|_| storage_error())?;
+        origins::verify_target(&mut conn, target).await
+    }
     async fn attribution_enqueue(&self, target: &AttributionTarget, priority: u8) -> Result<()> {
         self.owner_fence().await?;
         self.fence().await?;
@@ -806,6 +817,8 @@ impl AttributionStore for PgBlobStore {
             let row=sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await.map_err(source_error)?;
             let mut value=state(&row)?;
             if value.policy_epoch!=ATTRIBUTION_POLICY_EPOCH||!enabled.contains(&value.target.subject.provider)||!matches!(value.status.as_str(),"pending"|"retry"|"running")||value.retry_at>now{return Err(invalid());}
+            let eligible_since = if value.retry_at > 0 { Some(value.retry_at) } else { value.queued_at };
+            tracing::debug!(target: "devres_private_timings", provider = %value.target.subject.provider, eligible_age_secs = ?eligible_since.map(|since| now.saturating_sub(since).max(0)), reclaimed_lease = value.status == "running", "Attribution claim admitted");
             let claim=crate::integrity::canonical_hash(&json!({"subject":value.target.subject,"policy_epoch":value.policy_epoch,"pid":self.owner_pid,"started":self.owner_started,"counter":CLAIM.fetch_add(1,Ordering::Relaxed),"now":now}))?;
             value.status="running".into();value.retry_at=now.saturating_add(300);value.attempts=value.attempts.saturating_add(1);value.claim=Some(claim.clone());save(&mut tx,&value).await?;
             self.fence().await?;Ok(Some(AttributionJob{target:value.target,claim,attempts:value.attempts}))
@@ -851,6 +864,7 @@ impl AttributionStore for PgBlobStore {
             .map_err(|_| invalid())?;
             let root = state(&row)?;
             check_claim(&root, job, true)?;
+            origins::verify_target(&mut tx, &root.target).await?;
             let entries = publication_entries(&root.target, value, ATTRIBUTION_POLICY_MANIFESTS)?;
             for (target, generation) in entries {
                 let row = sqlx_core::query::query(
@@ -958,10 +972,17 @@ impl AttributionStore for PgBlobStore {
                     .map_err(|_| invalid())?;
             sweeps.push(json!({"provider":name,"completed_passes":sweep.passes,"scan_complete":sweep.complete,"source":sweep.source,"membership":"indexed_range_enumeration"}));
         }
+        let origins = self.attribution_origin_status().await?;
         let all_scanned = PROVIDERS.iter().all(|p| {
             sweeps.iter().any(|v| {
                 v["provider"] == *p && v["completed_passes"].as_u64().is_some_and(|n| n > 0)
-            })
+            }) && (!origins::supports(p)
+                || origins.iter().any(|value| {
+                    value["provider"] == *p
+                        && value["completed_passes"]
+                            .as_u64()
+                            .is_some_and(|passes| passes > 0)
+                }))
         });
         let repair_complete_for_enqueued_targets =
             !counts.is_empty() && counts.iter().all(|v| v["status"] == "ready");
@@ -1009,7 +1030,7 @@ impl AttributionStore for PgBlobStore {
             json!({"scope":"this_store_process","started_at":progress.started_at,"providers":progress.providers})
         };
         Ok(
-            json!({"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"counts":counts,"sweeps":sweeps,"progress":progress,
+            json!({"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"counts":counts,"sweeps":sweeps,"origin_discovery":origins,"progress":progress,
                 "diagnostics":{"sampled":true,"limit_per_bucket":2,"ordering":"retry_at_then_id",
                     "sample_budget_bytes":SAMPLE_BUDGET,"truncated":omitted_sample_rows>0,
                     "omitted_sample_rows":omitted_sample_rows,"omission_scope":"bounded_candidates_only",
@@ -1022,7 +1043,9 @@ impl AttributionStore for PgBlobStore {
     }
     async fn attribution_sweep_page(&self, name: &str) -> Result<Vec<AttributionTarget>> {
         self.owner_fence().await?;
-        self.sweep_attribution(name).await
+        let mut output = self.sweep_attribution_origins(name).await?;
+        output.extend(self.sweep_attribution(name).await?);
+        Ok(output)
     }
 }
 fn check_claim(state: &State, job: &AttributionJob, require_live: bool) -> Result<()> {
@@ -1706,6 +1729,9 @@ impl PgBlobStore {
                     match table {
                         TABLE_TARGETS => {
                             let state = state(&row)?;
+                            let mut conn =
+                                self.pool.acquire().await.map_err(|_| storage_error())?;
+                            origins::verify_target(&mut conn, &state.target).await?;
                             if let Some(id) = state.generation {
                                 let qualified = self.historical_attribution_bundle(&id).await?;
                                 if qualified.generation.subject != state.target.subject
@@ -1770,6 +1796,9 @@ impl PgBlobStore {
         }
         if version >= 17 {
             recovery::verify_journal(self, cancel).await?;
+        }
+        if version >= 18 {
+            self.verify_attribution_origins().await?;
         }
         Ok(())
     }
@@ -1954,11 +1983,14 @@ mod tests {
     #[test]
     fn registered_policy_versions_preserve_history_and_fence_unknown_future() {
         let next = AttributionPolicyManifest {
-            epoch: 2,
-            fingerprint: "fixture-only-policy-v2",
+            epoch: 3,
+            fingerprint: "fixture-only-policy-v3",
         };
         let registry = [ATTRIBUTION_REQUIRED_POLICY, next];
-        assert_eq!(supported_control(&control(), next, &registry).unwrap(), 1);
+        assert_eq!(
+            supported_control(&control(), next, &registry).unwrap(),
+            ATTRIBUTION_POLICY_EPOCH
+        );
         assert!(
             supported_control(&control_for(next), ATTRIBUTION_REQUIRED_POLICY, &registry).is_err()
         );
@@ -1970,7 +2002,7 @@ mod tests {
             target_id_at(&prior.subject, 2).unwrap()
         );
         let mut future = prior;
-        future.policy_epoch = 2;
+        future.policy_epoch = next.epoch;
         future.policy_fingerprint = next.fingerprint.into();
         future.receipts[0]["policy_epoch"] = json!(next.epoch);
         future.receipts[0]["policy_fingerprint"] = json!(next.fingerprint);
@@ -2222,7 +2254,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         let request = FetchRequest {
             key: "rfc:9000".into(),
             url: "https://www.rfc-editor.org/rfc/rfc9000.txt".into(),
@@ -2732,6 +2764,10 @@ mod tests {
             later_evidence, 0,
             "synthetic downgrade must preserve retained v2 crate evidence"
         );
+        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_origins")
+            .execute(&mut *fixture)
+            .await
+            .unwrap();
         sqlx_core::raw_sql::raw_sql(
             "ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; DROP VIEW devres_crate_enrichment_all; DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures; DROP FUNCTION devres_crate_enrichment_v2_immutable(); DROP FUNCTION devres_crate_enrichment_head_immutable(); DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control; UPDATE devres_schema SET version=10 WHERE singleton"
         ).execute(&mut *fixture).await.unwrap();
@@ -2781,7 +2817,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
             .attribution_claim(&["rfc".into()], now, 0)
@@ -2860,8 +2896,8 @@ mod tests {
         .await
         .unwrap();
         let next = AttributionPolicyManifest {
-            epoch: 2,
-            fingerprint: "fixture-only-policy-v2",
+            epoch: 3,
+            fingerprint: "fixture-only-policy-v3",
         };
         let registry = [ATTRIBUTION_REQUIRED_POLICY, next];
         let prior_count: i64 = sqlx_core::query_scalar::query_scalar(
@@ -2892,14 +2928,17 @@ mod tests {
             .fetch_one(&store.pool)
             .await
             .unwrap();
-        assert_eq!(state_for_registry(&old, &registry).unwrap().policy_epoch, 1);
+        assert_eq!(
+            state_for_registry(&old, &registry).unwrap().policy_epoch,
+            ATTRIBUTION_POLICY_EPOCH
+        );
         let mut new_state = State::new(first.clone(), 1);
-        new_state.policy_epoch = 2;
+        new_state.policy_epoch = next.epoch;
         let mut owner = store.owner.lock().await;
         save(&mut owner, &new_state).await.unwrap();
         drop(owner);
         let later = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
-            .bind(target_id_at(&first.subject, 2).unwrap())
+            .bind(target_id_at(&first.subject, next.epoch).unwrap())
             .fetch_one(&store.pool)
             .await
             .unwrap();

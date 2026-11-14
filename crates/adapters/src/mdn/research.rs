@@ -1442,6 +1442,14 @@ fn change_generation(data: &Value, key: &str) -> Result<Option<u32>> {
     }
     Ok(None)
 }
+pub(crate) fn attribution_member_evidence(snapshot: &Snapshot, member: &Member) -> Value {
+    let path = member
+        .raw
+        .as_ref()
+        .and_then(|raw| raw["source_path"].as_str())
+        .unwrap_or(&member.path);
+    json!({"source_url":source_url(snapshot,path),"oid":member.oid,"source_path":path,"revision":snapshot.revision,"license":license(snapshot)})
+}
 fn source_url(snapshot: &Snapshot, path: &str) -> String {
     let repository = if snapshot.repository == "content" {
         "content"

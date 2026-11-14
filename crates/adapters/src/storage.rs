@@ -26,8 +26,8 @@ mod advisory_storage;
 #[path = "storage_attribution.rs"]
 mod attribution_storage;
 pub use attribution_storage::recovery::{
-    RUSTSEC_CAPTURE_REPAIR_VERSION, RustSecRecoveryOptions, RustSecRecoveryOutcome,
-    RustSecRecoveryReport, recover_rustsec_attribution,
+    RUSTSEC_CAPTURE_REPAIR_VERSION, RUSTSEC_CAPTURE_REPAIR_VERSION_V2, RustSecRecoveryOptions,
+    RustSecRecoveryOutcome, RustSecRecoveryReport, recover_rustsec_attribution,
 };
 #[path = "chromium/storage.rs"]
 mod chromium_storage;
@@ -281,7 +281,7 @@ impl PgBlobStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| storage_error())?;
-        if !matches!(version, 11..=17) {
+        if !matches!(version, 11..=18) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
             ));
@@ -415,7 +415,7 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        let schema_upgrade_lock = version < 17 && mode == OpenMode::Serve;
+        let schema_upgrade_lock = version < 18 && mode == OpenMode::Serve;
         if schema_upgrade_lock {
             let exclusive: bool =
                 sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490, 2)")
@@ -439,7 +439,7 @@ impl PgBlobStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        } else if !(2..=17).contains(&version) {
+        } else if !(2..=18).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -613,7 +613,13 @@ impl PgBlobStore {
                     .await
                     .map_err(|_| storage_error())?;
             }
-            sqlx_core::query::query("UPDATE devres_schema SET version=17 WHERE singleton")
+            if version < 18 {
+                sqlx_core::raw_sql::raw_sql(attribution_storage::origins::SCHEMA_V18)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| storage_error())?;
+            }
+            sqlx_core::query::query("UPDATE devres_schema SET version=18 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;

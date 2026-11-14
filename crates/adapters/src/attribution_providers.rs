@@ -16,6 +16,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 mod rustsec;
+mod v2;
 
 /// A bounded eligibility predicate only; acquisition still verifies exact bytes
 /// and every applicable notice before publication.
@@ -390,7 +391,7 @@ pub fn targets(source: &str, value: &Value) -> Result<Vec<AttributionTarget>> {
     {
         return Ok(Vec::new());
     }
-    targets_v1(source, value)
+    v2::targets(source, value)
 }
 
 // This compiler and its normalization helpers are part of the persisted v1
@@ -922,6 +923,9 @@ pub fn retained_candidate(
         (1, "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices") => {
             candidate_v1(source, namespace, key, data)
         }
+        (2, "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices") => {
+            v2::candidate(source, namespace, key, data)
+        }
         _ => Err(Error::integrity("Unknown retained attribution recipe.")),
     }
 }
@@ -933,6 +937,22 @@ pub fn retained_target(
     policy_fingerprint: &str,
     target: &AttributionTarget,
 ) -> Result<Option<AttributionTarget>> {
+    if policy_epoch == 2
+        && policy_fingerprint
+            == "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices"
+        && target.evidence.get("origin_witness").is_some()
+    {
+        let source: AttributionTarget =
+            serde_json::from_value(target.evidence["source_target"].clone())
+                .map_err(|_| invalid())?;
+        if source.subject.provider != target.subject.provider
+            || source.subject.namespace != "source"
+            || crate::integrity::canonical_hash(&source.evidence)? != source.subject.fingerprint
+        {
+            return Err(invalid());
+        }
+        return Ok(Some(source));
+    }
     let Some(table) = target.evidence.get("table").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -1452,7 +1472,7 @@ async fn repair_inner(
     cancel: CancellationToken,
 ) -> Result<AttributionGeneration> {
     let p = provider(&target.subject.provider)?;
-    if target.evidence["version"] != 1 {
+    if target.evidence["version"] != 1 && target.evidence["version"] != 2 {
         return Err(unsupported());
     }
     if let Some(dependencies) = target
@@ -3265,7 +3285,23 @@ mod tests {
             .unwrap(),
             expected
         );
-        assert!(retained_target(2, ATTRIBUTION_POLICY_FINGERPRINT, &raw).is_err());
+        assert!(
+            retained_target(
+                ATTRIBUTION_POLICY_EPOCH + 1,
+                ATTRIBUTION_POLICY_FINGERPRINT,
+                &raw
+            )
+            .is_err()
+        );
+        assert_eq!(
+            retained_target(
+                1,
+                "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices",
+                &raw
+            )
+            .unwrap(),
+            expected
+        );
         assert!(retained_target(1, "other-manifest", &raw).is_err());
     }
 

@@ -39,7 +39,7 @@ fn recovery_options(target: &AttributionTarget) -> RustSecRecoveryOptions {
             &json!({"version":1,"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"subject":target.subject}),
         )
         .unwrap(),
-        ..Default::default()
+        ..RustSecRecoveryOptions::current_policy()
     }
 }
 

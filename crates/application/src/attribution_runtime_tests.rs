@@ -422,6 +422,68 @@ async fn immutable_notice_pages_do_not_repeat_unbounded_generation_payloads() {
     );
 }
 
+#[tokio::test]
+async fn historical_notice_uri_preserves_utf8_pages_without_qualifying_current_content() {
+    let store = Arc::new(Memory::default());
+    let mut historical = generation();
+    historical.policy_epoch = 1;
+    historical.policy_fingerprint =
+        "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices".into();
+    let expected = format!(
+        "{}\n{}",
+        historical.notices[0].source_url, historical.notices[0].text
+    );
+    let id = format!("blake3:{}", "a".repeat(64));
+    *store.ready.lock().await = Some(QualifiedAttribution {
+        id: id.clone(),
+        generation: historical,
+    });
+    let runtime = runtime(
+        store.clone(),
+        Arc::new(Acquirer {
+            calls: AtomicUsize::new(0),
+            stalled: false,
+        }),
+        false,
+    );
+    let mut text = String::new();
+    let mut offset = 0;
+    loop {
+        let page = runtime.bundle(&id, offset, 13).await.unwrap();
+        assert_eq!(
+            page["contents"][0]["_meta"]["attribution"]["policy_epoch"],
+            1
+        );
+        text.push_str(page["contents"][0]["text"].as_str().unwrap());
+        let Some(next) = page["contents"][0]["_meta"]["next_offset"].as_u64() else {
+            break;
+        };
+        offset = usize::try_from(next).unwrap();
+    }
+    assert_eq!(text, expected);
+    assert_eq!(
+        runtime
+            .qualify("audit:rfc", &json!({}))
+            .await
+            .unwrap_err()
+            .code,
+        "unavailable"
+    );
+    assert!(store.queued.lock().await.is_empty());
+    store
+        .ready
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .generation
+        .policy_fingerprint = "unknown-policy".into();
+    assert_eq!(
+        runtime.bundle(&id, 0, 13).await.unwrap_err().code,
+        "unavailable"
+    );
+}
+
 struct PublicSchedulingDelegate(AtomicUsize);
 #[async_trait]
 impl crate::acquisition::AcquisitionDelegate for PublicSchedulingDelegate {

@@ -278,7 +278,7 @@ impl Reader {
             .map_err(|_| unavailable())?;
         let schema: i32 = sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL")
             .fetch_one(&mut conn).await.map_err(|_| unavailable())?;
-        if !matches!(schema, 14..=17) {
+        if !matches!(schema, 14..=18) {
             return Err(unavailable());
         }
         let row = sqlx_core::query::query("SELECT backend,binding,store_id FROM devres_archive_control WHERE singleton AND pending_binding IS NULL AND NOT initializing_s3")
@@ -770,7 +770,7 @@ async fn inspect_chromium(reader: &mut Reader, report: &mut CollectionDiagnosis)
     Ok(())
 }
 
-/// Inspection accepts schemas 14 through 17 without upgrading the selected store.
+/// Inspection accepts schemas 14 through 18 without upgrading the selected store.
 pub async fn diagnose_collection(
     database: &str,
     root: &Path,

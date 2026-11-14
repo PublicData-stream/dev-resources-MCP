@@ -3,6 +3,9 @@ use super::*;
 
 const REPAIR_V1: &str = "rustsec-captures-v1";
 pub const RUSTSEC_CAPTURE_REPAIR_VERSION: &str = REPAIR_V1;
+/// Explicitly selected repair for current-policy successors. The established
+/// v1 option defaults and immutable journal dispatch remain pinned to v1.
+pub const RUSTSEC_CAPTURE_REPAIR_VERSION_V2: &str = "rustsec-captures-v2";
 // This recipe's rights-policy identity is immutable. A later active policy or
 // repair implementation must retain this dispatch for the permanent journal.
 const REPAIR_POLICY_V1: AttributionPolicyManifest = AttributionPolicyManifest {
@@ -37,13 +40,21 @@ impl Default for RustSecRecoveryOptions {
         Self {
             target_id: String::new(),
             expected_state: None,
-            policy_epoch: ATTRIBUTION_POLICY_EPOCH,
-            policy_fingerprint: ATTRIBUTION_POLICY_FINGERPRINT.into(),
+            policy_epoch: REPAIR_POLICY_V1.epoch,
+            policy_fingerprint: REPAIR_POLICY_V1.fingerprint.into(),
             repair_version: RUSTSEC_CAPTURE_REPAIR_VERSION.into(),
         }
     }
 }
 impl RustSecRecoveryOptions {
+    pub fn current_policy() -> Self {
+        Self {
+            policy_epoch: ATTRIBUTION_POLICY_EPOCH,
+            policy_fingerprint: ATTRIBUTION_POLICY_FINGERPRINT.into(),
+            repair_version: RUSTSEC_CAPTURE_REPAIR_VERSION_V2.into(),
+            ..Self::default()
+        }
+    }
     pub fn validate(&self, apply: bool) -> Result<()> {
         if !crate::integrity::valid_hash(&self.target_id)
             || !self.target_id.starts_with("blake3:")
@@ -52,9 +63,13 @@ impl RustSecRecoveryOptions {
                 .as_deref()
                 .is_some_and(|v| !v.starts_with("blake3:") || !crate::integrity::valid_hash(v))
             || (apply && self.expected_state.is_none())
-            || self.policy_epoch != ATTRIBUTION_POLICY_EPOCH
-            || self.policy_fingerprint != ATTRIBUTION_POLICY_FINGERPRINT
-            || self.repair_version != RUSTSEC_CAPTURE_REPAIR_VERSION
+            || recipe_policy(
+                &self.repair_version,
+                self.policy_epoch,
+                &self.policy_fingerprint,
+                ATTRIBUTION_POLICY_MANIFESTS,
+            )
+            .is_err()
         {
             return Err(Error::invalid("Invalid RustSec recovery options."));
         }
@@ -118,6 +133,17 @@ fn recipe_policy(
         {
             Ok(REPAIR_POLICY_V1)
         }
+        RUSTSEC_CAPTURE_REPAIR_VERSION_V2
+            if epoch == 2
+                && fingerprint
+                    == "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices"
+                && known_policy(epoch, fingerprint, registry) =>
+        {
+            Ok(AttributionPolicyManifest {
+                epoch: 2,
+                fingerprint: "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices",
+            })
+        }
         _ => Err(invalid()),
     }
 }
@@ -127,7 +153,7 @@ fn eligible(value: &State) -> Result<bool> {
         return Ok(false);
     }
     let policy = recipe_policy(
-        RUSTSEC_CAPTURE_REPAIR_VERSION,
+        RUSTSEC_CAPTURE_REPAIR_VERSION_V2,
         ATTRIBUTION_POLICY_EPOCH,
         ATTRIBUTION_POLICY_FINGERPRINT,
         ATTRIBUTION_POLICY_MANIFESTS,
@@ -174,12 +200,21 @@ fn eligible_v1(value: &State, policy: AttributionPolicyManifest) -> Result<bool>
 pub(crate) fn checked_target_summary(row: &PgRow) -> Result<Value> {
     let value = state(row)?;
     let digest: String = row.try_get("data_integrity").map_err(|_| invalid())?;
+    let manifest = ATTRIBUTION_POLICY_MANIFESTS
+        .iter()
+        .find(|policy| policy.epoch == value.policy_epoch)
+        .ok_or_else(invalid)?;
+    let recipe = if value.policy_epoch == REPAIR_POLICY_V1.epoch {
+        RUSTSEC_CAPTURE_REPAIR_VERSION
+    } else {
+        RUSTSEC_CAPTURE_REPAIR_VERSION_V2
+    };
     Ok(
         json!({"target_id":row.try_get::<String,_>("id").map_err(|_|invalid())?,
         "subject":value.target.subject,"policy_epoch":value.policy_epoch,
-        "policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT,"status":value.status,
+        "policy_fingerprint":manifest.fingerprint,"status":value.status,
         "classification":value.classification,"state_digest":digest,
-        "repair_version":RUSTSEC_CAPTURE_REPAIR_VERSION,"eligible":eligible(&value)?}),
+        "repair_version":recipe,"eligible":eligible(&value)?}),
     )
 }
 
@@ -259,7 +294,7 @@ async fn load_target(conn: &mut PgConnection, id: &str, lock: bool) -> Result<Pg
 }
 
 /// Uses no archive, collector, listener, migration, or PgBlobStore initialization.
-/// Apply requires stopped runtime participants and active schema seventeen.
+/// Apply requires stopped runtime participants and active schema seventeen or eighteen.
 pub async fn recover_rustsec_attribution(
     database_url: &str,
     options: &RustSecRecoveryOptions,
@@ -326,7 +361,7 @@ async fn recover(
     }
     let schema:i32 = sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL")
         .fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
-    if !(14..=17).contains(&schema) || (apply && schema != 17) {
+    if !(14..=18).contains(&schema) || (apply && schema < 17) {
         return Err(Error::unavailable(
             "RustSec recovery requires a supported active schema.",
         ));
@@ -356,7 +391,7 @@ async fn recover(
         options.policy_epoch,
         &options.repair_version,
     )?;
-    if schema == 17 {
+    if schema >= 17 {
         let bytes:Option<i64> = sqlx_core::query_scalar::query_scalar("SELECT octet_length(data::text)::bigint FROM devres_attribution_recoveries WHERE id=$1")
             .bind(&journal_id).fetch_optional(&mut *tx).await.map_err(|_|storage_error())?;
         if let Some(bytes) = bytes {
@@ -517,7 +552,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected, REPAIR_POLICY_V1);
-        assert!(eligible_v1(&blocked("historical recipe"), selected).unwrap());
+        let mut historical = blocked("historical recipe");
+        historical.policy_epoch = REPAIR_POLICY_V1.epoch;
+        assert!(eligible_v1(&historical, selected).unwrap());
         assert!(recipe_policy(REPAIR_V1, 1, REPAIR_POLICY_V1.fingerprint, &[later]).is_err());
         assert!(
             recipe_policy(
@@ -555,7 +592,7 @@ mod tests {
         assert!(!eligible(&changed).unwrap());
         let mut options = RustSecRecoveryOptions {
             target_id: target_id(&value.target.subject).unwrap(),
-            ..Default::default()
+            ..RustSecRecoveryOptions::current_policy()
         };
         assert!(options.validate(false).is_ok());
         assert!(options.validate(true).is_err());
@@ -606,10 +643,10 @@ mod tests {
         }
         let mut options = RustSecRecoveryOptions {
             target_id: target_id(&original.target.subject).unwrap(),
-            ..Default::default()
+            ..RustSecRecoveryOptions::current_policy()
         };
         // Simulate the immediately preceding active schema without changing targets.
-        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); UPDATE devres_schema SET version=16 WHERE singleton")
+        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_origins; DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); UPDATE devres_schema SET version=16 WHERE singleton")
             .execute(&store.pool).await.unwrap();
         let legacy = recover_rustsec_attribution(url.as_str(), &options, false)
             .await
@@ -711,7 +748,7 @@ mod tests {
         );
         let rollback_options = RustSecRecoveryOptions {
             target_id: target_id(&rollback.target.subject).unwrap(),
-            ..Default::default()
+            ..RustSecRecoveryOptions::current_policy()
         };
         let dry = recover_rustsec_attribution(url.as_str(), &rollback_options, false)
             .await

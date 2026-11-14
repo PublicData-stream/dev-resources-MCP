@@ -644,7 +644,7 @@ mod tests {
         let fixture = fixture(vec![(url.clone(), body)]);
         let generation = fixture_repair(&target, &fixture).await.unwrap();
         assert_eq!(generation.subject, target.subject);
-        assert_eq!(generation.policy_epoch, 1);
+        assert_eq!(generation.policy_epoch, ATTRIBUTION_POLICY_EPOCH);
         assert_eq!(generation.notices.len(), 1);
         for retained in [
             "Synthetic nested governing terms",

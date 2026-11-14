@@ -5,6 +5,16 @@ use serde_json::Value;
 
 #[async_trait]
 pub trait AttributionStore: Send + Sync {
+    /// Verify a compact immutable-origin witness using local retained evidence only.
+    /// Stores without that evidence must reject witnesses rather than trust references.
+    async fn attribution_verify_target(&self, target: &AttributionTarget) -> Result<()> {
+        if target.evidence.get("origin_witness").is_some() {
+            return Err(devres_domain::Error::unavailable(
+                "Attribution origin verification is unavailable.",
+            ));
+        }
+        Ok(())
+    }
     async fn attribution_enqueue(&self, target: &AttributionTarget, priority: u8) -> Result<()>;
     async fn attribution_ready(
         &self,

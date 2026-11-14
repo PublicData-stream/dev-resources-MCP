@@ -107,11 +107,19 @@ impl AttributionRuntime {
                 }
             }
             provider = (provider + 1) % ATTRIBUTION_PROVIDERS.len();
+            let claim_started = std::time::Instant::now();
             let claim = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Ok(()),
                 result = self.store.attribution_claim(&self.enabled, devres_domain::unix_now(), admission) => result,
             };
+            tracing::debug!(
+                target: "devres_private_timings",
+                attribution_stage = "claim",
+                elapsed_micros = u64::try_from(claim_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                success = claim.is_ok(),
+                "attribution operation"
+            );
             let job = match claim {
                 Ok(job) => {
                     *self.admission_gap.lock().await = None;
@@ -133,6 +141,7 @@ impl AttributionRuntime {
                 Err(error) => return Err(error),
             };
             if let Some(job) = job {
+                let repair_started = std::time::Instant::now();
                 admission = admission.wrapping_add(1);
                 let acquisition_cancel = cancel.child_token();
                 let acquisition = self
@@ -156,6 +165,21 @@ impl AttributionRuntime {
                     },
                     result = &mut acquisition => result,
                 };
+                // Only a fixed provider label and outcome are observable. Never
+                // attach subject keys, source evidence or request/audit inputs.
+                let provider = ATTRIBUTION_PROVIDERS
+                    .iter()
+                    .copied()
+                    .find(|provider| *provider == job.target.subject.provider)
+                    .unwrap_or("unknown");
+                tracing::debug!(
+                    target: "devres_private_timings",
+                    attribution_stage = "acquisition",
+                    provider,
+                    elapsed_micros = u64::try_from(repair_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    success = result.is_ok(),
+                    "attribution operation"
+                );
                 match result {
                     Ok(generation) => {
                         if generation.subject != job.target.subject
@@ -168,7 +192,16 @@ impl AttributionRuntime {
                                 "Attribution acquisition identity mismatch.",
                             ));
                         }
-                        match self.store.attribution_complete(&job, &generation).await {
+                        let completion = self.store.attribution_complete(&job, &generation).await;
+                        tracing::debug!(
+                            target: "devres_private_timings",
+                            attribution_stage = "completion",
+                            provider,
+                            elapsed_micros = u64::try_from(repair_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                            success = completion.is_ok(),
+                            "attribution operation"
+                        );
+                        match completion {
                             Ok(()) => {}
                             Err(error) if error.code == "capacity" => {
                                 self.store
@@ -385,8 +418,18 @@ impl AttributionGate for AttributionRuntime {
         self.acquirer
             .ensure_public(&generation.generation.subject)
             .await?;
-        if !current(&generation, &generation.generation.subject) {
-            return Err(Error::unavailable("Attribution policy is obsolete."));
+        // Historical notice URIs are immutable evidence. They remain readable
+        // under a registered policy even when that policy no longer qualifies
+        // copied research content. Storage verifies the sealed generation.
+        if generation.id != id
+            || !ATTRIBUTION_POLICY_MANIFESTS.iter().any(|policy| {
+                policy.epoch == generation.generation.policy_epoch
+                    && policy.fingerprint == generation.generation.policy_fingerprint
+            })
+            || generation.generation.notices.is_empty()
+            || generation.generation.receipts.is_empty()
+        {
+            return Err(Error::unavailable("Attribution policy is unsupported."));
         }
         let text = readable(std::slice::from_ref(&generation))?;
         if offset > text.len() || !text.is_char_boundary(offset) {

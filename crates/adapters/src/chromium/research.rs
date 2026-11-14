@@ -335,6 +335,9 @@ fn require_content_license(snapshot: &Snapshot) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) fn attribution_member_evidence(snapshot: &Snapshot, member: &Member) -> Value {
+    json!({"component":snapshot.component,"path":member.path,"citation":member_citation(snapshot,member),"source_metadata":member_metadata(snapshot,member),"license":license_metadata(snapshot,member_license(snapshot,member),member_source_url(snapshot,member))})
+}
 fn source_license(snapshot: &Snapshot) -> Value {
     license_metadata(
         snapshot,

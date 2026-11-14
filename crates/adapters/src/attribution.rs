@@ -149,11 +149,13 @@ impl AttributionAcquirer for AttributionAdapter {
         target: &AttributionTarget,
         cancel: CancellationToken,
     ) -> Result<AttributionGeneration> {
+        self.store.attribution_verify_target(target).await?;
         if target
             .evidence
             .get("table")
             .and_then(Value::as_str)
             .is_some()
+            || target.evidence.get("origin_witness").is_some()
         {
             let compiled = crate::attribution_providers::retained_target(
                 ATTRIBUTION_POLICY_EPOCH,

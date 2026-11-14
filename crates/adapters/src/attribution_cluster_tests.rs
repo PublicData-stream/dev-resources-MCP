@@ -12,6 +12,7 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 const RECEIPT: &str = "/tmp/attribution-backlog-receipt.json";
+const ORIGIN_RECEIPT: &str = "/tmp/attribution-origins-v2-receipt.json";
 const SOURCE: &str = "https://www.rfc-editor.org/rfc/rfc9000.txt";
 const BODY: &str = "First-party synthetic attribution backlog acceptance; not upstream evidence.\n\nCopyright Notice\nCopyright (c) IETF Trust and the persons identified as the document authors. All rights reserved. This synthetic example is authored by dev-resources-MCP contributors under AGPL-3.0-only; it is not a license determination for an RFC. UTF-8 notice: 원문.\n\nTable of Contents\n";
 
@@ -25,6 +26,23 @@ async fn store() -> Arc<PgBlobStore> {
             .await
             .unwrap(),
     )
+}
+
+#[tokio::test]
+#[ignore = "requires stopped disposable cluster writer and seeded four-provider corpus"]
+async fn attribution_origins_v2_cluster_seed() {
+    let store = store().await;
+    let receipt = store.seed_attribution_origins_fixture().await;
+    std::fs::write(ORIGIN_RECEIPT, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    store.readback_attribution_origins_fixture(&receipt).await;
+}
+
+#[tokio::test]
+#[ignore = "requires stopped disposable cluster writer and retained origins-v2 receipt"]
+async fn attribution_origins_v2_cluster_readback() {
+    let store = store().await;
+    let receipt: Value = serde_json::from_slice(&std::fs::read(ORIGIN_RECEIPT).unwrap()).unwrap();
+    store.readback_attribution_origins_fixture(&receipt).await;
 }
 
 fn target(key: &str) -> AttributionTarget {
