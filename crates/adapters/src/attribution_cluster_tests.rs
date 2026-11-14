@@ -28,7 +28,7 @@ async fn store() -> Arc<PgBlobStore> {
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires stopped disposable cluster writer and seeded four-provider corpus"]
 async fn attribution_origins_v2_cluster_seed() {
     let store = store().await;
@@ -37,7 +37,7 @@ async fn attribution_origins_v2_cluster_seed() {
     store.readback_attribution_origins_fixture(&receipt).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires stopped disposable cluster writer and retained origins-v2 receipt"]
 async fn attribution_origins_v2_cluster_readback() {
     let store = store().await;
