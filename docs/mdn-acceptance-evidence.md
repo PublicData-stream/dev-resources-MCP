@@ -95,3 +95,83 @@ Git objects, raw captures, indexes and integrity backup were preserved after
 stopping the acceptance PostgreSQL container. See
 [operations](operations.md#mdn-collection-repair-and-full-acceptance) for retention,
 quotas and recovery.
+
+## 2026-11-14 diagnostic and cursor repair
+
+This change adds bounded private MDN inspection, separate current/history
+diagnostics and explicit byte/commit history units. Commit paging now rejects a
+retained artifact whose length disagrees with its descriptor, including at EOF.
+Source identities, processor generation 3, historical selectors, collection
+budgets and the existing paired-view publication transaction remain unchanged.
+
+Validation caught stack growth from the new asynchronous diagnostic wrappers.
+Operation futures are now boxed before entering those wrappers; the existing
+ambiguity regression passes on its unchanged default test stack. The historical
+immutability regression compares the same explicit content selector before and
+after publication, preserving the rule that historical content does not receive
+implicit compatibility enrichment.
+
+The fixture coverage includes current publication with 103 historical commits
+still unprocessed, independent phase failures and replay, preserved defaults and
+historical reads, sanitized failures, unavailable diagnostic storage, and byte
+cursor integrity. PostgreSQL/S3 inspector fixtures distinguish prepared from
+published pairs, retain pinned old history, validate ordinary/rebuilt/migrated
+identities, and check each selected archive binding even when two paths contain
+identical bytes. Engine readability and attribution qualification remain explicitly
+outside metadata inspection.
+
+Independent agent reviews covered MCP/API, upstream/storage and security
+boundaries. They are separate from human GitHub approval and executed acceptance.
+The November production incident's exact failing operation remains unproven;
+these changes do not establish a parser defect, history starvation or a need for
+index maintenance. No production deployment or recovery is part of this delivery.
+
+The acceptance driver now establishes its durable attempt ledger before storage
+bootstrap creates blob metadata. A real PostgreSQL regression verifies that fresh
+startup retains zero attempts, interruption before broker creation preserves that
+ledger, and subsequent accounting remains monotonic. Existing legacy conservative
+reservations and the shared twenty-attempt ceiling are unchanged. The regression
+is included in the PostgreSQL gate.
+
+| Check | Observed result |
+| --- | --- |
+| Rust 1.99.1 formatting and strict locked workspace Clippy | Passed locally on Linux amd64 |
+| Locked workspace tests | Passed |
+| Fresh advisory audit, dependency policy and vendored-source audit | Passed; no dependency or policy exceptions added |
+| Real PostgreSQL and S3 fixtures | Passed, including MDN inspection and attribution exclusion |
+| Acceptance startup/resume regression | Eight ordinary example tests and the new disposable PostgreSQL fixture passed; strict example Clippy passed |
+| Pinned OxiBelt HTTP/WebTransport | Passed with synthetic retained evidence |
+| Disposable minikube | TCP/UDP routing, CNI isolation, PVC restart and coordinated restore passed |
+| Bounded official current-source acceptance | Passed with 6 of 20 allowed attempts and `full_history: false` |
+
+The final optional-index-reference compatibility case was executed in the
+PostgreSQL inspector fixture after the full workspace run. The later startup-only
+driver fix was checked through its example suite and real PostgreSQL regression.
+One concurrent migration fixture run hit its unchanged first-batch deadline;
+the unchanged full PostgreSQL gate passed when rerun serially. No cause is inferred
+from that timing difference.
+
+The current-source run froze content revision
+`deca95e12eeba261ff77a5e4db4575da16d0c1f5` and compatibility revision
+`69fcf3608174a8b18716318d31bf3a1031af0244`. Both main snapshots produced paired
+view `blake3:a8390b5cc166f2d11e0cb66aee703e38d0667fb101e9d0d731f021735d4fce13`.
+Frozen content search, document retrieval, compatibility retrieval and resource
+access passed. The current diagnostic reports `succeeded` at `default_publication`.
+
+| Selected snapshot | Raw members | Searchable members | Memberships with explicit projection gaps |
+| --- | ---: | ---: | ---: |
+| Content main | 16,440 | 14,748 | 13,290 |
+| Compatibility main | 3,336 | 20,982 | 1 |
+
+Compatibility features and browsers are derived inventory memberships in addition
+to the raw files. Gap memberships are not acquisition failures or unique parser defects.
+History processing was not started; the observation graphs contain 30,779 content
+and 21,790 compatibility commits, not that many processed historical snapshots.
+Current-mode `verification` is null: the full inventory/index/history verification
+pass was not run. The driver retains the database, raw evidence, indexes and
+checkpoints and requests graceful shutdown of its owned PostgreSQL container.
+
+The earlier October full-history result above remains historical evidence.
+Current-source acceptance uses frozen adapter research reads; it does not establish
+application attribution qualification, unpinned public MCP serving, native hosted
+architecture CI or production acceptance.

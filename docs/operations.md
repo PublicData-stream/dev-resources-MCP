@@ -958,6 +958,9 @@ Compare byte cursors with the pinned observation's commit-order byte length,
 and commit counts with that same observation's commit total. The latest source
 observation may describe a different graph. Never reset or clamp a byte cursor
 because it exceeds a commit count.
+The legacy `history.observation` contains a manifest digest, while
+`sources.<repository>.observation` identifies an observation evidence row. The
+private inspector validates their linkage; do not compare those unlike IDs directly.
 
 Current/history collector summaries distinguish observed attempts, durable success
 and historical failures. Saved activity after interruption is unknown. For selected
