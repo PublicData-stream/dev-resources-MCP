@@ -810,6 +810,17 @@ impl MdnGit {
                 .open(&observation.commits.body_hash, MAX_ORDER, cancel.clone()),
         )
         .await?;
+        let bytes = bulk::bounded(&cancel, deadline, async {
+            file.seek(std::io::SeekFrom::End(0))
+                .await
+                .map_err(|_| failure())
+        })
+        .await?;
+        if bytes != observation.commits.bytes {
+            return Err(Error::integrity(
+                "MDN commit order length differs from its descriptor.",
+            ));
+        }
         if offset > 0 {
             file.seek(std::io::SeekFrom::Start(offset - 1))
                 .await
@@ -831,6 +842,11 @@ impl MdnGit {
         while commits.len() < limit {
             let Some(line) = delimited(&mut reader, b'\n', 64 * 1024, &cancel, deadline).await?
             else {
+                if next_offset != observation.commits.bytes {
+                    return Err(Error::integrity(
+                        "MDN commit order ended before its descriptor.",
+                    ));
+                }
                 break;
             };
             next_offset += line.len() as u64 + 1;
@@ -1170,7 +1186,7 @@ fn valid_path(path: &str) -> bool {
         && !path.contains('\\')
         && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
-fn parse_commit_order(bytes: &[u8]) -> Result<CommitOrder> {
+pub(crate) fn parse_commit_order(bytes: &[u8]) -> Result<CommitOrder> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::integrity("Invalid MDN commit-order encoding."))?;
     let mut fields = text.split(' ');
@@ -2015,6 +2031,142 @@ pub(crate) mod tests {
         assert_eq!(after, before, "readers must not publish archive bindings");
         assert!(reader.is_reader());
         assert!(!writer.is_reader());
+    }
+
+    async fn commit_order_observation(git: &MdnGit, bytes: &[u8]) -> Observation {
+        let commits = git
+            .artifacts
+            .capture_bytes(bytes.to_vec(), CancellationToken::new())
+            .await
+            .unwrap();
+        Observation {
+            repo: Repo::Content,
+            observed_at: 1,
+            refs: Vec::new(),
+            roots: Vec::new(),
+            manifest: commits.clone(),
+            commits,
+            total_commits: bytes.iter().filter(|byte| **byte == b'\n').count(),
+            main_revision: None,
+        }
+    }
+    fn commit_order_reader(root: &Path) -> MdnGit {
+        MdnGit::new(
+            root,
+            Repo::Content,
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            None,
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn commit_order_pages_count_variable_length_lines_in_bytes() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let git = commit_order_reader(root.path());
+        let first = "1".repeat(40);
+        let second = "2".repeat(40);
+        let merge = "3".repeat(40);
+        let bytes = format!("1 {first}\n20 {second} {first}\n300 {merge} {first} {second}\n");
+        let observation = commit_order_observation(&git, bytes.as_bytes()).await;
+        let first_page = git
+            .commit_page(&observation, 0, 1, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(first_page.commits[0].revision, first);
+        assert!(first_page.commits[0].parents.is_empty());
+        assert_eq!(first_page.next_offset, 43);
+        assert!(first_page.next_offset > observation.total_commits as u64);
+        let rest = git
+            .commit_page(
+                &observation,
+                first_page.next_offset,
+                100,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rest.commits.len(), 2);
+        assert_eq!(rest.commits[1].revision, merge);
+        assert_eq!(rest.commits[1].parents, vec![first, second]);
+        assert_eq!(rest.next_offset, observation.commits.bytes);
+        assert_eq!(rest.offsets.last(), Some(&observation.commits.bytes));
+        let eof = git
+            .commit_page(&observation, rest.next_offset, 1, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(eof.commits.is_empty());
+        assert!(eof.offsets.is_empty());
+        assert_eq!(eof.next_offset, observation.commits.bytes);
+    }
+    #[tokio::test]
+    async fn commit_order_pages_reject_descriptor_mismatch_boundaries_and_cancellation() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let git = commit_order_reader(root.path());
+        let bytes = format!("1 {}\n", "1".repeat(40));
+        let observation = commit_order_observation(&git, bytes.as_bytes()).await;
+        for offset in [1, observation.commits.bytes + 1] {
+            assert_eq!(
+                git.commit_page(&observation, offset, 1, CancellationToken::new())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_input"
+            );
+        }
+        for size in [observation.commits.bytes - 1, observation.commits.bytes + 1] {
+            let mut invalid = observation.clone();
+            invalid.commits.bytes = size;
+            for offset in [0, size] {
+                assert_eq!(
+                    git.commit_page(&invalid, offset, 1, CancellationToken::new())
+                        .await
+                        .unwrap_err()
+                        .code,
+                    "integrity"
+                );
+            }
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            git.commit_page(&observation, 0, 1, cancel)
+                .await
+                .unwrap_err()
+                .code,
+            "unavailable"
+        );
+        let replay = git
+            .commit_page(&observation, 0, 1, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(replay.commits.len(), 1);
+        assert_eq!(replay.next_offset, observation.commits.bytes);
+    }
+    #[tokio::test]
+    async fn commit_order_pages_reject_a_self_consistent_truncated_record() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let git = commit_order_reader(root.path());
+        let first = "1".repeat(40);
+        let second = "2".repeat(40);
+        // The artifact digest and descriptor are valid; the final record lacks
+        // its delimiter, which must never be interpreted as a completed commit.
+        let bytes = format!("1 {first}\n20 {second} {first}");
+        let observation = commit_order_observation(&git, bytes.as_bytes()).await;
+        let prefix = git
+            .commit_page(&observation, 0, 1, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(prefix.commits[0].revision, first);
+        for offset in [0, prefix.next_offset] {
+            assert_eq!(
+                git.commit_page(&observation, offset, 100, CancellationToken::new())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "integrity"
+            );
+        }
     }
 
     #[tokio::test]
