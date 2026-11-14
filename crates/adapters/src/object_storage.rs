@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Deserialize)]
@@ -792,6 +792,22 @@ impl S3Archive {
         max_bytes: u64,
         cancel: &CancellationToken,
     ) -> Result<(String, u64)> {
+        // A dropped tokio::fs write can leave its blocking job running after
+        // the download future and archive byte reservation have been dropped.
+        // Keep each local operation in this poll's ownership instead. On a
+        // multithreaded runtime block_in_place supplies a replacement worker;
+        // cancellation is observed between bounded network/write iterations.
+        fn local_io<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+            if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            }) {
+                tokio::task::block_in_place(operation)
+            } else {
+                operation()
+            }
+        }
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         self.run(
             cancel,
             Box::pin(async {
@@ -807,13 +823,14 @@ impl S3Archive {
                 if expected > max_bytes {
                     return Err(Error::capacity("Object storage read exceeds its bound."));
                 }
-                let mut output = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .custom_flags(nix::libc::O_NOFOLLOW)
-                    .open(target)
-                    .await
-                    .map_err(|_| unavailable())?;
+                let mut output = local_io(|| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .custom_flags(nix::libc::O_NOFOLLOW)
+                        .open(target)
+                })
+                .map_err(|_| unavailable())?;
                 let mut guard = DownloadGuard(Some(target.to_owned()));
                 let mut reader = response.body.into_async_read();
                 let mut hasher = blake3::Hasher::new();
@@ -829,15 +846,12 @@ impl S3Archive {
                         .filter(|count| *count <= max_bytes && *count <= expected)
                         .ok_or_else(|| Error::integrity("Object storage length mismatch."))?;
                     hasher.update(&buffer[..count]);
-                    output
-                        .write_all(&buffer[..count])
-                        .await
-                        .map_err(|_| unavailable())?;
+                    local_io(|| output.write_all(&buffer[..count])).map_err(|_| unavailable())?;
                 }
                 if bytes != expected {
                     return Err(Error::integrity("Object storage length mismatch."));
                 }
-                output.sync_all().await.map_err(|_| unavailable())?;
+                local_io(|| output.sync_all()).map_err(|_| unavailable())?;
                 guard.0 = None;
                 Ok((format!("blake3:{}", hasher.finalize().to_hex()), bytes))
             }),

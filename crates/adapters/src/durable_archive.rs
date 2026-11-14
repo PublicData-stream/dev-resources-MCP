@@ -149,13 +149,15 @@ fn lock_materialization<'a>(
             }
         }
     };
-    if tokio::runtime::Handle::try_current()
-        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-    {
-        tokio::task::block_in_place(acquire)
-    } else {
-        acquire()
-    }
+    stage("cache_lock", || {
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(acquire)
+        } else {
+            acquire()
+        }
+    })
 }
 
 #[cfg(test)]
@@ -222,7 +224,7 @@ fn select(path: &Path) -> Result<Option<Arc<Archive>>> {
         None => Ok(None),
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Binding {
     version: u32,
@@ -278,6 +280,9 @@ struct Cache {
     paths: BTreeMap<PathBuf, PhysicalIdentity>,
     objects: BTreeMap<PhysicalIdentity, LocalObject>,
     used_bytes: u64,
+    // Full cold-download lengths are reserved before remote I/O. All ordinary
+    // write admission includes these bytes until they become observed files.
+    reserved_bytes: u64,
     identities: AccountingIdentities,
 }
 #[derive(Debug)]
@@ -510,15 +515,20 @@ fn admit_local_until(
     let fits = |cache: &Cache| {
         cache
             .used_bytes
-            .checked_add(extra)
+            .checked_add(cache.reserved_bytes)
+            .and_then(|bytes| bytes.checked_add(extra))
             .is_some_and(|bytes| bytes <= limit)
     };
-    let has_space = || {
+    let has_space = |cache: &Cache| {
         fs2::available_space(root)
-            .map(|free| free >= extra.saturating_add(64 * 1024 * 1024))
+            .map(|free| {
+                free >= extra
+                    .saturating_add(cache.reserved_bytes)
+                    .saturating_add(64 * 1024 * 1024)
+            })
             .map_err(|_| unavailable())
     };
-    if fits(cache) && has_space()? {
+    if fits(cache) && has_space(cache)? {
         return Ok(());
     }
     cache.reconcile(deadline)?;
@@ -533,7 +543,7 @@ fn admit_local_until(
         if Instant::now() >= deadline {
             return Err(capacity());
         }
-        if fits(cache) && has_space()? {
+        if fits(cache) && has_space(cache)? {
             return Ok(());
         }
         match std::fs::remove_file(&path) {
@@ -543,14 +553,17 @@ fn admit_local_until(
         }
         cache.detach(&path)?;
     }
-    if fits(cache) && has_space()? {
+    if fits(cache) && has_space(cache)? {
         Ok(())
     } else if !fits(cache) {
         Err(limited(
             capacity(),
             Phase::Materialization,
             LimitKind::CacheWorkingSet,
-            cache.used_bytes.checked_add(extra),
+            cache
+                .used_bytes
+                .checked_add(cache.reserved_bytes)
+                .and_then(|bytes| bytes.checked_add(extra)),
             Some(limit),
         ))
     } else {
@@ -560,7 +573,11 @@ fn admit_local_until(
             Phase::Materialization,
             LimitKind::FreeReserve,
             Some(free),
-            Some(extra.saturating_add(64 * 1024 * 1024)),
+            Some(
+                extra
+                    .saturating_add(cache.reserved_bytes)
+                    .saturating_add(64 * 1024 * 1024),
+            ),
         ))
     }
 }
@@ -861,12 +878,128 @@ pub struct Archive {
     owner_started: String,
     binding: String,
     cache: Mutex<Cache>,
+    materializations: MaterializationControl,
 }
 impl std::fmt::Debug for Archive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Archive").finish_non_exhaustive()
     }
 }
+/// Independent paths share exactly two remote materialization slots. Weak path
+/// entries bound lifetime without retaining an ever-growing lock per request.
+struct MaterializationControl {
+    flights: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    io: Arc<tokio::sync::Semaphore>,
+}
+impl Default for MaterializationControl {
+    fn default() -> Self {
+        Self {
+            flights: Mutex::new(BTreeMap::new()),
+            io: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
+    }
+}
+impl MaterializationControl {
+    fn claim(
+        &self,
+        path: &str,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let flight = {
+            let mut flights = self.flights.lock().map_err(|_| unavailable())?;
+            if let Some(flight) = flights.get(path).and_then(Weak::upgrade) {
+                flight
+            } else {
+                if flights.len() >= MAX_LOCAL_FILES {
+                    flights.retain(|_, value| value.strong_count() > 0);
+                    if flights.len() >= MAX_LOCAL_FILES {
+                        return Err(capacity());
+                    }
+                }
+                let flight = Arc::new(tokio::sync::Mutex::new(()));
+                flights.insert(path.to_owned(), Arc::downgrade(&flight));
+                flight
+            }
+        };
+        stage("single_flight", || {
+            run_bounded(deadline, cancel, async { Ok(flight.lock_owned().await) })
+        })
+    }
+}
+fn stage<T>(name: &'static str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let started = Instant::now();
+    let result = operation();
+    tracing::trace!(
+        target: "devres_private_timings",
+        archive_stage = name,
+        elapsed_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        success = result.is_ok(),
+        "archive materialization stage"
+    );
+    result
+}
+async fn stage_async<T>(name: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    let started = Instant::now();
+    let result = future.await;
+    tracing::trace!(
+        target: "devres_private_timings",
+        archive_stage = name,
+        elapsed_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        success = result.is_ok(),
+        "archive materialization stage"
+    );
+    result
+}
+struct DownloadReservation {
+    archive: Arc<Archive>,
+    bytes: u64,
+}
+impl DownloadReservation {
+    fn new(
+        archive: &Arc<Archive>,
+        bytes: u64,
+        path: &Path,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
+        let mut cache = lock_materialization(archive, deadline, cancel)?;
+        admit_local_until(
+            &archive.root,
+            &mut cache,
+            bytes,
+            archive.remote.config().cache_max_bytes,
+            &[path.to_owned()],
+            deadline,
+        )?;
+        cache.reserved_bytes = cache
+            .reserved_bytes
+            .checked_add(bytes)
+            .ok_or_else(capacity)?;
+        Ok(Self {
+            archive: archive.clone(),
+            bytes,
+        })
+    }
+    fn commit(&mut self, cache: &mut Cache) -> Result<()> {
+        cache.reserved_bytes = cache
+            .reserved_bytes
+            .checked_sub(self.bytes)
+            .ok_or_else(integrity)?;
+        self.bytes = 0;
+        Ok(())
+    }
+}
+impl Drop for DownloadReservation {
+    fn drop(&mut self) {
+        if self.bytes > 0
+            && let Ok(mut cache) = lock_cache(&self.archive)
+        {
+            cache.reserved_bytes = cache.reserved_bytes.saturating_sub(self.bytes);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ArchiveLease(Option<Arc<Lease>>);
 #[derive(Debug)]
@@ -955,6 +1088,7 @@ impl Archive {
             owner_started,
             binding,
             cache: Mutex::new(cache),
+            materializations: MaterializationControl::default(),
         });
         archive.health().await?;
         registry()
@@ -1075,6 +1209,7 @@ impl Archive {
             owner_started,
             binding,
             cache: Mutex::new(cache),
+            materializations: MaterializationControl::default(),
         });
         archive.recover_pending().await?;
         if !transfer && backend == "filesystem" {
@@ -1101,8 +1236,8 @@ impl Archive {
     }
     pub(crate) async fn health(&self) -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            self.fence().await?;
-            self.remote.health().await
+            stage_async("owner_fence", self.fence()).await?;
+            stage_async("remote_health", self.remote.health()).await
         })
         .await
         .map_err(|_| unavailable())?
@@ -1291,80 +1426,161 @@ impl Archive {
             protected,
         )
     }
-    fn materialize_locked(
+    fn materialize(
         self: &Arc<Self>,
-        cache: &mut Cache,
         path: &Path,
         max_bytes: u64,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<ArchiveLease> {
-        if cancel.is_cancelled() || Instant::now() >= deadline {
-            return Err(capacity());
-        }
+        self.materialize_selected(path, max_bytes, deadline, cancel, false)?
+            .ok_or_else(integrity)
+    }
+    fn materialize_selected(
+        self: &Arc<Self>,
+        path: &Path,
+        max_bytes: u64,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        optional: bool,
+    ) -> Result<Option<ArchiveLease>> {
         let relative = self.relative(path)?;
-        let binding = run_bounded(deadline, cancel, self.binding_for(&relative, true))?
-            .ok_or_else(integrity)?;
+        // Acquire path ownership before I/O admission. A waiter for this path
+        // cannot consume the other independent file's I/O slot.
+        let _flight = self.materializations.claim(&relative, deadline, cancel)?;
+        let _io = stage("io_admission", || {
+            run_bounded(deadline, cancel, async {
+                self.materializations
+                    .io
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| unavailable())
+            })
+        })?;
+        // Warm local bytes and optional misses never replace current authority.
+        stage("authority", || run_bounded(deadline, cancel, self.health()))?;
+        let binding = stage("binding", || {
+            run_bounded(deadline, cancel, self.binding_for(&relative, true))
+        })?;
+        let Some(binding) = binding else {
+            return if optional { Ok(None) } else { Err(integrity()) };
+        };
         if binding.bytes > max_bytes {
             return Err(capacity());
         }
-        // Always check the authority, including when the local bytes are warm.
-        run_bounded(deadline, cancel, self.health())?;
-        let remote = run_bounded(deadline, cancel, self.remote.head(&binding.object_key()?))?
-            .ok_or_else(integrity)?;
+        let remote = stage("head", || {
+            run_bounded(deadline, cancel, self.remote.head(&binding.object_key()?))
+        })?
+        .ok_or_else(integrity)?;
         if remote.bytes != binding.bytes {
             return Err(integrity());
         }
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) => {
-                if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != binding.bytes {
-                    return Err(integrity());
+        let warm = {
+            let mut cache = lock_materialization(self, deadline, cancel)?;
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) => {
+                    if !meta.is_file()
+                        || meta.file_type().is_symlink()
+                        || meta.len() != binding.bytes
+                    {
+                        return Err(integrity());
+                    }
+                    cache.observe(path)?;
+                    // Pin before releasing the mutex for hashing: unrelated
+                    // downloads and ordinary writers may concurrently evict.
+                    Some(ArchiveLease::pin(self, &mut cache, vec![path.to_owned()]))
                 }
-                let (digest, bytes) =
-                    crate::integrity::file_digest_local(path, max_bytes, deadline, cancel)?;
-                if digest != binding.digest || bytes != binding.bytes {
-                    return Err(integrity());
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return Err(unavailable()),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                admit_local_until(
-                    &self.root,
-                    cache,
-                    binding.bytes,
-                    self.remote.config().cache_max_bytes,
-                    &[path.to_owned()],
-                    deadline,
-                )?;
-                if let Some(parent) = path.parent() {
-                    crate::integrity::ensure_directory_durable(parent)?;
-                }
-                let directory = tempfile::Builder::new()
-                    .prefix(".archive-download-")
-                    .tempdir_in(path.parent().ok_or_else(integrity)?)
-                    .map_err(|_| unavailable())?;
-                let stage = directory.path().join("payload");
-                let (digest, bytes) = run_bounded(deadline, cancel, async {
-                    self.remote
-                        .get_to_file(&binding.object_key()?, &stage, max_bytes, cancel)
-                        .await
-                })?;
-                if digest != binding.digest || bytes != binding.bytes {
-                    return Err(integrity());
-                }
-                std::fs::hard_link(&stage, path).map_err(|_| unavailable())?;
+        };
+        if let Some(lease) = warm {
+            let (digest, bytes) = stage("hash", || {
+                crate::integrity::file_digest_local(path, binding.bytes, deadline, cancel)
+            })?;
+            if digest != binding.digest || bytes != binding.bytes {
+                return Err(integrity());
             }
-            Err(_) => return Err(unavailable()),
+            self.recheck_binding(&relative, &binding, deadline, cancel)?;
+            let mut cache = lock_materialization(self, deadline, cancel)?;
+            cache.observe(path)?;
+            self.record_identity(&mut cache, path, &binding)?;
+            return Ok(Some(lease));
         }
-        cache.observe(path)?;
-        admit_local_until(
-            &self.root,
-            cache,
-            0,
-            self.remote.config().cache_max_bytes,
-            &[path.to_owned()],
-            deadline,
-        )?;
+        let mut reservation = stage("cache_admission", || {
+            DownloadReservation::new(self, binding.bytes, path, deadline, cancel)
+        })?;
+        if let Some(parent) = path.parent() {
+            crate::integrity::ensure_directory_durable(parent)?;
+        }
+        let directory = tempfile::Builder::new()
+            .prefix(".archive-download-")
+            .tempdir_in(path.parent().ok_or_else(integrity)?)
+            .map_err(|_| unavailable())?;
+        let payload = directory.path().join("payload");
+        let (digest, bytes) = stage("download", || {
+            run_bounded(deadline, cancel, async {
+                self.remote
+                    .get_to_file(&binding.object_key()?, &payload, binding.bytes, cancel)
+                    .await
+            })
+        })?;
+        if digest != binding.digest || bytes != binding.bytes {
+            return Err(integrity());
+        }
+        self.recheck_binding(&relative, &binding, deadline, cancel)?;
+        let lease = {
+            let mut cache = lock_materialization(self, deadline, cancel)?;
+            // Publish only our verified stage. A surprising local file must
+            // never be overwritten, even if another writer created it.
+            std::fs::hard_link(&payload, path).map_err(|_| unavailable())?;
+            if let Err(error) = cache.observe(path) {
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
+            reservation.commit(&mut cache)?;
+            admit_local_until(
+                &self.root,
+                &mut cache,
+                0,
+                self.remote.config().cache_max_bytes,
+                &[path.to_owned()],
+                deadline,
+            )?;
+            self.record_identity(&mut cache, path, &binding)?;
+            ArchiveLease::pin(self, &mut cache, vec![path.to_owned()])
+        };
+        // The temporary alias and reservation are gone before the caller can
+        // use its pin. The permanent remote object is never modified.
+        drop(directory);
+        Ok(Some(lease))
+    }
+    fn recheck_binding(
+        &self,
+        relative: &str,
+        expected: &Binding,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        stage("recheck", || {
+            run_bounded(deadline, cancel, async {
+                self.health().await?;
+                if self.binding_for(relative, true).await?.as_ref() != Some(expected) {
+                    return Err(integrity());
+                }
+                Ok(())
+            })
+        })
+    }
+    fn record_identity(&self, cache: &mut Cache, path: &Path, binding: &Binding) -> Result<()> {
         let metadata = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != binding.bytes
+        {
+            return Err(integrity());
+        }
         cache.identities.insert(
             path.to_owned(),
             (
@@ -1372,7 +1588,7 @@ impl Archive {
                 (binding.device, binding.inode),
             ),
         );
-        Ok(ArchiveLease::pin(self, cache, vec![path.to_owned()]))
+        Ok(())
     }
     async fn children(&self, path: &str, max_files: usize) -> Result<Vec<Binding>> {
         let prefix = format!("{path}/");
@@ -1397,26 +1613,35 @@ impl Archive {
             return Err(integrity());
         }
         let physical = (meta.dev(), meta.ino());
-        let mut cache = lock_cache(self)?;
         // Only a currently present alias can establish physical equivalence;
         // stale inode numbers from evicted files must never identify a new file.
-        let known = cache
-            .identities
-            .iter()
-            .find_map(|(candidate, (local, identity))| {
-                if *local != physical {
-                    return None;
-                }
-                std::fs::symlink_metadata(candidate)
-                    .ok()
-                    .filter(|m| {
-                        m.is_file() && !m.file_type().is_symlink() && (m.dev(), m.ino()) == physical
-                    })
-                    .map(|_| *identity)
-            });
-        let identity = match known {
+        let known = |cache: &Cache| {
+            cache
+                .identities
+                .iter()
+                .find_map(|(candidate, (local, identity))| {
+                    if *local != physical {
+                        return None;
+                    }
+                    std::fs::symlink_metadata(candidate)
+                        .ok()
+                        .filter(|meta| {
+                            meta.is_file()
+                                && !meta.file_type().is_symlink()
+                                && (meta.dev(), meta.ino()) == physical
+                        })
+                        .map(|_| *identity)
+                })
+        };
+        let existing = {
+            let cache = lock_cache(self)?;
+            known(&cache)
+        };
+        let allocated = match existing {
             Some(value) => value,
             None => {
+                // Sequence allocation can wait on PostgreSQL; it must not hold
+                // cache bookkeeping or block unrelated materialization pins.
                 let id: i64 = run(async {
                     sqlx_core::query_scalar::query_scalar(
                         "SELECT nextval('devres_archive_accounting_seq')",
@@ -1428,6 +1653,17 @@ impl Archive {
                 (u64::MAX, u64::try_from(id).map_err(|_| integrity())?)
             }
         };
+        let mut cache = lock_cache(self)?;
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || (metadata.dev(), metadata.ino()) != physical
+        {
+            return Err(integrity());
+        }
+        // Another alias may have won while the sequence was allocated. Adopt
+        // its established identity rather than changing physical accounting.
+        let identity = known(&cache).unwrap_or(allocated);
         cache
             .identities
             .insert(path.to_owned(), (physical, identity));
@@ -1476,15 +1712,12 @@ pub fn materialize_if_retained(
     cancel: &CancellationToken,
 ) -> Result<Option<ArchiveLease>> {
     if let Some(archive) = select(path)? {
-        let relative = archive.relative(path)?;
-        run_bounded(deadline, cancel, archive.health())?;
-        if run_bounded(deadline, cancel, archive.binding_for(&relative, true))?.is_none() {
-            return Ok(None);
-        }
-    } else if !path.exists() {
-        return Ok(None);
+        archive.materialize_selected(path, max_bytes, deadline, cancel, true)
+    } else if path.exists() {
+        Ok(Some(ArchiveLease::default()))
+    } else {
+        Ok(None)
     }
-    materialize_file(path, max_bytes, deadline, cancel).map(Some)
 }
 pub fn materialize_file(
     path: &Path,
@@ -1495,8 +1728,7 @@ pub fn materialize_file(
     let Some(archive) = select(path)? else {
         return Ok(ArchiveLease::default());
     };
-    let mut cache = lock_materialization(&archive, deadline, cancel)?;
-    archive.materialize_locked(&mut cache, path, max_bytes, deadline, cancel)
+    archive.materialize(path, max_bytes, deadline, cancel)
 }
 pub fn materialize_directory(
     path: &Path,
@@ -1513,34 +1745,95 @@ pub fn materialize_directory(
     if files.is_empty() {
         return Err(integrity());
     }
-    let mut total = 0u64;
-    let mut cache = lock_materialization(&archive, deadline, cancel)?;
-    let mut leases = Vec::new();
-    let outcome = (|| {
-        for binding in files {
-            total = total
-                .checked_add(binding.bytes)
-                .filter(|v| *v <= max_bytes)
-                .ok_or_else(capacity)?;
-            leases.push(archive.materialize_locked(
-                &mut cache,
-                &archive.root.join(binding.path),
-                binding.bytes,
-                deadline,
-                cancel,
-            )?);
-        }
-        let paths = leases
-            .iter()
-            .filter_map(|v| v.0.as_ref())
-            .flat_map(|v| v.paths.iter().cloned())
-            .collect();
-        Ok(ArchiveLease::pin(&archive, &mut cache, paths))
-    })();
-    drop(cache);
+    files.iter().try_fold(0u64, |total, binding| {
+        total
+            .checked_add(binding.bytes)
+            .filter(|bytes| *bytes <= max_bytes)
+            .ok_or_else(capacity)
+    })?;
+    // Scoped workers are always joined. An error cancels the sibling's I/O,
+    // then drains its result before releasing any successful file leases.
+    let stopping = cancel.child_token();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let first_error = Mutex::new(None);
+    let execute = || {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..files.len().min(2))
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut leases = Vec::new();
+                        loop {
+                            if stopping.is_cancelled() {
+                                break;
+                            }
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(binding) = files.get(index) else {
+                                break;
+                            };
+                            match archive.materialize(
+                                &archive.root.join(&binding.path),
+                                binding.bytes,
+                                deadline,
+                                &stopping,
+                            ) {
+                                Ok(lease) => leases.push(lease),
+                                Err(error) => {
+                                    if let Ok(mut first) = first_error.lock()
+                                        && first.is_none()
+                                    {
+                                        *first = Some(error);
+                                    }
+                                    stopping.cancel();
+                                    break;
+                                }
+                            }
+                        }
+                        leases
+                    })
+                })
+                .collect();
+            let mut leases = Vec::new();
+            for worker in workers {
+                match worker.join() {
+                    Ok(result) => leases.extend(result),
+                    Err(_) => {
+                        stopping.cancel();
+                        if let Ok(mut first) = first_error.lock() {
+                            *first = Some(unavailable());
+                        }
+                    }
+                }
+            }
+            leases
+        })
+    };
+    let leases = if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(execute)
+    } else {
+        execute()
+    };
+    if let Some(error) = first_error.into_inner().map_err(|_| unavailable())? {
+        return Err(error);
+    }
+    if stopping.is_cancelled() {
+        return Err(Error::new("cancelled", "Archive materialization canceled."));
+    }
+    let paths = leases
+        .iter()
+        .filter_map(|lease| lease.0.as_ref())
+        .flat_map(|lease| lease.paths.iter().cloned())
+        .collect();
+    let result = {
+        let mut cache = lock_materialization(&archive, deadline, cancel)?;
+        ArchiveLease::pin(&archive, &mut cache, paths)
+    };
+    // Lease drops reacquire cache bookkeeping; never drop them under its mutex.
     drop(leases);
-    outcome
+    Ok(result)
 }
+
 pub(crate) fn publish_file(path: &Path, digest: &str, bytes: u64) -> Result<()> {
     let Some(archive) = select(path)? else {
         return Ok(());
@@ -2008,3 +2301,7 @@ impl Archive {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "durable_archive/materialization_tests.rs"]
+mod materialization_tests;
