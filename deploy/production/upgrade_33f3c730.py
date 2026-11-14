@@ -45,6 +45,32 @@ PROFILES = ('/serve/oxibelt-conf/10-tls.toml', OLD_BUNDLE + '/edge-conf/10-tls.t
 FENCES = ('capacity_fenced', 'withdrawn', 'withdraw_incomplete', 'stopped', 'stop_failed')
 
 
+# Explicitly authorized, externally completed shared-edge network change. These
+# pins describe the observed change; they never authorize another recreation.
+EDGE_COMPOSE = '/serve/docker-compose.yml'
+OLD_COMPOSE_SHA = '2326b3356a99efe0f45a46894b2494d9c090d15d8419d7a398aeca303abdfb3a'
+NEW_COMPOSE_SHA = '986c3a1986974071986fccddd9dffd78bff95fb3bba5f5faaa27061ab38b3406'
+OLD_EDGE_ID = '2bea104aec8b9ae368dcce5e18c91b00d1c993bdb4706326f2df22e3127bce78'
+NEW_EDGE_ID = '36e3ad39478bade960690a4bdb14e409b9899140fa6735ecca8400d79afeaeff'
+EDGE_IMAGE = 'sha256:9f8aa1715586a5c15e26fe48ab982b43c28abe49dc2f09b78c1450ffa01b33d1'
+OLD_COMPOSE_CONFIG = '1629b848b188a7dd4d7a4e810c5d012961358a9e11b508c927316cf188b5bd7d'
+NEW_COMPOSE_CONFIG = '3144ecd1981dcf105efac63eec9596848d2af98d2c1a7728b457988f1c8c3d71'
+OLD_DEVRES_MAC = '8a:a1:0c:9b:0a:c3'
+NEW_DEVRES_MAC = 'ee:13:17:aa:71:ea'
+PDF_NETWORK = {'IPAddress': '172.19.0.2', 'IPPrefixLen': 16, 'Gateway': '172.19.0.1',
+    'GlobalIPv6Address': '', 'GlobalIPv6PrefixLen': 0, 'IPv6Gateway': '',
+    'MacAddress': '42:32:66:39:05:52', 'Aliases': ['oxibelt', 'oxibelt'],
+    'DNSNames': ['oxibelt', NEW_EDGE_ID[:12]], 'IPAMConfig': {}, 'DriverOpts': None, 'Links': None}
+NETWORK_IDS = {'devres-net': 'c437bd5de32ebfad6fdeac4ea849a6c4a775e1e2ad1747f2bf17da1ce1f325ac',
+    'pdf2md-net': '979c94def752a88bd9ed1da4d3ae92013827245f94cce37e16bad1fce2414e9e'}
+NETWORK_ENDPOINTS = {'devres-net': 'f300a236bb39af07ee8b3eed51054842ae6cbc5cb1395481bae78b1b8ba966c8',
+    'pdf2md-net': '47dca947ef260309e7787e3ca6455616c40ae21af9d047986fafe806c43d8a5d'}
+NETWORK_LABEL_HASHES = {'devres-net': '50a76bc2c92662b13b3e41236406cefe37f6573f9472b385ed483a7ceaf15ec3',
+    'pdf2md-net': '14dadebdce79934b165a2d522278b1b3bade6a0a40e20ce17ec7e485d3bd182e'}
+NETWORK_FIELDS = ('Name', 'Id', 'Driver', 'Scope', 'EnableIPv6', 'Internal', 'IPAM',
+    'Options', 'Labels', 'ConfigOnly', 'Ingress')
+
+
 class Error(RuntimeError):
     pass
 
@@ -203,6 +229,99 @@ def instant(value):
         raise Error('invalid_timestamp') from None
 
 
+def compose_delta(raw):
+    require(len(raw) == 5311 and digest(raw) == NEW_COMPOSE_SHA, 'current_compose_identity')
+    text = raw.decode()
+    index = text.index('\n{') + 1
+    value = json.loads(text[index:])
+    require(value['services']['oxibelt']['networks'].get('pdf2md-net') == {}
+            and value['networks'].get('pdf2md-net') == {'driver': 'bridge', 'name': 'pdf2md-net'}, 'pdf_network_compose_delta')
+    historical = copy.deepcopy(value)
+    del historical['services']['oxibelt']['networks']['pdf2md-net']
+    del historical['networks']['pdf2md-net']
+    old_raw = (text[:index] + json.dumps(historical, indent=2)).encode()
+    require(len(old_raw) == 5204 and digest(old_raw) == OLD_COMPOSE_SHA
+            and raw == (text[:index] + json.dumps(value, indent=2) + '\n').encode(), 'historical_compose_reconstruction')
+
+
+def normalized_edge_delta(historical, actual, compose_raw):
+    """Validate the complete difference, then reverse only the admitted fields."""
+    compose_delta(compose_raw)
+    old, new = historical['edge'], actual['edge']
+    require(old['id'] == OLD_EDGE_ID and new == {'id': NEW_EDGE_ID, 'pid': 1898071,
+        'pid_start_ticks': '12826648', 'started': '2026-11-14T12:18:56.706543666Z',
+        'restarts': 0, 'image': EDGE_IMAGE} and old['image'] == EDGE_IMAGE and old['restarts'] == 0,
+        'authorized_edge_process_delta')
+    normalized_process = copy.deepcopy(new)
+    for key in ('id', 'pid', 'pid_start_ticks', 'started'):
+        normalized_process[key] = old[key]
+    require(normalized_process == old, 'unexpected_edge_process_delta')
+    before, after = historical['docker'], actual['docker']
+    require(before['id'] == OLD_EDGE_ID and after['id'] == NEW_EDGE_ID
+            and before['image'] == after['image'] == EDGE_IMAGE
+            and before['restart_count'] == after['restart_count'] == 0, 'authorized_edge_container_delta')
+    normalized_docker = copy.deepcopy(after)
+    normalized_docker['id'] = before['id']
+    require(before['config']['Hostname'] == OLD_EDGE_ID[:12]
+            and after['config']['Hostname'] == NEW_EDGE_ID[:12], 'edge_hostname_delta')
+    normalized_docker['config']['Hostname'] = before['config']['Hostname']
+    for key, old_value, new_value in (
+            ('com.docker.compose.config-hash', OLD_COMPOSE_CONFIG, NEW_COMPOSE_CONFIG),
+            ('com.docker.compose.version', '5.7.0', '5.7.1')):
+        require(before['config']['Labels'].get(key) == old_value
+                and after['config']['Labels'].get(key) == new_value, 'compose_runtime_label_delta')
+        normalized_docker['config']['Labels'][key] = old_value
+    for key in ('Dns', 'DnsOptions', 'DnsSearch'):
+        require(before['host_config'].get(key) == [] and key in after['host_config']
+                and after['host_config'][key] is None, 'compose_dns_default_delta')
+        normalized_docker['host_config'][key] = []
+    require(set(before['networks']) == {'devres-net'}
+            and set(after['networks']) == {'devres-net', 'pdf2md-net'}
+            and after['networks']['pdf2md-net'] == PDF_NETWORK, 'edge_network_set_delta')
+    old_network, new_network = before['networks']['devres-net'], after['networks']['devres-net']
+    require(old_network['MacAddress'] == OLD_DEVRES_MAC and new_network['MacAddress'] == NEW_DEVRES_MAC
+            and old_network['DNSNames'] == ['oxibelt', OLD_EDGE_ID[:12]]
+            and new_network['DNSNames'] == ['oxibelt', NEW_EDGE_ID[:12]], 'edge_devres_endpoint_delta')
+    normalized_docker['networks']['devres-net']['MacAddress'] = OLD_DEVRES_MAC
+    normalized_docker['networks']['devres-net']['DNSNames'] = old_network['DNSNames']
+    del normalized_docker['networks']['pdf2md-net']
+    require(normalized_docker == before, 'unlisted_edge_docker_delta')
+    old_files, new_files = historical['files'], actual['files']
+    require(set(new_files) == set(old_files) and EDGE_COMPOSE in old_files, 'edge_base_file_set')
+    old_compose, new_compose = old_files[EDGE_COMPOSE], new_files[EDGE_COMPOSE]
+    require(old_compose['sha256'] == OLD_COMPOSE_SHA and old_compose['size'] == 5204
+            and new_compose['sha256'] == NEW_COMPOSE_SHA and new_compose['size'] == 5311,
+            'compose_file_metadata_identity')
+    require(set(old_compose) == set(new_compose)
+            and all(new_compose[k] == v for k, v in old_compose.items()
+                    if k not in ('inode', 'mtime_ns', 'size', 'sha256')), 'compose_file_security_changed')
+    normalized_files = copy.deepcopy(new_files)
+    for key in ('inode', 'mtime_ns', 'size', 'sha256'):
+        normalized_files[EDGE_COMPOSE][key] = old_compose[key]
+    require(normalized_files == old_files, 'unlisted_edge_file_delta')
+    networks = actual['networks']
+    require(set(networks) == set(NETWORK_IDS), 'edge_network_inventory')
+    for name, subnet, gateway, mac, address in (
+            ('devres-net', '10.0.0.0/16', '10.0.0.1', NEW_DEVRES_MAC, '10.0.0.3/16'),
+            ('pdf2md-net', '172.19.0.0/16', '172.19.0.1', PDF_NETWORK['MacAddress'], '172.19.0.2/16')):
+        value = networks[name]
+        require(value['Name'] == name and value['Id'] == NETWORK_IDS[name]
+                and value['Driver'] == 'bridge' and value['Scope'] == 'local'
+                and value['EnableIPv6'] is False and value['Internal'] is False
+                and value['ConfigOnly'] is False and value['Ingress'] is False
+                and value['IPAM'] == {'Config': [{'Gateway': gateway, 'Subnet': subnet}], 'Driver': 'default', 'Options': None},
+                'edge_network_identity')
+        require(value.get('Options') == ({'com.docker.network.bridge.name': 'devres-edge0'} if name == 'devres-net' else {})
+                and value.get('Labels') == {'com.docker.compose.config-hash': NETWORK_LABEL_HASHES[name],
+                    'com.docker.compose.network': name, 'com.docker.compose.project': 'serve',
+                    'com.docker.compose.version': '5.7.0' if name == 'devres-net' else '5.7.1'}, 'edge_network_policy_changed')
+        member = value['edge_member']
+        require(member['Name'] == 'oxibelt' and member['MacAddress'] == mac
+                and member['IPv4Address'] == address and member['IPv6Address'] == ''
+                and member['EndpointID'] == NETWORK_ENDPOINTS[name], 'edge_network_membership')
+    return {'edge': normalized_process, 'docker': normalized_docker, 'files': normalized_files}
+
+
 class Controller:
     def __init__(self, bundle, plan, context):
         require(str(Path(bundle)) == BUNDLE, 'fixed_bundle_required')
@@ -211,7 +330,7 @@ class Controller:
         self.context = context
         self.plan_raw = read(plan)
         self.plan = json.loads(self.plan_raw)
-        require(set(self.plan) == {'version', 'context', 'store_binding_sha256', 'preserve_application_passwords', 'target', 'prior', 'inventory'}
+        require(set(self.plan) == {'version', 'context', 'store_binding_sha256', 'preserve_application_passwords', 'target', 'prior', 'inventory', 'edge_admission'}
                 and self.plan.get('version') == 1 and self.plan.get('context') == context
                 and self.plan.get('store_binding_sha256') == STORE_BINDING
                 and self.plan.get('preserve_application_passwords') is True
@@ -219,6 +338,125 @@ class Controller:
         self.activation = predecessor(context)
         self.base = self.activation.base
         self.module, self.old = self.base.module, self.base.old
+        self.attach_edge_admission(self.plan['edge_admission'])
+
+
+    def native_edge_snapshot(self):
+        # Do not call Activation.edge_docker after adapting base.edge: that
+        # method would attempt to inspect the retired historical container ID.
+        edge = self.edge()
+        value = json.loads(self.module.call(['docker', 'inspect', edge['id']]))[0]
+        status = value['State']
+        require(value['Id'] == edge['id'] and status['Running'] is True and not status.get('Dead')
+                and not status.get('Paused') and not status.get('Restarting'), 'edge_not_running')
+        keys = ('IPAddress', 'IPPrefixLen', 'Gateway', 'GlobalIPv6Address', 'GlobalIPv6PrefixLen',
+                'IPv6Gateway', 'MacAddress', 'Aliases', 'DNSNames', 'IPAMConfig', 'DriverOpts', 'Links')
+        docker = {'id': value['Id'], 'image': value['Image'], 'config': value['Config'], 'host_config': value['HostConfig'],
+            'mounts': value['Mounts'], 'restart_count': value['RestartCount'], 'health': status.get('Health', {}).get('Status'),
+            'networks': {name: {key: network.get(key) for key in keys}
+                         for name, network in value['NetworkSettings']['Networks'].items()}, 'ports': value['NetworkSettings']['Ports']}
+        inspected = json.loads(self.module.call(['docker', 'network', 'inspect', 'devres-net', 'pdf2md-net']))
+        require(len(inspected) == 2, 'edge_network_inventory')
+        networks = {n['Name']: {**{k: n.get(k) for k in NETWORK_FIELDS},
+                    'edge_member': n.get('Containers', {}).get(edge['id'])} for n in inspected}
+        files = self._native_edge_files()
+        fd = os.open(EDGE_COMPOSE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0
+                    and info.st_nlink == 1 and info.st_size == 5311 and not info.st_mode & 0o022, 'compose_public_file_bound')
+            raw = stream.read(65537)
+            require(len(raw) == info.st_size, 'compose_read_changed')
+        require(files == self._native_edge_files(), 'edge_files_changed_during_read')
+        return {'edge': edge, 'docker': docker, 'files': files, 'networks': networks}, raw
+
+    def historical_edge_snapshot(self, state, prepared):
+        docker = copy.deepcopy(prepared['edge_docker'])
+        if state.get('source_history') is not None:
+            evidence = self.activation.source_history(state, prepared)
+            docker['networks']['devres-net']['MacAddress'] = evidence['new_mac']
+            require(state['edge'] == evidence['new_edge'], 'historical_edge_admission_changed')
+        return {'edge': state['edge'], 'docker': docker, 'files': prepared['edge_base_files']}
+
+    def edge_admission_fresh(self, value):
+        age = (utc_now() - instant(value.get('observed_at'))).total_seconds()
+        require(-5 <= age <= 300, 'edge_admission_stale')
+
+    def attach_edge_admission(self, reference, value=None):
+        if not hasattr(self, '_native_edge_files'):
+            self._native_edge_files = self.activation.edge_files
+        self.edge_admission_reference = reference
+        if reference is not None:
+            require(set(reference) == {'path', 'sha256'} and Path(reference['path']).parent == Path(WORK), 'edge_admission_reference')
+            raw = read(reference['path'])
+            require(digest(raw) == reference['sha256'], 'edge_admission_hash')
+            value = json.loads(raw)
+        require(isinstance(value, dict), 'edge_admission_required')
+        self.edge_admission_value = value
+        self.verify_edge_admission()
+        # These adapters reverse only the delta validated in full immediately
+        # before each use. New-controller snapshots continue using native edge().
+        self.activation.edge_files = lambda: self.verify_edge_admission()['files']
+        self.activation.edge_docker = lambda: self.verify_edge_admission()['docker']
+        self.base.edge = lambda: self.verify_edge_admission()['edge']
+
+    def verify_edge_admission(self):
+        value = self.edge_admission_value
+        if self.edge_admission_reference is not None:
+            require(digest(read(self.edge_admission_reference['path'])) == self.edge_admission_reference['sha256'], 'edge_admission_changed')
+        require(value.get('version') == 1 and value.get('kind') == 'explicit-pdf2md-network-edge-admission'
+                and value.get('revision') == REVISION and value.get('verified') is True
+                and value.get('controller_sha256') == digest(Path(__file__).read_bytes())
+                and value.get('predecessor_controller_sha256') == PRIOR_CONTROLLER_SHA
+                and digest(read(PRIOR_CONTROLLER)) == PRIOR_CONTROLLER_SHA
+                and digest(read(self.prior / 'prepared.json')) == value.get('predecessor_prepared_sha256')
+                and digest(encoded(value['historical_state'])) == value.get('predecessor_state_sha256'), 'edge_admission_identity')
+        expected = copy.deepcopy(value['historical_state'])
+        if (self.root / 'state.json').exists():
+            state = self.state()
+            if state['chain_phase'] is not None:
+                expected.update(upgrade_successor=str(self.root), upgrade_successor_phase=state['chain_phase'])
+        require(self.activation.state() == expected, 'edge_admission_predecessor_changed')
+        require(self.boot() == value['boot'], 'edge_admission_boot_changed')
+        require(value.get('native_check', {}).get('verified') is True
+                and value['native_check'].get('container') == NEW_EDGE_ID
+                and re.fullmatch('[a-f0-9]{64}', value['native_check'].get('stdout_sha256', '')), 'edge_admission_native_check')
+        historical = self.historical_edge_snapshot(value['historical_state'], load(self.prior / 'prepared.json'))
+        require(historical == value['historical'], 'edge_admission_history_changed')
+        actual, raw = self.native_edge_snapshot()
+        require(actual == value['actual'], 'admitted_current_edge_changed')
+        return normalized_edge_delta(historical, actual, raw)
+
+    def admit_edge(self, path):
+        require(not self.root.exists() and Path(path).is_absolute() and Path(path).parent == Path(WORK), 'edge_admission_output')
+        self._native_edge_files = self.activation.edge_files
+        save(str(path) + '.intent.json', {'version': 1, 'operation': 'admit-edge', 'at': stamp(),
+             'maximum_attempts': 1, 'controller_sha256': digest(Path(__file__).read_bytes())})
+        self.safety()
+        state = self.activation.state()
+        require(state['phase'] == 'enabled' and state['edge_phase'] == 'published'
+                and not state.get('upgrade_successor'), 'edge_admission_predecessor_phase')
+        prepared = load(self.prior / 'prepared.json')
+        historical = self.historical_edge_snapshot(state, prepared)
+        actual, raw = self.native_edge_snapshot()
+        normalized_edge_delta(historical, actual, raw)
+        # Check current actual mounts/configuration in the running native image;
+        # preserve the historical check artifact byte-for-byte.
+        output = self.module.call(['docker', 'exec', actual['edge']['id'], '/usr/local/bin/oxibelt',
+            '--config', '/etc/oxibelt/config/oxibelt.toml', '--check'], timeout=45)
+        value = {'version': 1, 'kind': 'explicit-pdf2md-network-edge-admission', 'revision': REVISION,
+            'controller_sha256': digest(Path(__file__).read_bytes()), 'predecessor_controller_sha256': PRIOR_CONTROLLER_SHA,
+            'predecessor_state_sha256': digest(read(self.prior / 'state.json')),
+            'predecessor_prepared_sha256': digest(read(self.prior / 'prepared.json')),
+            'historical_state': state, 'historical': historical, 'actual': actual, 'boot': self.boot(),
+            'observed_at': stamp(), 'verified': True,
+            'native_check': {'verified': True, 'container': actual['edge']['id'], 'stdout_sha256': digest(output)}}
+        self.attach_edge_admission(None, value)
+        self.activation.guard()
+        self.verify_edge_admission()
+        self.edge_admission_fresh(value)
+        save(path, value)
+        save(str(path) + '.completed.json', {'version': 1, 'known_complete': True, 'sha256': digest(encoded(value))})
 
     @contextlib.contextmanager
     def locked(self):
@@ -366,8 +604,10 @@ class Controller:
         require(set(snapshot['pods']) == {'postgres', 'writer', 'backend'}
                 and snapshot['pods'] == prior_state['pods'], 'prior_process_changed')
         admitted = self.activation.snapshot()
-        for key in ('boot', 'foundation', 'profiles', 'edge', 'deployments', 'pods'):
+        for key in ('boot', 'foundation', 'profiles', 'deployments', 'pods'):
             require(snapshot[key] == admitted[key], 'prior_runtime_changed')
+        require(snapshot['edge'] == self.edge_admission_value['actual']['edge']
+                and admitted['edge'] == self.edge_admission_value['historical']['edge'], 'admitted_edge_projection')
         require(all(snapshot['secrets'].get(name) == value for name, value in admitted['secrets'].items()),
                 'prior_secret_boundary_changed')
         require(snapshot['deployments']['postgres']['image'] == PG_IMAGE
@@ -381,6 +621,8 @@ class Controller:
         state = self.state()
         prepared = load(self.root / 'prepared.json')
         require(digest(read(self.root / 'prepared.json')) == state['prepared_sha256'], 'prepared_changed')
+        if hasattr(self, 'edge_admission_reference'):
+            require(prepared.get('edge_admission') == self.edge_admission_reference, 'prepared_edge_admission_changed')
         self.admitted_prior(prepared['prior_artifacts'], allow_successor=True)
         expected_prior = copy.deepcopy(prepared['prior_state'])
         if state['chain_phase'] is not None:
@@ -421,6 +663,7 @@ class Controller:
         work = Path(WORK).stat()
         require(stat.S_ISDIR(work.st_mode) and work.st_uid == os.geteuid()
                 and not work.st_mode & 0o077, 'unsafe_private_directory')
+        self.edge_admission_fresh(self.edge_admission_value)
         self.safety()
         self.activation.guard()
         self.old.admit_storage_receipt()
@@ -429,15 +672,17 @@ class Controller:
         self.boundary_before_prepare(snapshot, state, prepared, completion)
         require(self.snapshot() == snapshot, 'capture_runtime_changed')
         inventory = {'version': 1, 'revision': REVISION, 'context': self.context,
-                     'captured_at': stamp(), 'snapshot': snapshot}
+                     'captured_at': stamp(), 'snapshot': snapshot, 'edge_admission': self.edge_admission_reference}
         plan = {'version': 1, 'context': self.context, 'store_binding_sha256': STORE_BINDING,
                 'preserve_application_passwords': True, 'target': target_identity(), 'prior': artifacts,
-                'inventory': {'path': str(inventory_path), 'sha256': digest(encoded(inventory))}}
+                'inventory': {'path': str(inventory_path), 'sha256': digest(encoded(inventory))},
+                'edge_admission': self.edge_admission_reference}
         save(inventory_path, inventory)
         save(plan_path, plan)
 
     def prepare(self):
         require(not self.root.exists() and not self.root.is_symlink(), 'bundle_already_exists')
+        self.edge_admission_fresh(self.edge_admission_value)
         self.guard()
         self.activation.guard()
         self.old.admit_storage_receipt()
@@ -445,7 +690,8 @@ class Controller:
         require(digest(inventory_raw) == self.plan['inventory']['sha256'], 'inventory_changed')
         inventory = json.loads(inventory_raw)
         require(inventory.get('version') == 1 and inventory.get('revision') == REVISION
-                and inventory.get('context') == self.context, 'inventory_identity')
+                and inventory.get('context') == self.context
+                and inventory.get('edge_admission') == self.plan['edge_admission'], 'inventory_identity')
         age = (dt.datetime.now(dt.timezone.utc) - instant(inventory.get('captured_at'))).total_seconds()
         require(-5 <= age <= 300, 'inventory_stale')
         artifacts, prior_state, prior_prepared, completion = self.admitted_prior(self.plan['prior'])
@@ -469,7 +715,7 @@ class Controller:
                     'secrets': secrets, 'edge': snapshot['edge'], 'foundation': snapshot['foundation'], 'boot': snapshot['boot'],
                     'old_anchor': self.module.read_json(self.old.bundle / 'state.json'), 'profiles': snapshot['profiles'],
                     'old_pods': pods, 'store_binding_sha256': STORE_BINDING,
-                    'prior_artifacts': artifacts, 'prior_state': prior_state,
+                    'prior_artifacts': artifacts, 'prior_state': prior_state, 'edge_admission': self.edge_admission_reference,
                     'config_hashes': {key: digest(encoded(value)) for key, value in configs.items()}}
         require(self.snapshot() == snapshot, 'prepare_runtime_changed')
         self.module.safe_directory(self.root.parent, create=True)
@@ -776,19 +1022,22 @@ class Controller:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bundle', default=BUNDLE)
-    parser.add_argument('--plan', required=True)
+    parser.add_argument('--plan')
     parser.add_argument('--context', required=True)
     parser.add_argument('--inventory')
+    parser.add_argument('--edge-admission')
+    parser.add_argument('--edge-admission-sha256')
     parser.add_argument('--approval')
     parser.add_argument('--approval-sha256')
     parser.add_argument('--receipt')
     parser.add_argument('--receipt-sha256')
-    parser.add_argument('operation', choices=('capture', 'prepare', 'stop', 'apply', 'start-writer', 'start-reader', 'runtime-ready', 'activate-existing', 'finish', 'withdraw'))
+    parser.add_argument('operation', choices=('admit-edge', 'capture', 'prepare', 'stop', 'apply', 'start-writer', 'start-reader', 'runtime-ready', 'activate-existing', 'finish', 'withdraw'))
     args = parser.parse_args()
     try:
         require(os.geteuid() == 0, 'root_required')
-        if args.operation == 'capture':
-            require(args.bundle == BUNDLE and args.inventory, 'capture_inputs')
+        if args.operation in ('admit-edge', 'capture'):
+            require(args.bundle == BUNDLE and args.edge_admission, 'edge_admission_inputs')
+            require(args.operation == 'admit-edge' or (args.inventory and args.plan and args.edge_admission_sha256), 'capture_inputs')
             controller = Controller.__new__(Controller)
             controller.root = Path(BUNDLE)
             controller.prior = Path(PRIOR_BUNDLE)
@@ -797,9 +1046,14 @@ def main():
             controller.base = controller.activation.base
             controller.module, controller.old = controller.base.module, controller.base.old
             with controller.locked():
-                controller.capture(Path(args.inventory), Path(args.plan))
-            print(json.dumps({'operation': 'capture', 'known_complete': True, 'private_data_export_allowed': False}))
+                if args.operation == 'admit-edge':
+                    controller.admit_edge(Path(args.edge_admission))
+                else:
+                    controller.attach_edge_admission({'path': args.edge_admission, 'sha256': args.edge_admission_sha256})
+                    controller.capture(Path(args.inventory), Path(args.plan))
+            print(json.dumps({'operation': args.operation, 'known_complete': True, 'private_data_export_allowed': False}))
         else:
+            require(args.plan, 'plan_required')
             controller = Controller(args.bundle, args.plan, args.context)
             with controller.locked():
                 controller.run(args.operation, args.approval, args.approval_sha256, args.receipt, args.receipt_sha256)

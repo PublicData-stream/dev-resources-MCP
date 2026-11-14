@@ -460,5 +460,188 @@ class LifecycleTests(Fixture):
         self.assertEqual(value['withheld_content_count'], 123)
 
 
+def edge_fixture():
+    value = {'services': {'oxibelt': {'networks': {'devres-net': {}}}},
+             'networks': {'devres-net': {'driver': 'bridge', 'name': 'devres-net'}}, 'fixture_padding': ''}
+    prefix = '# fixture\n'
+    value['fixture_padding'] = 'x' * (5204 - len((prefix + json.dumps(value, indent=2)).encode()))
+    old_raw = (prefix + json.dumps(value, indent=2)).encode()
+    current = copy.deepcopy(value)
+    current['services']['oxibelt']['networks']['pdf2md-net'] = {}
+    current['networks']['pdf2md-net'] = {'driver': 'bridge', 'name': 'pdf2md-net'}
+    raw = (prefix + json.dumps(current, indent=2) + '\n').encode()
+    edge = {'id': u.OLD_EDGE_ID, 'pid': 101, 'pid_start_ticks': '1001',
+            'started': '2026-11-13T12:00:00Z', 'restarts': 0, 'image': u.EDGE_IMAGE}
+    docker = {'id': u.OLD_EDGE_ID, 'image': u.EDGE_IMAGE, 'restart_count': 0, 'health': 'healthy',
+        'config': {'Hostname': u.OLD_EDGE_ID[:12], 'Env': ['SAFE=fixture'],
+            'Labels': {'com.docker.compose.config-hash': u.OLD_COMPOSE_CONFIG,
+                       'com.docker.compose.version': '5.7.0'}, 'User': '65532', 'Entrypoint': ['/oxibelt']},
+        'host_config': {'Dns': [], 'DnsOptions': [], 'DnsSearch': [], 'Privileged': False,
+                       'NetworkMode': 'devres-net', 'ReadonlyRootfs': True},
+        'mounts': [{'Source': '/serve/config', 'Destination': '/etc/config', 'RW': False}],
+        'ports': {'443/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '443'}]},
+        'networks': {'devres-net': {'IPAddress': '10.0.0.3', 'IPPrefixLen': 16, 'Gateway': '10.0.0.1',
+            'MacAddress': u.OLD_DEVRES_MAC, 'DNSNames': ['oxibelt', u.OLD_EDGE_ID[:12]], 'Aliases': ['oxibelt']}}}
+    files = {u.EDGE_COMPOSE: {'uid': 0, 'gid': 0, 'mode': 0o600, 'device': 1, 'inode': 100,
+                'kind': 'file', 'size': 5204, 'mtime_ns': 1, 'sha256': u.digest(old_raw)},
+             '/serve/oxibelt.toml': {'uid': 0, 'gid': 0, 'mode': 0o600, 'kind': 'file', 'sha256': 'a' * 64}}
+    historical = {'edge': edge, 'docker': docker, 'files': files}
+    actual = copy.deepcopy(historical)
+    actual['edge'] = {'id': u.NEW_EDGE_ID, 'pid': 1898071, 'pid_start_ticks': '12826648',
+        'started': '2026-11-14T12:18:56.706543666Z', 'restarts': 0, 'image': u.EDGE_IMAGE}
+    after = actual['docker']
+    after['id'] = u.NEW_EDGE_ID
+    after['config']['Hostname'] = u.NEW_EDGE_ID[:12]
+    after['config']['Labels'].update({'com.docker.compose.config-hash': u.NEW_COMPOSE_CONFIG,
+                                      'com.docker.compose.version': '5.7.1'})
+    for name in ('Dns', 'DnsOptions', 'DnsSearch'):
+        after['host_config'][name] = None
+    after['networks']['devres-net']['MacAddress'] = u.NEW_DEVRES_MAC
+    after['networks']['devres-net']['DNSNames'] = ['oxibelt', u.NEW_EDGE_ID[:12]]
+    after['networks']['pdf2md-net'] = copy.deepcopy(u.PDF_NETWORK)
+    actual['files'][u.EDGE_COMPOSE].update({'inode': 101, 'mtime_ns': 2, 'size': 5311, 'sha256': u.digest(raw)})
+    actual['networks'] = {}
+    for name, subnet, gateway, address, mac in (
+            ('devres-net', '10.0.0.0/16', '10.0.0.1', '10.0.0.3/16', u.NEW_DEVRES_MAC),
+            ('pdf2md-net', '172.19.0.0/16', '172.19.0.1', '172.19.0.2/16', u.PDF_NETWORK['MacAddress'])):
+        actual['networks'][name] = {'Name': name, 'Id': u.NETWORK_IDS[name], 'Driver': 'bridge', 'Scope': 'local',
+            'EnableIPv6': False, 'Internal': False, 'ConfigOnly': False, 'Ingress': False,
+            'IPAM': {'Config': [{'Gateway': gateway, 'Subnet': subnet}], 'Driver': 'default', 'Options': None},
+            'Options': {'com.docker.network.bridge.name': 'devres-edge0'} if name == 'devres-net' else {},
+            'Labels': {'com.docker.compose.config-hash': u.NETWORK_LABEL_HASHES[name], 'com.docker.compose.network': name,
+                       'com.docker.compose.project': 'serve', 'com.docker.compose.version': '5.7.0' if name == 'devres-net' else '5.7.1'},
+            'edge_member': {'Name': 'oxibelt', 'MacAddress': mac, 'IPv4Address': address, 'IPv6Address': '', 'EndpointID': u.NETWORK_ENDPOINTS[name]}}
+    return historical, actual, old_raw, raw
+
+
+class EdgeAdmissionTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.historical, self.actual, self.old_raw, self.raw = edge_fixture()
+        for name, value in (('OLD_COMPOSE_SHA', u.digest(self.old_raw)), ('NEW_COMPOSE_SHA', u.digest(self.raw)), ('WORK', str(self.top))):
+            p = patch.object(u, name, value); p.start(); self.addCleanup(p.stop)
+        self.c.root = self.top / 'not-yet-prepared'
+        prior_state = u.load(self.prior / 'state.json')
+        prior_state['edge'] = self.historical['edge']
+        prepared = u.load(self.prior / 'prepared.json')
+        prepared['edge_docker'] = self.historical['docker']
+        prepared['edge_base_files'] = self.historical['files']
+        prior_state['prepared_sha256'] = private(self.prior / 'prepared.json', prepared)
+        private(self.prior / 'state.json', prior_state)
+        self.c.activation.edge_files = lambda: copy.deepcopy(self.actual['files'])
+        self.c.native_edge_snapshot = lambda: (copy.deepcopy(self.actual), self.raw)
+        self.c.edge = lambda: copy.deepcopy(self.actual['edge'])
+        self.c.module.call = Mock(return_value=b'native check passed')
+        self.value = {'version': 1, 'kind': 'explicit-pdf2md-network-edge-admission', 'revision': u.REVISION,
+            'controller_sha256': u.digest(Path(u.__file__).read_bytes()),
+            'predecessor_controller_sha256': u.PRIOR_CONTROLLER_SHA,
+            'predecessor_state_sha256': u.digest(u.read(self.prior / 'state.json')),
+            'predecessor_prepared_sha256': u.digest(u.read(self.prior / 'prepared.json')),
+            'historical_state': prior_state, 'historical': self.historical, 'actual': copy.deepcopy(self.actual),
+            'boot': self.c.boot(), 'verified': True, 'observed_at': u.stamp(),
+            'native_check': {'verified': True, 'container': u.NEW_EDGE_ID, 'stdout_sha256': 'b' * 64}}
+
+    def test_exact_network_change_normalizes_only_allowed_fields(self):
+        normalized = u.normalized_edge_delta(self.historical, self.actual, self.raw)
+        self.assertEqual(normalized, self.historical)
+        self.assertIn('pdf2md-net', self.actual['docker']['networks'])
+        self.assertEqual(self.actual['edge']['id'], u.NEW_EDGE_ID)
+
+    def test_unlisted_docker_security_and_credentials_changes_are_rejected(self):
+        changes = [lambda a: a['docker']['config']['Env'].append('AWS_SECRET_ACCESS_KEY=fixture'),
+                   lambda a: a['docker']['host_config'].__setitem__('Privileged', True),
+                   lambda a: a['docker']['mounts'][0].__setitem__('RW', True),
+                   lambda a: a['docker']['ports'].__setitem__('5432/tcp', []),
+                   lambda a: a['docker']['networks']['devres-net'].__setitem__('IPAddress', '10.0.0.9'),
+                   lambda a: a['docker'].__setitem__('image', 'unadmitted-image')]
+        for change in changes:
+            current = copy.deepcopy(self.actual); change(current)
+            with self.subTest(change=change), self.assertRaises(u.Error):
+                u.normalized_edge_delta(self.historical, current, self.raw)
+
+    def test_both_old_and_current_compose_labels_are_exact(self):
+        for side in ('old', 'current'):
+            old, current = copy.deepcopy(self.historical), copy.deepcopy(self.actual)
+            selected = old if side == 'old' else current
+            selected['docker']['config']['Labels']['com.docker.compose.config-hash'] = 'c' * 64
+            with self.assertRaisesRegex(u.Error, 'compose_runtime_label_delta'):
+                u.normalized_edge_delta(old, current, self.raw)
+
+    def test_nonapproved_network_id_subnet_or_endpoint_is_rejected(self):
+        changes = [lambda a: a['networks']['pdf2md-net'].__setitem__('Id', 'c' * 64),
+                   lambda a: a['networks']['pdf2md-net']['IPAM']['Config'][0].__setitem__('Subnet', '0.0.0.0/0'),
+                   lambda a: a['networks']['devres-net']['edge_member'].__setitem__('MacAddress', '02:00:00:00:00:01'),
+                   lambda a: a['docker']['networks'].__setitem__('extra-network', {}),
+                   lambda a: a['networks']['pdf2md-net']['Options'].__setitem__('com.docker.network.bridge.enable_icc', 'true'),
+                   lambda a: a['networks']['devres-net']['edge_member'].__setitem__('EndpointID', 'e' * 64)]
+        for change in changes:
+            current = copy.deepcopy(self.actual); change(current)
+            with self.subTest(change=change), self.assertRaises(u.Error):
+                u.normalized_edge_delta(self.historical, current, self.raw)
+
+    def test_reconstructed_historical_compose_must_match_exact_bytes(self):
+        changed = self.raw.replace(b'fixture_padding', b'different_field')
+        with self.assertRaises(u.Error):
+            u.normalized_edge_delta(self.historical, self.actual, changed)
+        with patch.object(u, 'OLD_COMPOSE_SHA', 'f' * 64):
+            with self.assertRaisesRegex(u.Error, 'historical_compose_reconstruction'):
+                u.normalized_edge_delta(self.historical, self.actual, self.raw)
+
+    def test_changed_base_file_permissions_are_not_normalized(self):
+        self.actual['files'][u.EDGE_COMPOSE]['mode'] = 0o666
+        with self.assertRaisesRegex(u.Error, 'compose_file_security_changed'):
+            u.normalized_edge_delta(self.historical, self.actual, self.raw)
+
+    def test_adapters_preserve_actual_controller_snapshots(self):
+        self.c.attach_edge_admission(None, self.value)
+        self.assertEqual(self.c.activation.edge_files(), self.historical['files'])
+        self.assertEqual(self.c.activation.edge_docker(), self.historical['docker'])
+        self.assertEqual(self.c.base.edge(), self.historical['edge'])
+        self.assertEqual(self.c.edge(), self.actual['edge'])
+        self.assertEqual(self.c.snapshot()['edge'], self.actual['edge'])
+
+    def test_every_adapter_refuses_second_runtime_drift(self):
+        self.c.attach_edge_admission(None, self.value)
+        self.actual['docker']['config']['Env'].append('UNADMITTED=true')
+        for adapter in (self.c.activation.edge_files, self.c.activation.edge_docker, self.c.base.edge):
+            with self.assertRaisesRegex(u.Error, 'admitted_current_edge_changed'):
+                adapter()
+
+    def test_different_controller_or_predecessor_cannot_use_receipt(self):
+        for field in ('controller_sha256', 'predecessor_prepared_sha256', 'predecessor_controller_sha256'):
+            value = copy.deepcopy(self.value); value[field] = 'e' * 64
+            with self.subTest(field=field), self.assertRaisesRegex(u.Error, 'edge_admission_identity'):
+                self.c.attach_edge_admission(None, value)
+
+    def test_admission_artifact_is_rehashed_before_each_adapter(self):
+        path = self.top / 'admission.json'
+        reference = {'path': str(path), 'sha256': private(path, self.value)}
+        self.c.attach_edge_admission(reference)
+        private(path, {'tampered': True})
+        with self.assertRaisesRegex(u.Error, 'edge_admission_changed'):
+            self.c.base.edge()
+
+    def test_old_admission_is_rejected_for_capture_and_prepare(self):
+        value = copy.deepcopy(self.value)
+        value['observed_at'] = (u.utc_now() - dt.timedelta(seconds=301)).isoformat()
+        self.c.attach_edge_admission(None, value)
+        with self.assertRaisesRegex(u.Error, 'edge_admission_stale'):
+            self.c.edge_admission_fresh(value)
+
+    def test_admission_generator_checks_native_config_once_and_preserves_history(self):
+        before = {p.name: p.read_bytes() for p in self.prior.iterdir()}
+        path = self.top / 'current-edge-admission.json'
+        self.c.admit_edge(path)
+        value = u.load(path)
+        self.assertEqual(value['actual']['edge'], self.actual['edge'])
+        self.c.module.call.assert_called_once_with(['docker', 'exec', u.NEW_EDGE_ID, '/usr/local/bin/oxibelt',
+            '--config', '/etc/oxibelt/config/oxibelt.toml', '--check'], timeout=45)
+        self.c.activation.guard.assert_called_once()
+        self.assertEqual({p.name: p.read_bytes() for p in self.prior.iterdir()}, before)
+        with self.assertRaises(FileExistsError):
+            self.c.admit_edge(path)
+        self.c.module.call.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

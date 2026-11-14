@@ -33,7 +33,11 @@ cluster, edge, capacity and emergency-stop checks remain in force.
 1. Complete contributor checks and independent MCP/API, Upstream/Storage and
    Security Boundary review of the actual controller, checkpoint and operational
    proof sources. Preserve exact-release hosted native CI evidence separately.
-2. Install reviewed sources root-private. Capture and prepare a fresh inventory
+2. Install reviewed sources root-private. The explicitly confirmed shared-edge
+   successor retains `pdf2md-net`. Run `admit-edge` to prove its exact compose
+   delta, unchanged edge image/security/configuration and current process/network
+   identities. Preserve the historical activation journal and require this
+   immutable proof for capture and every later guard. Capture and prepare a fresh inventory
    within 300 seconds. The controller freezes the actual predecessor chain,
    process/security projections, namespace Secrets and candidate configurations.
 3. Obtain one bounded authenticated read of the existing S3 store claim with the
