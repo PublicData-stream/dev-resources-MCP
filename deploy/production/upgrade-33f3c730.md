@@ -85,6 +85,26 @@ After migration begins, failures stop the application roles and preserve all new
 state. There is no old-image hot swap, automatic restore or schema decrement.
 Any later recovery must preserve post-upgrade permanent evidence.
 
+### Preserving writer-cache recovery
+
+The target's local archive scan admits at most 262,144 ordinary file paths and
+excludes mutable `history.git`/`registry.git` trees. Byte capacity alone therefore
+does not establish startup feasibility. The observed writer cache contained
+262,147 counted files. Its failed start committed schema 18; both application
+roles were then withdrawn without reverting database state.
+
+`cache_resume_33f3c730.py` provides a separately reviewed forward recovery from
+that exact withdrawn state. Its source/prepared/state-bound approval admits one
+rotation and one start attempt. `prepare` inventories the whole original cache
+and permanent SQL manifests; `rotate` retains that directory in a root-private
+journal, recreates the same cache path with its original UID/GID/mode, and copies
+the 32 mutable Git trees without executing their contents. The old cache remains
+intact. A successful `start` proves the same target writer is Ready before
+returning the original lifecycle to `writer_ready`. It does not change permanent
+S3 objects, corpus SQL, configuration, provider budgets or the release's limits.
+Failure fencing uses new recovery-specific intents; uncertain attempts cannot
+replay the original failed start or withdrawal.
+
 Never retain caller lockfiles, dependency inventories or audit reports in these
 artifacts. Root-private operational evidence must not enter Git; publish only
 sanitized results, hashes and explicit verification limits.
