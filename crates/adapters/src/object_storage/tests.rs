@@ -28,6 +28,8 @@ struct Fixture {
     credential_requests: usize,
     stall_credentials: bool,
     credential_ttl_secs: Option<u64>,
+    credential_delay: Option<Duration>,
+    credential_started: Option<Arc<tokio::sync::Notify>>,
 }
 
 fn response(status: u16, body: impl Into<Body>) -> Response {
@@ -62,9 +64,23 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
     let body = to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
         .unwrap();
-    let stall_credentials = state.lock().unwrap().stall_credentials;
-    if path == "/credentials" && stall_credentials {
-        return std::future::pending().await;
+    let (stall_credentials, credential_delay) = {
+        let mut state = state.lock().unwrap();
+        if path == "/credentials" {
+            state.credential_requests += 1;
+            if let Some(started) = &state.credential_started {
+                started.notify_one();
+            }
+        }
+        (state.stall_credentials, state.credential_delay)
+    };
+    if path == "/credentials" {
+        if stall_credentials {
+            return std::future::pending().await;
+        }
+        if let Some(delay) = credential_delay {
+            tokio::time::sleep(delay).await;
+        }
     }
     let mut state = state.lock().unwrap();
     state.methods.push(method.clone());
@@ -83,7 +99,6 @@ async fn handler(State(state): State<Arc<Mutex<Fixture>>>, request: Request) -> 
             .unwrap();
     }
     if path == "/credentials" {
-        state.credential_requests += 1;
         assert_eq!(authorization.as_ref().unwrap(), "fixture-auth");
         let expiration = if state.credentials_expired {
             "2020-01-01T00:00:00Z".to_owned()
@@ -687,6 +702,128 @@ async fn scaleway_pair_is_cached_then_refreshed_before_expiry() {
         .await
         .unwrap();
     assert_eq!(cached.access_key_id(), "still-valid");
+}
+
+fn delayed_credential_provider(
+    server: &Server,
+    expiry: std::time::SystemTime,
+) -> (ExplicitCredentials, Arc<tokio::sync::Notify>) {
+    let started = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = server.state.lock().unwrap();
+        state.credential_delay = Some(Duration::from_secs(3));
+        state.credential_started = Some(started.clone());
+    }
+    let token = server._directory.path().join("delayed-identity");
+    std::fs::write(&token, "fixture-auth").unwrap();
+    let provider = ExplicitCredentials {
+        source: S3Credentials::Container {
+            endpoint: format!("{}/credentials", server.endpoint),
+            authorization_token_file: Some(token),
+            allow_http: true,
+            ca_file: None,
+            refresh_before_secs: 300,
+        },
+        region: "us-east-1".into(),
+        identity_client: Some(http_client(None).unwrap()),
+        container_cache: Default::default(),
+    };
+    *provider.container_cache.value.lock().unwrap() = Some(Credentials::new(
+        "still-valid",
+        "cached-secret",
+        None,
+        Some(expiry),
+        "fixture",
+    ));
+    (provider, started)
+}
+
+#[tokio::test]
+async fn delayed_successful_refresh_survives_cached_key_fallback() {
+    let server = Server::new().await;
+    let (provider, _) = delayed_credential_provider(
+        &server,
+        std::time::SystemTime::now() + Duration::from_secs(100),
+    );
+    let started = tokio::time::Instant::now();
+    let (first, second, third) = tokio::join!(
+        provider.cached_load(),
+        provider.cached_load(),
+        provider.cached_load()
+    );
+    for result in [first, second, third] {
+        assert_eq!(
+            result.unwrap().access_key_id(),
+            "still-valid",
+            "concurrent callers keep their valid key during one delayed renewal"
+        );
+    }
+    assert_eq!(server.state.lock().unwrap().credential_requests, 1);
+    // The admitted successful response outlives the caller's two-second wait.
+    tokio::time::sleep_until(started + Duration::from_secs(4)).await;
+    server.state.lock().unwrap().credential_delay = None;
+    let renewed = provider.cached_load().await.unwrap();
+    assert_eq!(renewed.access_key_id(), "fixture-key");
+    assert_eq!(
+        server.state.lock().unwrap().credential_requests,
+        1,
+        "the completed renewal must populate the cache without a second issuance"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_credential_waiter_does_not_abort_shared_refresh() {
+    let server = Server::new().await;
+    let (provider, admitted) = delayed_credential_provider(
+        &server,
+        std::time::SystemTime::now() + Duration::from_secs(100),
+    );
+    let waiter_provider = provider.clone();
+    let waiter = tokio::spawn(async move { waiter_provider.cached_load().await });
+    tokio::time::timeout(Duration::from_secs(5), admitted.notified())
+        .await
+        .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    server.state.lock().unwrap().credential_delay = None;
+    assert_eq!(
+        provider.cached_load().await.unwrap().access_key_id(),
+        "fixture-key"
+    );
+    assert_eq!(
+        server.state.lock().unwrap().credential_requests,
+        1,
+        "cancelling a signer must retain the admitted refresh owner"
+    );
+}
+
+#[tokio::test]
+async fn expired_cached_key_is_not_returned_while_shared_refresh_is_pending() {
+    let server = Server::new().await;
+    let (provider, admitted) = delayed_credential_provider(
+        &server,
+        std::time::SystemTime::now() - Duration::from_secs(1),
+    );
+    let first = provider
+        .cached_load_until(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await;
+    assert_eq!(first.unwrap_err().code, "unavailable");
+    tokio::time::timeout(Duration::from_secs(5), admitted.notified())
+        .await
+        .unwrap();
+    let second = provider
+        .cached_load_until(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await;
+    assert_eq!(second.unwrap_err().code, "unavailable");
+    assert_eq!(server.state.lock().unwrap().credential_requests, 1);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    server.state.lock().unwrap().credential_delay = None;
+    assert_eq!(
+        provider.cached_load().await.unwrap().access_key_id(),
+        "fixture-key"
+    );
+    assert_eq!(server.state.lock().unwrap().credential_requests, 1);
 }
 
 #[tokio::test]

@@ -522,6 +522,12 @@ Both identity modes support their own optional
 fall through to profiles, instance metadata, external credential commands, or
 another identity source. Keep secret values out of TOML and process arguments.
 
+Container credentials share one refresh per cache, bounded to 15 seconds. A caller
+with a cached key valid for more than five seconds waits at most two seconds for
+refresh before using that key. Cancelling or timing out the caller leaves the
+shared refresh running within its bound, so a delayed successful response can
+populate the cache. Expired or nearly expired keys never provide this fallback.
+
 Static Scaleway IAM pairs use the existing `files` mode with separate serving
 read-only and writer read/write key files. The optional production deployment
 profile, permission templates, restart-based rotation, and acceptance gates are

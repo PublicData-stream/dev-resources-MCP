@@ -380,7 +380,7 @@ struct ExplicitCredentials {
 #[derive(Default)]
 struct ContainerCache {
     value: std::sync::Mutex<Option<Credentials>>,
-    refresh: tokio::sync::Mutex<()>,
+    refresh: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 impl std::fmt::Debug for ExplicitCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -433,9 +433,9 @@ impl ExplicitCredentials {
         {
             return Ok(value.clone());
         }
-        // A concurrent signer can keep using the valid current key while another
-        // signer refreshes it. No async network wait holds the value mutex.
-        let _refresh = match self.container_cache.refresh.try_lock() {
+        // One cache-owned refresh survives a cancelled or impatient waiter.
+        // Concurrent signers keep using an old key only while it remains valid.
+        let refresh = match self.container_cache.refresh.clone().try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => {
                 if let Some(value) = cached.as_ref()
@@ -443,9 +443,14 @@ impl ExplicitCredentials {
                 {
                     return Ok(value.clone());
                 }
-                tokio::time::timeout_at(deadline, self.container_cache.refresh.lock())
-                    .await
-                    .map_err(|_| unavailable())?
+                let _refresh =
+                    tokio::time::timeout_at(deadline, self.container_cache.refresh.lock())
+                        .await
+                        .map_err(|_| unavailable())?;
+                return self
+                    .cached_value()?
+                    .filter(|value| usable(value, 5))
+                    .ok_or_else(unavailable);
             }
         };
         let cached = self.cached_value()?;
@@ -454,33 +459,37 @@ impl ExplicitCredentials {
         {
             return Ok(value.clone());
         }
-        // Health checks have a five-second total budget. A still-valid key must
-        // remain usable when identity resolution hangs, so refresh gets two
-        // seconds and leaves the rest of that budget for the actual S3 request.
-        let deadline = if cached.as_ref().is_some_and(|value| usable(value, 5)) {
+        // Health still waits at most two seconds before falling back to a valid
+        // key. That waiter budget must not cancel an admitted credential issuance.
+        let wait_deadline = if cached.as_ref().is_some_and(|value| usable(value, 5)) {
             deadline.min(tokio::time::Instant::now() + Duration::from_secs(2))
         } else {
             deadline
         };
-        // Timeouts enter the same fallback path as other refresh failures. The
-        // cache guard stays owned until that decision, then releases on return.
-        match tokio::time::timeout_at(deadline, self.load())
-            .await
-            .unwrap_or_else(|_| Err(unavailable()))
-        {
-            Ok(value) => {
-                *self
-                    .container_cache
-                    .value
-                    .lock()
-                    .map_err(|_| unavailable())? = Some(value.clone());
-                Ok(value)
-            }
+        let owner = self.clone();
+        let renewal = tokio::spawn(async move {
+            let _refresh = refresh;
+            let value = tokio::time::timeout(Duration::from_secs(15), owner.load())
+                .await
+                .map_err(|_| unavailable())??;
+            *owner
+                .container_cache
+                .value
+                .lock()
+                .map_err(|_| unavailable())? = Some(value.clone());
+            Ok(value)
+        });
+        // Dropping a JoinHandle detaches the single bounded owner; it does not
+        // abort the request and turn a healthy slow response into an unknown create.
+        let result = match tokio::time::timeout_at(wait_deadline, renewal).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(unavailable()),
+        };
+        match result {
+            Ok(value) => Ok(value),
             Err(error) => {
                 if let Some(value) = cached.as_ref()
-                    && value.expiry().is_some_and(|expiry| {
-                        expiry > std::time::SystemTime::now() + Duration::from_secs(5)
-                    })
+                    && usable(value, 5)
                 {
                     return Ok(value.clone());
                 }
