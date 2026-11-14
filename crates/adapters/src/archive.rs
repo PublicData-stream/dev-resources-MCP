@@ -329,6 +329,61 @@ pub fn advisory_files(
     Ok(files)
 }
 
+/// Attribution needs notices outside advisory directories too. Validate the
+/// whole immutable Git archive before returning any inert member bytes.
+pub(crate) fn rustsec_attribution_files(
+    bytes: &[u8],
+    checksum: &str,
+    revision: &str,
+    deadline: Instant,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let root = format!("advisory-db-{revision}");
+    inspect_until(bytes, checksum, &root, None, deadline, Some(revision))?;
+    let decoder = MultiGzDecoder::new(bytes);
+    let budget = BudgetReader {
+        inner: decoder,
+        remaining: MAX_EXPANDED,
+        deadline,
+    };
+    let mut archive = tar::Archive::new(budget);
+    let mut files = Vec::new();
+    let mut retained = 0usize;
+    for entry in archive
+        .entries()
+        .map_err(|_| Error::integrity("Invalid RustSec archive."))?
+    {
+        let mut entry = entry.map_err(|_| Error::integrity("Invalid RustSec archive member."))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if entry.size() > MAX_SELECTED {
+            return Err(Error::capacity("RustSec attribution member exceeds 4 MiB."));
+        }
+        let path = entry.path_bytes();
+        let path = std::str::from_utf8(&path)
+            .map_err(|_| Error::integrity("Invalid RustSec archive path."))?;
+        let path = path
+            .strip_prefix(&root)
+            .and_then(|v| v.strip_prefix('/'))
+            .ok_or_else(|| Error::integrity("Invalid RustSec archive root."))?
+            .to_owned();
+        let mut body = Vec::new();
+        entry
+            .by_ref()
+            .take(MAX_SELECTED + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| Error::integrity("Could not read RustSec attribution member."))?;
+        retained = retained.saturating_add(body.len());
+        if body.len() as u64 != entry.size() || retained > 64 * 1024 * 1024 {
+            return Err(Error::capacity(
+                "RustSec attribution members exceed their bound.",
+            ));
+        }
+        files.push((path, body));
+    }
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

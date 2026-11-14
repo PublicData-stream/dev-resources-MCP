@@ -48,6 +48,17 @@ impl HttpFetcher {
     }
     pub fn with_broker(broker: std::sync::Arc<crate::bulk::BulkBroker>) -> Result<Self> {
         let mut fetcher = Self::new()?;
+        #[cfg(test)]
+        if let Some(origin) = broker.fixture_origin() {
+            fetcher.test_origin = Some(origin);
+            fetcher.client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|_| Error::unavailable("Fixture HTTP initialization failed"))?;
+        }
         fetcher.broker = Some(broker);
         Ok(fetcher)
     }

@@ -359,6 +359,10 @@ pub struct BulkBroker {
 }
 impl BulkBroker {
     #[cfg(test)]
+    pub(crate) fn fixture_origin(&self) -> Option<url::Url> {
+        self.test_origin.clone()
+    }
+    #[cfg(test)]
     pub(crate) fn fixture(origin: url::Url) -> Result<Self> {
         if origin.scheme() != "http" || origin.host_str() != Some("127.0.0.1") {
             return Err(Error::invalid("Fixture broker requires loopback HTTP."));

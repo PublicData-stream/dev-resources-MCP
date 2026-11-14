@@ -15,6 +15,8 @@ use std::{collections::BTreeMap, io::Read, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+mod rustsec;
+
 const MAX_SOURCE: usize = 32 * 1024 * 1024;
 const MAX_NOTICE: usize = 1024 * 1024;
 const MAX_TARGETS: usize = 256;
@@ -1374,9 +1376,32 @@ pub async fn repair(
     broker: &Arc<BulkBroker>,
     cancel: CancellationToken,
 ) -> Result<AttributionGeneration> {
-    repair_inner(target, broker, cancel)
+    let generation = repair_inner(target, broker, cancel)
         .await
-        .map_err(qualification_error)
+        .map_err(qualification_error)?;
+    #[cfg(test)]
+    let generation = if broker.fixture_origin().is_some() {
+        // Loopback fixtures still traverse exact acquisition and notice checks;
+        // their receipts must never claim an actual upstream validation.
+        let mut generation = generation;
+        for notice in &mut generation.notices {
+            notice.evidence["synthetic"] = json!(true);
+        }
+        for receipt in &mut generation.receipts {
+            if receipt["kind"] == "dependency_generation"
+                || receipt["kind"] == "retained_subject_binding"
+            {
+                continue;
+            }
+            receipt["kind"] = json!("synthetic_fixture_validation");
+            receipt["synthetic"] = json!(true);
+            receipt["source_fingerprint"] = json!(target.subject.fingerprint);
+        }
+        generation
+    } else {
+        generation
+    };
+    Ok(generation)
 }
 async fn repair_inner(
     target: &AttributionTarget,
@@ -1435,6 +1460,9 @@ async fn repair_inner(
         return Err(invalid());
     }
     let mut receipts = Vec::new();
+    if p == "rustsec" && rustsec::supported(source) {
+        return rustsec::repair(target, broker, cancel).await;
+    }
     let git_path = source_path(source)
         .ok()
         .filter(|path| git_source(p, source, path).is_ok());
