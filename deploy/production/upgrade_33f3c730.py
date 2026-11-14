@@ -71,6 +71,33 @@ NETWORK_FIELDS = ('Name', 'Id', 'Driver', 'Scope', 'EnableIPv6', 'Internal', 'IP
     'Options', 'Labels', 'ConfigOnly', 'Ingress')
 
 
+EDGE_CONF = Path('/serve/oxibelt-conf')
+# Only these already-authorized metadata/content differences may be reversed.
+CONF_FILE_RULES = {
+    '10-tls.toml': {'inode': 13107217, 'old_size': 1210, 'new_size': 1210,
+        'old_sha': PROFILE_SHA, 'new_sha': PROFILE_SHA, 'old_mtime': 1794378633630782462,
+        'new_mtime': 1794658726895668662},
+    '20-proxy.toml': {'inode': 13107240, 'old_size': 1146, 'new_size': 1116,
+        'old_sha': 'a2894792a6761e22c1c4921e90d24530012dea0dfba94af2244123f8cd5673c2',
+        'new_sha': 'bd544f46640edab8890ac677f1d100ab807e9a1d20959c5143ea83db750d89d7',
+        'new_mtime': 1794632754921703091},
+    '40-compression.toml': {'inode': 13107210, 'old_size': 955, 'new_size': 835,
+        'old_sha': 'ecf63a7dd2284f41786d5fb6e37016a556b92b7a8a9f24807e29893a539c5c',
+        'new_sha': 'cf0c5b06bd104166990173e6e3abd931b8f80dd2ae19dcb5c839110cbd585a29',
+        'new_mtime': 1794632318220912288},
+    '62-route-devres.toml': {'inode': 13107219, 'old_size': 759, 'new_size': 763,
+        'old_sha': 'a417bdae885508b4895125c37b18021236100141ecbeea4f95418c788afacb7b',
+        'new_sha': '31071b3d409cf2895356af672a5b0a0e0cb50aa243bdb2b3cd05dbba6dd4fa6c',
+        'new_mtime': 1794632495354418998}}
+CURRENT_COMPRESSION = {'compression': {'enabled': True, 'gzip': True, 'deflate': False,
+    'zstd': True, 'br': True, 'min_size_bytes': 256, 'statuses': [200],
+    'mime_types': ['text/*', 'application/json', 'application/*+json', 'application/javascript',
+        'application/xml', 'application/*+xml', 'application/xhtml+xml', 'application/rss+xml',
+        'application/atom+xml', 'font/opentype', 'font/ttf', 'font/eot', 'font/otf', 'image/svg+xml'],
+    'level': 5, 'vary': True, 'proxied': ['any'], 'upstream_accept_encoding': 'strip',
+    'max_concurrent_responses': 0}}
+
+
 class Error(RuntimeError):
     pass
 
@@ -244,6 +271,66 @@ def compose_delta(raw):
             and raw == (text[:index] + json.dumps(value, indent=2) + '\n').encode(), 'historical_compose_reconstruction')
 
 
+def public_config_read(path, size, sha):
+    path = Path(path)
+    require(path.is_absolute() and not any(p.is_symlink() for p in (path, *path.parents)), 'public_config_path')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0 and info.st_nlink == 1
+                and info.st_size == size and not info.st_mode & 0o022 and size <= 65536, 'public_config_permissions')
+        raw = stream.read(65537)
+        require(len(raw) == size and digest(raw) == sha, 'public_config_identity')
+    return raw
+
+
+def normalized_conf_delta(historical, actual):
+    old_tree, new_tree = historical['conf_tree'], actual['conf_tree']
+    require(set(old_tree) == set(new_tree), 'unlisted_conf_tree_entry')
+    normalized = copy.deepcopy(new_tree)
+    for name, rule in CONF_FILE_RULES.items():
+        before, after = old_tree[name], new_tree[name]
+        require(set(before) == set(after)
+                and all(before[k] == v and after[k] == v for k, v in
+                    {'uid': 0, 'gid': 0, 'mode': 0o644, 'device': 2305, 'inode': rule['inode'], 'kind': 'file'}.items())
+                and before['size'] == rule['old_size'] and before['sha256'] == rule['old_sha']
+                and after['size'] == rule['new_size'] and after['sha256'] == rule['new_sha']
+                and after['mtime_ns'] == rule['new_mtime'], 'authorized_conf_file_delta')
+        if 'old_mtime' in rule:
+            require(before['mtime_ns'] == rule['old_mtime'], 'historical_tls_metadata_changed')
+        expected = copy.deepcopy(before)
+        expected.update(size=rule['new_size'], sha256=rule['new_sha'], mtime_ns=rule['new_mtime'])
+        require(after == expected, 'unlisted_conf_file_metadata')
+        for key in ('size', 'sha256', 'mtime_ns'):
+            normalized[name][key] = before[key]
+    require(normalized == old_tree, 'unlisted_conf_tree_delta')
+    contents = actual['conf_contents']
+    require(set(contents) == {'20-proxy.toml', '40-compression.toml', '62-route-devres.toml'}
+            and set(historical['conf_preimages']) == {'20-proxy.toml', '62-route-devres.toml'}, 'conf_content_set')
+    current, prior = {}, {}
+    for name, text in contents.items():
+        raw = base64.b64decode(text, validate=True)
+        rule = CONF_FILE_RULES[name]
+        require(len(raw) == rule['new_size'] and digest(raw) == rule['new_sha'], 'current_conf_content_changed')
+        current[name] = tomllib.loads(raw.decode())
+    for name, text in historical['conf_preimages'].items():
+        raw = base64.b64decode(text, validate=True)
+        rule = CONF_FILE_RULES[name]
+        require(len(raw) == rule['old_size'] and digest(raw) == rule['old_sha'], 'historical_conf_preimage_changed')
+        prior[name] = tomllib.loads(raw.decode())
+    expected_proxy = copy.deepcopy(prior['20-proxy.toml'])
+    require(expected_proxy.pop('compression', None) == {'enabled': False}, 'historical_proxy_compression')
+    require(encoded(current['20-proxy.toml']) == encoded(expected_proxy), 'unlisted_proxy_semantic_delta')
+    expected_route = copy.deepcopy(prior['62-route-devres.toml'])
+    require(expected_route['routes'][0]['compression'] == 'off', 'historical_route_compression')
+    expected_route['routes'][0]['compression'] = 'default'
+    require(encoded(current['62-route-devres.toml']) == encoded(expected_route), 'unlisted_route_semantic_delta')
+    # Original 40-compression bytes are unavailable. Preserve its historical hash
+    # and independently verify the explicitly approved complete current policy.
+    require(encoded(current['40-compression.toml']) == encoded(CURRENT_COMPRESSION), 'current_compression_policy_changed')
+    return normalized
+
+
 def normalized_edge_delta(historical, actual, compose_raw):
     """Validate the complete difference, then reverse only the admitted fields."""
     compose_delta(compose_raw)
@@ -319,7 +406,8 @@ def normalized_edge_delta(historical, actual, compose_raw):
         require(member['Name'] == 'oxibelt' and member['MacAddress'] == mac
                 and member['IPv4Address'] == address and member['IPv6Address'] == ''
                 and member['EndpointID'] == NETWORK_ENDPOINTS[name], 'edge_network_membership')
-    return {'edge': normalized_process, 'docker': normalized_docker, 'files': normalized_files}
+    return {'edge': normalized_process, 'docker': normalized_docker, 'files': normalized_files,
+            'conf_tree': normalized_conf_delta(historical, actual)}
 
 
 class Controller:
@@ -368,7 +456,15 @@ class Controller:
             raw = stream.read(65537)
             require(len(raw) == info.st_size, 'compose_read_changed')
         require(files == self._native_edge_files(), 'edge_files_changed_during_read')
-        return {'edge': edge, 'docker': docker, 'files': files, 'networks': networks}, raw
+        conf_tree = self._native_conf_tree()
+        conf_contents = {}
+        for name in ('20-proxy.toml', '40-compression.toml', '62-route-devres.toml'):
+            rule = CONF_FILE_RULES[name]
+            body = public_config_read(EDGE_CONF / name, rule['new_size'], rule['new_sha'])
+            conf_contents[name] = base64.b64encode(body).decode()
+        require(conf_tree == self._native_conf_tree(), 'current_conf_tree_changed_during_read')
+        return {'edge': edge, 'docker': docker, 'files': files, 'networks': networks,
+                'conf_tree': conf_tree, 'conf_contents': conf_contents}, raw
 
     def historical_edge_snapshot(self, state, prepared):
         docker = copy.deepcopy(prepared['edge_docker'])
@@ -376,7 +472,16 @@ class Controller:
             evidence = self.activation.source_history(state, prepared)
             docker['networks']['devres-net']['MacAddress'] = evidence['new_mac']
             require(state['edge'] == evidence['new_edge'], 'historical_edge_admission_changed')
-        return {'edge': state['edge'], 'docker': docker, 'files': prepared['edge_base_files']}
+        tree = copy.deepcopy(prepared['edge_conf_tree'])
+        require(isinstance(state.get('new_conf'), dict) and not set(tree) & set(state['new_conf']), 'historical_conf_tree_shape')
+        tree.update(state['new_conf'])
+        preimages = {}
+        for name in ('20-proxy.toml', '62-route-devres.toml'):
+            rule = CONF_FILE_RULES[name]
+            body = public_config_read(Path(OLD_BUNDLE) / 'edge-conf' / name, rule['old_size'], rule['old_sha'])
+            preimages[name] = base64.b64encode(body).decode()
+        return {'edge': state['edge'], 'docker': docker, 'files': prepared['edge_base_files'],
+                'conf_tree': tree, 'conf_preimages': preimages}
 
     def edge_admission_fresh(self, value):
         age = (utc_now() - instant(value.get('observed_at'))).total_seconds()
@@ -385,6 +490,8 @@ class Controller:
     def attach_edge_admission(self, reference, value=None):
         if not hasattr(self, '_native_edge_files'):
             self._native_edge_files = self.activation.edge_files
+        if not hasattr(self, '_native_conf_tree'):
+            self._native_conf_tree = self.activation.conf_tree
         self.edge_admission_reference = reference
         if reference is not None:
             require(set(reference) == {'path', 'sha256'} and Path(reference['path']).parent == Path(WORK), 'edge_admission_reference')
@@ -398,13 +505,14 @@ class Controller:
         # before each use. New-controller snapshots continue using native edge().
         self.activation.edge_files = lambda: self.verify_edge_admission()['files']
         self.activation.edge_docker = lambda: self.verify_edge_admission()['docker']
+        self.activation.conf_tree = lambda: self.verify_edge_admission()['conf_tree']
         self.base.edge = lambda: self.verify_edge_admission()['edge']
 
     def verify_edge_admission(self):
         value = self.edge_admission_value
         if self.edge_admission_reference is not None:
             require(digest(read(self.edge_admission_reference['path'])) == self.edge_admission_reference['sha256'], 'edge_admission_changed')
-        require(value.get('version') == 1 and value.get('kind') == 'explicit-pdf2md-network-edge-admission'
+        require(value.get('version') == 1 and value.get('kind') == 'explicit-pdf2md-compression-edge-admission'
                 and value.get('revision') == REVISION and value.get('verified') is True
                 and value.get('controller_sha256') == digest(Path(__file__).read_bytes())
                 and value.get('predecessor_controller_sha256') == PRIOR_CONTROLLER_SHA
@@ -430,6 +538,7 @@ class Controller:
     def admit_edge(self, path):
         require(not self.root.exists() and Path(path).is_absolute() and Path(path).parent == Path(WORK), 'edge_admission_output')
         self._native_edge_files = self.activation.edge_files
+        self._native_conf_tree = self.activation.conf_tree
         save(str(path) + '.intent.json', {'version': 1, 'operation': 'admit-edge', 'at': stamp(),
              'maximum_attempts': 1, 'controller_sha256': digest(Path(__file__).read_bytes())})
         self.safety()
@@ -444,7 +553,7 @@ class Controller:
         # preserve the historical check artifact byte-for-byte.
         output = self.module.call(['docker', 'exec', actual['edge']['id'], '/usr/local/bin/oxibelt',
             '--config', '/etc/oxibelt/config/oxibelt.toml', '--check'], timeout=45)
-        value = {'version': 1, 'kind': 'explicit-pdf2md-network-edge-admission', 'revision': REVISION,
+        value = {'version': 1, 'kind': 'explicit-pdf2md-compression-edge-admission', 'revision': REVISION,
             'controller_sha256': digest(Path(__file__).read_bytes()), 'predecessor_controller_sha256': PRIOR_CONTROLLER_SHA,
             'predecessor_state_sha256': digest(read(self.prior / 'state.json')),
             'predecessor_prepared_sha256': digest(read(self.prior / 'prepared.json')),
@@ -596,6 +705,7 @@ class Controller:
         return {'boot': self.boot(), 'deployments': deployments,
                 'secrets': {value['metadata']['name']: secret_projection(value) for value in secrets},
                 'pods': self.pods(), 'edge': self.edge(), 'foundation': self.foundation(),
+                'edge_conf_tree': self._native_conf_tree() if hasattr(self, '_native_conf_tree') else None,
                 'profiles': {name: digest(raw) for name, raw in self.profiles().items()}}
 
     def boundary_before_prepare(self, snapshot, prior_state, prior_prepared, completion):
@@ -607,7 +717,8 @@ class Controller:
         for key in ('boot', 'foundation', 'profiles', 'deployments', 'pods'):
             require(snapshot[key] == admitted[key], 'prior_runtime_changed')
         require(snapshot['edge'] == self.edge_admission_value['actual']['edge']
-                and admitted['edge'] == self.edge_admission_value['historical']['edge'], 'admitted_edge_projection')
+                and admitted['edge'] == self.edge_admission_value['historical']['edge']
+                and snapshot['edge_conf_tree'] == self.edge_admission_value['actual']['conf_tree'], 'admitted_edge_projection')
         require(all(snapshot['secrets'].get(name) == value for name, value in admitted['secrets'].items()),
                 'prior_secret_boundary_changed')
         require(snapshot['deployments']['postgres']['image'] == PG_IMAGE
@@ -622,7 +733,8 @@ class Controller:
         prepared = load(self.root / 'prepared.json')
         require(digest(read(self.root / 'prepared.json')) == state['prepared_sha256'], 'prepared_changed')
         if hasattr(self, 'edge_admission_reference'):
-            require(prepared.get('edge_admission') == self.edge_admission_reference, 'prepared_edge_admission_changed')
+            require(prepared.get('edge_admission') == self.edge_admission_reference
+                    and prepared.get('edge_conf_tree') == self._native_conf_tree(), 'prepared_edge_admission_changed')
         self.admitted_prior(prepared['prior_artifacts'], allow_successor=True)
         expected_prior = copy.deepcopy(prepared['prior_state'])
         if state['chain_phase'] is not None:
@@ -714,6 +826,7 @@ class Controller:
         prepared = {'version': 1, 'revision': REVISION, 'at': stamp(), 'deployments': deployments,
                     'secrets': secrets, 'edge': snapshot['edge'], 'foundation': snapshot['foundation'], 'boot': snapshot['boot'],
                     'old_anchor': self.module.read_json(self.old.bundle / 'state.json'), 'profiles': snapshot['profiles'],
+                    'edge_conf_tree': snapshot['edge_conf_tree'],
                     'old_pods': pods, 'store_binding_sha256': STORE_BINDING,
                     'prior_artifacts': artifacts, 'prior_state': prior_state, 'edge_admission': self.edge_admission_reference,
                     'config_hashes': {key: digest(encoded(value)) for key, value in configs.items()}}
@@ -898,14 +1011,14 @@ class Controller:
             kind, checks = {
                 'start-reader': ('migration18', ('schema18', 'policy2', 'sole_writer', 'new_table_reader_grants', 'history_preserved', 'archive_binding_preserved', 'historical_notices_preserved')),
                 'runtime-ready': ('target-private-acceptance', ('schema18', 'policy2', 'sole_writer', 'read_only_serving', 'private_boundary', 'capture_notice_preserved', 'tool_contract98')),
-                'activate-existing': ('target-activation-acceptance', ('schema18', 'policy2', 'sole_writer', 'private_boundary', 'public_http_both_families_revisions', 'public_wt_both_families_revisions', 'capture_notice_preserved'))}[operation]
+                'activate-existing': ('target-activation-acceptance', ('schema18', 'policy2', 'sole_writer', 'private_boundary', 'public_http_both_families_revisions', 'public_wt_both_families_revisions', 'public_compression_gzip_br_zstd', 'capture_notice_preserved'))}[operation]
             accepted, raw = self.receipt(receipt, receipt_sha, kind, checks)
             require(accepted.get('schema') == 18, 'target_schema_receipt')
             save(self.root / ('accepted-' + operation + '.json'), raw)
         if operation == 'finish':
             accepted, raw = self.receipt(receipt, receipt_sha, 'target-observation-acceptance',
                 ('schema18', 'policy2', 'sole_writer', 'read_only_serving', 'private_boundary',
-                 'public_http_both_families_revisions', 'public_wt_both_families_revisions',
+                 'public_http_both_families_revisions', 'public_wt_both_families_revisions', 'public_compression_gzip_br_zstd',
                  'nine_source_settings_preserved', 'capture_notice_preserved', 'timers_preserved', 'stable_processes'))
             require(accepted.get('schema') == 18
                     and type(accepted.get('duration_seconds')) in (int, float) and accepted['duration_seconds'] >= 600

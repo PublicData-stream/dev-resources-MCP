@@ -22,7 +22,9 @@ archive SHA-256 is
 `46491351a46d4518274982406bc66174908e7559a8a4d6e1bd3f787e2b9b1b0a`.
 
 Only application images, corresponding-source URLs and temporary collector
-pause/resume change. Preserve all nine source switches and Wikipedia identity,
+pause/resume change. The confirmed existing edge compression configuration stays
+in place. Explicit gzip, Brotli and Zstd decoding with both address families and
+MCP revisions is required before collector activation and final acceptance. Preserve all nine source switches and Wikipedia identity,
 credentials, role authority, archive binding, TLS, edge, AppArmor, firewall and
 CNI/RBAC. The existing capacity/certificate timers retain their original operator
 entrypoints. Those entrypoints do not traverse upgrade journals; their existing

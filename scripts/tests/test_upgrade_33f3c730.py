@@ -417,7 +417,7 @@ class LifecycleTests(Fixture):
             ('schema18', 'policy2', 'sole_writer', 'read_only_serving', 'private_boundary', 'capture_notice_preserved', 'tool_contract98')))
         self.run_op('activate-existing', self.envelope('target-activation-acceptance',
             ('schema18', 'policy2', 'sole_writer', 'private_boundary', 'public_http_both_families_revisions',
-             'public_wt_both_families_revisions', 'capture_notice_preserved')))
+             'public_wt_both_families_revisions', 'public_compression_gzip_br_zstd', 'capture_notice_preserved')))
         self.assertEqual(self.c.state()['phase'], 'collectors_active')
         for role, (name, key) in u.ROLES.items():
             actual = tomllib.loads(base64.b64decode(self.cluster.secrets[name]['data'][key]).decode())
@@ -425,7 +425,7 @@ class LifecycleTests(Fixture):
             expected['source']['url'] = u.SOURCE_URL
             self.assertEqual(actual, expected)
         checks = ('schema18', 'policy2', 'sole_writer', 'read_only_serving', 'private_boundary',
-                  'public_http_both_families_revisions', 'public_wt_both_families_revisions',
+                  'public_http_both_families_revisions', 'public_wt_both_families_revisions', 'public_compression_gzip_br_zstd',
                   'nine_source_settings_preserved', 'capture_notice_preserved', 'timers_preserved', 'stable_processes')
         self.run_op('finish', self.envelope('target-observation-acceptance', checks,
             duration_seconds=630.5, sample_count=22, maximum_gap_seconds=30.2))
@@ -436,12 +436,42 @@ class LifecycleTests(Fixture):
         state['phase'] = 'collectors_active'
         self.c.record(state)
         checks = ('schema18', 'policy2', 'sole_writer', 'read_only_serving', 'private_boundary',
-                  'public_http_both_families_revisions', 'public_wt_both_families_revisions',
+                  'public_http_both_families_revisions', 'public_wt_both_families_revisions', 'public_compression_gzip_br_zstd',
                   'nine_source_settings_preserved', 'capture_notice_preserved', 'timers_preserved', 'stable_processes')
         receipt = self.envelope('target-observation-acceptance', checks,
             duration_seconds=599.9, sample_count=21, maximum_gap_seconds=30)
         with self.assertRaisesRegex(u.Error, 'observation_interval'):
             self.run_op('finish', receipt)
+        self.assertEqual(self.c.state()['phase'], 'collectors_active')
+
+
+    def test_collector_activation_rejects_missing_or_false_public_compression(self):
+        state = self.c.state(); state['phase'] = 'runtime_ready'; self.c.record(state)
+        checks = ('schema18', 'policy2', 'sole_writer', 'private_boundary',
+                  'public_http_both_families_revisions', 'public_wt_both_families_revisions', 'capture_notice_preserved')
+        for flag in (None, False):
+            path, sha = self.envelope('target-activation-acceptance', checks)
+            if flag is False:
+                value = u.load(path); value['checks']['public_compression_gzip_br_zstd'] = False
+                sha = private(path, value)
+            with self.subTest(flag=flag), self.assertRaisesRegex(u.Error, 'receipt_checks'):
+                self.run_op('activate-existing', (path, sha))
+        self.assertEqual(self.c.state()['phase'], 'runtime_ready')
+        self.assertFalse(any(a[0] == 'patch' for a, _ in self.cluster.calls))
+
+    def test_finish_rejects_missing_or_false_public_compression(self):
+        state = self.c.state(); state['phase'] = 'collectors_active'; self.c.record(state)
+        checks = ('schema18', 'policy2', 'sole_writer', 'read_only_serving', 'private_boundary',
+                  'public_http_both_families_revisions', 'public_wt_both_families_revisions',
+                  'nine_source_settings_preserved', 'capture_notice_preserved', 'timers_preserved', 'stable_processes')
+        for flag in (None, False):
+            path, sha = self.envelope('target-observation-acceptance', checks,
+                duration_seconds=630.5, sample_count=22, maximum_gap_seconds=30.2)
+            if flag is False:
+                value = u.load(path); value['checks']['public_compression_gzip_br_zstd'] = False
+                sha = private(path, value)
+            with self.subTest(flag=flag), self.assertRaisesRegex(u.Error, 'receipt_checks'):
+                self.run_op('finish', (path, sha))
         self.assertEqual(self.c.state()['phase'], 'collectors_active')
 
     def test_mutation_durability_barriers_precede_dispatch(self):
@@ -458,6 +488,24 @@ class LifecycleTests(Fixture):
         receipt = self.envelope('proof', ('policy2',), withheld_content_count=123)
         value, _ = self.c.receipt(*receipt, 'proof', ('policy2',))
         self.assertEqual(value['withheld_content_count'], 123)
+
+
+def padded_toml(body, size):
+    raw = body.encode()
+    assert len(raw) + 2 <= size
+    return b'#' + b'x' * (size - len(raw) - 2) + b'\n' + raw
+
+
+def compression_fixture():
+    old = {
+        '20-proxy.toml': padded_toml('proxy_setting = "fixture"\n[compression]\nenabled = false\n', 1146),
+        '62-route-devres.toml': padded_toml('[[routes]]\ncompression = "off"\nendpoint = "fixture"\n', 759)}
+    body = '[compression]\n' + ''.join(k + ' = ' + json.dumps(v) + '\n' for k, v in u.CURRENT_COMPRESSION['compression'].items())
+    current = {
+        '20-proxy.toml': padded_toml('proxy_setting = "fixture"\n', 1116),
+        '62-route-devres.toml': padded_toml('[[routes]]\ncompression = "default"\nendpoint = "fixture"\n', 763),
+        '40-compression.toml': padded_toml(body, 835)}
+    return old, current
 
 
 def edge_fixture():
@@ -511,6 +559,20 @@ def edge_fixture():
             'Labels': {'com.docker.compose.config-hash': u.NETWORK_LABEL_HASHES[name], 'com.docker.compose.network': name,
                        'com.docker.compose.project': 'serve', 'com.docker.compose.version': '5.7.0' if name == 'devres-net' else '5.7.1'},
             'edge_member': {'Name': 'oxibelt', 'MacAddress': mac, 'IPv4Address': address, 'IPv6Address': '', 'EndpointID': u.NETWORK_ENDPOINTS[name]}}
+    old_contents, current_contents = compression_fixture()
+    historical['conf_tree'] = {'.': {'kind': 'directory', 'inode': 10, 'mtime_ns': 1}}
+    for name, rule in u.CONF_FILE_RULES.items():
+        historical['conf_tree'][name] = {'uid': 0, 'gid': 0, 'mode': 0o644, 'device': 2305,
+            'inode': rule['inode'], 'kind': 'file', 'size': rule['old_size'],
+            'sha256': u.digest(old_contents[name]) if name in old_contents else rule['old_sha'],
+            'mtime_ns': rule.get('old_mtime', 1)}
+    historical['conf_tree']['63-route-wikimedia-cidrs.toml'] = {'kind': 'file', 'sha256': 'f' * 64}
+    historical['conf_preimages'] = {name: base64.b64encode(body).decode() for name, body in old_contents.items()}
+    actual['conf_tree'] = copy.deepcopy(historical['conf_tree'])
+    for name, rule in u.CONF_FILE_RULES.items():
+        actual['conf_tree'][name].update(size=rule['new_size'], mtime_ns=rule['new_mtime'],
+            sha256=u.digest(current_contents[name]) if name in current_contents else rule['new_sha'])
+    actual['conf_contents'] = {name: base64.b64encode(body).decode() for name, body in current_contents.items()}
     return historical, actual, old_raw, raw
 
 
@@ -520,19 +582,34 @@ class EdgeAdmissionTests(Fixture):
         self.historical, self.actual, self.old_raw, self.raw = edge_fixture()
         for name, value in (('OLD_COMPOSE_SHA', u.digest(self.old_raw)), ('NEW_COMPOSE_SHA', u.digest(self.raw)), ('WORK', str(self.top))):
             p = patch.object(u, name, value); p.start(); self.addCleanup(p.stop)
+        rules = copy.deepcopy(u.CONF_FILE_RULES)
+        for name, rule in rules.items():
+            rule['old_sha'] = self.historical['conf_tree'][name]['sha256']
+            rule['new_sha'] = self.actual['conf_tree'][name]['sha256']
+        rule_patch = patch.object(u, 'CONF_FILE_RULES', rules)
+        rule_patch.start(); self.addCleanup(rule_patch.stop)
+        def preimage(path, size, sha):
+            body = base64.b64decode(self.historical['conf_preimages'][Path(path).name])
+            u.require(len(body) == size and u.digest(body) == sha, 'fixture_preimage_mismatch')
+            return body
+        read_patch = patch.object(u, 'public_config_read', side_effect=preimage)
+        read_patch.start(); self.addCleanup(read_patch.stop)
         self.c.root = self.top / 'not-yet-prepared'
         prior_state = u.load(self.prior / 'state.json')
         prior_state['edge'] = self.historical['edge']
+        prior_state['new_conf'] = {'63-route-wikimedia-cidrs.toml': self.historical['conf_tree']['63-route-wikimedia-cidrs.toml']}
         prepared = u.load(self.prior / 'prepared.json')
         prepared['edge_docker'] = self.historical['docker']
         prepared['edge_base_files'] = self.historical['files']
+        prepared['edge_conf_tree'] = {k: v for k, v in self.historical['conf_tree'].items() if k not in prior_state['new_conf']}
         prior_state['prepared_sha256'] = private(self.prior / 'prepared.json', prepared)
         private(self.prior / 'state.json', prior_state)
         self.c.activation.edge_files = lambda: copy.deepcopy(self.actual['files'])
+        self.c.activation.conf_tree = lambda: copy.deepcopy(self.actual['conf_tree'])
         self.c.native_edge_snapshot = lambda: (copy.deepcopy(self.actual), self.raw)
         self.c.edge = lambda: copy.deepcopy(self.actual['edge'])
         self.c.module.call = Mock(return_value=b'native check passed')
-        self.value = {'version': 1, 'kind': 'explicit-pdf2md-network-edge-admission', 'revision': u.REVISION,
+        self.value = {'version': 1, 'kind': 'explicit-pdf2md-compression-edge-admission', 'revision': u.REVISION,
             'controller_sha256': u.digest(Path(u.__file__).read_bytes()),
             'predecessor_controller_sha256': u.PRIOR_CONTROLLER_SHA,
             'predecessor_state_sha256': u.digest(u.read(self.prior / 'state.json')),
@@ -543,7 +620,7 @@ class EdgeAdmissionTests(Fixture):
 
     def test_exact_network_change_normalizes_only_allowed_fields(self):
         normalized = u.normalized_edge_delta(self.historical, self.actual, self.raw)
-        self.assertEqual(normalized, self.historical)
+        self.assertEqual(normalized, {k: v for k, v in self.historical.items() if k != 'conf_preimages'})
         self.assertIn('pdf2md-net', self.actual['docker']['networks'])
         self.assertEqual(self.actual['edge']['id'], u.NEW_EDGE_ID)
 
@@ -596,14 +673,16 @@ class EdgeAdmissionTests(Fixture):
         self.c.attach_edge_admission(None, self.value)
         self.assertEqual(self.c.activation.edge_files(), self.historical['files'])
         self.assertEqual(self.c.activation.edge_docker(), self.historical['docker'])
+        self.assertEqual(self.c.activation.conf_tree(), self.historical['conf_tree'])
         self.assertEqual(self.c.base.edge(), self.historical['edge'])
         self.assertEqual(self.c.edge(), self.actual['edge'])
         self.assertEqual(self.c.snapshot()['edge'], self.actual['edge'])
+        self.assertEqual(self.c.snapshot()['edge_conf_tree'], self.actual['conf_tree'])
 
     def test_every_adapter_refuses_second_runtime_drift(self):
         self.c.attach_edge_admission(None, self.value)
         self.actual['docker']['config']['Env'].append('UNADMITTED=true')
-        for adapter in (self.c.activation.edge_files, self.c.activation.edge_docker, self.c.base.edge):
+        for adapter in (self.c.activation.edge_files, self.c.activation.edge_docker, self.c.activation.conf_tree, self.c.base.edge):
             with self.assertRaisesRegex(u.Error, 'admitted_current_edge_changed'):
                 adapter()
 
@@ -627,6 +706,55 @@ class EdgeAdmissionTests(Fixture):
         self.c.attach_edge_admission(None, value)
         with self.assertRaisesRegex(u.Error, 'edge_admission_stale'):
             self.c.edge_admission_fresh(value)
+
+
+    def test_exact_compression_policy_and_tls_mtime_are_narrowly_normalized(self):
+        result = u.normalized_conf_delta(self.historical, self.actual)
+        self.assertEqual(result, self.historical['conf_tree'])
+        self.assertEqual(tomllib.loads(base64.b64decode(self.actual['conf_contents']['40-compression.toml']).decode()), u.CURRENT_COMPRESSION)
+        self.assertEqual(self.historical['conf_tree']['10-tls.toml']['sha256'], self.actual['conf_tree']['10-tls.toml']['sha256'])
+
+    def test_unlisted_conf_tree_node_or_metadata_is_rejected(self):
+        for mutate in (lambda t: t.__setitem__('new-private-route.toml', {}),
+                       lambda t: t.pop('63-route-wikimedia-cidrs.toml'),
+                       lambda t: t['.'].__setitem__('mtime_ns', 99),
+                       lambda t: t['20-proxy.toml'].__setitem__('mode', 0o666),
+                       lambda t: t['10-tls.toml'].__setitem__('sha256', '1' * 64)):
+            actual = copy.deepcopy(self.actual); mutate(actual['conf_tree'])
+            with self.subTest(mutate=mutate), self.assertRaises(u.Error):
+                u.normalized_conf_delta(self.historical, actual)
+
+    def test_admitted_metadata_cannot_hide_other_proxy_or_route_semantics(self):
+        for name, body, code in (
+                ('20-proxy.toml', 'proxy_setting = "changed"\n', 'unlisted_proxy_semantic_delta'),
+                ('62-route-devres.toml', '[[routes]]\ncompression = "default"\nendpoint = "untrusted"\n', 'unlisted_route_semantic_delta')):
+            actual = copy.deepcopy(self.actual)
+            raw = padded_toml(body, u.CONF_FILE_RULES[name]['new_size'])
+            rules = copy.deepcopy(u.CONF_FILE_RULES); rules[name]['new_sha'] = u.digest(raw)
+            actual['conf_tree'][name]['sha256'] = u.digest(raw)
+            actual['conf_contents'][name] = base64.b64encode(raw).decode()
+            with patch.object(u, 'CONF_FILE_RULES', rules), self.assertRaisesRegex(u.Error, code):
+                u.normalized_conf_delta(self.historical, actual)
+
+    def test_global_compression_requires_complete_exact_approved_policy(self):
+        for change in (lambda c: c['compression'].__setitem__('deflate', True),
+                       lambda c: c['compression'].__setitem__('vary', False),
+                       lambda c: c['compression'].__setitem__('mime_types', ['*/*'])):
+            policy = copy.deepcopy(u.CURRENT_COMPRESSION); change(policy)
+            body = '[compression]\n' + ''.join(k + ' = ' + json.dumps(v) + '\n' for k, v in policy['compression'].items())
+            raw = padded_toml(body, 835)
+            actual = copy.deepcopy(self.actual)
+            actual['conf_tree']['40-compression.toml']['sha256'] = u.digest(raw)
+            actual['conf_contents']['40-compression.toml'] = base64.b64encode(raw).decode()
+            rules = copy.deepcopy(u.CONF_FILE_RULES); rules['40-compression.toml']['new_sha'] = u.digest(raw)
+            with patch.object(u, 'CONF_FILE_RULES', rules), self.assertRaisesRegex(u.Error, 'current_compression_policy_changed'):
+                u.normalized_conf_delta(self.historical, actual)
+
+    def test_conf_adapter_detects_post_admission_current_tree_drift(self):
+        self.c.attach_edge_admission(None, self.value)
+        self.actual['conf_tree']['40-compression.toml']['mtime_ns'] += 1
+        with self.assertRaisesRegex(u.Error, 'admitted_current_edge_changed'):
+            self.c.activation.conf_tree()
 
     def test_admission_generator_checks_native_config_once_and_preserves_history(self):
         before = {p.name: p.read_bytes() for p in self.prior.iterdir()}
