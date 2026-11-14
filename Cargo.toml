@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/domain", "crates/application", "crates/adapters", "apps/server", "apps/credential-broker"]
 resolver = "3"
+exclude = ["vendor/rmcp"]
 
 [workspace.package]
 version = "0.0.0"
@@ -15,3 +16,6 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
+
+[patch.crates-io]
+rmcp = { path = "vendor/rmcp" }

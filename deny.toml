@@ -17,6 +17,10 @@ exceptions = [
  { crate = "devres-adapters@0.0.0", allow = ["AGPL-3.0-only"] },
  { crate = "devres-server@0.0.0", allow = ["AGPL-3.0-only"] },
  { crate = "devres-credential-broker@0.0.0", allow = ["AGPL-3.0-only"] },
+ # Local transport-budget additions follow the first-party AGPL policy; original
+ # rmcp source remains Apache-2.0. Exact vendored package, not a copyleft allowance.
+ # Owner: repository maintainers. Review by 2027-01-24 or on SDK/patch changes.
+ { crate = "rmcp@3.9.0", allow = ["AGPL-3.0-only"] },
  # ZIP BZIP2 support: reviewed permissive redistribution/attribution terms.
  # Owner: repository maintainers. Review by 2027-01-24 or on graph changes.
  { crate = "libbz2-rs-sys@0.2.5", allow = ["bzip2-1.0.6"] },

@@ -18,8 +18,11 @@ def collect(destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     index = []
     missing = []
+    workspace_members = set(metadata["workspace_members"])
     for package in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"])):
-        if package["source"] is None:
+        # Path dependencies can be vendored third-party packages. Only the
+        # workspace's own packages have their notices handled by the image root.
+        if package["id"] in workspace_members:
             continue
         root = Path(package["manifest_path"]).resolve().parent
         target = destination / f'{package["name"]}-{package["version"]}'

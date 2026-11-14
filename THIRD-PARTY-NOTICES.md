@@ -2,6 +2,17 @@
 
 First-party work is AGPL-3.0-only; this does not relicense retrieved public sources.
 
+## Vendored Rust MCP SDK
+
+`vendor/rmcp` contains the published `rmcp 3.9.0` Rust MCP SDK from
+[modelcontextprotocol/rust-sdk](https://github.com/modelcontextprotocol/rust-sdk/),
+under its original Apache-2.0 license. Preserve the packaged license and source
+provenance alongside the local transport-budget modifications. The modification
+adds bounded input and JSON/SSE byte accounting; it does not relicense upstream
+code. First-party transport modifications remain AGPL-3.0-only under the root
+[LICENSE](LICENSE); the modified distribution records both license obligations.
+Runtime image dependency notices include this local path dependency.
+
 ## OpenLegal transport adaptation
 
 Generic Rust HTTP/WebTransport, framing, deadlines, TLS client authentication,

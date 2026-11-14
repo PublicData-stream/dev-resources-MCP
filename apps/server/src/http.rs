@@ -8,7 +8,7 @@ use crate::{
 };
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::Body,
     extract::{Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
@@ -17,7 +17,8 @@ use axum::{
 };
 use futures::{FutureExt, StreamExt};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    BodyBudget, StreamableHttpServerConfig, StreamableHttpService,
+    session::local::LocalSessionManager,
 };
 use std::{
     net::SocketAddr,
@@ -154,6 +155,11 @@ impl Endpoint for HttpEndpoint {
             .with_json_response(false)
             .with_cancellation_token(context.shutdown.clone())
             .with_max_request_body_bytes(context.limits.max_message_bytes)
+            .with_body_budget(Arc::new(BodyBudget::new(
+                context.buffers.clone(),
+                context.limits.max_message_bytes,
+                context.shutdown.clone(),
+            )))
             .with_allowed_hosts(self.access.allowed_hosts.clone())
             .with_allowed_origins(self.access.allowed_origins.clone());
         let service = StreamableHttpService::new(
@@ -229,48 +235,61 @@ async fn guard(
         });
     let response_limit = context.limits.max_message_bytes;
     let buffers = context.buffers.clone();
-    let reserve_bytes = context.limits.max_message_bytes * 4;
-    // Reserve capacity before collecting, including room for the SDK's decoding and serialization copies.
-    let buffer_permit = match reserve_http_buffers(
-        buffers,
-        reserve_bytes as u32,
-        input_deadline,
-        &context.shutdown,
-    )
-    .await
-    {
-        Ok(permit) => permit,
-        Err(BufferAdmissionError::Shutdown) => {
-            context
-                .handler
-                .counters
-                .http_shutdown_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        Err(BufferAdmissionError::Expired) => {
-            context
-                .handler
-                .counters
-                .http_buffer_wait_expired
-                .fetch_add(1, Ordering::Relaxed);
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+    let budget = BodyBudget::new(buffers.clone(), response_limit, context.shutdown.clone());
+    let declared = match crate::http_budget::declared_length(request.headers(), response_limit) {
+        Ok(declared) => declared,
+        Err(status) => return status.into_response(),
     };
-    let (parts, body) = request.into_parts();
+    // Known-length input acquires its complete allocation atomically before
+    // reading. Unknown-length growth never waits while retaining partial input.
+    let initial = if let Some(length) = declared {
+        match reserve_http_buffers(buffers, length as u32, input_deadline, &context.shutdown).await
+        {
+            Ok(permit) => Some(permit),
+            Err(BufferAdmissionError::Shutdown) => {
+                context
+                    .handler
+                    .counters
+                    .http_shutdown_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(BufferAdmissionError::Expired) => {
+                context
+                    .handler
+                    .counters
+                    .http_buffer_wait_expired
+                    .fetch_add(1, Ordering::Relaxed);
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let (mut parts, body) = request.into_parts();
     let bytes = match tokio::time::timeout_at(
         input_deadline,
-        to_bytes(body, context.limits.max_message_bytes),
+        crate::http_budget::collect(body, declared, initial, &budget),
     )
     .await
     {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Ok(Err(status)) => {
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                context
+                    .handler
+                    .counters
+                    .http_request_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return status.into_response();
+        }
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
     if parts.method == http::Method::POST
-        && let Some(response) = validate_version(&parts.headers, &bytes)
+        && let Some(response) = validate_version(&parts.headers, &bytes, &budget)
     {
+        record_response_rejection(&context, &response);
         return response;
     }
     let timeout_secs = request_timeout_secs(&context.limits, &parts.method, &bytes);
@@ -285,6 +304,7 @@ async fn guard(
             .get("mcp-protocol-version")
             .and_then(|v| v.to_str().ok())
             == Some("2026-07-28");
+    parts.extensions.insert(budget.request(bytes.clone()));
     let response = match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
         next.run(Request::from_parts(parts, Body::from(bytes))),
@@ -301,8 +321,10 @@ async fn guard(
         response_limit,
         deadline,
         &context.shutdown,
+        Some(&budget),
     )
     .await;
+    record_response_rejection(&context, &response);
     let (mut parts, body) = response.into_parts();
     parts.headers.insert(
         header::CACHE_CONTROL,
@@ -314,7 +336,6 @@ async fn guard(
     let state = (
         body.into_data_stream(),
         request_permit,
-        buffer_permit,
         0usize,
         context,
         deadline,
@@ -323,16 +344,7 @@ async fn guard(
     );
     let stream = futures::stream::try_unfold(
         state,
-        |(
-            mut stream,
-            request_permit,
-            buffer_permit,
-            used,
-            context,
-            deadline,
-            watchdog,
-            response_limit,
-        )| async move {
+        |(mut stream, request_permit, used, context, deadline, watchdog, response_limit)| async move {
             let chunk = tokio::select! {
                 biased;
                 _ = context.shutdown.cancelled() => return Err(std::io::Error::other("server shutdown")),
@@ -346,7 +358,6 @@ async fn guard(
                         (
                             stream,
                             request_permit,
-                            buffer_permit,
                             used,
                             context,
                             deadline,
@@ -398,6 +409,17 @@ fn request_timeout_secs(
     limits.call_timeout_secs
 }
 
+fn record_response_rejection(context: &EndpointContext, response: &Response) {
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        let counter = if context.shutdown.is_cancelled() {
+            &context.handler.counters.http_shutdown_rejected
+        } else {
+            &context.handler.counters.http_request_rejected
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 enum BufferAdmissionError {
     Shutdown,
     Expired,
@@ -432,23 +454,66 @@ async fn reserve_http_buffers(
     }
 }
 
-fn validate_version(headers: &http::HeaderMap, bytes: &[u8]) -> Option<Response> {
-    use serde_json::{Value, json};
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+fn validate_version(
+    headers: &http::HeaderMap,
+    bytes: &[u8],
+    budget: &BodyBudget,
+) -> Option<Response> {
+    use serde::Deserialize;
+    use serde_json::{Value, json, value::RawValue};
+    use std::borrow::Cow;
+    #[derive(Deserialize)]
+    struct Meta<'a> {
+        #[serde(rename = "io.modelcontextprotocol/protocolVersion", borrow)]
+        version: Option<Cow<'a, str>>,
+    }
+    #[derive(Deserialize)]
+    struct Params<'a> {
+        #[serde(rename = "protocolVersion", borrow)]
+        proposed: Option<Cow<'a, str>>,
+        #[serde(rename = "_meta", borrow)]
+        meta: Option<Meta<'a>>,
+    }
+    #[derive(Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow)]
+        id: Option<&'a RawValue>,
+        #[serde(borrow)]
+        method: Option<Cow<'a, str>>,
+        #[serde(borrow)]
+        params: Option<Params<'a>>,
+    }
+    let Ok(value) = serde_json::from_slice::<Envelope<'_>>(bytes) else {
         return None;
     };
-    let id = value.get("id").cloned().unwrap_or(Value::Null);
-    let invalid_id = id.as_str().is_some_and(|id| id.len() > 128);
+    // Decode only a bounded identifier. Unknown fields, including audit arguments,
+    // are skipped by serde rather than copied into a full JSON tree.
+    let raw_id = value.id.map(RawValue::get).unwrap_or("null");
+    let eligible_id = raw_id.len() <= 1024
+        && matches!(
+            raw_id.as_bytes().first(),
+            Some(b'"' | b'-' | b'0'..=b'9' | b'n')
+        );
+    let id = eligible_id
+        .then(|| serde_json::from_str::<Value>(raw_id).ok())
+        .flatten()
+        .unwrap_or(Value::Null);
+    let invalid_id = !eligible_id
+        || id.as_str().is_some_and(|id| id.len() > 128)
+        || !matches!(id, Value::Null | Value::String(_) | Value::Number(_));
     let id = if invalid_id { Value::Null } else { id };
     let reject = |code: i32, message: &str, data: Value| {
-        Some(
-            (
+        let value =
+            json!({"jsonrpc":"2.0", "id":id, "error":{"code":code,"message":message,"data":data}});
+        Some(match budget.encode_json(&value) {
+            Ok(bytes) => (
                 StatusCode::BAD_REQUEST,
-                axum::Json(json!({"jsonrpc":"2.0", "id":id,
-            "error":{"code":code,"message":message,"data":data}})),
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(bytes),
             )
                 .into_response(),
-        )
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        })
     };
     if invalid_id {
         return reject(-32600, "request identifier exceeds limit", Value::Null);
@@ -463,10 +528,12 @@ fn validate_version(headers: &http::HeaderMap, bytes: &[u8]) -> Option<Response>
     let version = headers
         .get("mcp-protocol-version")
         .and_then(|v| v.to_str().ok());
-    let initialize = value.get("method").and_then(Value::as_str) == Some("initialize");
+    let initialize = value.method.as_deref() == Some("initialize");
     let body_version = value
-        .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
-        .and_then(Value::as_str);
+        .params
+        .as_ref()
+        .and_then(|params| params.meta.as_ref())
+        .and_then(|meta| meta.version.as_deref());
     if let (Some(header), Some(body)) = (version, body_version)
         && header != body
     {
@@ -475,8 +542,9 @@ fn validate_version(headers: &http::HeaderMap, bytes: &[u8]) -> Option<Response>
     let supported = json!({"supported":["2026-07-28","2025-11-25"]});
     if initialize {
         let Some(proposed) = value
-            .pointer("/params/protocolVersion")
-            .and_then(Value::as_str)
+            .params
+            .as_ref()
+            .and_then(|params| params.proposed.as_deref())
         else {
             return reject(-32022, "unsupported initialization protocol", supported);
         };

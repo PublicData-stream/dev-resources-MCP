@@ -20,11 +20,25 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+fn logging_filter(private_timings: bool) -> &'static str {
+    if private_timings {
+        "devres_server=info,devres_private_timings=trace"
+    } else {
+        "devres_server=info"
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
     // No request/provider payload or tracing HTTP middleware is installed.
+    // Only this allowlisted first-party target can be enabled for private
+    // diagnosis. Do not accept arbitrary RUST_LOG directives: SDK payload events
+    // must remain disabled, including during attribution/archive investigation.
+    let logging = logging_filter(
+        std::env::var_os("DEVRES_PRIVATE_TIMINGS").is_some_and(|value| value == "1"),
+    );
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("devres_server=info"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(logging))
         .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args
@@ -959,5 +973,51 @@ mod wikipedia_identity_tests {
             .await
             .expect("invalid fixture");
         assert!(wikipedia_identity(&config, true).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::logging_filter;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn private_timings_never_enable_sdk_or_unrelated_payload_events() {
+        for enabled in [false, true] {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::new(logging_filter(enabled)))
+                .with_writer(move || Capture(writer.clone()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "devres_server", "server control event");
+                tracing::trace!(target: "rmcp::transport", payload = "private-audit-sentinel", "SDK payload");
+                tracing::info!(target: "devres_adapters::unrelated", body = "private-audit-sentinel", "unrelated event");
+                tracing::debug!(target: "devres_private_timings", attribution_stage = "claim", provider = "rfc", elapsed_micros = 7, "sanitized timing");
+            });
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(text.contains("server control event"));
+            assert_eq!(text.contains("sanitized timing"), enabled);
+            assert!(!text.contains("private-audit-sentinel"));
+            assert!(!text.contains("SDK payload"));
+            assert!(!text.contains("unrelated event"));
+        }
     }
 }

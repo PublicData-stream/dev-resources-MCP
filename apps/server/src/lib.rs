@@ -6,6 +6,7 @@ pub mod endpoint;
 pub mod framing;
 pub mod handler;
 pub mod http;
+mod http_budget;
 mod http_status;
 pub mod progress;
 mod rate_limit;

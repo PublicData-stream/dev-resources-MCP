@@ -1,104 +1,184 @@
-// Adapted from OpenLegal local snapshot, base 7a592e0c7b1ef1518bd9ab47788a4e03697f3e63; source SHA256 8540d400d3fc9decc254a11d183c18917ed2a100bfa476e5ae9472bd78498d5e (AGPL-3.0-only).
-//! Preserve the admitted modern HTTP error mapping across SDK maintenance.
-//!
-//! Only SDK-produced SSE is inspected. Its serializer emits one compact JSON data
-//! line per message. Other framing is replayed unchanged, never reinterpreted.
+// Adapted from OpenLegal 7a592e0c (AGPL-3.0-only); first-party bounded replay changes are AGPL-3.0-only.
+//! Inspect the first SDK SSE event through charged slices, without a second body.
 use axum::{
     body::{Body, BodyDataStream, Bytes},
     http::{StatusCode, header, response::Parts},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use futures::{StreamExt, stream};
+use rmcp::transport::streamable_http_server::{BodyBudget, BodyCapacityFailure};
 use serde::Deserialize;
-use std::{io, ops::Range};
+use std::{
+    io::{self, Read},
+    ops::Range,
+};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
 struct FirstData {
-    scan: usize,
+    position: usize,
     line: usize,
+    head: [u8; 6],
+    head_used: usize,
     data: Option<Range<usize>>,
     multiline: bool,
+    previous: Option<u8>,
 }
 impl FirstData {
-    // Scan each byte once and borrow the SDK's JSON line without another buffer.
     fn scan(&mut self, bytes: &[u8]) -> Option<Option<Range<usize>>> {
-        while let Some(end) = bytes[self.scan..].iter().position(|b| *b == b'\n') {
-            let end = self.scan + end;
-            let start = self.line;
-            let line = bytes[start..end]
-                .strip_suffix(b"\r")
-                .unwrap_or(&bytes[start..end]);
-            self.scan = end + 1;
-            self.line = self.scan;
-            if line.is_empty() {
-                if let Some(data) = self.data.take() {
-                    return Some((!self.multiline).then_some(data));
+        for &byte in bytes {
+            let position = self.position;
+            self.position += 1;
+            if byte == b'\n' {
+                let end = position - usize::from(self.previous == Some(b'\r'));
+                let length = end - self.line;
+                if length == 0 {
+                    if let Some(data) = self.data.take() {
+                        return Some((!self.multiline).then_some(data));
+                    }
+                } else if self.head_used >= 5 && &self.head[..5] == b"data:" {
+                    let start = self.line + 5 + usize::from(length > 5 && self.head[5] == b' ');
+                    self.multiline |= self.data.is_some();
+                    self.data = Some(start..end);
                 }
-            } else if let Some(value) = line.strip_prefix(b"data:") {
-                let value = value.strip_prefix(b" ").unwrap_or(value);
-                let offset = start + line.len() - value.len();
-                self.multiline |= self.data.is_some();
-                self.data = Some(offset..offset + value.len());
+                self.line = self.position;
+                self.head_used = 0;
+            } else if self.head_used < self.head.len() {
+                self.head[self.head_used] = byte;
+                self.head_used += 1;
             }
+            self.previous = Some(byte);
         }
-        self.scan = bytes.len();
         None
     }
 }
-
 #[derive(Deserialize)]
 struct ErrorCode {
     code: i32,
 }
 #[derive(Deserialize)]
-struct ErrorHeader<'a> {
-    #[serde(borrow)]
-    jsonrpc: &'a str,
+struct ErrorHeader {
+    jsonrpc: String,
     #[serde(rename = "id")]
     _id: serde::de::IgnoredAny,
     error: ErrorCode,
 }
-fn invalid_params(data: &[u8]) -> bool {
-    serde_json::from_slice::<ErrorHeader<'_>>(data)
+struct SliceReader<'a> {
+    parts: &'a [Bytes],
+    range: Range<usize>,
+    position: usize,
+    index: usize,
+}
+impl Read for SliceReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        while let Some(bytes) = self.parts.get(self.index) {
+            let end = self.position + bytes.len();
+            if self.range.start >= end {
+                self.position = end;
+                self.index += 1;
+                continue;
+            }
+            if self.range.start >= self.range.end {
+                return Ok(0);
+            }
+            let start = self.range.start - self.position;
+            let count = output
+                .len()
+                .min(bytes.len() - start)
+                .min(self.range.end - self.range.start);
+            output[..count].copy_from_slice(&bytes[start..start + count]);
+            self.range.start += count;
+            return Ok(count);
+        }
+        Ok(0)
+    }
+}
+fn invalid_params(parts: &[Bytes], range: Range<usize>) -> bool {
+    let reader = SliceReader {
+        parts,
+        range,
+        position: 0,
+        index: 0,
+    };
+    serde_json::from_reader::<_, ErrorHeader>(reader)
         .is_ok_and(|message| message.jsonrpc == "2.0" && message.error.code == -32602)
 }
-
+#[derive(Default)]
+struct Prefix {
+    parts: Vec<Bytes>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+impl Prefix {
+    fn push(&mut self, bytes: Bytes, budget: Option<&BodyBudget>) -> Result<(), ()> {
+        if self.parts.len() == self.parts.capacity() {
+            let capacity = self.parts.capacity().max(4).checked_mul(2).ok_or(())?;
+            // Account both allocations during vector growth. Payloads themselves
+            // remain owner-charged Bytes from the SDK; only handles move here.
+            let permit = budget
+                .map(|budget| budget.reserve(capacity * std::mem::size_of::<Bytes>()))
+                .transpose()
+                .map_err(|_| ())?;
+            let mut next = Vec::new();
+            next.try_reserve_exact(capacity).map_err(|_| ())?;
+            if next.capacity() != capacity {
+                return Err(());
+            }
+            next.append(&mut self.parts);
+            self.parts = next;
+            self._permit = permit;
+        }
+        self.parts.push(bytes);
+        Ok(())
+    }
+    fn select(&mut self, range: Range<usize>) {
+        let mut position = 0;
+        self.parts.retain_mut(|bytes| {
+            let end = position + bytes.len();
+            let start = range.start.saturating_sub(position).min(bytes.len());
+            let stop = range.end.saturating_sub(position).min(bytes.len());
+            position = end;
+            if start >= stop {
+                return false;
+            }
+            *bytes = bytes.slice(start..stop);
+            true
+        });
+    }
+}
 fn replay(
     parts: Parts,
-    prefix: Vec<u8>,
+    prefix: Prefix,
     deferred: Option<Result<Bytes, axum::Error>>,
     source: BodyDataStream,
 ) -> Response {
-    let prefix = (!prefix.is_empty()).then(|| Ok(Bytes::from(prefix)));
+    let Prefix {
+        parts: chunks,
+        _permit,
+    } = prefix;
+    let first = stream::unfold(
+        (chunks.into_iter(), _permit),
+        |(mut chunks, permit)| async move {
+            chunks
+                .next()
+                .map(|bytes| (Ok::<_, axum::Error>(bytes), (chunks, permit)))
+        },
+    );
     Response::from_parts(
         parts,
-        Body::from_stream(
-            stream::iter(prefix)
-                .chain(stream::iter(deferred))
-                .chain(source),
-        ),
+        Body::from_stream(first.chain(stream::iter(deferred)).chain(source)),
     )
 }
-fn failed(parts: Parts, message: &'static str) -> Response {
-    Response::from_parts(
-        parts,
-        Body::from_stream(stream::once(async move {
-            Err::<Bytes, _>(io::Error::other(message))
-        })),
-    )
-}
-
 pub(crate) async fn preserve_invalid_params_status(
     response: Response,
     modern: bool,
     limit: usize,
     deadline: Instant,
     cancel: &CancellationToken,
+    budget: Option<&BodyBudget>,
 ) -> Response {
-    if !modern
-        || response.status() != StatusCode::OK
+    if response.status() != StatusCode::OK
         || response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -108,45 +188,52 @@ pub(crate) async fn preserve_invalid_params_status(
     {
         return response;
     }
+    let capacity = response.extensions().get::<BodyCapacityFailure>().cloned();
     let (mut parts, body) = response.into_parts();
     let mut source = body.into_data_stream();
-    // At most one ceiling-sized prefix and, only for a replacement, one JSON copy.
-    // Borrowed header decoding creates no full JSON tree. The existing four-copy
-    // request reservation and final response-byte ceiling continue to apply.
-    let mut prefix = Vec::with_capacity(limit);
+    let mut prefix = Prefix::default();
+    let mut used = 0usize;
     let mut first = FirstData::default();
     loop {
         let chunk = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return failed(parts, "server shutdown"),
+            _ = cancel.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             result = tokio::time::timeout_at(deadline, source.next()) => match result {
                 Ok(chunk) => chunk,
-                Err(_) => return failed(parts, "response deadline"),
+                Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
             },
         };
+        if capacity.as_ref().is_some_and(BodyCapacityFailure::failed) {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let Some(chunk) = chunk else {
             return replay(parts, prefix, None, source);
         };
         let bytes = match chunk {
-            Ok(bytes) if bytes.len() <= limit - prefix.len() => bytes,
+            Ok(bytes) if bytes.len() <= limit - used => bytes,
             deferred => return replay(parts, prefix, Some(deferred), source),
         };
-        prefix.extend_from_slice(&bytes);
-        drop(bytes);
-        if let Some(data) = first.scan(&prefix) {
-            if let Some(data) = data.filter(|range| invalid_params(&prefix[range.clone()])) {
-                // Exactly the old SDK first-terminal-message mapping. A progress
-                // notification first keeps HTTP 200 and its complete original SSE.
+        used += bytes.len();
+        let data = first.scan(&bytes);
+        if prefix.push(bytes, budget).is_err() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if !modern {
+            return replay(parts, prefix, None, source);
+        }
+        if let Some(data) = data {
+            if let Some(data) = data.filter(|range| invalid_params(&prefix.parts, range.clone())) {
                 parts.status = StatusCode::BAD_REQUEST;
                 parts.headers.insert(
                     header::CONTENT_TYPE,
                     http::HeaderValue::from_static("application/json"),
                 );
                 parts.headers.remove(header::CONTENT_LENGTH);
-                return Response::from_parts(
-                    parts,
-                    Body::from(Bytes::copy_from_slice(&prefix[data])),
-                );
+                prefix.select(data);
+                // Only slices of the first event survive; trailing messages are
+                // dropped, cancelling the SDK stream and its request owner.
+                let empty = Body::empty().into_data_stream();
+                return replay(parts, prefix, None, empty);
             }
             return replay(parts, prefix, None, source);
         }
@@ -189,6 +276,7 @@ mod tests {
                 1024,
                 deadline(),
                 &CancellationToken::new(),
+                None,
             )
             .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -209,6 +297,7 @@ mod tests {
             1024,
             deadline(),
             &CancellationToken::new(),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -240,6 +329,7 @@ mod tests {
                 1024,
                 deadline(),
                 &CancellationToken::new(),
+                None,
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
@@ -259,6 +349,7 @@ mod tests {
             16,
             deadline(),
             &CancellationToken::new(),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -289,11 +380,25 @@ mod tests {
                     1024,
                     Instant::now() + Duration::from_millis(10),
                     &cancel,
+                    None,
                 ),
             )
             .await
             .unwrap();
-            assert!(to_bytes(response.into_body(), 1024).await.is_err());
+            assert_eq!(
+                response.status(),
+                if canceled {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::GATEWAY_TIMEOUT
+                }
+            );
+            assert!(
+                to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }
