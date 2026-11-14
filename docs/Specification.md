@@ -38,11 +38,12 @@ Active schema-10 stores automatically receive additive schema-11 attribution
 tables at normal startup under the exclusive storage-owner fence. This bounded
 transition does not perform the schema 1–9 BLAKE3 conversion, scan the corpus or
 request upstream data. Pending conversion still requires offline activation.
-Normal writer startup records schema 17 for filesystem and S3, including the
+Normal writer startup records schema 18 for filesystem and S3, including the
 runtime split, Wikipedia tables, crate enrichment, bounded RFC job diagnostics
-and the immutable RustSec attribution recovery journal.
+and the immutable RustSec attribution recovery journal, plus policy-v2 forward
+provenance discovery checkpoints.
 Older binaries cannot reopen the store; serving readers require the committed
-schema-17 backend. Attribution policy compatibility remains independent
+schema-18 backend. Attribution policy compatibility remains independent
 of that private topology marker.
 
 Serving and collection run as separate workloads. Public-source acquisition needed
@@ -59,6 +60,8 @@ source evidence. Tools include structured `attribution` and readable notices;
 resource reads preserve the original page/blob as their first content item and
 append readable attribution. Complete notices are immutable paged resources under
 `devres://attribution/<generation>`. Required notices are never silently truncated.
+Registered historical notice URIs retain their original policy and UTF-8 paging;
+they do not establish readiness for copied content under the current policy.
 Source bytes, offsets, captures, historical memberships and cursor order stay fixed.
 Missing or obsolete qualification withholds copied content with `unavailable` and
 bounded public attribution details. Operational status remains available. Native

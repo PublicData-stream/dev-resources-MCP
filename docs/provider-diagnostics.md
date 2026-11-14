@@ -4,7 +4,7 @@
 collectors or listeners, acquiring writer authority, or making provider requests.
 Supply reader-only database/S3 credentials through a private configuration file.
 Neither configuration nor arbitrary upstream text enters the report. This command
-supports active schemas 14 through 17 so diagnosis can precede a rollout.
+supports active schemas 14 through 18 so diagnosis can precede a rollout.
 
 ```sh
 devres-server diagnose-collection /etc/devres/reader.toml \

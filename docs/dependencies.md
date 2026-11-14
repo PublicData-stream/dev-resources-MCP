@@ -1,5 +1,37 @@
 # Dependency admission
 
+## Budgeted MCP transport
+
+The pinned `rmcp 3.9.0` source is retained in `vendor/rmcp` with its original
+Apache-2.0 license. First-party changes follow the repository's AGPL-3.0-only
+policy; the modified package declares both obligations. The exact
+`rmcp@3.9.0` cargo-deny exception admits only those local AGPL additions, with
+repository maintainers as owner and review due 2027-01-24 or on SDK/patch changes.
+It is not a general exception for upstream copyleft dependencies.
+The local patch adds an optional, explicitly propagated byte
+budget to HTTP input collection and JSON/SSE serialization. It retains the SDK's
+protocol service, negotiation and unhooked behavior. Copying the entire HTTP
+state machine into first-party code would create a larger maintenance boundary;
+increasing the public buffer budget would increase worst-case encoded memory.
+
+The hook counts an immutable message including SSE framing before allocation,
+reserves capacity, and serializes through a capped writer. Reference-counted byte
+owners retain admission through SDK handoff, response polling, clones and slices.
+Input staging/copies and status translation participate in the same accounting.
+The existing `serde_json` package additionally enables `raw_value` for borrowed
+request-envelope inspection; it adds no package, version or executable capability.
+This is encoded-buffer admission, not a bound on parsed JSON or total process RSS.
+No client transport, process execution, network destination or dependency version
+is added. Existing features and the upstream build script remain selected as
+before; the lockfile records a local path source instead of a registry source.
+
+Keep the patch transport-only and compare it to the exact published source when
+updating the SDK. Audit the upstream version as well as the local changes; a path
+source is not an advisory exemption. Current advisory/license/source checks and
+protocol/admission fixtures are required. Image notice collection includes path
+dependencies outside the first-party workspace and preserves their original
+license texts.
+
 ## Filesystem advisory admission
 
 The locked transitive `rustix` version is updated from 1.1.5 to 1.1.6 for
@@ -61,6 +93,11 @@ The direct `tracing` dependency emits only fixed collection stage/provider label
 allowlisted domain error codes and HTTP status numbers. It reuses the deployed
 operator logging filter and never records source bodies, client errors, URLs,
 credentials or supplied audit input.
+
+Application attribution supervision also uses the same locked `tracing` package
+for private claim, acquisition and completion durations with finite provider and
+outcome fields. This adds no resolved version, build script, destination or request
+data; source identity and audit inputs never become tracing fields.
 
 ## S3-compatible archive transport
 

@@ -474,6 +474,12 @@ attribution_readback() {
     < "$scratch/attribution-backlog-receipt.json"
   k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
     attribution_backlog_cluster_readback
+  if [[ -f $scratch/attribution-origins-v2-receipt.json ]]; then
+    k exec -i storage-maintenance -- sh -c 'cat > /tmp/attribution-origins-v2-receipt.json' \
+      < "$scratch/attribution-origins-v2-receipt.json"
+    k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
+      attribution_origins_v2_cluster_readback
+  fi
   if [[ -f $scratch/rustsec-collector.json ]]; then
     k exec -i storage-maintenance -- sh -c 'cat > /tmp/rustsec-collector-receipt.json' \
       < "$scratch/rustsec-collector.json"
@@ -583,6 +589,12 @@ for provider in "${collector_providers[@]}"; do
   k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 "${provider}_collector_cluster_seed"
   k exec storage-maintenance -- cat "/tmp/${provider}-collector-receipt.json" > "$scratch/$provider-collector.json"
 done
+k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
+  attribution_origins_v2_cluster_seed
+k exec storage-maintenance -- cat /tmp/attribution-origins-v2-receipt.json \
+  > "$scratch/attribution-origins-v2-receipt.json"
+test "$(wc -c < "$scratch/attribution-origins-v2-receipt.json")" -le 262144
+attribution_readback
 if (( ! live )); then
   k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
     rustsec_collector_cluster_readback

@@ -85,11 +85,17 @@ async fn streamed_migration_seals_cancel_rollback_resume_and_verify_without_rewr
     let cancel = CancellationToken::new();
     let task_store = store.clone();
     let task_cancel = cancel.clone();
-    let task = tokio::spawn(async move { task_store.migrate_storage(task_cancel).await });
+    let mut task = tokio::spawn(async move { task_store.migrate_storage(task_cancel).await });
     let waiting = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let waiting: bool = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=802171101 AND objid=1 AND NOT granted)")
-                .fetch_one(&pool).await.unwrap();
+            let waiting: bool = tokio::select! {
+                result = &mut task => match result {
+                    Ok(Err(error)) => panic!("migration exited before first bounded update: {}", error.code),
+                    Ok(Ok(_)) => panic!("migration completed without reaching its blocked update"),
+                    Err(_) => panic!("migration task failed before first bounded update"),
+                },
+                result = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND classid=802171101 AND objid=1 AND NOT granted)").fetch_one(&pool) => result.unwrap(),
+            };
             if waiting { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

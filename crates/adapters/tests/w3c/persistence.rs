@@ -893,7 +893,7 @@ END;
 $fixture$;
 DROP TABLE IF EXISTS devres_attribution_recoveries;
 DROP FUNCTION IF EXISTS devres_attribution_recovery_immutable();
-DROP TABLE IF EXISTS devres_attribution_targets,devres_attribution_sweeps,devres_attribution_generations,devres_attribution_control;
+DROP TABLE IF EXISTS devres_attribution_origins,devres_attribution_targets,devres_attribution_sweeps,devres_attribution_generations,devres_attribution_control;
 DROP TABLE devres_integrity_staged_state;
 DROP TABLE devres_integrity_provider_cutoffs;
 DROP TABLE devres_integrity_graph_progress;

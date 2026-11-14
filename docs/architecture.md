@@ -61,6 +61,16 @@ immutable, with explicit generation/occurrence bindings outside capture hashes.
 Unknown mappings are blocked, never inferred from common body hashes. Audits pass
 only public snapshot evidence and never schedule inventory-derived work.
 
+Schema 18 adds sealed forward-origin checkpoints for attribution policy v2. A
+bounded local traversal starts from frozen provider snapshots/publications and
+proves typed inventory, member and projection/header/chunk membership. Compact
+witnesses reference immutable rows; adapters re-read and verify those rows before
+repair, publication and full storage acceptance. Foreground extraction and sweeps
+share canonical source identities, while occurrence witnesses preserve their exact
+historical context. Cursor advancement and target insertion commit together. V1
+recipes, generations and paged notice resources remain verifiable; current copied
+content requires v2 readiness. Neither requests nor audits traverse source history.
+
 New blobs use `blake3/<64 lowercase hex>` paths in an operator-owned directory;
 public hash identifiers use `blake3:<64 lowercase hex>`. Legacy SHA-256 paths remain
 retained compatibility evidence. Publication writes a unique staging file, fsyncs
@@ -86,7 +96,7 @@ archive capture; checksum verification precedes archive parsing.
 
 ## BLAKE3 enforcement and schema 10
 
-Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 17. Schemas 1–9 require explicit
+Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 18. Schemas 1–9 require explicit
 private offline migration; serving rejects pre-10 schemas or pending migration.
 The maintenance path first excludes readers and writer with the lifecycle fence,
 then acquires the exclusive writer fence before any provider

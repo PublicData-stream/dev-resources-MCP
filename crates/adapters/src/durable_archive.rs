@@ -80,8 +80,9 @@ fn run<T: Send>(future: impl Future<Output = Result<T>> + Send) -> Result<T> {
     let runtime = runtime.as_ref().map_err(|_| unavailable())?;
     let execute = || {
         std::thread::scope(|scope| {
-            scope
-                .spawn(|| runtime.block_on(future))
+            std::thread::Builder::new()
+                .spawn_scoped(scope, || runtime.block_on(future))
+                .map_err(|_| unavailable())?
                 .join()
                 .map_err(|_| unavailable())?
         })
@@ -1759,8 +1760,8 @@ pub fn materialize_directory(
     let execute = || {
         std::thread::scope(|scope| {
             let workers: Vec<_> = (0..files.len().min(2))
-                .map(|_| {
-                    scope.spawn(|| {
+                .filter_map(|_| {
+                    let worker = std::thread::Builder::new().spawn_scoped(scope, || {
                         let mut leases = Vec::new();
                         loop {
                             if stopping.is_cancelled() {
@@ -1789,7 +1790,19 @@ pub fn materialize_directory(
                             }
                         }
                         leases
-                    })
+                    });
+                    match worker {
+                        Ok(worker) => Some(worker),
+                        Err(_) => {
+                            stopping.cancel();
+                            if let Ok(mut first) = first_error.lock()
+                                && first.is_none()
+                            {
+                                *first = Some(unavailable());
+                            }
+                            None
+                        }
+                    }
                 })
                 .collect();
             let mut leases = Vec::new();

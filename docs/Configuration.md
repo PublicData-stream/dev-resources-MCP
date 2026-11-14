@@ -1,5 +1,13 @@
 # Configuration
 
+Private archive/attribution stage timings are disabled by default. Set the
+operator environment variable `DEVRES_PRIVATE_TIMINGS=1` for a bounded diagnostic
+window. Only the fixed `devres_private_timings` target is enabled alongside normal
+server logs; arbitrary `RUST_LOG` directives are not accepted. Fields contain only
+stage/provider enums, durations, eligible age and outcomes, never source paths,
+request/audit inputs or credentials. Disable the switch after collecting the
+needed observation to avoid retaining unnecessary per-operation logs.
+
 Run `devres-server serve CONFIG.toml` and `devres-server collect CONFIG.toml` as
 separate serving and writer workloads. The old `devres-server CONFIG.toml`
 invocation aliases serving only. Each takes one operator-controlled TOML path.
@@ -223,6 +231,15 @@ Zero/invalid limits fail startup. Messages are at most 16 MiB; tool output must
 fit at most one eighth of the configured message size. Buffer capacity must be at
 least four message sizes. Increasing limits must be accompanied by resource and
 acceptance review; transport buffer accounting does not measure total process RSS.
+
+HTTP reserves encoded buffers by admitted allocation capacity rather than reserving
+four maximum-sized messages for every small request. SDK input handoff, JSON/SSE
+serialization and status translation share the same pool as WebTransport. Byte
+owners retain their reservation until their last clone or slice is dropped.
+Admission does not wait for growth while retaining partial buffer reservations;
+capacity pressure can still reject work. The default acceptance fixture exercises
+ten simultaneous small calls; this is not a guarantee for ten maximum-sized calls
+or a total process-memory bound. Existing message, call and I/O deadlines apply.
 
 Capture bodies also share a separate 128 MiB read budget, retained through
 projection and cheap shared clones; it does not count the entire process heap.
@@ -514,6 +531,12 @@ static keys do not inherit broker lease expiry or automatic revocation.
 
 The local cache must fit pinned search generations, admitted downloads, and
 managed staging. Eviction removes only disposable, unleased materializations.
+
+Each archive instance admits at most two concurrent materialization I/O operations,
+including directory members. Requests for one logical path share in-progress
+materialization. Pending downloads reserve cache bytes alongside resident files;
+remote I/O and hashing do not hold the shared cache bookkeeping lock. Every caller
+still checks exact binding, ownership, remote health and HEAD, including warm reads.
 An oversized working set fails explicitly; public reads retain existing deadlines
 and limits. Mutable Git working repositories keep their separate provider byte
 limits and free-space reserves. Remote storage has no portable free-space API:
@@ -555,7 +578,8 @@ Public selectors, freshness, result limits, and capture-fixed reads are unchange
 
 Serving uses SELECT-only PostgreSQL credentials, has no writer-owner lock, and
 runs no migration, stage recovery, or collectors. The sole writer initializes and
-publishes schema 17 for either backend, including RFC job diagnostics and the RustSec recovery journal. Existing configuration values and backend
+publishes schema 18 for either backend, including RFC job diagnostics, the RustSec
+recovery journal and policy-v2 origin checkpoints. Existing configuration values and backend
 defaults remain; operators must add the role-specific client/listener/scratch
 settings and deploy both processes. See the [operator templates](../deploy/examples/scaleway-credential-broker/README.md).
 
@@ -636,4 +660,4 @@ the Current profile. `requests_per_second=1` accepts 1..3, under shared admissio
 `min_free_bytes=1073741824` (minimum64MiB); optional
 `max_archive_storage_bytes` must cover the free-space reserve. Quotas pause new
 acquisition without deleting permanent bodies. Article representations cap at16MiB;
-public text pages remain at most32KiB. Reader attachment requires schema17.
+public text pages remain at most32KiB. Reader attachment requires schema18.

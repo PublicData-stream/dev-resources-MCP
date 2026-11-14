@@ -1,11 +1,78 @@
 # Operations and acceptance
 
+## Attribution policy v2 and shared read admission
+
+Schema 18 adds the sealed, provider-local `devres_attribution_origins` checkpoint
+table. Upgrade the writer, readers and maintenance tools together with readers
+stopped for the owner-fenced schema transition. Normal writer startup promotes
+the required attribution policy to v2 and resets only bounded sweep metadata;
+it does not traverse history or acquire upstream evidence during startup. Old
+binaries reject the new schema/policy. Take a coordinated PostgreSQL/blob backup
+before activation; downgrade requires restoring that matching backup.
+
+Existing v1 targets, generations, notices and RustSec recovery receipts remain
+retained and verifiable. They do not establish v2 readiness. Background discovery
+and exact-evidence repair requalify retained public history under the existing
+single repair lane, source budgets and foreground/background fairness. Content
+can remain unavailable during that work. A completed initial scan does not imply
+that every retained or newly arriving source has qualified.
+
+For MDN, WHATWG, W3C and Chromium, forward discovery follows immutable snapshot or
+publication membership to source members, projections and header/chunk references.
+Contextual witnesses bind exact source identities and typed parent/child edges;
+equal bytes or a moving latest revision cannot supply missing ancestry. Witnesses
+and traversal position commit together. Interrupted discovery resumes from its
+sealed checkpoint. Repair, publication and full storage verification re-read the
+referenced rows and check their integrity and membership. Missing, ambiguous,
+corrupt or excessive evidence stays blocked; actual missing notices are not
+manufactured. Old blocked rows are never cleared to force progress.
+
+Origin discovery admits at most 16 transitions and 32 MiB of cumulative decoded
+row work per page, with a 16 MiB individual-row ceiling, 128-reference proof depth,
+256-entry frontier and the existing 8 MiB sealed-target ceiling. Ancestor re-reads
+also consume that page allowance. Work yields after a one-second slice and retains
+its frontier; SQL uses two-second statement and 250 ms lock limits, with a separate
+15-second whole-operation deadline. These are work/representation bounds, not RSS
+measurements or a limit on the number of retained historical roots.
+
+Include the new checkpoint table in reader SELECT grants and coordinated backups.
+The example roles already grant SELECT on existing and future owner-created
+tables. Restore acceptance must verify historical v1 notices and current v2
+qualification after restart, including the S3 disposable-cache-loss branch.
+Discovery never persists audit inputs or schedules inventory-derived audit work.
+
+Archive materialization uses two I/O slots per archive instance, per-path work
+coalescing and pending-byte cache reservations. Private fixed-stage timings
+distinguish lock admission, binding/owner checks, remote health/HEAD, transfer,
+verification and cache admission. Warm cache bytes still require remote authority;
+increasing deadlines or bypassing health is not an outage recovery procedure.
+Enable only `DEVRES_PRIVATE_TIMINGS=1` for a bounded private observation window to
+collect these sanitized events and attribution claim/repair durations. It does not
+enable SDK or HTTP payload traces. Remove the switch when observation is complete.
+
+HTTP and WebTransport share encoded-buffer admission. HTTP accounts input copies
+and actual JSON/SSE allocation capacities instead of reserving four maximum-sized
+messages per call. Reservations follow byte owners through response consumption;
+capacity errors before headers reject admission, while errors after SSE starts
+terminate that stream. The unchanged 64 MiB default does not bound total RSS.
+Inspect the separate admission/shutdown counters before attributing HTTP 503 to a
+provider. `http_request_rejected` includes input-growth and pre-header SDK/output
+admission failures; `http_buffer_wait_expired` identifies initial input reservation
+expiry. Local ten-small-call acceptance is not a production load test.
+
+Run fixture-only PostgreSQL, S3, OxiBelt and filesystem/S3 minikube gates through
+`scripts/with-tmp-state.sh` and `scripts/with-local-docker.sh`, with
+`CARGO_TARGET_DIR=/tmp/rust/target` and `OXIBELT_TARGET_DIR=/tmp/rust/target` set
+after entering the temporary-state wrapper. Use a fresh task-owned minikube
+profile and no `--live` option. This proves isolated behavior only, separately
+from native hosted architecture CI, real-provider acceptance and production.
+
 ## Automatic attribution upgrade (schema 11)
 
 Writer startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
 without corpus rewrite or provider acquisition. Existing offline schemas 1–9 to 10
 migration and activation remain required; inspection never bootstraps attribution.
-The same normal writer startup records schema 17, retaining the required runtime
+The same normal writer startup records schema 18, retaining the required runtime
 split and adding Wikipedia tables;
 see [split upgrade](#credential-broker-and-split-runtime-upgrade).
 
@@ -574,12 +641,15 @@ a previously verified digest through a separately authorized deployment operatio
 
 `recover-rustsec-attribution` is private offline maintenance. It does not acquire
 provider data, start collection, upgrade schema or publish qualification. Dry-run
-uses a reader connection and accepts active schemas 14 through 17; older schemas
+uses a reader connection and accepts active schemas 14 through 18; older schemas
 report that upgrade is required before applying recovery.
 
 ```sh
 devres-server recover-rustsec-attribution /etc/devres/reader.toml \
   --target blake3:TARGET_HEX \
+  --policy-epoch 2 \
+  --policy-fingerprint devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices \
+  --repair-version rustsec-captures-v2 \
   --output /tmp/devres-rustsec-recovery/dry-run.json
 ```
 
@@ -587,19 +657,21 @@ Select an exact target using private diagnosis. Only current-policy RustSec
 `blocked / mapping / unsupported_source` targets supported by the capture repair
 recipe are eligible. Unknown legacy failures, unsupported mappings, missing rights,
 active claims and ready generations are not reset. A retained dependency target
-must reproduce its existing sealed v1 compiler recipe.
+must reproduce its sealed compiler recipe. The v1 recipe/defaults remain pinned
+to policy 1 for compatibility; current-policy recovery explicitly selects v2.
+Historical v1 recovery journal entries retain their original verifier.
 
 For a separately authorized operational application, first stop all serving and
 writer participants and preserve the coordinated database/archive backup. Apply
-requires active schema 17, writer credentials, exclusive lifecycle/owner fences,
+requires active schema 18, writer credentials, exclusive lifecycle/owner fences,
 the whole-state digest and explicit policy/recipe identities from dry-run:
 
 ```sh
 devres-server recover-rustsec-attribution /etc/devres/writer.toml \
   --target blake3:TARGET_HEX --apply --expected-state blake3:STATE_HEX \
-  --policy-epoch 1 \
-  --policy-fingerprint devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices \
-  --repair-version rustsec-captures-v1 \
+  --policy-epoch 2 \
+  --policy-fingerprint devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices \
+  --repair-version rustsec-captures-v2 \
   --output /tmp/devres-rustsec-recovery/apply.json
 ```
 
@@ -634,7 +706,7 @@ Schema 16 added RFC operational failure metadata; schema 17 adds the immutable
 RustSec attribution recovery journal. Stop serving readers and the old
 writer, preserve a coordinated database/archive backup, then let the sole new
 writer upgrade under the exclusive lifecycle fence before starting new readers.
-Readers require schema 17; older binaries are not a rollback mechanism. The
+Current readers require schema 18; older binaries are not a rollback mechanism. The
 migration does not retry failed jobs or rewrite retained public evidence.
 
 RFC job diagnostics distinguish claim time, failure completion time and next due
@@ -1356,7 +1428,7 @@ authority or provision their prerequisites.
    Give serving SELECT-only PostgreSQL and either a read-only filesystem mount plus
    separate writable scratch, or an RO broker profile and its own S3 cache.
 4. Start the broker, then the sole writer. Its bounded additive startup commits
-   schema 17 and retains the archive format/history; earlier pending BLAKE3 migration
+   schema 18 and retains the archive format/history; earlier pending BLAKE3 migration
    still requires the existing offline procedure. Start serving after the committed
    backend is available. No role split silently transfers filesystem data to S3.
 5. Verify historical capture/resource identities and pagination; a foreground cold
