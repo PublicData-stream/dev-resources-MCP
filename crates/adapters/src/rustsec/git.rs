@@ -8,8 +8,10 @@ use crate::{
     },
 };
 use devres_application::advisory::{
-    ADVISORY_PROCESSOR_VERSION, AdvisorySnapshot, AdvisoryStore, RustSecConfig,
+    ADVISORY_PROCESSOR_VERSION, AdvisoryAttemptOutcome, AdvisorySnapshot, AdvisoryStore,
+    HISTORY_DIAGNOSTICS_KEY, RustSecConfig,
 };
+use devres_application::collection::{Failure, Phase};
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -94,6 +96,87 @@ fn reset_processor(state: &mut HistoryState) -> bool {
 }
 fn default_true() -> bool {
     true
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HistoryOperation {
+    Synchronize,
+    Restore,
+    Projection,
+}
+impl HistoryOperation {
+    fn phase(self) -> Phase {
+        match self {
+            Self::Synchronize => Phase::GitTransfer,
+            Self::Restore => Phase::InventoryRestore,
+            Self::Projection => Phase::Projection,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryFailure {
+    attempt: String,
+    operation: HistoryOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<usize>,
+    failure: Failure,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved_at: Option<i64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryDiagnostic {
+    version: u32,
+    attempt: String,
+    operation: HistoryOperation,
+    stage: HistoryOperation,
+    outcome: AdvisoryAttemptOutcome,
+    started_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finished_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<usize>,
+    failures: Vec<HistoryFailure>,
+}
+impl HistoryDiagnostic {
+    fn validate(&self) -> Result<()> {
+        let valid = |id: &str| devres_domain::valid_content_id(id);
+        if self.version != 1
+            || !valid(&self.attempt)
+            || self.stage != self.operation
+            || self.observation.as_deref().is_some_and(|id| !valid(id))
+            || self.failures.len() > 3
+            || self.failures.iter().any(|failure| {
+                !valid(&failure.attempt)
+                    || failure.observation.as_deref().is_some_and(|id| !valid(id))
+                    || failure.failure.code
+                        != devres_application::collection::safe_code(&failure.failure.code)
+                    || failure
+                        .failure
+                        .http_status
+                        .is_some_and(|status| !(100..=599).contains(&status))
+            })
+        {
+            return Err(Error::integrity(
+                "Invalid private advisory history diagnostic.",
+            ));
+        }
+        for (index, failure) in self.failures.iter().enumerate() {
+            if self.failures[..index]
+                .iter()
+                .any(|old| old.operation == failure.operation)
+            {
+                return Err(Error::integrity("Duplicate advisory history failure lane."));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct AdvisoryHistory {
@@ -281,6 +364,97 @@ impl AdvisoryHistory {
         }
         result
     }
+    async fn begin_stage(
+        &self,
+        operation: HistoryOperation,
+        observation: Option<&str>,
+        checkpoint: Option<usize>,
+    ) -> Result<HistoryDiagnostic> {
+        let previous = self
+            .store
+            .advisory_state(HISTORY_DIAGNOSTICS_KEY)
+            .await?
+            .map(serde_json::from_value::<HistoryDiagnostic>)
+            .transpose()
+            .map_err(|_| Error::integrity("Invalid private advisory history diagnostic."))?;
+        if let Some(previous) = &previous {
+            previous.validate()?;
+        }
+        let diagnostic = HistoryDiagnostic {
+            version: 1,
+            attempt: super::corpus::attempt_id("history")?,
+            operation,
+            stage: operation,
+            outcome: AdvisoryAttemptOutcome::Running,
+            started_at: devres_domain::unix_now(),
+            finished_at: None,
+            observation: observation.map(str::to_owned),
+            checkpoint,
+            failures: previous
+                .map(|previous| previous.failures)
+                .unwrap_or_default(),
+        };
+        self.save_history_diagnostic(&diagnostic).await?;
+        Ok(diagnostic)
+    }
+    async fn save_history_diagnostic(&self, diagnostic: &HistoryDiagnostic) -> Result<()> {
+        diagnostic.validate()?;
+        self.store
+            .set_advisory_state(
+                HISTORY_DIAGNOSTICS_KEY,
+                &serde_json::to_value(diagnostic)
+                    .map_err(|_| Error::integrity("Invalid history diagnostic encoding."))?,
+            )
+            .await
+    }
+    async fn finish_stage(
+        &self,
+        mut diagnostic: HistoryDiagnostic,
+        error: Option<&Error>,
+        progress: Option<usize>,
+        complete: bool,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        // A canceled future or a deadline yield without forward progress is not recovery.
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        let now = devres_domain::unix_now().max(diagnostic.started_at);
+        diagnostic.finished_at = Some(now);
+        diagnostic.outcome = if error.is_some() {
+            AdvisoryAttemptOutcome::Failed
+        } else {
+            AdvisoryAttemptOutcome::Succeeded
+        };
+        if let Some(error) = error {
+            diagnostic
+                .failures
+                .retain(|old| old.operation != diagnostic.operation);
+            diagnostic.failures.push(HistoryFailure {
+                attempt: diagnostic.attempt.clone(),
+                operation: diagnostic.operation,
+                observation: diagnostic.observation.clone(),
+                checkpoint: progress.or(diagnostic.checkpoint),
+                failure: Failure::from_error(error, diagnostic.operation.phase(), now),
+                resolved_at: None,
+            });
+        } else {
+            for old in &mut diagnostic.failures {
+                if old.operation == diagnostic.operation
+                    && old.observation == diagnostic.observation
+                    && (diagnostic.operation != HistoryOperation::Projection
+                        || complete
+                        || progress
+                            .zip(old.checkpoint)
+                            .is_some_and(|(processed, failed)| processed > failed))
+                    && old.resolved_at.is_none()
+                {
+                    old.resolved_at = Some(now);
+                }
+            }
+        }
+        self.save_history_diagnostic(&diagnostic).await
+    }
     async fn state(&self, key: &str) -> Result<Option<HistoryState>> {
         self.store
             .advisory_state(key)
@@ -290,7 +464,6 @@ impl AdvisoryHistory {
             .map_err(|_| Error::integrity("Invalid retained RustSec history checkpoint."))
     }
     async fn tick_inner(&self, shutdown: CancellationToken) -> Result<()> {
-        self.artifacts.recover_stages().await?;
         let mut active = self.state("history").await?;
         let active_reset = active.as_mut().is_some_and(reset_processor);
         if active_reset {
@@ -319,11 +492,42 @@ impl AdvisoryHistory {
                 .set_advisory_state("history-commit", &json!({}))
                 .await?;
         }
+        let synchronize_due = latest.as_ref().is_none_or(|state| {
+            devres_domain::unix_now().saturating_sub(state.observed_at)
+                >= self.config.history_refresh_secs as i64
+        });
+        if !synchronize_due
+            && active.as_ref().is_some_and(|active| {
+                active.complete
+                    && latest
+                        .as_ref()
+                        .is_some_and(|latest| latest.observation_id == active.observation_id)
+            })
+        {
+            return Ok(());
+        }
+        let preflight = self
+            .begin_stage(HistoryOperation::Restore, None, None)
+            .await?;
+        let result = self.artifacts.recover_stages().await;
+        self.finish_stage(preflight, result.as_ref().err(), None, true, &shutdown)
+            .await?;
+        result?;
         if latest.as_ref().is_none_or(|state| {
             devres_domain::unix_now().saturating_sub(state.observed_at)
                 >= self.config.history_refresh_secs as i64
         }) {
-            latest = Some(self.synchronize(latest.as_ref(), shutdown.clone()).await?);
+            let diagnostic = self
+                .begin_stage(
+                    HistoryOperation::Synchronize,
+                    latest.as_ref().map(|state| state.observation_id.as_str()),
+                    None,
+                )
+                .await?;
+            let result = self.synchronize(latest.as_ref(), shutdown.clone()).await;
+            self.finish_stage(diagnostic, result.as_ref().err(), None, true, &shutdown)
+                .await?;
+            latest = Some(result?);
         }
         let mut state = match active {
             Some(state) if !state.complete => state,
@@ -342,9 +546,31 @@ impl AdvisoryHistory {
                 .await
                 .map_err(|_| failure())?;
         if needs_restore {
-            self.restore(&state.manifest, shutdown.clone()).await?;
+            let diagnostic = self
+                .begin_stage(HistoryOperation::Restore, Some(&state.observation_id), None)
+                .await?;
+            let result = self.restore(&state.manifest, shutdown.clone()).await;
+            self.finish_stage(diagnostic, result.as_ref().err(), None, true, &shutdown)
+                .await?;
+            result?;
         }
-        self.process_batch(&mut state, shutdown).await
+        let diagnostic = self
+            .begin_stage(
+                HistoryOperation::Projection,
+                Some(&state.observation_id),
+                Some(state.processed),
+            )
+            .await?;
+        let result = self.process_batch(&mut state, shutdown.clone()).await;
+        self.finish_stage(
+            diagnostic,
+            result.as_ref().err(),
+            Some(state.processed),
+            state.complete,
+            &shutdown,
+        )
+        .await?;
+        result
     }
     async fn synchronize(
         &self,
@@ -1847,6 +2073,9 @@ mod tests {
         async fn advisory_status(&self) -> Result<Value> {
             Ok(json!({}))
         }
+    }
+    mod history_diagnostic_tests {
+        include!("history_diagnostic_tests.rs");
     }
     fn config() -> RustSecConfig {
         RustSecConfig {

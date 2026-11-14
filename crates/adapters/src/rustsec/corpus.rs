@@ -3,8 +3,11 @@ use crate::{archive, bulk::BulkBroker, rustsec::advisory, rustsec::git::Advisory
 use devres_application::{
     ResponseValidator, Retrieval,
     advisory::{
-        ADVISORY_PROCESSOR_VERSION, AdvisoryRecord, AdvisorySnapshot, AdvisoryStore, RustSecConfig,
+        ADVISORY_PROCESSOR_VERSION, AdvisoryAttemptOutcome, AdvisoryCurrentDiagnostic,
+        AdvisoryCurrentOperation, AdvisoryCurrentStage, AdvisoryPublicationError, AdvisoryRecord,
+        AdvisorySnapshot, AdvisoryStore, CURRENT_DIAGNOSTICS_KEY, RustSecConfig,
     },
+    collection::{Failure, Phase},
 };
 use devres_domain::{Error, FetchRequest, FetchResponse, Result, StoredCapture};
 use serde_json::{Value, json};
@@ -43,10 +46,40 @@ pub(crate) fn revision(bytes: &[u8]) -> Result<String> {
 struct HeadValidator;
 #[async_trait::async_trait]
 impl ResponseValidator for HeadValidator {
+    fn collection_diagnostics(&self) -> bool {
+        true
+    }
     async fn validate(&self, _: &FetchRequest, response: FetchResponse) -> Result<FetchResponse> {
         revision(&response.body)?;
         Ok(response)
     }
+}
+
+struct BundleValidator;
+#[async_trait::async_trait]
+impl ResponseValidator for BundleValidator {
+    fn collection_diagnostics(&self) -> bool {
+        true
+    }
+    async fn validate(&self, _: &FetchRequest, response: FetchResponse) -> Result<FetchResponse> {
+        Ok(response)
+    }
+}
+
+pub(super) fn attempt_id(operation: &str) -> Result<String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::unavailable("Advisory attempt clock unavailable."))?
+        .as_nanos();
+    Ok(digest(
+        format!(
+            "{operation}:{}:{nanos}:{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+        .as_bytes(),
+    ))
 }
 
 /// Normalize every relevant file; unsupported historical inputs remain explicit gaps.
@@ -178,7 +211,132 @@ impl AdvisoryCorpus {
         })
     }
     pub async fn refresh_current(&self) -> Result<Value> {
+        // Keep failure recording under this gate too: a late error must not erase success.
         let _gate = self.gate.lock().await;
+        self.reconcile_interrupted_current().await?;
+        let mut attempt = AdvisoryCurrentDiagnostic {
+            version: 1,
+            attempt: attempt_id("current_refresh")?,
+            operation: AdvisoryCurrentOperation::CurrentRefresh,
+            outcome: AdvisoryAttemptOutcome::Running,
+            stage: AdvisoryCurrentStage::Head,
+            started_at: devres_domain::unix_now(),
+            finished_at: None,
+            head_capture: None,
+            bundle_capture: None,
+            revision: None,
+            snapshot: None,
+            failure: None,
+        };
+        self.save_attempt(&attempt).await?;
+        let result = self.prepare_current(&mut attempt).await;
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.fail_attempt(&mut attempt, &error, false).await?;
+                return Err(error);
+            }
+        };
+        attempt.stage = AdvisoryCurrentStage::Publication;
+        attempt.snapshot = Some(snapshot.id.clone());
+        self.save_attempt(&attempt).await?;
+        match self
+            .store
+            .publish_current_advisory(&snapshot, &attempt)
+            .await
+        {
+            Ok(()) => {}
+            Err(failure) => {
+                let unknown = matches!(failure, AdvisoryPublicationError::CommitUnknown(_));
+                let error = failure.into_error();
+                // A COMMIT response can be lost after the server committed. Read only exact
+                // attempt success, public success, and its default before reporting success.
+                if unknown && self.committed_attempt(&attempt).await.unwrap_or(false) {
+                    return Ok(Self::refresh_result(&snapshot));
+                }
+                self.fail_attempt(&mut attempt, &error, unknown).await?;
+                return Err(error);
+            }
+        }
+        Ok(Self::refresh_result(&snapshot))
+    }
+    async fn reconcile_interrupted_current(&self) -> Result<()> {
+        let Some(previous) = self.store.advisory_state(CURRENT_DIAGNOSTICS_KEY).await? else {
+            return Ok(());
+        };
+        let previous: AdvisoryCurrentDiagnostic = serde_json::from_value(previous)
+            .map_err(|_| Error::integrity("Invalid current advisory diagnostic."))?;
+        previous.validate()?;
+        if matches!(
+            previous.outcome,
+            AdvisoryAttemptOutcome::Running | AdvisoryAttemptOutcome::Unknown
+        ) {
+            self.store.reconcile_current_advisory_attempt().await?;
+        }
+        Ok(())
+    }
+    fn refresh_result(snapshot: &AdvisorySnapshot) -> Value {
+        json!({"snapshot":crate::rustsec::research::snapshot_metadata(snapshot),"advisories":snapshot.records.len()})
+    }
+    async fn save_attempt(&self, attempt: &AdvisoryCurrentDiagnostic) -> Result<()> {
+        attempt.validate()?;
+        self.store
+            .set_advisory_state(
+                CURRENT_DIAGNOSTICS_KEY,
+                &serde_json::to_value(attempt)
+                    .map_err(|_| Error::integrity("Invalid advisory attempt encoding."))?,
+            )
+            .await
+    }
+    async fn fail_attempt(
+        &self,
+        attempt: &mut AdvisoryCurrentDiagnostic,
+        error: &Error,
+        unknown: bool,
+    ) -> Result<()> {
+        let now = devres_domain::unix_now().max(attempt.started_at);
+        attempt.finished_at = Some(now);
+        attempt.outcome = if unknown {
+            AdvisoryAttemptOutcome::Unknown
+        } else {
+            AdvisoryAttemptOutcome::Failed
+        };
+        let phase = match attempt.stage {
+            AdvisoryCurrentStage::Head | AdvisoryCurrentStage::Bundle => Phase::HttpAcquisition,
+            AdvisoryCurrentStage::Normalization => Phase::Projection,
+            AdvisoryCurrentStage::SnapshotLookup => Phase::RetainedLookup,
+            AdvisoryCurrentStage::Publication => Phase::ViewPublication,
+        };
+        attempt.failure = Some(Failure::from_error(error, phase, now));
+        self.store.finish_current_advisory_attempt(attempt).await?;
+        Ok(())
+    }
+    async fn committed_attempt(&self, attempt: &AdvisoryCurrentDiagnostic) -> Result<bool> {
+        let Some(retained) = self.store.advisory_state(CURRENT_DIAGNOSTICS_KEY).await? else {
+            return Ok(false);
+        };
+        let retained: AdvisoryCurrentDiagnostic = serde_json::from_value(retained)
+            .map_err(|_| Error::integrity("Invalid current advisory diagnostic."))?;
+        retained.validate()?;
+        if retained.attempt != attempt.attempt
+            || retained.outcome != AdvisoryAttemptOutcome::Succeeded
+            || retained.snapshot != attempt.snapshot
+        {
+            return Ok(false);
+        }
+        let public = self
+            .store
+            .advisory_state("current")
+            .await?
+            .unwrap_or(Value::Null);
+        let default = self.store.advisory_snapshot(None, "rustsec").await?;
+        Ok(public["snapshot"].as_str() == attempt.snapshot.as_deref()
+            && default.as_ref().map(|snapshot| snapshot.id.as_str()) == attempt.snapshot.as_deref())
+    }
+    async fn prepare_current(
+        &self,
+        attempt: &mut AdvisoryCurrentDiagnostic,
+    ) -> Result<AdvisorySnapshot> {
         let head = self
             .retrieval
             .get_fresh_validated(
@@ -193,21 +351,30 @@ impl AdvisoryCorpus {
             )
             .await?;
         let revision = revision(&head.body)?;
-        // Stale fallback is usable evidence, but never a successful fresh observation.
+        attempt.head_capture = Some(head.capture.id.clone());
+        attempt.revision = Some(revision.clone());
+        attempt.stage = AdvisoryCurrentStage::Bundle;
+        self.save_attempt(attempt).await?;
+        // Immutable bundle reuse does not replace fresh head validation.
         let bundle = self
             .retrieval
-            .get(FetchRequest {
-                key: format!("rustsec:bundle:{revision}"),
-                url: format!("https://codeload.github.com/RustSec/advisory-db/tar.gz/{revision}"),
-                ttl_secs: 365 * 86400,
-                max_bytes: archive::MAX_COMPRESSED,
-                media_type: "application/gzip".into(),
-            })
+            .get_validated(
+                FetchRequest {
+                    key: format!("rustsec:bundle:{revision}"),
+                    url: format!(
+                        "https://codeload.github.com/RustSec/advisory-db/tar.gz/{revision}"
+                    ),
+                    ttl_secs: 365 * 86400,
+                    max_bytes: archive::MAX_COMPRESSED,
+                    media_type: "application/gzip".into(),
+                },
+                &BundleValidator,
+            )
             .await?;
-        let snapshot = self.publish_pair(head, bundle, false, true).await?;
-        let result = json!({"snapshot":crate::rustsec::research::snapshot_metadata(&snapshot),"advisories":snapshot.records.len()});
-        self.store.set_advisory_state("current",&json!({"last_attempt":devres_domain::unix_now(),"last_success":snapshot.validated_at,"snapshot":snapshot.id,"error":null})).await?;
-        Ok(result)
+        attempt.bundle_capture = Some(bundle.capture.id.clone());
+        attempt.stage = AdvisoryCurrentStage::Normalization;
+        self.save_attempt(attempt).await?;
+        self.prepare_pair(head, bundle, false, Some(attempt)).await
     }
     async fn publish_pair(
         &self,
@@ -215,6 +382,19 @@ impl AdvisoryCorpus {
         bundle: StoredCapture,
         historical: bool,
         make_default: bool,
+    ) -> Result<AdvisorySnapshot> {
+        let snapshot = self.prepare_pair(head, bundle, historical, None).await?;
+        self.store
+            .publish_advisory_snapshot(&snapshot, make_default)
+            .await?;
+        Ok(snapshot)
+    }
+    async fn prepare_pair(
+        &self,
+        head: StoredCapture,
+        bundle: StoredCapture,
+        historical: bool,
+        mut attempt: Option<&mut AdvisoryCurrentDiagnostic>,
     ) -> Result<AdvisorySnapshot> {
         let _permit = archive::admit()?;
         let bytes = bundle.body;
@@ -255,6 +435,11 @@ impl AdvisoryCorpus {
         };
         // Processing time does not change an observation's immutable identity.
         snapshot.id=digest(&serde_json::to_vec(&json!({"revision":snapshot.revision,"format":"rustsec","validated_at":snapshot.validated_at,"captures":snapshot.captures.iter().map(|c|&c.id).collect::<Vec<_>>(),"historical":historical,"processor_version":ADVISORY_PROCESSOR_VERSION})).map_err(|_|Error::integrity("RustSec snapshot identity failed."))?);
+        if let Some(attempt) = attempt.as_mut() {
+            attempt.stage = AdvisoryCurrentStage::SnapshotLookup;
+            attempt.snapshot = Some(snapshot.id.clone());
+            self.save_attempt(attempt).await?;
+        }
         // Same observation after restart must retain exactly the same descriptor.
         if let Some(existing) = self
             .store
@@ -263,9 +448,6 @@ impl AdvisoryCorpus {
         {
             snapshot = existing;
         }
-        self.store
-            .publish_advisory_snapshot(&snapshot, make_default)
-            .await?;
         Ok(snapshot)
     }
     async fn recover_legacy(&self) -> Result<()> {
@@ -324,6 +506,10 @@ impl AdvisoryCorpus {
                 return Ok(());
             }
             tokio::select! {_=shutdown.cancelled()=>return Ok(()), result=self.recover_legacy()=>result?};
+            {
+                let _gate = self.gate.lock().await;
+                self.reconcile_interrupted_current().await?;
+            }
             let state = self.store.advisory_state("current").await?;
             let last = state
                 .as_ref()
@@ -333,9 +519,27 @@ impl AdvisoryCorpus {
             if self.config.enabled
                 && now.saturating_sub(last) >= self.config.current_refresh_secs as i64
             {
+                let previous_attempt = self
+                    .store
+                    .advisory_state(CURRENT_DIAGNOSTICS_KEY)
+                    .await?
+                    .and_then(|value| value["attempt"].as_str().map(str::to_owned));
                 let result = tokio::select! {biased;_=shutdown.cancelled()=>return Ok(()), result=self.refresh_current()=>result};
                 if let Err(error) = result {
-                    self.store.set_advisory_state("current",&json!({"last_attempt":now,"error":error.code,"previous_snapshot_preserved":true})).await?;
+                    let recorded = self.store.advisory_state(CURRENT_DIAGNOSTICS_KEY).await?;
+                    // A failed diagnostic write must not create an acquisition loop at the
+                    // collection interval. Supervision stops unless this attempt has a
+                    // durable terminal result (including a commit outcome still unknown).
+                    let recorded = recorded.as_ref().is_some_and(|value| {
+                        value["attempt"].as_str() != previous_attempt.as_deref()
+                            && matches!(
+                                value["outcome"].as_str(),
+                                Some("failed" | "unknown" | "succeeded")
+                            )
+                    });
+                    if !recorded {
+                        return Err(error);
+                    }
                 }
             }
             tokio::select! {_=shutdown.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(self.config.collection_interval_secs))=>{}}
@@ -401,3 +605,7 @@ mod tests {
         assert_eq!(coverage["gaps"][0]["code"], "integrity");
     }
 }
+
+#[cfg(test)]
+#[path = "current_tests.rs"]
+mod current_tests;

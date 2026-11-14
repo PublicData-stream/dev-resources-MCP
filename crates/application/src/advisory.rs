@@ -7,6 +7,107 @@ use serde_json::Value;
 /// A normalization change publishes new immutable projections of retained evidence.
 pub const ADVISORY_PROCESSOR_VERSION: u32 = 2;
 
+/// Private collector state; deliberately excluded from public corpus status.
+pub const CURRENT_DIAGNOSTICS_KEY: &str = "diagnostics-current";
+pub const HISTORY_DIAGNOSTICS_KEY: &str = "diagnostics-history";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvisoryCurrentStage {
+    Head,
+    Bundle,
+    Normalization,
+    SnapshotLookup,
+    Publication,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvisoryAttemptOutcome {
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisoryCurrentDiagnostic {
+    pub version: u32,
+    pub attempt: String,
+    pub operation: AdvisoryCurrentOperation,
+    pub outcome: AdvisoryAttemptOutcome,
+    pub stage: AdvisoryCurrentStage,
+    pub started_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_capture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_capture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::collection::Failure>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvisoryCurrentOperation {
+    CurrentRefresh,
+}
+
+impl AdvisoryCurrentDiagnostic {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1
+            || !self.attempt.starts_with("blake3:")
+            || !devres_domain::valid_content_id(&self.attempt)
+            || self.started_at < 0
+            || self.finished_at.is_some_and(|at| at < self.started_at)
+            || [&self.head_capture, &self.bundle_capture, &self.snapshot]
+                .into_iter()
+                .flatten()
+                .any(|id| !devres_domain::valid_content_id(id))
+            || self.revision.as_ref().is_some_and(|revision| {
+                revision.len() != 40
+                    || !revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            || self.failure.as_ref().is_some_and(|failure| {
+                failure.code != crate::collection::safe_code(&failure.code)
+                    || failure
+                        .http_status
+                        .is_some_and(|status| !(100..=599).contains(&status))
+            })
+        {
+            return Err(Error::integrity("Invalid private advisory attempt."));
+        }
+        Ok(())
+    }
+}
+
+/// A failed COMMIT response does not establish whether publication happened.
+#[derive(Debug)]
+pub enum AdvisoryPublicationError {
+    Rejected(Error),
+    CommitUnknown(Error),
+}
+impl From<Error> for AdvisoryPublicationError {
+    fn from(error: Error) -> Self {
+        Self::Rejected(error)
+    }
+}
+impl AdvisoryPublicationError {
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::Rejected(error) | Self::CommitUnknown(error) => error,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdvisoryRecord {
     pub id: String,
@@ -112,6 +213,31 @@ pub trait AdvisoryStore: Send + Sync {
         snapshot: &AdvisorySnapshot,
         make_default: bool,
     ) -> Result<()>;
+    /// Snapshot, default, public success and private attempt success commit together.
+    /// Implementations must never emulate this with separate successful writes.
+    async fn publish_current_advisory(
+        &self,
+        _snapshot: &AdvisorySnapshot,
+        _attempt: &AdvisoryCurrentDiagnostic,
+    ) -> std::result::Result<(), AdvisoryPublicationError> {
+        Err(Error::unavailable("Atomic current advisory publication unavailable.").into())
+    }
+    /// Update only the matching unfinished attempt. A committed success wins.
+    async fn finish_current_advisory_attempt(
+        &self,
+        _attempt: &AdvisoryCurrentDiagnostic,
+    ) -> Result<bool> {
+        Err(Error::unavailable(
+            "Current advisory attempt finalization unavailable.",
+        ))
+    }
+    /// Drain the exclusive owner's preceding transaction before deciding whether
+    /// an interrupted publication committed. No provider traffic is permitted.
+    async fn reconcile_current_advisory_attempt(&self) -> Result<AdvisoryAttemptOutcome> {
+        Err(Error::unavailable(
+            "Current advisory reconciliation unavailable.",
+        ))
+    }
     async fn advisory_snapshot(
         &self,
         id: Option<&str>,

@@ -1260,7 +1260,7 @@ fn sources(name: &str) -> Result<Vec<Source>> {
             list.push(Source {
                 table: "devres_advisory_state",
                 select: "t.*,''::text AS kind,to_jsonb(t)-'data' AS metadata",
-                filter: "true",
+                filter: "NOT starts_with(key,'diagnostics-')",
             });
             list.push(Source {
                 table: "devres_advisory_records",

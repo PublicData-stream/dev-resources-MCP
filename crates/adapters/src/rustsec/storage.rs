@@ -2,8 +2,9 @@
 use super::{PgBlobStore, hash, payload_integrity, storage_error, valid_hash};
 use async_trait::async_trait;
 use devres_application::advisory::{
-    ADVISORY_PROCESSOR_VERSION, AdvisoryProjectionState, AdvisoryRecord, AdvisoryRow,
-    AdvisorySnapshot, AdvisoryStore,
+    ADVISORY_PROCESSOR_VERSION, AdvisoryAttemptOutcome, AdvisoryCurrentDiagnostic,
+    AdvisoryCurrentStage, AdvisoryProjectionState, AdvisoryPublicationError, AdvisoryRecord,
+    AdvisoryRow, AdvisorySnapshot, AdvisoryStore, CURRENT_DIAGNOSTICS_KEY,
 };
 use devres_domain::{Error, Result};
 use futures::TryStreamExt;
@@ -65,176 +66,195 @@ impl AdvisoryStore for PgBlobStore {
         snapshot: &AdvisorySnapshot,
         make_default: bool,
     ) -> Result<()> {
+        self.publish_advisory_snapshot_inner(snapshot, make_default, None)
+            .await
+            .map_err(AdvisoryPublicationError::into_error)
+    }
+    async fn publish_current_advisory(
+        &self,
+        snapshot: &AdvisorySnapshot,
+        attempt: &AdvisoryCurrentDiagnostic,
+    ) -> std::result::Result<(), AdvisoryPublicationError> {
+        self.publish_advisory_snapshot_inner(snapshot, true, Some(attempt))
+            .await
+    }
+    async fn finish_current_advisory_attempt(
+        &self,
+        attempt: &AdvisoryCurrentDiagnostic,
+    ) -> Result<bool> {
         self.owner_fence().await?;
-        if !snapshot.id.starts_with("blake3:") {
-            let retained = self
-                .advisory_snapshot(Some(&snapshot.id), &snapshot.format)
-                .await?
-                .ok_or_else(|| {
-                    Error::integrity("New advisory snapshots require tagged BLAKE3 identities.")
-                })?;
-            if serde_json::to_value(&retained).map_err(|_| storage_error())?
-                != serde_json::to_value(snapshot).map_err(|_| storage_error())?
-            {
-                return Err(Error::integrity(
-                    "Legacy advisory snapshot replay differs from retained evidence.",
-                ));
-            }
-            return Ok(());
-        }
-        if !valid_hash(&snapshot.id)
-            || !matches!(snapshot.format.as_str(), "rustsec" | "osv")
-            || snapshot.records.len() > 20_000
-            || snapshot.revision.len() != 40
-            || !snapshot
-                .revision
-                .bytes()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        {
-            return Err(Error::integrity("Invalid advisory snapshot identity."));
-        }
-        if make_default
-            && (!snapshot.complete
-                || snapshot.historical
-                || snapshot.validated_at.is_none()
-                || snapshot.coverage["synthetic"] == true)
+        attempt.validate()?;
+        if !matches!(
+            attempt.outcome,
+            AdvisoryAttemptOutcome::Failed | AdvisoryAttemptOutcome::Unknown
+        ) || attempt.failure.is_none()
         {
             return Err(Error::integrity(
-                "Incomplete historical evidence cannot become the default.",
+                "Invalid current advisory failure outcome.",
             ));
         }
-        let mut descriptor = bounded(snapshot, 96 * 1024 * 1024)?;
-        descriptor["records"] = json!([]);
-        let mut descriptor = bounded(&descriptor, 4 * 1024 * 1024)?;
-        let mut ids = std::collections::HashSet::new();
-        let mut records = Vec::new();
-        let mut total = 0usize;
-        for record in &snapshot.records {
-            if record.format != snapshot.format
-                || !valid_hash(&record.body_hash)
-                || !ids.insert(&record.id)
-            {
-                return Err(Error::integrity("Invalid advisory record membership."));
-            }
-            crate::integrity::verify(&record.body_hash, record.body.as_bytes())?;
-            total = total.saturating_add(record.body.len());
-            if record.body.len() > 1024 * 1024 || total > 64 * 1024 * 1024 {
-                return Err(Error::capacity("Advisory snapshot body bound exceeded."));
-            }
-            let data = bounded(record, 4 * 1024 * 1024)?;
-            let id = if record.body_hash.starts_with("blake3:") {
-                hash(&serde_json::to_vec(&data).map_err(|_| storage_error())?)
-            } else {
-                let legacy = crate::integrity::legacy_hash(
-                    &serde_json::to_vec(&data).map_err(|_| storage_error())?,
-                );
-                let retained =
-                    payload_integrity::load(&self.pool, "devres_advisory_records", "", &legacy)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::integrity(
-                                "New advisory record bodies require BLAKE3 identities.",
-                            )
-                        })?;
-                if retained.0 != data {
-                    return Err(Error::integrity(
-                        "Legacy advisory record replay differs from retained evidence.",
-                    ));
-                }
-                legacy
-            };
-            records.push((id, data));
-        }
-        descriptor["membership_hash"] = json!(hash(
-            &serde_json::to_vec(&records.iter().map(|(id, _)| id).collect::<Vec<_>>())
-                .map_err(|_| storage_error())?
-        ));
-        descriptor["record_count"] = json!(records.len());
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        let identities: Vec<_> = records.iter().map(|(id, _)| id.clone()).collect();
-        let existing: std::collections::HashSet<String> = sqlx_core::query_scalar::query_scalar(
-            "SELECT id FROM devres_advisory_records WHERE id=ANY($1::text[])",
-        )
-        .bind(&identities)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?
-        .into_iter()
-        .collect();
-        for id in &existing {
-            let retained = payload_integrity::load(&mut *tx, "devres_advisory_records", "", id)
-                .await?
-                .ok_or_else(|| Error::integrity("Retained advisory record missing."))?;
-            if records
-                .iter()
-                .find(|(key, _)| key == id)
-                .is_none_or(|(_, data)| *data != retained.0)
+        let prepared: Result<bool> = async {
+            let retained = payload_integrity::load(
+                &mut *tx,
+                "devres_advisory_state",
+                "",
+                CURRENT_DIAGNOSTICS_KEY,
+            )
+            .await?;
+            let Some(Json(retained)) = retained else {
+                return Ok(false);
+            };
+            let retained: AdvisoryCurrentDiagnostic = serde_json::from_value(retained)
+                .map_err(|_| Error::integrity("Invalid current advisory attempt."))?;
+            retained.validate()?;
+            if retained.attempt != attempt.attempt
+                || retained.outcome == AdvisoryAttemptOutcome::Succeeded
             {
-                return Err(Error::integrity("Advisory record identity collision."));
+                return Ok(false);
+            }
+            write_state(&mut tx, CURRENT_DIAGNOSTICS_KEY, &bounded(attempt, 4096)?).await?;
+            if attempt.outcome == AdvisoryAttemptOutcome::Failed {
+                let mut public =
+                    payload_integrity::load(&mut *tx, "devres_advisory_state", "", "current")
+                        .await?
+                        .map(|value| value.0)
+                        .unwrap_or_else(|| json!({}));
+                let public = public
+                    .as_object_mut()
+                    .ok_or_else(|| Error::integrity("Invalid current advisory state."))?;
+                public.insert("last_attempt".into(), json!(attempt.started_at));
+                public.insert(
+                    "error".into(),
+                    json!(
+                        attempt
+                            .failure
+                            .as_ref()
+                            .map(|failure| failure.code.as_str())
+                    ),
+                );
+                public.insert("previous_snapshot_preserved".into(), json!(true));
+                write_state(&mut tx, "current", &json!(public)).await?;
+            }
+            Ok(true)
+        }
+        .await;
+        match prepared {
+            Ok(true) => {
+                tx.commit().await.map_err(|_| storage_error())?;
+                Ok(true)
+            }
+            Ok(false) => {
+                tx.rollback().await.map_err(|_| storage_error())?;
+                Ok(false)
+            }
+            Err(error) => {
+                tx.rollback().await.map_err(|_| storage_error())?;
+                Err(error)
             }
         }
-        let new_records: Vec<_> = records
-            .iter()
-            .filter(|(id, _)| !existing.contains(id))
-            .collect();
-        // Chunking avoids giant SQL parameters while all memberships remain atomic.
-        for chunk in new_records.chunks(250) {
-            let ids: Vec<_> = chunk.iter().map(|(id, _)| id.clone()).collect();
-            let data: Vec<_> = chunk.iter().map(|(_, v)| Json(v.clone())).collect();
-            let digests = chunk
-                .iter()
-                .map(|(id, data)| {
-                    payload_integrity::digest("devres_advisory_records", "", id, data)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            sqlx_core::query::query("INSERT INTO devres_advisory_records(id,data,data_integrity) SELECT * FROM UNNEST($1::text[],$2::jsonb[],$3::text[]) ON CONFLICT DO NOTHING")
-                .bind(ids).bind(data).bind(digests).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        }
-        let sequence: i64 = sqlx_core::query_scalar::query_scalar(
-            "SELECT nextval(pg_get_serial_sequence('devres_advisory_snapshots','sequence'))",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?;
-        sqlx_core::query::query("INSERT INTO devres_advisory_snapshots(id,format,revision,data,data_integrity,sequence) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
-            .bind(&snapshot.id).bind(&snapshot.format).bind(&snapshot.revision).bind(Json(&descriptor)).bind(payload_integrity::digest("devres_advisory_snapshots","",&snapshot.id,&payload_integrity::advisory_snapshot_payload(sequence,&snapshot.format,&snapshot.revision,&descriptor)?)?).bind(sequence).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        let retained: Json<Value> =
-            payload_integrity::load(&mut *tx, "devres_advisory_snapshots", "", &snapshot.id)
-                .await?
-                .ok_or_else(|| Error::integrity("Advisory snapshot missing."))?;
-        if retained.0 != descriptor {
-            return Err(Error::integrity("Advisory snapshot identity collision."));
-        }
-        let positions: Vec<i32> = (0..records.len() as i32).collect();
-        let record_ids: Vec<_> = records.iter().map(|(id, _)| id.clone()).collect();
-        sqlx_core::query::query("INSERT INTO devres_advisory_members(snapshot,position,record) SELECT $1,p,r FROM UNNEST($2::integer[],$3::text[]) AS members(p,r) ON CONFLICT DO NOTHING")
-            .bind(&snapshot.id).bind(positions).bind(record_ids).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        let retained_members: Vec<String> = sqlx_core::query_scalar::query_scalar(
-            "SELECT record FROM devres_advisory_members WHERE snapshot=$1 ORDER BY position",
-        )
-        .bind(&snapshot.id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| storage_error())?;
-        if !retained_members.iter().eq(records.iter().map(|(id, _)| id)) {
-            return Err(Error::integrity("Advisory snapshot membership collision."));
-        }
-        // Legacy selectors are fixed aliases. A later revalidation cannot rebind one.
-        if snapshot.format == "rustsec" {
-            for capture in &snapshot.captures {
-                if capture.key == "rustsec:head" {
-                    sqlx_core::query::query("INSERT INTO devres_advisory_aliases(alias,snapshot) VALUES($1,$2) ON CONFLICT DO NOTHING")
-                        .bind(&capture.id).bind(&snapshot.id).execute(&mut *tx).await.map_err(|_|storage_error())?;
+    }
+    async fn reconcile_current_advisory_attempt(&self) -> Result<AdvisoryAttemptOutcome> {
+        self.owner_fence().await?;
+        let mut owner = self.owner.lock().await;
+        // This exact session owns all advisory writes. The mutex excludes any live
+        // transaction handle. ROLLBACK drains a cancelled/failed COMMIT response and
+        // terminates any preceding transaction before the sealed proof is inspected.
+        // A new writer session can acquire its exclusive fence only after the old
+        // session's transaction ended. Never infer rollback from an unrelated reader.
+        sqlx_core::raw_sql::raw_sql("ROLLBACK")
+            .execute(&mut *owner)
+            .await
+            .map_err(|_| storage_error())?;
+        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let prepared: Result<(AdvisoryAttemptOutcome, bool)> = async {
+            let retained = payload_integrity::load(
+                &mut *tx,
+                "devres_advisory_state",
+                "",
+                CURRENT_DIAGNOSTICS_KEY,
+            )
+            .await?
+            .ok_or_else(|| Error::integrity("Current advisory attempt missing."))?;
+            let mut attempt: AdvisoryCurrentDiagnostic = serde_json::from_value(retained.0)
+                .map_err(|_| Error::integrity("Invalid current advisory attempt."))?;
+            attempt.validate()?;
+            if attempt.outcome == AdvisoryAttemptOutcome::Succeeded {
+                let public =
+                    payload_integrity::load(&mut *tx, "devres_advisory_state", "", "current")
+                        .await?
+                        .ok_or_else(|| Error::integrity("Current advisory success missing."))?;
+                let default: Option<String> = sqlx_core::query_scalar::query_scalar(
+                    "SELECT snapshot FROM devres_advisory_defaults WHERE format='rustsec'",
+                )
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| storage_error())?;
+                if public.0["snapshot"].as_str() != attempt.snapshot.as_deref()
+                    || default.as_deref() != attempt.snapshot.as_deref()
+                {
+                    return Err(Error::integrity(
+                        "Current advisory success pointers disagree.",
+                    ));
                 }
+                return Ok((AdvisoryAttemptOutcome::Succeeded, false));
+            }
+            if !matches!(
+                attempt.outcome,
+                AdvisoryAttemptOutcome::Running | AdvisoryAttemptOutcome::Unknown
+            ) {
+                return Ok((attempt.outcome, false));
+            }
+            let now = devres_domain::unix_now().max(attempt.started_at);
+            attempt.outcome = AdvisoryAttemptOutcome::Failed;
+            attempt.finished_at = Some(now);
+            if attempt.failure.is_none() {
+                attempt.failure = Some(devres_application::collection::Failure::from_error(
+                    &Error::unavailable("Interrupted advisory attempt did not commit."),
+                    devres_application::collection::Phase::ViewPublication,
+                    now,
+                ));
+            }
+            write_state(&mut tx, CURRENT_DIAGNOSTICS_KEY, &bounded(&attempt, 4096)?).await?;
+            let mut public =
+                payload_integrity::load(&mut *tx, "devres_advisory_state", "", "current")
+                    .await?
+                    .map(|value| value.0)
+                    .unwrap_or_else(|| json!({}));
+            let public = public
+                .as_object_mut()
+                .ok_or_else(|| Error::integrity("Invalid current advisory state."))?;
+            public.insert("last_attempt".into(), json!(attempt.started_at));
+            public.insert(
+                "error".into(),
+                json!(
+                    attempt
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.code.as_str())
+                ),
+            );
+            public.insert("previous_snapshot_preserved".into(), json!(true));
+            write_state(&mut tx, "current", &json!(public)).await?;
+            Ok((AdvisoryAttemptOutcome::Failed, true))
+        }
+        .await;
+        match prepared {
+            Ok((outcome, true)) => {
+                tx.commit().await.map_err(|_| storage_error())?;
+                Ok(outcome)
+            }
+            Ok((outcome, false)) => {
+                tx.rollback().await.map_err(|_| storage_error())?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                tx.rollback().await.map_err(|_| storage_error())?;
+                Err(error)
             }
         }
-        if make_default {
-            sqlx_core::query::query("INSERT INTO devres_advisory_defaults(format,snapshot) VALUES($1,$2) ON CONFLICT(format) DO UPDATE SET snapshot=EXCLUDED.snapshot")
-                .bind(&snapshot.format).bind(&snapshot.id).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        }
-        tx.commit().await.map_err(|_| storage_error())
     }
     async fn advisory_snapshot(
         &self,
@@ -1271,3 +1291,267 @@ mod migration_tests {
         assert_eq!(value["refs"][0]["oid"], old);
     }
 }
+
+impl PgBlobStore {
+    async fn publish_advisory_snapshot_inner(
+        &self,
+        snapshot: &AdvisorySnapshot,
+        make_default: bool,
+        current: Option<&AdvisoryCurrentDiagnostic>,
+    ) -> std::result::Result<(), AdvisoryPublicationError> {
+        if let Some(attempt) = current {
+            attempt.validate()?;
+            if snapshot.format != "rustsec"
+                || !snapshot.id.starts_with("blake3:")
+                || attempt.outcome != AdvisoryAttemptOutcome::Running
+                || attempt.stage != AdvisoryCurrentStage::Publication
+                || attempt.snapshot.as_deref() != Some(snapshot.id.as_str())
+                || attempt.revision.as_deref() != Some(snapshot.revision.as_str())
+                || !snapshot.captures.iter().any(|capture| {
+                    capture.key == "rustsec:head"
+                        && Some(capture.id.as_str()) == attempt.head_capture.as_deref()
+                        && snapshot.validated_at == Some(capture.validated_at)
+                })
+                || !snapshot.captures.iter().any(|capture| {
+                    capture.key == format!("rustsec:bundle:{}", snapshot.revision)
+                        && Some(capture.id.as_str()) == attempt.bundle_capture.as_deref()
+                })
+            {
+                return Err(
+                    Error::integrity("Current advisory publication identity mismatch.").into(),
+                );
+            }
+        }
+        self.owner_fence().await?;
+        if !snapshot.id.starts_with("blake3:") {
+            let retained = self
+                .advisory_snapshot(Some(&snapshot.id), &snapshot.format)
+                .await?
+                .ok_or_else(|| {
+                    Error::integrity("New advisory snapshots require tagged BLAKE3 identities.")
+                })?;
+            if serde_json::to_value(&retained).map_err(|_| storage_error())?
+                != serde_json::to_value(snapshot).map_err(|_| storage_error())?
+            {
+                return Err(Error::integrity(
+                    "Legacy advisory snapshot replay differs from retained evidence.",
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        if !valid_hash(&snapshot.id)
+            || !matches!(snapshot.format.as_str(), "rustsec" | "osv")
+            || snapshot.records.len() > 20_000
+            || snapshot.revision.len() != 40
+            || !snapshot
+                .revision
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            return Err(Error::integrity("Invalid advisory snapshot identity.").into());
+        }
+        if make_default
+            && (!snapshot.complete
+                || snapshot.historical
+                || snapshot.validated_at.is_none()
+                || snapshot.coverage["synthetic"] == true)
+        {
+            return Err(Error::integrity(
+                "Incomplete historical evidence cannot become the default.",
+            )
+            .into());
+        }
+        let mut descriptor = bounded(snapshot, 96 * 1024 * 1024)?;
+        descriptor["records"] = json!([]);
+        let mut descriptor = bounded(&descriptor, 4 * 1024 * 1024)?;
+        let mut ids = std::collections::HashSet::new();
+        let mut records = Vec::new();
+        let mut total = 0usize;
+        for record in &snapshot.records {
+            if record.format != snapshot.format
+                || !valid_hash(&record.body_hash)
+                || !ids.insert(&record.id)
+            {
+                return Err(Error::integrity("Invalid advisory record membership.").into());
+            }
+            crate::integrity::verify(&record.body_hash, record.body.as_bytes())?;
+            total = total.saturating_add(record.body.len());
+            if record.body.len() > 1024 * 1024 || total > 64 * 1024 * 1024 {
+                return Err(Error::capacity("Advisory snapshot body bound exceeded.").into());
+            }
+            let data = bounded(record, 4 * 1024 * 1024)?;
+            let id = if record.body_hash.starts_with("blake3:") {
+                hash(&serde_json::to_vec(&data).map_err(|_| storage_error())?)
+            } else {
+                let legacy = crate::integrity::legacy_hash(
+                    &serde_json::to_vec(&data).map_err(|_| storage_error())?,
+                );
+                let retained =
+                    payload_integrity::load(&self.pool, "devres_advisory_records", "", &legacy)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::integrity(
+                                "New advisory record bodies require BLAKE3 identities.",
+                            )
+                        })?;
+                if retained.0 != data {
+                    return Err(Error::integrity(
+                        "Legacy advisory record replay differs from retained evidence.",
+                    )
+                    .into());
+                }
+                legacy
+            };
+            records.push((id, data));
+        }
+        descriptor["membership_hash"] = json!(hash(
+            &serde_json::to_vec(&records.iter().map(|(id, _)| id).collect::<Vec<_>>())
+                .map_err(|_| storage_error())?
+        ));
+        descriptor["record_count"] = json!(records.len());
+        let mut owner = self.owner.lock().await;
+        owner.ping().await.map_err(|_| storage_error())?;
+        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+        let prepared: std::result::Result<(), AdvisoryPublicationError> = async {
+        if let Some(attempt) = current {
+            let retained = payload_integrity::load(
+                &mut *tx,
+                "devres_advisory_state",
+                "",
+                CURRENT_DIAGNOSTICS_KEY,
+            )
+            .await?
+            .ok_or_else(|| Error::integrity("Current advisory attempt missing."))?;
+            let retained: AdvisoryCurrentDiagnostic = serde_json::from_value(retained.0)
+                .map_err(|_| Error::integrity("Invalid current advisory attempt."))?;
+            retained.validate()?;
+            if retained.attempt != attempt.attempt
+                || retained.outcome != AdvisoryAttemptOutcome::Running
+            {
+                return Err(Error::integrity("Current advisory attempt changed.").into());
+            }
+        }
+        let identities: Vec<_> = records.iter().map(|(id, _)| id.clone()).collect();
+        let existing: std::collections::HashSet<String> = sqlx_core::query_scalar::query_scalar(
+            "SELECT id FROM devres_advisory_records WHERE id=ANY($1::text[])",
+        )
+        .bind(&identities)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?
+        .into_iter()
+        .collect();
+        for id in &existing {
+            let retained = payload_integrity::load(&mut *tx, "devres_advisory_records", "", id)
+                .await?
+                .ok_or_else(|| Error::integrity("Retained advisory record missing."))?;
+            if records
+                .iter()
+                .find(|(key, _)| key == id)
+                .is_none_or(|(_, data)| *data != retained.0)
+            {
+                return Err(Error::integrity("Advisory record identity collision.").into());
+            }
+        }
+        let new_records: Vec<_> = records
+            .iter()
+            .filter(|(id, _)| !existing.contains(id))
+            .collect();
+        // Chunking avoids giant SQL parameters while all memberships remain atomic.
+        for chunk in new_records.chunks(250) {
+            let ids: Vec<_> = chunk.iter().map(|(id, _)| id.clone()).collect();
+            let data: Vec<_> = chunk.iter().map(|(_, v)| Json(v.clone())).collect();
+            let digests = chunk
+                .iter()
+                .map(|(id, data)| {
+                    payload_integrity::digest("devres_advisory_records", "", id, data)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            sqlx_core::query::query("INSERT INTO devres_advisory_records(id,data,data_integrity) SELECT * FROM UNNEST($1::text[],$2::jsonb[],$3::text[]) ON CONFLICT DO NOTHING")
+                .bind(ids).bind(data).bind(digests).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        }
+        let sequence: i64 = sqlx_core::query_scalar::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('devres_advisory_snapshots','sequence'))",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?;
+        sqlx_core::query::query("INSERT INTO devres_advisory_snapshots(id,format,revision,data,data_integrity,sequence) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
+            .bind(&snapshot.id).bind(&snapshot.format).bind(&snapshot.revision).bind(Json(&descriptor)).bind(payload_integrity::digest("devres_advisory_snapshots","",&snapshot.id,&payload_integrity::advisory_snapshot_payload(sequence,&snapshot.format,&snapshot.revision,&descriptor)?)?).bind(sequence).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        let retained: Json<Value> =
+            payload_integrity::load(&mut *tx, "devres_advisory_snapshots", "", &snapshot.id)
+                .await?
+                .ok_or_else(|| Error::integrity("Advisory snapshot missing."))?;
+        if retained.0 != descriptor {
+            return Err(Error::integrity("Advisory snapshot identity collision.").into());
+        }
+        let positions: Vec<i32> = (0..records.len() as i32).collect();
+        let record_ids: Vec<_> = records.iter().map(|(id, _)| id.clone()).collect();
+        sqlx_core::query::query("INSERT INTO devres_advisory_members(snapshot,position,record) SELECT $1,p,r FROM UNNEST($2::integer[],$3::text[]) AS members(p,r) ON CONFLICT DO NOTHING")
+            .bind(&snapshot.id).bind(positions).bind(record_ids).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        let retained_members: Vec<String> = sqlx_core::query_scalar::query_scalar(
+            "SELECT record FROM devres_advisory_members WHERE snapshot=$1 ORDER BY position",
+        )
+        .bind(&snapshot.id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| storage_error())?;
+        if !retained_members.iter().eq(records.iter().map(|(id, _)| id)) {
+            return Err(Error::integrity("Advisory snapshot membership collision.").into());
+        }
+        // Legacy selectors are fixed aliases. A later revalidation cannot rebind one.
+        if snapshot.format == "rustsec" {
+            for capture in &snapshot.captures {
+                if capture.key == "rustsec:head" {
+                    sqlx_core::query::query("INSERT INTO devres_advisory_aliases(alias,snapshot) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                        .bind(&capture.id).bind(&snapshot.id).execute(&mut *tx).await.map_err(|_|storage_error())?;
+                }
+            }
+        }
+        if make_default {
+            sqlx_core::query::query("INSERT INTO devres_advisory_defaults(format,snapshot) VALUES($1,$2) ON CONFLICT(format) DO UPDATE SET snapshot=EXCLUDED.snapshot")
+                .bind(&snapshot.format).bind(&snapshot.id).execute(&mut *tx).await.map_err(|_|storage_error())?;
+        }
+        if let Some(attempt) = current {
+            let mut succeeded = attempt.clone();
+            succeeded.outcome = AdvisoryAttemptOutcome::Succeeded;
+            succeeded.finished_at = Some(devres_domain::unix_now().max(attempt.started_at));
+            succeeded.failure = None;
+            let public = json!({"last_attempt":attempt.started_at,"last_success":snapshot.validated_at,"snapshot":snapshot.id,"error":null});
+            for (key, value) in [
+                ("current", public),
+                (CURRENT_DIAGNOSTICS_KEY, bounded(&succeeded, 4096)?),
+            ] {
+                write_state(&mut tx, key, &value).await?;
+            }
+        }
+            Ok(())
+        }.await;
+        if let Err(error) = prepared {
+            // Transaction Drop only queues ROLLBACK on this dedicated connection.
+            // Drain it before releasing the owner mutex, including server rejection,
+            // so other sessions do not remain blocked by this failed publication.
+            tx.rollback().await.map_err(|_| storage_error())?;
+            return Err(error);
+        }
+        tx.commit()
+            .await
+            .map_err(|_| AdvisoryPublicationError::CommitUnknown(storage_error()))
+    }
+}
+
+async fn write_state(
+    tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+    key: &str,
+    data: &Value,
+) -> Result<()> {
+    sqlx_core::query::query("INSERT INTO devres_advisory_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
+        .bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_advisory_state", "", key, data)?)
+        .execute(&mut **tx).await.map_err(|_| storage_error())?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "current_storage_tests.rs"]
+mod current_storage_tests;
