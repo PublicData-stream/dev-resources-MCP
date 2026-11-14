@@ -14,13 +14,26 @@ import secrets
 import sys
 import threading
 import xml.etree.ElementTree as ET
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, build_opener, ProxyHandler
 
 READONLY = '11111111-1111-4111-8111-111111111111'
 READWRITE = '22222222-2222-4222-8222-222222222222'
 ISSUER = '33333333-3333-4333-8333-333333333333'
+
+
+def request_failure_category(error):
+    """Classify known failures without exposing exception text or request data."""
+    if isinstance(error, URLError) and isinstance(error.reason, BaseException):
+        error = error.reason
+    if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+        return 'client_disconnect'
+    if isinstance(error, TimeoutError):
+        return 'timeout'
+    if isinstance(error, OSError):
+        return 'io'
+    return 'internal'
 
 
 def native_error_code(body):
@@ -250,7 +263,7 @@ def serve(config_file):
     class QuietServer(ThreadingHTTPServer):
         def handle_error(self, *_):
             # Never let HTTP/URL exceptions print request paths or credential values.
-            print('iam-fixture-request failure', flush=True)
+            print('iam-fixture-request failure category=' + request_failure_category(sys.exc_info()[1]), flush=True)
 
     QuietServer(('0.0.0.0', 8001), Handler).serve_forever()
 
@@ -263,6 +276,23 @@ def self_test():
     import tempfile
     import unittest
     from unittest import mock
+
+    class RequestFailures(unittest.TestCase):
+        def test_exception_categories_never_include_request_or_exception_text(self):
+            private = 'synthetic-secret https://private.invalid/credential?token=private'
+            for error, expected in (
+                    (BrokenPipeError(private), 'client_disconnect'),
+                    (ConnectionResetError(private), 'client_disconnect'),
+                    (TimeoutError(private), 'timeout'),
+                    (URLError(TimeoutError(private)), 'timeout'),
+                    (OSError(private), 'io'),
+                    (ValueError(private), 'internal'),
+                    (URLError(private), 'io')):
+                with self.subTest(expected=expected):
+                    category = request_failure_category(error)
+                    self.assertEqual(category, expected)
+                    self.assertNotIn(private, category)
+                    self.assertNotIn('private', category)
 
     class DeleteRecovery(unittest.TestCase):
         def run_case(self, replies, expected, calls):
@@ -382,7 +412,7 @@ def self_test():
                     self.assertFalse(worker.is_alive())
 
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
-                               for case in (DeleteRecovery, OrganizationListing))
+                               for case in (RequestFailures, DeleteRecovery, OrganizationListing))
     result = unittest.TextTestRunner().run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)
 
