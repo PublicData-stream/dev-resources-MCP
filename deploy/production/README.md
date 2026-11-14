@@ -22,7 +22,11 @@ published releases, local checks, inactive target state and incomplete gates.
 The [2026-11-12 production upgrade](upgrade-5196c629-evidence.md) records the
 previous schema-14 runtime. The [first 2026-11-13 upgrade](upgrade-60e10624-evidence.md)
 records the transition to schema 15. The [subsequent update](upgrade-65236494-evidence.md)
-records the active `0.1.0-build.65236494` runtime with schema 15 preserved. The generic
+records the prior `0.1.0-build.65236494` runtime with schema 15 preserved. The
+[2026-11-14 schema-18 update](upgrade-33f3c730-evidence.md) records release
+`0.1.0-build.33f3c730`, preserved checkpoints and cache generations, nine existing
+source settings, and the separately approved MCP SSE compression transition.
+The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
 
