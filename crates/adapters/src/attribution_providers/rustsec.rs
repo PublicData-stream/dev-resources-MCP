@@ -860,4 +860,25 @@ mod tests {
         truncated.truncate(truncated.len() - 5);
         assert!(inspect(&truncated, REV).is_err());
     }
+    #[test]
+    fn recovery_predicate_is_exact_and_keeps_v1_targets_stable() {
+        let source = target(HEAD, b"synthetic head");
+        let before = targets(
+            "rustsec",
+            &json!({"source_url":HEAD,"body_hash":crate::integrity::hash(b"synthetic head")}),
+        )
+        .unwrap();
+        assert!(rustsec_capture_supported(&source));
+        assert_eq!(before, vec![source.clone()]);
+        let mut wrapper = source.clone();
+        wrapper.evidence = json!({"version":1,"dependencies":[source]});
+        assert!(rustsec_capture_supported(&wrapper));
+        for url in [
+            "https://api.github.com/repos/RustSec/advisory-db/commits/main?unsafe=1",
+            "https://codeload.github.com/RustSec/advisory-db/tar.gz/main",
+            "https://evil.invalid/source",
+        ] {
+            assert!(!rustsec_capture_supported(&target(url, b"synthetic")));
+        }
+    }
 }

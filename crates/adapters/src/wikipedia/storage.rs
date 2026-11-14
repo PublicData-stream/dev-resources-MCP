@@ -657,6 +657,8 @@ mod tests {
              DROP FUNCTION devres_crate_enrichment_head_immutable();
              DROP TABLE devres_wikipedia_evidence;
              DROP TABLE devres_wikipedia_state;
+             DROP TABLE devres_attribution_recoveries;
+             DROP FUNCTION devres_attribution_recovery_immutable();
              UPDATE devres_schema SET version=13 WHERE singleton"
         ).execute(&mut *legacy).await.unwrap();
         legacy.commit().await.unwrap();

@@ -17,6 +17,49 @@ use tokio_util::sync::CancellationToken;
 
 mod rustsec;
 
+/// A bounded eligibility predicate only; acquisition still verifies exact bytes
+/// and every applicable notice before publication.
+pub(crate) fn rustsec_capture_supported(target: &AttributionTarget) -> bool {
+    fn visit(target: &AttributionTarget, depth: usize, remaining: &mut usize) -> Option<bool> {
+        if depth > 8
+            || *remaining == 0
+            || target.subject.provider != "rustsec"
+            || target.evidence["version"] != 1
+        {
+            return None;
+        }
+        *remaining -= 1;
+        if let Some(children) = target
+            .evidence
+            .get("dependencies")
+            .and_then(Value::as_array)
+        {
+            if children.is_empty() || children.len() > 128 {
+                return None;
+            }
+            let mut newly_supported = false;
+            for child in children {
+                let child = serde_json::from_value::<AttributionTarget>(child.clone()).ok()?;
+                newly_supported |= visit(&child, depth + 1, remaining)?;
+            }
+            return Some(newly_supported);
+        }
+        let source = &target.evidence["source"];
+        if rustsec::supported(source) {
+            return Some(true);
+        }
+        let path = source_path(source).ok()?;
+        git_source("rustsec", source, &path).ok()?.url().ok()?;
+        if !string(source, "body_hash").is_some_and(devres_domain::valid_content_id)
+            && !string(source, "oid").is_some_and(oid)
+        {
+            return None;
+        }
+        Some(false)
+    }
+    visit(target, 0, &mut 128) == Some(true)
+}
+
 const MAX_SOURCE: usize = 32 * 1024 * 1024;
 const MAX_NOTICE: usize = 1024 * 1024;
 const MAX_TARGETS: usize = 256;

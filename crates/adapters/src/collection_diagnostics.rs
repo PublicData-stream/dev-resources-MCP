@@ -30,12 +30,14 @@ pub enum DiagnosisProvider {
     Chromium,
     Crates,
     Rfc,
+    Rustsec,
 }
 impl DiagnosisProvider {
     fn tables(self) -> Result<(&'static str, &'static str)> {
         match self {
             Self::W3c => Ok(("devres_w3c_evidence", "devres_w3c_state")),
             Self::Chromium => Ok(("devres_chromium_evidence", "devres_chromium_state")),
+            Self::Rustsec => Ok(("devres_advisory_rows", "devres_advisory_state")),
             Self::Crates | Self::Rfc => Err(invalid()),
         }
     }
@@ -49,6 +51,8 @@ pub struct DiagnosisOptions {
     pub scan_retained_dump: bool,
     pub snapshot: Option<String>,
     pub job_keys: Vec<String>,
+    pub commit: Option<String>,
+    pub attribution_target: Option<String>,
 }
 impl DiagnosisOptions {
     pub fn validate(&self) -> Result<()> {
@@ -58,6 +62,20 @@ impl DiagnosisOptions {
             || self.timeout_secs > 300
             || (self.scan_retained_dump && self.provider != DiagnosisProvider::Crates)
         {
+            return Err(invalid());
+        }
+        if self.provider == DiagnosisProvider::Rustsec {
+            if self
+                .commit
+                .as_deref()
+                .is_some_and(|value| !rustsec_diagnostics::valid_oid(value))
+                || self.attribution_target.as_deref().is_some_and(|value| {
+                    !value.starts_with("blake3:") || !integrity::valid_hash(value)
+                })
+            {
+                return Err(invalid());
+            }
+        } else if self.commit.is_some() || self.attribution_target.is_some() {
             return Err(invalid());
         }
         if self.provider == DiagnosisProvider::Rfc {
@@ -260,7 +278,7 @@ impl Reader {
             .map_err(|_| unavailable())?;
         let schema: i32 = sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL")
             .fetch_one(&mut conn).await.map_err(|_| unavailable())?;
-        if !matches!(schema, 14..=16) {
+        if !matches!(schema, 14..=17) {
             return Err(unavailable());
         }
         let row = sqlx_core::query::query("SELECT backend,binding,store_id FROM devres_archive_control WHERE singleton AND pending_binding IS NULL AND NOT initializing_s3")
@@ -752,7 +770,7 @@ async fn inspect_chromium(reader: &mut Reader, report: &mut CollectionDiagnosis)
     Ok(())
 }
 
-/// Inspection accepts schemas 14 through 16 without upgrading the selected store.
+/// Inspection accepts schemas 14 through 17 without upgrading the selected store.
 pub async fn diagnose_collection(
     database: &str,
     root: &Path,
@@ -810,6 +828,9 @@ pub async fn diagnose_collection(
             DiagnosisProvider::W3c => inspect_w3c(&mut reader, &mut report).await,
             DiagnosisProvider::Chromium => inspect_chromium(&mut reader, &mut report).await,
             DiagnosisProvider::Rfc => inspect_rfc(&mut reader, &mut report, &options).await,
+            DiagnosisProvider::Rustsec => {
+                rustsec_diagnostics::inspect(&mut reader, &mut report, &options).await
+            }
             DiagnosisProvider::Crates => {
                 inspect_crates(&mut reader, &mut report, options.scan_retained_dump).await
             }
@@ -825,7 +846,11 @@ pub async fn diagnose_collection(
             } else if error.code == "integrity" {
                 report.complete = false;
                 report.outcome = DiagnosisOutcome::IntegrityFailed;
-            } else if options.provider == DiagnosisProvider::Rfc && error.code == "unavailable" {
+            } else if matches!(
+                options.provider,
+                DiagnosisProvider::Rfc | DiagnosisProvider::Rustsec
+            ) && error.code == "unavailable"
+            {
                 report.complete = false;
                 report.outcome = DiagnosisOutcome::SelectedEvidenceUnavailable;
             } else {
@@ -862,6 +887,9 @@ pub async fn diagnose_collection(
 #[path = "rfc/diagnostics.rs"]
 mod rfc_diagnostics;
 use rfc_diagnostics::{inspect_rfc, rfc_job_identity};
+
+#[path = "rustsec/diagnostics.rs"]
+mod rustsec_diagnostics;
 
 async fn inspect_crates(
     reader: &mut Reader,
@@ -1004,6 +1032,8 @@ mod tests {
             scan_retained_dump: false,
             snapshot: None,
             job_keys: Vec::new(),
+            commit: None,
+            attribution_target: None,
         };
         assert!(options.validate().is_ok());
         options.max_total_bytes += 1;
@@ -1059,6 +1089,8 @@ mod tests {
             scan_retained_dump: false,
             snapshot: None,
             job_keys: Vec::new(),
+            commit: None,
+            attribution_target: None,
         };
         let mut latest = String::new();
         for now in [10, 11] {
@@ -1193,6 +1225,8 @@ mod tests {
             scan_retained_dump: false,
             snapshot: None,
             job_keys: Vec::new(),
+            commit: None,
+            attribution_target: None,
         };
         let started = Instant::now();
         let result = diagnose_collection(

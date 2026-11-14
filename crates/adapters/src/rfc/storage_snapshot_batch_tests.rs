@@ -411,7 +411,7 @@ async fn representation_diagnostics_upgrade_counts_and_history() {
     drop(store);
     // This database is disposable. Remove only the additive operational columns
     // to reproduce a real schema-15 store; retained evidence remains untouched.
-    sqlx_core::raw_sql::raw_sql("ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; UPDATE devres_schema SET version=15 WHERE singleton")
+    sqlx_core::raw_sql::raw_sql("ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); UPDATE devres_schema SET version=15 WHERE singleton")
         .execute(&pool).await.unwrap();
     let mut lifecycle_reader = pool.acquire().await.unwrap();
     sqlx_core::query::query("SELECT pg_advisory_lock_shared(1835365490,2)")

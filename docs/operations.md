@@ -5,7 +5,7 @@
 Writer startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
 without corpus rewrite or provider acquisition. Existing offline schemas 1–9 to 10
 migration and activation remain required; inspection never bootstraps attribution.
-The same normal writer startup records schema 16, retaining the required runtime
+The same normal writer startup records schema 17, retaining the required runtime
 split and adding Wikipedia tables;
 see [split upgrade](#credential-broker-and-split-runtime-upgrade).
 
@@ -570,10 +570,71 @@ a previously verified digest through a separately authorized deployment operatio
 
 ## Persistent operation and recovery
 
-Schema 16 adds RFC operational failure metadata. Stop serving readers and the old
+### Exact RustSec attribution recovery
+
+`recover-rustsec-attribution` is private offline maintenance. It does not acquire
+provider data, start collection, upgrade schema or publish qualification. Dry-run
+uses a reader connection and accepts active schemas 14 through 17; older schemas
+report that upgrade is required before applying recovery.
+
+```sh
+devres-server recover-rustsec-attribution /etc/devres/reader.toml \
+  --target blake3:TARGET_HEX \
+  --output /tmp/devres-rustsec-recovery/dry-run.json
+```
+
+Select an exact target using private diagnosis. Only current-policy RustSec
+`blocked / mapping / unsupported_source` targets supported by the capture repair
+recipe are eligible. Unknown legacy failures, unsupported mappings, missing rights,
+active claims and ready generations are not reset. A retained dependency target
+must reproduce its existing sealed v1 compiler recipe.
+
+For a separately authorized operational application, first stop all serving and
+writer participants and preserve the coordinated database/archive backup. Apply
+requires active schema 17, writer credentials, exclusive lifecycle/owner fences,
+the whole-state digest and explicit policy/recipe identities from dry-run:
+
+```sh
+devres-server recover-rustsec-attribution /etc/devres/writer.toml \
+  --target blake3:TARGET_HEX --apply --expected-state blake3:STATE_HEX \
+  --policy-epoch 1 \
+  --policy-fingerprint devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices \
+  --repair-version rustsec-captures-v1 \
+  --output /tmp/devres-rustsec-recovery/apply.json
+```
+
+Replace every placeholder with the exact inspected identity. A concurrent priority
+or state change invalidates the digest. Applying records the previous sealed state
+in an immutable journal and rearms only that target atomically. Attempts and existing
+generations remain retained. The same target/policy/recipe can be applied once;
+repetition returns `already_applied`, including after a lost commit response.
+Normal writer-owned repair performs later acquisition under existing budgets.
+
+Head repair re-requests the original `commits/main` response and requires the exact
+retained body hash. It never substitutes an immutable-SHA endpoint or latest bytes.
+Single-parent patch notice scope is checked against exact current/parent bundles;
+merge or ambiguous scopes remain blocked. Bundle repair preserves repository,
+nested and original per-advisory notices, including GHSA-specific license and
+attribution fields. Missing notices or exceeded bounds remain unavailable.
+
+Recovery acceptance requires an actual capture-fixed catalog/advisory read and all
+paged readable notices after repair, alongside honest per-format projection gaps.
+Queue movement or complete commit counts do not establish that acceptance.
+The offline RustSec fixture creates one exact old mapping block, applies guarded
+recovery with all writers stopped, then uses the normal repair runtime. Its
+nonempty journal and ready target are checked again after reader restart and
+coordinated database/archive restore. HTTP and WebTransport checks compare the
+pinned advisory/catalog and every original UTF-8 notice page with its generation.
+This implementation's fixture checks do not authorize production recovery or prove
+upstream acceptance. Include the recovery journal in coordinated backups and full
+storage verification. Earlier binaries reject schema 17; downgrade requires the
+matching pre-upgrade database and complete archive backup.
+
+Schema 16 added RFC operational failure metadata; schema 17 adds the immutable
+RustSec attribution recovery journal. Stop serving readers and the old
 writer, preserve a coordinated database/archive backup, then let the sole new
 writer upgrade under the exclusive lifecycle fence before starting new readers.
-Readers require schema 16; older binaries are not a rollback mechanism. The
+Readers require schema 17; older binaries are not a rollback mechanism. The
 migration does not retry failed jobs or rewrite retained public evidence.
 
 RFC job diagnostics distinguish claim time, failure completion time and next due
@@ -1295,7 +1356,7 @@ authority or provision their prerequisites.
    Give serving SELECT-only PostgreSQL and either a read-only filesystem mount plus
    separate writable scratch, or an RO broker profile and its own S3 cache.
 4. Start the broker, then the sole writer. Its bounded additive startup commits
-   schema 16 and retains the archive format/history; earlier pending BLAKE3 migration
+   schema 17 and retains the archive format/history; earlier pending BLAKE3 migration
    still requires the existing offline procedure. Start serving after the committed
    backend is available. No role split silently transfers filesystem data to S3.
 5. Verify historical capture/resource identities and pagination; a foreground cold

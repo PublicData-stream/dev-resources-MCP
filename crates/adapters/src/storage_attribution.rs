@@ -27,6 +27,9 @@ static CLAIM: AtomicU64 = AtomicU64::new(0);
 const TABLE_TARGETS: &str = "devres_attribution_targets";
 const TABLE_GENERATIONS: &str = "devres_attribution_generations";
 
+#[path = "storage_attribution_recovery.rs"]
+pub(crate) mod recovery;
+
 #[derive(Serialize)]
 pub(super) struct Progress {
     started_at: i64,
@@ -312,13 +315,27 @@ impl State {
         }
     }
 }
+fn validate_state(value: &State, registry: &[AttributionPolicyManifest]) -> Result<()> {
+    checked_target(&value.target)?;
+    if !registry.iter().any(|p| p.epoch == value.policy_epoch)
+        || !matches!(
+            value.status.as_str(),
+            "pending" | "running" | "retry" | "blocked" | "ready"
+        )
+        || value.priority > 1
+        || (value.status == "running") != value.claim.is_some()
+        || (value.status == "ready") != value.generation.is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
 fn state_for_registry(row: &PgRow, registry: &[AttributionPolicyManifest]) -> Result<State> {
     let id: String = row.try_get("id").map_err(|_| invalid())?;
     let data = checked(TABLE_TARGETS, &id, row)?;
     let value: State = serde_json::from_value(data).map_err(|_| invalid())?;
-    checked_target(&value.target)?;
+    validate_state(&value, registry)?;
     if target_id_at(&value.target.subject, value.policy_epoch)? != id
-        || !registry.iter().any(|p| p.epoch == value.policy_epoch)
         || row
             .try_get::<i32, _>("policy_epoch")
             .map_err(|_| invalid())?
@@ -330,13 +347,6 @@ fn state_for_registry(row: &PgRow, registry: &[AttributionPolicyManifest]) -> Re
         || row.try_get::<String, _>("status").map_err(|_| invalid())? != value.status
         || row.try_get::<i32, _>("priority").map_err(|_| invalid())? != i32::from(value.priority)
         || row.try_get::<i64, _>("retry_at").map_err(|_| invalid())? != value.retry_at
-        || !matches!(
-            value.status.as_str(),
-            "pending" | "running" | "retry" | "blocked" | "ready"
-        )
-        || value.priority > 1
-        || (value.status == "running") != value.claim.is_some()
-        || (value.status == "ready") != value.generation.is_some()
     {
         return Err(invalid());
     }
@@ -1758,6 +1768,9 @@ impl PgBlobStore {
                 }
             }
         }
+        if version >= 17 {
+            recovery::verify_journal(self, cancel).await?;
+        }
         Ok(())
     }
 }
@@ -2209,7 +2222,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         let request = FetchRequest {
             key: "rfc:9000".into(),
             url: "https://www.rfc-editor.org/rfc/rfc9000.txt".into(),
@@ -2720,7 +2733,7 @@ mod tests {
             "synthetic downgrade must preserve retained v2 crate evidence"
         );
         sqlx_core::raw_sql::raw_sql(
-            "ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; DROP VIEW devres_crate_enrichment_all; DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures; DROP FUNCTION devres_crate_enrichment_v2_immutable(); DROP FUNCTION devres_crate_enrichment_head_immutable(); DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control; UPDATE devres_schema SET version=10 WHERE singleton"
+            "ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; DROP VIEW devres_crate_enrichment_all; DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures; DROP FUNCTION devres_crate_enrichment_v2_immutable(); DROP FUNCTION devres_crate_enrichment_head_immutable(); DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control; UPDATE devres_schema SET version=10 WHERE singleton"
         ).execute(&mut *fixture).await.unwrap();
         fixture.commit().await.unwrap();
         drop(store);
@@ -2768,7 +2781,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
             .attribution_claim(&["rfc".into()], now, 0)

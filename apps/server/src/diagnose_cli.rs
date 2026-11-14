@@ -16,7 +16,7 @@ pub struct Arguments {
 pub fn parse(args: &[String]) -> Result<Arguments> {
     let invalid = || {
         Error::invalid(
-            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]]",
+            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc|rustsec --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]] [--commit OID] [--attribution-target ID]",
         )
     };
     if args.len() < 2 || args[0] != "diagnose-collection" {
@@ -30,6 +30,8 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
     let mut scan = false;
     let mut snapshot = None;
     let mut job_keys = Vec::new();
+    let mut commit = None;
+    let mut attribution_target = None;
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -51,11 +53,16 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
                     "chromium" => DiagnosisProvider::Chromium,
                     "crates" => DiagnosisProvider::Crates,
                     "rfc" => DiagnosisProvider::Rfc,
+                    "rustsec" => DiagnosisProvider::Rustsec,
                     _ => return Err(invalid()),
                 })
             }
             "--snapshot" if snapshot.is_none() => snapshot = Some(value.clone()),
             "--job-key" if job_keys.len() < 2 => job_keys.push(value.clone()),
+            "--commit" if commit.is_none() => commit = Some(value.clone()),
+            "--attribution-target" if attribution_target.is_none() => {
+                attribution_target = Some(value.clone())
+            }
             "--output" if output.is_none() => output = Some(PathBuf::from(value)),
             "--max-total-bytes" if bytes.is_none() => {
                 bytes = Some(value.parse::<u64>().map_err(|_| invalid())?)
@@ -73,6 +80,8 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
         scan_retained_dump: scan,
         snapshot,
         job_keys,
+        commit,
+        attribution_target,
     };
     options.validate()?;
     if latest && options.provider == DiagnosisProvider::Rfc {
@@ -182,6 +191,32 @@ mod tests {
         args.extend(["--job-key".into(), "rfc:text:9001".into()]);
         assert!(parse(&args).is_err());
         assert!(parse(&arguments(&["--job-key", "rfc:text:9000"])).is_err());
+    }
+    #[test]
+    fn rustsec_selects_one_canonical_commit_and_target() {
+        let mut args = arguments(&[]);
+        args[3] = "rustsec".into();
+        let revision = "a".repeat(40);
+        let target = format!("blake3:{}", "b".repeat(64));
+        args.extend([
+            "--commit".into(),
+            revision.clone(),
+            "--attribution-target".into(),
+            target,
+        ]);
+        assert_eq!(
+            parse(&args).unwrap().options.commit.as_deref(),
+            Some(revision.as_str())
+        );
+        for extra in [
+            vec!["--commit", "bad"],
+            vec!["--scan-retained-dump"],
+            vec!["--snapshot", "bad"],
+        ] {
+            let mut invalid = args.clone();
+            invalid.extend(extra.into_iter().map(str::to_owned));
+            assert!(parse(&invalid).is_err());
+        }
     }
     #[test]
     fn output_cannot_overwrite_or_follow_links() {

@@ -555,7 +555,7 @@ Public selectors, freshness, result limits, and capture-fixed reads are unchange
 
 Serving uses SELECT-only PostgreSQL credentials, has no writer-owner lock, and
 runs no migration, stage recovery, or collectors. The sole writer initializes and
-publishes schema 16 for either backend, including RFC job diagnostics. Existing configuration values and backend
+publishes schema 17 for either backend, including RFC job diagnostics and the RustSec recovery journal. Existing configuration values and backend
 defaults remain; operators must add the role-specific client/listener/scratch
 settings and deploy both processes. See the [operator templates](../deploy/examples/scaleway-credential-broker/README.md).
 
@@ -636,4 +636,4 @@ the Current profile. `requests_per_second=1` accepts 1..3, under shared admissio
 `min_free_bytes=1073741824` (minimum64MiB); optional
 `max_archive_storage_bytes` must cover the free-space reserve. Quotas pause new
 acquisition without deleting permanent bodies. Article representations cap at16MiB;
-public text pages remain at most32KiB. Reader attachment requires schema16.
+public text pages remain at most32KiB. Reader attachment requires schema17.

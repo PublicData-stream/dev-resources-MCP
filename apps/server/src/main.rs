@@ -1,5 +1,6 @@
 mod diagnose_cli;
 mod offline_cli;
+mod recovery_cli;
 mod storage_worker;
 use devres_server::{
     ServerBuilder, ServerError,
@@ -26,6 +27,28 @@ async fn main() -> Result<(), ServerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::new("devres_server=info"))
         .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|command| command == "recover-rustsec-attribution")
+    {
+        let arguments = recovery_cli::parse(&args)?;
+        let output = devres_adapters::create_diagnosis_output(&arguments.output)?;
+        let config = Config::load(&arguments.config)
+            .await
+            .map_err(|_| "Recovery configuration unavailable.")?;
+        let report = devres_adapters::recover_rustsec_attribution(
+            &config.storage.database_url,
+            &arguments.options,
+            arguments.apply,
+        )
+        .await?;
+        recovery_cli::write_report(output, &report)?;
+        println!(
+            "rustsec_recovery outcome={:?} eligible={}",
+            report.outcome, report.eligible
+        );
+        return Ok(());
+    }
     if args
         .first()
         .is_some_and(|command| command == "diagnose-collection")

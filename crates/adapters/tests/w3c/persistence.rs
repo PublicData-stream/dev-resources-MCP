@@ -284,7 +284,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("schema"),
-        16
+        17
     );
     // Recognized opaque acceptance evidence can migrate without invented provider graph variants.
     // Exercise the actual version-six migration branch with retained older-provider evidence.
@@ -377,7 +377,7 @@ async fn w3c_owner_fenced_atomic_evidence_default_and_restart() {
         .fetch_one(&inspection)
         .await
         .expect("upgraded schema"),
-        16
+        17
     );
     assert_eq!(
         store
@@ -855,7 +855,7 @@ async fn wait_owner_release(pool: &sqlx_postgres::PgPool) {
     panic!("owned PostgreSQL session did not release its fence");
 }
 
-// Remove only schema-ten metadata in this task-owned fixture database. Retained
+// Remove only integrity and later operational metadata in this owned fixture database. Retained
 // captures, source rows, and permanent filesystem evidence remain untouched.
 async fn remove_integrity_schema(pool: &sqlx_postgres::PgPool) {
     let mut transaction = pool
@@ -891,6 +891,8 @@ BEGIN
     END LOOP;
 END;
 $fixture$;
+DROP TABLE IF EXISTS devres_attribution_recoveries;
+DROP FUNCTION IF EXISTS devres_attribution_recovery_immutable();
 DROP TABLE IF EXISTS devres_attribution_targets,devres_attribution_sweeps,devres_attribution_generations,devres_attribution_control;
 DROP TABLE devres_integrity_staged_state;
 DROP TABLE devres_integrity_provider_cutoffs;

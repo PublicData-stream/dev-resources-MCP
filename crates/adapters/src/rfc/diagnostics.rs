@@ -299,6 +299,8 @@ mod tests {
             scan_retained_dump: false,
             snapshot: Some(snapshot.into()),
             job_keys: vec!["rfc:text:9000".into()],
+            commit: None,
+            attribution_target: None,
         }
     }
 

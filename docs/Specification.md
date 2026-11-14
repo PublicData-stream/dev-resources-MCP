@@ -38,10 +38,11 @@ Active schema-10 stores automatically receive additive schema-11 attribution
 tables at normal startup under the exclusive storage-owner fence. This bounded
 transition does not perform the schema 1–9 BLAKE3 conversion, scan the corpus or
 request upstream data. Pending conversion still requires offline activation.
-Normal writer startup records schema 16 for filesystem and S3, including the
-runtime split, Wikipedia tables, crate enrichment and bounded RFC job diagnostics.
+Normal writer startup records schema 17 for filesystem and S3, including the
+runtime split, Wikipedia tables, crate enrichment, bounded RFC job diagnostics
+and the immutable RustSec attribution recovery journal.
 Older binaries cannot reopen the store; serving readers require the committed
-schema-16 backend. Attribution policy compatibility remains independent
+schema-17 backend. Attribution policy compatibility remains independent
 of that private topology marker.
 
 Serving and collection run as separate workloads. Public-source acquisition needed

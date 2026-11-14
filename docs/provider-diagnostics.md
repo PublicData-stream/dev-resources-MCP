@@ -4,7 +4,7 @@
 collectors or listeners, acquiring writer authority, or making provider requests.
 Supply reader-only database/S3 credentials through a private configuration file.
 Neither configuration nor arbitrary upstream text enters the report. This command
-supports active schemas 14 through 16 so diagnosis can precede a rollout.
+supports active schemas 14 through 17 so diagnosis can precede a rollout.
 
 ```sh
 devres-server diagnose-collection /etc/devres/reader.toml \
@@ -30,6 +30,44 @@ explicit incomplete outcomes. If initialization cannot finish or a dependency
 cannot stop before the hard deadline, the command instead returns a typed error
 and leaves no completed report; an already-created output file can be empty.
 An incomplete report does not establish parser compatibility or corpus integrity.
+
+## Selected RustSec metadata
+
+RustSec inspection reads the retained current/history states and both default
+descriptors. Optional selectors add exactly one commit's latest visible processing
+generation and one exact attribution target:
+
+```sh
+devres-server diagnose-collection /etc/devres/reader.toml \
+  --provider rustsec --latest-failure \
+  --commit COMMIT_SHA --attribution-target blake3:TARGET_HEX \
+  --output /tmp/devres-rustsec-diagnosis/report.json
+```
+
+Replace the placeholders with the selected lowercase 40-digit Git revision and
+64-digit target hash. Omit either selector when it is not needed. RustSec does not
+accept RFC job/snapshot selectors or dump scanning. Inspection freezes the advisory
+row cutoff, verifies descriptor/capture/occurrence seals and legacy alias bindings,
+and reports at most two projection-gap samples per format. It never reads member
+bodies, reconstructs Git state, opens serving caches, queues repairs or calls a
+provider. Descriptor verification does not prove membership bytes, qualification,
+fresh acquisition or complete historical format support.
+
+New writer attempts retain finite stage/failure and exact public capture references
+in private `diagnostics-current` and `diagnostics-history` state. These records are
+excluded from public status and attribution enumeration. Legacy attempts without
+this linkage remain `legacy_unknown`; no cause is inferred from `unavailable`.
+Resolution of a history failure requires successful execution of its own stage
+and checkpoint. An idle/backoff tick or successful local projection cannot resolve
+a remote synchronization failure. Historical unsupported TOML and placeholder
+advisories remain retained projection gaps; their presence does not make OSV
+coverage incomplete when that independent representation is complete.
+
+For current publication, the default and successful attempt are committed together.
+An ambiguous commit response is reconciled through the exact writer session and
+sealed attempt, never by default equality alone. Until its outcome is known, no
+replacement source attempt is started. Existing public status retains its shape;
+private reports contain no raw response, arbitrary URL, configuration or audit data.
 
 Use `--provider chromium` for the component/lane collector states and latest
 private validation observation. These observations contain operation/reason,

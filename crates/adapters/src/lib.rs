@@ -95,6 +95,10 @@ pub use storage::collection_diagnostics::{
     CollectionDiagnosis, DiagnosisOptions, DiagnosisOutcome, DiagnosisProvider,
     create_diagnosis_output, diagnose_collection,
 };
+pub use storage::{
+    RUSTSEC_CAPTURE_REPAIR_VERSION, RustSecRecoveryOptions, RustSecRecoveryOutcome,
+    RustSecRecoveryReport, recover_rustsec_attribution,
+};
 pub use w3c::{W3cConfig, W3cCorpus};
 pub use whatwg::{WhatwgConfig, WhatwgCorpus};
 pub use wikipedia::{WikipediaConfig, WikipediaCorpus};
