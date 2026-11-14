@@ -952,6 +952,21 @@ parent-relative source changes. Main publication has priority over backfill.
 Unknown historical formats/macros and individual index limits remain explicit
 projection gaps; they do not imply missing raw Git evidence.
 
+History status retains legacy `offset`, `processed` and `total` fields and adds
+`offset_bytes`, `commit_order_bytes`, `processed_commits` and `total_commits`.
+Compare byte cursors with the pinned observation's commit-order byte length,
+and commit counts with that same observation's commit total. The latest source
+observation may describe a different graph. Never reset or clamp a byte cursor
+because it exceeds a commit count.
+
+Current/history collector summaries distinguish observed attempts, durable success
+and historical failures. Saved activity after interruption is unknown. For selected
+work records, failure phases and verified cursor boundaries, use the
+[private MDN inspector](provider-diagnostics.md#selected-mdn-metadata). A prepared
+snapshot, a retained index or an enabled collector does not establish a usable
+paired current view. Publish only after both main snapshots have valid indexes;
+preserve the previous default while either source remains incomplete.
+
 Stop serving before private offline index maintenance:
 
 ```sh

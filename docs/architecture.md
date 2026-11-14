@@ -314,6 +314,14 @@ historical processing share owner-fenced bookkeeping and bounded processing;
 source I/O never runs inside database transactions. Completed commit prefixes and
 member checkpoints resume after interruption. Processing-version changes restart
 backfill without replacing old projections.
+
+Operational MDN diagnostics use bounded sealed private state excluded from
+attribution enumeration. They keep operation attempts, durable success and past
+failures separate and never make a saved activity flag a liveness guarantee.
+The private inspector opens read-only evidence without initializing writer state
+or serving caches; its metadata, artifact and cursor checks remain separate from
+index-engine readability and research qualification.
+
 Private processing slices reuse a bounded cache of hash-verified immutable nodes.
 New nodes enter it only after their write group commits. Public research keeps
 its independent storage fencing, and every checkpoint/default publication still

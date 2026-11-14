@@ -16,6 +16,23 @@ struct Memory {
     rows: StdMutex<BTreeMap<(String, String), MdnRow>>,
     states: StdMutex<BTreeMap<String, Value>>,
     sequence: AtomicI64,
+    fault: StdMutex<Option<(&'static str, &'static str)>>,
+}
+impl Memory {
+    fn fail(&self, operation: &str, selected: &str) -> Result<()> {
+        if self
+            .fault
+            .lock()
+            .expect("fault")
+            .is_some_and(|(fault, prefix)| operation == fault && selected.starts_with(prefix))
+        {
+            return Err(Error::new(
+                "fixture_private_code",
+                "private source path and credential fixture",
+            ));
+        }
+        Ok(())
+    }
 }
 #[async_trait]
 impl MdnStore for Memory {
@@ -55,6 +72,7 @@ impl MdnStore for Memory {
         Ok(self.sequence.load(Ordering::Relaxed))
     }
     async fn mdn_get(&self, kind: &str, key: &str) -> Result<Option<MdnRow>> {
+        self.fail("row-read", kind)?;
         Ok(self
             .rows
             .lock()
@@ -63,6 +81,7 @@ impl MdnStore for Memory {
             .cloned())
     }
     async fn mdn_put(&self, kind: &str, key: &str, data: &Value) -> Result<i64> {
+        self.fail("row-write", kind)?;
         let mut rows = self.rows.lock().expect("memory rows");
         if let Some(row) = rows.get(&(kind.into(), key.into())) {
             if row.data != *data {
@@ -88,6 +107,7 @@ impl MdnStore for Memory {
         limit: usize,
         cutoff: Option<i64>,
     ) -> Result<Vec<MdnRow>> {
+        self.fail("rows", kind)?;
         let mut rows: Vec<_> = self
             .rows
             .lock()
@@ -105,9 +125,11 @@ impl MdnStore for Memory {
         Ok(rows)
     }
     async fn mdn_state(&self, key: &str) -> Result<Option<Value>> {
+        self.fail("state-read", key)?;
         Ok(self.states.lock().expect("memory state").get(key).cloned())
     }
     async fn mdn_set_state(&self, key: &str, data: &Value) -> Result<()> {
+        self.fail("state-write", key)?;
         self.states
             .lock()
             .expect("memory state")
@@ -115,6 +137,7 @@ impl MdnStore for Memory {
         Ok(())
     }
     async fn mdn_publish_view(&self, view: &View) -> Result<()> {
+        self.fail("view", "default")?;
         for (id, repo) in [(&view.content, "content"), (&view.compatibility, "compat")] {
             let snapshot: Snapshot = decoded(
                 self.mdn_get("snapshots", id)
@@ -2320,4 +2343,443 @@ async fn blake3_migration_preserves_distinct_frozen_snapshot_occurrences() {
             .code,
         "cancelled"
     );
+}
+
+#[tokio::test]
+async fn mdn_diagnostics_preserve_failures_across_yields_idle_and_other_lanes() {
+    let store = Memory::default();
+    let original = Error::new("private-code", "private source path and credential fixture");
+    let revision = "a".repeat(40);
+    let observation = inventory::digest(b"retained observation");
+    let error = diagnostics::run(&store, "diagnostics-current", async {
+        diagnostics::input(Repo::Content, Some(&revision), Some(&observation));
+        diagnostics::phase(Phase::ObjectAccess);
+        Err::<(), _>(original.clone())
+    })
+    .await
+    .expect_err("original failure");
+    assert_eq!(error.code, original.code);
+    assert_eq!(error.message, original.message);
+    let failed = store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed["last_failure"]["code"], "other");
+    assert_eq!(failed["last_failure"]["phase"], "object_access");
+    assert_eq!(failed["last_failure"]["revision"], revision);
+    assert_eq!(failed["last_failure"]["observation"], observation);
+    assert!(!failed.to_string().contains("private"));
+
+    diagnostics::run_slice(&store, "diagnostics-current", async {
+        diagnostics::phase(Phase::InventoryCheckpoint);
+        diagnostics::progress(122);
+        // One finished substage followed by an incomplete slice is still a yield.
+        diagnostics::completed();
+        Ok(false)
+    })
+    .await
+    .unwrap();
+    let yielded = store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(yielded["outcome"], "yielded");
+    assert_eq!(yielded["last_progress"]["checkpoint"], 122);
+    assert_eq!(yielded["last_progress"]["checkpoint_unit"], "entries");
+    assert!(yielded["last_success"].is_null());
+    assert_eq!(yielded["last_failure"], failed["last_failure"]);
+    diagnostics::run(&store, "diagnostics-history", async {
+        diagnostics::phase(Phase::HistoryCheckpoint);
+        diagnostics::progress(81_004);
+        diagnostics::completed();
+        Ok(())
+    })
+    .await
+    .unwrap();
+    diagnostics::run(&store, "diagnostics-current", async { Ok(()) })
+        .await
+        .unwrap();
+    let idle = store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(idle["outcome"], "idle");
+    assert_eq!(idle["last_failure"], failed["last_failure"]);
+    let public = diagnostics::public_summary(Some(idle.clone())).unwrap();
+    assert!(public["active"].is_null());
+    assert_eq!(public["activity"], "unknown");
+    assert!(public["last_progress"].get("checkpoint").is_none());
+    assert!(!public.to_string().contains(&revision));
+    assert!(!public.to_string().contains(&observation));
+
+    let mut extra = idle;
+    extra["arbitrary"] = json!("private arbitrary field");
+    let private = diagnostics::private_summary(extra.clone()).unwrap();
+    assert!(private.get("arbitrary").is_none());
+    assert!(private["active"].is_null());
+    extra["phase"] = json!("private arbitrary phase");
+    assert_eq!(
+        diagnostics::private_summary(extra).unwrap_err().code,
+        "integrity"
+    );
+}
+
+#[tokio::test]
+async fn mdn_diagnostics_storage_failure_never_replaces_original_error() {
+    let store = Memory::default();
+    *store.fault.lock().unwrap() = Some(("state-write", "diagnostics-current"));
+    let original = Error::capacity("original bounded source failure");
+    let error = diagnostics::run(&store, "diagnostics-current", async {
+        Err::<(), _>(original.clone())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, original.code);
+    assert_eq!(error.message, original.message);
+    let error = diagnostics::run(&store, "diagnostics-current", async { Ok(()) })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "unavailable");
+    assert_eq!(error.message, "MDN diagnostic observation incomplete.");
+}
+
+#[tokio::test]
+async fn mdn_corpus_publication_failures_recover_before_large_history_completes() {
+    let fixture = Fixture::new().await;
+    let tree = fixture
+        .content
+        .commit(&fixture.content_revision, CancellationToken::new())
+        .await
+        .unwrap()
+        .tree;
+    let mut head = fixture.content_revision.clone();
+    for _ in 0..102 {
+        let raw = crate::mdn::git::tests::input(
+            &fixture.content,
+            &["commit-tree", &tree, "-p", &head],
+            b"Synthetic retained history\n",
+        )
+        .await;
+        head = std::str::from_utf8(&raw).unwrap().trim().to_owned();
+    }
+    update(&fixture.content, "refs/heads/main", &head).await;
+    fixture
+        .corpus
+        .synchronize(Repo::Content, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut histories = BTreeMap::new();
+    for repo in [Repo::Content, Repo::Compat] {
+        let observation = fixture.corpus.observation(repo).await.unwrap().unwrap();
+        let history = encoded(&History {
+            observation,
+            offset: 0,
+            processed: 0,
+            complete: false,
+            processor_version: PROCESSOR_VERSION,
+        })
+        .unwrap();
+        fixture
+            .store
+            .mdn_set_state(&format!("{}-history", repo.as_str()), &history)
+            .await
+            .unwrap();
+        histories.insert(repo.as_str(), history);
+    }
+    for (operation, selected, phase) in [
+        ("state-write", "work:", "inventory_checkpoint"),
+        ("rows", "index-documents", "index_publication"),
+        ("state-write", "index-checkpoint", "index_checkpoint"),
+        ("row-write", "snapshots", "snapshot_publication"),
+        ("view", "default", "default_publication"),
+    ] {
+        *fixture.store.fault.lock().unwrap() = Some((operation, selected));
+        let error = fixture
+            .corpus
+            .process_current(CancellationToken::new())
+            .await
+            .expect_err("injected phase failure");
+        assert_eq!(error.code, "fixture_private_code");
+        let diagnostic = fixture
+            .store
+            .mdn_state("diagnostics-current")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(diagnostic["last_failure"]["phase"], phase);
+        assert_eq!(diagnostic["last_failure"]["code"], "other");
+        assert!(!diagnostic.to_string().contains("private"));
+        assert!(
+            fixture
+                .store
+                .mdn_state("default-view")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    *fixture.store.fault.lock().unwrap() = None;
+    fixture.current().await;
+    let accepted = fixture
+        .store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted["outcome"], "succeeded");
+    assert_eq!(accepted["last_success"]["phase"], "default_publication");
+    assert_eq!(accepted["last_failure"]["phase"], "default_publication");
+    let default = fixture
+        .store
+        .mdn_state("default-view")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!default.is_null());
+    fixture.current().await;
+    let idle = fixture
+        .store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(idle["outcome"], "idle");
+    assert_eq!(idle["last_success"], accepted["last_success"]);
+    for (repo, history) in histories {
+        assert_eq!(
+            fixture
+                .store
+                .mdn_state(&format!("{repo}-history"))
+                .await
+                .unwrap()
+                .unwrap(),
+            history
+        );
+    }
+    let status = fixture.store.mdn_state("status").await.unwrap().unwrap();
+    assert_eq!(
+        status["sources"]["content"]["history"]["total_commits"],
+        103
+    );
+    for repo in ["content", "compat"] {
+        let history = &status["sources"][repo]["history"];
+        assert_eq!(history["offset_bytes"], history["offset"]);
+        assert_eq!(history["processed_commits"], history["processed"]);
+        assert_eq!(history["total_commits"], history["total"]);
+        assert!(
+            history["commit_order_bytes"].as_u64().unwrap()
+                > history["total_commits"].as_u64().unwrap()
+        );
+    }
+    let document = fixture.text("Web/API/Fetch", None).await;
+    let before = document["provenance"]["snapshot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // An explicit historical content selector does not inherit the default's BCD pair.
+    let pinned = fixture.text("Web/API/Fetch", Some(&before)).await;
+    let mut files = content_files();
+    files.insert(
+        LEAF_PATH,
+        b"---\ntitle: Leaf\nslug: Web/API/Leaf\n---\nNew unpublished body.".to_vec(),
+    );
+    let next = commit_map(&fixture.content, &files, &[&head]).await;
+    update(&fixture.content, "refs/heads/main", &next).await;
+    fixture
+        .corpus
+        .synchronize(Repo::Content, CancellationToken::new())
+        .await
+        .unwrap();
+    *fixture.store.fault.lock().unwrap() = Some(("view", "default"));
+    fixture
+        .corpus
+        .process_current(CancellationToken::new())
+        .await
+        .expect_err("preserve last admitted view");
+    assert_eq!(
+        fixture
+            .store
+            .mdn_state("default-view")
+            .await
+            .unwrap()
+            .unwrap(),
+        default
+    );
+    *fixture.store.fault.lock().unwrap() = None;
+    assert_eq!(
+        fixture.text("Web/API/Fetch", Some(&before)).await["page"]["text"],
+        pinned["page"]["text"]
+    );
+    fixture.current().await;
+    assert_ne!(
+        fixture
+            .store
+            .mdn_state("default-view")
+            .await
+            .unwrap()
+            .unwrap(),
+        default
+    );
+
+    *fixture.store.fault.lock().unwrap() = Some(("state-read", "compat-observation"));
+    fixture
+        .corpus
+        .process_current(CancellationToken::new())
+        .await
+        .expect_err("compat lookup failure");
+    *fixture.store.fault.lock().unwrap() = None;
+    let diagnostic = fixture
+        .store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(diagnostic["last_failure"]["phase"], "observation_lookup");
+    assert_eq!(diagnostic["last_failure"]["repository"], "compat");
+    assert!(diagnostic["last_failure"]["revision"].is_null());
+}
+
+#[tokio::test]
+async fn mdn_corpus_phase_diagnostics_distinguish_object_projection_and_changes_failures() {
+    let fixture = Fixture::new().await;
+    let observation = fixture
+        .corpus
+        .observation(Repo::Content)
+        .await
+        .unwrap()
+        .unwrap();
+    let observation = observation_key(&observation);
+    let mut root = inventory::empty(fixture.store.as_ref()).await.unwrap();
+    let original_root = root.clone();
+    let mut cache = inventory::NodeCache::new();
+    let entry = TreeEntry {
+        path: FETCH_PATH.into(),
+        oid: "f".repeat(40),
+        mode: "100644".into(),
+        kind: "blob".into(),
+        removed: false,
+        raw_path_hex: None,
+    };
+    for fault in [Some(("row-read", "nodes")), None] {
+        *fixture.store.fault.lock().unwrap() = fault;
+        let error = diagnostics::run(fixture.store.as_ref(), "diagnostics-current", async {
+            diagnostics::input(
+                Repo::Content,
+                Some(&fixture.content_revision),
+                Some(&observation),
+            );
+            fixture
+                .corpus
+                .apply_entry(
+                    &mut cache,
+                    Repo::Content,
+                    &fixture.content_revision,
+                    &mut root,
+                    entry.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+        })
+        .await
+        .expect_err("selected inventory/object failure");
+        assert_eq!(
+            error.code,
+            if fault.is_some() {
+                "fixture_private_code"
+            } else {
+                "unavailable"
+            }
+        );
+        let diagnostic = fixture
+            .store
+            .mdn_state("diagnostics-current")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            diagnostic["last_failure"]["phase"],
+            if fault.is_some() {
+                "inventory_apply"
+            } else {
+                "object_access"
+            }
+        );
+        assert_eq!(
+            root, original_root,
+            "failed entry cannot advance the inventory root"
+        );
+    }
+    *fixture.store.fault.lock().unwrap() = Some(("row-write", "projections"));
+    diagnostics::run(fixture.store.as_ref(), "diagnostics-current", async {
+        diagnostics::input(
+            Repo::Content,
+            Some(&fixture.content_revision),
+            Some(&observation),
+        );
+        fixture
+            .corpus
+            .projection(fixture.store.as_ref(), json!({"slug":"Synthetic"}), None)
+            .await
+    })
+    .await
+    .expect_err("projection persistence failure");
+    let diagnostic = fixture
+        .store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(diagnostic["last_failure"]["phase"], "projection");
+    fixture
+        .corpus
+        .process_current(CancellationToken::new())
+        .await
+        .expect_err("entry batch publication failure");
+    let diagnostic = fixture
+        .store
+        .mdn_state("diagnostics-current")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(diagnostic["last_failure"]["phase"], "entry_publication");
+    assert!(
+        fixture
+            .store
+            .mdn_state("default-view")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    *fixture.store.fault.lock().unwrap() = None;
+    fixture.current().await;
+    *fixture.store.fault.lock().unwrap() = Some(("row-write", "changes"));
+    fixture
+        .corpus
+        .process_history(CancellationToken::new())
+        .await
+        .expect_err("history change publication failure");
+    let diagnostic = fixture
+        .store
+        .mdn_state("diagnostics-history")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(diagnostic["last_failure"]["phase"], "changes_publication");
+    assert_eq!(diagnostic["last_failure"]["observation"], observation);
+    assert!(!diagnostic.to_string().contains(FETCH_PATH));
+    assert!(!diagnostic.to_string().contains("private"));
+    *fixture.store.fault.lock().unwrap() = None;
+    fixture.history().await;
+    let recovered = fixture
+        .store
+        .mdn_state("diagnostics-history")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered["last_failure"], diagnostic["last_failure"]);
+    assert_eq!(recovered["outcome"], "succeeded");
+    assert!(!recovered["last_success"].is_null());
 }

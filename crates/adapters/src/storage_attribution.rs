@@ -1331,7 +1331,7 @@ fn sources(name: &str) -> Result<Vec<Source>> {
                 select: "t.*,''::text AS kind,to_jsonb(t)-'data' AS metadata",
                 filter: match name {
                     "w3c" => "key NOT IN ('status','failure','catalog-work') AND NOT starts_with(key,'collector-')",
-                    "mdn" => "key NOT IN ('status','failure','content-retry','compat-retry')",
+                    "mdn" => "key NOT IN ('status','failure','content-retry','compat-retry') AND NOT starts_with(key,'diagnostics-')",
                     _ => "key NOT IN ('status','failure')",
                 },
             });
@@ -2553,7 +2553,17 @@ mod tests {
             .attribution_fail(&claimed[0], None, "fixture_done")
             .await
             .unwrap();
-        for key in ["status", "failure", "content-retry", "compat-retry"] {
+        for key in [
+            "status",
+            "failure",
+            "content-retry",
+            "compat-retry",
+            "diagnostics-current",
+            "diagnostics-history",
+            "diagnostics-acquisition-content",
+            "diagnostics-acquisition-compat",
+            "diagnostics-recovery",
+        ] {
             store
                 .mdn_set_state(key, &json!({"at":1,"status":"synthetic"}))
                 .await
@@ -2588,7 +2598,17 @@ mod tests {
             .verify_attribution_storage(&CancellationToken::new())
             .await
             .unwrap();
-        for key in ["status", "failure", "content-retry", "compat-retry"] {
+        for key in [
+            "status",
+            "failure",
+            "content-retry",
+            "compat-retry",
+            "diagnostics-current",
+            "diagnostics-history",
+            "diagnostics-acquisition-content",
+            "diagnostics-acquisition-compat",
+            "diagnostics-recovery",
+        ] {
             store
                 .mdn_set_state(key, &json!({"at":2,"status":"changed"}))
                 .await
@@ -2597,7 +2617,7 @@ mod tests {
         for _ in 0..12 {
             store.attribution_sweep_page("mdn").await.unwrap();
         }
-        let operational:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_attribution_targets WHERE provider='mdn' AND data#>>'{target,subject,namespace}'='devres_mdn_state' AND data#>>'{target,subject,key}' IN ('status','failure','content-retry','compat-retry')").fetch_one(&store.pool).await.unwrap();
+        let operational:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_attribution_targets WHERE provider='mdn' AND data#>>'{target,subject,namespace}'='devres_mdn_state' AND (data#>>'{target,subject,key}' IN ('status','failure','content-retry','compat-retry') OR starts_with(data#>>'{target,subject,key}','diagnostics-'))").fetch_one(&store.pool).await.unwrap();
         assert_eq!(
             operational, 0,
             "operational updates must not create attribution occurrences"

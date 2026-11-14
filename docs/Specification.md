@@ -301,6 +301,16 @@ inventory and metadata remain independent operations. These public-source-only
 fields contain no source bodies, URLs, runtime configuration or raw error text.
 Catalog/default read failures remain explicit rather than appearing as zero coverage.
 
+MDN exposes separate `collectors.current` and `collectors.history` summaries with
+phase, outcome, last attempt, durable progress, success and historical failure.
+Persisted activity is unknown after interruption; a stored running flag
+does not certify a live worker. Detailed revision/checkpoint evidence remains
+private. Its history fields explicitly distinguish `offset_bytes` and
+`commit_order_bytes` from `processed_commits` and `total_commits`, while retaining
+the legacy fields. History counts belong to the pinned history observation,
+which can differ from the latest source observation. Missing legacy phase evidence
+remains unknown, and later unrelated success does not erase an earlier failure.
+
 RustSec collection runs independently of public requests: current main metadata and
 immutable archives refresh hourly, and full official Git branch/tag ancestry
 synchronizes daily. These are scheduling targets. All advisory tools read published

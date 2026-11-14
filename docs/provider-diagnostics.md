@@ -31,6 +31,48 @@ cannot stop before the hard deadline, the command instead returns a typed error
 and leaves no completed report; an already-created output file can be empty.
 An incomplete report does not establish parser compatibility or corpus integrity.
 
+## Selected MDN metadata
+
+Inspect retained MDN heads and pinned history without cloning, reconstructing Git
+state, starting collectors or opening serving caches:
+
+```sh
+devres-server diagnose-collection /etc/devres/reader.toml \
+  --provider mdn --latest-failure \
+  --max-total-bytes 67108864 --timeout-secs 300 \
+  --output /tmp/devres-mdn-diagnosis/report.json
+```
+
+MDN accepts no commit, snapshot, representation-job, attribution-target or dump-scan
+selectors. The report freezes the database evidence cutoff and selects at most two
+main work records, two pinned history observations, pending count, index/checkpoint,
+main prepared/published bindings and default view. It verifies admitted metadata
+seals and selected aliases. Selected commit-order artifacts are checked against
+their retained digest and byte descriptor, including cursor bounds and newline
+boundaries. The existing aggregate byte/time budget applies to the whole command;
+missing evidence or exhausted admission produces an explicit incomplete result.
+
+Metadata and cursor verification do not establish index-engine readability,
+complete inventory membership, attribution qualification or current source
+acceptance. Output contains finite classifications, validated public identities,
+counts and timestamps, never source bodies, paths or arbitrary error text. It does
+not enqueue repairs or refresh source validation times.
+
+New collection attempts retain private finite phase and outcome records separate
+from source evidence. Legacy attempts without these records remain
+`legacy_unknown`. Last failure and last successful durable work are separate:
+an idle tick, yielded inventory slice or another operation's success cannot resolve
+the failure. Committed checkpoints update progress; incomplete slices do not
+advance the last completed collection/publication success. Saved activity alone
+does not establish that a worker remains active.
+If storage prevents recording diagnostics, exact phase evidence may be unavailable;
+the original operation failure remains authoritative.
+
+Use frozen evidence to reproduce a selected failure before changing a parser,
+storage path, attribution mapping or scheduling policy. A missing default alone
+does not justify rebuilding indexes, resetting history or increasing concurrency.
+Production diagnosis and later maintenance or deployment are separate actions.
+
 ## Selected RustSec metadata
 
 RustSec inspection reads the retained current/history states and both default

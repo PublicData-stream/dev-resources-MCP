@@ -16,7 +16,7 @@ pub struct Arguments {
 pub fn parse(args: &[String]) -> Result<Arguments> {
     let invalid = || {
         Error::invalid(
-            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc|rustsec --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]] [--commit OID] [--attribution-target ID]",
+            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc|rustsec|mdn --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]] [--commit OID] [--attribution-target ID]",
         )
     };
     if args.len() < 2 || args[0] != "diagnose-collection" {
@@ -54,6 +54,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
                     "crates" => DiagnosisProvider::Crates,
                     "rfc" => DiagnosisProvider::Rfc,
                     "rustsec" => DiagnosisProvider::Rustsec,
+                    "mdn" => DiagnosisProvider::Mdn,
                     _ => return Err(invalid()),
                 })
             }
@@ -212,6 +213,26 @@ mod tests {
             vec!["--commit", "bad"],
             vec!["--scan-retained-dump"],
             vec!["--snapshot", "bad"],
+        ] {
+            let mut invalid = args.clone();
+            invalid.extend(extra.into_iter().map(str::to_owned));
+            assert!(parse(&invalid).is_err());
+        }
+    }
+    #[test]
+    fn mdn_inspection_is_bounded_without_cross_provider_selectors() {
+        let mut args = arguments(&["--latest-failure"]);
+        args[3] = "mdn".into();
+        assert!(matches!(
+            parse(&args).unwrap().options.provider,
+            DiagnosisProvider::Mdn
+        ));
+        let revision = "a".repeat(40);
+        for extra in [
+            vec!["--commit", &revision],
+            vec!["--scan-retained-dump"],
+            vec!["--job-key", "rfc:text:9000"],
+            vec!["--max-total-bytes", "67108865"],
         ] {
             let mut invalid = args.clone();
             invalid.extend(extra.into_iter().map(str::to_owned));

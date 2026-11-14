@@ -31,6 +31,7 @@ pub enum DiagnosisProvider {
     Crates,
     Rfc,
     Rustsec,
+    Mdn,
 }
 impl DiagnosisProvider {
     fn tables(self) -> Result<(&'static str, &'static str)> {
@@ -38,6 +39,7 @@ impl DiagnosisProvider {
             Self::W3c => Ok(("devres_w3c_evidence", "devres_w3c_state")),
             Self::Chromium => Ok(("devres_chromium_evidence", "devres_chromium_state")),
             Self::Rustsec => Ok(("devres_advisory_rows", "devres_advisory_state")),
+            Self::Mdn => Ok(("devres_mdn_evidence", "devres_mdn_state")),
             Self::Crates | Self::Rfc => Err(invalid()),
         }
     }
@@ -831,6 +833,7 @@ pub async fn diagnose_collection(
             DiagnosisProvider::Rustsec => {
                 rustsec_diagnostics::inspect(&mut reader, &mut report, &options).await
             }
+            DiagnosisProvider::Mdn => mdn_diagnostics::inspect(&mut reader, &mut report).await,
             DiagnosisProvider::Crates => {
                 inspect_crates(&mut reader, &mut report, options.scan_retained_dump).await
             }
@@ -848,7 +851,7 @@ pub async fn diagnose_collection(
                 report.outcome = DiagnosisOutcome::IntegrityFailed;
             } else if matches!(
                 options.provider,
-                DiagnosisProvider::Rfc | DiagnosisProvider::Rustsec
+                DiagnosisProvider::Rfc | DiagnosisProvider::Rustsec | DiagnosisProvider::Mdn
             ) && error.code == "unavailable"
             {
                 report.complete = false;
@@ -888,6 +891,8 @@ pub async fn diagnose_collection(
 mod rfc_diagnostics;
 use rfc_diagnostics::{inspect_rfc, rfc_job_identity};
 
+#[path = "mdn/diagnostics.rs"]
+mod mdn_diagnostics;
 #[path = "rustsec/diagnostics.rs"]
 mod rustsec_diagnostics;
 

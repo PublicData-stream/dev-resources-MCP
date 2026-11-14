@@ -58,6 +58,9 @@ pub struct MdnCorpus {
 
 #[path = "corpus/buffer.rs"]
 mod buffer;
+#[path = "corpus/diagnostics.rs"]
+pub(crate) mod diagnostics;
+use diagnostics::Phase;
 #[path = "corpus/migration.rs"]
 pub(crate) mod migration;
 
@@ -259,14 +262,29 @@ impl MdnCorpus {
         }
     }
     pub async fn recover(&self, cancel: CancellationToken) -> Result<()> {
+        diagnostics::run(
+            self.store.as_ref(),
+            "diagnostics-recovery",
+            Box::pin(self.recover_inner(cancel)),
+        )
+        .await
+    }
+    async fn recover_inner(&self, cancel: CancellationToken) -> Result<()> {
+        diagnostics::phase(Phase::Recovery);
         let _guard = self.processing.lock().await;
         self.raw.recover_stages().await?;
         self.index.recover_stages()?;
         for repo in [Repo::Content, Repo::Compat] {
+            diagnostics::input(repo, None, None);
+            diagnostics::phase(Phase::ObservationLookup);
             if let Some(o) = self.observation(repo).await? {
+                diagnostics::input(repo, o.main_revision.as_deref(), Some(&observation_key(&o)));
+                diagnostics::phase(Phase::Recovery);
                 self.git(repo).restore(&o.manifest, cancel.clone()).await?;
             }
         }
+        diagnostics::shared();
+        diagnostics::phase(Phase::Recovery);
         if let Some(reference) = self.store.mdn_state("index").await? {
             self.index.prewarm(&reference, cancel).await?;
         }
@@ -281,7 +299,26 @@ impl MdnCorpus {
     }
     /// Acquire one fixed ref observation. Used by serving and explicit full acceptance.
     pub async fn synchronize(&self, repo: Repo, cancel: CancellationToken) -> Result<Observation> {
+        let key = match repo {
+            Repo::Content => "diagnostics-acquisition-content",
+            Repo::Compat => "diagnostics-acquisition-compat",
+        };
+        diagnostics::run(
+            self.store.as_ref(),
+            key,
+            Box::pin(self.synchronize_inner(repo, cancel)),
+        )
+        .await
+    }
+    async fn synchronize_inner(
+        &self,
+        repo: Repo,
+        cancel: CancellationToken,
+    ) -> Result<Observation> {
+        diagnostics::input(repo, None, None);
+        diagnostics::phase(Phase::ObservationLookup);
         let previous = self.observation(repo).await?;
+        diagnostics::phase(Phase::Acquisition);
         let observation = self
             .git(repo)
             .synchronize(
@@ -290,6 +327,12 @@ impl MdnCorpus {
                 cancel,
             )
             .await?;
+        diagnostics::input(
+            repo,
+            observation.main_revision.as_deref(),
+            Some(&observation_key(&observation)),
+        );
+        diagnostics::phase(Phase::ObservationPublication);
         self.store
             .mdn_put(
                 "observations",
@@ -303,6 +346,7 @@ impl MdnCorpus {
                 &encoded(&observation)?,
             )
             .await?;
+        diagnostics::completed();
         Ok(observation)
     }
     async fn snapshot(&self, repo: Repo, rev: &str) -> Result<Option<Snapshot>> {
@@ -387,6 +431,7 @@ impl MdnCorpus {
         history: bool,
         cancel: CancellationToken,
     ) -> Result<bool> {
+        diagnostics::phase(Phase::CommitLookup);
         if let Some(snapshot) = self.snapshot(repo, revision).await? {
             if snapshot.index.is_null() {
                 self.enqueue(repo, revision).await?;
@@ -420,11 +465,17 @@ impl MdnCorpus {
                 }
             };
         let operation = cancel.child_token();
+        diagnostics::phase(Phase::InventoryEnumeration);
+        let initial_offset = work.offset;
         let mut entries = git.records(revision, work.previous.as_deref(), operation.clone())?;
         let started = tokio::time::Instant::now();
         let mut seen = 0;
         let mut finished = true;
-        while let Some(entry) = entries.recv().await {
+        loop {
+            diagnostics::phase(Phase::InventoryEnumeration);
+            let Some(entry) = entries.recv().await else {
+                break;
+            };
             let entry = entry?;
             seen += 1;
             if seen <= work.offset {
@@ -451,7 +502,9 @@ impl MdnCorpus {
                 return Err(Error::capacity("MDN commit change bound exceeded."));
             }
             if seen % 100 == 0 {
+                diagnostics::phase(Phase::InventoryCheckpoint);
                 self.store.mdn_set_state(&key, &encoded(&work)?).await?;
+                diagnostics::progress(work.offset as u64);
             }
             if started.elapsed() >= Duration::from_secs(10) {
                 finished = false;
@@ -460,7 +513,11 @@ impl MdnCorpus {
         }
         operation.cancel();
         drop(entries);
+        diagnostics::phase(Phase::InventoryCheckpoint);
         self.store.mdn_set_state(&key, &encoded(&work)?).await?;
+        if work.offset > initial_offset {
+            diagnostics::progress(work.offset as u64);
+        }
         if !finished {
             return Ok(false);
         }
@@ -499,6 +556,7 @@ impl MdnCorpus {
                 }
             }
         }
+        diagnostics::phase(Phase::SnapshotPreparation);
         let root = inventory::node_cached(self.store.as_ref(), &work.root, &mut cache).await?;
         let id = inventory::digest(
             &serde_json::to_vec(&(repo.as_str(), revision, PROCESSOR_VERSION, &work.root))
@@ -538,6 +596,7 @@ impl MdnCorpus {
         revision: &str,
         cancel: CancellationToken,
     ) -> Result<bool> {
+        diagnostics::phase(Phase::ChangesPublication);
         let done_key = snapshot_key(repo, revision);
         if self
             .store
@@ -713,6 +772,7 @@ impl MdnCorpus {
         mut data: Value,
         indexed: Option<IndexDocument>,
     ) -> Result<String> {
+        diagnostics::phase(Phase::Projection);
         data["processor_version"] = json!(PROCESSOR_VERSION);
         let id = inventory::digest(
             &serde_json::to_vec(&data).map_err(|_| Error::integrity("Invalid MDN projection."))?,
@@ -772,6 +832,7 @@ impl MdnCorpus {
         entry: TreeEntry,
         cancel: CancellationToken,
     ) -> Result<()> {
+        diagnostics::phase(Phase::InventoryApply);
         cache.defer_writes();
         let buffered = buffer::BufferedMdnStore::new(self.store.as_ref());
         let store: &dyn MdnStore = &buffered;
@@ -807,6 +868,7 @@ impl MdnCorpus {
         }
         if entry.removed {
             *root = inventory::update_cached(store, root, &path, None, cache).await?;
+            diagnostics::phase(Phase::EntryPublication);
             buffered.flush().await?;
             *published_root = next_root;
             return Ok(());
@@ -815,6 +877,7 @@ impl MdnCorpus {
         let regular = entry.raw_path_hex.is_none()
             && entry.kind == "blob"
             && matches!(entry.mode.as_str(), "100644" | "100755");
+        diagnostics::phase(Phase::ObjectAccess);
         let bytes = if entry.kind == "blob" {
             git.blob_size(&entry.oid, cancel.clone()).await?
         } else {
@@ -863,7 +926,9 @@ impl MdnCorpus {
                 let body = git
                     .read_blob_known_length(&entry.oid, bytes, 4 * 1024 * 1024, cancel.clone())
                     .await?;
+                diagnostics::phase(Phase::RawRetention);
                 let artifact = self.raw.capture_bytes(body.clone(), cancel.clone()).await?;
+                diagnostics::phase(Phase::Projection);
                 raw = encoded(&artifact)?;
                 raw["relative_path"] =
                     json!(format!("mdn/raw-artifacts/{}", artifact.relative_path));
@@ -1120,7 +1185,9 @@ impl MdnCorpus {
                 }
             }
         }
+        diagnostics::phase(Phase::InventoryApply);
         *root = inventory::update_cached(store, root, &path, Some(member), cache).await?;
+        diagnostics::phase(Phase::EntryPublication);
         buffered.flush().await?;
         *published_root = next_root;
         Ok(())
@@ -1201,6 +1268,8 @@ impl MdnCorpus {
         Ok(())
     }
     async fn flush(&self, cancel: CancellationToken) -> Result<()> {
+        diagnostics::shared();
+        diagnostics::phase(Phase::IndexPublication);
         let pending: Pending = self
             .store
             .mdn_state("pending")
@@ -1220,6 +1289,7 @@ impl MdnCorpus {
         {
             let manifest = checkpoint["manifest"].clone();
             self.index.prewarm(&manifest, cancel.clone()).await?;
+            diagnostics::phase(Phase::IndexCheckpoint);
             self.store.mdn_set_state("index", &manifest).await?;
             self.store
                 .mdn_set_state("index-sequence", &checkpoint["sequence"])
@@ -1236,6 +1306,7 @@ impl MdnCorpus {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         loop {
+            diagnostics::phase(Phase::IndexPublication);
             let mut documents = Vec::new();
             let mut bytes = 0usize;
             let mut end = sequence;
@@ -1270,6 +1341,7 @@ impl MdnCorpus {
                 .index
                 .publish(reference.as_ref(), documents, cancel.clone())
                 .await?;
+            diagnostics::phase(Phase::IndexCheckpoint);
             self.store
                 .mdn_set_state(
                     "index-checkpoint",
@@ -1288,7 +1360,9 @@ impl MdnCorpus {
                 break;
             }
             sequence = end;
+            diagnostics::progress(sequence as u64);
         }
+        diagnostics::phase(Phase::SnapshotPublication);
         let reference = reference.ok_or_else(|| Error::integrity("Missing MDN index manifest."))?;
         for key in &pending.snapshots {
             if self.store.mdn_get("snapshot-keys", key).await?.is_some() {
@@ -1318,6 +1392,8 @@ impl MdnCorpus {
         self.publish_default().await
     }
     async fn publish_default(&self) -> Result<()> {
+        diagnostics::shared();
+        diagnostics::phase(Phase::DefaultPublication);
         let (Some(content), Some(compat)) = (
             self.observation(Repo::Content).await?,
             self.observation(Repo::Compat).await?,
@@ -1346,6 +1422,13 @@ impl MdnCorpus {
             &serde_json::to_vec(&(&c.id, &b.id, &co, &bo, validated_at))
                 .map_err(|_| Error::integrity("Invalid MDN view."))?,
         );
+        let changed = self
+            .store
+            .mdn_state("default-view")
+            .await?
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .as_deref()
+            != Some(id.as_str());
         self.store
             .mdn_publish_view(&View {
                 id,
@@ -1355,14 +1438,34 @@ impl MdnCorpus {
                 compatibility_observation: bo,
                 validated_at,
             })
-            .await
+            .await?;
+        if changed {
+            diagnostics::completed();
+        }
+        Ok(())
     }
     pub async fn process_current(&self, cancel: CancellationToken) -> Result<bool> {
         let _guard = self.processing.lock().await;
+        let result = diagnostics::run_slice(
+            self.store.as_ref(),
+            "diagnostics-current",
+            Box::pin(self.process_current_inner(cancel)),
+        )
+        .await;
+        let status = self.update_status().await;
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => status.map(|()| value),
+        }
+    }
+    async fn process_current_inner(&self, cancel: CancellationToken) -> Result<bool> {
         let mut complete = true;
         for repo in [Repo::Content, Repo::Compat] {
+            diagnostics::input(repo, None, None);
+            diagnostics::phase(Phase::ObservationLookup);
             if let Some(o) = self.observation(repo).await? {
-                if let Some(rev) = o.main_revision {
+                if let Some(rev) = o.main_revision.clone() {
+                    diagnostics::input(repo, Some(&rev), Some(&observation_key(&o)));
                     complete &= self
                         .process_commit(repo, &rev, false, cancel.clone())
                         .await?;
@@ -1373,9 +1476,13 @@ impl MdnCorpus {
         }
         let mut needs_publication = false;
         for repo in [Repo::Content, Repo::Compat] {
+            diagnostics::input(repo, None, None);
+            diagnostics::phase(Phase::ObservationLookup);
             if let Some(o) = self.observation(repo).await?
-                && let Some(rev) = o.main_revision
+                && let Some(rev) = o.main_revision.clone()
             {
+                diagnostics::input(repo, Some(&rev), Some(&observation_key(&o)));
+                diagnostics::phase(Phase::CommitLookup);
                 needs_publication |= self
                     .snapshot(repo, &rev)
                     .await?
@@ -1387,7 +1494,6 @@ impl MdnCorpus {
         } else {
             self.publish_default().await?;
         }
-        self.update_status().await?;
         Ok(complete)
     }
     /// Repair only the already selected source pair during offline maintenance.
@@ -1633,15 +1739,31 @@ impl MdnCorpus {
     }
     pub async fn process_history(&self, cancel: CancellationToken) -> Result<bool> {
         let _guard = self.processing.lock().await;
+        let result = diagnostics::run_slice(
+            self.store.as_ref(),
+            "diagnostics-history",
+            Box::pin(self.process_history_inner(cancel)),
+        )
+        .await;
+        let status = self.update_status().await;
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => status.map(|()| value),
+        }
+    }
+    async fn process_history_inner(&self, cancel: CancellationToken) -> Result<bool> {
         let mut all = true;
         for repo in [Repo::Content, Repo::Compat] {
             // Each source receives a bounded slice even during a large bootstrap.
             let started = tokio::time::Instant::now();
+            diagnostics::input(repo, None, None);
+            diagnostics::phase(Phase::ObservationLookup);
             let Some(latest) = self.observation(repo).await? else {
                 all = false;
                 continue;
             };
             let state_key = format!("{}-history", repo.as_str());
+            diagnostics::phase(Phase::HistoryCheckpoint);
             let mut state: History = self
                 .store
                 .mdn_state(&state_key)
@@ -1669,6 +1791,8 @@ impl MdnCorpus {
             if state.complete {
                 continue;
             }
+            diagnostics::input(repo, None, Some(&observation_key(&state.observation)));
+            diagnostics::phase(Phase::InventoryEnumeration);
             let page = self
                 .git(repo)
                 .commit_page(&state.observation, state.offset, 100, cancel.clone())
@@ -1677,6 +1801,11 @@ impl MdnCorpus {
             // idempotent after cancellation within a commit.
             let mut completed = 0;
             for commit in &page.commits {
+                diagnostics::input(
+                    repo,
+                    Some(&commit.revision),
+                    Some(&observation_key(&state.observation)),
+                );
                 if !self
                     .process_commit(repo, &commit.revision, true, cancel.clone())
                     .await?
@@ -1694,9 +1823,16 @@ impl MdnCorpus {
             }
             state.complete = state.offset >= state.observation.commits.bytes;
             all &= state.complete;
+            diagnostics::phase(Phase::HistoryCheckpoint);
             self.store
                 .mdn_set_state(&state_key, &encoded(&state)?)
                 .await?;
+            if completed > 0 {
+                diagnostics::progress(state.offset);
+                if state.complete {
+                    diagnostics::completed();
+                }
+            }
         }
         let pending: Pending = self
             .store
@@ -1712,7 +1848,6 @@ impl MdnCorpus {
         {
             self.flush(cancel).await?;
         }
-        self.update_status().await?;
         Ok(all)
     }
     async fn update_status(&self) -> Result<()> {
@@ -1723,7 +1858,7 @@ impl MdnCorpus {
                 .mdn_state(&format!("{}-history", repo.as_str()))
                 .await?;
             let observation = self.observation(repo).await?;
-            let history=history.map(|h|json!({"observation":h["observation"]["manifest"]["body_hash"],"processed":h["processed"],"offset":h["offset"],"complete":h["complete"],"total":h["observation"]["total_commits"]}));
+            let history=history.map(|h|json!({"observation":h["observation"]["manifest"]["body_hash"],"processed":h["processed"],"offset":h["offset"],"processed_commits":h["processed"],"offset_bytes":h["offset"],"commit_order_bytes":h["observation"]["commits"]["bytes"],"total_commits":h["observation"]["total_commits"],"complete":h["complete"],"total":h["observation"]["total_commits"]}));
             let main = if let Some(revision) =
                 observation.as_ref().and_then(|o| o.main_revision.as_ref())
             {
@@ -1738,6 +1873,10 @@ impl MdnCorpus {
             .mdn_state("default-view")
             .await?
             .unwrap_or(Value::Null);
+        status["collectors"] = json!({
+            "current": diagnostics::public_summary(self.store.mdn_state("diagnostics-current").await?)?,
+            "history": diagnostics::public_summary(self.store.mdn_state("diagnostics-history").await?)?
+        });
         status["failure"] = self
             .store
             .mdn_state("failure")
