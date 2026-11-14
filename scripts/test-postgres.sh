@@ -37,6 +37,7 @@ cargo test --locked -p devres-adapters --lib crate_snapshot_preparation_receipts
 cargo test --locked -p devres-adapters --lib crate_row_pipeline -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --example migration-benchmark -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test mdn_persistence -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --example mdn-probe -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test whatwg_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test w3c_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test chromium_persistence -- --ignored --test-threads=1

@@ -120,6 +120,20 @@ fn attempt_accounting(root: &Path, live: bool) -> Result<(usize, AttemptObserver
     Ok((initial, observer))
 }
 
+async fn acceptance_storage(
+    root: &Path,
+    blob: &Path,
+    database: &str,
+    live: bool,
+) -> Result<(PgBlobStore, usize, AttemptObserver)> {
+    // Storage bootstrap creates blob metadata even before any source request.
+    // Establish the durable ledger while fresh blobs are still empty, so that
+    // this first-party metadata cannot be mistaken for unaccounted legacy work.
+    let (initial, observer) = attempt_accounting(root, live)?;
+    let store = PgBlobStore::connect(database, blob).await?;
+    Ok((store, initial, observer))
+}
+
 async fn budget(root: &Path) -> Result<()> {
     for path in [
         root.to_path_buf(),
@@ -548,6 +562,53 @@ mod tests {
         assert_eq!(attempt_accounting(root.path(), true).unwrap().0, 20);
         assert!(root.path().join("attempts-conservative").is_file());
     }
+
+    #[tokio::test]
+    #[ignore = "requires disposable DEVRES_TEST_DATABASE_URL PostgreSQL"]
+    async fn fresh_storage_bootstrap_preserves_attempts_before_source_startup_and_resume() {
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        let name = format!("devres_mdn_accounting_{}", std::process::id());
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {name}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path(&format!("/{name}"));
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let blob = root.path().join("blobs");
+        std::fs::create_dir(&blob).unwrap();
+        let (store, initial, observer) = acceptance_storage(root.path(), &blob, url.as_str(), true)
+            .await
+            .unwrap();
+        assert_eq!(initial, 0);
+        assert!(
+            std::fs::read_dir(&blob).unwrap().next().is_some(),
+            "real storage bootstrap must create the metadata that previously consumed the fresh budget"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("attempts")).unwrap(),
+            "0"
+        );
+        assert!(!root.path().join("attempts-conservative").exists());
+        // Simulate interruption after storage initialization, before constructing
+        // any source-capable broker. Resume must use this exact durable ledger.
+        drop(store);
+        drop(observer);
+        let (resumed, observer) = attempt_accounting(root.path(), false).unwrap();
+        assert_eq!(resumed, 0);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("attempts")).unwrap(),
+            "0"
+        );
+        assert!(!root.path().join("attempts-conservative").exists());
+        observer(3).unwrap();
+        observer(2).unwrap();
+        drop(observer);
+        assert_eq!(attempt_accounting(root.path(), false).unwrap().0, 3);
+    }
 }
 async fn verify(store: &dyn MdnStore, root: &Path, cancel: CancellationToken) -> Result<Value> {
     let reference = store
@@ -955,8 +1016,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         stop.cancel();
     });
-    let store = Arc::new(PgBlobStore::connect(&std::env::var("DATABASE_URL")?, &blob).await?);
-    let (initial_attempts, observer) = attempt_accounting(&root, live)?;
+    let (store, initial_attempts, observer) =
+        acceptance_storage(&root, &blob, &std::env::var("DATABASE_URL")?, live).await?;
+    let store = Arc::new(store);
     let broker = Arc::new(
         BulkBroker::new(BulkConfig::default())?
             .with_attempt_budget(20)?
