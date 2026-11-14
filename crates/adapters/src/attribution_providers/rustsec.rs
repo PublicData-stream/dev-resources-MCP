@@ -3,6 +3,10 @@ use super::*;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "rustsec_cluster_tests.rs"]
+mod cluster_tests;
+
 const HEAD: &str = "https://api.github.com/repos/RustSec/advisory-db/commits/main";
 const BUNDLE: &str = "https://codeload.github.com/RustSec/advisory-db/tar.gz/";
 

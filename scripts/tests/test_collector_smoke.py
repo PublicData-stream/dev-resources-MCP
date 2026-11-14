@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import urllib.parse
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
@@ -188,3 +189,40 @@ class CollectorSmokeTests(unittest.TestCase):
         selected[0]['expected'] = 'x' * 65537
         with self.assertRaises(ValueError):
             self.load(selected)
+
+    def test_rustsec_pinned_catalog_resource_and_all_utf8_notices(self):
+        snapshot='blake3:'+'3'*64
+        uri='devres://advisory/rustsec/RUSTSEC-2026-9001/'+snapshot
+        notice_uri='devres://attribution/blake3:'+'4'*64
+        notice_body=('First-party synthetic RustSec fixture notice CC-BY-4.0 GHSA-synthetic-fixture 원문\n'*40)
+        notice='https://fixtures.invalid/original\n'+notice_body
+        class RustsecClient(Client):
+            corrupt=False
+            def tool(self,tool,args,revision):
+                if tool=='packages.crate.advisory_catalog_search':
+                    return {'snapshot':{'id':snapshot},'items':[{'id':'RUSTSEC-2026-9001'}], 'attribution':{'status':'ready','readable_notice':notice}}
+                if tool=='packages.crate.advisory_get':
+                    return {'snapshot':{'id':snapshot},'resource_uri':uri,'page':{'text':'rustsecfixturebody'},
+                            'attribution':{'status':'ready','resource_uris':[notice_uri],'readable_notice':notice,
+                                           'generations':[{'id':notice_uri.rsplit('/',1)[-1],'notices':[{'source_url':'https://fixtures.invalid/original','text':notice_body}]}]}}
+                return super().tool(tool,args,revision)
+            def call(self,method,args,revision):
+                if args.get('uri','').startswith(notice_uri):
+                    parsed=urllib.parse.urlparse(args['uri']);params=urllib.parse.parse_qs(parsed.query)
+                    start=int(params['offset'][0]);end=min(start+int(params['limit'][0]),len(notice.encode()))
+                    while end>start:
+                        try:chunk=notice.encode()[start:end].decode();break
+                        except UnicodeDecodeError:end-=1
+                    if self.corrupt=='text':chunk=chunk.replace('First-party','Wrong-party')
+                    return {'contents':[{'uri':notice_uri,'text':chunk,'_meta':{'offset':start,'total_bytes':len(notice.encode())+(1 if self.corrupt=='total' else 0),
+                            'attribution':{'policy_epoch':1,'id':'wrong' if self.corrupt=='id' else notice_uri.rsplit('/',1)[-1]},'next_offset':0 if self.corrupt is True else end if end<len(notice.encode()) else None}}]}
+                if args.get('uri')==uri:
+                    return {'contents':[{'text':'rustsecfixturebody','_meta':{'attribution':{'status':'ready'},'source_evidence':{'snapshot':{'id':snapshot}}}}, {'text':notice}]}
+                return super().call(method,args,revision)
+        selected=receipts()+[dict(provider='rustsec',tool='packages.crate.advisory_get',arguments={'snapshot':snapshot,'id':'RUSTSEC-2026-9001'},resource=uri,expected='rustsecfixturebody')]
+        smoke.verify(RustsecClient(),self.load(selected))
+        for failure in (True,'id','total','text'):
+            broken=RustsecClient();broken.corrupt=failure
+            with self.subTest(failure=failure),self.assertRaises(AssertionError):smoke.verify(broken,selected)
+        wrong=copy.deepcopy(selected);wrong[-1]['arguments']['id']='RUSTSEC-2026-9002'
+        with self.assertRaises(ValueError):self.load(wrong)

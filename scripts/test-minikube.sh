@@ -23,7 +23,7 @@ if (( s3 && live )); then echo '--s3 is an isolated fixture scenario and does no
 if (( credential_broker && ! s3 )); then echo '--credential-broker requires --s3' >&2; exit 2; fi
 # Canonical synthetic RFC captures must never satisfy later live-provider probes.
 collector_providers=(w3c chromium)
-if (( ! live )); then collector_providers+=(rfc); fi
+if (( ! live )); then collector_providers+=(rfc rustsec); fi
 if [[ ${DEVRES_TMP_STATE:-} != 1 ]]; then
   docker_endpoint=${DEVRES_DOCKER_HOST:-${DOCKER_HOST:-}}
   if [[ -z $docker_endpoint ]]; then
@@ -474,6 +474,12 @@ attribution_readback() {
     < "$scratch/attribution-backlog-receipt.json"
   k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
     attribution_backlog_cluster_readback
+  if [[ -f $scratch/rustsec-collector.json ]]; then
+    k exec -i storage-maintenance -- sh -c 'cat > /tmp/rustsec-collector-receipt.json' \
+      < "$scratch/rustsec-collector.json"
+    k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
+      rustsec_collector_cluster_readback
+  fi
 }
 s3_capture_state() {
   k exec -i deployment/backend -- python3 - "$capture" "$1" <<'PYS3CAPTURE'
@@ -577,11 +583,15 @@ for provider in "${collector_providers[@]}"; do
   k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 "${provider}_collector_cluster_seed"
   k exec storage-maintenance -- cat "/tmp/${provider}-collector-receipt.json" > "$scratch/$provider-collector.json"
 done
+if (( ! live )); then
+  k exec storage-maintenance -- devres-collector-tests --ignored --test-threads=1 \
+    rustsec_collector_cluster_readback
+fi
 python3 - "$scratch" "${collector_providers[@]}" <<'PYCOLLECTOR'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 providers = tuple(sys.argv[2:])
-assert providers in (('w3c', 'chromium'), ('w3c', 'chromium', 'rfc')), 'unexpected fixture provider selection'
+assert providers in (('w3c', 'chromium'), ('w3c', 'chromium', 'rfc', 'rustsec')), 'unexpected fixture provider selection'
 receipts = []
 for provider in providers:
     with (root / (provider + '-collector.json')).open('rb') as source:

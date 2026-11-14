@@ -1238,6 +1238,46 @@ async fn main() -> Result<(), ServerError> {
                 {
                     return Err("RFC historical body or notice bytes changed".into());
                 }
+            } else if receipt.provider == "rustsec" {
+                if detail["snapshot"]["id"] != receipt.arguments["snapshot"]
+                    || detail["resource_uri"] != receipt.resource
+                    || detail["attribution"]["status"] != "ready"
+                    || !detail["page"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&receipt.expected))
+                {
+                    return Err("RustSec pinned advisory or attribution changed".into());
+                }
+                let catalog = tool_exchange(
+                    &mut send,
+                    &mut reader,
+                    &budget,
+                    revision,
+                    id + 2,
+                    "packages.crate.advisory_catalog_search",
+                    json!({"snapshot":receipt.arguments["snapshot"],"limit":1}),
+                )
+                .await?;
+                if catalog["snapshot"]["id"] != receipt.arguments["snapshot"]
+                    || catalog["attribution"]["status"] != "ready"
+                    || !catalog["attribution"]["readable_notice"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty())
+                    || catalog["items"].as_array().is_none_or(|items| {
+                        items.len() != 1 || items[0]["id"] != receipt.arguments["id"]
+                    })
+                {
+                    return Err("RustSec pinned catalog membership changed".into());
+                }
+                rustsec_notice_resources(
+                    &mut send,
+                    &mut reader,
+                    &budget,
+                    revision,
+                    &detail["attribution"],
+                    10000 + offset as u64 * 1000,
+                )
+                .await?;
             } else if detail["selection"]["snapshot"] != receipt.arguments["snapshot"]
                 || !detail["page"]["text"]
                     .as_str()
@@ -1277,6 +1317,22 @@ async fn main() -> Result<(), ServerError> {
                     return Err(
                         "RFC resource bytes, capture evidence or qualified license changed".into(),
                     );
+                }
+            } else if receipt.provider == "rustsec" {
+                if contents.is_empty()
+                    || !contents[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&receipt.expected))
+                    || contents[0]["_meta"]["attribution"]["status"] != "ready"
+                    || contents[0]["_meta"]["source_evidence"]["snapshot"]["id"]
+                        != receipt.arguments["snapshot"]
+                    || !contents.iter().skip(1).any(|item| {
+                        item["text"]
+                            .as_str()
+                            .is_some_and(|text| !text.trim().is_empty())
+                    })
+                {
+                    return Err("RustSec resource content or qualification changed".into());
                 }
             } else if !contents.iter().skip(1).any(|item| {
                 item["text"]
@@ -1324,6 +1380,150 @@ fn rfc_resource_matches(contents: &[Value], capture: &str) -> bool {
         })
 }
 
+async fn rustsec_notice_resources(
+    send: &mut wtransport::SendStream,
+    reader: &mut FrameReader<wtransport::RecvStream>,
+    budget: &Arc<Semaphore>,
+    revision: &str,
+    attribution: &Value,
+    mut id: u64,
+) -> Result<(), ServerError> {
+    let uris = attribution["resource_uris"]
+        .as_array()
+        .filter(|uris| !uris.is_empty() && uris.len() <= 8)
+        .ok_or("RustSec notice resources missing")?;
+    let mut seen = std::collections::BTreeSet::new();
+    let expected = rustsec_expected_notices(attribution)?;
+    if expected.len() != uris.len() {
+        return Err("Notice generation membership changed".into());
+    }
+    let mut combined = String::new();
+    for uri in uris {
+        let uri = uri
+            .as_str()
+            .filter(|uri| {
+                uri.strip_prefix("devres://attribution/")
+                    .is_some_and(devres_domain::valid_content_id)
+            })
+            .ok_or("Invalid notice resource")?;
+        if !seen.insert(uri) {
+            return Err("Duplicate notice resource".into());
+        }
+        let original = expected.get(uri).ok_or("Notice generation changed")?;
+        let start = combined.len();
+        let mut offset = 0usize;
+        let mut complete = false;
+        for _ in 0..64 {
+            let mut params = json!({"uri":format!("{uri}?offset={offset}&limit=1024")});
+            if revision == "2026-07-28" {
+                params["_meta"] = metadata(revision);
+            }
+            let response = exchange(
+                send,
+                reader,
+                budget,
+                json!({"jsonrpc":"2.0","id":id,"method":"resources/read","params":params}),
+            )
+            .await?;
+            id += 1;
+            let contents = response["result"]["contents"]
+                .as_array()
+                .filter(|contents| contents.len() == 1)
+                .ok_or("Notice page missing")?;
+            let text = contents[0]["text"].as_str().ok_or("Notice text missing")?;
+            let meta = &contents[0]["_meta"];
+            let end = offset
+                .checked_add(text.len())
+                .ok_or("Notice offset overflow")?;
+            let total = meta["total_bytes"].as_u64().ok_or("Notice size missing")?;
+            if meta["offset"].as_u64() != Some(offset as u64)
+                || contents[0]["uri"] != uri
+                || meta["attribution"]["id"]
+                    != uri.rsplit('/').next().ok_or("Notice generation missing")?
+                || total != original.len() as u64
+                || end as u64 > total
+                || meta["attribution"]["policy_epoch"] != 1
+                || combined.len() + text.len() > 512 * 1024
+            {
+                return Err("Notice identity or byte bound changed".into());
+            }
+            combined.push_str(text);
+            if meta["next_offset"].is_null() {
+                if end as u64 != total {
+                    return Err("Notice truncated".into());
+                }
+                complete = true;
+                break;
+            }
+            if meta["next_offset"].as_u64() != Some(end as u64) || end <= offset {
+                return Err("Notice pagination failed".into());
+            }
+            offset = end;
+        }
+        if !complete {
+            return Err("Notice pages exceeded fixture bound".into());
+        }
+        if &combined[start..] != original {
+            return Err("Original notice bytes changed".into());
+        }
+    }
+    if [
+        "First-party synthetic RustSec fixture notice",
+        "CC-BY-4.0",
+        "GHSA-synthetic-fixture",
+        "원문",
+    ]
+    .iter()
+    .any(|required| !combined.contains(required))
+    {
+        return Err("Original RustSec fixture terms missing".into());
+    }
+    Ok(())
+}
+
+fn rustsec_expected_notices(
+    attribution: &Value,
+) -> Result<std::collections::BTreeMap<String, String>, ServerError> {
+    let generations = attribution["generations"]
+        .as_array()
+        .filter(|generations| !generations.is_empty() && generations.len() <= 8)
+        .ok_or("Notice generations missing")?;
+    let mut expected = std::collections::BTreeMap::new();
+    for generation in generations {
+        let id = generation["id"]
+            .as_str()
+            .filter(|id| devres_domain::valid_content_id(id))
+            .ok_or("Invalid notice generation")?;
+        let notices = generation["notices"]
+            .as_array()
+            .filter(|notices| !notices.is_empty() && notices.len() <= 128)
+            .ok_or("Original notices missing")?;
+        let mut entries = Vec::new();
+        for notice in notices {
+            let entry = format!(
+                "{}\n{}",
+                notice["source_url"]
+                    .as_str()
+                    .ok_or("Notice source missing")?,
+                notice["text"].as_str().ok_or("Notice text missing")?
+            );
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+        let text = entries.join("\n\n");
+        if text.is_empty()
+            || text.len() > 65536
+            || expected
+                .insert(format!("devres://attribution/{id}"), text)
+                .is_some()
+        {
+            return Err("Notice fixture bound or identity invalid".into());
+        }
+    }
+    Ok(expected)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CollectorReceipt {
@@ -1338,17 +1538,30 @@ fn collector_receipts(raw: &[u8]) -> Result<Vec<CollectorReceipt>, ServerError> 
         return Err("Collector receipts exceed bound".into());
     }
     let receipts: Vec<CollectorReceipt> = serde_json::from_slice(raw)?;
-    if !(2..=3).contains(&receipts.len())
+    if !(2..=4).contains(&receipts.len())
         || !["w3c", "chromium"]
             .iter()
             .all(|provider| receipts.iter().filter(|r| r.provider == *provider).count() == 1)
-        || (receipts.len() == 3 && receipts.iter().filter(|r| r.provider == "rfc").count() != 1)
+        || receipts.iter().any(|receipt| {
+            !matches!(
+                receipt.provider.as_str(),
+                "w3c" | "chromium" | "rfc" | "rustsec"
+            ) || receipts
+                .iter()
+                .filter(|other| other.provider == receipt.provider)
+                .count()
+                != 1
+        })
     {
-        return Err("Distinct W3C/Chromium fixtures and optional RFC fixture required".into());
+        return Err(
+            "Distinct W3C/Chromium fixtures and optional RFC/RustSec fixtures required".into(),
+        );
     }
     for receipt in &receipts {
         let expected_tool = if receipt.provider == "rfc" {
             "rfc.fulltext_search".to_owned()
+        } else if receipt.provider == "rustsec" {
+            "packages.crate.advisory_get".to_owned()
         } else {
             format!("{}.get", receipt.provider)
         };
@@ -1358,7 +1571,11 @@ fn collector_receipts(raw: &[u8]) -> Result<Vec<CollectorReceipt>, ServerError> 
                 .is_some_and(devres_domain::valid_content_id)
             || !receipt
                 .resource
-                .starts_with(&format!("devres://{}/", receipt.provider))
+                .starts_with(&if receipt.provider == "rustsec" {
+                    "devres://advisory/rustsec/".into()
+                } else {
+                    format!("devres://{}/", receipt.provider)
+                })
             || receipt.resource.len() > 8192
             || receipt.expected.is_empty()
             || receipt.expected.len() > 256
@@ -1373,6 +1590,18 @@ fn collector_receipts(raw: &[u8]) -> Result<Vec<CollectorReceipt>, ServerError> 
                     .is_some_and(devres_domain::valid_content_id))
         {
             return Err("Invalid retained RFC fixture selection".into());
+        }
+        if receipt.provider == "rustsec"
+            && (receipt.arguments["id"] != "RUSTSEC-2026-9001"
+                || receipt.resource
+                    != format!(
+                        "devres://advisory/rustsec/RUSTSEC-2026-9001/{}",
+                        receipt.arguments["snapshot"]
+                            .as_str()
+                            .ok_or("Invalid RustSec fixture snapshot")?
+                    ))
+        {
+            return Err("Invalid RustSec fixture selection".into());
         }
     }
     Ok(receipts)
@@ -1483,10 +1712,32 @@ async fn exchange_response(
 mod diagnostic_tests {
     use super::*;
     #[test]
+    fn rustsec_notice_expectations_preserve_exact_order_and_generation_identity() {
+        let id = format!("blake3:{}", "a".repeat(64));
+        let first = json!({"source_url":"https://fixtures.invalid/a","text":"원문\r\n"});
+        let second = json!({"source_url":"https://fixtures.invalid/b","text":"Original terms"});
+        let generation = json!({"id":id,"notices":[first.clone(),first,second]});
+        let expected =
+            rustsec_expected_notices(&json!({"generations":[generation.clone()]})).unwrap();
+        assert_eq!(
+            expected[&format!("devres://attribution/{id}")],
+            "https://fixtures.invalid/a\n원문\r\n\n\nhttps://fixtures.invalid/b\nOriginal terms"
+        );
+        assert!(
+            rustsec_expected_notices(&json!({"generations":[generation.clone(),generation]}))
+                .is_err()
+        );
+        assert!(
+            rustsec_expected_notices(&json!({"generations":[{"id":id,"notices":[]}]})).is_err()
+        );
+    }
+    #[test]
     fn collector_receipts_require_distinct_pinned_provider_selections() {
-        let rows = ["w3c", "chromium", "rfc"].map(|provider| {
+        let rows = ["w3c", "chromium", "rfc", "rustsec"].map(|provider| {
             if provider == "rfc" {
                 json!({"provider":provider,"tool":"rfc.fulltext_search","arguments":{"snapshot":format!("blake3:{}","1".repeat(64)),"query":"fixturetransport"},"resource":format!("devres://rfc/9000/txt/blake3:{}","2".repeat(64)),"expected":"synthetic"})
+            } else if provider=="rustsec" {
+                json!({"provider":provider,"tool":"packages.crate.advisory_get","arguments":{"snapshot":format!("blake3:{}","1".repeat(64)),"id":"RUSTSEC-2026-9001"},"resource":format!("devres://advisory/rustsec/RUSTSEC-2026-9001/blake3:{}","1".repeat(64)),"expected":"synthetic"})
             } else {
                 json!({"provider":provider,"tool":format!("{provider}.get"),"arguments":{"snapshot":format!("blake3:{}","1".repeat(64))},"resource":format!("devres://{provider}/fixture"),"expected":"synthetic"})
             }

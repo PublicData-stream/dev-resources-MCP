@@ -15,18 +15,19 @@ def load_receipts(path):
     if len(raw) > 65536:
         raise ValueError('collector receipts exceed bound')
     receipts = json.loads(raw)
-    if not isinstance(receipts, list) or len(receipts) not in (2, 3):
-        raise ValueError('two or three fixture receipts required')
+    if not isinstance(receipts, list) or not 2 <= len(receipts) <= 4:
+        raise ValueError('two to four fixture receipts required')
     providers = {r.get('provider') for r in receipts if isinstance(r, dict)}
-    expected_providers = {'w3c', 'chromium'} if len(receipts) == 2 else {'w3c', 'chromium', 'rfc'}
-    if providers != expected_providers:
+    if (not {'w3c', 'chromium'} <= providers or not providers <= {'w3c', 'chromium', 'rfc', 'rustsec'}
+            or len(providers) != len(receipts)):
         raise ValueError('unexpected collector fixture providers')
     for receipt in receipts:
         if set(receipt) != {'provider', 'tool', 'arguments', 'resource', 'expected'}:
             raise ValueError('invalid collector receipt fields')
         provider = receipt['provider']
         args = receipt['arguments']
-        expected_tool = 'rfc.fulltext_search' if provider == 'rfc' else provider + '.get'
+        expected_tool = ('rfc.fulltext_search' if provider == 'rfc' else
+                         'packages.crate.advisory_get' if provider == 'rustsec' else provider + '.get')
         if receipt['tool'] != expected_tool or not isinstance(args, dict):
             raise ValueError('unexpected collector fixture tool')
         snapshot = args.get('snapshot', '')
@@ -34,7 +35,8 @@ def load_receipts(path):
         if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
             raise ValueError('capture-fixed collector snapshot required')
         resource = receipt['resource']
-        if not isinstance(resource, str) or not resource.startswith('devres://' + provider + '/') or len(resource) > 8192:
+        prefix = 'devres://advisory/rustsec/' if provider == 'rustsec' else 'devres://' + provider + '/'
+        if not isinstance(resource, str) or not resource.startswith(prefix) or len(resource) > 8192:
             raise ValueError('unexpected collector fixture resource')
         if provider == 'rfc':
             prefix = 'devres://rfc/9000/txt/'
@@ -42,6 +44,9 @@ def load_receipts(path):
             if (args.get('query') != 'fixturetransport' or not resource.startswith(prefix)
                     or len(capture) != 64 or any(c not in '0123456789abcdef' for c in capture)):
                 raise ValueError('invalid retained RFC fixture selection')
+        if provider == 'rustsec' and (args.get('id') != 'RUSTSEC-2026-9001'
+                or resource != 'devres://advisory/rustsec/' + args['id'] + '/' + snapshot):
+            raise ValueError('invalid RustSec fixture selection')
         expected = receipt['expected']
         if not isinstance(expected, str) or not 1 <= len(expected) <= 256:
             raise ValueError('invalid collector content token')
@@ -58,6 +63,17 @@ def verify(client, receipts):
             detail = client.tool(receipt['tool'], receipt['arguments'], revision)
             if receipt['provider'] == 'rfc':
                 verify_rfc(client, receipt, detail, revision)
+            elif receipt['provider'] == 'rustsec':
+                assert detail.get('snapshot', {}).get('id') == receipt['arguments']['snapshot'], 'RustSec snapshot changed'
+                assert detail.get('resource_uri') == receipt['resource'], 'RustSec resource changed'
+                assert receipt['expected'] in detail.get('page', {}).get('text', ''), 'RustSec source changed'
+                assert detail.get('attribution', {}).get('status') == 'ready', 'RustSec attribution unqualified'
+                catalog = client.tool('packages.crate.advisory_catalog_search',
+                                      {'snapshot': receipt['arguments']['snapshot'], 'limit': 1}, revision)
+                assert catalog.get('snapshot', {}).get('id') == receipt['arguments']['snapshot'], 'RustSec catalog snapshot changed'
+                assert [row.get('id') for row in catalog.get('items', [])] == [receipt['arguments']['id']], 'RustSec catalog membership changed'
+                assert catalog.get('attribution', {}).get('status') == 'ready' and catalog['attribution'].get('readable_notice'), 'RustSec catalog attribution missing'
+                verify_rustsec_notices(client, detail['attribution'], revision)
             else:
                 assert receipt['expected'] in detail.get('page', {}).get('text', ''), 'collector tool content changed'
                 assert detail.get('selection', {}).get('snapshot') == receipt['arguments']['snapshot'], 'collector snapshot changed'
@@ -78,10 +94,63 @@ def verify(client, receipts):
                 for generation in generations:
                     notices = generation.get('notices', [])
                     assert notices and all(notice.get('license') == 'AGPL-3.0-only' for notice in notices), 'RFC resource fixture license missing'
+            elif receipt['provider'] == 'rustsec':
+                assert contents[0].get('_meta', {}).get('attribution', {}).get('status') == 'ready', 'RustSec resource unqualified'
+                evidence = contents[0].get('_meta', {}).get('source_evidence', {})
+                assert evidence.get('snapshot', {}).get('id') == receipt['arguments']['snapshot'], 'RustSec resource snapshot changed'
             else:
                 assert contents[0].get('_meta', {}).get('license'), 'collector resource license missing'
             assert any(isinstance(item.get('text'), str) and item['text'].strip()
                        for item in contents[1:]), 'collector resource readable attribution missing'
+
+
+def verify_rustsec_notices(client, attribution, revision):
+    uris = attribution.get('resource_uris', [])
+    assert isinstance(uris, list) and 1 <= len(uris) <= 8 and len(set(uris)) == len(uris), 'RustSec notice resources missing'
+    generations = attribution.get('generations', [])
+    assert isinstance(generations, list) and len(generations) == len(uris), 'notice generations missing'
+    expected = {}
+    for generation in generations:
+        entries = []
+        for notice in generation.get('notices', []):
+            assert isinstance(notice.get('source_url'), str) and isinstance(notice.get('text'), str), 'invalid original notice'
+            entry = notice['source_url'] + '\n' + notice['text']
+            if entry not in entries:
+                entries.append(entry)
+        text = '\n\n'.join(entries)
+        uri = 'devres://attribution/' + generation.get('id', '')
+        assert text and len(text.encode()) <= 65536 and uri not in expected, 'invalid notice generation'
+        expected[uri] = text
+    assert set(expected) == set(uris), 'notice generation identity mismatch'
+    combined = []
+    for uri in uris:
+        assert isinstance(uri, str) and uri.startswith('devres://attribution/blake3:') and len(uri) <= 128, 'invalid notice resource'
+        offset, text = 0, []
+        for _ in range(64):
+            result = client.call('resources/read', {'uri': uri + '?offset=' + str(offset) + '&limit=1024'}, revision)
+            page = result.get('contents', [])
+            assert len(page) == 1 and isinstance(page[0].get('text'), str), 'notice page missing'
+            metadata = page[0].get('_meta', {})
+            chunk = page[0]['text']
+            end = offset + len(chunk.encode('utf-8'))
+            assert page[0].get('uri') == uri and metadata.get('attribution', {}).get('id') == uri.rsplit('/', 1)[-1], 'notice generation changed'
+            assert metadata.get('offset') == offset and metadata.get('total_bytes') == len(expected[uri].encode()) and end <= metadata['total_bytes'], 'notice byte offset changed'
+            assert metadata.get('attribution', {}).get('policy_epoch') == 1, 'notice policy changed'
+            text.append(chunk)
+            next_offset = metadata.get('next_offset')
+            if next_offset is None:
+                assert end == metadata['total_bytes'], 'notice truncated'
+                break
+            assert isinstance(next_offset, int) and next_offset == end and next_offset > offset, 'notice pagination failed'
+            offset = next_offset
+        else:
+            raise AssertionError('notice pagination exceeded fixture bound')
+        text = ''.join(text)
+        assert text == expected[uri], 'original notice bytes changed'
+        combined.append(text)
+    text = '\n'.join(combined)
+    for required in ('First-party synthetic RustSec fixture notice', 'CC-BY-4.0', 'GHSA-synthetic-fixture', '원문'):
+        assert required in text, 'original RustSec fixture notice or terms missing'
 
 
 def verify_rfc(client, receipt, pinned, revision):

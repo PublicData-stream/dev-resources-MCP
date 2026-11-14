@@ -51,7 +51,10 @@ cargo test --locked -p devres-adapters --lib storage::acceptance -- --ignored --
 cargo test --locked -p devres-adapters --lib storage::wikipedia_storage -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::reader -- --ignored --skip s3_ --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::collection_diagnostics -- --ignored --skip s3_ --test-threads=1
+cargo test --locked -p devres-adapters --lib rustsec_current_atomic_publication_and_reconciliation -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::visibility -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib attribution_storage -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --example staging-attribution-qualify -- --ignored --test-threads=1
+BLOB_DIR="$scratch/rustsec-blobs" cargo test --locked -p devres-adapters --lib rustsec_collector_cluster_seed -- --ignored --test-threads=1
+BLOB_DIR="$scratch/rustsec-blobs" cargo test --locked -p devres-adapters --lib rustsec_collector_cluster_readback -- --ignored --test-threads=1
 echo 'Real PostgreSQL persistence checks passed'
