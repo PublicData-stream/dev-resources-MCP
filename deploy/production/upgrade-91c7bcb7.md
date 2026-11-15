@@ -82,3 +82,29 @@ part of this operation.
 If required activation checks fail, stop backend/writer and retain all checkpoint,
 new-history and failure evidence. Automatic data restore or old-image swap is not
 offered. Reconcile failures before a reviewed forward recovery or explicit restore.
+
+## One instrumented diagnostic continuation
+
+For the exact known withdrawn state following the first late public HTTP failure,
+`resume_91c7bcb7.py` offers one separately reviewed `resume-v1` continuation.
+This does not identify or claim to fix the lost failure cause. It requires the
+exact withdrawn-state digest, unchanged original source pins, guarded PostgreSQL
+and archive/policy/authority identity, no application Pods or writer owner, and
+fresh external admission bound to a root-private preflight and preserved failure
+artifacts. Old state, sources, receipts and consumed intents remain retained.
+
+The helper uses new writer/reader start and withdrawal intents. It changes no
+image, configuration, source budget, queue, PostgreSQL process or storage binding.
+Unknown partial starts are fenced with the new withdrawal path; the old consumed
+withdrawal intents are never replayed. A later acceptance failure can use the
+same new helper's emergency withdrawal, bound to its admitted history and current
+state digest, without pretending that its old admission is fresh activation.
+
+`resume-v1-runner.py` hashes the reviewed continuation sources, retains each
+child's bounded stdout/stderr and stage result, and repeats full early negatives,
+private/public transport/codec checks, a fresh 32-sample observation and late
+acceptance for the new processes. `resume-v1-public-matrix.py` records only fixed
+method/tool, address family, revision, stage and finite outcome metadata; it never
+records arguments, payloads, headers or exception messages in its exchange ledger.
+The versioned aggregator binds these ledgers and uses separate final receipts.
+A second failed continuation remains withdrawn for further reviewed work.
