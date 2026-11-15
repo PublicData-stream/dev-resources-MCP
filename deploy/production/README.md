@@ -27,7 +27,9 @@ records the prior `0.1.0-build.65236494` runtime with schema 15 preserved. The
 `0.1.0-build.33f3c730`, preserved checkpoints and cache generations, nine existing
 source settings, and the separately approved MCP SSE compression transition.
 The [same-schema 91c7bcb7 successor](upgrade-91c7bcb7.md) documents the next
-guarded deployment and checkpoint procedure.
+guarded deployment and checkpoint procedure. Its [2026-11-15 execution record](upgrade-91c7bcb7-evidence.md)
+records two failed late acceptance attempts and the preserved withdrawn state;
+`91c7bcb7` is not accepted as a running production deployment.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
