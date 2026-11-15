@@ -30,6 +30,9 @@ The [same-schema 91c7bcb7 successor](upgrade-91c7bcb7.md) documents the next
 guarded deployment and checkpoint procedure. Its [2026-11-15 execution record](upgrade-91c7bcb7-evidence.md)
 records two failed late acceptance attempts and the preserved withdrawn state;
 `91c7bcb7` is not accepted as a running production deployment.
+The [schema-19 successor](upgrade-1d76fbcc.md) adds fresh checkpoint and guarded
+automatic fallback without replaying either failed attempt. Its actual execution
+result is recorded separately from preparation.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
