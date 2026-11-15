@@ -710,6 +710,57 @@ fn qualified(row: &PgRow) -> Result<QualifiedAttribution> {
     qualified_for_registry(row, ATTRIBUTION_POLICY_MANIFESTS)
 }
 
+/// Private inspection only. The caller size-admits rows before loading them.
+/// Reuse the serving validators without acquiring a claim or returning evidence.
+pub(super) struct DiagnosticTarget {
+    pub summary: Value,
+    pub generation_id: Option<String>,
+    subject: AttributionSubject,
+    epoch: u32,
+}
+pub(super) fn diagnostic_target(row: &PgRow, now: i64) -> Result<DiagnosticTarget> {
+    let value = state(row)?;
+    let policy = ATTRIBUTION_POLICY_MANIFESTS
+        .iter()
+        .find(|policy| policy.epoch == value.policy_epoch)
+        .ok_or_else(invalid)?;
+    let running = value.status == "running";
+    let summary = json!({
+        "target_id":row.try_get::<String,_>("id").map_err(|_|invalid())?,
+        "subject":value.target.subject,"policy_epoch":value.policy_epoch,
+        "policy_fingerprint":policy.fingerprint,"status":value.status,
+        "priority":value.priority,"attempts":value.attempts,"queued_at":value.queued_at,
+        "retry_at":value.retry_at,"retry_eligible":matches!(value.status.as_str(),"pending"|"retry") && value.retry_at<=now,
+        "claim_present":value.claim.is_some(),"lease_expires_at":running.then_some(value.retry_at),
+        "lease_expired":running.then_some(value.retry_at<=now),
+        "failure":value.failure.as_deref().map(devres_application::collection::safe_code),
+        "classification":value.classification,"state_seal":"verified",
+        "current_policy":value.policy_epoch==ATTRIBUTION_POLICY_EPOCH,
+        "stored_generation":value.generation,"generation":null,
+        "public_readiness":"not_checked","retained_origin_traversal":"not_checked",
+        "reusable_generation_lookup":"not_checked"
+    });
+    Ok(DiagnosticTarget {
+        summary,
+        generation_id: value.generation,
+        subject: value.target.subject,
+        epoch: value.policy_epoch,
+    })
+}
+pub(super) fn diagnostic_generation(row: &PgRow, target: &DiagnosticTarget) -> Result<Value> {
+    let value = qualified(row)?;
+    let exact = target.generation_id.as_deref() == Some(value.id.as_str())
+        && value.generation.subject == target.subject
+        && value.generation.policy_epoch == target.epoch;
+    let current = exact
+        && value.generation.policy_epoch == ATTRIBUTION_POLICY_EPOCH
+        && value.generation.policy_fingerprint == ATTRIBUTION_POLICY_FINGERPRINT;
+    Ok(
+        json!({"id":value.id,"sealed_evidence":"verified","exact_subject_policy":exact,
+        "matches_current_generation_contract":current,"notices":value.generation.notices.len(),"receipts":value.generation.receipts.len()}),
+    )
+}
+
 #[async_trait]
 impl AttributionStore for PgBlobStore {
     async fn attribution_verify_target(&self, target: &AttributionTarget) -> Result<()> {

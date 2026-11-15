@@ -248,6 +248,26 @@ not accept `--latest-failure` or `--scan-retained-dump`. HTTPS TXT keys use
 `rfc:text:NUMBER`; other formats use `rfc:format:NUMBER:FORMAT`; rsync jobs retain
 `rfc:rsync:NUMBER:FORMAT`. These are separate job identities, not distinct RFCs.
 
+An optional `--attribution-target blake3:TARGET_HEX` selects one exact RFC repair
+target alongside the required snapshot and jobs. It does not select a recovery
+operation. Target/generation payloads are size-admitted and verified before their
+bounded summary is returned. State, attempts, retry eligibility, classification,
+claim presence/expiry and exact stored-generation contract matching are distinct
+observations. A claim token does not expose a reversible worker identity; neither
+raw tokens nor notice/source bodies enter the report. Unknown historical failure
+metadata remains unknown.
+
+Selected representation references include their retained capture and body
+identities and binding metadata. The selected snapshot's representation and the
+job's current capture/head are reported separately when they differ. These
+references do not establish that body bytes are currently readable, and a current
+job capture never replaces the selected historical representation. Generation
+contract matching similarly requires exact subject, fingerprint, registered policy,
+notices and receipts; a ready row or nonzero counts alone are not proof. Public
+read readiness, retained-origin traversal and reusable-generation lookup remain
+explicitly `not_checked`; inspection does not search the generation table by
+unindexed subject fields.
+
 The report checks selected job identity and closed failure metadata, the sealed
 snapshot payload, bounded manifest shape, and, for S3, committed SQL bindings
 against independent remote binding descriptors. It reads the manifest object,

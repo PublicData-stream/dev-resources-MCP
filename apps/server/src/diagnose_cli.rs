@@ -190,6 +190,12 @@ mod tests {
         }
         args.extend(["--job-key".into(), "rfc:format:9000:xml".into()]);
         assert!(parse(&args).is_ok());
+        let target = format!("blake3:{}", "2".repeat(64));
+        args.extend(["--attribution-target".into(), target.clone()]);
+        assert_eq!(
+            parse(&args).unwrap().options.attribution_target,
+            Some(target)
+        );
         args.extend(["--job-key".into(), "rfc:text:9001".into()]);
         assert!(parse(&args).is_err());
         assert!(parse(&arguments(&["--job-key", "rfc:text:9000"])).is_err());

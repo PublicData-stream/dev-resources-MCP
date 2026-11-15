@@ -73,13 +73,19 @@ impl DiagnosisOptions {
                 .commit
                 .as_deref()
                 .is_some_and(|value| !rustsec_diagnostics::valid_oid(value))
-                || self.attribution_target.as_deref().is_some_and(|value| {
-                    !value.starts_with("blake3:") || !integrity::valid_hash(value)
-                })
             {
                 return Err(invalid());
             }
-        } else if self.commit.is_some() || self.attribution_target.is_some() {
+        } else if self.commit.is_some() {
+            return Err(invalid());
+        }
+        if self.attribution_target.as_deref().is_some_and(|value| {
+            !matches!(
+                self.provider,
+                DiagnosisProvider::Rustsec | DiagnosisProvider::Rfc
+            ) || !value.starts_with("blake3:")
+                || !integrity::valid_hash(value)
+        }) {
             return Err(invalid());
         }
         if self.provider == DiagnosisProvider::Rfc {
@@ -247,6 +253,7 @@ impl Budget {
 struct Reader {
     conn: PgConnection,
     root: PathBuf,
+    archive_epoch: i64,
     remote: Option<S3Archive>,
     budget: Budget,
     bodies: BTreeMap<String, Vec<u8>>,
@@ -285,9 +292,13 @@ impl Reader {
         if !matches!(schema, 14..=18) {
             return Err(unavailable());
         }
-        let row = sqlx_core::query::query("SELECT backend,binding,store_id FROM devres_archive_control WHERE singleton AND pending_binding IS NULL AND NOT initializing_s3")
+        let row = sqlx_core::query::query("SELECT backend,binding,store_id,epoch FROM devres_archive_control WHERE singleton AND pending_binding IS NULL AND NOT initializing_s3")
             .fetch_one(&mut conn).await.map_err(|_| unavailable())?;
         let backend: String = row.try_get("backend").map_err(|_| failed())?;
+        let archive_epoch: i64 = row.try_get("epoch").map_err(|_| failed())?;
+        if archive_epoch <= 0 {
+            return Err(failed());
+        }
         let mut budget = Budget {
             remaining: options.max_total_bytes,
             read: 0,
@@ -323,6 +334,7 @@ impl Reader {
             Self {
                 conn,
                 root: root.to_path_buf(),
+                archive_epoch,
                 remote,
                 budget,
                 bodies: BTreeMap::new(),
