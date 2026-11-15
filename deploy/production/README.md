@@ -26,6 +26,8 @@ records the prior `0.1.0-build.65236494` runtime with schema 15 preserved. The
 [2026-11-14 schema-18 update](upgrade-33f3c730-evidence.md) records release
 `0.1.0-build.33f3c730`, preserved checkpoints and cache generations, nine existing
 source settings, and the separately approved MCP SSE compression transition.
+The [same-schema 91c7bcb7 successor](upgrade-91c7bcb7.md) documents the next
+guarded deployment and checkpoint procedure.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
