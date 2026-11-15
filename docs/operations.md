@@ -144,6 +144,12 @@ The [npm module](npm.md) adds schema 9, public catalog/advisory acquisition and
 local npm/pnpm/Yarn assessment. Include npm evidence and search data in coordinated
 backups. Private maintenance uses `devres-server rebuild-npm-index CONFIG.toml`
 with serving stopped and the same ownership fence as other rebuild commands.
+For read-only advisory job/retry/publication inspection, use
+[`diagnose-collection --provider npm`](provider-diagnostics.md#selected-npm-advisory-metadata)
+with the serving reader configuration. This metadata-only command neither starts
+collection nor downloads the export, and does not revive historical terminal jobs.
+Isolated PostgreSQL/S3 and minikube fixture acceptance is separate from live OSV
+acceptance and production recovery.
 
 ## BLAKE3 storage upgrade (schema 10)
 

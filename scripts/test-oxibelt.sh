@@ -168,6 +168,8 @@ writer
 backend
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --wait-ready 30
 probe python3 /harness/mcp_smoke.py --url https://edge:8443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
+# The running reader inspects only retained metadata, using a private disposable report.
+docker exec -i "$run_id-backend" python3 -I -B - < scripts/npm-diagnosis-fixture.py
 for revision in 2026-07-28 2025-11-25; do
   probe env DEVRES_PROBE_MDN_SNAPSHOT="$mdn_content" DEVRES_PROBE_MDN_COMPAT_SNAPSHOT="$mdn_compat" \
     DEVRES_PROBE_ADVISORY_SNAPSHOT="$advisory_snapshot" DEVRES_PROBE_WHATWG_SNAPSHOT="$whatwg_snapshot" DEVRES_PROBE_W3C_SNAPSHOT="$w3c_snapshot" DEVRES_PROBE_CHROMIUM_SNAPSHOT="$chromium_snapshot" DEVRES_PROBE_NPM_FIXTURE=1 DEVRES_PROBE_WIKIPEDIA_FIXTURE=1 devres-probe https://edge:8443/mcp-wt/v1 /fixture/cert/ca.pem "$revision" https://client.example

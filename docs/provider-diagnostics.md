@@ -31,6 +31,59 @@ cannot stop before the hard deadline, the command instead returns a typed error
 and leaves no completed report; an already-created output file can be empty.
 An incomplete report does not establish parser compatibility or corpus integrity.
 
+## Selected npm advisory metadata
+
+Inspect the independent npm advisory lane without starting collection, downloading
+the OSV export or opening the serving archive cache:
+
+```sh
+devres-server diagnose-collection /etc/devres/reader.toml \
+  --provider npm --latest-failure \
+  --max-total-bytes 67108864 --timeout-secs 300 \
+  --output /tmp/devres-npm-diagnosis/report.json
+```
+
+npm accepts no snapshot, job, commit, attribution-target or dump-scan selectors.
+The existing byte/time and private output limits apply. Inspection selects fixed
+advisory job/retry/diagnostic/default state and bounded failure metadata, then
+checks exact referenced snapshot and readiness metadata. Payload and sequence
+seals and retained migration aliases preserve historical identity. An absent job
+is compatible with an already published default; an absent default does not
+identify the cause of a collection failure.
+
+Reports contain finite classifications, timestamps, committed cursors/counts,
+validated digest/size references and metadata linkage. They never contain export
+or member bodies, archive paths, member names, arbitrary errors, configuration,
+credentials or supplied audit inputs. S3 inspection compares selected committed
+SQL bindings with bounded independent binding descriptors. It does not read the
+export object. Object existence, complete bytes/digest verification, ZIP parsing,
+full membership accounting and attribution qualification remain `not_checked`.
+Missing or damaged selected evidence and exhausted budgets are explicit incomplete
+outcomes, not permission to fetch, publish or reset work.
+
+New advisory attempts retain versioned private `diagnostics-advisories` state.
+Acquisition, artifact opening, ZIP scanning, evidence writes, checkpoints and
+publication have separate finite stages. Last failure, durable checkpoint progress
+and completed publication success are distinct. A yielded slice or backoff does
+not resolve a failure, and saved activity does not prove a live worker. A new
+acquisition failure is not linked to an older terminal job's artifact. If recording
+diagnostics fails, the original operation error is preserved. Legacy missing
+phase/processor metadata remains unknown; inspection does not infer it.
+Optional writer diagnostic reads and writes each have a two-second deadline and
+no independent retry, so diagnostics cannot wait indefinitely behind collection.
+Diagnostic writes also use a short owner-fenced transaction with local PostgreSQL
+lock/statement timeouts; a canceled optional query cannot leave a row-lock wait
+blocking the next primary owner operation. Other state writes retain their existing
+transaction behavior.
+
+Only a new `capacity` error with validated collector context
+`materialization` / `deadline` uses the existing transient retry delay while
+preserving the retained artifact and cursor. Other capacity errors retain their
+existing terminal treatment. Historical terminal jobs are not revived. This
+specific retry correction does not identify a historical unclassified capacity
+failure or authorize production recovery. npm private diagnostic state is excluded
+from attribution enumeration and public MCP status retains its existing shape.
+
 ## Selected MDN metadata
 
 Inspect retained MDN heads and pinned history without cloning, reconstructing Git

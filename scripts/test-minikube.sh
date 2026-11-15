@@ -616,6 +616,9 @@ capture=${before%% *}
 maintenance_stop
 start_backend
 external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixture/cert/ca.pem --capture "$capture"
+# Run with the serving SELECT-only configuration for both filesystem and S3 scenarios.
+# The report stays in an owned /tmp directory inside the pod and is removed afterwards.
+k exec -i deployment/backend -- python3 -I -B - < scripts/npm-diagnosis-fixture.py
 seeded_webtransport
 collector_reads
 if (( s3 )); then

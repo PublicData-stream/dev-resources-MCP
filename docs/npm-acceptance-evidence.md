@@ -98,3 +98,56 @@ compatibility or a complete JavaScript/TypeScript symbol model.
 
 No hosted workflow, native ARM64 CI, registry publication, native ChatGPT UI,
 production activation, or production capacity claim follows from these results.
+
+## 2026-11-15 advisory checkpoints and private diagnosis
+
+The advisory retry correction preserves an unfinished job only for validated
+`capacity` / `materialization` / `deadline` failures. Unknown capacity failures and
+historical terminal jobs keep their existing treatment. Versioned private attempt
+metadata and `diagnose-collection --provider npm` distinguish acquisition, retained
+artifact access, scanning, evidence writes, checkpoints and publication without
+changing the public MCP schema, processor version or operator package catalog.
+
+| Local check | Result |
+| --- | --- |
+| Rust 1.99.1 formatting and strict workspace/all-target Clippy | Passed |
+| Locked workspace tests, one test thread | 1,113 passed, 96 opt-in tests ignored |
+| Python harness suite and final npm/MCP wire fixtures | 963 passed, 4 skipped; final focused fixtures 44 passed |
+| Current `cargo audit`, vendored SDK audit, `cargo deny check` | Passed; 525 locked dependencies, 1,509 advisory entries; existing duplicate-version warnings remain |
+| Real PostgreSQL persistence | 69 passed across 33 selected test binaries |
+| Disposable RustFS/PostgreSQL S3 acceptance | 17 passed |
+| Pinned OxiBelt Docker acceptance | HTTP/WebTransport passed for both MCP revisions, including snapshot-pinned advisory catalog/get/resources and private reader-only npm diagnosis |
+| Disposable filesystem minikube acceptance | NodePort TCP/UDP, CNI isolation, PVC restart and coordinated restore passed; private npm diagnosis and pinned advisory reads passed |
+| Disposable S3 minikube acceptance | Object-store isolation, complete cache loss, database restore and both MCP transports passed; private npm diagnosis and pinned advisory reads passed |
+
+The PostgreSQL tests exercise exact advisory replay, atomic snapshot/default
+rollback, diagnostic-row contention, original-error preservation, owner connection
+reuse and restoration of transaction-local timeout settings. Inspector fixtures
+cover sealed and migrated identities, legacy unknown phases, unrelated acquisition
+failures, fixed-size failure sampling and private-state exclusion from attribution.
+S3 diagnosis succeeds with an absent export object while checking its independent
+binding descriptor; forged descriptors and insufficient aggregate budgets fail
+closed. Metadata inspection does not verify export bytes, full membership or
+attribution qualification.
+
+The first new PostgreSQL publication fixture used a future validation timestamp
+and correctly failed the existing time check. The fixture now uses two distinct
+past timestamps; the complete PostgreSQL script then passed. Product freshness
+checks and parser bounds were not changed.
+
+All generated test state is below `/tmp`, with Cargo output at `/tmp/rust/target`.
+Independent MCP/API, Upstream/Storage and Security Boundary reviews inspected the
+integrated changes and affected callers. The client-timeout/pending-SQL finding
+was corrected with diagnostic-only server-side deadlines and verified against an
+actual retained owner connection. This is agent review, not human GitHub approval.
+Container acceptance uses a rootless-built local fixture image and a task-owned
+isolated rootful daemon. The shared rootful daemon had missing BuildKit/runtime
+overlay snapshots; its configuration and cache were not repaired or reset.
+Both task-owned minikube profiles and the isolated daemon were stopped after the
+successful runs; disposable diagnostics and daemon caches remain below `/tmp`.
+The resource smoke checks the standard MCP `contents`/content `_meta` wire shape,
+including exact readable notice text and notice-URI linkage, without requiring
+an adapter-only top-level attribution field that the SDK does not serialize.
+No new live npm/OSV acquisition, hosted CI, registry publication or production
+recovery was performed. The historical production capacity reason remains unknown;
+these checks do not establish that the production advisory default is available.

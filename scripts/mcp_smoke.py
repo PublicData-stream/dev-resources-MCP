@@ -550,6 +550,7 @@ def synthetic_npm(client):
         advisory = client.tool("packages.npm.advisory_lookup", {"name": "npm-fixture", "version": "1.0.0"}, revision)
         assert advisory["total"] == 1, "npm public advisory fixture missing"
         advisory_snapshot = advisory["snapshot"]["id"]
+        synthetic_npm_advisory(client, advisory_snapshot, revision)
         for format_name, text in (
             ("npm", json.dumps({"lockfileVersion": 3, "name": AUDIT_PRIVACY_MARKER, "packages": {"node_modules/npm-fixture": {"version": "1.0.0"}}})),
             ("pnpm", "lockfileVersion: '9.0'\npackages:\n  npm-fixture@1.0.0: {}\n"),
@@ -565,6 +566,46 @@ def synthetic_npm(client):
         assert code == (400 if revision == MODERN else 200), "malformed npm input changed its HTTP error mapping"
         assert isinstance(rejected, dict) and rejected.get("error", {}).get("code") == -32602, "malformed npm input did not return sanitized invalid params"
         assert AUDIT_PRIVACY_MARKER not in json.dumps(rejected), "npm parser reflected private input"
+
+
+def synthetic_npm_advisory(client, snapshot, revision):
+    """Read the same rights-qualified advisory through pinned catalog/get/resources."""
+    require_blake3(snapshot, "npm advisory snapshot")
+    advisory_id = "GHSA-fixt-ure0-npm0"
+    catalog = client.tool("packages.npm.advisory_catalog_search", {
+        "snapshot": snapshot, "filters": {"id": advisory_id}, "limit": 1}, revision)
+    assert catalog.get("snapshot", {}).get("id") == snapshot, "npm advisory catalog changed snapshot"
+    assert catalog.get("total") == 1, "npm advisory catalog lost fixture membership"
+    item = catalog.get("items", [{}])[0]
+    assert item.get("id") == advisory_id, "npm advisory catalog selected another record"
+    detail = client.tool("packages.npm.advisory_get", {
+        "id": advisory_id, "snapshot": snapshot, "representation": "source"}, revision)
+    assert detail.get("snapshot", {}).get("id") == snapshot, "npm advisory source changed snapshot"
+    assert detail.get("advisory", {}).get("id") == advisory_id, "npm advisory source changed identity"
+    assert detail.get("metadata_only") is not True, "npm source acceptance requires qualified readable bytes"
+    text = detail.get("page", {}).get("text", "")
+    assert json.loads(text).get("id") == advisory_id, "npm advisory original source missing"
+    assert "Synthetic npm acceptance fixture" in text, "npm advisory source changed"
+    assert detail.get("source_capture") == item.get("source_capture") and detail.get("source_capture"), "npm advisory catalog/source capture changed"
+    expected_notice = detail.get("attribution", {}).get("readable_notice")
+    assert expected_notice, "npm advisory readable attribution missing"
+    resource = detail.get("resource_uri", "")
+    assert resource.startswith("devres://npm/"), "npm advisory resource identity missing"
+    for method, params in (("resources/read", {"uri": resource}),
+                           ("tools/call", {"name": "fetch", "arguments": {"id": resource}})):
+        value = client.call(method, params, revision)
+        if method == "tools/call":
+            assert not value.get("isError"), "npm advisory resource fetch failed"
+            value = value.get("structuredContent", value)
+        content = value.get("contents", [{}])[0]
+        assert content.get("text") == text, "npm advisory resource changed original bytes"
+        # resources/read passes through the SDK's ReadResourceResult, which retains
+        # contents/_meta rather than the adapter's extra top-level attribution.
+        # The seeded fixture uses one deduplicated notice across its selections.
+        notice_uri = content.get("_meta", {}).get("attribution", {}).get("resource_uri", "")
+        assert notice_uri.startswith("devres://attribution/"), "npm advisory resource dropped attribution linkage"
+        assert any(item.get("uri") == notice_uri and item.get("mimeType") == "text/plain"
+                   and item.get("text") == expected_notice for item in value.get("contents", [])[1:]), "npm advisory resource dropped its readable notice"
 
 
 def live(client, rfc_text_only=False):

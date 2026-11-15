@@ -99,6 +99,14 @@ explicit versions, SEMVER and npm ECOSYSTEM event ranges, wildcard package
 applicability, prereleases, inclusive last-affected and exclusive fixed/limit
 boundaries. Unsupported records make affected assessments incomplete.
 
+The [private provider inspector](provider-diagnostics.md#selected-npm-advisory-metadata)
+reports bounded job, retry, checkpoint and publication metadata without reading the
+export. Typed materialization deadline failures retain the exact unfinished job
+for the existing retry owner; other capacity failures keep their existing terminal
+classification. Legacy terminal jobs require separately scoped investigation and
+are never automatically revived. These diagnostics do not alter the operator
+package catalog or establish that a retained advisory is rights-qualified.
+
 Withdrawals, malicious-package classification, aliases and original source records
 remain distinct evidence. Absence from a later export is not withdrawal.
 GHSA and OpenSSF malicious-package records retain their CC-BY-4.0 and Apache-2.0

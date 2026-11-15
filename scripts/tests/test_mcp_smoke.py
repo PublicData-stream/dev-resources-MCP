@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import pathlib
 import unittest
 from unittest.mock import patch
@@ -79,6 +80,73 @@ class StoredIdentityTests(unittest.TestCase):
                         value + "\n", " " + value, None, 123):
             with self.subTest(value=invalid), self.assertRaisesRegex(AssertionError, "tagged BLAKE3"):
                 smoke.require_blake3(invalid)
+
+
+class NpmAdvisoryFixtureClient:
+    def __init__(self, defect=None):
+        self.defect = defect
+        self.calls = []
+        self.snapshot = "blake3:" + "c" * 64
+        self.advisory = "GHSA-fixt-ure0-npm0"
+        self.text = json.dumps({"id": self.advisory, "summary": "Synthetic npm acceptance fixture"})
+        self.source = {"capture": "blake3:" + "d" * 64}
+
+    def tool(self, name, arguments, revision):
+        self.calls.append((name, arguments, revision))
+        if arguments.get("snapshot") != self.snapshot:
+            raise AssertionError("npm advisory request lost the pinned snapshot")
+        selected = "blake3:" + "f" * 64 if self.defect == "snapshot" else self.snapshot
+        if name == "packages.npm.advisory_catalog_search":
+            return {"snapshot": {"id": selected}, "total": 1,
+                    "items": [{"id": self.advisory, "source_capture": self.source}]}
+        if name == "packages.npm.advisory_get":
+            return {"snapshot": {"id": selected}, "advisory": {"id": self.advisory},
+                    "metadata_only": self.defect == "unqualified", "page": {"text": self.text},
+                    "source_capture": self.source, "attribution": {} if self.defect == "notice" else {"readable_notice": "Fixture notice"},
+                    "resource_uri": "devres://npm/" + self.snapshot + "/advisory/fixture"}
+        raise AssertionError("unexpected npm fixture tool")
+
+    def call(self, method, arguments, revision):
+        self.calls.append((method, arguments, revision))
+        notice_uri = "devres://attribution/" + "a" * 64
+        content = {"uri": "devres://npm/" + self.snapshot + "/advisory/fixture", "mimeType": "text/plain",
+                   "text": "changed bytes" if self.defect == "bytes" else self.text,
+                   "_meta": {"attribution": {} if self.defect == "resource_link" else {"resource_uri": notice_uri}}}
+        notice = {"uri": "devres://attribution/" + "b" * 64 if self.defect == "notice_identity" else notice_uri,
+                  "mimeType": "text/plain", "text": "changed notice" if self.defect == "notice_text" else "Fixture notice"}
+        result = {"contents": [content] if self.defect == "resource_notice" else [content, notice]}
+        if method == "tools/call":
+            # Tool structuredContent preserves the adapter's additional metadata.
+            result["attribution"] = {"readable_notice": "Fixture notice"}
+            result = {"structuredContent": result, "content": []}
+        # Match handler.rs's ReadResourceResult serialization for resources/read:
+        # no nonstandard top-level attribution, notice remains a separate content.
+        wire = json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}).encode()
+        return smoke.decode_response(Response(wire), 1)["result"]
+
+
+class NpmAdvisoryAcceptanceTests(unittest.TestCase):
+    def test_catalog_get_and_resources_use_one_snapshot_in_both_revisions(self):
+        for revision in (smoke.MODERN, smoke.LEGACY):
+            client = NpmAdvisoryFixtureClient()
+            smoke.synthetic_npm_advisory(client, client.snapshot, revision)
+            self.assertEqual(len(client.calls), 4)
+            self.assertTrue(all(call[2] == revision for call in client.calls))
+
+    def test_wrong_snapshot_unqualified_source_changed_bytes_or_missing_notices_fail(self):
+        for defect in ("snapshot", "unqualified", "notice", "bytes", "resource_notice",
+                       "resource_link", "notice_identity", "notice_text"):
+            client = NpmAdvisoryFixtureClient(defect)
+            with self.subTest(defect=defect), self.assertRaises(AssertionError):
+                smoke.synthetic_npm_advisory(client, client.snapshot, smoke.MODERN)
+
+    def test_sdk_resource_wire_preserves_notice_contents_without_top_level_attribution(self):
+        client = NpmAdvisoryFixtureClient()
+        result = client.call("resources/read", {"uri": "devres://npm/fixture"}, smoke.MODERN)
+        self.assertNotIn("attribution", result)
+        self.assertEqual(result["contents"][1]["text"], "Fixture notice")
+        self.assertEqual(result["contents"][1]["uri"], result["contents"][0]["_meta"]["attribution"]["resource_uri"])
+        smoke.synthetic_npm_advisory(client, client.snapshot, smoke.MODERN)
 
 
 class DecodeResponseTests(unittest.TestCase):

@@ -16,7 +16,7 @@ pub struct Arguments {
 pub fn parse(args: &[String]) -> Result<Arguments> {
     let invalid = || {
         Error::invalid(
-            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc|rustsec|mdn --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]] [--commit OID] [--attribution-target ID]",
+            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc|rustsec|mdn|npm --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]] [--commit OID] [--attribution-target ID]",
         )
     };
     if args.len() < 2 || args[0] != "diagnose-collection" {
@@ -55,6 +55,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
                     "rfc" => DiagnosisProvider::Rfc,
                     "rustsec" => DiagnosisProvider::Rustsec,
                     "mdn" => DiagnosisProvider::Mdn,
+                    "npm" => DiagnosisProvider::Npm,
                     _ => return Err(invalid()),
                 })
             }
@@ -237,6 +238,30 @@ mod tests {
             let mut invalid = args.clone();
             invalid.extend(extra.into_iter().map(str::to_owned));
             assert!(parse(&invalid).is_err());
+        }
+    }
+    #[test]
+    fn npm_metadata_accepts_only_bounded_provider_options() {
+        let mut args = arguments(&["--latest-failure"]);
+        args[3] = "npm".into();
+        let options = parse(&args).unwrap().options;
+        assert_eq!(options.provider, DiagnosisProvider::Npm);
+        assert_eq!(options.max_total_bytes, 64 * 1024 * 1024);
+        assert_eq!(options.timeout_secs, 300);
+        let id = format!("blake3:{}", "a".repeat(64));
+        let revision = "b".repeat(40);
+        for extra in [
+            vec!["--scan-retained-dump"],
+            vec!["--snapshot", &id],
+            vec!["--job-key", "rfc:text:9000"],
+            vec!["--commit", &revision],
+            vec!["--attribution-target", &id],
+            vec!["--max-total-bytes", "67108865"],
+            vec!["--timeout-secs", "301"],
+        ] {
+            let mut rejected = args.clone();
+            rejected.extend(extra.into_iter().map(str::to_owned));
+            assert!(parse(&rejected).is_err());
         }
     }
     #[test]
