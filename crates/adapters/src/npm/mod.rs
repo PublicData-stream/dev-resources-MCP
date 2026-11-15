@@ -1,6 +1,7 @@
 //! npm provider adapters.
 pub mod audit;
 pub mod corpus;
+pub(crate) mod diagnostics;
 pub mod index;
 pub(crate) mod lockfile;
 mod packages;

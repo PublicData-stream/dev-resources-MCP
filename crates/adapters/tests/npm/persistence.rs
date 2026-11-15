@@ -616,6 +616,74 @@ async fn npm_schema_publication_restart_immutability_and_owner_fence() {
     let mut invalid = retained.clone();
     invalid["validated_at"] = json!(1);
     assert!(store.npm_publish("research", &invalid).await.is_err());
+    // A failed default write must roll back its immutable snapshot in the same
+    // transaction while retaining staged members/ready metadata for exact replay.
+    let advisory_time = devres_domain::unix_now().saturating_sub(2);
+    corpus
+        .import_fixture_advisories(vec![advisory()], advisory_time)
+        .await
+        .unwrap();
+    let old_advisory = store
+        .npm_state("default-advisories")
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx_core::raw_sql::raw_sql(
+        "CREATE FUNCTION npm_fixture_reject_default() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture publication interruption'; END $$; CREATE TRIGGER npm_fixture_reject_default BEFORE INSERT OR UPDATE ON devres_npm_state FOR EACH ROW WHEN (NEW.key='default-advisories') EXECUTE FUNCTION npm_fixture_reject_default();",
+    ).execute(&inspection).await.unwrap();
+    assert!(
+        corpus
+            .import_fixture_advisories(vec![advisory()], advisory_time + 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .npm_state("default-advisories")
+            .await
+            .unwrap()
+            .unwrap(),
+        old_advisory
+    );
+    let snapshots: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT count(*) FROM devres_npm_evidence WHERE kind='snapshots' AND data->>'lane'='advisories'",
+    ).fetch_one(&inspection).await.unwrap();
+    assert_eq!(
+        snapshots, 1,
+        "failed default publication must roll back the new snapshot"
+    );
+    let staged_members = store
+        .npm_rows("advisory-members", 0, 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(staged_members.len(), 2);
+    sqlx_core::raw_sql::raw_sql("DROP TRIGGER npm_fixture_reject_default ON devres_npm_state; DROP FUNCTION npm_fixture_reject_default();").execute(&inspection).await.unwrap();
+    let replay = corpus
+        .import_fixture_advisories(vec![advisory()], advisory_time + 1)
+        .await
+        .unwrap();
+    assert_ne!(replay["id"], old_advisory["id"]);
+    let replayed_members = store
+        .npm_rows("advisory-members", 0, 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(replayed_members.len(), staged_members.len());
+    for (before, after) in staged_members.iter().zip(&replayed_members) {
+        assert_eq!(before.sequence, after.sequence);
+        assert_eq!(before.key, after.key);
+        assert_eq!(before.data, after.data);
+    }
+    store
+        .npm_publish(
+            "advisories",
+            &store
+                .npm_state("default-advisories")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     drop(corpus);
     drop(store);
     for _ in 0..100 {

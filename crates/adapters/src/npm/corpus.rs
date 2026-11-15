@@ -1,6 +1,7 @@
 //! Resumable public npm catalog and OSV collection. Research never enrolls packages.
 use crate::{
     bulk::{BulkArtifact, BulkArtifactStore, BulkBroker, BulkRequest, BulkSource},
+    npm::diagnostics::{Attempt, Stage},
     npm::index::{IndexDocument, NpmIndex},
     npm::processing as npm_processing,
     npm::source::Operation,
@@ -21,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_METADATA: u64 = 16 * 1024 * 1024;
 const MAX_INSPECTION: u64 = 32 * 1024 * 1024;
 const MAX_RELEVANT: usize = 120 * 1024 * 1024;
+const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
 struct ScannedAdvisory {
     record: Value,
     bytes: Vec<u8>,
@@ -193,7 +195,9 @@ impl NpmCorpus {
         let terminal = matches!(
             error.code.as_str(),
             "invalid_input" | "integrity" | "processing_gap"
-        ) || lane == "advisories" && error.code == "capacity";
+        ) || lane == "advisories"
+            && error.code == "capacity"
+            && !crate::npm::diagnostics::materialization_deadline(error);
         let job_key = if let Some(name) = name {
             state_key("package-job", name)
         } else {
@@ -819,6 +823,64 @@ impl NpmCorpus {
         {
             return Ok(());
         }
+        let previous = match tokio::time::timeout(
+            DIAGNOSTIC_TIMEOUT,
+            self.store.npm_state("diagnostics-advisories"),
+        )
+        .await
+        .unwrap_or_else(|_| Err(Error::unavailable("npm private diagnostic read deadline.")))
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    code = devres_application::collection::safe_code(&error.code),
+                    "npm private diagnostics read failed"
+                );
+                None
+            }
+        };
+        let mut attempt = Attempt::begin(previous);
+        self.save_advisory_diagnostics(&mut attempt).await;
+        let result = self.collect_advisory_attempt(cancel, &mut attempt).await;
+        if let Err(error) = &result {
+            attempt.fail(error);
+        }
+        self.save_advisory_diagnostics(&mut attempt).await;
+        result
+    }
+
+    async fn save_advisory_diagnostics(&self, attempt: &mut Attempt) {
+        let result = match attempt.value() {
+            Ok(value) => tokio::time::timeout(
+                DIAGNOSTIC_TIMEOUT,
+                self.store.npm_set_state("diagnostics-advisories", &value),
+            )
+            .await
+            .unwrap_or_else(|_| Err(Error::unavailable("npm private diagnostic write deadline."))),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                code = devres_application::collection::safe_code(&error.code),
+                "npm private diagnostics write failed"
+            );
+        }
+    }
+
+    fn advisory_diagnostic_checkpoint(attempt: &mut Attempt, job: &Value) {
+        if let Err(error) = attempt.checkpoint(job) {
+            tracing::warn!(
+                code = devres_application::collection::safe_code(&error.code),
+                "npm private diagnostic checkpoint invalid"
+            );
+        }
+    }
+
+    async fn collect_advisory_attempt(
+        &self,
+        cancel: CancellationToken,
+        attempt: &mut Attempt,
+    ) -> Result<()> {
         let mut job = match self.store.npm_state("advisory-job").await? {
             Some(job) if job["done"] != true => job,
             _ => {
@@ -831,8 +893,11 @@ impl NpmCorpus {
                             < self.config.advisory_refresh_secs as i64
                     })
                 {
+                    attempt.yielded();
                     return Ok(());
                 }
+                attempt.stage(Stage::Acquisition);
+                self.save_advisory_diagnostics(attempt).await;
                 let artifact = self
                     .fetch(
                         Operation::AdvisoryExport,
@@ -850,23 +915,32 @@ impl NpmCorpus {
                     data["validated_at"] = json!(time);
                     data["id"] = json!(identity(&data)?);
                     let id = data["id"].as_str().ok_or_else(failure)?;
+                    attempt.publication(id);
+                    attempt.stage(Stage::ReadyMarker);
                     self.store
                         .npm_set_state(
                             &format!("ready:{id}"),
                             &json!({"id":id,"records":data["records"],"accounted":true}),
                         )
                         .await?;
+                    attempt.stage(Stage::Publication);
                     self.store.npm_publish("advisories", &data).await?;
+                    attempt.stage(Stage::ValidatorAcceptance);
                     self.accept_fetch(Operation::AdvisoryExport, &artifact)
                         .await?;
+                    attempt.succeed(id);
                     return Ok(());
                 }
                 let snapshot = identity(&json!([artifact.body_hash, time, PROCESSOR_VERSION]))?;
                 let job = json!({"snapshot":snapshot,"artifact":artifact,"validated_at":time,"next":0,"records":0,"gaps":0,"done":false});
+                attempt.stage(Stage::JobCheckpoint);
                 self.store.npm_set_state("advisory-job", &job).await?;
                 job
             }
         };
+        Self::advisory_diagnostic_checkpoint(attempt, &job);
+        attempt.stage(Stage::Materialization);
+        self.save_advisory_diagnostics(attempt).await;
         let artifact: BulkArtifact =
             serde_json::from_value(job["artifact"].clone()).map_err(|_| failure())?;
         let (file, materialized) = self
@@ -887,6 +961,8 @@ impl NpmCorpus {
             let _materialized = materialized;
             scan_export(file, next, expanded, sender, &stop)
         });
+        attempt.stage(Stage::Scanner);
+        self.save_advisory_diagnostics(attempt).await;
         let snapshot = job["snapshot"].as_str().ok_or_else(failure)?.to_owned();
         while let Some((position, expanded, result)) = receiver.recv().await {
             job["expanded"] = json!(expanded);
@@ -896,14 +972,17 @@ impl NpmCorpus {
                     let record = item.record;
                     if record["matching_complete"] != true || record["rights_gap"] == true {
                         let gap = json!({"snapshot":snapshot,"member":position,"code":"unsupported_advisory_coverage","artifact":artifact.body_hash});
+                        attempt.stage(Stage::GapRetention);
                         self.store.npm_put("gaps", &identity(&gap)?, &gap).await?;
                         job["gaps"] = json!(job["gaps"].as_u64().unwrap_or(0) + 1);
                     }
                     let id = identity(&record)?;
+                    attempt.stage(Stage::RecordRetention);
                     self.store.npm_put("advisories", &id, &record).await?;
                     let raw_id = if record["rights_gap"] == true {
                         None
                     } else {
+                        attempt.stage(Stage::RawRetention);
                         let raw = self.raw.capture_bytes(item.bytes, cancel.clone()).await?;
                         let data = json!({"record":id,"artifact":raw,"member_path":item.path,"export_hash":artifact.body_hash,"source_url":crate::npm::source::OSV_EXPORT});
                         let raw_id = identity(&data)?;
@@ -912,6 +991,7 @@ impl NpmCorpus {
                     };
                     let member =
                         json!({"snapshot":snapshot,"id":record["id"],"record":id,"raw":raw_id});
+                    attempt.stage(Stage::MemberRetention);
                     self.store
                         .npm_put("advisory-members", &identity(&member)?, &member)
                         .await?;
@@ -924,6 +1004,7 @@ impl NpmCorpus {
                         })
                         .collect();
                     for name in if names.is_empty() { vec!["*"] } else { names } {
+                        attempt.stage(Stage::PackageLinkRetention);
                         let link =
                             json!({"snapshot":snapshot,"name":name,"record":id,"id":record["id"]});
                         self.store
@@ -935,14 +1016,25 @@ impl NpmCorpus {
                 Ok(None) => {}
                 Err(error) => {
                     let gap = json!({"snapshot":snapshot,"member":position,"code":error.code,"artifact":artifact.body_hash});
+                    attempt.stage(Stage::GapRetention);
                     self.store.npm_put("gaps", &identity(&gap)?, &gap).await?;
                     job["gaps"] = json!(job["gaps"].as_u64().unwrap_or(0) + 1);
                 }
             }
             job["next"] = json!(position + 1);
+            attempt.stage(Stage::JobCheckpoint);
             self.store.npm_set_state("advisory-job", &job).await?;
+            if let Err(error) = attempt.progress(&job) {
+                tracing::warn!(
+                    code = devres_application::collection::safe_code(&error.code),
+                    "npm private diagnostic progress invalid"
+                );
+            }
+            attempt.stage(Stage::Scanner);
         }
+        attempt.stage(Stage::Scanner);
         if !worker.await.map_err(|_| failure())?? {
+            attempt.yielded();
             return Ok(());
         }
         let mut data = json!({"lane":"advisories","artifact":artifact,"validated_at":job["validated_at"],"records":job["records"],
@@ -951,17 +1043,23 @@ impl NpmCorpus {
         data["membership"] = json!(snapshot);
         data["id"] = json!(identity(&data)?);
         let id = data["id"].as_str().ok_or_else(failure)?;
+        attempt.publication(id);
+        attempt.stage(Stage::ReadyMarker);
         self.store
             .npm_set_state(
                 &format!("ready:{id}"),
                 &json!({"id":id,"records":data["records"],"accounted":true}),
             )
             .await?;
+        attempt.stage(Stage::Publication);
         self.store.npm_publish("advisories", &data).await?;
+        attempt.stage(Stage::ValidatorAcceptance);
         self.accept_fetch(Operation::AdvisoryExport, &artifact)
             .await?;
         job["done"] = json!(true);
+        attempt.stage(Stage::CompletionCheckpoint);
         self.store.npm_set_state("advisory-job", &job).await?;
+        attempt.succeed(id);
         Ok(())
     }
     pub async fn selection(&self, lane: &str, selected: Option<&str>) -> Result<Value> {
@@ -1428,7 +1526,23 @@ mod tests {
         BTreeMap<String, Value>,
     );
     #[derive(Default)]
-    struct Memory(Mutex<State>);
+    struct Memory(
+        Mutex<State>,
+        Mutex<Option<&'static str>>,
+        std::sync::atomic::AtomicBool,
+        std::sync::atomic::AtomicBool,
+    );
+    impl Memory {
+        async fn interrupt(&self, point: &str) -> Result<()> {
+            let mut selected = self.1.lock().await;
+            if selected.is_some_and(|selected| selected == point) {
+                *selected = None;
+                return Err(Error::unavailable("Fixture interrupted operation.")
+                    .with_details(json!({"private":"never-copy-this-fixture-body"})));
+            }
+            Ok(())
+        }
+    }
     #[async_trait]
     impl NpmStore for Memory {
         async fn npm_get(&self, kind: &str, key: &str) -> Result<Option<Row>> {
@@ -1441,6 +1555,7 @@ mod tests {
                 .cloned())
         }
         async fn npm_put(&self, kind: &str, key: &str, value: &Value) -> Result<i64> {
+            self.interrupt(kind).await?;
             let mut state = self.0.lock().await;
             let key = (kind.into(), key.into());
             if let Some(old) = state.1.get(&key) {
@@ -1496,6 +1611,28 @@ mod tests {
             Ok(self.0.lock().await.2.get(key).cloned())
         }
         async fn npm_set_state(&self, key: &str, value: &Value) -> Result<()> {
+            if key == "diagnostics-advisories" && self.3.swap(false, Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if key == "diagnostics-advisories" && self.2.load(Ordering::SeqCst) {
+                return Err(Error::unavailable(
+                    "Fixture diagnostic storage unavailable.",
+                ));
+            }
+            let point = if key.starts_with("ready:") {
+                "ready"
+            } else if key == "advisory-job" {
+                if value["done"] == true {
+                    "completion"
+                } else {
+                    "checkpoint"
+                }
+            } else if key.starts_with("source-cache:") {
+                "validator"
+            } else {
+                key
+            };
+            self.interrupt(point).await?;
             self.0.lock().await.2.insert(key.into(), value.clone());
             Ok(())
         }
@@ -1542,6 +1679,7 @@ mod tests {
             self.npm_commit_index(index, &ids).await
         }
         async fn npm_publish(&self, lane: &str, value: &Value) -> Result<()> {
+            self.interrupt("publication").await?;
             self.npm_put("snapshots", value["id"].as_str().unwrap(), value)
                 .await?;
             self.npm_set_state(&format!("default-{lane}"), value).await
@@ -1833,4 +1971,6 @@ mod tests {
         assert!(task.await.unwrap().unwrap());
         assert_eq!(records, 1);
     }
+
+    include!("corpus/advisory_tests.rs");
 }

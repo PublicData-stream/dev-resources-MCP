@@ -181,6 +181,31 @@ impl NpmStore for PgBlobStore {
         bounded(data)?;
         let mut owner = self.owner.lock().await;
         owner.ping().await.map_err(|_| storage_error())?;
+        if key == "diagnostics-advisories" {
+            // Dropping an async timeout does not cancel a PostgreSQL query already
+            // sent on this shared owner connection. Bound the optional write on
+            // the server, and restore both settings before returning ownership.
+            let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+            let written = async {
+                sqlx_core::raw_sql::raw_sql("SET LOCAL statement_timeout='1000ms'; SET LOCAL lock_timeout='500ms'")
+                    .execute(&mut *tx).await.map_err(|_| storage_error())?;
+                sqlx_core::query::query("INSERT INTO devres_npm_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
+                    .bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_npm_state","",key,data)?)
+                    .execute(&mut *tx).await.map_err(|_| storage_error())?;
+                Ok::<(), Error>(())
+            }.await;
+            return match written {
+                Ok(()) => tx.commit().await.map_err(|_| storage_error()),
+                Err(error) => {
+                    // Explicit rollback drains the failed statement and avoids
+                    // leaving an aborted transaction for primary collection I/O.
+                    if tx.rollback().await.is_err() {
+                        tracing::warn!("npm private diagnostic rollback failed");
+                    }
+                    Err(error)
+                }
+            };
+        }
         sqlx_core::query::query("INSERT INTO devres_npm_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
             .bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_npm_state","",key,data)?).execute(&mut *owner).await.map_err(|_|storage_error())?;
         Ok(())

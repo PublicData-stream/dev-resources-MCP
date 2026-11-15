@@ -1332,6 +1332,7 @@ fn sources(name: &str) -> Result<Vec<Source>> {
                 filter: match name {
                     "w3c" => "key NOT IN ('status','failure','catalog-work') AND NOT starts_with(key,'collector-')",
                     "mdn" => "key NOT IN ('status','failure','content-retry','compat-retry') AND NOT starts_with(key,'diagnostics-')",
+                    "npm" => "key NOT IN ('status','failure') AND NOT starts_with(key,'diagnostics-')",
                     _ => "key NOT IN ('status','failure')",
                 },
             });
@@ -1807,7 +1808,7 @@ impl PgBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devres_application::{Store, mdn::MdnStore};
+    use devres_application::{Store, mdn::MdnStore, npm::NpmStore};
     use devres_domain::{FetchRequest, FetchResponse, Validators};
     use std::sync::Arc;
 
@@ -2621,6 +2622,34 @@ mod tests {
         assert_eq!(
             operational, 0,
             "operational updates must not create attribution occurrences"
+        );
+        let npm_public = json!({"synthetic":true,"id":"GHSA-fixture","matching_complete":true});
+        let npm_key = crate::integrity::canonical_hash(&npm_public).unwrap();
+        store
+            .npm_put("advisories", &npm_key, &npm_public)
+            .await
+            .unwrap();
+        let mut found_public = false;
+        for at in [1, 2] {
+            for key in ["diagnostics-advisories", "diagnostics-future"] {
+                store
+                    .npm_set_state(key, &json!({"at":at,"private":"operational-only"}))
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..12 {
+                for target in store.attribution_sweep_page("npm").await.unwrap() {
+                    assert!(!target.subject.key.starts_with("diagnostics-"));
+                    found_public |= target.subject.namespace == "devres_npm_evidence/advisories"
+                        && target.subject.key == npm_key;
+                }
+            }
+        }
+        assert!(found_public, "public npm evidence must remain enumerable");
+        let private_npm:i64=sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_attribution_targets WHERE provider='npm' AND data#>>'{target,subject,namespace}'='devres_npm_state' AND starts_with(data#>>'{target,subject,key}','diagnostics-')").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(
+            private_npm, 0,
+            "private npm diagnostics must never become attribution targets"
         );
         let large = json!({"synthetic":true,"text":"x".repeat(9*1024*1024)});
         let large_key = crate::integrity::canonical_hash(&large).unwrap();

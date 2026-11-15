@@ -43,6 +43,7 @@ cargo test --locked -p devres-adapters --test w3c_persistence -- --ignored --tes
 cargo test --locked -p devres-adapters --test chromium_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib chromium_collector_postgres_publication_with_accounted_gaps -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test npm_persistence -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib npm_advisory_diagnostic_row_lock_preserves_source_error_and_owner_reuse -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib mdn_corpus_git_postgres_history_research_restart_and_restore -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib crate_corpus_captured_inventory_acquisition_research_and_restart -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::payload_integrity -- --ignored --test-threads=1
