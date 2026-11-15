@@ -539,7 +539,9 @@ async fn http_media_and_optional_extensions_preserve_both_protocol_contracts() {
 
 #[tokio::test]
 async fn native_webtransport_probe_both_revisions_and_origin_rejection() {
-    let temp = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
     let cert_path = temp.path().join("cert.pem");
     let key_path = temp.path().join("key.pem");

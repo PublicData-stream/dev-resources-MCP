@@ -1,7 +1,7 @@
 //! Native diagnostic fault fixtures: loopback only, no provider or production I/O.
 use devres_server::framing::{FrameReader, write_json};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::timeout};
 use wtransport::{Endpoint, Identity, ServerConfig};
 
@@ -12,6 +12,7 @@ async fn native_fault_diagnostics_stream_large_frames_and_sanitize_errors_in_bot
     for revision in ["2026-07-28", "2025-11-25"] {
         for malformed in [false, true] {
             let temp = tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
             let cert_path = temp.path().join("cert.pem");
             let key_path = temp.path().join("key.pem");

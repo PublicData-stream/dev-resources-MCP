@@ -5,6 +5,12 @@ use serde_json::{Value, json};
 use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, sync::Semaphore};
 
+fn private_temp() -> tempfile::TempDir {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    root
+}
+
 fn entries(path: &Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -20,7 +26,7 @@ fn request() -> Value {
 #[tokio::test(start_paused = true)]
 async fn timeout_diagnostics_distinguish_no_bytes_and_partial_frame() {
     for partial in [false, true] {
-        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let temp = private_temp();
         let path = temp.path().join("trace.jsonl");
         let trace = Trace::create(&path).unwrap();
         let (mut tx, rx) = tokio::io::duplex(32);
@@ -76,7 +82,7 @@ async fn timeout_diagnostics_distinguish_no_bytes_and_partial_frame() {
 
 #[tokio::test]
 async fn streaming_response_crosses_flow_control_windows_and_skips_unmatched_frames() {
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let temp = private_temp();
     let path = temp.path().join("trace.jsonl");
     let trace = Trace::create(&path).unwrap();
     // The response exceeds the server's 256-KiB QUIC stream window; this much
@@ -156,7 +162,7 @@ async fn cancelled_receive_retains_progress_deadline_and_budget() {
 
 #[tokio::test(start_paused = true)]
 async fn write_stall_keeps_its_ten_second_deadline_and_safe_stage() {
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let temp = private_temp();
     let path = temp.path().join("trace.jsonl");
     let trace = Trace::create(&path).unwrap();
     let (mut send, _undrained) = tokio::io::duplex(1);
@@ -188,7 +194,7 @@ async fn write_stall_keeps_its_ten_second_deadline_and_safe_stage() {
 
 #[tokio::test(start_paused = true)]
 async fn legacy_notification_stall_is_distinct_from_initialize_response_assertions() {
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let temp = private_temp();
     let path = temp.path().join("trace.jsonl");
     let trace = Trace::create(&path).unwrap();
     let budget = Arc::new(Semaphore::new(32 * 1024 * 1024));
@@ -234,7 +240,7 @@ async fn malformed_oversized_and_unterminated_frames_have_finite_categories() {
         (b"{\"id\":1}".as_slice(), 64, "invalid_data", "read"),
         (b"".as_slice(), 64, "closed", "read"),
     ] {
-        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let temp = private_temp();
         let path = temp.path().join("trace.jsonl");
         let trace = Trace::create(&path).unwrap();
         let budget = Arc::new(Semaphore::new(32 * 1024 * 1024));
@@ -263,7 +269,7 @@ async fn malformed_oversized_and_unterminated_frames_have_finite_categories() {
 
 #[test]
 fn output_requires_a_new_private_tmp_file_and_is_bounded() {
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let temp = private_temp();
     let path = temp.path().join("trace.jsonl");
     let mut trace = Trace::create(&path).unwrap();
     assert_eq!(
@@ -295,7 +301,7 @@ fn output_requires_a_new_private_tmp_file_and_is_bounded() {
 
 #[tokio::test]
 async fn recorder_refuses_unlisted_labels_and_output_failures_are_sanitized() {
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let temp = private_temp();
     let path = temp.path().join("trace.jsonl");
     let mut trace = Trace::create(&path).unwrap();
     // A read-only descriptor deterministically fails writes without special
