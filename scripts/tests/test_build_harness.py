@@ -114,9 +114,20 @@ with open(os.environ["TEST_LOG"], "a") as output:
                                  [str(staged / name) for name in BINARIES])
                 for name in BINARIES:
                     self.assertEqual((staged / name).read_bytes(), original[name][0].replace(DEBUG, b""))
-                    self.assertEqual(stat.S_IMODE((staged / name).stat().st_mode), original[name][1])
+                    self.assertEqual(stat.S_IMODE((staged / name).stat().st_mode), 0o755)
                 build = next(i for i, call in enumerate(calls) if call[:2] == ["docker", "build"])
                 self.assertTrue(all(i < build for i, call in enumerate(calls) if call[0] == "strip"))
+
+    def test_owner_only_builds_become_executable_by_fixture_uid_without_changing_sources(self):
+        for source in self.sources.values():
+            source.chmod(0o700)
+        result, _, original = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in BINARIES:
+            staged = self.scratch / 'build/bin' / name
+            self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(self.sources[name].stat().st_mode), 0o700)
+            self.assertEqual(staged.read_bytes(), original[name][0].replace(DEBUG, b''))
 
     def test_strip_failure_prevents_image_build(self):
         result, calls, _ = self.run_build(TEST_STRIP_FAIL="storage-probe")

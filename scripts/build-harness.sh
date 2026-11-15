@@ -49,6 +49,9 @@ cp "$collector_tests" "$scratch/build/bin/devres-collector-tests"
 # Remove debug information only from disposable copies, preserving shared builds.
 for binary in devres-server devres-probe devres-credential-broker storage-probe devres-audit-worker devres-pdf-worker oxibelt devres-collector-tests; do
   strip --strip-debug "$scratch/build/bin/$binary"
+  # Cargo artifacts can be owner-executable only. The fixture image runs as
+  # uid 65532, so normalize disposable copies without changing shared builds.
+  chmod 0755 "$scratch/build/bin/$binary"
 done
 cp scripts/mcp_smoke.py "$scratch/build/scripts/"
 cp scripts/collector-smoke.py "$scratch/build/scripts/"
