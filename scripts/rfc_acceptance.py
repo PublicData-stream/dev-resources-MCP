@@ -3,7 +3,7 @@
 
 Usage: PYTHONDONTWRITEBYTECODE=1 python3 scripts/rfc_acceptance.py --live --url HTTPS_MCP_URL
        --output-dir /tmp/OWNED_DIRECTORY [--connector-observations /tmp/FILE]
-No collector configuration, product data, or Kubernetes resources are changed.
+Ordinary reads can refresh retained public evidence; collector settings stay unchanged.
 """
 import argparse
 import base64
@@ -788,12 +788,17 @@ class Acceptance:
         require(b'QUIC' in page_bytes(value, 'txt'), 'RFC 9000 text lacks QUIC title')
         return value
 
-    def get_parity(self, first, representation, revision):
+    def fetch_rfc(self, revision):
+        value = self.tool('fetch', {'id': 'rfc:9000', 'limit': PAGE_SIZE}, revision)
+        self.content(value, 'txt')
+        return value
+
+    def get_parity(self, first, representation, fetched, revision):
         self.dependent(first)
         self.dependent(representation)
+        self.dependent(fetched)
         require(self.content(first, 'txt') == self.content(representation, 'txt'),
                 'RFC get and TXT format bytes differ')
-        fetched = self.tool('fetch', {'id': 'rfc:9000', 'limit': PAGE_SIZE}, revision)
         require(self.content(fetched, 'txt') == self.content(first, 'txt'), 'generic RFC fetch bytes differ')
         pinned = self.tool('rfc.get', {'number': 9000, 'limit': PAGE_SIZE,
                            'capture': first['capture']['id']}, revision)
@@ -839,6 +844,7 @@ class Acceptance:
             self.step('rfc.fulltext_search.' + mode, revision,
                       lambda mode=mode: self.fulltext(snapshot, revision, mode))
         text = self.step('rfc.get', revision, lambda: self.get(revision))
+        fetched = self.step('fetch.rfc', revision, lambda: self.fetch_rfc(revision))
         formats = {}
         for fmt in ('txt', 'html', 'xml', 'pdf'):
             first = self.step('rfc.format_get.' + fmt, revision, lambda fmt=fmt: self.representation(fmt, revision))
@@ -850,7 +856,7 @@ class Acceptance:
             self.step('fetch.resource.' + fmt, revision,
                       lambda first=first, fmt=fmt: self.resource(first, fmt, revision, via_fetch=True))
             self.step('attribution.resources.' + fmt, revision, lambda first=first: self.notices(first, revision))
-        self.step('rfc.get.fetch_parity', revision, lambda: self.get_parity(text, formats.get('txt'), revision))
+        self.step('rfc.get.fetch_parity', revision, lambda: self.get_parity(text, formats.get('txt'), fetched, revision))
         for label, name, args in (
             ('unknown_argument', 'rfc.get', {'number': 9000, 'url': 'https://untrusted.invalid'}),
             ('invalid_limit', 'rfc.get', {'number': 9000, 'limit': 0}),

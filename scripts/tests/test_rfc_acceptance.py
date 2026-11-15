@@ -318,6 +318,19 @@ class WireTests(unittest.TestCase):
                     runner.open_revision(revision)
 
 
+    def test_get_failure_does_not_suppress_independent_generic_fetch(self):
+        runner, report, _ = self.runner(FakeClient('rfc.get'))
+        runner.run()
+        fetch_revisions = [revision for method, args, revision in runner.client.calls
+                           if method == 'tools/call' and args['name'] == 'fetch'
+                           and args['arguments'].get('id') == 'rfc:9000']
+        self.assertEqual(fetch_revisions, list(rfc.REVISIONS))
+        fetch_results = [row for row in report.checks if row['check'] == 'fetch.rfc']
+        self.assertEqual([row['status'] for row in fetch_results], ['passed', 'passed'])
+        parity = [row for row in report.checks if row['check'] == 'rfc.get.fetch_parity']
+        self.assertEqual([row['status'] for row in parity], ['unverified', 'unverified'])
+
+
 class LimitsTests(unittest.TestCase):
     def test_deadline_and_budget_stop_before_another_exchange(self):
         clock = [0]
