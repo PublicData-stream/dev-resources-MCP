@@ -55,6 +55,18 @@ any application mutation.
 This recovery proof assumes the original immutable S3 survives. It makes no
 independent bucket backup or bucket-loss recovery claim.
 
+If the isolated proof has already consumed its intent and failed, preserve its
+journals, source manifest, golden checkpoint and private inputs. Do not replay it
+or edit its frozen producer. `proof_continuation_1d76fbcc.py` admits one separate
+scope using an externally pinned source and admission digest. It restores only
+the copied writer's original cache ceiling: the initial proof's 64 MiB ceiling
+cannot hold the retained, non-evictable Git working state. It verifies all original
+checkpoint and failed-proof hashes, captures bounded redacted diagnostics before
+cleanup, and publishes missing successful evidence with explicit provenance.
+Partial publication requires reconciliation; it never permits another proof
+attempt. This correction does not change production configuration or establish
+the unretained first failure's exact exception.
+
 ## Exact incident and rollout
 
 The schema-18 incident job selected by this successor becomes migration-created
