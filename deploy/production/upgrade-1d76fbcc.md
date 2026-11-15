@@ -81,7 +81,12 @@ operational outcome and require their own schema-19 checkpoint and admission.
 Start target writer first, verify schema 19 and reader grants, perform the exact
 read-only npm assessment with an isolated ephemeral maintenance Pod, then renew
 the process-bound migration proof before starting the reader. Assessment has no
-PVC, writer credentials or publication authority; its reports are private.
+PVC, hostPath, writer credentials or publication authority. Keep its report in an
+owned private directory on the existing `/tmp` emptyDir. After the exact CLI
+succeeds, transfer a bounded metadata-and-report frame through private exec,
+bookended by the Pod UID and container identity. Delete the Pod before persisting
+the root-private report; never place report JSON in container logs. Validate the
+exact Pod against production restricted admission before a new deployment cycle.
 After private/paused acceptance, restore the exact original nine source settings.
 Keep unqualified RFC errata blocked. Do not reset queues, reindex or run a separate
 source-provider live probe.
@@ -123,6 +128,8 @@ Prepare the admitted `91c7bcb7` fallback in the new journal, start its sole writ
 before reader and repeat complete paused/active, dual-stack, observation and late
 acceptance with its own source/probe identities. Its old failed attempts remain
 failed. Fallback failure withdraws applications without another restore or retry.
+Select the fallback environment before creating its Python process: the lifetime
+guard's `sitecustomize` imports runtime globals before command-line parsing.
 Report target acceptance, target failure with accepted fallback, and incomplete
 restoration/service recovery as distinct results.
 

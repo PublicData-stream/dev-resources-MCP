@@ -100,8 +100,12 @@ def supervise_fallback(controller, supervisor, command, timeout=7200):
     handlers = {number: signal.signal(number, lambda *_: interrupted.__setitem__(0, True))
                 for number in (signal.SIGINT, signal.SIGTERM)}
     try:
+        # sitecustomize imports acceptance_common before deploy.py can parse
+        # --runtime. Select fallback before interpreter startup while retaining
+        # the parent's target identity for its existing control callbacks.
+        child_environment = {**os.environ, 'DEVRES_ACCEPTANCE_RUNTIME': 'fallback'}
         process = subprocess.Popen(supervisor.parent_bound_command(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+            stderr=subprocess.PIPE, start_new_session=True, close_fds=True, env=child_environment)
         for name, stream in [('stdout', process.stdout), ('stderr', process.stderr)]:
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, name)
