@@ -10,6 +10,8 @@ acceptance. Older binaries reject the new schema; rollback requires the matching
 pre-upgrade database/archive backup. Policy 2 remains unchanged. See
 [exact recovery](terminal-recovery-design.md) for private command syntax and
 [local diagnostics](diagnostic-tooling.md) for bounded IPv4 reproduction.
+The [local verification record](recovery-diagnostics-acceptance.md) records completed
+fixture, PostgreSQL, pinned-edge and minikube checks and their operational limits.
 
 ## Attribution policy v2 and shared read admission
 
