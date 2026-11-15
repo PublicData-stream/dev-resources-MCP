@@ -90,6 +90,11 @@ evidence identity, notice completeness and policy checks remain qualification ga
 transient access failures can retry, while deterministic unsupported evidence or
 payload bounds remain withheld. Status counters describe target transitions within
 the current process and do not establish unique-document counts or corpus completion.
+Valid metadata containing copied prose without its exact notice dependency is
+classified as `qualification / unqualified_scope / blocked`; that condition does
+not establish malformed evidence. The classification does not permit copying the
+prose, change policy v2, or reset historical blocked targets. See the separate
+[errata qualification proposal](rfc-errata-qualification-design.md).
 
 ## MCP and transport
 

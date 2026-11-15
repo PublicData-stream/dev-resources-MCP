@@ -213,6 +213,111 @@ One full Python run failed an existing five-second S3 concurrency assertion in
 assertions; four tests were skipped. After the checker fetch delta, the final
 integrated suite passed all 986 tests with the same four skips.
 
+## 2026-11-15 bounded repair implementation
+
+The repair retains existing cache/resource limits, provider scheduling and retry
+ownership, permanent captures, immutable notice generations and attribution
+policy v2. It adds private rejection evidence and selected read-only inspection;
+it does not establish production recovery or complete RFC coverage.
+
+### Refreshed planning evidence
+
+Authorized read-only production inspection identified schema 18, S3 archive epoch
+2 and running build `0.1.0-build.33f3c730` from its image metadata. The effective
+serving cache limit was 34,359,738,368 bytes and the writer limit was
+68,719,476,736 bytes. A bounded filesystem census found 99,488,951 resident
+physical bytes in the serving cache and 8,463,508,864 in the writer cache; volume
+free space was approximately 778.7 GB. These are dated filesystem measurements,
+not rejection-time in-process reservation/pin accounting.
+
+The selected RFC 9000 TXT capture is
+`blake3:f561023b34507798258530bff923c41bab5d092d71b2cae7da484e6d5ce6d0e0`,
+with body
+`blake3:58f50168dc03a034edf54305bbf7dd71e1e1f91cb942d5e8e401ab8939890c1a`.
+Its complete committed binding declares 403,442 bytes, consistent with its
+SQL-retained descriptor's digest/size fields. The serving cache contained a
+regular file of that length. This SQL/filesystem inspection did not
+cryptographically verify body bytes or prove successful public retrieval. It does not reproduce the historical
+capacity rejection or justify raising the cache limit.
+
+The selected TXT and catalogue public source targets were recorded as ready,
+with matching current-policy subject fields and nonempty notice/receipt arrays.
+The selected errata source target was blocked at
+`qualification / invalid_evidence`, with one attempt. Background dataset targets
+blocked at `mapping / payload_bound` and pending retained/snapshot targets are
+different subjects; their state is not the public source target's cause. This
+inspection was not a replacement for sealed-generation or public-read acceptance.
+
+### Implemented boundaries
+
+Archive rejection events distinguish closed private reasons and available numeric
+accounting through the existing opt-in timing target. Physical pin/eviction totals
+deduplicate aliases and become explicitly unknown when bounded computation cannot
+finish. Public error codes, existing limit contexts and retry dispositions remain
+unchanged; no new persisted limit enum or migration is introduced.
+
+Private RFC inspection separates selected historical representations, current job
+captures and source heads. It verifies bounded capture/binding metadata and can
+inspect one exact RFC attribution target, without attaching a serving cache or
+requesting repair. Generation contract verification remains separate from a
+successful public qualification/read and any unperformed origin traversal.
+
+Synthetic valid errata reproduces the copied-prose guard's misleading
+`invalid_evidence` classification. The repair attaches
+`qualification / unqualified_scope / blocked` while preserving the original outer
+error code/message and withholding. It does not relabel historical rows or prove
+that a particular production export followed this fixture's exact guard branch.
+The [errata qualification proposal](rfc-errata-qualification-design.md) records
+the separate evidence and future policy requirements for positive qualification.
+
+The npm readable-notice checker correction already exists in `78d80c4`, as
+recorded in [npm acceptance](npm-acceptance-evidence.md). The earlier failed RFC
+task's OxiBelt result remains historical; reuse of the correction does not itself
+establish fresh integrated edge acceptance.
+
+### Verification boundary
+
+All checks below ran against the integrated working tree on local Linux amd64,
+with Rust 1.99.1 and locked resolution. Workspace Rust tests used four test
+threads; service-dependent fixtures ran through their separate scripts. All
+disposable state stayed below `/tmp`, with Cargo output at `/tmp/rust/target`.
+
+| Check | Result |
+| --- | --- |
+| Formatting and Clippy, workspace/all targets with warnings denied | Passed |
+| Workspace Rust tests | Passed; adapter unit suite: 920 passed, 80 service-dependent fixtures ignored |
+| Complete Python script suite | 987 run, 4 skipped; passed |
+| Current `cargo audit`, `cargo deny check`, vendored SDK projection | Passed; existing configured duplicate-version warnings retained |
+| Full PostgreSQL persistence script | Passed, including selected RFC read-only/schema/history/target/generation fixtures |
+| S3/RustFS script | 17 passed, including cold index reads, pinning, descriptor-only inspection and caller-bound rejection before object GET |
+| Pinned OxiBelt HTTP/WebTransport fixture gate | Passed, including npm source/resource readable-notice parity |
+| Minikube filesystem scenario | Passed: NodePort TCP/UDP, CNI isolation, PVC restart, coordinated restore, retained history and notices |
+| Minikube S3/credential-broker scenario | Passed: isolation, complete cache loss, database restore, cold history, and stopped broker-to-static-to-broker credential cutover |
+| Local documentation links and whitespace | Passed |
+
+Initial service startup attempts failed before application acceptance because the
+task-local launcher inherited a restrictive umask: container roots and staged
+executables had mode 0700. The first cluster attempt was interrupted after that
+cause was identified. The launcher and staging permissions were corrected, the
+staged executable hashes remained unchanged, and a fresh daemon/image completed
+the entire gate matrix above. No repository assertion or production configuration
+was changed to obtain a pass. Task-owned clusters and daemon were stopped and the
+temporary Docker filesystem was unmounted after the successful run.
+
+Independent reviewers inspected the integrated implementation and affected
+callers across MCP/API, Upstream/Storage and Security Boundaries. Protected-path
+evictability diagnostics and source-head/capture-key consistency findings were
+corrected and reviewed again. No review findings remain unresolved. These are
+agent reviews, not human GitHub approvals.
+
+No live provider acceptance, hosted native amd64/arm64 workflow, publication,
+production deployment, recovery batch or index rebuild was performed. The
+historical production capacity cause remains unproved, and policy v2 still
+withholds unqualified errata prose. A later approved production attempt must retain
+the fixed records, 160-call ceiling, 15-minute HTTP/reference deadline, fresh
+connector observations and source budgets described above. Local fixture success
+does not replace that separate acceptance or establish full-corpus qualification.
+
 Independent reviewers inspected the actual implementation and follow-up, covering
 MCP/API, Upstream/Storage and Security boundaries. These agent reviews are not
 human GitHub approvals. Local compilation, fixtures, direct provider references,
