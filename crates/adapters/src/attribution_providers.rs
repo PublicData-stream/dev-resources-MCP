@@ -2113,10 +2113,15 @@ fn metadata_markings<'a>(
                         || value.is_object()
                         || value.is_array())
                 {
-                    return Err(Error::new(
+                    return Err(AttributionFailure::new(
+                        AttributionPhase::Qualification,
+                        AttributionFailureReason::UnqualifiedScope,
+                        AttributionDisposition::Blocked,
+                    )
+                    .attach(Error::new(
                         "attribution_blocked",
                         "Copied package prose needs its exact source notice dependency.",
-                    ));
+                    )));
                 }
                 if matches!(
                     key.as_str(),
@@ -2948,6 +2953,112 @@ mod tests {
             AttributionDisposition::Cancelled
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn rfc_errata_prose_is_unqualified_instead_of_invalid_evidence() {
+        let base = json!({"errata_id":"1234","doc-id":"RFC09000","errata_status_code":"Verified","errata_type_code":"Technical"});
+        let url = "https://www.rfc-editor.org/api/v1/errata.json";
+        for field in ["orig_text", "correct_text"] {
+            let mut record = base.clone();
+            record[field] = json!("unchanged original report prose");
+            let body = serde_json::to_vec(&vec![record]).unwrap();
+            crate::rfc::source::parse_errata(&body).unwrap();
+            let error = qualification_error(metadata_notice("rfc", url, &body).unwrap_err());
+            assert_eq!(error.code, "attribution_blocked");
+            assert_eq!(
+                error.message,
+                "Copied package prose needs its exact source notice dependency."
+            );
+            assert_eq!(
+                AttributionFailure::from_error(&error),
+                Some(AttributionFailure::new(
+                    AttributionPhase::Qualification,
+                    AttributionFailureReason::UnqualifiedScope,
+                    AttributionDisposition::Blocked,
+                ))
+            );
+        }
+        for record in [
+            base.clone(),
+            json!({"errata_id":"1234","doc-id":"RFC09000","errata_status_code":"Verified","errata_type_code":"Technical","orig_text":"","correct_text":""}),
+        ] {
+            let body = serde_json::to_vec(&vec![record]).unwrap();
+            metadata_notice("rfc", url, &body).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rfc_errata_repair_withholds_prose_and_distinguishes_invalid_notice() {
+        use std::sync::atomic::Ordering;
+        let base = json!({"errata_id":"1234","doc-id":"RFC09000","errata_status_code":"Verified","errata_type_code":"Technical"});
+        let mut prose = base.clone();
+        prose["orig_text"] = json!("before");
+        prose["correct_text"] = json!("after");
+        let mut empty = base.clone();
+        empty["orig_text"] = json!("");
+        empty["correct_text"] = json!("");
+        let mut invalid_notice = base.clone();
+        invalid_notice["notice"] = json!("invalid\0notice");
+        for (record, expected_failure) in [
+            (prose, Some(AttributionFailureReason::UnqualifiedScope)),
+            (empty, None),
+            (base, None),
+            (
+                invalid_notice,
+                Some(AttributionFailureReason::InvalidEvidence),
+            ),
+        ] {
+            let body = serde_json::to_vec(&vec![record]).unwrap();
+            crate::rfc::source::parse_errata(&body).unwrap();
+            let (broker, count, stop, server) = changing_response(body.clone(), body.clone()).await;
+            let target = targets("rfc", &json!({"source_url":"https://www.rfc-editor.org/api/v1/errata.json","body_hash":crate::integrity::hash(&body)})).unwrap().pop().unwrap();
+            let result = repair(&target, &broker, CancellationToken::new()).await;
+            if let Some(reason) = expected_failure {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    AttributionFailure::from_error(&error),
+                    Some(AttributionFailure::new(
+                        AttributionPhase::Qualification,
+                        reason,
+                        AttributionDisposition::Blocked,
+                    ))
+                );
+            } else {
+                let generation = result.unwrap();
+                assert_eq!(generation.subject, target.subject);
+                assert_eq!(generation.notices.len(), 1);
+                assert_eq!(generation.receipts.len(), 1);
+                assert_eq!(
+                    generation.notices[0].evidence["scope"],
+                    "public_metadata_source_attribution"
+                );
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            stop.cancel();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rfc_errata_repair_rejects_changed_source_before_notice_qualification() {
+        let retained = br#"[{"errata_id":"1234","doc-id":"RFC09000","errata_status_code":"Verified","errata_type_code":"Technical","orig_text":"before","correct_text":"after"}]"#;
+        let changed = br#"[{"errata_id":"1234","doc-id":"RFC09000","errata_status_code":"Verified","errata_type_code":"Technical","orig_text":"before","correct_text":"different"}]"#;
+        let (broker, _, stop, server) = changing_response(changed.to_vec(), changed.to_vec()).await;
+        let target = targets("rfc", &json!({"source_url":"https://www.rfc-editor.org/api/v1/errata.json","body_hash":crate::integrity::hash(retained)})).unwrap().pop().unwrap();
+        let error = repair(&target, &broker, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            AttributionFailure::from_error(&error),
+            Some(AttributionFailure::new(
+                AttributionPhase::Qualification,
+                AttributionFailureReason::SourceMismatch,
+                AttributionDisposition::Blocked,
+            ))
+        );
         stop.cancel();
         server.await.unwrap();
     }
