@@ -92,3 +92,34 @@ recipe dispatch and unchanged old generation reads. Network tests must reject
 unapproved destinations. Promotion tests must demonstrate honest readiness for
 other providers. A later fixed-record live acceptance must still count unresolved
 errata content as incomplete; a correctly classified error is not content success.
+
+## Local evidence validation
+
+`verify-rfc-errata-evidence` implements local packaging checks for review, without
+configuration, a database connection, provider acquisition or publication:
+
+```sh
+devres-server verify-rfc-errata-evidence /tmp/errata-owned \
+  --manifest /tmp/errata-owned/manifest.json \
+  --output /tmp/errata-owned/report.json
+```
+
+The version-1 manifest contains `export_capture`, `export_body`, `member_body`,
+`errata_id`, `rfc`, optional `report_date`, `stream`, `contributor`, and a bounded
+`dependencies` list of `{role, body}` records. Hashes use BLAKE3. Bundle files are
+named by the bare 64-digit body digest and must be private owned regular files
+without links. `member_body` hashes the exact raw JSON member slice, including its
+original formatting; the entire export is independently hash checked and parsed
+with the existing RFC bounds. Date and contributor assertions must match the
+selected record's `submit_date` and `submitter_name`. Required review roles are
+`terms`, `applicability`, `original_notice`, `authorship`, `quoted_scope` and
+`contributed_scope`. Each dependency is hash checked, not interpreted as authority.
+
+The whole byte allowance is 64 MiB; individual dependencies are at most 1 MiB,
+manifest input 64 KiB and output 1 MiB. Missing declared metadata/roles yields
+`incomplete`; mismatched bytes/identities or unsafe inputs are rejected. Complete
+packaging yields `complete_for_review`, while `publication_authorized`,
+`applicability_approved` and `archive_binding_checked` remain false. Declaring a
+stream or supplying arbitrary terms bytes proves neither applicability nor an
+archive capture binding. Reports omit contributor names, prose, paths and terms
+bodies. Policy 2 and all earlier qualification recipes remain unchanged.

@@ -1,4 +1,6 @@
+mod collection_recovery_cli;
 mod diagnose_cli;
+mod errata_evidence_cli;
 mod offline_cli;
 mod recovery_cli;
 mod storage_worker;
@@ -41,6 +43,31 @@ async fn main() -> Result<(), ServerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::new(logging))
         .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|command| command == "verify-rfc-errata-evidence")
+    {
+        let arguments = errata_evidence_cli::parse(&args)?;
+        let output = devres_adapters::create_diagnosis_output(&arguments.output)?;
+        let bytes =
+            devres_adapters::local_evidence::read_private_input(&arguments.manifest, 64 * 1024)?;
+        let manifest =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid errata evidence manifest.")?;
+        let report = devres_adapters::rfc_errata_evidence::verify_errata_evidence(
+            &arguments.bundle,
+            &manifest,
+            &CancellationToken::new(),
+        )?;
+        collection_recovery_cli::write_report(output, &report)?;
+        println!("errata_evidence publication_authorized=false");
+        return Ok(());
+    }
+    if args
+        .first()
+        .is_some_and(|command| command == "recover-collection")
+    {
+        return run_collection_recovery_command(&args).await;
+    }
     if args
         .first()
         .is_some_and(|command| command == "recover-rustsec-attribution")
@@ -868,6 +895,94 @@ async fn main() -> Result<(), ServerError> {
     result?;
     policy_result?;
     Ok(())
+}
+
+async fn run_collection_recovery_command(args: &[String]) -> Result<(), ServerError> {
+    use collection_recovery_cli::{Action, Selection};
+    use devres_adapters::collection_recovery::{
+        RecoveryCheckpoint, RecoveryEvidenceReceipt, apply_npm_recovery, diagnose_npm_recovery,
+        run_npm_recovery, verify_npm_recovery_evidence,
+    };
+    let arguments = collection_recovery_cli::parse(args)?;
+    let output = devres_adapters::create_diagnosis_output(&arguments.output)?;
+    let config = Config::load(&arguments.config)
+        .await
+        .map_err(|_| "Recovery configuration unavailable.")?;
+    let evidence: Option<RecoveryEvidenceReceipt> = arguments
+        .evidence
+        .as_ref()
+        .map(|path| {
+            let bytes = devres_adapters::local_evidence::read_private_input(path, 1024 * 1024)?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| devres_domain::Error::invalid("Invalid recovery evidence receipt."))
+        })
+        .transpose()?;
+    let checkpoint: Option<RecoveryCheckpoint> = arguments
+        .checkpoint
+        .as_ref()
+        .map(|path| {
+            let bytes = devres_adapters::local_evidence::read_private_input(path, 1024 * 1024)?;
+            let mut value: RecoveryCheckpoint = serde_json::from_slice(&bytes).map_err(|_| {
+                devres_domain::Error::invalid("Invalid coordinated checkpoint receipt.")
+            })?;
+            value.receipt_digest = devres_adapters::integrity::hash(&bytes);
+            Ok::<_, devres_domain::Error>(value)
+        })
+        .transpose()?;
+    let cancel = CancellationToken::new();
+    let stopping = cancel.clone();
+    let signal = tokio::spawn(async move {
+        shutdown_signal().await;
+        stopping.cancel();
+    });
+    let result: Result<(), ServerError> = async {
+        match &arguments.selection {
+            Selection::Rfc(options) => {
+                let diagnosis = devres_adapters::diagnose_collection(
+                    &config.storage.database_url, &config.storage.blob_dir,
+                    config.storage.s3.clone(), options.clone(), cancel.clone(),
+                ).await?;
+                let report = serde_json::json!({"version":1,"provider":"rfc","eligible":false,"outcome":"ineligible","reason":"no_registered_proved_recovery_recipe","diagnosis":diagnosis});
+                collection_recovery_cli::write_report(output, &report)?;
+            }
+            Selection::Npm(options) => match arguments.action {
+                Action::Verify => {
+                    let artifact = arguments.artifact.as_deref().ok_or("Recovery artifact required.")?;
+                    let receipt = verify_npm_recovery_evidence(&config.storage.database_url, options, artifact, &cancel).await?;
+                    collection_recovery_cli::write_report(output, &receipt)?;
+                }
+                Action::DryRun => {
+                    let report = diagnose_npm_recovery(&config.storage.database_url, options, evidence.as_ref()).await?;
+                    collection_recovery_cli::write_report(output, &report)?;
+                }
+                Action::Apply => {
+                    let artifact = arguments.artifact.as_deref().ok_or("Recovery artifact required.")?;
+                    let evidence = evidence.as_ref().ok_or("Recovery evidence required.")?;
+                    let checkpoint = checkpoint.as_ref().ok_or("Recovery checkpoint required.")?;
+                    let report = apply_npm_recovery(&config.storage.database_url, options, evidence, artifact, checkpoint, &cancel).await?;
+                    collection_recovery_cli::write_report(output, &report)?;
+                }
+                Action::Run => return Err("Invalid recovery command selection.".into()),
+            },
+            Selection::Queued(operation) => {
+                let artifact = arguments.artifact.as_deref().ok_or("Recovery artifact required.")?;
+                devres_adapters::collection_recovery::inspect_npm_recovery_operation(&config.storage.database_url, operation).await?;
+                let store = devres_adapters::PgBlobStore::connect_archive_for_recovery(
+                    &config.storage.database_url, &config.storage.blob_dir, config.storage.s3.clone(),
+                ).await?;
+                let raw = devres_adapters::bulk::BulkArtifactStore::new(
+                    config.storage.blob_dir.join("npm/raw-artifacts"), config.npm.min_free_bytes,
+                )?;
+                let report = run_npm_recovery(&store, &raw, operation, artifact, &cancel).await?;
+                collection_recovery_cli::write_report(output, &report)?;
+            }
+        }
+        println!("collection_recovery report_written=true");
+        Ok(())
+    }.await;
+    signal.abort();
+    let _ = signal.await;
+    result
 }
 
 async fn migrate_storage_graphs(

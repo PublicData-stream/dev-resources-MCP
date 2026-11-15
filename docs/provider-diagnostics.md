@@ -4,7 +4,7 @@
 collectors or listeners, acquiring writer authority, or making provider requests.
 Supply reader-only database/S3 credentials through a private configuration file.
 Neither configuration nor arbitrary upstream text enters the report. This command
-supports active schemas 14 through 18 so diagnosis can precede a rollout.
+supports active schemas 14 through 19 so diagnosis can precede a rollout.
 
 ```sh
 devres-server diagnose-collection /etc/devres/reader.toml \
@@ -285,3 +285,7 @@ publication, or enqueue attribution work. Schema 14/15 rows have unknown failure
 phases and attempt times; inspection never migrates them or infers a phase from a
 coarse error code. Schema 16 adds bounded per-job failure context and claim time;
 this does not establish the cause of an older failure or authorize its recovery.
+
+Exact historical npm recovery selection is separate from `--latest-failure`.
+Use the [private recovery workflow](terminal-recovery-design.md); missing job
+history or legacy failure phase remains unknown and cannot authorize rearming.

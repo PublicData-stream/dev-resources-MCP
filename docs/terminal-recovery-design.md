@@ -1,147 +1,132 @@
-# Terminal recovery under attribution policy 2
+# Exact retained collection recovery under attribution policy 2
 
-Design recorded for deployment of `0.1.0-build.91c7bcb7`. This document adds no
-recovery command, executable recipe, batch authority or public API. The deployment
-keeps schema 18, attribution policy 2, existing resource limits and provider budgets.
-Its acceptance is separate from recovery of selected retained data. Existing RFC
-or npm gaps remain explicit unless the deployment introduces a regression.
+Recovery is private offline maintenance, never an MCP tool. The implementation
+adds schema 19 and retains policy 2. It does not authorize production application,
+source-provider traffic, a generic SQL reset, or publication of unqualified prose.
+The failed [91c7bcb7 deployment](../deploy/production/upgrade-91c7bcb7-evidence.md)
+remains failed evidence; these tools do not replay its consumed continuation.
 
-## Existing behavior and eligibility
+## Durable identities and eligibility
 
-Attribution targets and source-collection jobs are different state machines. A
-successful collector tick, new snapshot or queue transition does not prove a
-selected historical capture is readable with complete attribution.
+Schema 19 adds immutable npm advisory-job versions, immutable recovery admissions,
+and a separate fenced recovery-work queue. The job ID is its acquisition snapshot;
+versions bind the exact export, processor, cursor, counters and failure context.
+Job replacement and history insertion share the primary owner transaction. Terminal
+failure context is recorded with that job, independently of optional diagnostics.
+Migration retains only the existing current job and does not invent superseded
+history or authenticated failure provenance. Include all three tables in reader
+SELECT grants, coordinated backups and integrity verification.
 
-| Selected state or cause | Existing behavior in the target release | Recovery disposition |
-| --- | --- | --- |
-| Current-policy attribution `pending` or `retry`, with due time reached | The normal sole writer can claim work for enabled providers. | Observe ordinary repair; no rearm. Future retries remain scheduled. |
-| Attribution `running` with expired lease | The normal writer can issue a new fenced claim; the previous claim cannot publish. | Observe reclamation and completion, preserving identity and attempts. A live lease is ineligible. |
-| Attribution `ready` | Existing qualification and public-read checks apply. | Never reset it to diagnose an archive rejection or unrelated blocked subject. |
-| RFC representation job `failed` and due | Ordinary HTTPS collection retries its canonical job key, retaining an earlier capture when present. | Observe the existing collector. A current job head does not replace an explicitly selected historical snapshot or capture. |
-| RFC source target `blocked / qualification / invalid_evidence` from an older attempt | Historical state remains unchanged. | Unknown legacy cause is ineligible for automatic reinterpretation. Establish the exact failing branch first. |
-| RFC errata copied prose without its exact applicable notice dependency | New attempts classify `qualification / unqualified_scope / blocked`; content remains withheld. | Ineligible under this design. Classification repair does not qualify rights or rearm historical rows. |
-| RFC dataset target `blocked / mapping / payload_bound` | Retained oversized evidence remains blocked under the unchanged bounds. | Ineligible. A different ready source target does not remove this bound; do not split, truncate or raise limits as recovery. |
-| Other RFC `blocked` mapping or qualification target | Public enqueue preserves status and only increases priority. | Candidate for future design only if a reviewed exact recipe can prove support under policy 2 with unchanged subject/evidence and bounds. |
-| npm advisory job unfinished, with a newly validated `capacity / materialization / deadline` failure | Existing transient retry preserves the retained artifact and committed cursor. | Observe ordinary resumption after its due time; no job reset or export reacquisition as a retry shortcut. |
-| npm advisory job terminal (`done=true`, `failed` set), including historical unclassified capacity | The new exception does not revive it. A later ordinary refresh may acquire a new job/export. | No implemented rearm. A new acquisition is distinct from recovery of the historical job. |
-| npm terminal integrity, invalid-input, processing-gap or other deterministic bound failure | Existing terminal treatment remains. | Ineligible without a separately validated cause-specific implementation; missing rights or corrupt evidence cannot be waived. |
+`npm-materialization-deadline-v1` accepts only an exact terminal advisory job with
+an authenticated `capacity / materialization / deadline` cause, a compatible
+processor (v1 is permanently pinned to processor 1), intact export and verified
+committed prefix. A later live scanner requires explicit retained recipe dispatch;
+historical journal verification does not follow the live processor constant. Unknown legacy capacity,
+missing historical state, integrity/processing/bounds failures, changed evidence,
+active participants or ambiguous publication are ineligible. An operator-supplied
+cause string, latest diagnostic timestamp or matching artifact hash is insufficient.
+The incident's legacy-unknown npm report therefore does not establish eligibility.
 
-Ordinary attribution claims consider only current-policy `pending`, `retry` and
-expired `running` rows. Re-enqueueing an existing target does not reset its status,
-failure, attempts or generation. The existing exact RustSec recovery command has
-its own narrow recipe and cannot operate on RFC or npm subjects; no RustSec apply
-is included in this design. See [operations](operations.md#exact-rustsec-attribution-recovery).
+Superseded retained jobs can be selected without replacing the current job. Apply
+adds a separate recovery operation. Run scans only its exact retained export,
+continues its own cursor, and reconciles deterministic partially retained member
+writes. It never acquires a newer export or updates acquisition validators. Its
+historical publication performs normal membership/integrity/readiness checks but
+never promotes `default-advisories` or modifies the newer current job. Snapshot
+publication and recovery completion commit together. Select the resulting explicit
+snapshot for readback; a newer default is not evidence of historical recovery.
 
-## Read-only selection and evidence
+## Private command workflow
 
-Use the released private [provider inspector](provider-diagnostics.md) with
-reader-only database/S3 credentials supplied through a private configuration file.
-The metadata/evidence budget is at most 64 MiB and five minutes; reports are at
-most 1 MiB in owned mode-0700 directories below `/tmp`, with mode-0600 files.
-Do not overwrite reports, follow symlinks, attach serving caches or acquire writer
-authority. Reports contain bounded public identities and closed diagnostics, not
-source bodies, credentials, configuration, raw errors or request-only audit data.
+Use reader credentials for inspection and writer credentials only for separately
+admitted offline changes. Apply/run additionally require offline operator authority
+to execute `pg_control_system()` for the checkpoint identity check; runtime database
+roles need not be expanded. Configuration supplies credentials; commands never take
+provider URLs or passwords. Every invocation selects one exact job/version. All
+local inputs and reports require owned private directories below `/tmp`, regular
+files, restrictive permissions and no symlink ancestors. Reports are create-new,
+mode 0600, bounded to 1 MiB and contain no evidence bodies or request-only inputs.
 
-RFC selection requires one immutable snapshot and one or two canonical job keys;
-an optional exact attribution-target ID adds state/generation inspection. The
-supported forms are `rfc:text:NUMBER`, `rfc:format:NUMBER:FORMAT` and
-`rfc:rsync:NUMBER:FORMAT`. RFC rejects `--latest-failure`. Freeze the selected
-snapshot's capture/body references separately from current job captures and heads.
-Record attempts, classification, due/lease state, sealed subject, policy and stored
-generation identity. Verified metadata is distinct from body/engine readability,
-origin traversal and public qualification; the inspector leaves unperformed work
-explicitly `not_checked`.
+```sh
+devres-server recover-collection verify-evidence /etc/devres/reader.toml \
+  --provider npm --job-id blake3:JOB_HEX --revision REVISION \
+  --recipe npm-materialization-deadline-v1 \
+  --artifact /tmp/recovery/export.zip --output /tmp/recovery/evidence.json
 
-npm selection is `--provider npm --latest-failure`; it accepts no exact job,
-snapshot or attribution-target selector. It reports bounded current job, retry,
-diagnostic, default-publication and referenced-evidence metadata. Legacy phase
-evidence remains unknown. It does not download the export or verify every ZIP
-member. If the historical terminal job was superseded, this interface cannot
-select it; a future recipe must reject missing authoritative historical state
-rather than infer it from the current default, a diagnostic timestamp or a reused
-artifact hash.
+devres-server recover-collection dry-run /etc/devres/reader.toml \
+  --provider npm --job-id blake3:JOB_HEX --revision REVISION \
+  --recipe npm-materialization-deadline-v1 \
+  --evidence /tmp/recovery/evidence.json --output /tmp/recovery/proposal.json
+```
 
-Read-only diagnosis may read retained S3 descriptors/manifests. It performs no
-provider acquisition, collection, repair enqueue or publication. The deployment
-does not add fixed-provider live probes. Existing automatic collectors retain
-their admitted settings and normal budgets.
+Replace every placeholder with an exact retained identity. Evidence verification
+hashes the entire local export and checks ZIP/cursor/membership under existing
+artifact/scanner bounds. It makes no provider requests or serving-cache writes.
+The 64-MiB private diagnostic metadata allowance is not the bulk export ceiling.
+Dry-run is metadata-only, repeatable-read, and never hydrates bytes or changes work.
+An evidence receipt alone is not authority: apply independently verifies the bytes.
 
-## Proposed exact-target recipes; not implemented
+Before apply, stop all serving, collection and maintenance participants and obtain
+a coordinated database/archive checkpoint with a successful restore rehearsal.
+The private checkpoint JSON contains version 1, schema 19, store ID, archive epoch,
+PostgreSQL system identifier, `coordinated=true`, and `restoration_verified=true`.
+The CLI hashes the exact receipt bytes; optional `receipt_digest` is replaced with
+that digest. Apply checks the current database/archive identity and requires the
+operator's checkpoint assertions. It does not independently repeat the backup or
+restore rehearsal, and supplies no independent S3 bucket-loss guarantee.
 
-A future implementation must register immutable, cause-specific recipe versions
-and review their actual affected callers before exposing an apply path. A generic
-SQL reset, a provider-wide retry switch and a command that accepts arbitrary URLs
-are excluded. Dry-run does no repair writes, provider I/O or cache materialization.
-It returns eligible/ineligible/incomplete, finite reasons, exact identities and a
-digest of the complete authoritative state that apply would consume.
+```sh
+devres-server recover-collection apply /etc/devres/writer.toml \
+  --provider npm --job-id blake3:JOB_HEX --revision REVISION \
+  --recipe npm-materialization-deadline-v1 \
+  --artifact /tmp/recovery/export.zip --evidence /tmp/recovery/evidence.json \
+  --expected-state blake3:STATE_HEX --operation-id blake3:OPERATION_HEX \
+  --checkpoint /tmp/recovery/checkpoint.json --output /tmp/recovery/admitted.json
 
-- An npm retained-advisory recipe could consider only an exact terminal job whose
-  authenticated failure context proves the corrected materialization-deadline
-  case. Bind the job, export digest/size, processing version, snapshot/membership,
-  committed cursor and counters, failure/retry state and publication boundary.
-  Verify the retained artifact and cursor under existing bounds before proposing
-  resumption. Unknown old `capacity` errors, missing job history, incompatible
-  processors, partial/unverifiable artifacts and ambiguous existing publication
-  are ineligible. Never replay already committed members or replace the export
-  with newer bytes.
-- An RFC mapping recipe could consider only an exact blocked target with no live
-  claim or stored generation, a proven repaired compiler/mapping defect, and
-  exact retained source dependencies now supported by the existing policy-2
-  compiler. Bind the subject/fingerprint, evidence, policy, prior sealed state,
-  source snapshot/capture/body and every required origin dependency. Compilation
-  must preserve exact identities, rights checks and bounds. Unknown failures,
-  changed evidence, payload bounds, missing notices, unqualified errata prose and
-  a request to replace history with a current head are ineligible.
+devres-server recover-collection run /etc/devres/writer.toml \
+  --provider npm --operation-id blake3:OPERATION_HEX \
+  --artifact /tmp/recovery/export.zip --output /tmp/recovery/run-1.json
+```
 
-Future apply requires a fresh coordinated database/archive recovery checkpoint,
-stopped serving readers, collection writers and maintenance participants, explicit
-writer credentials, exclusive lifecycle and publication-owner fences, and an
-explicit expected-state digest plus policy/recipe identities from dry-run. Recheck
-all admission conditions inside the transaction; any state, priority, cursor,
-publication, policy or ownership change invalidates the proposal.
+Apply rechecks expected state and publication boundaries inside exclusive
+lifecycle/publication ownership, atomically recording immutable admission and
+queued work. Repeating the exact operation reconciles its journal; a lost commit
+response must be reconciled before a different operation is attempted. Run requires
+exclusive offline ownership and executes one bounded scanner slice. A yielded
+slice may be continued with the same operation and a new report path. Cancellation
+preserves committed progress. A transition or yielded receipt does not establish
+successful publication or readable notices.
 
-Journal the previous sealed state, recipe, exact identities and operation intent
-immutably, and commit that journal with the narrowly defined transition. Retain
-attempt history, captures, mappings, generations and notice resources. A unique
-target/policy/recipe identity supplies idempotence; a lost commit response must be
-reconciled through that identity before retrying. Preserve historical recipe
-verification indefinitely. Cancellation, ownership loss or failure must preserve
-the previous committed state or expose an uncertain outcome requiring review;
-never silently replay an uncertain mutation.
+## RFC and errata boundaries
 
-An apply receipt would prove only the transition. Subsequent acquisition and
-qualification remain owned by the normal writer and source budgets. Any resumed
-moving-source request must satisfy the recipe's exact retained-byte requirements;
-newer successful bytes do not repair a different historical capture. Receipt and
-journal formats, execution limits, selected-target count and any storage schema
-change require a future reviewed implementation and operational authorization.
-No apply syntax or runnable reset procedure is supplied here.
+No proved RFC mapping/compiler defect or positive RFC recovery recipe is currently
+registered. Exact RFC selection is available through a read-only dry-run:
 
-## Verification and acceptance boundaries
+```sh
+devres-server recover-collection dry-run /etc/devres/reader.toml \
+  --provider rfc --snapshot blake3:SNAPSHOT_HEX --job-key rfc:text:9000 \
+  --attribution-target blake3:TARGET_HEX --output /tmp/recovery/rfc.json
+```
 
-Future behavior fixtures must cover eligible and ineligible exact subjects,
-changed expected state, wrong policy/recipe, missing or corrupt evidence, live
-claims, existing generations/publication, stale cursor, changed export, duplicate
-members, foreign owner, cancellation, transaction rollback, lost commit response
-and idempotent reconciliation. Verify reader-only dry-run, no provider I/O during
-selection/apply, no arbitrary destination admission, immutable journals, unchanged
-limits and no request-only audit persistence. Test replay after restart and
-coordinated restore with historical notices retained. PostgreSQL, S3 cache-loss,
-HTTP/WebTransport and minikube fixtures remain separate from production evidence.
+The result is explicitly ineligible. Registering a positive recipe requires the
+exact faulty branch, retained source/dependency evidence, a regression proving its
+correction, complete qualification, unchanged policy/bounds, and independent review.
+Pure mapping compilation or an improved error classification is not qualification.
+Unknown failures, payload bounds, missing notices and unqualified errata prose
+remain blocked. Ordinary due retries and expired claims retain normal writer
+ownership; queue progress alone does not prove their content recovered.
 
-For ordinary recovery exercised during this deployment, record the same selected
-identities before and after resumption. Require a fenced claim and successful
-completion for representative due retries/expired leases when observed; subjects
-that do not complete remain incomplete. Require capture-fixed public reads and
-all readable-notice pages for claimed content recovery. Compare immutable bytes,
-body/generation identities and historical notice readback, separately from current
-availability, queue counts or diagnostic classifications. No additional public
-provider test traffic or terminal recovery batch is authorized by this document.
+The local [errata evidence validator](rfc-errata-qualification-design.md#local-evidence-validation)
+checks packaging and exact selected bytes for review. Policy 2 remains active;
+complete packaging still has `publication_authorized=false`. No policy 3 promotion,
+new destination admission or source acquisition is implemented by this workflow.
 
-RFC errata rights qualification cannot be delivered by this policy-2 recovery
-design. The separate [errata qualification proposal](rfc-errata-qualification-design.md)
-requires approved applicable rights evidence and a newly registered immutable
-policy before positive qualification. Neither public availability, technical
-verification status nor an RFC's original notice establishes that permission.
-Retain the blocked policy-2 target and its historical evidence. Correctly reported
-unavailability is an honest remaining gap, not successful content recovery.
+## Acceptance
+
+Fixtures must cover schema-18 preservation on upgrade, immutable history/journals,
+atomic cause linkage, wrong expected state/recipe/processor, corrupt/missing bytes,
+partial member writes, stale ownership, cancellation/restart and lost-commit
+reconciliation. Execute a superseded job and read its historical snapshot while
+asserting the newer current job/default remain identical. Keep PostgreSQL, archive
+cache-loss/restore, IPv4 HTTP/WebTransport and minikube outcomes distinct from
+production repair or whole-corpus acceptance. Production application is separate.
