@@ -56,7 +56,104 @@ fn integrity() -> Error {
 fn capacity() -> Error {
     Error::capacity("Local archive working set exceeds its capacity.")
 }
+/// Private discriminators must not become collector limit kinds: attribution
+/// retry policy and older readers depend on the existing public context.
+#[derive(Clone, Copy)]
+enum RejectionReason {
+    CallerBytes,
+    TrackedFiles,
+    ScanEntries,
+    ScanDepth,
+    ScanDeadline,
+    AccountingOverflow,
+    ReconcileDeadline,
+    EvictionDeadline,
+    CacheWorkingSet,
+    FreeReserve,
+    MaterializationDeadline,
+    FlightRegistry,
+    DirectoryFiles,
+    DirectoryBytes,
+    BindingBytes,
+}
+impl RejectionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CallerBytes => "caller_bytes",
+            Self::TrackedFiles => "tracked_files",
+            Self::ScanEntries => "scan_entries",
+            Self::ScanDepth => "scan_depth",
+            Self::ScanDeadline => "scan_deadline",
+            Self::AccountingOverflow => "accounting_overflow",
+            Self::ReconcileDeadline => "reconcile_deadline",
+            Self::EvictionDeadline => "eviction_deadline",
+            Self::CacheWorkingSet => "cache_working_set",
+            Self::FreeReserve => "free_reserve",
+            Self::MaterializationDeadline => "materialization_deadline",
+            Self::FlightRegistry => "flight_registry",
+            Self::DirectoryFiles => "directory_files",
+            Self::DirectoryBytes => "directory_bytes",
+            Self::BindingBytes => "binding_bytes",
+        }
+    }
+}
+
+fn rejection(
+    reason: RejectionReason,
+    observed: Option<u64>,
+    maximum: Option<u64>,
+    cache: Option<&Cache>,
+) {
+    rejection_protected(reason, observed, maximum, cache, None);
+}
+
+fn rejection_protected(
+    reason: RejectionReason,
+    observed: Option<u64>,
+    maximum: Option<u64>,
+    cache: Option<&Cache>,
+    protected: Option<&[PathBuf]>,
+) {
+    if !tracing::enabled!(target: "devres_private_timings", tracing::Level::TRACE) {
+        return;
+    }
+    // No filesystem access or additional lock acquisition. The optional physical
+    // accounting walk is capped independently of corpus size; partial totals are
+    // unknown rather than misleading lower bounds.
+    // Without the operation's protected paths we cannot claim an exact
+    // evictable total, even if all currently known pin counts are zero.
+    let physical = protected
+        .and_then(|protected| cache.and_then(|cache| cache.private_physical_totals(protected)));
+    tracing::trace!(
+        target: "devres_private_timings",
+        rejection_reason = reason.as_str(),
+        observed_known = observed.is_some(),
+        observed,
+        maximum_known = maximum.is_some(),
+        maximum,
+        cache_accounting_known = cache.is_some(),
+        resident_bytes = cache.map(|cache| cache.used_bytes),
+        reserved_bytes = cache.map(|cache| cache.reserved_bytes),
+        tracked_files = cache.map(|cache| cache.paths.len()),
+        physical_objects = cache.map(|cache| cache.objects.len()),
+        physical_totals_known = physical.is_some(),
+        pinned_bytes = physical.map(|totals| totals.0),
+        evictable_bytes = physical.map(|totals| totals.1),
+        "archive admission rejected"
+    );
+}
+
+fn rejected(
+    reason: RejectionReason,
+    observed: Option<u64>,
+    maximum: Option<u64>,
+    cache: Option<&Cache>,
+) -> Error {
+    rejection(reason, observed, maximum, cache);
+    capacity()
+}
 fn materialization_deadline() -> Error {
+    rejection(RejectionReason::MaterializationDeadline, None, None, None);
     limited(
         Error::capacity("Archive materialization deadline exceeded."),
         Phase::Materialization,
@@ -300,6 +397,44 @@ fn mutable_git(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root).is_ok_and(|relative| relative.components().any(|part| matches!(part, Component::Normal(name) if name == "history.git" || name == "registry.git")))
 }
 impl Cache {
+    fn private_physical_totals(&self, protected: &[PathBuf]) -> Option<(u64, u64)> {
+        const MAX_PATHS: usize = 4096;
+        if self.paths.len() > MAX_PATHS
+            || self.objects.len() > MAX_PATHS
+            || protected.len() > MAX_PATHS
+        {
+            return None;
+        }
+        let protected: std::collections::BTreeSet<_> =
+            protected.iter().map(PathBuf::as_path).collect();
+        let mut visited = 0_usize;
+        let mut pinned = 0_u64;
+        let mut evictable = 0_u64;
+        for object in self.objects.values() {
+            let mut has_pin = false;
+            let mut all_evictable = !object.paths.is_empty();
+            for path in &object.paths {
+                visited = visited.checked_add(1)?;
+                if visited > MAX_PATHS {
+                    return None;
+                }
+                match self.files.get(path) {
+                    Some(entry) => {
+                        has_pin |= entry.pins > 0;
+                        all_evictable &= entry.pins == 0 && !protected.contains(path.as_path());
+                    }
+                    None => all_evictable = false,
+                }
+            }
+            if has_pin {
+                pinned = pinned.checked_add(object.bytes)?;
+            } else if all_evictable {
+                evictable = evictable.checked_add(object.bytes)?;
+            }
+        }
+        Some((pinned, evictable))
+    }
+
     fn scan(root: &Path) -> Result<Self> {
         fn visit(
             cache: &mut Cache,
@@ -308,16 +443,41 @@ impl Cache {
             entries: &mut usize,
             deadline: Instant,
         ) -> Result<()> {
-            if depth > 128 || Instant::now() >= deadline {
-                return Err(capacity());
+            if depth > 128 {
+                return Err(rejected(
+                    RejectionReason::ScanDepth,
+                    Some(depth as u64),
+                    Some(128),
+                    Some(cache),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(rejected(
+                    RejectionReason::ScanDeadline,
+                    None,
+                    None,
+                    Some(cache),
+                ));
             }
             for entry in std::fs::read_dir(directory).map_err(|_| unavailable())? {
                 *entries = entries
                     .checked_add(1)
                     .filter(|v| *v <= MAX_LOCAL_ENTRIES)
-                    .ok_or_else(capacity)?;
+                    .ok_or_else(|| {
+                        rejected(
+                            RejectionReason::ScanEntries,
+                            entries.checked_add(1).map(|value| value as u64),
+                            Some(MAX_LOCAL_ENTRIES as u64),
+                            Some(cache),
+                        )
+                    })?;
                 if Instant::now() >= deadline {
-                    return Err(capacity());
+                    return Err(rejected(
+                        RejectionReason::ScanDeadline,
+                        None,
+                        None,
+                        Some(cache),
+                    ));
                 }
                 let entry = entry.map_err(|_| unavailable())?;
                 let path = entry.path();
@@ -435,14 +595,19 @@ impl Cache {
             self.detach(path)?;
         }
         if !self.paths.contains_key(path) && self.paths.len() >= MAX_LOCAL_FILES {
-            return Err(capacity());
+            return Err(rejected(
+                RejectionReason::TrackedFiles,
+                Some(self.paths.len() as u64 + 1),
+                Some(MAX_LOCAL_FILES as u64),
+                Some(self),
+            ));
         }
         let previous = self.objects.get(&physical).map_or(0, |object| object.bytes);
         self.used_bytes = self
             .used_bytes
             .checked_sub(previous)
             .and_then(|bytes| bytes.checked_add(metadata.len()))
-            .ok_or_else(capacity)?;
+            .ok_or_else(|| rejected(RejectionReason::AccountingOverflow, None, None, Some(self)))?;
         let object = self.objects.entry(physical).or_insert_with(|| LocalObject {
             bytes: 0,
             paths: Default::default(),
@@ -475,7 +640,12 @@ impl Cache {
         let paths: Vec<_> = self.paths.keys().cloned().collect();
         for path in paths {
             if Instant::now() >= deadline {
-                return Err(capacity());
+                return Err(rejected(
+                    RejectionReason::ReconcileDeadline,
+                    None,
+                    None,
+                    Some(self),
+                ));
             }
             match std::fs::symlink_metadata(&path) {
                 Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
@@ -542,6 +712,13 @@ fn admit_local_until(
     candidates.sort_unstable();
     for (_, path) in candidates {
         if Instant::now() >= deadline {
+            rejection_protected(
+                RejectionReason::EvictionDeadline,
+                None,
+                None,
+                Some(cache),
+                Some(protected),
+            );
             return Err(capacity());
         }
         if fits(cache) && has_space(cache)? {
@@ -557,6 +734,16 @@ fn admit_local_until(
     if fits(cache) && has_space(cache)? {
         Ok(())
     } else if !fits(cache) {
+        rejection_protected(
+            RejectionReason::CacheWorkingSet,
+            cache
+                .used_bytes
+                .checked_add(cache.reserved_bytes)
+                .and_then(|bytes| bytes.checked_add(extra)),
+            Some(limit),
+            Some(cache),
+            Some(protected),
+        );
         Err(limited(
             capacity(),
             Phase::Materialization,
@@ -569,6 +756,17 @@ fn admit_local_until(
         ))
     } else {
         let free = fs2::available_space(root).map_err(|_| unavailable())?;
+        rejection_protected(
+            RejectionReason::FreeReserve,
+            Some(free),
+            Some(
+                extra
+                    .saturating_add(cache.reserved_bytes)
+                    .saturating_add(64 * 1024 * 1024),
+            ),
+            Some(cache),
+            Some(protected),
+        );
         Err(limited(
             capacity(),
             Phase::Materialization,
@@ -915,7 +1113,12 @@ impl MaterializationControl {
                 if flights.len() >= MAX_LOCAL_FILES {
                     flights.retain(|_, value| value.strong_count() > 0);
                     if flights.len() >= MAX_LOCAL_FILES {
-                        return Err(capacity());
+                        return Err(rejected(
+                            RejectionReason::FlightRegistry,
+                            Some(flights.len() as u64 + 1),
+                            Some(MAX_LOCAL_FILES as u64),
+                            None,
+                        ));
                     }
                 }
                 let flight = Arc::new(tokio::sync::Mutex::new(()));
@@ -973,10 +1176,14 @@ impl DownloadReservation {
             &[path.to_owned()],
             deadline,
         )?;
-        cache.reserved_bytes = cache
-            .reserved_bytes
-            .checked_add(bytes)
-            .ok_or_else(capacity)?;
+        cache.reserved_bytes = cache.reserved_bytes.checked_add(bytes).ok_or_else(|| {
+            rejected(
+                RejectionReason::AccountingOverflow,
+                None,
+                None,
+                Some(&cache),
+            )
+        })?;
         Ok(Self {
             archive: archive.clone(),
             bytes,
@@ -1388,7 +1595,7 @@ impl Archive {
         {
             let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
             let mut owner = owner_handle.lock().await;
-            sqlx_core::query::query("INSERT INTO devres_archive_file(path,digest,bytes,device,inode,epoch,evidence) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(path) DO NOTHING").bind(&relative).bind(digest).bind(i64::try_from(bytes).map_err(|_|capacity())?).bind(binding.device.to_string()).bind(binding.inode.to_string()).bind(self.epoch).bind(&encoded).execute(&mut *owner).await.map_err(|_|unavailable())?;
+            sqlx_core::query::query("INSERT INTO devres_archive_file(path,digest,bytes,device,inode,epoch,evidence) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(path) DO NOTHING").bind(&relative).bind(digest).bind(i64::try_from(bytes).map_err(|_|rejected(RejectionReason::BindingBytes, Some(bytes), Some(i64::MAX as u64), None))?).bind(binding.device.to_string()).bind(binding.inode.to_string()).bind(self.epoch).bind(&encoded).execute(&mut *owner).await.map_err(|_|unavailable())?;
         }
         // Intent remains durable on cancellation or an ambiguous network failure.
         self.remote
@@ -1468,7 +1675,12 @@ impl Archive {
             return if optional { Ok(None) } else { Err(integrity()) };
         };
         if binding.bytes > max_bytes {
-            return Err(capacity());
+            return Err(rejected(
+                RejectionReason::CallerBytes,
+                Some(binding.bytes),
+                Some(max_bytes),
+                None,
+            ));
         }
         let remote = stage("head", || {
             run_bounded(deadline, cancel, self.remote.head(&binding.object_key()?))
@@ -1593,9 +1805,14 @@ impl Archive {
     }
     async fn children(&self, path: &str, max_files: usize) -> Result<Vec<Binding>> {
         let prefix = format!("{path}/");
-        let rows:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT evidence FROM devres_archive_file WHERE complete AND starts_with(path,$1) ORDER BY path LIMIT $2").bind(prefix).bind(i64::try_from(max_files.saturating_add(1)).map_err(|_|capacity())?).fetch_all(&self.pool).await.map_err(|_|unavailable())?;
+        let rows:Vec<String>=sqlx_core::query_scalar::query_scalar("SELECT evidence FROM devres_archive_file WHERE complete AND starts_with(path,$1) ORDER BY path LIMIT $2").bind(prefix).bind(i64::try_from(max_files.saturating_add(1)).map_err(|_|rejected(RejectionReason::DirectoryFiles, u64::try_from(max_files.saturating_add(1)).ok(), Some(i64::MAX as u64), None))?).fetch_all(&self.pool).await.map_err(|_|unavailable())?;
         if rows.len() > max_files {
-            return Err(capacity());
+            return Err(rejected(
+                RejectionReason::DirectoryFiles,
+                Some(rows.len() as u64),
+                Some(max_files as u64),
+                None,
+            ));
         }
         rows.into_iter()
             .map(|value| {
@@ -1750,7 +1967,14 @@ pub fn materialize_directory(
         total
             .checked_add(binding.bytes)
             .filter(|bytes| *bytes <= max_bytes)
-            .ok_or_else(capacity)
+            .ok_or_else(|| {
+                rejected(
+                    RejectionReason::DirectoryBytes,
+                    total.checked_add(binding.bytes),
+                    Some(max_bytes),
+                    None,
+                )
+            })
     })?;
     // Scoped workers are always joined. An error cancels the sibling's I/O,
     // then drains its result before releasing any successful file leases.
@@ -1930,7 +2154,12 @@ pub fn with_write_budget<T>(
         }
         let mut cache = lock_cache(&archive).map_err(mapped)?;
         if !cache.paths.contains_key(path) && cache.paths.len() >= MAX_LOCAL_FILES {
-            return Err(mapped(capacity()));
+            return Err(mapped(rejected(
+                RejectionReason::TrackedFiles,
+                Some(cache.paths.len() as u64 + 1),
+                Some(MAX_LOCAL_FILES as u64),
+                Some(&cache),
+            )));
         }
         archive
             .admit(&mut cache, bytes, &[path.to_owned()])
@@ -2318,3 +2547,7 @@ impl Archive {
 #[cfg(test)]
 #[path = "durable_archive/materialization_tests.rs"]
 mod materialization_tests;
+
+#[cfg(test)]
+#[path = "durable_archive/rejection_tests.rs"]
+mod rejection_tests;

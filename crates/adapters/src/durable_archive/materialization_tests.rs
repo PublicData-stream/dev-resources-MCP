@@ -280,6 +280,19 @@ async fn s3_materialization_parallel_singleflight_cancellation_and_authority() {
         .unwrap();
         evict(path);
     }
+    // Caller size rejection stays generic/retryable and must precede object GET.
+    let selected = paths[0].clone();
+    let before = state.gets.load(Ordering::SeqCst);
+    let error = tokio::task::spawn_blocking(move || {
+        materialize_file(&selected, 4095, deadline(), &CancellationToken::new())
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code, "capacity");
+    assert!(error.details.is_none());
+    assert_eq!(state.gets.load(Ordering::SeqCst), before);
+    assert!(!paths[0].exists());
     state.enabled.store(true, Ordering::SeqCst);
     let first = read(paths[0].clone(), CancellationToken::new());
     let second = read(paths[1].clone(), CancellationToken::new());

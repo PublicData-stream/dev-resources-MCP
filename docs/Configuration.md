@@ -4,9 +4,23 @@ Private archive/attribution stage timings are disabled by default. Set the
 operator environment variable `DEVRES_PRIVATE_TIMINGS=1` for a bounded diagnostic
 window. Only the fixed `devres_private_timings` target is enabled alongside normal
 server logs; arbitrary `RUST_LOG` directives are not accepted. Fields contain only
-stage/provider enums, durations, eligible age and outcomes, never source paths,
-request/audit inputs or credentials. Disable the switch after collecting the
+stage/provider enums, durations, eligible age and outcomes. Archive rejection
+events additionally contain closed reasons, observed/allowed bounds and available
+numeric cache accounting. Pinned/evictable totals deduplicate physical objects and
+remain unknown if bounded accounting cannot finish. These events contain no source
+paths, request/audit inputs or credentials. They do not change public error codes,
+retry disposition or persisted limit enums. Disable the switch after collecting the
 needed observation to avoid retaining unnecessary per-operation logs.
+
+Rejection events use `rejection_reason`, `observed_known`, `maximum_known` and
+optional numeric `observed`/`maximum`. `cache_accounting_known` gates resident and
+reserved bytes plus tracked-file/physical-object counts; `physical_totals_known`
+gates pinned and evictable bytes. Physical totals are unknown above 4,096 tracked
+paths/objects or when operation protection is unknown. These are in-memory
+logical-byte counters, not filesystem allocated blocks. For `free_reserve`, the
+comparison bound is the required minimum free space; other numeric bounds are
+upper limits. A separate inspector process cannot recover these serving-process
+counters or reproduce an earlier rejection from current filesystem usage.
 
 Run `devres-server serve CONFIG.toml` and `devres-server collect CONFIG.toml` as
 separate serving and writer workloads. The old `devres-server CONFIG.toml`
