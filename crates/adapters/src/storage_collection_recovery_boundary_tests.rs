@@ -30,7 +30,11 @@ pub(super) async fn restore_nonempty_recovery_fixture(
         container.len() <= 100
             && container
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+            && container
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     );
     let mut restored = url::Url::parse(database).unwrap();
     let original = restored.path().trim_start_matches('/').to_owned();

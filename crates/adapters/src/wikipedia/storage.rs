@@ -658,7 +658,7 @@ mod tests {
              DROP TABLE devres_wikipedia_evidence;
              DROP TABLE devres_wikipedia_state;
              DROP TABLE devres_attribution_origins;
-             DROP TABLE devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION devres_npm_recovery_immutable();
+             DROP TABLE IF EXISTS devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION IF EXISTS devres_npm_recovery_immutable();
              DROP TABLE devres_attribution_recoveries;
              DROP FUNCTION devres_attribution_recovery_immutable();
              UPDATE devres_schema SET version=13 WHERE singleton"

@@ -79,7 +79,7 @@ async fn chromium_schema_upgrade_immutability_fencing_and_restart() {
         b"Synthetic retained public evidence",
     )
     .await;
-    sqlx_core::raw_sql::raw_sql("DROP TABLE devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION devres_npm_recovery_immutable(); DROP TABLE devres_wikipedia_state; DROP TABLE devres_wikipedia_evidence; DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
+    sqlx_core::raw_sql::raw_sql("DROP TABLE IF EXISTS devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION IF EXISTS devres_npm_recovery_immutable(); DROP TABLE devres_wikipedia_state; DROP TABLE devres_wikipedia_evidence; DROP TABLE devres_npm_state; DROP TABLE devres_npm_evidence; DROP TABLE devres_chromium_statistics; DROP TABLE devres_chromium_state; DROP TABLE devres_chromium_evidence; UPDATE devres_schema SET version=7 WHERE singleton")
         .execute(&inspection).await.expect("prepare owned schema-seven fixture");
     assert!(
         PgBlobStore::connect(url.as_str(), root.path())
@@ -307,7 +307,7 @@ DROP VIEW devres_crate_enrichment_all;
 DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures;
 DROP FUNCTION devres_crate_enrichment_v2_immutable();
 DROP FUNCTION devres_crate_enrichment_head_immutable();
-DROP TABLE devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION devres_npm_recovery_immutable();
+DROP TABLE IF EXISTS devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION IF EXISTS devres_npm_recovery_immutable();
 DO $fixture$
 DECLARE retained_column record;
 BEGIN

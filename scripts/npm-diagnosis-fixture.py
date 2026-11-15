@@ -17,7 +17,7 @@ FORBIDDEN_KEYS = frozenset(("path", "relative_path", "member_path", "filename", 
 def validate_report(report):
     """Require metadata-only success; a fixture is never real export acceptance."""
     assert report.get("version") == 1 and report.get("provider") == "npm", "wrong diagnosis identity"
-    assert type(report.get("schema")) is int and 14 <= report["schema"] <= 18, "unsupported diagnosis schema"
+    assert type(report.get("schema")) is int and 14 <= report["schema"] <= 19, "unsupported diagnosis schema"
     assert report.get("complete") is True and report.get("outcome") == "inspected", "npm metadata diagnosis incomplete"
     assert type(report.get("bytes_read")) is int and 0 <= report["bytes_read"] <= MAX_INPUT, "diagnosis input bound missing"
     diagnostics = report.get("diagnostics", [])

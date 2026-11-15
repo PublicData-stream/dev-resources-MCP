@@ -29,6 +29,17 @@ class NpmDiagnosisAcceptanceTests(unittest.TestCase):
     def test_metadata_success_retains_explicit_unchecked_coverage(self):
         fixture.validate_report(report())
 
+    def test_supported_schema_nineteen_keeps_unknown_and_future_versions_closed(self):
+        for schema in (14, 18, 19):
+            selected = report()
+            selected['schema'] = schema
+            fixture.validate_report(selected)
+        for schema in (13, 20, True, '19'):
+            selected = report()
+            selected['schema'] = schema
+            with self.subTest(schema=schema), self.assertRaisesRegex(AssertionError, 'schema'):
+                fixture.validate_report(selected)
+
     def test_incomplete_and_unverified_default_cannot_pass(self):
         for field, value in (("complete", False), ("outcome", "selected_evidence_unavailable"),
                              ("bytes_read", fixture.MAX_INPUT + 1), ("provider", "mdn")):
