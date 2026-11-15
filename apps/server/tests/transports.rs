@@ -594,6 +594,37 @@ async fn native_webtransport_probe_both_revisions_and_origin_rejection() {
             String::from_utf8_lossy(&status.stderr)
         );
     }
+    for revision in ["2026-07-28", "2025-11-25"] {
+        let trace = temp.path().join(format!("diagnostic-{revision}.jsonl"));
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_devres-probe"))
+            .args([
+                "--diagnostic-trace".into(),
+                trace.to_str().unwrap().into(),
+                format!("https://{authority}/mcp-wt/v1"),
+                cert_path.to_str().unwrap().into(),
+                revision.into(),
+                "https://client.test".into(),
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "diagnostic probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<Value> = std::fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|row| row["stage"] == "connect" && row["event"] == "ready")
+        );
+        assert!(rows.iter().any(|row| row["label"] == "tools/list" && row["completed_frame_bytes"].is_number()));
+        assert_eq!(rows.last().unwrap()["stage"], "complete");
+    }
     let rejected = tokio::process::Command::new(env!("CARGO_BIN_EXE_devres-probe"))
         .args([
             format!("https://{authority}/mcp-wt/v1"),

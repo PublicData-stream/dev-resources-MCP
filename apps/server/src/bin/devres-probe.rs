@@ -3,9 +3,16 @@ use devres_server::{
     ServerError,
     framing::{FrameReader, write_json},
 };
+#[path = "probe_diagnostics/mod.rs"]
+mod diagnostics;
+use diagnostics::{Event, Stage};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
-use tokio::{io::AsyncReadExt, sync::Semaphore, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    sync::Semaphore,
+    time::timeout,
+};
 use wtransport::{
     ClientConfig, Endpoint, Identity,
     endpoint::ConnectOptions,
@@ -18,7 +25,28 @@ const RFC_NOTICE: &str = "https://fixtures.invalid/devres/rfc-retained\nFirst-pa
 
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--diagnostic-trace") {
+        let path = args.get(1).ok_or("missing diagnostic trace path")?;
+        let trace = diagnostics::Trace::create(std::path::Path::new(path))?;
+        args.drain(..2);
+        return diagnostics::TRACE
+            .scope(std::cell::RefCell::new(trace), async {
+                diagnostics::mark(Stage::Setup, Event::Begin)?;
+                match probe(args).await {
+                    Ok(()) => diagnostics::mark(Stage::Complete, Event::Ready),
+                    Err(error) => {
+                        diagnostics::failed(error.as_ref());
+                        Err("diagnostic probe failed".into())
+                    }
+                }
+            })
+            .await;
+    }
+    probe(args).await
+}
+
+async fn probe(args: Vec<String>) -> Result<(), ServerError> {
     if !matches!(args.len(), 3 | 4 | 6) {
         return Err(
             "usage: devres-probe URL CA_PATH REVISION [ORIGIN] [CLIENT_CERT CLIENT_KEY]".into(),
@@ -67,11 +95,15 @@ async fn main() -> Result<(), ServerError> {
     if let Some(origin) = args.get(3) {
         options = options.add_header("origin", origin);
     }
+    diagnostics::mark(Stage::Connect, Event::Begin)?;
     let connection = timeout(Duration::from_secs(10), endpoint.connect(options.build())).await??;
+    diagnostics::mark(Stage::Connect, Event::Ready)?;
+    diagnostics::mark(Stage::OpenStream, Event::Begin)?;
     let (mut send, recv) = timeout(Duration::from_secs(10), async {
         Ok::<_, ServerError>(connection.open_bi().await?.await?)
     })
     .await??;
+    diagnostics::mark(Stage::OpenStream, Event::Ready)?;
     let budget = Arc::new(Semaphore::new(32 * 1024 * 1024));
     let mut reader = FrameReader::new(
         recv,
@@ -82,14 +114,7 @@ async fn main() -> Result<(), ServerError> {
     );
     let discover = if revision == "2025-11-25" {
         let value = exchange(&mut send, &mut reader, &budget, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"devres-probe","version":"1"}}})).await?;
-        write_json(
-            &mut send,
-            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-            MAX,
-            &budget,
-            Duration::from_secs(10),
-        )
-        .await?;
+        initialized_notification(&mut send, &budget).await?;
         value
     } else {
         exchange(&mut send, &mut reader, &budget, json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":metadata(revision)}})).await?
@@ -1349,6 +1374,7 @@ async fn main() -> Result<(), ServerError> {
             }
         }
     }
+    diagnostics::mark(Stage::Shutdown, Event::Begin)?;
     connection.close(0_u32.into(), b"probe complete");
     endpoint.close(0_u32.into(), b"probe complete");
     timeout(Duration::from_secs(2), endpoint.wait_idle()).await?;
@@ -1748,18 +1774,56 @@ fn operation_failure(label: &str, response: &Value) -> Option<String> {
     None
 }
 
-async fn exchange_response(
-    send: &mut wtransport::SendStream,
-    reader: &mut FrameReader<wtransport::RecvStream>,
+async fn initialized_notification<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    budget: &Arc<Semaphore>,
+) -> Result<(), ServerError> {
+    diagnostics::mark(Stage::InitializedNotificationWrite, Event::Begin)?;
+    write_json(
+        send,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        MAX,
+        budget,
+        Duration::from_secs(10),
+    )
+    .await?;
+    diagnostics::mark(Stage::InitializedNotificationWrite, Event::Ready)?;
+    // The following source-offer assertions concern the retained initialize
+    // response, so keep its operation identity after the distinct notification.
+    diagnostics::mark(Stage::Assertions, Event::Begin)
+}
+
+async fn exchange_response<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    send: &mut W,
+    reader: &mut FrameReader<R>,
     budget: &Arc<Semaphore>,
     request: Value,
 ) -> Result<Value, ServerError> {
+    diagnostics::operation(|| operation_label(&request))?;
     let id = request["id"].clone();
+    diagnostics::mark(Stage::Write, Event::Begin)?;
     write_json(send, &request, MAX, budget, Duration::from_secs(10)).await?;
+    diagnostics::mark(Stage::Write, Event::Ready)?;
     loop {
-        let frame = reader.read().await?.ok_or("response stream closed")?;
+        diagnostics::mark(Stage::Read, Event::Begin)?;
+        let frame = match reader.read().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                diagnostics::read_failed(reader.progress(), None);
+                return Err("response stream closed".into());
+            }
+            Err(error) => {
+                diagnostics::read_failed(reader.progress(), Some(&error));
+                return Err(error.into());
+            }
+        };
+        diagnostics::frame_ready(frame.bytes.len())?;
+        diagnostics::mark(Stage::Decode, Event::Begin)?;
         let value: Value = serde_json::from_slice(&frame.bytes)?;
+        diagnostics::mark(Stage::Decode, Event::Ready)?;
         if value["id"] == id {
+            diagnostics::mark(Stage::MatchResponse, Event::Ready)?;
+            diagnostics::mark(Stage::Assertions, Event::Begin)?;
             return Ok(value);
         }
     }

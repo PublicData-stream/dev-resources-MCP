@@ -16,6 +16,21 @@ pub struct Frame {
     pub(crate) permit: OwnedSemaphorePermit,
 }
 
+/// Payload-free state of an unfinished read. Inspecting it never polls I/O or resets a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameReadPhase {
+    AwaitingFirstByte,
+    CompletingFrame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct FrameProgress {
+    pub phase: FrameReadPhase,
+    /// Bytes consumed into the current frame, excluding read-ahead and the LF delimiter.
+    pub buffered_frame_bytes: usize,
+}
+
 /// Retains partial input and its deadline when the SDK cancels a receive future.
 pub struct FrameReader<R> {
     reader: BufReader<R>,
@@ -54,6 +69,18 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             idle,
             completion,
             read_buffer_permit,
+        }
+    }
+
+    /// Observes retained frame state without exposing bytes or changing its deadline/accounting.
+    pub fn progress(&self) -> FrameProgress {
+        FrameProgress {
+            phase: if self.permit.is_some() {
+                FrameReadPhase::CompletingFrame
+            } else {
+                FrameReadPhase::AwaitingFirstByte
+            },
+            buffered_frame_bytes: self.bytes.len(),
         }
     }
 
