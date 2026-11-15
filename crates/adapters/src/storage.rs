@@ -33,6 +33,8 @@ pub use attribution_storage::recovery::{
 mod chromium_storage;
 #[path = "collection_diagnostics.rs"]
 pub(crate) mod collection_diagnostics;
+#[path = "storage_collection_recovery.rs"]
+pub(crate) mod collection_recovery;
 #[path = "rfc/storage.rs"]
 mod corpus_storage;
 #[path = "crates_io/storage.rs"]
@@ -133,6 +135,7 @@ pub struct PgBlobStore {
     active: AtomicBool,
     reader: bool,
     lifecycle_shared: bool,
+    recovery: bool,
     visibility: tokio::sync::OnceCell<visibility::VisibilityRegistry>,
     enrichment_membership: Mutex<std::collections::BTreeSet<String>>,
     root: PathBuf,
@@ -174,6 +177,7 @@ enum OpenMode {
     RestoreCheck,
     Reader,
     Maintenance,
+    Recovery,
 }
 
 impl PgBlobStore {
@@ -196,6 +200,15 @@ impl PgBlobStore {
         config: Option<crate::object_storage::S3Config>,
     ) -> Result<Self> {
         Self::connect_inner(database_url, root, OpenMode::Maintenance, config).await
+    }
+
+    /// Attach existing recovery storage under exclusive ownership; never migrate it.
+    pub async fn connect_archive_for_recovery(
+        database_url: &str,
+        root: impl AsRef<Path>,
+        config: Option<crate::object_storage::S3Config>,
+    ) -> Result<Self> {
+        Self::connect_inner(database_url, root, OpenMode::Recovery, config).await
     }
 
     /// Open committed evidence without acquiring writer authority or changing storage.
@@ -281,7 +294,7 @@ impl PgBlobStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| storage_error())?;
-        if !matches!(version, 11..=18) {
+        if !matches!(version, 11..=19) {
             return Err(Error::unavailable(
                 "Attribution maintenance requires schema eleven.",
             ));
@@ -310,6 +323,14 @@ impl PgBlobStore {
         let mut owner = PgConnection::connect(database_url)
             .await
             .map_err(|_| storage_error())?;
+        if mode == OpenMode::Recovery {
+            sqlx_core::raw_sql::raw_sql(
+                "SET statement_timeout='3000ms'; SET lock_timeout='1000ms'",
+            )
+            .execute(&mut owner)
+            .await
+            .map_err(|_| storage_error())?;
+        }
         let lifecycle_sql = if lifecycle_exclusive {
             "SELECT pg_try_advisory_lock(1835365490, 2)"
         } else {
@@ -363,8 +384,15 @@ impl PgBlobStore {
                 Box::pin(async move {
                     if read_only {
                         sqlx_core::query::query("SET default_transaction_read_only=on")
-                            .execute(connection)
+                            .execute(&mut *connection)
                             .await?;
+                    }
+                    if mode == OpenMode::Recovery {
+                        sqlx_core::raw_sql::raw_sql(
+                            "SET statement_timeout='3000ms'; SET lock_timeout='1000ms'",
+                        )
+                        .execute(&mut *connection)
+                        .await?;
                     }
                     Ok(())
                 })
@@ -384,7 +412,12 @@ impl PgBlobStore {
         .fetch_one(&mut owner)
         .await
         .map_err(|_| storage_error())?;
-        if !existed && matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
+        if !existed
+            && matches!(
+                mode,
+                OpenMode::Inspect | OpenMode::Activate | OpenMode::Recovery
+            )
+        {
             return Err(Error::unavailable(
                 "No initialized storage schema to inspect.",
             ));
@@ -401,9 +434,17 @@ impl PgBlobStore {
                     "Offline BLAKE3 storage migration required.",
                 ));
             }
+            if mode == OpenMode::Recovery && existing != 19 {
+                return Err(Error::unavailable(
+                    "Recovery requires existing schema nineteen; upgrade separately.",
+                ));
+            }
         }
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
+        if !matches!(
+            mode,
+            OpenMode::Inspect | OpenMode::Activate | OpenMode::Recovery
+        ) {
             sqlx_core::raw_sql::raw_sql(SCHEMA)
                 .execute(&mut *tx)
                 .await
@@ -415,7 +456,7 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        let schema_upgrade_lock = version < 18 && mode == OpenMode::Serve;
+        let schema_upgrade_lock = version < 19 && mode == OpenMode::Serve;
         if schema_upgrade_lock {
             let exclusive: bool =
                 sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490, 2)")
@@ -439,7 +480,7 @@ impl PgBlobStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| storage_error())?;
-        } else if !(2..=18).contains(&version) {
+        } else if !(2..=19).contains(&version) {
             return Err(Error::integrity("Unsupported storage schema version"));
         }
         if version <= 2 {
@@ -521,7 +562,7 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        if !maintenance && !active {
+        if (!maintenance || mode == OpenMode::Recovery) && !active {
             return Err(Error::unavailable(
                 "BLAKE3 storage migration is pending activation.",
             ));
@@ -541,7 +582,10 @@ impl PgBlobStore {
                 "Activate schema eleven before object archive migration.",
             ));
         }
-        if !matches!(mode, OpenMode::Inspect | OpenMode::Activate) {
+        if !matches!(
+            mode,
+            OpenMode::Inspect | OpenMode::Activate | OpenMode::Recovery
+        ) {
             sqlx_core::raw_sql::raw_sql(crate::durable_archive::SCHEMA)
                 .execute(&mut *tx)
                 .await
@@ -619,7 +663,14 @@ impl PgBlobStore {
                     .await
                     .map_err(|_| storage_error())?;
             }
-            sqlx_core::query::query("UPDATE devres_schema SET version=18 WHERE singleton")
+            if version < 19 {
+                sqlx_core::raw_sql::raw_sql(collection_recovery::SCHEMA_V19)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| storage_error())?;
+                collection_recovery::migrate_current_job(&mut tx).await?;
+            }
+            sqlx_core::query::query("UPDATE devres_schema SET version=19 WHERE singleton")
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| storage_error())?;
@@ -700,6 +751,7 @@ impl PgBlobStore {
             active: AtomicBool::new(active),
             reader: false,
             lifecycle_shared: !lifecycle_exclusive,
+            recovery: mode == OpenMode::Recovery,
             visibility: tokio::sync::OnceCell::new(),
             enrichment_membership: Mutex::new(std::collections::BTreeSet::new()),
             pool,

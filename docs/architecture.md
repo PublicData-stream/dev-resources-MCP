@@ -71,6 +71,13 @@ historical context. Cursor advancement and target insertion commit together. V1
 recipes, generations and paged notice resources remain verifiable; current copied
 content requires v2 readiness. Neither requests nor audits traverse source history.
 
+Schema 19 adds immutable npm advisory-job versions and recovery admission journals,
+plus a separate fenced recovery queue. Current job writes and history commit
+atomically; migrated legacy provenance remains unknown. Offline historical recovery
+uses retained exports and publishes explicit snapshots without promoting the current
+default or replacing newer work. See [exact recovery](terminal-recovery-design.md).
+Readers require schema 19; schema 18 binaries cannot join the upgraded store.
+
 New blobs use `blake3/<64 lowercase hex>` paths in an operator-owned directory;
 public hash identifiers use `blake3:<64 lowercase hex>`. Legacy SHA-256 paths remain
 retained compatibility evidence. Publication writes a unique staging file, fsyncs
@@ -96,7 +103,7 @@ archive capture; checksum verification precedes archive parsing.
 
 ## BLAKE3 enforcement and schema 10
 
-Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 18. Schemas 1–9 require explicit
+Fresh writer stores initialize with enforced BLAKE3, attribution tables, and schema 19. Schemas 1–9 require explicit
 private offline migration; serving rejects pre-10 schemas or pending migration.
 The maintenance path first excludes readers and writer with the lifecycle fence,
 then acquires the exclusive writer fence before any provider

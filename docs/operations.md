@@ -1,5 +1,16 @@
 # Operations and acceptance
 
+## Schema 19 and local diagnostic tooling
+
+Schema 19 adds immutable npm job history and recovery admissions plus a separate
+historical recovery queue. Stop readers and writers and preserve a coordinated
+PostgreSQL/archive checkpoint before activating the new writer. Update reader
+SELECT grants for the three new tables and include them in full integrity/restore
+acceptance. Older binaries reject the new schema; rollback requires the matching
+pre-upgrade database/archive backup. Policy 2 remains unchanged. See
+[exact recovery](terminal-recovery-design.md) for private command syntax and
+[local diagnostics](diagnostic-tooling.md) for bounded IPv4 reproduction.
+
 ## Attribution policy v2 and shared read admission
 
 Schema 18 adds the sealed, provider-local `devres_attribution_origins` checkpoint
@@ -72,7 +83,7 @@ from native hosted architecture CI, real-provider acceptance and production.
 Writer startup upgrades active schema 10 with bounded, owner-fenced additive DDL,
 without corpus rewrite or provider acquisition. Existing offline schemas 1–9 to 10
 migration and activation remain required; inspection never bootstraps attribution.
-The same normal writer startup records schema 18, retaining the required runtime
+The same normal writer startup records schema 19, retaining the required runtime
 split and adding Wikipedia tables;
 see [split upgrade](#credential-broker-and-split-runtime-upgrade).
 
@@ -647,7 +658,7 @@ a previously verified digest through a separately authorized deployment operatio
 
 `recover-rustsec-attribution` is private offline maintenance. It does not acquire
 provider data, start collection, upgrade schema or publish qualification. Dry-run
-uses a reader connection and accepts active schemas 14 through 18; older schemas
+uses a reader connection and accepts active schemas 14 through 19; older schemas
 report that upgrade is required before applying recovery.
 
 ```sh
@@ -669,7 +680,7 @@ Historical v1 recovery journal entries retain their original verifier.
 
 For a separately authorized operational application, first stop all serving and
 writer participants and preserve the coordinated database/archive backup. Apply
-requires active schema 18, writer credentials, exclusive lifecycle/owner fences,
+requires active schema 19, writer credentials, exclusive lifecycle/owner fences,
 the whole-state digest and explicit policy/recipe identities from dry-run:
 
 ```sh
@@ -712,7 +723,7 @@ Schema 16 added RFC operational failure metadata; schema 17 adds the immutable
 RustSec attribution recovery journal. Stop serving readers and the old
 writer, preserve a coordinated database/archive backup, then let the sole new
 writer upgrade under the exclusive lifecycle fence before starting new readers.
-Current readers require schema 18; older binaries are not a rollback mechanism. The
+Current readers require schema 19; older binaries are not a rollback mechanism. The
 migration does not retry failed jobs or rewrite retained public evidence.
 
 RFC job diagnostics distinguish claim time, failure completion time and next due
@@ -1452,7 +1463,7 @@ authority or provision their prerequisites.
    Give serving SELECT-only PostgreSQL and either a read-only filesystem mount plus
    separate writable scratch, or an RO broker profile and its own S3 cache.
 4. Start the broker, then the sole writer. Its bounded additive startup commits
-   schema 18 and retains the archive format/history; earlier pending BLAKE3 migration
+   schema 19 and retains the archive format/history; earlier pending BLAKE3 migration
    still requires the existing offline procedure. Start serving after the committed
    backend is available. No role split silently transfers filesystem data to S3.
 5. Verify historical capture/resource identities and pagination; a foreground cold

@@ -23,10 +23,10 @@ const MAX_METADATA: u64 = 16 * 1024 * 1024;
 const MAX_INSPECTION: u64 = 32 * 1024 * 1024;
 const MAX_RELEVANT: usize = 120 * 1024 * 1024;
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
-struct ScannedAdvisory {
-    record: Value,
-    bytes: Vec<u8>,
-    path: String,
+pub(crate) struct ScannedAdvisory {
+    pub(crate) record: Value,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) path: String,
 }
 pub struct NpmCorpus {
     pub(crate) store: Arc<dyn NpmStore>,
@@ -203,7 +203,10 @@ impl NpmCorpus {
         } else {
             "advisory-job".into()
         };
-        if terminal && let Some(mut job) = self.store.npm_state(&job_key).await? {
+        if terminal
+            && lane != "advisories"
+            && let Some(mut job) = self.store.npm_state(&job_key).await?
+        {
             job["done"] = json!(true);
             job["failed"] = json!(error.code);
             self.store.npm_set_state(&job_key, &job).await?;
@@ -843,10 +846,64 @@ impl NpmCorpus {
         self.save_advisory_diagnostics(&mut attempt).await;
         let result = self.collect_advisory_attempt(cancel, &mut attempt).await;
         if let Err(error) = &result {
+            if let Err(record_error) = self.fail_active_advisory_job(&mut attempt, error).await {
+                tracing::warn!(
+                    code = devres_application::collection::safe_code(&record_error.code),
+                    "npm primary failure checkpoint unavailable"
+                );
+            }
             attempt.fail(error);
         }
         self.save_advisory_diagnostics(&mut attempt).await;
         result
+    }
+
+    async fn fail_active_advisory_job(&self, attempt: &mut Attempt, error: &Error) -> Result<()> {
+        let terminal = matches!(
+            error.code.as_str(),
+            "invalid_input" | "integrity" | "processing_gap"
+        ) || error.code == "capacity"
+            && !crate::npm::diagnostics::materialization_deadline(error);
+        if !terminal {
+            return Ok(());
+        }
+        // This projection is made from this live attempt only. begin(previous)
+        // deliberately leaves job empty even when it retains older progress.
+        let active = attempt.value()?;
+        let checkpoint = &active["job"];
+        if checkpoint.is_null()
+            || matches!(active["stage"].as_str(), Some("selection" | "acquisition"))
+        {
+            return Ok(());
+        }
+        let Some(mut job) = self.store.npm_state("advisory-job").await? else {
+            return Ok(());
+        };
+        if job["done"] != false
+            || checkpoint["snapshot"] != job["snapshot"]
+            || checkpoint["artifact_capture"] != job["artifact"]["body_hash"]
+            || checkpoint["artifact_bytes"] != job["artifact"]["bytes"]
+            || checkpoint["next_member"] != job["next"]
+            || checkpoint["records"] != job["records"]
+            || checkpoint["gaps"] != job["gaps"]
+            || checkpoint["expanded_bytes"]
+                != json!(job.get("expanded").and_then(Value::as_u64).unwrap_or(0))
+        {
+            // A checkpoint response may have been uncertain. Never overwrite a
+            // different committed cursor, selected export, or terminal subject.
+            return Ok(());
+        }
+        job["done"] = json!(true);
+        job["failed"] = json!(error.code);
+        if job["processor_version"] == PROCESSOR_VERSION {
+            job["failure_context"] = json!({"version":1,"code":devres_application::collection::safe_code(&error.code),
+                "materialization_deadline":active["stage"]=="materialization" && crate::npm::diagnostics::materialization_deadline(error)});
+        } else {
+            job.as_object_mut()
+                .ok_or_else(failure)?
+                .remove("failure_context");
+        }
+        self.store.npm_set_state("advisory-job", &job).await
     }
 
     async fn save_advisory_diagnostics(&self, attempt: &mut Attempt) {
@@ -932,7 +989,7 @@ impl NpmCorpus {
                     return Ok(());
                 }
                 let snapshot = identity(&json!([artifact.body_hash, time, PROCESSOR_VERSION]))?;
-                let job = json!({"snapshot":snapshot,"artifact":artifact,"validated_at":time,"next":0,"records":0,"gaps":0,"done":false});
+                let job = json!({"snapshot":snapshot,"artifact":artifact,"validated_at":time,"next":0,"records":0,"gaps":0,"done":false,"processor_version":PROCESSOR_VERSION});
                 attempt.stage(Stage::JobCheckpoint);
                 self.store.npm_set_state("advisory-job", &job).await?;
                 job
@@ -1403,7 +1460,7 @@ impl NpmCorpus {
 }
 
 /// ZIP metadata and one member are bounded before parsing; a two-record channel applies backpressure.
-fn scan_export(
+pub(crate) fn scan_export(
     file: std::fs::File,
     next: usize,
     mut expanded: u64,
@@ -1973,4 +2030,5 @@ mod tests {
     }
 
     include!("corpus/advisory_tests.rs");
+    include!("corpus/recovery_provenance_tests.rs");
 }

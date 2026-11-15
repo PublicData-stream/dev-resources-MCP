@@ -17,9 +17,9 @@ impl PgBlobStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| storage_error())?;
-        if version != 18 {
+        if version != 19 {
             return Err(Error::unavailable(
-                "Concurrent serving requires storage schema eighteen.",
+                "Concurrent serving requires storage schema nineteen.",
             ));
         }
         let active: bool = sqlx_core::query_scalar::query_scalar(
@@ -54,6 +54,7 @@ impl PgBlobStore {
             active: AtomicBool::new(true),
             reader: true,
             lifecycle_shared: true,
+            recovery: false,
             visibility: tokio::sync::OnceCell::new(),
             enrichment_membership: Mutex::new(std::collections::BTreeSet::new()),
             root,
@@ -95,7 +96,7 @@ impl PgBlobStore {
             ));
         }
         if self.reader {
-            let supported: bool = sqlx_core::query_scalar::query_scalar("SELECT version=18 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
+            let supported: bool = sqlx_core::query_scalar::query_scalar("SELECT version=19 AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL FROM devres_schema WHERE singleton")
                 .fetch_one(&self.pool).await.map_err(|_| storage_error())?;
             if !supported {
                 return Err(Error::unavailable(
@@ -319,6 +320,15 @@ mod tests {
                 .is_err()
         );
         sqlx_core::query::query("UPDATE devres_schema SET version=18 WHERE singleton")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        assert!(
+            PgBlobStore::connect_reader(url.as_str(), root.path(), None)
+                .await
+                .is_err()
+        );
+        sqlx_core::query::query("UPDATE devres_schema SET version=19 WHERE singleton")
             .execute(&writer.pool)
             .await
             .unwrap();

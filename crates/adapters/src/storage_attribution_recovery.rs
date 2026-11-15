@@ -361,7 +361,7 @@ async fn recover(
     }
     let schema:i32 = sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL")
         .fetch_one(&mut *tx).await.map_err(|_|storage_error())?;
-    if !(14..=18).contains(&schema) || (apply && schema < 17) {
+    if !(14..=19).contains(&schema) || (apply && schema < 17) {
         return Err(Error::unavailable(
             "RustSec recovery requires a supported active schema.",
         ));
@@ -646,7 +646,7 @@ mod tests {
             ..RustSecRecoveryOptions::current_policy()
         };
         // Simulate the immediately preceding active schema without changing targets.
-        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_origins; DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); UPDATE devres_schema SET version=16 WHERE singleton")
+        sqlx_core::raw_sql::raw_sql("DROP TABLE devres_attribution_origins; DROP TABLE devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION devres_npm_recovery_immutable(); DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); UPDATE devres_schema SET version=16 WHERE singleton")
             .execute(&store.pool).await.unwrap();
         let legacy = recover_rustsec_attribution(url.as_str(), &options, false)
             .await

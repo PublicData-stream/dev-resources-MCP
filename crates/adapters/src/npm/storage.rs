@@ -206,6 +206,14 @@ impl NpmStore for PgBlobStore {
                 }
             };
         }
+        if key == "advisory-job" {
+            let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+            super::collection_recovery::record_job(&mut tx, data).await?;
+            sqlx_core::query::query("INSERT INTO devres_npm_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
+                .bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_npm_state","",key,data)?)
+                .execute(&mut *tx).await.map_err(|_|storage_error())?;
+            return tx.commit().await.map_err(|_| storage_error());
+        }
         sqlx_core::query::query("INSERT INTO devres_npm_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
             .bind(key).bind(Json(data)).bind(payload_integrity::digest("devres_npm_state","",key,data)?).execute(&mut *owner).await.map_err(|_|storage_error())?;
         Ok(())
@@ -284,6 +292,41 @@ impl NpmStore for PgBlobStore {
         tx.commit().await.map_err(|_| storage_error())
     }
     async fn npm_publish(&self, lane: &str, snapshot: &Value) -> Result<()> {
+        self.npm_publish_mode(lane, snapshot, None).await
+    }
+    async fn npm_statistics(&self) -> Result<Value> {
+        self.fence().await?;
+        let mut counts = serde_json::Map::new();
+        for kind in self.npm_migration_kinds().await? {
+            let mut count = 0_u64;
+            let mut after = 0;
+            loop {
+                let rows = self.npm_rows(&kind, after, 1000, None, None).await?;
+                if rows.is_empty() {
+                    break;
+                }
+                count = count
+                    .checked_add(rows.len() as u64)
+                    .ok_or_else(|| Error::capacity("npm statistics count overflow."))?;
+                after = rows
+                    .last()
+                    .ok_or_else(|| Error::integrity("npm statistics page missing."))?
+                    .sequence;
+            }
+            if count > 0 {
+                counts.insert(kind, json!(count));
+            }
+        }
+        Ok(Value::Object(counts))
+    }
+}
+impl PgBlobStore {
+    pub(crate) async fn npm_publish_mode(
+        &self,
+        lane: &str,
+        snapshot: &Value,
+        completion: Option<(&str, &str)>,
+    ) -> Result<()> {
         self.owner_fence().await?;
         if !matches!(lane, "research" | "advisories") {
             return Err(Error::invalid("Invalid npm publication lane."));
@@ -392,34 +435,16 @@ impl NpmStore for PgBlobStore {
         if !same {
             return Err(Error::integrity("npm snapshot identity collision."));
         }
-        sqlx_core::query::query("INSERT INTO devres_npm_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
-            .bind(format!("default-{lane}")).bind(Json(snapshot)).bind(payload_integrity::digest("devres_npm_state","",&format!("default-{lane}"),snapshot)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
-        tx.commit().await.map_err(|_| storage_error())
-    }
-    async fn npm_statistics(&self) -> Result<Value> {
-        self.fence().await?;
-        let mut counts = serde_json::Map::new();
-        for kind in self.npm_migration_kinds().await? {
-            let mut count = 0_u64;
-            let mut after = 0;
-            loop {
-                let rows = self.npm_rows(&kind, after, 1000, None, None).await?;
-                if rows.is_empty() {
-                    break;
-                }
-                count = count
-                    .checked_add(rows.len() as u64)
-                    .ok_or_else(|| Error::capacity("npm statistics count overflow."))?;
-                after = rows
-                    .last()
-                    .ok_or_else(|| Error::integrity("npm statistics page missing."))?
-                    .sequence;
+        if let Some((operation, claim)) = completion {
+            if lane != "advisories" {
+                return Err(Error::invalid("Historical recovery is advisory-only."));
             }
-            if count > 0 {
-                counts.insert(kind, json!(count));
-            }
+            super::collection_recovery::complete_work(&mut tx, operation, claim, snapshot).await?;
+        } else {
+            sqlx_core::query::query("INSERT INTO devres_npm_state(key,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(key) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
+                .bind(format!("default-{lane}")).bind(Json(snapshot)).bind(payload_integrity::digest("devres_npm_state","",&format!("default-{lane}"),snapshot)?).execute(&mut *tx).await.map_err(|_|storage_error())?;
         }
-        Ok(Value::Object(counts))
+        tx.commit().await.map_err(|_| storage_error())
     }
 }
 async fn put_index_markers(

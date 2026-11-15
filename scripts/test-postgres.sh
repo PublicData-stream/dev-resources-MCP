@@ -26,6 +26,7 @@ done
 port=$(docker port "$run_id" 5432/tcp | sed 's/.*://')
 export DATABASE_URL="postgres://devres:fixture-only@127.0.0.1:$port/devres"
 export DEVRES_TEST_DATABASE_URL="$DATABASE_URL"
+export DEVRES_TEST_POSTGRES_CONTAINER="$run_id"
 cargo test --locked -p devres-adapters --test persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test migration_batching -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test seal_owner_loss -- --ignored --test-threads=1
@@ -44,6 +45,7 @@ cargo test --locked -p devres-adapters --test chromium_persistence -- --ignored 
 cargo test --locked -p devres-adapters --lib chromium_collector_postgres_publication_with_accounted_gaps -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --test npm_persistence -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib npm_advisory_diagnostic_row_lock_preserves_source_error_and_owner_reuse -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib npm_acquisition_terminal_failures_preserve_unrelated_terminal_history -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib mdn_corpus_git_postgres_history_research_restart_and_restore -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib crate_corpus_captured_inventory_acquisition_research_and_restart -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::payload_integrity -- --ignored --test-threads=1
@@ -53,6 +55,7 @@ cargo test --locked -p devres-adapters --lib storage::acceptance -- --ignored --
 cargo test --locked -p devres-adapters --lib storage::wikipedia_storage -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::reader -- --ignored --skip s3_ --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::collection_diagnostics -- --ignored --skip s3_ --test-threads=1
+cargo test --locked -p devres-adapters --lib storage::collection_recovery -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib rustsec_current_atomic_publication_and_reconciliation -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib storage::visibility -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib attribution_storage -- --ignored --test-threads=1

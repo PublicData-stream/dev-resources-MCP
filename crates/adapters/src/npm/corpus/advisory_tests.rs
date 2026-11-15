@@ -158,6 +158,13 @@ async fn typed_materialization_deadline_preserves_advisory_job_but_other_capacit
             Arc::new(BulkBroker::fixture(url::Url::parse("http://127.0.0.1:9").unwrap()).unwrap());
         let corpus = corpus(store.clone(), broker.clone(), root.path());
         let (job, _) = retained_advisory_job(&corpus, &store).await;
+        let mut active = Attempt::begin(None);
+        active.checkpoint(&job).unwrap();
+        active.stage(Stage::Materialization);
+        corpus
+            .fail_active_advisory_job(&mut active, &error)
+            .await
+            .unwrap();
         corpus
             .record_failure("advisories", None, &error)
             .await
@@ -285,7 +292,19 @@ async fn incomplete_or_cancelled_export_does_not_publish_a_default() {
         if cancel_before_open {
             cancel.cancel();
         }
-        assert!(corpus.collect_advisories(cancel).await.is_err());
+        let error = corpus.collect_advisories(cancel).await.unwrap_err();
+        if !cancel_before_open {
+            // Terminal provenance is now committed while this exact live
+            // attempt is available, before outer scheduling/backoff accounting.
+            assert_eq!(error.code, "integrity");
+            job["done"] = json!(true);
+            job["failed"] = json!(error.code);
+            assert!(job.get("processor_version").is_none());
+        } else {
+            // Retained artifact opening preserves its existing unavailable
+            // boundary on pre-cancel; this must never terminalize the job.
+            assert_eq!(error.code, "unavailable");
+        }
         assert_eq!(store.npm_state("advisory-job").await.unwrap().unwrap(), job);
         assert!(
             store

@@ -598,8 +598,8 @@ Public selectors, freshness, result limits, and capture-fixed reads are unchange
 
 Serving uses SELECT-only PostgreSQL credentials, has no writer-owner lock, and
 runs no migration, stage recovery, or collectors. The sole writer initializes and
-publishes schema 18 for either backend, including RFC job diagnostics, the RustSec
-recovery journal and policy-v2 origin checkpoints. Existing configuration values and backend
+publishes schema 19 for either backend, including RFC job diagnostics, the RustSec
+recovery journal, policy-v2 origin checkpoints and exact historical npm recovery tables. Existing configuration values and backend
 defaults remain; operators must add the role-specific client/listener/scratch
 settings and deploy both processes. See the [operator templates](../deploy/examples/scaleway-credential-broker/README.md).
 

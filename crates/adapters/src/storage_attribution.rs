@@ -1852,6 +1852,10 @@ impl PgBlobStore {
         if version >= 18 {
             self.verify_attribution_origins().await?;
         }
+        if version >= 19 {
+            let mut owner = self.owner.lock().await;
+            super::collection_recovery::verify_history(&mut owner, cancel).await?;
+        }
         Ok(())
     }
 }
@@ -2306,7 +2310,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         let request = FetchRequest {
             key: "rfc:9000".into(),
             url: "https://www.rfc-editor.org/rfc/rfc9000.txt".into(),
@@ -2869,7 +2873,7 @@ mod tests {
             .await
             .unwrap();
         sqlx_core::raw_sql::raw_sql(
-            "ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; DROP VIEW devres_crate_enrichment_all; DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures; DROP FUNCTION devres_crate_enrichment_v2_immutable(); DROP FUNCTION devres_crate_enrichment_head_immutable(); DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control; UPDATE devres_schema SET version=10 WHERE singleton"
+            "ALTER TABLE devres_rfc_jobs DROP COLUMN failure,DROP COLUMN last_attempt_at; DROP VIEW devres_crate_enrichment_all; DROP TABLE devres_crate_enrichment_v2,devres_crate_enrichment_heads_v2,devres_crate_dump_failures; DROP FUNCTION devres_crate_enrichment_v2_immutable(); DROP FUNCTION devres_crate_enrichment_head_immutable(); DROP TABLE devres_npm_recovery_work,devres_npm_advisory_recoveries,devres_npm_advisory_job_history; DROP FUNCTION devres_npm_recovery_immutable(); DROP TABLE devres_attribution_recoveries; DROP FUNCTION devres_attribution_recovery_immutable(); DROP TABLE devres_attribution_sweeps,devres_attribution_targets,devres_attribution_generations,devres_attribution_control; UPDATE devres_schema SET version=10 WHERE singleton"
         ).execute(&mut *fixture).await.unwrap();
         fixture.commit().await.unwrap();
         drop(store);
@@ -2917,7 +2921,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         store.attribution_enqueue(&first, 1).await.unwrap();
         let job = store
             .attribution_claim(&["rfc".into()], now, 0)
