@@ -12,6 +12,18 @@ source archive, four image families, provenance and anonymous platform downloads
 separately. Keep server/probe references pinned to the published image digests.
 No rebuild or publication is part of deployment.
 
+The separately approved 2026-11-16 cycle uses `cycle2_1d76fbcc.py` to render fresh
+sources from signed corrective commit `93426e7`. Rendering writes 24 reviewed
+source files and their provenance below a new `/tmp` directory; add the two
+qualified native-probe records and bind the resulting exact 26-file manifest
+before installation. It preserves the consumed first-cycle sources and journals.
+The new admission requires that cycle's verified schema-18 restoration and
+withdrawn fallback state. Keep the actual paused Secret preimage separate from
+the original active source settings retained in its bound fallback-active
+configuration. Historical source files, bounded journal/log bytes and directory
+inventories are pinned throughout the new cycle. Fresh checkpoint, isolated
+reader/writer proof and actual Restore rehearsal evidence remain mandatory.
+
 ## Admission and checkpoint
 
 Install the reviewed successor sources root-private in a new versioned directory.
