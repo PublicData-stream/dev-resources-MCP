@@ -12,6 +12,11 @@ source archive, four image families, provenance and anonymous platform downloads
 separately. Keep server/probe references pinned to the published image digests.
 No rebuild or publication is part of deployment.
 
+The [2026-11-16 execution record](upgrade-1d76fbcc-cycle2-evidence.md) records
+that cycle as failed and finally withdrawn after successful restoration. Its
+consumed scopes cannot be replayed. The procedure below documents its gates; it
+does not authorize another production attempt.
+
 The separately approved 2026-11-16 cycle uses `cycle2_1d76fbcc.py` to render fresh
 sources from signed corrective commit `93426e7`. Rendering writes 24 reviewed
 source files and their provenance below a new `/tmp` directory; add the two

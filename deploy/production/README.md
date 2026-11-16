@@ -33,7 +33,9 @@ records two failed late acceptance attempts and the preserved withdrawn state;
 The [schema-19 successor](upgrade-1d76fbcc.md) adds fresh checkpoint and guarded
 automatic fallback without replaying either failed attempt. Its actual execution
 result is recorded in the [schema-19 execution evidence](upgrade-1d76fbcc-evidence.md),
-separately from preparation.
+separately from preparation. The [second approved cycle](upgrade-1d76fbcc-cycle2-evidence.md)
+records another failed target, successful schema-18 restoration and failed
+fallback private acceptance; applications remain withdrawn.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
