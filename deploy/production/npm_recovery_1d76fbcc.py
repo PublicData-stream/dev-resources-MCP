@@ -167,6 +167,64 @@ def assessment_command():
             'exec',POD,'-c','assessment','--','/bin/sh','-c',READ_SCRIPT]
 
 
+FAILURE_STEPS=frozenset(('create-pod','get-created-pod','save-pod-identity','get-pod-status',
+    'check-pod-status','check-container-status','check-process-identity','exec-private-report',
+    'get-report-bookend','check-report-bookend','decode-private-report','validate-report','recheck-selection'))
+STATUS_REASONS=frozenset(('Completed','Error','OOMKilled','ContainerCannotRun','StartError','DeadlineExceeded',
+    'Evicted','NodeLost','ContainerCreating','PodInitializing','ErrImagePull','ImagePullBackOff',
+    'CrashLoopBackOff','CreateContainerConfigError','CreateContainerError','RunContainerError','InvalidImageName'))
+EXCEPTION_TYPES=frozenset(('RuntimeError','OSError','PermissionError','FileNotFoundError','ConnectionError',
+    'TimeoutError','ValueError','JSONDecodeError','UnicodeDecodeError','KeyError','IndexError','TypeError',
+    'AttributeError','AssertionError','SubprocessError','CalledProcessError','TimeoutExpired',
+    'KeyboardInterrupt','SystemExit'))
+
+
+def pod_failure_metadata(pod):
+    """Copy only closed status fields from an already observed Pod, without I/O."""
+    if type(pod) is not dict:return None
+    metadata=pod.get('metadata',{});status=pod.get('status',{})
+    if type(metadata) is not dict:metadata={}
+    if type(status) is not dict:status={}
+    uid=metadata.get('uid');phase=status.get('phase');reason=status.get('reason')
+    uid=uid.lower() if type(uid) is str and len(uid)==36 and re.fullmatch(
+        '[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',uid) else None
+    values=status.get('containerStatuses',[])
+    if type(values) is not list:values=[]
+    containers=[]
+    for value in values[:2]:
+        if type(value) is not dict:value={}
+        state=value.get('state',{})
+        if type(state) is not dict:state={}
+        kinds=[key for key in ('running','waiting','terminated') if type(state.get(key)) is dict]
+        kind=kinds[0] if len(kinds)==1 else 'unknown';detail=state[kind] if kind!='unknown' else {}
+        why=detail.get('reason');restart=value.get('restartCount');exit_code=detail.get('exitCode')
+        containers.append({'state':kind,'reason':why if type(why) is str and why in STATUS_REASONS else None,
+            'restart_count':restart if type(restart) is int and 0<=restart<=2147483647 else None,
+            'exit_code':exit_code if kind=='terminated' and type(exit_code) is int and -2147483648<=exit_code<=2147483647 else None,
+            'oom_killed':kind=='terminated' and why=='OOMKilled',
+            'container_id_present':type(value.get('containerID')) is str and bool(value['containerID'])})
+    return {'uid':uid,'phase':phase if type(phase) is str and phase in ('Pending','Running','Succeeded','Failed','Unknown') else None,
+        'reason':reason if type(reason) is str and reason in STATUS_REASONS else None,
+        'container_status_count':min(len(values),2),'container_statuses_truncated':len(values)>2,'containers':containers}
+
+
+def assessment_failure_metadata(step,error,last_pod):
+    """Exclude exception messages, arguments, source text, locals and remote data."""
+    frames=[];trace=error.__traceback__;remaining=64
+    functions={'assess','need','sql','selection','validate_report','decode_report_frame','report_exchange','unique','<lambda>'}
+    while trace is not None and remaining:
+        code=trace.tb_frame.f_code
+        if code.co_filename==__file__:
+            frames.append({'function':code.co_name if code.co_name in functions else 'other','line':trace.tb_lineno})
+        trace=trace.tb_next;remaining-=1
+    name=type(error).__name__
+    value={'version':1,'kind':'npm-assessment-failure','step':step if type(step) is str and step in FAILURE_STEPS else 'other',
+        'exception_type':name if name in EXCEPTION_TYPES else 'other','source':'npm-recovery.py',
+        'traceback':frames[-4:],'traceback_truncated':trace is not None or len(frames)>4,'last_pod':last_pod}
+    need(len(json.dumps(value).encode())<=4096,'closed_failure_metadata_bound')
+    return value
+
+
 def assess(c):
     import importlib
     module=importlib.import_module(c.__class__.__module__)
@@ -179,35 +237,52 @@ def assess(c):
         output=WORK/'npm-assessment';output.mkdir(mode=0o700)
         pod=assessment_pod(c.get('deployment','backend')['spec']['template'],state['images']['backend'])
         module.save(c.root/'npm-assessment-pod-admission.json',{'name':POD,'pod':pod})
+        failure=None;last_pod=None;step='create-pod'
         try:
             # Cleanup covers rejected/lost create responses and UID persistence
             # failures, as well as the successful process/report path.
             c.mutate('npm-assessment-pod-create',lambda:c.old.k('create','-f','/dev/stdin',data=module.encoded(pod)))
-            admitted=c.get('pod',POD);uid=admitted['metadata']['uid']
+            step='get-created-pod';admitted=c.get('pod',POD);last_pod=pod_failure_metadata(admitted)
+            uid=admitted['metadata']['uid'];step='save-pod-identity'
             module.save(c.root/'npm-assessment-pod-identity.json',{'name':POD,'uid':uid})
             deadline=time.monotonic()+330
             while True:
-                current=c.get('pod',POD)
+                step='get-pod-status';current=c.get('pod',POD);last_pod=pod_failure_metadata(current)
+                step='check-pod-status'
                 need(current['metadata']['uid']==uid,'maintenance_pod_identity_changed')
                 phase=current.get('status',{}).get('phase')
                 need(phase not in ('Succeeded','Failed'),'npm_assessment_cli_or_hold_ended')
                 need(time.monotonic()<deadline,'npm_assessment_timeout')
                 if phase=='Running':
+                    step='check-container-status'
                     statuses=current.get('status',{}).get('containerStatuses',[])
                     need(len(statuses)==1 and statuses[0].get('restartCount',0)==0,'one_unrestarted_assessment_required')
+                    step='check-process-identity'
                     identity=statuses[0].get('containerID')
                     need(isinstance(identity,str) and identity,'assessment_process_identity_required')
+                    step='exec-private-report'
                     body=report_exchange(assessment_command(),timeout=min(5,max(.01,deadline-time.monotonic())))
-                    after=c.get('pod',POD)
+                    step='get-report-bookend';after=c.get('pod',POD);last_pod=pod_failure_metadata(after)
+                    step='check-report-bookend'
                     after_status=after.get('status',{}).get('containerStatuses',[])
                     need(after['metadata']['uid']==uid and len(after_status)==1
                          and after_status[0].get('containerID')==identity and after_status[0].get('restartCount',0)==0,
                          'maintenance_report_process_identity_changed')
                     if body is not None:
+                        step='decode-private-report'
                         report_bytes,report=decode_report_frame(body);break
                 time.sleep(1)
-            result=validate_report(report);need(selection(c)==selected,'incident_changed_during_assessment')
-        finally:cleanup(c)
+            step='validate-report';result=validate_report(report)
+            step='recheck-selection';need(selection(c)==selected,'incident_changed_during_assessment')
+        except BaseException as error:
+            try:failure=assessment_failure_metadata(step,error,last_pod)
+            except BaseException:pass
+            raise
+        finally:
+            cleanup(c)
+            if failure is not None:
+                try:module.save(c.root/'npm-assessment-failed.json',failure)
+                except BaseException:pass
         c.guard();c.storage_guard(19,owner=False)
         # Remove the Pod before local report fsync: evidence persistence cannot
         # leave the credential-bearing assessment process alive on a failed path.
