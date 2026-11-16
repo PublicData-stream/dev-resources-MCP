@@ -3,6 +3,7 @@ pub mod acquisition;
 pub mod advisory;
 pub mod attribution;
 pub mod attribution_gate;
+pub mod attribution_observation;
 pub mod attribution_runtime;
 pub mod chromium;
 pub mod collection;

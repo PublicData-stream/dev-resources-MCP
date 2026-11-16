@@ -48,6 +48,7 @@ pub struct AttributionRuntime {
     sweep_gaps: Mutex<BTreeMap<String, String>>,
     admission_gap: Mutex<Option<AttributionFailure>>,
     delegate: Option<Arc<dyn crate::acquisition::AcquisitionDelegate>>,
+    observation: Option<crate::attribution_observation::AttributionObservation>,
 }
 impl AttributionRuntime {
     pub fn new(
@@ -69,6 +70,7 @@ impl AttributionRuntime {
             sweep_gaps: Mutex::new(BTreeMap::new()),
             admission_gap: Mutex::new(None),
             delegate: None,
+            observation: None,
         })
     }
 
@@ -79,7 +81,38 @@ impl AttributionRuntime {
         self.delegate = Some(delegate);
         self
     }
+    /// A strict observer exposes status without scheduling or repairing evidence.
+    pub fn with_observation(
+        mut self,
+        store: Arc<dyn crate::attribution_observation::AttributionObservationStore>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        if self.delegate.is_some() || !self.enabled.is_empty() || timeout.is_zero() {
+            return Err(Error::invalid(
+                "Observation requires disabled providers and no delegate.",
+            ));
+        }
+        self.observation = Some(crate::attribution_observation::AttributionObservation::new(
+            store, timeout,
+        ));
+        Ok(self)
+    }
+    pub async fn run_observation(&self, cancel: CancellationToken) -> Result<()> {
+        self.observation
+            .as_ref()
+            .ok_or_else(|| Error::invalid("Observation is not configured."))?
+            .run(cancel.clone())
+            .await?;
+        // Required workers remain supervised after their one bounded pass.
+        cancel.cancelled().await;
+        Ok(())
+    }
     pub async fn enqueue_public(&self, target: &AttributionTarget) -> Result<()> {
+        if self.observation.is_some() {
+            return Err(Error::unavailable(
+                "Attribution observation cannot enqueue evidence.",
+            ));
+        }
         if !ATTRIBUTION_PROVIDERS.contains(&target.subject.provider.as_str()) {
             return Err(Error::invalid("Unknown attribution provider."));
         }
@@ -88,6 +121,11 @@ impl AttributionRuntime {
         Ok(())
     }
     pub async fn run(&self, cancel: CancellationToken) -> Result<()> {
+        if self.observation.is_some() {
+            return Err(Error::unavailable(
+                "Attribution observation cannot run repairs.",
+            ));
+        }
         let mut provider = 0;
         let mut admission = 0_u64;
         loop {
@@ -335,6 +373,11 @@ fn readable(generations: &[QualifiedAttribution]) -> Result<String> {
 #[async_trait]
 impl AttributionGate for AttributionRuntime {
     async fn qualify(&self, provider: &str, value: &Value) -> Result<Value> {
+        if self.observation.is_some() {
+            return Err(Error::unavailable(
+                "Attribution observation cannot qualify requests.",
+            ));
+        }
         let audit = provider.starts_with("audit:");
         let provider = provider.strip_prefix("audit:").unwrap_or(provider);
         let provider = match provider {
@@ -456,6 +499,32 @@ impl AttributionGate for AttributionRuntime {
         )
     }
     async fn status(&self) -> Result<Value> {
+        if let Some(observation) = &self.observation {
+            let mut status = self.store.attribution_status().await?;
+            let observed = observation.status().await?;
+            status["enabled_providers"] = json!([]);
+            status["disabled_providers"] = json!(ATTRIBUTION_PROVIDERS);
+            status["policy_epoch"] = json!(ATTRIBUTION_POLICY_EPOCH);
+            let gaps: BTreeMap<_, _> = ATTRIBUTION_PROVIDERS
+                .into_iter()
+                .filter_map(|provider| {
+                    let counts = observed.providers.get(provider)?;
+                    if counts.origin_gaps > 0 {
+                        Some((provider, "origin_gap"))
+                    } else if observed.state != "complete" {
+                        Some((provider, observed.gap.unwrap_or("scan_pending")))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            status["scan_gaps"] = json!(gaps);
+            status["observation_scan"] = serde_json::to_value(&observed)
+                .map_err(|_| Error::integrity("Invalid attribution observation status."))?;
+            status["complete"] = json!(false);
+            status["repair_complete_for_enqueued_targets"] = json!(false);
+            return Ok(status);
+        }
         if let Some(delegate) = &self.delegate {
             return delegate.attribution_status().await;
         }

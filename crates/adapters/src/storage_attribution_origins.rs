@@ -130,6 +130,110 @@ fn validate_checkpoint(value: &Checkpoint) -> Result<()> {
     Ok(())
 }
 
+/// Disposable forward traversal state; no durable sweep/checkpoint is read or written.
+pub(super) struct ObservationOrigins {
+    after: i64,
+    cutoff: i64,
+    frontier: Vec<Frame>,
+    complete: bool,
+}
+impl ObservationOrigins {
+    pub(super) async fn new(conn: &mut PgConnection, provider: &str) -> Result<Self> {
+        let table = table(provider)?;
+        let sql = format!("SELECT COALESCE(max(sequence),0) FROM {table} WHERE kind='snapshots'");
+        let cutoff = sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(sql))
+            .fetch_one(conn)
+            .await
+            .map_err(source_error)?;
+        Ok(Self {
+            after: 0,
+            cutoff,
+            frontier: Vec::new(),
+            complete: false,
+        })
+    }
+    pub(super) async fn page(
+        &mut self,
+        conn: &mut PgConnection,
+        provider: &str,
+    ) -> Result<(Vec<AttributionTarget>, u64, bool)> {
+        let started = std::time::Instant::now();
+        let mut output = Vec::new();
+        let mut gaps = 0_u64;
+        let mut charge = 0;
+        for _ in 0..PAGE_STEPS {
+            if started.elapsed() >= std::time::Duration::from_secs(1) {
+                break;
+            }
+            if self.frontier.is_empty() {
+                let table = table(provider)?;
+                let sql = format!(
+                    "SELECT sequence,key FROM {table} WHERE kind='snapshots' AND sequence>$1 AND sequence<=$2 ORDER BY sequence LIMIT 1"
+                );
+                let next: Option<(i64, String)> =
+                    sqlx_core::query_as::query_as(sqlx_core::sql_str::AssertSqlSafe(sql))
+                        .bind(self.after)
+                        .bind(self.cutoff)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(source_error)?;
+                let Some((sequence, key)) = next else {
+                    self.complete = true;
+                    break;
+                };
+                self.after = sequence;
+                self.frontier.push(Frame {
+                    kind: "snapshots".into(),
+                    key,
+                    ancestors: Vec::new(),
+                    member: None,
+                    leaf: None,
+                });
+            }
+            let frame = self.frontier.pop().ok_or_else(invalid)?;
+            let original = self.frontier.clone();
+            let before = charge;
+            let result = step(
+                conn,
+                provider,
+                frame.clone(),
+                &mut self.frontier,
+                &mut charge,
+            )
+            .await;
+            if before > 0
+                && result.as_ref().is_err_and(|error| {
+                    error.code == "capacity"
+                        && error.message == "Attribution origin traversal exceeds its byte bound."
+                })
+            {
+                self.frontier = original;
+                self.frontier.push(frame);
+                break;
+            }
+            match result {
+                Ok(Some(target)) => output.push(target),
+                Ok(None) => {}
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "attribution_origin_missing" | "integrity" | "invalid"
+                    ) || (error.code == "capacity"
+                        && error.message.starts_with("Attribution origin"))
+                        || AttributionFailure::from_error(&error).is_some_and(|failure| {
+                            failure.disposition == AttributionDisposition::Blocked
+                        }) =>
+                {
+                    self.frontier = original;
+                    gaps = gaps.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((output, gaps, self.complete))
+    }
+}
+
 async fn load(
     conn: &mut PgConnection,
     provider: &str,

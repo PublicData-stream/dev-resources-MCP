@@ -27,6 +27,8 @@ static CLAIM: AtomicU64 = AtomicU64::new(0);
 const TABLE_TARGETS: &str = "devres_attribution_targets";
 const TABLE_GENERATIONS: &str = "devres_attribution_generations";
 
+#[path = "storage_attribution_observation.rs"]
+mod observation;
 #[path = "storage_attribution_origins.rs"]
 pub(super) mod origins;
 #[path = "storage_attribution_recovery.rs"]

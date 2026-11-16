@@ -584,3 +584,16 @@ permit does not occupy an article transfer slot. The sole writer owns acquisitio
 and serving demand crosses only typed private writer operations. Public article
 bytes and attribution reads consult a live moderation overlay independently of
 immutable snapshot membership. See [Wikipedia](wikipedia.md).
+
+### Read-only observation boundary
+
+The private status listener's capability controls runtime composition as well as
+RPC dispatch. An observer attaches reader storage and has no outbound acquisition
+delegate, publication owner, collector, repair lane or writable initialization.
+Its sole attribution worker enumerates through a separate observation port;
+it never invokes the mutating sweep/checkpoint APIs. The adapter owns a bounded
+repeatable-read read-only transaction, ephemeral cursors and forward-origin
+frontiers. Enumeration and qualification checks share that transaction snapshot.
+Live lifecycle/policy/archive/visibility binding checks fence each page and status
+observation. Shutdown rolls back and releases the session. No observation tables
+or schema migration are required.
