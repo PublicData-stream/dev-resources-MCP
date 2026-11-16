@@ -2,6 +2,9 @@
 use devres_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+#[path = "collection_recovery_diagnostics.rs"]
+pub mod diagnostics;
+
 pub const NPM_RECOVERY_RECIPE: &str = "npm-materialization-deadline-v1";
 /// Immutable recipe identity; later live processors must register retained dispatch.
 pub const NPM_RECOVERY_PROCESSOR_VERSION: u32 = 1;
@@ -84,6 +87,6 @@ pub struct CollectionRecoveryReport {
 }
 
 pub use crate::storage::collection_recovery::{
-    apply_npm_recovery, diagnose_npm_recovery, inspect_npm_recovery_operation, run_npm_recovery,
-    verify_npm_recovery_evidence,
+    apply_npm_recovery, diagnose_npm_recovery, diagnose_npm_recovery_with_diagnostics,
+    inspect_npm_recovery_operation, run_npm_recovery, verify_npm_recovery_evidence,
 };

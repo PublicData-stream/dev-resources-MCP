@@ -60,6 +60,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
                 | "--snapshot"
                 | "--job-key"
                 | "--attribution-target"
+                | "--phase-file"
         ) || value.starts_with('-')
             || flags.insert(flag, value.clone()).is_some()
         {
@@ -71,6 +72,13 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
     let provider = flags.remove("--provider").ok_or_else(invalid)?;
     let output = PathBuf::from(flags.remove("--output").ok_or_else(invalid)?);
     private_path(&output)?;
+    let phase_file = flags.remove("--phase-file").map(PathBuf::from);
+    if let Some(path) = &phase_file {
+        private_path(path)?;
+        if action != Action::DryRun || provider != "npm" || path.parent() == output.parent() {
+            return Err(invalid());
+        }
+    }
     let artifact = flags.remove("--artifact").map(PathBuf::from);
     if let Some(p) = &artifact {
         private_path(p)?;
@@ -176,16 +184,69 @@ pub fn private_path(p: &std::path::Path) -> Result<()> {
     }
     Ok(())
 }
-pub fn write_report(mut file: std::fs::File, report: &impl serde::Serialize) -> Result<()> {
-    use std::io::Write;
-    let bytes = serde_json::to_vec_pretty(report).map_err(|_| invalid())?;
+/// Admit the optional phase sink before full parsing, so parse failures can be
+/// observed. Invalid/missing telemetry remains disabled and never changes outcome.
+pub fn diagnostics(
+    args: &[String],
+) -> devres_adapters::collection_recovery::diagnostics::Diagnostics {
+    use devres_adapters::collection_recovery::diagnostics::Diagnostics;
+    let paths: Vec<_> = args
+        .get(3..)
+        .unwrap_or_default()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|pair| pair[0] == "--phase-file")
+        .map(|pair| std::path::Path::new(&pair[1]))
+        .collect();
+    if paths.len() == 1 && private_path(paths[0]).is_ok() {
+        Diagnostics::open(paths[0])
+    } else {
+        Diagnostics::default()
+    }
+}
+pub fn write_report(file: std::fs::File, report: &impl serde::Serialize) -> Result<()> {
+    write_report_with_diagnostics(file, report, &Default::default())
+}
+pub fn write_report_with_diagnostics(
+    mut file: std::fs::File,
+    report: &impl serde::Serialize,
+    diagnostics: &devres_adapters::collection_recovery::diagnostics::Diagnostics,
+) -> Result<()> {
+    write_report_to(&mut file, report, diagnostics, |file| file.sync_all())
+}
+fn write_report_to<W: std::io::Write>(
+    file: &mut W,
+    report: &impl serde::Serialize,
+    diagnostics: &devres_adapters::collection_recovery::diagnostics::Diagnostics,
+    sync: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> Result<()> {
+    use devres_adapters::collection_recovery::diagnostics::{Phase, Reason};
+    diagnostics.start(Phase::ReportSerialize);
+    let bytes = serde_json::to_vec_pretty(report).map_err(|_| {
+        diagnostics.fail(Phase::ReportSerialize, Reason::Invalid);
+        invalid()
+    })?;
     if bytes.len() > 1024 * 1024 {
+        diagnostics.fail(Phase::ReportSerialize, Reason::Capacity);
         return Err(Error::capacity("Recovery report exceeds its bound."));
     }
+    diagnostics.ok(Phase::ReportSerialize);
+    diagnostics.start(Phase::ReportWrite);
     file.write_all(&bytes)
         .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_all())
-        .map_err(|_| Error::unavailable("Recovery report publication failed."))
+        .map_err(|error| {
+            diagnostics.fail(Phase::ReportWrite, Reason::io(&error));
+            Error::unavailable("Recovery report publication failed.")
+        })?;
+    diagnostics.ok(Phase::ReportWrite);
+    diagnostics.start(Phase::ReportSync);
+    sync(file).map_err(|error| {
+        diagnostics.fail(Phase::ReportSync, Reason::io(&error));
+        Error::unavailable("Recovery report publication failed.")
+    })?;
+    diagnostics.ok(Phase::ReportSync);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -244,5 +305,73 @@ mod tests {
         let mut v = args("apply", &[]);
         v[4] = "rfc".into();
         assert!(parse(&v).is_err());
+    }
+    #[test]
+    fn telemetry_is_separate_and_only_admitted_for_readonly_npm() {
+        let id = format!("blake3:{}", "a".repeat(64));
+        let base = [
+            "--job-id",
+            &id,
+            "--revision",
+            "1",
+            "--recipe",
+            devres_adapters::collection_recovery::NPM_RECOVERY_RECIPE,
+            "--phase-file",
+            "/tmp/phases/status",
+        ];
+        assert!(parse(&args("dry-run", &base)).is_ok());
+        let mut same_parent = args("dry-run", &base);
+        *same_parent.last_mut().unwrap() = "/tmp/owned/status".into();
+        assert!(parse(&same_parent).is_err());
+        assert!(parse(&args("apply", &base)).is_err());
+    }
+    #[test]
+    fn real_report_write_and_sync_failures_have_distinct_closed_phases() {
+        use devres_adapters::collection_recovery::diagnostics::Diagnostics;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        for fail_write in [true, false] {
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.path().join("status");
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            let diagnostics = Diagnostics::open(&path);
+            let mut bytes = Vec::new();
+            let result = if fail_write {
+                // /dev/full returns a genuine write error, without modifying a file.
+                let mut full = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap();
+                write_report_to(
+                    &mut full,
+                    &serde_json::json!({"outcome":"fixture"}),
+                    &diagnostics,
+                    |_| panic!("sync must not run after write failure"),
+                )
+            } else {
+                write_report_to(
+                    &mut bytes,
+                    &serde_json::json!({"outcome":"fixture"}),
+                    &diagnostics,
+                    |_| Err(std::io::Error::other("secret sync detail")),
+                )
+            };
+            assert_eq!(result.unwrap_err().code, "unavailable");
+            let phases = std::fs::read_to_string(&path).unwrap();
+            assert!(phases.contains(if fail_write {
+                "report_write\terror\tio"
+            } else {
+                "report_sync\terror\tio"
+            }));
+            assert!(!phases.contains("secret"));
+            if !fail_write {
+                assert!(!bytes.is_empty());
+            }
+        }
     }
 }

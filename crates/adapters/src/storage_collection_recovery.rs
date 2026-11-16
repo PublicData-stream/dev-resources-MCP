@@ -1,6 +1,7 @@
 //! Exact offline npm recovery. Source acquisition and default promotion are absent.
 use super::*;
 use crate::bulk::{BulkArtifact, BulkArtifactStore, MAX_ARTIFACT_BYTES};
+use crate::collection_recovery::diagnostics::{Diagnostics, Phase, Reason};
 use crate::collection_recovery::{
     CollectionRecoveryOptions, CollectionRecoveryReport, NPM_RECOVERY_PROCESSOR_VERSION,
     NPM_RECOVERY_RECIPE, RecoveryCheckpoint, RecoveryEvidenceReceipt,
@@ -539,13 +540,25 @@ pub(crate) async fn verify_history(
 }
 
 async fn connection(database_url: &str, apply: bool) -> Result<PgConnection> {
+    connection_with_diagnostics(database_url, apply, &Diagnostics::default()).await
+}
+async fn connection_with_diagnostics(
+    database_url: &str,
+    apply: bool,
+    diagnostics: &Diagnostics,
+) -> Result<PgConnection> {
+    diagnostics.start(Phase::SqlConnect);
     let mut conn = PgConnection::connect(database_url)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|error| sql_failure(diagnostics, Phase::SqlConnect, &error))?;
+    diagnostics.ok(Phase::SqlConnect);
+    diagnostics.start(Phase::SqlSetup);
     sqlx_core::raw_sql::raw_sql("SET statement_timeout='3000ms'; SET lock_timeout='1000ms'")
         .execute(&mut conn)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|error| sql_failure(diagnostics, Phase::SqlSetup, &error))?;
+    diagnostics.ok(Phase::SqlSetup);
+    diagnostics.start(Phase::Lifecycle);
     let sql = if apply {
         "SELECT pg_try_advisory_lock(1835365490,2)"
     } else {
@@ -554,8 +567,9 @@ async fn connection(database_url: &str, apply: bool) -> Result<PgConnection> {
     let held: bool = sqlx_core::query_scalar::query_scalar(sql)
         .fetch_one(&mut conn)
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|error| sql_failure(diagnostics, Phase::Lifecycle, &error))?;
     if !held {
+        diagnostics.fail(Phase::Lifecycle, Reason::LockBusy);
         return Err(Error::capacity(
             "Collection recovery requires stopped participants.",
         ));
@@ -565,7 +579,7 @@ async fn connection(database_url: &str, apply: bool) -> Result<PgConnection> {
             sqlx_core::query_scalar::query_scalar("SELECT pg_try_advisory_lock(1835365490,1)")
                 .fetch_one(&mut conn)
                 .await
-                .map_err(|_| unavailable())?;
+                .map_err(|error| sql_failure(diagnostics, Phase::Lifecycle, &error))?;
         if !held {
             return Err(Error::capacity(
                 "Collection recovery requires stopped writers.",
@@ -575,18 +589,31 @@ async fn connection(database_url: &str, apply: bool) -> Result<PgConnection> {
         sqlx_core::raw_sql::raw_sql("SET default_transaction_read_only=on")
             .execute(&mut conn)
             .await
-            .map_err(|_| unavailable())?;
+            .map_err(|error| sql_failure(diagnostics, Phase::Lifecycle, &error))?;
     }
+    diagnostics.ok(Phase::Lifecycle);
+    diagnostics.start(Phase::Schema);
     let schema:i32=sqlx_core::query_scalar::query_scalar("SELECT version FROM devres_schema WHERE singleton AND (SELECT active FROM devres_integrity_control WHERE singleton) AND to_regclass('public.devres_archive_restore_pending') IS NULL")
-        .fetch_one(&mut conn).await.map_err(|_|unavailable())?;
+        .fetch_one(&mut conn).await.map_err(|error|sql_failure(diagnostics, Phase::Schema, &error))?;
     if schema != 19 {
+        diagnostics.fail(Phase::Schema, Reason::Schema);
         return Err(Error::unavailable(
             "Collection recovery requires active schema 19.",
         ));
     }
-    attribution_storage::verify_control(&mut conn).await?;
+    diagnostics.ok(Phase::Schema);
+    diagnostics.start(Phase::Policy);
+    diagnostics.domain(
+        Phase::Policy,
+        attribution_storage::verify_control(&mut conn).await,
+    )?;
     Ok(conn)
 }
+fn sql_failure(diagnostics: &Diagnostics, phase: Phase, error: &sqlx_core::Error) -> Error {
+    diagnostics.fail(phase, Reason::sql(error));
+    unavailable()
+}
+
 struct Selected {
     job: Value,
     state_digest: String,
@@ -596,25 +623,43 @@ async fn selected(
     conn: &mut PgConnection,
     options: &CollectionRecoveryOptions,
 ) -> Result<Selected> {
+    selected_with_diagnostics(conn, options, &Diagnostics::default()).await
+}
+async fn selected_with_diagnostics(
+    conn: &mut PgConnection,
+    options: &CollectionRecoveryOptions,
+    diagnostics: &Diagnostics,
+) -> Result<Selected> {
+    diagnostics.start(Phase::HistorySelect);
     let row=sqlx_core::query::query("SELECT data,data_integrity FROM devres_npm_advisory_job_history WHERE job_id=$1 AND revision=$2 AND octet_length(data::text)<=8388608")
-        .bind(&options.job_id).bind(options.revision as i64).fetch_optional(&mut *conn).await.map_err(|_|unavailable())?.ok_or_else(||Error::not_found("Exact retained advisory job revision unavailable."))?;
-    let data: Json<Value> = row.try_get("data").map_err(|_| invalid())?;
-    let seal: String = row.try_get("data_integrity").map_err(|_| invalid())?;
-    let data = payload_integrity::checked(
-        HISTORY,
-        &options.job_id,
-        &options.revision.to_string(),
-        data.0,
-        &seal,
+        .bind(&options.job_id).bind(options.revision as i64).fetch_optional(&mut *conn).await.map_err(|error|sql_failure(diagnostics, Phase::HistorySelect, &error))?;
+    let row = diagnostics.domain(
+        Phase::HistorySelect,
+        row.ok_or_else(|| Error::not_found("Exact retained advisory job revision unavailable.")),
     )?;
-    let job = data["job"].clone();
-    validate_job(&job)?;
-    if job_id(&job)? != options.job_id
-        || data["revision"] != options.revision
-        || data["state_digest"] != hash(&job)?
-    {
-        return Err(invalid());
-    }
+    let checked = (|| -> Result<_> {
+        let data: Json<Value> = row.try_get("data").map_err(|_| invalid())?;
+        let seal: String = row.try_get("data_integrity").map_err(|_| invalid())?;
+        let data = payload_integrity::checked(
+            HISTORY,
+            &options.job_id,
+            &options.revision.to_string(),
+            data.0,
+            &seal,
+        )?;
+        let job = data["job"].clone();
+        validate_job(&job)?;
+        if job_id(&job)? != options.job_id
+            || data["revision"] != options.revision
+            || data["state_digest"] != hash(&job)?
+        {
+            return Err(invalid());
+        }
+        Ok((data, seal, job))
+    })();
+    let (data, seal, job) = diagnostics.domain(Phase::HistorySelect, checked)?;
+    diagnostics.start(Phase::StateSelect);
+    let checked = async {
     let latest: i64 = sqlx_core::query_scalar::query_scalar(
         "SELECT max(revision) FROM devres_npm_advisory_job_history WHERE job_id=$1",
     )
@@ -661,6 +706,8 @@ async fn selected(
         state_digest,
         reason,
     })
+    }.await;
+    diagnostics.domain(Phase::StateSelect, checked)
 }
 fn report(
     options: &CollectionRecoveryOptions,
@@ -710,14 +757,30 @@ pub async fn diagnose_npm_recovery(
     options: &CollectionRecoveryOptions,
     evidence: Option<&RecoveryEvidenceReceipt>,
 ) -> Result<CollectionRecoveryReport> {
+    diagnose_npm_recovery_with_diagnostics(database_url, options, evidence, &Diagnostics::default())
+        .await
+}
+/// Same read-only diagnosis with optional private, closed phase observations.
+pub async fn diagnose_npm_recovery_with_diagnostics(
+    database_url: &str,
+    options: &CollectionRecoveryOptions,
+    evidence: Option<&RecoveryEvidenceReceipt>,
+    diagnostics: &Diagnostics,
+) -> Result<CollectionRecoveryReport> {
     options.validate(false)?;
-    let mut conn = connection(database_url, false).await?;
-    let mut tx = conn.begin().await.map_err(|_| unavailable())?;
+    let mut conn = connection_with_diagnostics(database_url, false, diagnostics).await?;
+    diagnostics.start(Phase::Transaction);
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|error| sql_failure(diagnostics, Phase::Transaction, &error))?;
     sqlx_core::raw_sql::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await
-        .map_err(|_| unavailable())?;
-    let mut found = selected(&mut tx, options).await?;
+        .map_err(|error| sql_failure(diagnostics, Phase::Transaction, &error))?;
+    diagnostics.ok(Phase::Transaction);
+    let mut found = selected_with_diagnostics(&mut tx, options, diagnostics).await?;
+    diagnostics.start(Phase::Eligibility);
     if found.reason == "eligible" && require_available_processor(PROCESSOR_VERSION).is_err() {
         found.reason = "unsupported_recipe_processor";
     }
@@ -738,7 +801,12 @@ pub async fn diagnose_npm_recovery(
             "ineligible"
         },
     );
-    tx.rollback().await.map_err(|_| unavailable())?;
+    diagnostics.ok(Phase::Eligibility);
+    diagnostics.start(Phase::Rollback);
+    tx.rollback()
+        .await
+        .map_err(|error| sql_failure(diagnostics, Phase::Rollback, &error))?;
+    diagnostics.ok(Phase::Rollback);
     Ok(result)
 }
 

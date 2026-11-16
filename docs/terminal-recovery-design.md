@@ -130,3 +130,19 @@ reconciliation. Execute a superseded job and read its historical snapshot while
 asserting the newer current job/default remain identical. Keep PostgreSQL, archive
 cache-loss/restore, IPv4 HTTP/WebTransport and minikube outcomes distinct from
 production repair or whole-corpus acceptance. Production application is separate.
+
+### Optional npm assessment phases
+
+For a new, independently admitted assessment helper, npm `dry-run` accepts
+`--phase-file /tmp/npm-assessment-phases/status`. The helper creates this separate
+private regular file; it does not pre-create the report. Other recovery actions
+reject the flag. Finite CLI events distinguish output/configuration, PostgreSQL
+admission/selection, and report serialization/write/fsync. Instrumentation failure
+preserves the original assessment result. The maintained helper mirrors only
+closed events into a File-only kubelet termination record and records the numeric
+child exit separately from READY/hold and container termination. Missing telemetry
+is unknown evidence, not eligibility or a reason to retry.
+
+A status-only listener configuration cannot authorize recovery apply/run,
+rebuild/import, migration, activation or object-storage maintenance. Use separately
+admitted maintenance configuration and credentials outside the paused phase.
