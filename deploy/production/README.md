@@ -38,6 +38,9 @@ records another failed target, successful schema-18 restoration and failed
 fallback private acceptance; applications remain withdrawn.
 The [9373f71e fresh-cycle procedure](upgrade-9373f71e.md) selects the new signed
 release and current diagnostic helpers without replaying either consumed cycle.
+Its [execution evidence](upgrade-9373f71e-evidence.md) records the failed target,
+automatic schema-18 restoration and failed fallback private status call;
+application roles remain withdrawn with all nine sources paused.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.

@@ -7,6 +7,11 @@ The predecessor is the withdrawn schema-18 fallback recorded in the
 cycles, their source closures, journals and finite probe ledgers. Their consumed
 intents cannot be replayed.
 
+The [execution evidence](upgrade-9373f71e-evidence.md) records this cycle's failed
+target and failed fallback acceptance. Its target and automatic recovery intents
+are consumed. Further production execution needs a separately authorized fresh
+cycle; rendering this procedure does not authorize one.
+
 The renderer reads its exact 24-source whitelist from that signed commit, including
 both reviewed failure-observability corrections. Add the separately qualified
 target/fallback native records and bind the complete 26-file manifest before any
