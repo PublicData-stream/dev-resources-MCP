@@ -36,6 +36,8 @@ EXPECTED_JOBS = frozenset({
     "e2e (minikube, arm64)",
     "e2e (minikube-s3, amd64)",
     "e2e (minikube-s3, arm64)",
+    "e2e (minikube-s3-paused, amd64)",
+    "e2e (minikube-s3-paused, arm64)",
 })
 
 

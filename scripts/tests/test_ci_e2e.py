@@ -110,7 +110,8 @@ print("1.2.3")
         ])
 
     def test_release_consumer_validates_without_tag_check_or_stamp(self):
-        for scenario, platform in (("docker", "linux/amd64"), ("minikube", "linux/arm64"), ("minikube-s3", "linux/amd64")):
+        for scenario, platform in (("docker", "linux/amd64"), ("minikube", "linux/arm64"),
+                                   ("minikube-s3", "linux/amd64"), ("minikube-s3-paused", "linux/arm64")):
             with self.subTest(scenario=scenario):
                 self.log.unlink(missing_ok=True)
                 result, calls = self.run_driver("test", scenario, platform, "artifact", RELEASE_TAG="1.2.3")
@@ -187,7 +188,7 @@ elif command == "verify":
 
     def test_minikube_consumers_install_verified_companion_without_download(self):
         self.prepare_full_driver()
-        for scenario in ("minikube", "minikube-s3"):
+        for scenario in ("minikube", "minikube-s3", "minikube-s3-paused"):
             for platform in ("linux/amd64", "linux/arm64"):
                 with self.subTest(scenario=scenario, platform=platform):
                     self.log.unlink(missing_ok=True)
@@ -203,7 +204,9 @@ elif command == "verify":
                     expected = ["test-minikube.sh", "--image", "fixture:test"]
                     if scenario == "minikube-s3":
                         expected += ["--s3", "--credential-broker"]
-                    self.assertIn(expected, calls)
+                    elif scenario == "minikube-s3-paused":
+                        expected += ["--s3"]
+                    self.assertEqual([call for call in calls if call[0] == "test-minikube.sh"], [expected])
                     self.assertEqual(calls[-1], ["minikube", "version"])
                     self.assertEqual((self.state / "bin/minikube").read_bytes(),
                                      (self.root / "fixture-minikube").read_bytes())
@@ -223,6 +226,7 @@ elif command == "verify":
             (("build", "linux/amd64", "artifact"), "acquire-minikube"),
             (("test", "minikube", "linux/amd64", "artifact"), "verify-minikube"),
             (("test", "minikube-s3", "linux/arm64", "artifact"), "verify-minikube"),
+            (("test", "minikube-s3-paused", "linux/amd64", "artifact"), "verify-minikube"),
         ):
             with self.subTest(args=args):
                 self.log.unlink(missing_ok=True)

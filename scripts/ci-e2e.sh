@@ -4,7 +4,7 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
 if [[ ${1:-} != --inside-state ]]; then
-  case "${1:-}:$#" in build:3|test:4) ;; *) echo 'usage: ci-e2e.sh build PLATFORM DIRECTORY | test docker|minikube|minikube-s3 PLATFORM DIRECTORY' >&2; exit 2 ;; esac
+  case "${1:-}:$#" in build:3|test:4) ;; *) echo 'usage: ci-e2e.sh build PLATFORM DIRECTORY | test docker|minikube|minikube-s3|minikube-s3-paused PLATFORM DIRECTORY' >&2; exit 2 ;; esac
   export DEVRES_TMP_ROOT
   DEVRES_TMP_ROOT=$(mktemp -d /tmp/devres-ci-e2e.XXXXXX)
   umask 022
@@ -23,7 +23,7 @@ case "$platform" in
   linux/arm64) arch=arm64 ;;
   *) echo 'Unsupported native platform' >&2; exit 2 ;;
 esac
-case "$mode:$scenario" in build:|test:docker|test:minikube|test:minikube-s3) ;; *) echo 'Unsupported CI scenario' >&2; exit 2 ;; esac
+case "$mode:$scenario" in build:|test:docker|test:minikube|test:minikube-s3|test:minikube-s3-paused) ;; *) echo 'Unsupported CI scenario' >&2; exit 2 ;; esac
 # Resolve paths before changing subprocess environments; artifact storage is runner-owned.
 artifact=$(realpath -m -- "$artifact")
 commit=${GITHUB_SHA:-$(git rev-parse HEAD)}
@@ -46,7 +46,7 @@ export RUSTUP_TOOLCHAIN=1.99.1
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 if [[ $mode == build ]]; then
   python3 scripts/e2e-artifact.py acquire-minikube "$artifact" "$platform" "$commit" "$version"
-elif [[ $scenario == minikube || $scenario == minikube-s3 ]]; then
+elif [[ $scenario == minikube || $scenario == minikube-s3 || $scenario == minikube-s3-paused ]]; then
   minikube_binary=$(python3 scripts/e2e-artifact.py verify-minikube "$artifact" "$platform" "$commit" "$version")
   mkdir -p "$DEVRES_TMP_ROOT/bin"
   install -m 755 -- "$minikube_binary" "$DEVRES_TMP_ROOT/bin/minikube"
@@ -75,6 +75,7 @@ exec scripts/with-local-docker.sh bash -euo pipefail -c '
       docker) scripts/test-oxibelt.sh --image "$image"; scripts/test-credential-broker.sh --image "$image" ;;
       minikube) scripts/test-minikube.sh --image "$image" ;;
       minikube-s3) scripts/test-minikube.sh --image "$image" --s3 --credential-broker ;;
+      minikube-s3-paused) scripts/test-minikube.sh --image "$image" --s3 ;;
     esac
   fi
 ' ci-e2e "$platform" "$mode" "$artifact" "$version" "$commit" "$arch" "$scenario"

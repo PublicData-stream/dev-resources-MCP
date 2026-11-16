@@ -438,7 +438,7 @@ provider coverage, and production deployment require their own evidence.
 `scripts/ci-e2e.sh build PLATFORM DIRECTORY` builds the fixture harness once per
 native architecture and exports a Docker-save artifact through
 `scripts/e2e-artifact.py`, together with a verified minikube companion.
-`test docker|minikube|minikube-s3 PLATFORM DIRECTORY` verifies its
+`test docker|minikube|minikube-s3|minikube-s3-paused PLATFORM DIRECTORY` verifies its
 platform, commit, version and contents, loads it, and passes `--image` to the
 scenario harness without rebuilding. Release builds stamp their sources; consumers
 validate the version from the release tag without stamping their checkout.
@@ -448,10 +448,17 @@ the six staged executable copies before building the image, preserving symbol ta
 and shared build outputs. This reduces the archive, Docker and minikube image copies
 without changing compiler profiles or acceptance coverage.
 
+The `minikube` scenario uses filesystem storage. `minikube-s3` keeps credential
+broker coverage, while `minikube-s3-paused` uses plain S3 credentials to exercise
+the SELECT-only paused observer and SQL/S3 failure ordering; the broker scenario
+does not run that fixture. Both S3 scenarios use synthetic credentials and stores.
+
 The `e2e-build` matrix uses Ubuntu 26.04 amd64 and ARM64 runners with 60-minute
-limits. The `e2e` matrix runs Docker and minikube on both architectures with
-45-minute limits and fail-fast disabled. The always-running `edge` aggregate
+limits. The `e2e` matrix runs Docker and all three minikube scenarios on both
+architectures with 45-minute limits and fail-fast disabled. The always-running `edge` aggregate
 requires both matrices to succeed, including rejecting skipped or cancelled work.
+The release CI selector requires the same fourteen expanded jobs, including both
+plain-S3 native legs, before reusing an attempt.
 Harness artifacts `e2e-harness-ARCH` live for one day; scenario diagnostics selected
 by `DEVRES_E2E_DIAGNOSTICS_DIR` live for seven days, including tool preparation
 diagnostics from the build jobs. Diagnostics exclude fixture
@@ -1616,3 +1623,13 @@ remaining Kubernetes acceptance gate. The optional real-image assessment runs wi
 `--npm-assessment-image SERVER_IMAGE`; `--s3` additionally exercises paused archive
 failure ordering. Set `DEVRES_E2E_DIAGNOSTICS_DIR` to an owned directory below
 `/tmp` to retain validated receipts after ordinary fixture scratch cleanup.
+
+The paused fixture starts a fresh observer backend for each storage fault and
+binds bounded timing evidence to that exact process. Fault probes preserve mTLS
+and hostname verification while addressing the pod directly, because an archive
+outage intentionally withdraws Service readiness. Healthy public checks use
+Service DNS. A `paused-status-failure.json` records closed failure metadata before
+restoration replaces the observer; `paused-status-restoration.json` records the
+restoration outcomes separately. These private create-new receipts exclude raw
+stderr, responses, configuration and credentials. Retention or restoration failure
+cannot replace the primary error or produce successful acceptance.

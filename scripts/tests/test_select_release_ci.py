@@ -24,6 +24,7 @@ JOB_NAMES = (
     "e2e (docker, amd64)", "e2e (docker, arm64)",
     "e2e (minikube, amd64)", "e2e (minikube, arm64)",
     "e2e (minikube-s3, amd64)", "e2e (minikube-s3, arm64)",
+    "e2e (minikube-s3-paused, amd64)", "e2e (minikube-s3-paused, arm64)",
 )
 
 
@@ -85,10 +86,31 @@ class FakeApi:
 class ReleaseCIReuseTests(unittest.TestCase):
     def test_accepts_complete_first_attempt_and_complete_rerun(self):
         first = FakeApi()
+        self.assertEqual(len(first.jobs), 14)
         self.assertEqual(reuse.select_reusable_ci(first, REVISION, NOW), (42, 1))
         rerun = FakeApi(runs=[run(attempt=2)], attempt_jobs=jobs(attempt=2))
         self.assertEqual(reuse.select_reusable_ci(rerun, REVISION, NOW), (42, 2))
         self.assertIn("/actions/runs/42/attempts/2/jobs?per_page=100&page=1", rerun.calls)
+
+    def test_each_missing_plain_s3_native_leg_requires_fresh_ci(self):
+        for architecture in ("amd64", "arm64"):
+            name = f"e2e (minikube-s3-paused, {architecture})"
+            incomplete = [job for job in jobs() if job["name"] != name]
+            with self.subTest(architecture=architecture):
+                self.assertEqual(len(incomplete), 13)
+                self.assertIsNone(reuse.select_reusable_ci(FakeApi(attempt_jobs=incomplete), REVISION, NOW))
+
+    def test_each_unsuccessful_plain_s3_native_leg_requires_fresh_ci(self):
+        for architecture in ("amd64", "arm64"):
+            for conclusion in ("failure", "skipped", "cancelled"):
+                attempt_jobs = jobs()
+                selected = next(job for job in attempt_jobs
+                                if job["name"] == f"e2e (minikube-s3-paused, {architecture})")
+                selected["conclusion"] = conclusion
+                with self.subTest(architecture=architecture, conclusion=conclusion):
+                    self.assertIsNone(reuse.select_reusable_ci(
+                        FakeApi(attempt_jobs=attempt_jobs), REVISION, NOW
+                    ))
 
     def test_partial_rerun_cannot_borrow_jobs_from_earlier_attempt(self):
         partial = FakeApi(runs=[run(attempt=2)], attempt_jobs=jobs(attempt=2)[:-1])
