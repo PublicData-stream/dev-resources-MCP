@@ -36,6 +36,8 @@ result is recorded in the [schema-19 execution evidence](upgrade-1d76fbcc-eviden
 separately from preparation. The [second approved cycle](upgrade-1d76fbcc-cycle2-evidence.md)
 records another failed target, successful schema-18 restoration and failed
 fallback private acceptance; applications remain withdrawn.
+The [9373f71e fresh-cycle procedure](upgrade-9373f71e.md) selects the new signed
+release and current diagnostic helpers without replaying either consumed cycle.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
