@@ -176,6 +176,10 @@ name = "storage-probe"
 path = "examples/shared/storage-probe.rs"
 
 [[example]]
+name = "npm-assessment-seed"
+path = "examples/shared/npm-assessment-seed.rs"
+
+[[example]]
 name = "w3c-live-probe"
 path = "examples/w3c/live-probe.rs"
 

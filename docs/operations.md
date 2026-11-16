@@ -1571,3 +1571,48 @@ backups. The default-enabled Wikipedia collector adds one continuous stream and
 paced current-body acquisition; explicitly pause it in disposable/offline fixtures.
 The bounded opt-in `scripts/live-smoke.sh --live --wikipedia` check is separate from
 full STEM collection and production activation. See [Wikipedia](wikipedia.md).
+
+### Failed assessment diagnostics and paused acceptance
+
+Use the maintained `deploy/diagnostics/npm_assessment.py` helper for new assessment
+fixtures and future source closures. Historical cycle helpers, their frozen
+manifests and consumed intents remain unchanged. A future production cycle must
+explicitly admit the new helper and a corrected release/fallback; old binaries
+reject the new access fields and cannot enforce status-only authority.
+
+Assessment evidence distinguishes CLI failure from later READY/hold failure.
+The optional compiled phase channel uses only closed phase/result/reason values,
+with a 3-KiB/48-record bound and File-only Kubernetes termination messages. Missing
+or malformed telemetry means unknown phase. Never retain raw log tails or stderr
+as a diagnostic substitute. Report output retains separate private create-new
+admission and framing. Credential-bearing Pod cleanup runs independently of host
+evidence persistence; lost diagnostics do not justify keeping a failed Pod alive
+or automatically repeating its CLI.
+
+Enable `DEVRES_PRIVATE_TIMINGS=1` for opt-in finite status-stage aggregates. Stages
+separate npm metadata/statistics/page verification from attribution token and
+transport dependencies. Cancellation is explicit; diagnostic records contain no
+request inputs, raw errors, URLs, credentials, queries, package bodies or reports.
+This does not replace archive authority checks or justify larger timeouts.
+
+Strict paused acceptance starts the status-only observer only after separate
+bootstrap/migration has stopped. Use SELECT-only SQL, read-only S3/broker identity,
+and a fresh disposable observer cache. Verify the entire observer startup adds no
+publication owner, repairs, queue/checkpoint writes or provider requests before
+running complete public status acceptance. Observer scan coverage is snapshot
+metadata and remains distinct from repair and full corpus/body acceptance.
+
+Local Kubernetes assessment qualification requires the candidate Dockerfile
+server image, synthetic legacy history, effective `devres-runtime` AppArmor,
+restricted security settings, and fixture DNS/PostgreSQL-only egress. Harness
+images or admitted Pod specifications alone do not establish those properties.
+All fixture state belongs below `/tmp`; temporarily loaded profile ownership must
+be checked before cleanup. No local result authorizes replay of a production
+cycle, recovery apply/run, provider traffic or publication.
+
+See the [local paused-status verification record](paused-assessment-acceptance.md)
+for completed checks, the default-stack regression, local image identities and the
+remaining Kubernetes acceptance gate. The optional real-image assessment runs with
+`--npm-assessment-image SERVER_IMAGE`; `--s3` additionally exercises paused archive
+failure ordering. Set `DEVRES_E2E_DIAGNOSTICS_DIR` to an owned directory below
+`/tmp` to retain validated receipts after ordinary fixture scratch cleanup.

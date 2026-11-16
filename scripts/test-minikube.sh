@@ -8,19 +8,22 @@ s3=0
 credential_broker=0
 live_rfc_args=()
 supplied_image=
+npm_assessment_image=
 while (( $# )); do
   case "$1" in
     --image) [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo '--image requires an image' >&2; exit 2; }; supplied_image=$2; shift 2 ;;
+    --npm-assessment-image) [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo '--npm-assessment-image requires the Dockerfile server image' >&2; exit 2; }; npm_assessment_image=$2; shift 2 ;;
     --live) live=1; shift ;;
     --s3) s3=1; shift ;;
     --credential-broker) credential_broker=1; shift ;;
     --rfc-text-only) live_rfc_args=(--rfc-text-only); shift ;;
-    *) echo 'usage: scripts/test-minikube.sh [--image IMAGE] [--s3 [--credential-broker]] [--live [--rfc-text-only]]' >&2; exit 2 ;;
+    *) echo 'usage: scripts/test-minikube.sh [--image IMAGE] [--npm-assessment-image SERVER_IMAGE] [--s3 [--credential-broker]] [--live [--rfc-text-only]]' >&2; exit 2 ;;
   esac
 done
 if (( ! live && ${#live_rfc_args[@]} )); then echo '--rfc-text-only requires --live' >&2; exit 2; fi
 if (( s3 && live )); then echo '--s3 is an isolated fixture scenario and does not accept --live' >&2; exit 2; fi
 if (( credential_broker && ! s3 )); then echo '--credential-broker requires --s3' >&2; exit 2; fi
+if [[ -n $npm_assessment_image ]] && (( live )); then echo '--npm-assessment-image is synthetic and does not accept --live' >&2; exit 2; fi
 # Canonical synthetic RFC captures must never satisfy later live-provider probes.
 collector_providers=(w3c chromium)
 if (( ! live )); then collector_providers+=(rfc rustsec); fi
@@ -168,6 +171,11 @@ minikube -p "$profile" image load "$image" || {
   scripts/e2e-storage.sh minikube-import-failed "$image" "$scratch" || true
   exit "$status"
 }
+if [[ -n $npm_assessment_image ]]; then
+  [[ $npm_assessment_image != "$image" ]] || { echo 'The npm assessment requires a separate Dockerfile server image' >&2; exit 2; }
+  docker image inspect "$npm_assessment_image" >/dev/null
+  minikube -p "$profile" image load "$npm_assessment_image"
+fi
 scripts/e2e-storage.sh after-minikube-import "$image" "$scratch" || true
 k create namespace "$namespace" --dry-run=client -o yaml | k apply -f -
 k create secret generic devres-encryption-canary --from-literal=value=devres-synthetic-encryption-canary
@@ -222,6 +230,10 @@ k patch deployment writer --type=json -p='[
   {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"wikipedia-identity","mountPath":"/run/devres-wikipedia","readOnly":true}}
 ]'
 k rollout status deployment/postgres --timeout=180s
+if [[ -n $npm_assessment_image ]]; then
+  python3 -I -B scripts/npm-assessment-fixture.py --profile "$profile" --scratch "$scratch" \
+    --harness-image "$image" --server-image "$npm_assessment_image"
+fi
 k exec -i deployment/postgres -- psql -v ON_ERROR_STOP=1 -U devres -d devres < "$scratch/reader-role.sql" >/dev/null
 if (( credential_broker )); then
   k exec -i deployment/postgres -- psql -v ON_ERROR_STOP=1 -U devres -d postgres < "$scratch/fixture/broker/database-init.sql" >/dev/null
@@ -619,6 +631,12 @@ external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixtur
 # Run with the serving SELECT-only configuration for both filesystem and S3 scenarios.
 # The report stays in an owned /tmp directory inside the pod and is removed afterwards.
 k exec -i deployment/backend -- python3 -I -B - < scripts/npm-diagnosis-fixture.py
+if (( ! live && ! credential_broker )); then
+  observer_args=()
+  if (( s3 )); then observer_args+=(--s3); fi
+  python3 -I -B scripts/paused-status-fixture.py --profile "$profile" --scratch "$scratch" "${observer_args[@]}"
+  wait_edge
+fi
 seeded_webtransport
 collector_reads
 if (( s3 )); then

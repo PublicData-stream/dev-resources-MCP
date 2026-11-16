@@ -7,7 +7,7 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
 command -v strip >/dev/null || { echo 'strip is required to stage harness binaries' >&2; exit 1; }
 if [[ -z ${SERVER_BINARY:-} || -z ${PROBE_BINARY:-} ]]; then cargo build --workspace --bins --locked; fi
-cargo build --locked -p devres-adapters --example storage-probe --bin devres-audit-worker --bin devres-pdf-worker
+cargo build --locked -p devres-adapters --example storage-probe --example npm-assessment-seed --bin devres-audit-worker --bin devres-pdf-worker
 target_dir=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 edge_binary=${OXIBELT_BINARY:-}
 if [[ -z $edge_binary ]]; then edge_binary=$(scripts/build-oxibelt.sh | tail -n 1); fi
@@ -38,21 +38,23 @@ PYTESTBIN
 if docker image inspect "$image" >/dev/null 2>&1; then
   echo 'Refusing to overwrite an existing harness image tag' >&2; exit 1
 fi
-cp "${SERVER_BINARY:-$target_dir/debug/devres-server}" "$scratch/build/bin/devres-server"
-cp "${PROBE_BINARY:-$target_dir/debug/devres-probe}" "$scratch/build/bin/devres-probe"
-cp "$target_dir/debug/devres-credential-broker" "$scratch/build/bin/devres-credential-broker"
-cp "$target_dir/debug/examples/storage-probe" "$scratch/build/bin/storage-probe"
-cp "$target_dir/debug/devres-audit-worker" "$scratch/build/bin/devres-audit-worker"
-cp "$target_dir/debug/devres-pdf-worker" "$scratch/build/bin/devres-pdf-worker"
-cp "$edge_binary" "$scratch/build/bin/oxibelt"
-cp "$collector_tests" "$scratch/build/bin/devres-collector-tests"
-# Remove debug information only from disposable copies, preserving shared builds.
-for binary in devres-server devres-probe devres-credential-broker storage-probe devres-audit-worker devres-pdf-worker oxibelt devres-collector-tests; do
-  strip --strip-debug "$scratch/build/bin/$binary"
-  # Cargo artifacts can be owner-executable only. The fixture image runs as
-  # uid 65532, so normalize disposable copies without changing shared builds.
-  chmod 0755 "$scratch/build/bin/$binary"
-done
+# Strip each disposable copy immediately so peak scratch use includes only one
+# full debug executable. Shared build artifacts and their modes remain untouched.
+stage_binary() {
+  local source=$1 name=$2
+  cp -- "$source" "$scratch/build/bin/$name"
+  strip --strip-debug "$scratch/build/bin/$name"
+  chmod 0755 "$scratch/build/bin/$name"
+}
+stage_binary "${SERVER_BINARY:-$target_dir/debug/devres-server}" devres-server
+stage_binary "${PROBE_BINARY:-$target_dir/debug/devres-probe}" devres-probe
+stage_binary "$target_dir/debug/devres-credential-broker" devres-credential-broker
+stage_binary "$target_dir/debug/examples/storage-probe" storage-probe
+stage_binary "$target_dir/debug/examples/npm-assessment-seed" npm-assessment-seed
+stage_binary "$target_dir/debug/devres-audit-worker" devres-audit-worker
+stage_binary "$target_dir/debug/devres-pdf-worker" devres-pdf-worker
+stage_binary "$edge_binary" oxibelt
+stage_binary "$collector_tests" devres-collector-tests
 cp scripts/mcp_smoke.py "$scratch/build/scripts/"
 cp scripts/collector-smoke.py "$scratch/build/scripts/"
 cp scripts/kube-identity-fixture.py "$scratch/build/scripts/"

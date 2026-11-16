@@ -11,7 +11,7 @@ import unittest
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-BINARIES = ("devres-server", "devres-probe", "devres-credential-broker", "storage-probe",
+BINARIES = ("devres-server", "devres-probe", "devres-credential-broker", "storage-probe", "npm-assessment-seed",
             "devres-audit-worker", "devres-pdf-worker", "oxibelt", "devres-collector-tests")
 DEBUG = b"\n# fixture debug information\n"
 
@@ -40,7 +40,7 @@ class BuildHarnessTests(unittest.TestCase):
         self.log = self.root / "calls.jsonl"
         self.sources = {}
         for name in BINARIES:
-            path = self.target / "debug" / ("examples/storage-probe" if name == "storage-probe" else name)
+            path = self.target / "debug" / ("examples/" + name if name in ("storage-probe", "npm-assessment-seed") else name)
             contents = b"#!/bin/sh\nexit 0\n"
             if name == "oxibelt":
                 contents = ("#!/bin/sh\nprintf '%s\\n' 'OXIBELT_BUILD_IDENTITY_V1="
