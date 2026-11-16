@@ -46,16 +46,103 @@ These identify a local worktree build, not a registry release or hosted-CI artif
 The separate final tooling harness passed local edge checks; it does not substitute
 for the server image in assessment qualification.
 
+## Paused observer CI repair
+
+The filesystem [amd64 job](https://github.com/PublicData-stream/dev-resources-MCP/actions/runs/43892403817/job/133443554093)
+failed with `fixture_command_failed`; its [arm64 counterpart](https://github.com/PublicData-stream/dev-resources-MCP/actions/runs/43892403817/job/133443554351)
+failed with `observer_timing_event_bound`. The [edge aggregate](https://github.com/PublicData-stream/dev-resources-MCP/actions/runs/43892403817/job/133446894937)
+correctly propagated E2E failure. The retained logs came from replacement pods
+after restoration, so neither the original amd64 command nor the arm64 event
+count can be recovered from that evidence.
+
+The repaired fixture establishes bounded offline `server.info` routing readiness.
+Each SQL/S3 fault gets a fresh healthy observer backend and exactly one status
+request. The fault request targets its admitted pod IP while preserving the
+`backend` Host, TLS hostname, CA validation and client certificate; an S3 outage
+may intentionally remove the pod from ready Service endpoints. Healthy public
+status acceptance still uses Service DNS and both supported MCP revisions.
+
+Evidence is tied to the exact pod UID, container identity, restart count and IP.
+The complete bounded log is polled for ten seconds without host-time filtering.
+A 65,537-byte sentinel detects logs over the 65,536-byte allowance. Eight finite
+stages remain the limit; malformed, duplicate and later attribution records fail
+acceptance. Only evidence retrieval is repeated, never the fault request.
+
+A private create-new `paused-status-failure.json` retains closed phase/case/error
+codes, bounded command outcomes and validated stages before restoration replaces
+the observer. `paused-status-restoration.json` separately records each attempted
+restoration. Both use the maintained receipt validator and retention mechanism;
+raw stderr, response bodies, inputs, configuration and credentials are excluded.
+The primary error survives diagnostic or restoration failure. A complete success
+receipt requires unchanged retained metadata, no publication owner, authenticated
+acquisition denial, successful public statuses and completed restoration.
+
+The first local repair run returned the expected SQL `unavailable` result and
+retained `saved_state`, `statistics` and nested `kind_inventory` stages, but its
+last identity query exhausted the shortened observation budget. The new receipts
+localized this to `fault-timing` and proved every restoration succeeded. An
+identity timeout exactly at the absolute deadline now ends collection using only
+an earlier snapshot verified on both sides of its log read; earlier timeouts and
+identity changes still fail. Four regressions cover the boundary and discard an
+unverified final snapshot.
+
+Independent agent review covered MCP/API, Upstream/Storage and Security Boundary
+changes. Observer regressions passed 33 tests, shared fixture regressions passed
+17, CI driver regressions passed 12, and release-selector regressions passed 15. The final full Python suite passed 1,463 tests
+with four skipped using an isolated interpreter with the trusted repository root
+explicitly admitted. Its initial invocation excluded that root and produced three
+import errors; no source change was needed for the corrected run.
+
+Rust 1.99.1 formatting, all-target locked clippy and locked workspace tests passed;
+the workspace run reported 1,164 passed and 103 ignored. Current advisory admission,
+vendored advisory checks and cargo-deny advisory/license/source policy passed
+against a fresh task-owned database with 1,509 advisories. Initial shared-cache
+checks encountered Git-object/permission errors; the successful retry changed only
+the database location and retained the policy. Ignored database/cluster cases and
+hosted native architecture acceptance remain separate gates.
+
+The rebuilt pinned-edge harness passed local HTTP MCP and native WebTransport
+acceptance for both revisions. The full disposable PostgreSQL script passed 76
+tests on the default thread stack, including all 14 row-pipeline cases. A configured
+rootful BuildKit cache first failed on missing overlay snapshots; the successful
+run used an idle isolated Docker daemon with its data below `/tmp`, without
+changing the broken shared cache or storage guards. These are native Linux amd64
+fixture results, not hosted arm64 or production evidence.
+
+Local capacity was recovered from verified inactive compiler incremental caches,
+old duplicate test executables, minikube downloads and generated harness build
+contexts. Existing profiles, retained corpus data, receipts and sibling evidence
+were preserved. All new test state and Cargo targets remained below `/tmp`.
+
+The final native Linux amd64 runs used minikube 1.39.0 and Kubernetes 1.37.0:
+
+| Scenario | Result |
+| --- | --- |
+| Filesystem | NodePort TCP/UDP, CNI isolation, paused status, PVC restart and coordinated restore passed. |
+| Plain S3 | Read-only paused status and SQL/S3 failure ordering, warm-cache outage, static credential rotation, complete cache loss, database/object restore and HTTP/WebTransport passed. |
+| Credential-broker S3 | Projected pod identities, encrypted broker restart, distinct S3 roles, outage recovery, coordinated restore and broker/static/broker cutover passed. |
+
+All three scenario scripts exited successfully and their owned profiles were
+cleaned up. The broker uses a synthetic IAM fixture and disposable RustFS; these
+results do not establish real provider IAM, expiry/quota or production activation.
+The CI driver and release selector now require the added plain-S3 scenario on
+both native architectures; hosted execution remains a separate gate.
+
 ## Kubernetes gate remains incomplete
 
-The requested isolated minikube run stopped at its `RSRC_DOCKER_STORAGE` startup
-guard: the backing filesystem was 98–99 percent used despite several GiB free.
-No successful cluster or effective Kubernetes/AppArmor assessment is claimed.
-A local override with explicit absolute-space admission and a continuous free-space
-reserve was prepared for operator confirmation; it is not part of the tracked
-harness and has not been used.
+The initial pre-repair minikube run stopped at `RSRC_DOCKER_STORAGE` with
+98–99 percent filesystem use. The repaired filesystem scenario subsequently
+passed NodePort TCP/UDP, CNI isolation, PVC restart and coordinated restore under
+the normal storage guards. Closed success/restoration receipts separately verify
+the paused observer for filesystem and plain S3: both protocol revisions,
+SELECT-only startup/calls, unchanged retained rows, absent publication ownership,
+and authenticated acquisition denial. SQL denial produced `saved_state`,
+`statistics` and nested `kind_inventory` timing stages; S3 unavailability stopped
+at `saved_state`, with no attribution forwarding. All restoration steps succeeded.
 
-The implemented Kubernetes scenarios remain required before readiness:
+These base-harness results do not qualify the separate Dockerfile server-image
+assessment or effective AppArmor enforcement. The remaining real-image scenarios
+require:
 
 - Exact candidate-image CLI assessment with restricted UID/GID, mounts, seccomp,
   enforcing pinned AppArmor, fixture DNS/PostgreSQL-only egress and synthetic
@@ -63,11 +150,6 @@ The implemented Kubernetes scenarios remain required before readiness:
 - Fourteen controlled assessment cases, including connection/auth/configuration,
   output admission, READY failure, restore marker, lifecycle exclusion, corrupt
   history seal, SELECT denial and unavailable telemetry.
-- Complete paused backend-MCP status through authenticated reader-to-observer RPC
-  for both revisions, denial of acquisition, zero publication ownership and exact
-  retained-row equality across startup and calls.
-- Earlier SQL/S3 failures distinguished from attribution forwarding, including
-  restoration of fixture roles, object-store availability and original workloads.
 
 Run the owned harness with a separately built server image and retain only
 validated receipts, for example:

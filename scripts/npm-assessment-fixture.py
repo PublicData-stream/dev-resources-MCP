@@ -30,6 +30,23 @@ PROFILE = 'devres-runtime'
 APPARMOR_SHA256 = '4375146629c956b8e63cc4b358ef52c6bcda458621b7dcf8601b0f3d922b3e7e'
 MAX_METADATA = 2 * 1024 * 1024
 IMAGE_DIGEST = r'sha256:[0-9a-f]{64}'
+OBSERVER_STAGES = frozenset(('saved_state', 'statistics', 'kind_inventory', 'evidence_page',
+    'defaults', 'attribution', 'writer_token', 'writer_transport'))
+OBSERVER_REASONS = frozenset(('none', 'ok', 'unavailable', 'integrity', 'capacity', 'invalid', 'unknown', 'cancelled'))
+OBSERVER_PHASES = frozenset(('setup', 'stop', 'baseline', 'configure', 'startup', 'readiness',
+    'fault-startup', 'fault-injection', 'fault-probe', 'fault-timing', 'public-status',
+    'acquisition-denial', 'invariants', 'restore'))
+OBSERVER_ERRORS = frozenset(('unknown', 'interrupted', 'fixture_command_failed',
+    'fixture_command_output_bound', 'observer_command_timeout', 'observer_process_changed',
+    'observer_process_unavailable', 'observer_timing_bound', 'observer_timing_schema',
+    'observer_timing_count_bound', 'observer_timing_missing', 'observer_timing_overflow',
+    'observer_timing_duplicate', 'observer_timing_unavailable', 'observer_earlier_storage_stage_missing',
+    'observer_forwarded_after_storage_failure', 'observer_publication_owner_present',
+    'observer_startup_mutated_metadata', 'observer_status_mutated_metadata',
+    'observer_restoration_failed', 'fixture_evidence_retention_incomplete'))
+OBSERVER_RESTORATIONS = frozenset(('sql-grant', 'objectstore-start', 'objectstore-ready',
+    'backend-stop', 'writer-stop', 'policy-remove', 'writer-config', 'reader-config',
+    'writer-template', 'reader-template', 'writer-start', 'backend-start', 'semantic-ready'))
 MAX_IMAGE_METADATA = 1024 * 1024
 DATABASE_ADMIN = 'postgres://devres:fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
 DATABASE_READER = 'postgres://devres_assessment_reader:assessment-fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
@@ -267,6 +284,30 @@ def validate_receipt(name, value):
         need(type(value['faults']) is list and len(value['faults']) == 14, 'fixture_receipt_faults')
         for record in value['faults']:
             result(record)
+    elif name == 'paused-status-failure.json':
+        need(set(value) == {'version', 'synthetic', 'phase', 'case', 'code', 'command_outcome',
+            'exit_code', 'stages'}, 'fixture_receipt_fields')
+        need(value['phase'] in OBSERVER_PHASES and value['case'] in ('none', 'sql-permission', 's3-unavailable')
+             and value['code'] in OBSERVER_ERRORS and value['command_outcome'] in ('none', 'nonzero', 'timeout'),
+             'fixture_receipt_observer_failure')
+        need(value['exit_code'] is None or type(value['exit_code']) is int and 0 <= value['exit_code'] <= 255,
+             'fixture_receipt_observer_exit')
+        need(type(value['stages']) is list and len(value['stages']) <= 8, 'fixture_receipt_status_stages')
+        seen = set()
+        for stage in value['stages']:
+            need(type(stage) is dict and set(stage) == {'stage', 'reason', 'calls', 'failed', 'cancelled'}
+                 and stage['stage'] in OBSERVER_STAGES and stage['stage'] not in seen
+                 and stage['reason'] in OBSERVER_REASONS
+                 and all(type(stage[field]) is int and 0 <= stage[field] <= 1000000
+                         for field in ('calls', 'failed', 'cancelled')), 'fixture_receipt_status_stages')
+            seen.add(stage['stage'])
+    elif name == 'paused-status-restoration.json':
+        need(set(value) == {'version', 'synthetic', 'steps'} and type(value['steps']) is list
+             and 1 <= len(value['steps']) <= 32, 'fixture_receipt_fields')
+        for step in value['steps']:
+            need(type(step) is dict and set(step) == {'step', 'restored'}
+                 and step['step'] in OBSERVER_RESTORATIONS and type(step['restored']) is bool,
+                 'fixture_receipt_observer_restoration')
     elif name == 'paused-status-receipt.json':
         need(set(value) == {'version', 'synthetic', 'public_status', 'provider_requests', 'startup_and_calls_metadata_unchanged',
             'publication_owner_absent', 'authenticated_acquisition_denied', 's3_readonly_identity', 'earlier_storage_faults'}, 'fixture_receipt_fields')
