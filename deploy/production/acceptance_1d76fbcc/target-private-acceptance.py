@@ -1,12 +1,43 @@
 #!/usr/bin/env python3
 """Bounded first-party private acceptance. No source acquisition or credential output."""
-import pathlib,json,subprocess,ssl,socket,http.client,hashlib,os,sys,importlib.util,datetime,re
+import pathlib,json,subprocess,ssl,socket,http.client,hashlib,os,sys,importlib.util,datetime,re,traceback
 import acceptance_common as common
 
 N=common.WORK
 B=pathlib.Path('/var/lib/devres-production-upgrades/1d76fbcc-20261115')
 T=pathlib.Path('/var/lib/devres-production-preparation/a938112b-7c7a24f/tls')
 CID='blake3:f561023b34507798258530bff923c41bab5d092d71b2cae7da484e6d5ce6d0e0'
+RECENT_EXCHANGES=[]
+def traced_client(client_type,allowed_tools):
+ class TracedClient(client_type):
+  def exchange(self,method,params=None,revision='2026-07-28',path=None,host=None,origin=None):
+   name=params.get('name') if isinstance(params,dict) else None
+   entry={'method':method if isinstance(method,str) and method in {'server/discover','initialize','tools/list','tools/call','resources/read'} else 'unknown',
+          'revision':revision if isinstance(revision,str) and revision in {'2025-11-25','2026-07-28'} else 'unknown',
+          'tool':name if isinstance(name,str) and name in allowed_tools else None,'event':'begin'}
+   RECENT_EXCHANGES.append(entry);del RECENT_EXCHANGES[:-8]
+   try:status,value=super().exchange(method,params,revision,path,host,origin)
+   except Exception as error:
+    entry.update(event='exception',exception_type=type(error).__name__);raise
+   result=value.get('result') if isinstance(value,dict) else None
+   rpc=value.get('error') if isinstance(value,dict) else None
+   code=rpc.get('code') if isinstance(rpc,dict) else None
+   detail=result.get('structuredContent') if isinstance(result,dict) else None
+   tool_code=detail.get('code') if isinstance(detail,dict) else None
+   entry.update(event='returned',status=status if type(status) is int and 100<=status<=599 else None,
+                rpc_error_code=code if type(code) is int and -(2**31)<=code<2**31 else None,
+                tool_is_error=isinstance(result,dict) and result.get('isError') is True,
+                tool_error_code=tool_code if isinstance(tool_code,str) and tool_code in {'unavailable','capacity','invalid_input','not_found','cancelled','integrity'} else None)
+   return status,value
+ return TracedClient
+def failure_metadata(error):
+ locations=[]
+ for frame,line in traceback.walk_tb(error.__traceback__):
+  filename=pathlib.Path(frame.f_code.co_filename).name
+  function=frame.f_code.co_name
+  locations.append({'file':filename if filename in {'target-private-acceptance.py','mcp_smoke.py','acceptance_common.py'} else 'external',
+                    'line':line,'function':function if re.fullmatch('[A-Za-z0-9_<>.]{1,80}',function) else 'unknown'})
+ return {'error_type':type(error).__name__,'failure_locations':locations[-6:],'recent_exchanges':list(RECENT_EXCHANGES)}
 def need(v,code):
  if not v:raise RuntimeError(code)
 def command(args,data=None,timeout=30):
@@ -34,7 +65,7 @@ def main():
   mapping={'devres-k8s':ips['backend'],'writer.devres.svc':ips['writer']}
   return original(mapping.get(host,host),port,*args,**kw)
  socket.getaddrinfo=lookup
- class Client(m.Client):
+ class Client(traced_client(m.Client,m.EXPECTED_TOOLS)):
   def exchange(self,method,params=None,revision=m.MODERN,path=None,host=None,origin=None):
    return super().exchange(method,params,revision,path,host or 'devres-k8s:30081',origin)
  def client(cert=None,key=None):
@@ -110,5 +141,5 @@ def main():
 if __name__=='__main__':
  try:main()
  except Exception as e:
-  code=str(e) if type(e) is RuntimeError and str(e).replace('_','').isalnum() else 'private_acceptance_failed'
-  print(json.dumps({'verified':False,'code':code,'error_type':type(e).__name__}));sys.exit(1)
+  code=str(e) if type(e) is RuntimeError and re.fullmatch('[a-z][a-z0-9_]{0,95}',str(e)) else 'private_acceptance_failed'
+  print(json.dumps({'verified':False,'code':code,**failure_metadata(e)}));sys.exit(1)
