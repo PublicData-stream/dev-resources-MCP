@@ -241,6 +241,18 @@ impl Research {
     }
 
     pub async fn call(&self, tool: &str, input: Value) -> Result<Value> {
+        // Keep large adapter dispatch futures off the caller's stack. In
+        // particular, optional timing must not multiply nested async state for
+        // ordinary research and request-only audits.
+        let work = Box::pin(self.call_inner(tool, input));
+        if tool.ends_with(".corpus_status") || tool == "packages.crate.advisory_corpus_status" {
+            crate::status_diagnostics::scope(work).await
+        } else {
+            work.await
+        }
+    }
+
+    async fn call_inner(&self, tool: &str, input: Value) -> Result<Value> {
         let provider = if tool == "fetch" {
             input
                 .get("id")
@@ -273,7 +285,11 @@ impl Research {
             return Err(Error::integrity("Invalid public tool representation."));
         }
         if tool.ends_with(".corpus_status") || tool == "packages.crate.advisory_corpus_status" {
-            output["attribution"] = gate.status().await?;
+            output["attribution"] = crate::status_diagnostics::stage(
+                crate::status_diagnostics::Stage::Attribution,
+                gate.status(),
+            )
+            .await?;
             return Ok(output);
         }
         if metadata_only_discovery(tool, &output) {
@@ -1699,6 +1715,27 @@ mod attribution_boundary_tests {
         }
         async fn status(&self) -> Result<Value> {
             Ok(json!({"ready":1,"pending":2}))
+        }
+    }
+
+    #[tokio::test]
+    async fn public_research_future_has_a_bounded_caller_stack_footprint() {
+        let research = Research::new(Arc::new(Retrieval::new(
+            Arc::new(NoRetrieval),
+            Arc::new(NoRetrieval),
+        )))
+        .await
+        .unwrap();
+        for tool in [
+            "packages.npm.corpus_status",
+            "packages.crate.content_search",
+            "packages.npm.audit_lockfile",
+        ] {
+            let future = research.call(tool, json!({}));
+            assert!(
+                std::mem::size_of_val(&future) <= 32 * 1024,
+                "public dispatch must fit a bounded caller stack"
+            );
         }
     }
 

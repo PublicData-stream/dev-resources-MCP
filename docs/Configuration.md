@@ -681,3 +681,33 @@ the Current profile. `requests_per_second=1` accepts 1..3, under shared admissio
 `max_archive_storage_bytes` must cover the free-space reserve. Quotas pause new
 acquisition without deleting permanent bodies. Article representations cap at16MiB;
 public text pages remain at most32KiB. Reader attachment requires schema18.
+
+### Strict paused status observer
+
+`writer_listener.access` and `writer_client.access` accept `full` (the omitted
+compatibility default) or `status_only`. The listener enforces authority;
+restricting only the client is insufficient. A status-only listener admits only
+attribution and source status through the existing authenticated `/v1/acquire`
+endpoint. Acquisition, effects, enqueue, Wikipedia operations and snapshot
+publication are denied before coordinator dispatch.
+
+`collect CONFIG` with a status-only listener starts a read-only observer, with no
+public MCP endpoints. Every provider `enabled` flag and `npm.advisories_enabled`
+must be false. It uses the released SELECT-only database role and read-only
+archive credentials, takes no publication ownership, and skips initialization,
+stage recovery, collection and repair. Maintenance commands reject this
+configuration. Bootstrap/migration must finish separately before observation.
+
+Give the observer its own disposable `storage.blob_dir` cache and separate
+`storage.scratch_dir`; never reuse the writer's permanent archive cache. Mount
+filesystem archives read-only. Its Kubernetes identity must receive only the
+reader broker profile, never a writer key. The serving reader keeps its delegate
+and valid projected identity, using `writer_client.access = "status_only"` and
+the reachable observer endpoint. Keep both roles private and independently
+restricted by NetworkPolicy.
+
+`writer_listener.observation_max_pass_secs` defaults to 900 and accepts 1 through 86400 seconds.
+The observer performs one bounded read-only attribution scan per startup, with
+no automatic retry. Public status does not start or wait for a scan. Change
+configuration and restart explicitly to resume acquisition or perform another
+pass. Existing full-mode behavior is unchanged.

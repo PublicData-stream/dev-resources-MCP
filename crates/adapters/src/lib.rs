@@ -25,6 +25,7 @@ mod html_transport;
 mod network;
 mod research;
 mod standards_processing;
+pub mod status_diagnostics;
 mod storage;
 mod storage_migration_runner;
 pub use storage_migration_runner::{

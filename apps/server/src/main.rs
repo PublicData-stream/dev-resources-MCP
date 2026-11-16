@@ -77,6 +77,9 @@ async fn main() -> Result<(), ServerError> {
         let config = Config::load(&arguments.config)
             .await
             .map_err(|_| "Recovery configuration unavailable.")?;
+        if arguments.apply {
+            config.ensure_maintenance_allowed()?;
+        }
         let report = devres_adapters::recover_rustsec_attribution(
             &config.storage.database_url,
             &arguments.options,
@@ -139,6 +142,7 @@ async fn main() -> Result<(), ServerError> {
             return Err("usage: devres-server migrate-object-storage|verify-object-storage|activate-object-storage CONFIG.toml".into());
         }
         let config = Config::load(Path::new(&args[1])).await?;
+        config.ensure_maintenance_allowed()?;
         let s3 = config
             .storage
             .s3
@@ -172,6 +176,7 @@ async fn main() -> Result<(), ServerError> {
             return Err("usage: devres-server backup-object-storage|restore-object-storage CONFIG.toml BACKUP-S3.toml".into());
         }
         let config = Config::load(Path::new(&args[1])).await?;
+        config.ensure_maintenance_allowed()?;
         let archive = config
             .storage
             .s3
@@ -235,6 +240,7 @@ async fn main() -> Result<(), ServerError> {
         )?;
         execution.enable_progress();
         let config = Config::load(Path::new(path)).await?;
+        config.ensure_maintenance_allowed()?;
         if config.storage.s3.is_some() {
             return Err("Use verify-object-storage for S3 archives; existing integrity migration must precede S3 activation.".into());
         }
@@ -320,18 +326,31 @@ async fn main() -> Result<(), ServerError> {
         || w3c_rebuild
         || chromium_rebuild
         || npm_rebuild;
-    let writer_role =
-        runtime_role == devres_server::writer_rpc::RuntimeRole::Collect || maintenance;
+    let status_only = config
+        .writer_listener
+        .as_ref()
+        .is_some_and(|listener| listener.access == devres_server::config::WriterAccess::StatusOnly);
+    if maintenance && status_only {
+        return Err("status_only configuration cannot authorize maintenance".into());
+    }
+    let observer = runtime_role == devres_server::writer_rpc::RuntimeRole::Collect && status_only;
+    if observer {
+        config.validate_observer()?;
+    }
+    let can_publish = (runtime_role == devres_server::writer_rpc::RuntimeRole::Collect
+        && !observer)
+        || maintenance;
+    let is_serving = runtime_role == devres_server::writer_rpc::RuntimeRole::Serve && !maintenance;
     // Other providers' maintenance commands do not acquire Wikipedia content
     // and must not depend on its optional credential mount.
-    let wikipedia_network_writer = writer_role && !maintenance;
+    let wikipedia_network_writer = can_publish && !maintenance;
     let wikipedia_identity =
         wikipedia_identity(&config.wikipedia, wikipedia_network_writer).await?;
     if wikipedia_network_writer && config.wikipedia.user_agent.is_none() {
         tracing::info!("Wikipedia network acquisition paused; configure wikipedia.user_agent.");
     }
     let delegate: Option<Arc<dyn devres_application::acquisition::AcquisitionDelegate>> =
-        if writer_role {
+        if can_publish || observer {
             None
         } else {
             let client = config
@@ -343,7 +362,7 @@ async fn main() -> Result<(), ServerError> {
                 Duration::from_secs(config.limits.search_timeout_secs),
             )?))
         };
-    if !writer_role {
+    if !can_publish {
         let scratch = config
             .storage
             .scratch_dir
@@ -364,7 +383,7 @@ async fn main() -> Result<(), ServerError> {
             config.storage.s3.clone(),
         )
         .await?
-    } else if writer_role {
+    } else if can_publish {
         devres_adapters::PgBlobStore::connect_archive(
             &config.storage.database_url,
             &config.storage.blob_dir,
@@ -400,10 +419,10 @@ async fn main() -> Result<(), ServerError> {
         &config.storage.blob_dir,
         config.rfc.clone(),
     )?);
-    if writer_role {
+    if can_publish {
         corpus.recover_stages().await?;
     }
-    let crate_corpus = Arc::new((if writer_role {
+    let crate_corpus = Arc::new((if can_publish {
         devres_adapters::crates_io::CrateCorpus::new
     } else {
         devres_adapters::crates_io::CrateCorpus::new_reader
@@ -414,11 +433,11 @@ async fn main() -> Result<(), ServerError> {
         &config.storage.blob_dir,
         config.crates.clone(),
     )?);
-    if writer_role {
+    if can_publish {
         store.attach_artifact_budget(crate_corpus.artifact_budget())?;
         crate_corpus.recover_stages().await?;
     }
-    let advisory_corpus = Arc::new((if writer_role {
+    let advisory_corpus = Arc::new((if can_publish {
         devres_adapters::rustsec::AdvisoryCorpus::new
     } else {
         devres_adapters::rustsec::AdvisoryCorpus::new_reader
@@ -429,7 +448,7 @@ async fn main() -> Result<(), ServerError> {
         &config.storage.blob_dir,
         config.rustsec.clone(),
     )?);
-    let npm_corpus = Arc::new((if writer_role {
+    let npm_corpus = Arc::new((if can_publish {
         devres_adapters::npm::NpmCorpus::new
     } else {
         devres_adapters::npm::NpmCorpus::new_reader
@@ -439,7 +458,7 @@ async fn main() -> Result<(), ServerError> {
         &config.storage.blob_dir,
         config.npm.clone(),
     )?);
-    if writer_role {
+    if can_publish {
         npm_corpus.initialize_status().await?;
     }
     if npm_rebuild {
@@ -456,7 +475,7 @@ async fn main() -> Result<(), ServerError> {
         return Ok(());
     }
     let mdn_corpus = Arc::new(
-        (if writer_role {
+        (if can_publish {
             devres_adapters::mdn::MdnCorpus::new
         } else {
             devres_adapters::mdn::MdnCorpus::new_reader
@@ -466,17 +485,17 @@ async fn main() -> Result<(), ServerError> {
             &config.storage.blob_dir,
             config.mdn.clone(),
         )?
-        .with_reader_scratch(if writer_role {
+        .with_reader_scratch(if can_publish {
             None
         } else {
             config.storage.scratch_dir.as_deref()
         })?,
     );
-    if writer_role {
+    if can_publish {
         mdn_corpus.initialize_status().await?;
     }
     let whatwg_corpus = Arc::new(
-        (if writer_role {
+        (if can_publish {
             devres_adapters::whatwg::WhatwgCorpus::new
         } else {
             devres_adapters::whatwg::WhatwgCorpus::new_reader
@@ -486,17 +505,17 @@ async fn main() -> Result<(), ServerError> {
             &config.storage.blob_dir,
             config.whatwg.clone(),
         )?
-        .with_reader_scratch(if writer_role {
+        .with_reader_scratch(if can_publish {
             None
         } else {
             config.storage.scratch_dir.as_deref()
         })?,
     );
-    if writer_role {
+    if can_publish {
         whatwg_corpus.initialize_status().await?;
     }
     let w3c_corpus = Arc::new(
-        (if writer_role {
+        (if can_publish {
             devres_adapters::w3c::W3cCorpus::new
         } else {
             devres_adapters::w3c::W3cCorpus::new_reader
@@ -506,16 +525,16 @@ async fn main() -> Result<(), ServerError> {
             &config.storage.blob_dir,
             config.w3c.clone(),
         )?
-        .with_reader_scratch(if writer_role {
+        .with_reader_scratch(if can_publish {
             None
         } else {
             config.storage.scratch_dir.as_deref()
         })?,
     );
-    if writer_role {
+    if can_publish {
         w3c_corpus.initialize_status().await?;
     }
-    let chromium_corpus = Arc::new((if writer_role {
+    let chromium_corpus = Arc::new((if can_publish {
         devres_adapters::chromium::ChromiumCorpus::new
     } else {
         devres_adapters::chromium::ChromiumCorpus::new_reader
@@ -525,11 +544,11 @@ async fn main() -> Result<(), ServerError> {
         &config.storage.blob_dir,
         config.chromium.clone(),
     )?);
-    if writer_role {
+    if can_publish {
         chromium_corpus.initialize_status().await?;
     }
     let wikipedia_corpus = Arc::new(
-        (if writer_role {
+        (if can_publish {
             devres_adapters::wikipedia::WikipediaCorpus::new
         } else {
             devres_adapters::wikipedia::WikipediaCorpus::new_reader
@@ -541,7 +560,7 @@ async fn main() -> Result<(), ServerError> {
         )?
         .with_delegate(delegate.clone()),
     );
-    if writer_role {
+    if can_publish {
         wikipedia_corpus.initialize_status().await?;
     }
     if chromium_rebuild {
@@ -623,6 +642,15 @@ async fn main() -> Result<(), ServerError> {
     if let Some(delegate) = &delegate {
         attribution = attribution.with_delegate(delegate.clone());
     }
+    if observer {
+        let pass_secs = config
+            .writer_listener
+            .as_ref()
+            .ok_or("observer requires listener")?
+            .observation_max_pass_secs;
+        attribution =
+            attribution.with_observation(store.clone(), Duration::from_secs(pass_secs))?;
+    }
     let attribution = Arc::new(attribution);
     let research = Arc::new(
         devres_adapters::Research::new(retrieval.clone())
@@ -689,11 +717,11 @@ async fn main() -> Result<(), ServerError> {
         .with_wikipedia(wikipedia_corpus.clone()),
     );
     let mut registry = server_info_registry(config.source.url.clone())?;
-    if !writer_role {
+    if is_serving {
         registry.register_research(research)?;
     }
     let mut server = ServerBuilder::new(registry, config.limits, config.source.url);
-    if writer_role {
+    if can_publish || observer {
         let listener = config
             .writer_listener
             .clone()
@@ -703,9 +731,18 @@ async fn main() -> Result<(), ServerError> {
             coordinator,
         })?;
     }
+    if observer {
+        let observation = attribution.clone();
+        server.register_worker("attribution-observation", move |shutdown| async move {
+            observation
+                .run_observation(shutdown)
+                .await
+                .map_err(Into::into)
+        })?;
+    }
     let wikipedia_shutdown = wikipedia_corpus.clone();
     let recover_archive_worker = store.has_object_archive();
-    if writer_role {
+    if can_publish {
         let wikipedia_events = wikipedia_corpus.clone();
         server.register_worker("wikipedia-events", move |shutdown| async move {
             storage_worker::run(recover_archive_worker, shutdown, |token| {
@@ -825,7 +862,7 @@ async fn main() -> Result<(), ServerError> {
             .map_err(Into::into)
         })?;
     }
-    if !writer_role {
+    if is_serving {
         server.register_endpoint(HttpEndpoint {
             bind: config.http.bind,
             access: AccessPolicy {
@@ -886,7 +923,11 @@ async fn main() -> Result<(), ServerError> {
     let result = server.run(shutdown).await;
     // Workers and request bodies have stopped; queued upstream policy receipts
     // retain storage ownership until this bounded barrier completes.
-    let policy_result = wikipedia_shutdown.drain_policy_receipts().await;
+    let policy_result = if can_publish {
+        wikipedia_shutdown.drain_policy_receipts().await
+    } else {
+        Ok(())
+    };
     if let Err(error) = &policy_result {
         tracing::error!(code=%error.code, "Wikipedia policy receipt drain failed");
     }
@@ -908,6 +949,9 @@ async fn run_collection_recovery_command(args: &[String]) -> Result<(), ServerEr
     let config = Config::load(&arguments.config)
         .await
         .map_err(|_| "Recovery configuration unavailable.")?;
+    if matches!(arguments.action, Action::Apply | Action::Run) {
+        config.ensure_maintenance_allowed()?;
+    }
     let evidence: Option<RecoveryEvidenceReceipt> = arguments
         .evidence
         .as_ref()

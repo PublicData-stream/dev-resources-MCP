@@ -57,6 +57,11 @@ impl AcquisitionDelegate for FakeWriter {
         Ok(json!({"collector":{"index":{"code":"capacity"}}}))
     }
     async fn attribution_status(&self) -> Result<Value> {
+        self.entered.notify_one();
+        if self.hold.load(Ordering::SeqCst) {
+            let _guard = Cancelled(self.cancelled.clone());
+            std::future::pending::<()>().await;
+        }
         Ok(self
             .attribution
             .clone()
@@ -104,6 +109,9 @@ impl Fixture {
         Self::with_attribution(allowed, None).await
     }
     async fn with_attribution(allowed: bool, attribution: Option<Value>) -> Self {
+        Self::with_access(allowed, attribution, WriterAccess::Full).await
+    }
+    async fn with_access(allowed: bool, attribution: Option<Value>, access: WriterAccess) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
         let cert = directory.path().join("writer.pem");
@@ -165,6 +173,8 @@ impl Fixture {
             .register_endpoint(WriterEndpoint {
                 coordinator: writer.clone(),
                 config: WriterListenerConfig {
+                    access,
+                    observation_max_pass_secs: 900,
                     bind: "127.0.0.1:0".parse().unwrap(),
                     certificate: cert.clone(),
                     private_key: key,
@@ -198,6 +208,7 @@ impl Fixture {
         Self {
             _directory: directory,
             config: WriterClientConfig {
+                access: WriterAccess::Full,
                 endpoint,
                 token_file: token,
                 ca_file: Some(cert),
@@ -483,6 +494,7 @@ fn runtime_alias_is_serve_only_and_configuration_rejects_identity_redirects() {
     ] {
         assert!(
             WriterClientConfig {
+                access: WriterAccess::Full,
                 endpoint: endpoint.into(),
                 token_file: "/run/token".into(),
                 ca_file: None
@@ -527,4 +539,103 @@ async fn private_body_admission_charges_actual_bytes_and_releases_capacity() {
     assert_eq!(buffers.available_permits(), 4 * 1024 * 1024 - 5);
     drop(permit);
     assert_eq!(buffers.available_permits(), 4 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn status_only_server_enforces_authority_against_unrestricted_client() {
+    let fixture = Fixture::with_access(true, None, WriterAccess::StatusOnly).await;
+    let client = WriterClient::new(fixture.config.clone(), Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        client.attribution_status().await.unwrap()["scan_gaps"]["mdn"],
+        "capacity"
+    );
+    for source in [SourceStatus::Rfc, SourceStatus::Crates] {
+        assert!(client.source_status(source).await.is_ok());
+    }
+    for request in [
+        source_request(),
+        json!({"kind":"effect","effect":{"operation":"rfc_catalogue"}}),
+        json!({"kind":"rfc_snapshot"}),
+        json!({"kind":"wikipedia_request","title":"Fixture","page_id":null}),
+        json!({"kind":"wikipedia_search","query":"fixture","limit":1}),
+    ] {
+        assert_eq!(
+            fixture.request(request).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(client.rfc_snapshot().await.unwrap_err().code, "unavailable");
+    assert_eq!(fixture.writer.calls.load(Ordering::SeqCst), 0);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn status_only_client_rejects_mutation_before_token_or_network() {
+    let fixture = Fixture::new(true).await;
+    let mut config = fixture.config.clone();
+    config.access = WriterAccess::StatusOnly;
+    std::fs::remove_file(&config.token_file).unwrap();
+    let client = WriterClient::new(config, Duration::from_secs(5)).unwrap();
+    assert_eq!(client.rfc_snapshot().await.unwrap_err().code, "unavailable");
+    assert_eq!(
+        client
+            .effect(WriterEffect::RfcCatalogue)
+            .await
+            .unwrap_err()
+            .code,
+        "unavailable"
+    );
+    assert_eq!(fixture.kube.reviews.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.writer.calls.load(Ordering::SeqCst), 0);
+    fixture.finish().await;
+}
+
+#[test]
+fn writer_access_defaults_and_exhaustive_operation_classes() {
+    let config: WriterClientConfig =
+        toml::from_str("endpoint = 'https://fixture/v1/acquire'\ntoken_file='/run/fixture'")
+            .unwrap();
+    assert_eq!(config.access, WriterAccess::Full);
+    assert!(
+        toml::from_str::<WriterClientConfig>(
+            "endpoint='https://fixture/v1/acquire'\ntoken_file='/run/fixture'\naccess='unknown'"
+        )
+        .is_err()
+    );
+    assert!(
+        !Operation::Effect {
+            effect: WriterEffect::AttributionEnqueue {
+                target: devres_domain::attribution::AttributionTarget {
+                    subject: devres_domain::attribution::AttributionSubject {
+                        provider: "npm".into(),
+                        namespace: "fixture".into(),
+                        key: "fixture".into(),
+                        fingerprint: "a".repeat(64)
+                    },
+                    evidence: json!({}),
+                }
+            }
+        }
+        .permitted(WriterAccess::StatusOnly)
+    );
+}
+
+#[tokio::test]
+async fn status_body_after_early_headers_remains_owned_and_cancelable() {
+    let fixture = Fixture::with_access(true, None, WriterAccess::StatusOnly).await;
+    fixture.writer.hold.store(true, Ordering::SeqCst);
+    let client = WriterClient::new(fixture.config.clone(), Duration::from_secs(2)).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), client.attribution_status())
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.writer.cancelled.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.finish().await;
 }

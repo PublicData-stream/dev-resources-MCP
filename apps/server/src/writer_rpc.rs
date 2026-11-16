@@ -1,7 +1,7 @@
 //! Private source-only acquisition RPC. Audit requests never enter this interface.
 use crate::{
     ServerError,
-    config::{WriterClientConfig, WriterListenerConfig},
+    config::{WriterAccess, WriterClientConfig, WriterListenerConfig},
     endpoint::{Binding, BoundEndpoint, Endpoint, EndpointContext, Network},
 };
 use async_trait::async_trait;
@@ -50,6 +50,18 @@ enum Operation {
     SourceStatus {
         source: SourceStatus,
     },
+}
+impl Operation {
+    fn permitted(&self, access: WriterAccess) -> bool {
+        match self {
+            Self::AttributionStatus | Self::SourceStatus { .. } => true,
+            Self::Acquire { .. }
+            | Self::Effect { .. }
+            | Self::RfcSnapshot
+            | Self::WikipediaRequest { .. }
+            | Self::WikipediaSearch { .. } => access == WriterAccess::Full,
+        }
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -110,6 +122,9 @@ impl WriterClient {
         })
     }
     async fn call(&self, operation: Operation) -> Result<Reply> {
+        if !operation.permitted(self.config.access) {
+            return Err(unavailable());
+        }
         let encoded = serde_json::to_vec(&operation)
             .map_err(|_| Error::invalid("Invalid private source operation."))?;
         if encoded.len() > REQUEST_LIMIT {
@@ -117,39 +132,49 @@ impl WriterClient {
                 "Private source operation exceeds its limit.",
             ));
         }
-        let token = secret(&self.config.token_file).await?;
-        let mut response = self
-            .client
-            .post(&self.config.endpoint)
-            .header(header::AUTHORIZATION, token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(encoded)
-            .send()
-            .await
-            .map_err(|_| unavailable())?;
-        if !response.status().is_success()
-            || response
-                .content_length()
-                .is_some_and(|n| n > RESPONSE_LIMIT as u64)
-        {
-            return Err(unavailable());
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
-            if bytes
-                .len()
-                .checked_add(chunk.len())
-                .is_none_or(|n| n > RESPONSE_LIMIT)
-            {
-                return Err(unavailable());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let reply: Reply = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
-        match reply {
-            Reply::Failure { error } => Err(error),
-            reply => Ok(reply),
-        }
+        let token = devres_adapters::status_diagnostics::stage(
+            devres_adapters::status_diagnostics::Stage::WriterToken,
+            secret(&self.config.token_file),
+        )
+        .await?;
+        devres_adapters::status_diagnostics::stage(
+            devres_adapters::status_diagnostics::Stage::WriterTransport,
+            async {
+                let mut response = self
+                    .client
+                    .post(&self.config.endpoint)
+                    .header(header::AUTHORIZATION, token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(encoded)
+                    .send()
+                    .await
+                    .map_err(|_| unavailable())?;
+                if !response.status().is_success()
+                    || response
+                        .content_length()
+                        .is_some_and(|n| n > RESPONSE_LIMIT as u64)
+                {
+                    return Err(unavailable());
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+                    if bytes
+                        .len()
+                        .checked_add(chunk.len())
+                        .is_none_or(|n| n > RESPONSE_LIMIT)
+                    {
+                        return Err(unavailable());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let reply: Reply = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+                match reply {
+                    Reply::Failure { error } => Err(error),
+                    reply => Ok(reply),
+                }
+            },
+        )
+        .await
     }
 }
 #[async_trait]
@@ -353,6 +378,9 @@ async fn authorize_operation(
     }
     let (bytes, permit) = admitted_body(request, state.context.buffers.clone()).await?;
     let operation = serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if !Operation::permitted(&operation, state.config.access) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     Ok((operation, permit))
 }
 

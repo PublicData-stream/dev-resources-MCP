@@ -607,3 +607,21 @@ Automatic English STEM collection, observed history, REST/EventStreams freshness
 Markdown retrieval and the `wikipedia` research group are specified in
 [Wikipedia](wikipedia.md). Generic search adds local Wikipedia as its ninth source.
 Schema 14 adds Wikipedia storage; serving readers require the upgraded store.
+
+### Paused attribution observation
+
+Strict paused corpus status still includes attribution qualification state. The
+private status observer adds optional `attribution.observation_scan` metadata for
+one read-only scan: version, state, snapshot observation times, policy identity,
+coverage scope, bounded provider counters and finite gap reasons. Raw source keys,
+cursors, traversal frontiers and package evidence are not public diagnostics.
+Counters describe source occurrences, not unique subjects.
+
+Existing stored sweeps, origin discovery, queues and repair diagnostics retain
+their durable meanings. The observer conservatively reports
+`repair_complete_for_enqueued_targets=false`; its scan never certifies repair. Observation scans do not enqueue repairs or change those
+checkpoints. Completed observation means enumeration of the recorded snapshot
+scope, not current corpus completeness, repaired content or full archive-body
+verification. Pending, failed, cancelled, timed-out and invalidated coverage
+remains explicit. Policy, visibility or lifecycle changes invalidate observation
+completion rather than presenting old coverage as current evidence.

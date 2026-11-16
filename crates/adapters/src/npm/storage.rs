@@ -297,11 +297,20 @@ impl NpmStore for PgBlobStore {
     async fn npm_statistics(&self) -> Result<Value> {
         self.fence().await?;
         let mut counts = serde_json::Map::new();
-        for kind in self.npm_migration_kinds().await? {
+        for kind in crate::status_diagnostics::stage(
+            crate::status_diagnostics::Stage::KindInventory,
+            self.npm_migration_kinds(),
+        )
+        .await?
+        {
             let mut count = 0_u64;
             let mut after = 0;
             loop {
-                let rows = self.npm_rows(&kind, after, 1000, None, None).await?;
+                let rows = crate::status_diagnostics::stage(
+                    crate::status_diagnostics::Stage::EvidencePage,
+                    self.npm_rows(&kind, after, 1000, None, None),
+                )
+                .await?;
                 if rows.is_empty() {
                     break;
                 }

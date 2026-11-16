@@ -324,6 +324,8 @@ pub enum StorageBackend {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriterClientConfig {
+    #[serde(default)]
+    pub access: WriterAccess,
     pub endpoint: String,
     pub token_file: PathBuf,
     pub ca_file: Option<PathBuf>,
@@ -337,11 +339,25 @@ pub struct WriterClientIdentity {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriterListenerConfig {
+    #[serde(default)]
+    pub access: WriterAccess,
+    #[serde(default = "observation_pass_secs")]
+    pub observation_max_pass_secs: u64,
     pub bind: SocketAddr,
     pub certificate: PathBuf,
     pub private_key: PathBuf,
     pub auth: devres_adapters::credential_broker::identity::AuthConfig,
     pub allowed_clients: Vec<WriterClientIdentity>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterAccess {
+    #[default]
+    Full,
+    StatusOnly,
+}
+fn observation_pass_secs() -> u64 {
+    900
 }
 impl WriterClientConfig {
     pub fn validate(&self) -> Result<(), ServerError> {
@@ -396,8 +412,42 @@ pub struct Config {
     pub npm: devres_adapters::npm::NpmConfig,
 }
 impl Config {
+    pub fn ensure_maintenance_allowed(&self) -> Result<(), ServerError> {
+        if self
+            .writer_listener
+            .as_ref()
+            .is_some_and(|listener| listener.access == WriterAccess::StatusOnly)
+        {
+            return Err("status_only configuration cannot authorize maintenance".into());
+        }
+        Ok(())
+    }
+    /// Reject observer misconfiguration before any storage or network I/O.
+    pub fn validate_observer(&self) -> Result<(), ServerError> {
+        if self.rfc.enabled
+            || self.crates.enabled
+            || self.rustsec.enabled
+            || self.mdn.enabled
+            || self.whatwg.enabled
+            || self.w3c.enabled
+            || self.chromium.enabled
+            || self.wikipedia.enabled
+            || self.npm.enabled
+            || self.npm.advisories_enabled
+        {
+            return Err("status_only requires every collector and npm advisories disabled".into());
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), ServerError> {
         self.limits.validate()?;
+        if self
+            .writer_listener
+            .as_ref()
+            .is_some_and(|listener| !(1..=86_400).contains(&listener.observation_max_pass_secs))
+        {
+            return Err("observation_max_pass_secs must be between 1 and 86400".into());
+        }
         if let Some(client) = &self.writer_client {
             client.validate()?;
         }
@@ -657,5 +707,71 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.to_string(), "configuration exceeds limit");
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    fn observer() -> Config {
+        let mut config: Config =
+            toml::from_str(include_str!("../../../deploy/oxibelt/backend.toml")).unwrap();
+        config.npm.advisories_enabled = false;
+        config.writer_listener = Some(
+            toml::from_str(
+                r#"
+access = "status_only"
+bind = "127.0.0.1:9443"
+certificate = "/tmp/fixture.pem"
+private_key = "/tmp/fixture-key.pem"
+allowed_clients = []
+[auth]
+kube_api_url = "https://fixture.invalid"
+kube_token_file = "/tmp/fixture-token"
+audience = "devres-writer"
+"#,
+            )
+            .unwrap(),
+        );
+        config
+    }
+    #[test]
+    fn observer_requires_every_collection_lane_paused_and_denies_maintenance() {
+        let config = observer();
+        config.validate().unwrap();
+        config.validate_observer().unwrap();
+        assert!(config.ensure_maintenance_allowed().is_err());
+        for lane in 0..10 {
+            let mut changed = config.clone();
+            match lane {
+                0 => changed.rfc.enabled = true,
+                1 => changed.crates.enabled = true,
+                2 => changed.rustsec.enabled = true,
+                3 => changed.mdn.enabled = true,
+                4 => changed.whatwg.enabled = true,
+                5 => changed.w3c.enabled = true,
+                6 => changed.chromium.enabled = true,
+                7 => changed.wikipedia.enabled = true,
+                8 => changed.npm.enabled = true,
+                _ => changed.npm.advisories_enabled = true,
+            }
+            assert!(changed.validate_observer().is_err());
+        }
+        let mut full = config.clone();
+        full.writer_listener.as_mut().unwrap().access = WriterAccess::Full;
+        full.ensure_maintenance_allowed().unwrap();
+        for seconds in [0, 86_401, u64::MAX] {
+            let mut invalid = config.clone();
+            invalid
+                .writer_listener
+                .as_mut()
+                .unwrap()
+                .observation_max_pass_secs = seconds;
+            assert!(invalid.validate().is_err());
+        }
+        assert_eq!(
+            config.writer_listener.unwrap().observation_max_pass_secs,
+            900
+        );
     }
 }

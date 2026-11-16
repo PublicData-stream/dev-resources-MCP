@@ -116,12 +116,17 @@ impl NpmCorpus {
         self.update_status().await
     }
     pub async fn status(&self) -> Result<Value> {
-        let mut output = self
-            .store
-            .npm_state("status")
-            .await?
-            .unwrap_or_else(|| json!({}));
-        output["counts"] = self.store.npm_statistics().await?;
+        let mut output = crate::status_diagnostics::stage(
+            crate::status_diagnostics::Stage::SavedState,
+            self.store.npm_state("status"),
+        )
+        .await?
+        .unwrap_or_else(|| json!({}));
+        output["counts"] = crate::status_diagnostics::stage(
+            crate::status_diagnostics::Stage::Statistics,
+            self.store.npm_statistics(),
+        )
+        .await?;
         output["enabled"] = json!(self.config.enabled);
         output["collection_enabled"] = json!(self.config.enabled);
         output["advisories_enabled"] = json!(self.config.advisories_enabled);
@@ -131,12 +136,13 @@ impl NpmCorpus {
         output["raw_bytes"] = json!(self.raw.accounted_bytes());
         output["raw_quota_bytes"] = json!(self.raw.quota_bytes());
         for lane in ["research", "advisories"] {
-            output[format!("{lane}_default")] = self
-                .store
-                .npm_state(&format!("default-{lane}"))
-                .await?
-                .map(|v| snapshot_summary(&v))
-                .unwrap_or(Value::Null);
+            output[format!("{lane}_default")] = crate::status_diagnostics::stage(
+                crate::status_diagnostics::Stage::Defaults,
+                self.store.npm_state(&format!("default-{lane}")),
+            )
+            .await?
+            .map(|v| snapshot_summary(&v))
+            .unwrap_or(Value::Null);
         }
         Ok(output)
     }
