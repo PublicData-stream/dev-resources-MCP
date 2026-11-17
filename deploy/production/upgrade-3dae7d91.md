@@ -140,6 +140,14 @@ published-server assessment with enforcing AppArmor and all controlled failures.
 Hosted CI success without `--npm-assessment-image` does not satisfy the latter.
 All test state belongs below `/tmp`; Cargo target is `/tmp/rust/target`.
 
+The optional assessment prepares digest references with one CRI-native pull in
+the owned disposable node. Before creating workloads, verify the exact requested
+name, original OCI index, selected native manifest, config and architecture, and
+retain the bounded source-bound preparation receipt. This avoids minikube's
+digest archive path losing the image name. Local tags retain the existing image
+load path and require config verification. Neither path retries, retags an image
+or changes the assessment Pod's `Never` pull policy.
+
 Obtain independent MCP/API, Upstream/Storage and Security Boundary reviews of the
 integrated implementation. Commit reviewed tooling and sanitized outcome
 evidence separately, signed, with the Codex assistance trailer. Do not push or

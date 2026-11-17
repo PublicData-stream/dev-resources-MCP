@@ -91,6 +91,133 @@ class SyntheticFixtureTests(unittest.TestCase):
             run.assert_not_called()
             popen.assert_not_called()
 
+    def test_image_graph_keeps_exact_index_native_config_name_and_platform(self):
+        identity={'container_id':'1'*64,'container_pid':42}
+        for scenario in ('valid','wrong-name','wrong-target','wrong-config','wrong-native-config','wrong-platform','duplicate-platform','wrong-config-arch','corrupt-root','local-tag'):
+            cfg={'architecture':'arm64' if scenario=='wrong-config-arch' else 'amd64','os':'linux','rootfs':{'diff_ids':[]}}
+            cfg_raw=json.dumps(cfg).encode();cfg_id='sha256:'+hashlib.sha256(cfg_raw).hexdigest()
+            native={'schemaVersion':2,'config':{'digest':'sha256:'+'9'*64 if scenario=='wrong-native-config' else cfg_id},'layers':[]}
+            native_raw=json.dumps(native).encode();native_id='sha256:'+hashlib.sha256(native_raw).hexdigest()
+            item={'digest':native_id,'platform':{'os':'linux','architecture':'arm64' if scenario=='wrong-platform' else 'amd64'}}
+            index={'schemaVersion':2,'manifests':[item,item] if scenario=='duplicate-platform' else [item]}
+            index_raw=json.dumps(index).encode();root='sha256:'+hashlib.sha256(index_raw).hexdigest()
+            image='candidate:server' if scenario=='local-tag' else 'ghcr.io/example/server@'+root
+            expected={'artifact':root,'configs':[cfg_id],'known_digests':[root,cfg_id]}
+            blobs={root:index_raw,native_id:native_raw,cfg_id:cfg_raw}
+            def execute(_identity,*args,**kwargs):
+                self.assertEqual(_identity,identity)
+                if args[:2]==('crictl','inspecti'):
+                    data={'status':{'id':'sha256:'+'8'*64 if scenario=='wrong-config' else cfg_id,
+                                   'repoDigests':[] if scenario=='wrong-name' else [image]}}
+                    output=json.dumps(data).encode()
+                elif args[:5]==('ctr','-n','k8s.io','images','ls'):
+                    output=('REF TYPE DIGEST SIZE PLATFORMS LABELS\n'+image+' application/vnd.oci.image.index.v1+json '+('sha256:'+'7'*64 if scenario=='wrong-target' else root)+' 0B linux/amd64 -\n').encode()
+                elif args[:5]==('ctr','-n','k8s.io','content','get'):
+                    output=blobs[args[5]]
+                    if scenario=='corrupt-root' and args[5]==root:output+=b' '
+                else:raise AssertionError(args)
+                return subprocess.CompletedProcess([],0,output,b'')
+            with self.subTest(scenario=scenario),patch.object(fixture,'node_exec',side_effect=execute):
+                if scenario in ('valid','local-tag'):
+                    result=fixture.admitted_image(identity,image,expected,'amd64','local-tag' if scenario=='local-tag' else 'digest')
+                    self.assertEqual(result['config'],cfg_id)
+                    self.assertEqual(result['native_manifest'],None if scenario=='local-tag' else native_id)
+                else:
+                    with self.assertRaises(fixture.FixtureError):fixture.admitted_image(identity,image,expected,'amd64','digest')
+
+    def test_image_preparation_single_dispatch_failures_and_receipt_replay(self):
+        identity={'container_id':'1'*64,'container_pid':42};uid='12345678-1234-1234-1234-123456789abc'
+        root='sha256:'+'2'*64;config='sha256:'+'3'*64
+        expected={'artifact':root,'configs':[config],'known_digests':[root,config]}
+        for scenario in ('digest','local-tag','pull-failure','pull-timeout','pull-cancel','import-failure','storage-refused','storage-drift','node-refused','identity-drift','lost-intent','replay'):
+            with self.subTest(scenario=scenario),tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+                image='candidate:server' if scenario in ('local-tag','import-failure') else 'ghcr.io/example/server@'+root
+                cluster=fixture.Cluster('devres-acceptance-fixture',Path(temporary));operations=[]
+                arguments=types.SimpleNamespace(profile=cluster.profile,scratch=temporary,server_image=image)
+                graph={'root_digest':None if scenario in ('local-tag','import-failure') else root,
+                       'native_manifest':None if scenario in ('local-tag','import-failure') else 'sha256:'+'4'*64,
+                       'config':config,'architecture':'amd64','os':'linux'}
+                def execute(_identity,*args,**kwargs):
+                    if args==('uname','-m'):return subprocess.CompletedProcess([],0,b'x86_64\n',b'')
+                    if args[:2]==('crictl','pull'):
+                        operations.append('pull')
+                        if scenario=='pull-failure':raise fixture.FixtureError('fixture_command_failed')
+                        if scenario=='pull-timeout':raise subprocess.TimeoutExpired(['PRIVATE_ARGUMENT'],240)
+                        if scenario=='pull-cancel':raise KeyboardInterrupt()
+                        return subprocess.CompletedProcess([],0,b'public digest',b'')
+                    raise AssertionError(args)
+                def command(args,**kwargs):
+                    self.assertEqual(args,['minikube','-p',cluster.profile,'image','load',image]);operations.append('import')
+                    if scenario=='import-failure':raise fixture.FixtureError('fixture_command_failed')
+                    return subprocess.CompletedProcess([],0,b'',b'')
+                actual_receipt=fixture.receipt
+                def receipt(_cluster,name,value):
+                    if scenario=='lost-intent' and name.endswith('-intent.json'):return False
+                    return actual_receipt(_cluster,name,value)
+                with patch.dict(os.environ,{'DEVRES_E2E_DIAGNOSTICS_DIR':''}),patch.object(fixture,'Cluster',return_value=cluster), \
+                     patch.object(fixture,'node_docker_identity',side_effect=fixture.FixtureError('fixture_node_identity') if scenario=='node-refused' else None,return_value=identity), \
+                     patch.object(fixture,'node_uid',side_effect=[uid,'23456789-1234-1234-1234-123456789abc'] if scenario=='identity-drift' else None,return_value=uid), \
+                     patch.object(fixture,'node_namespace',return_value='mnt:[20]'),patch.object(fixture,'host_mount_state',return_value=('mnt:[10]','5'*64,set())), \
+                     patch.object(fixture,'node_exec',side_effect=execute),patch.object(fixture,'command',side_effect=command), \
+                     patch.object(fixture,'expected_image_identity',return_value=expected), \
+                     patch.object(fixture,'image_cache_boundary',side_effect=fixture.FixtureError('fixture_image_storage') if scenario=='storage-refused' else ['6'*64,'7'*64] if scenario=='storage-drift' else None,return_value='6'*64), \
+                     patch.object(fixture,'admitted_image',return_value=graph),patch.object(fixture,'receipt',side_effect=receipt):
+                    if scenario in ('digest','local-tag','replay'):
+                        fixture.prepare_image(arguments)
+                        self.assertEqual(operations,['import' if scenario=='local-tag' else 'pull'])
+                        if scenario=='replay':
+                            with self.assertRaisesRegex(fixture.FixtureError,'fixture_evidence_retention_incomplete'):fixture.prepare_image(arguments)
+                            self.assertEqual(operations,['pull'])
+                    else:
+                        error_type=subprocess.TimeoutExpired if scenario=='pull-timeout' else KeyboardInterrupt if scenario=='pull-cancel' else fixture.FixtureError
+                        with self.assertRaises(error_type):fixture.prepare_image(arguments)
+                        self.assertEqual(operations,['pull'] if scenario in ('pull-failure','pull-timeout','pull-cancel') else ['import'] if scenario=='import-failure' else [])
+                    for path in Path(temporary).glob('npm-assessment-image-*.json'):
+                        value=json.loads(path.read_bytes());fixture.validate_receipt(path.name,value)
+                        self.assertNotIn('private',path.read_text().lower())
+                        with self.assertRaises(fixture.FixtureError):fixture.validate_receipt(path.name,{**value,'stderr':'PRIVATE_SECRET'})
+                    if scenario in ('pull-timeout','pull-cancel'):
+                        failure=json.loads((Path(temporary)/'npm-assessment-image-preparation-failure.json').read_bytes())
+                        self.assertEqual(failure['phase'],'operation')
+                        self.assertEqual(failure['failure']['code'],'fixture_command_timeout' if scenario=='pull-timeout' else 'unknown')
+
+    def test_image_preparation_refuses_context_and_invalid_refs_before_operations(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary,patch.dict(os.environ,{'DOCKER_CONTEXT':'foreign'}), \
+             patch.object(fixture,'Cluster') as cluster,patch.object(fixture,'command') as command:
+            with self.assertRaisesRegex(fixture.FixtureError,'fixture_docker_context_refused'):
+                fixture.prepare_image(types.SimpleNamespace(scratch=temporary))
+            cluster.assert_not_called();command.assert_not_called()
+        for image in ('sha256:'+'1'*64,'candidate@not-a-digest','https://user:password@registry/image','candidate','candidate:tag;foreign'):
+            with self.subTest(image=image),self.assertRaises(fixture.FixtureError):fixture.image_reference_kind(image)
+
+    def test_image_cache_storage_rejects_foreign_bind_mount_alias_and_kernel_source(self):
+        profile='devres-acceptance-fixture';state=Path('/tmp/owned-daemon');storage=str(state/'data/volumes'/profile/'_data')
+        identity={'container_id':'1'*64,'container_pid':42}
+        host=b'1 0 253:1 / /tmp rw - ext4 /dev/vda1 rw\n'
+        node=('2 1 253:1 '+storage.removeprefix('/tmp')+' /var rw shared:2 - ext4 /dev/vda1 rw\n').encode()
+        original={'Id':identity['container_id'],'State':{'Pid':42},'HostConfig':{},'Mounts':[{'Type':'volume','Name':profile,'Driver':'local','Source':storage,'RW':True,'Destination':'/var'}]}
+        for scenario in ('valid','foreign-source','foreign-name','bind','remote-driver','readonly','descendant','kernel-root','kernel-submount'):
+            value,raw=copy.deepcopy(original),node
+            mount=value['Mounts'][0]
+            if scenario=='foreign-source':mount['Source']='/foreign/data'
+            elif scenario=='foreign-name':mount['Name']='foreign'
+            elif scenario=='bind':mount['Type']='bind'
+            elif scenario=='remote-driver':mount['Driver']='foreign'
+            elif scenario=='readonly':mount['RW']=False
+            elif scenario=='descendant':value['Mounts'].append({'Destination':'/var/lib/containerd','Type':'bind','Source':'/foreign'})
+            elif scenario=='kernel-root':raw=raw.replace(storage.removeprefix('/tmp').encode(),b'/foreign')
+            elif scenario=='kernel-submount':raw+=b'3 2 253:1 /foreign /var/lib/containerd/sub rw - ext4 /dev/vda1 rw\n'
+            with self.subTest(scenario=scenario),patch.dict(os.environ,{'DOCKER_HOST':'unix:///tmp/owned-daemon/docker.sock'}), \
+                 patch.object(fixture,'node_docker_identity',return_value=identity),patch.object(fixture,'command',side_effect=[subprocess.CompletedProcess([],0,b'"/tmp/owned-daemon/data"',b''),subprocess.CompletedProcess([],0,json.dumps([value]).encode(),b'')]), \
+                 patch.object(fixture,'verify_private_storage') as verify,patch.object(fixture.Path,'read_bytes',return_value=host), \
+                 patch.object(fixture,'node_exec',return_value=subprocess.CompletedProcess([],0,raw,b'')):
+                if scenario=='valid':
+                    self.assertEqual(len(fixture.image_cache_boundary(types.SimpleNamespace(profile=profile),identity)),64)
+                    verify.assert_called_once_with(state,[storage])
+                else:
+                    with self.assertRaisesRegex(fixture.FixtureError,'fixture_image_storage'):
+                        fixture.image_cache_boundary(types.SimpleNamespace(profile=profile),identity)
+
     def test_namespace_freshness_requires_successful_authoritative_absence(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
             cluster = fixture.Cluster('devres-acceptance-fixture', Path(temporary))

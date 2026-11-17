@@ -174,7 +174,8 @@ minikube -p "$profile" image load "$image" || {
 if [[ -n $npm_assessment_image ]]; then
   [[ $npm_assessment_image != "$image" ]] || { echo 'The npm assessment requires a separate Dockerfile server image' >&2; exit 2; }
   docker image inspect "$npm_assessment_image" >/dev/null
-  minikube -p "$profile" image load "$npm_assessment_image"
+  python3 -I -B scripts/npm-assessment-fixture.py --profile "$profile" --scratch "$scratch" \
+    --harness-image "$image" --server-image "$npm_assessment_image" --prepare-image-only
 fi
 scripts/e2e-storage.sh after-minikube-import "$image" "$scratch" || true
 k create namespace "$namespace" --dry-run=client -o yaml | k apply -f -

@@ -78,7 +78,8 @@ SETUP_CODES = OBSERVER_ERRORS | frozenset(('fixture_command_timeout', 'fixture_a
     'fixture_owned_resource_replaced', 'fixture_owned_resource_cleanup_unconfirmed', 'fixture_apply_operation_invalid'))
 SETUP_CODES = SETUP_CODES | frozenset(('fixture_parser_package', 'fixture_parser_archive',
     'fixture_parser_member', 'fixture_parser_download', 'fixture_parser_node', 'fixture_parser_version',
-    'fixture_parser_write_boundary'))
+    'fixture_parser_write_boundary', 'fixture_image_reference', 'fixture_image_identity',
+    'fixture_image_storage', 'fixture_image_graph', 'fixture_image_architecture'))
 CONTROL_COMMANDS = frozenset(('unknown', 'apparmor-policy', 'apparmor-state', 'apparmor-tasks',
     'docker-metadata', 'docker-exec', 'kubectl.apply', 'kubectl.create', 'kubectl.exec',
     'kubectl.wait', 'kubectl.delete', 'kubectl.get', 'kubectl.logs', 'kubectl.patch', 'kubectl.rollout'))
@@ -159,11 +160,19 @@ def validate_command_outcome(value):
     need(type(value['command']) is str and value['command'] in CONTROL_COMMANDS
          and value['outcome'] in ('nonzero', 'timeout', 'output_bound'),
          'fixture_receipt_command')
+
+
     need(value['exit_code'] is None or type(value['exit_code']) is int and -255 <= value['exit_code'] <= 255,
          'fixture_receipt_command')
     for name in ('stdout_bytes', 'stderr_bytes'):
         need(value[name] is None or type(value[name]) is int and 0 <= value[name] <= MAX_METADATA + 1,
              'fixture_receipt_command')
+
+
+def validate_closed_failure(value):
+    need(type(value) is dict and set(value) == {'code', 'command_outcome'}
+         and type(value['code']) is str and value['code'] in SETUP_CODES, 'fixture_receipt_setup_failure')
+    validate_command_outcome(value['command_outcome'])
 
 
 def docker_config_digests(image, timeout=32):
@@ -274,6 +283,180 @@ def expected_image_identity(image):
     return {'artifact': lines[0], 'configs': configs, 'known_digests': sorted(manifests | {lines[0]} | set(configs))}
 
 
+def image_reference_kind(image):
+    need(type(image) is str and re.fullmatch(r'[A-Za-z0-9._:/@+\-]{1,256}', image), 'fixture_image_reference')
+    if '@' in image:
+        need(re.fullmatch(r'[A-Za-z0-9._:/+\-]+@' + IMAGE_DIGEST, image), 'fixture_image_reference')
+        return 'digest'
+    need(not image.startswith('sha256:') and re.fullmatch(r'[A-Za-z0-9._:/+\-]+:[A-Za-z0-9_.\-]+', image),
+         'fixture_image_reference')
+    return 'local-tag'
+
+
+def verify_private_storage(state, directories):
+    script = ('import os,pathlib,stat,sys\n'
+              'root=pathlib.Path(sys.argv[1]);uid=int(sys.argv[2])\n'
+              'for name in sys.argv[3:]:\n'
+              ' path=pathlib.Path(name);assert root in path.parents and path==path.resolve(strict=True)\n'
+              ' for item in [root,*reversed(list(path.parents)[:list(path.parents).index(root)]),path]:\n'
+              '  info=item.lstat();assert stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)\n'
+              '  assert info.st_uid in (0,uid) and not info.st_mode & 0o022\n')
+    command(['sudo', '-n', 'python3', '-I', '-B', '-c', script, str(state), str(os.getuid()), *directories])
+
+
+def image_cache_boundary(cluster, identity):
+    """The node cache is the task's disposable named /var volume, never a host bind."""
+    need(node_docker_identity(cluster) == identity, 'fixture_node_identity_changed')
+    state = Path(os.environ['DOCKER_HOST'].removeprefix('unix://')).parent
+    need(json.loads(command(['docker', 'info', '--format', '{{json .DockerRootDir}}']).stdout) == str(state / 'data'),
+         'fixture_image_storage')
+    inspected = json.loads(command(['docker', 'inspect', '--', identity['container_id']]).stdout)
+    need(type(inspected) is list and len(inspected) == 1 and inspected[0]['Id'] == identity['container_id']
+         and inspected[0]['State']['Pid'] == identity['container_pid'], 'fixture_node_identity_changed')
+    mounts = inspected[0].get('Mounts', [])
+    selected = [mount for mount in mounts if mount.get('Destination') == '/var']
+    storage = state / 'data/volumes' / cluster.profile / '_data'
+    need(len(selected) == 1 and selected[0].get('Type') == 'volume' and selected[0].get('Name') == cluster.profile
+         and selected[0].get('Driver') == 'local' and selected[0].get('Source') == str(storage) and selected[0].get('RW') is True
+         and not inspected[0].get('HostConfig', {}).get('VolumesFrom'),
+         'fixture_image_storage')
+    need(all(mount is selected[0] or not (str(mount.get('Destination', '')).startswith('/var/')
+         or mount.get('Destination') == '/') for mount in mounts), 'fixture_image_storage')
+    verify_private_storage(state, [str(storage)])
+    host_cover, _rows, _shared = mount_projection(Path('/proc/self/mountinfo').read_bytes(), str(storage))
+    expected_root = str(Path(host_cover['root']) / storage.relative_to(host_cover['target']))
+    cover, related, _shared = mount_projection(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout, '/var/lib/containerd')
+    need(cover['target'] == '/var' and cover['device'] == host_cover['device'] and cover['root'] == expected_root
+         and cover['filesystem'] == host_cover['filesystem'] and len(related) == 1,
+         'fixture_image_storage')
+    return hashlib.sha256(json.dumps({'volume': selected[0], 'mount': cover}, sort_keys=True).encode()).hexdigest()
+
+
+def node_image_content(identity, digest):
+    need(type(digest) is str and re.fullmatch(IMAGE_DIGEST, digest), 'fixture_image_graph')
+    raw = node_exec(identity, 'ctr', '-n', 'k8s.io', 'content', 'get', digest).stdout
+    need('sha256:' + hashlib.sha256(raw).hexdigest() == digest, 'fixture_image_graph')
+    value = json.loads(raw)
+    need(type(value) is dict, 'fixture_image_graph')
+    return value
+
+
+def validate_image_preparation(name, value):
+    need(set(value) == {'version', 'synthetic', 'state', 'source_sha256', 'image', 'mode', 'identity',
+         'storage_sha256', 'host_mounts_sha256', 'expected', 'graph'}, 'fixture_receipt_image_preparation')
+    complete = name == 'npm-assessment-image-preparation.json'
+    need(value['state'] == ('complete' if complete else 'prepared') and value['mode'] == image_reference_kind(value['image'])
+         and all(type(value[key]) is str and re.fullmatch('[a-f0-9]{64}', value[key])
+                 for key in ('source_sha256', 'storage_sha256', 'host_mounts_sha256')), 'fixture_receipt_image_preparation')
+    identity = value['identity']
+    need(type(identity) is dict and set(identity) == {'container_id', 'container_pid', 'profile', 'node_uid', 'node_mount_namespace'}
+         and type(identity['container_id']) is str and re.fullmatch('[a-f0-9]{64}', identity['container_id'])
+         and type(identity['container_pid']) is int and 1 < identity['container_pid'] < 2**31
+         and type(identity['node_uid']) is str and re.fullmatch(UUID_PATTERN, identity['node_uid'])
+         and type(identity['profile']) is str and re.fullmatch('devres-acceptance-[a-z0-9-]+', identity['profile'])
+         and type(identity['node_mount_namespace']) is str and re.fullmatch(r'mnt:\[[0-9]{1,20}\]', identity['node_mount_namespace']),
+         'fixture_receipt_image_preparation')
+    expected = value['expected']
+    need(type(expected) is dict and set(expected) == {'artifact', 'configs', 'known_digests'}
+         and type(expected['known_digests']) is list and 1 <= len(expected['known_digests']) <= 49
+         and all(type(item) is str and re.fullmatch(IMAGE_DIGEST, item) for item in expected['known_digests'])
+         and expected['artifact'] in expected['known_digests'] and type(expected['configs']) is list
+         and 1 <= len(expected['configs']) <= 16 and all(item in expected['known_digests'] for item in expected['configs']),
+         'fixture_receipt_image_preparation')
+    graph = value['graph']
+    if complete:
+        need(type(graph) is dict and set(graph) == {'root_digest', 'native_manifest', 'config', 'architecture', 'os'}
+             and graph['architecture'] in ('amd64', 'arm64') and graph['os'] == 'linux'
+             and graph['config'] in expected['configs'], 'fixture_receipt_image_preparation')
+        if value['mode'] == 'digest':
+            need(graph['root_digest'] == value['image'].rsplit('@', 1)[1]
+                 and graph['root_digest'] in expected['known_digests']
+                 and type(graph['native_manifest']) is str and re.fullmatch(IMAGE_DIGEST, graph['native_manifest']),
+                 'fixture_receipt_image_preparation')
+        else:
+            need(graph['root_digest'] is None and graph['native_manifest'] is None, 'fixture_receipt_image_preparation')
+    else:
+        need(graph is None, 'fixture_receipt_image_preparation')
+
+
+def admitted_image(identity, image, expected, architecture, kind):
+    value = json.loads(node_exec(identity, 'crictl', 'inspecti', image).stdout)
+    config = value.get('status', {}).get('id')
+    need(config in expected['configs'], 'fixture_image_identity')
+    graph = {'root_digest': None, 'native_manifest': None, 'config': config, 'architecture': architecture, 'os': 'linux'}
+    if kind == 'digest':
+        root = image.rsplit('@', 1)[1]
+        need(root in expected['known_digests'] and image in value.get('status', {}).get('repoDigests', []),
+             'fixture_image_identity')
+        rows = node_exec(identity, 'ctr', '-n', 'k8s.io', 'images', 'ls').stdout.decode('ascii').splitlines()[1:]
+        matches = [row.split()[2] for row in rows if len(row.split()) >= 3 and row.split()[0] == image]
+        need(matches == [root], 'fixture_image_identity')
+        descriptor = node_image_content(identity, root)
+        native = root
+        if 'manifests' in descriptor:
+            manifests = descriptor['manifests']
+            need(type(manifests) is list and len(manifests) <= 64, 'fixture_image_graph')
+            selected = [item for item in manifests if type(item) is dict
+                and item.get('platform', {}).get('architecture') == architecture
+                and item.get('platform', {}).get('os') == 'linux']
+            need(len(selected) == 1, 'fixture_image_architecture')
+            native = selected[0].get('digest')
+            descriptor = node_image_content(identity, native)
+        need(descriptor.get('config', {}).get('digest') == config, 'fixture_image_graph')
+        graph.update(root_digest=root, native_manifest=native)
+    cfg = node_image_content(identity, config)
+    need(cfg.get('architecture') == architecture and cfg.get('os') == 'linux', 'fixture_image_architecture')
+    return graph
+
+
+def prepare_image(arguments):
+    scratch = Path(arguments.scratch).resolve(strict=True)
+    need(Path('/tmp') in scratch.parents and scratch.stat().st_uid == os.getuid(), 'owned_tmp_fixture_required')
+    need(not os.environ.get('DOCKER_CONTEXT'), 'fixture_docker_context_refused')
+    cluster = Cluster(arguments.profile, scratch)
+    try:
+        prepare_image_fixture(arguments, cluster)
+    except BaseException as error:
+        receipt(cluster, 'npm-assessment-image-preparation-failure.json', {'version': 1, 'synthetic': True,
+            'phase': getattr(cluster, 'image_preparation_phase', 'admission'), 'failure': closed_failure(error)})
+        raise
+
+
+def prepare_image_fixture(arguments, cluster):
+    kind = image_reference_kind(arguments.server_image)
+    identity = node_docker_identity(cluster)
+    uid, namespace = node_uid(cluster), node_namespace(identity)
+    host_namespace, host_hash, _shared = host_mount_state()
+    need(namespace != host_namespace, 'fixture_host_mount_namespace_refused')
+    architecture = {b'x86_64': 'amd64', b'aarch64': 'arm64'}.get(node_exec(identity, 'uname', '-m').stdout.strip())
+    need(architecture is not None, 'fixture_image_architecture')
+    source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    expected = expected_image_identity(arguments.server_image)
+    if kind == 'digest':
+        need(arguments.server_image.rsplit('@', 1)[1] in expected['known_digests'], 'fixture_image_identity')
+    storage = image_cache_boundary(cluster, identity)
+    bound = {**identity, 'profile': cluster.profile, 'node_uid': uid, 'node_mount_namespace': namespace}
+    record = {'version': 1, 'synthetic': True, 'state': 'prepared', 'source_sha256': source,
+              'image': arguments.server_image, 'mode': kind, 'identity': bound, 'storage_sha256': storage,
+              'host_mounts_sha256': host_hash, 'expected': expected, 'graph': None}
+    need(receipt(cluster, 'npm-assessment-image-preparation-intent.json', record), 'fixture_evidence_retention_incomplete')
+    need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid and node_namespace(identity) == namespace
+         and image_cache_boundary(cluster, identity) == storage, 'fixture_node_identity_changed')
+    # Exactly one primary setup operation. A failure has no retry, alias or fallback.
+    cluster.image_preparation_phase = 'operation'
+    if kind == 'digest':
+        node_exec(identity, 'crictl', 'pull', arguments.server_image, timeout=240)
+    else:
+        command(['minikube', '-p', cluster.profile, 'image', 'load', arguments.server_image], timeout=240)
+    cluster.image_preparation_phase = 'identity'
+    graph = admitted_image(identity, arguments.server_image, expected, architecture, kind)
+    need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid and node_namespace(identity) == namespace
+         and image_cache_boundary(cluster, identity) == storage and host_mount_state()[:2] == (host_namespace, host_hash)
+         and hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == source, 'fixture_node_identity_changed')
+    need(receipt(cluster, 'npm-assessment-image-preparation.json', {**record, 'state': 'complete', 'graph': graph}),
+         'fixture_evidence_retention_incomplete')
+
+
 def resolved_image_identity(cluster, image_id, expected):
     """Match immutable Docker and CRI digests; tag equality is insufficient."""
     need(type(image_id) is str and len(image_id) <= 512, 'assessment_resolved_image_required')
@@ -368,6 +551,12 @@ def validate_receipt(name, value):
          and value.get('synthetic') is True, 'fixture_receipt_identity')
     if name in ('npm-assessment-node-preparation-intent.json', 'npm-assessment-node-preparation.json'):
         validate_node_preparation(name, value)
+    elif name in ('npm-assessment-image-preparation-intent.json', 'npm-assessment-image-preparation.json'):
+        validate_image_preparation(name, value)
+    elif name == 'npm-assessment-image-preparation-failure.json':
+        need(set(value) == {'version', 'synthetic', 'phase', 'failure'} and value['phase'] in ('admission', 'operation', 'identity'),
+             'fixture_receipt_image_preparation')
+        validate_closed_failure(value['failure'])
     elif name == 'npm-assessment-receipt.json':
         need(set(value) == {'version', 'synthetic', 'apparmor_sha256', 'server_image', 'provider_requests', 'selection',
                             'network', 'result', 'faults', 'metadata_unchanged'}, 'fixture_receipt_fields')
@@ -804,14 +993,7 @@ def node_write_boundaries(cluster, identity, uid):
     digest, directories = parser_write_projection(values[0], node_exec(identity, 'cat', '/proc/self/mountinfo').stdout, state)
     # Read-only host-side identity proof, including root-owned daemon directories
     # inaccessible to the invoking user. No host file is created or changed.
-    script = ('import os,pathlib,stat,sys\n'
-              'root=pathlib.Path(sys.argv[1]);uid=int(sys.argv[2])\n'
-              'for name in sys.argv[3:]:\n'
-              ' path=pathlib.Path(name);assert root in path.parents and path==path.resolve(strict=True)\n'
-              ' for item in [root,*reversed(list(path.parents)[:list(path.parents).index(root)]),path]:\n'
-              '  info=item.lstat();assert stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)\n'
-              '  assert info.st_uid in (0,uid) and not info.st_mode & 0o022\n')
-    command(['sudo', '-n', 'python3', '-I', '-B', '-c', script, str(state), str(os.getuid()), *directories])
+    verify_private_storage(state, directories)
     return {'projection_sha256': digest}
 
 
@@ -1736,8 +1918,13 @@ if __name__ == '__main__':
     parser.add_argument('--scratch', required=True)
     parser.add_argument('--harness-image', required=True)
     parser.add_argument('--server-image', required=True)
+    parser.add_argument('--prepare-image-only', action='store_true')
     try:
-        run(parser.parse_args())
+        arguments = parser.parse_args()
+        if arguments.prepare_image_only:
+            prepare_image(arguments)
+        else:
+            run(arguments)
     except FixtureError as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
