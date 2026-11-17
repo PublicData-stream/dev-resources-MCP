@@ -1621,12 +1621,24 @@ The assessment admits only an owned `/tmp` Docker socket and rejects a
 `DOCKER_CONTEXT` override. It proves namespace and policy absence before creating
 them, then binds cleanup to a unique owner label and API UIDs. On a newly owned
 minikube node without securityfs, preparation mounts it read-only inside that
-node's distinct mount namespace and restarts only its admitted containerd and
-kubelet once. Existing securityfs is observed without changing its flags.
+node's distinct mount namespace. For the pinned Debian 12 node, it reads only the
+SHA-256-pinned native AppArmor parser member from a fixed Debian package, stages
+that executable in node-private `/tmp` storage, and links an absent canonical
+parser entry point. It runs no package scripts and replaces no libraries or
+profiles. Actual write-path mounts and node identity must remain admitted.
+Preparation verifies the real parser version and restarts only the admitted
+containerd and kubelet once. Existing securityfs is observed without changing its
+flags.
 Preparation requires unchanged PostgreSQL Pod/container/process/shim identities
 and the host's securityfs mount projection; it never restarts a host daemon.
 Finite setup failures are retained after cleanup attempts; a complete result
 requires checked cleanup.
+
+The synthetic network probe verifies the enforcing kernel profile and a controlled
+read denial: a same-UID readable canary is exposed through the same emptyDir at a
+read-only canonical denied path. This does not mount host securityfs into the Pod.
+The actual probe's complete authority and policy selection must match its admitted
+template; submitted Pod settings alone cannot establish CNI or AppArmor enforcement.
 
 See the [local paused-status verification record](paused-assessment-acceptance.md)
 for completed checks, the default-stack regression, local image identities and the

@@ -12,6 +12,8 @@ import contextlib
 import fcntl
 import hashlib
 import importlib.util
+import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -24,12 +26,18 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMESPACE = 'devres-assessment'
 DATABASE = 'devres_assessment_fixture'
 PROFILE = 'devres-runtime'
 APPARMOR_SHA256 = '4375146629c956b8e63cc4b358ef52c6bcda458621b7dcf8601b0f3d922b3e7e'
+PARSER_URL = 'https://deb.debian.org/debian/pool/main/a/apparmor/apparmor_3.0.8-3_amd64.deb'
+PARSER_PACKAGE_SHA256 = '8185d7f9c14618bca0e0230f71b33f87a316182e35f569b4f25e1159904778b2'
+PARSER_PACKAGE_SIZE = 616144
+PARSER_SHA256 = '8e00d0f40bf623dd1244f962638db680c6ae6c9c868e04680a6481eeed0e5f26'
+PARSER_SIZE = 1457264
 MAX_METADATA = 2 * 1024 * 1024
 IMAGE_DIGEST = r'sha256:[0-9a-f]{64}'
 UUID_PATTERN = r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}'
@@ -68,6 +76,9 @@ SETUP_CODES = OBSERVER_ERRORS | frozenset(('fixture_command_timeout', 'fixture_a
     'fixture_docker_context_refused', 'fixture_owned_resource_kind', 'fixture_owned_resource_unavailable',
     'fixture_owned_resource_list', 'fixture_owned_resource_missing', 'fixture_owned_resource_foreign',
     'fixture_owned_resource_replaced', 'fixture_owned_resource_cleanup_unconfirmed', 'fixture_apply_operation_invalid'))
+SETUP_CODES = SETUP_CODES | frozenset(('fixture_parser_package', 'fixture_parser_archive',
+    'fixture_parser_member', 'fixture_parser_download', 'fixture_parser_node', 'fixture_parser_version',
+    'fixture_parser_write_boundary'))
 CONTROL_COMMANDS = frozenset(('unknown', 'apparmor-policy', 'apparmor-state', 'apparmor-tasks',
     'docker-metadata', 'docker-exec', 'kubectl.apply', 'kubectl.create', 'kubectl.exec',
     'kubectl.wait', 'kubectl.delete', 'kubectl.get', 'kubectl.logs', 'kubectl.patch', 'kubectl.rollout'))
@@ -368,7 +379,8 @@ def validate_receipt(name, value):
              and selected['version'] == 1 and selected['schema'] == 19 and selected['revision'] == 1
              and selected['cause_authoritative'] is False and selected['synthetic'] is True, 'fixture_receipt_selection')
         api.Selection(selected['job_id'], selected['revision']).validate()
-        need(value['network'] == {'dns': True, 'postgres_tcp': True, 'local_api_denied': True, 'public_requests': 0}, 'fixture_receipt_network')
+        need(value['network'] == {'dns': True, 'postgres_tcp': True, 'local_api_denied': True, 'public_requests': 0,
+             'apparmor_enforcing': True, 'canonical_alias_read_denied': True}, 'fixture_receipt_network')
         result(value['result'])
         need(type(value['faults']) is list and len(value['faults']) == 14, 'fixture_receipt_faults')
         for record in value['faults']:
@@ -664,6 +676,191 @@ def postgres_runtime(identity, postgres):
     return {'pid': pid, 'start_ticks': int(fields[19]), 'shim': shim}
 
 
+def parser_payload(package):
+    """Read one pinned OS-tool member as data; never extract archive paths/scripts."""
+    need(len(package) == PARSER_PACKAGE_SIZE and hashlib.sha256(package).hexdigest() == PARSER_PACKAGE_SHA256,
+         'fixture_parser_package')
+    need(package[:8] == b'!<arch>\n', 'fixture_parser_archive')
+    offset, members = 8, []
+    while offset < len(package):
+        header = package[offset:offset + 60]
+        need(len(header) == 60 and header[-2:] == b'`\n' and header[48:58].strip().isdigit(), 'fixture_parser_archive')
+        size = int(header[48:58]); offset += 60
+        need(size <= len(package) - offset and len(members) < 8, 'fixture_parser_archive')
+        members.append((header[:16].strip().rstrip(b'/'), package[offset:offset + size]))
+        offset += size + size % 2
+    need(offset == len(package) and [name for name, _ in members] == [b'debian-binary', b'control.tar.xz', b'data.tar.xz']
+         and members[0][1] == b'2.0\n', 'fixture_parser_archive')
+    selected, total = [], 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(members[2][1]), mode='r|xz') as archive:
+            for count, item in enumerate(archive, 1):
+                total += item.size
+                need(count <= 4096 and total <= 16 * 1024 * 1024, 'fixture_parser_archive')
+                if item.name != './sbin/apparmor_parser':
+                    continue
+                need(item.isfile() and item.uid == 0 and item.gid == 0 and item.size == PARSER_SIZE
+                     and item.mode == 0o755 and not selected, 'fixture_parser_member')
+                stream = archive.extractfile(item)
+                need(stream is not None, 'fixture_parser_member')
+                with stream:
+                    payload = stream.read(PARSER_SIZE + 1)
+                need(len(payload) == PARSER_SIZE and hashlib.sha256(payload).hexdigest() == PARSER_SHA256,
+                     'fixture_parser_member')
+                selected.append(payload)
+    except (tarfile.TarError, EOFError, ValueError):
+        raise FixtureError('fixture_parser_archive') from None
+    need(len(selected) == 1, 'fixture_parser_member')
+    return selected[0]
+
+
+def genuine_parser(scratch):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_args, **_kwargs):
+            raise FixtureError('fixture_parser_download')
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(PARSER_URL, timeout=30) as response:
+            need(response.geturl() == PARSER_URL, 'fixture_parser_download')
+            package = response.read(PARSER_PACKAGE_SIZE + 1)
+    except OSError:
+        raise FixtureError('fixture_parser_download') from None
+    payload = parser_payload(package)
+    need(Path('/tmp') in scratch.resolve().parents, 'owned_tmp_fixture_required')
+    descriptor = os.open(scratch / 'apparmor-native-package.deb', os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, 'wb') as output:
+        output.write(package); output.flush(); os.fsync(output.fileno())
+    return payload
+
+
+def parser_admission(identity):
+    # The pinned Debian-native ELF needs only libc/loader, maximum GLIBC_2.36.
+    # Never install packages, replace libraries, alter ldconfig, or hide markers.
+    script = ('set -eu\n'
+              'test "$(uname -m)" = x86_64\n'
+              'test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.36"\n'
+              'test "$(readlink -f /sbin)" = /usr/sbin\n'
+              'test "$(stat -c %u:%g:%a /usr/sbin)" = 0:0:755\n'
+              'test -f /lib/x86_64-linux-gnu/libc.so.6\n'
+              'test -f /lib64/ld-linux-x86-64.so.2\n'
+              'test ! -e /usr/sbin/apparmor_parser\n'
+              'test ! -L /usr/sbin/apparmor_parser\n')
+    node_exec(identity, '/bin/sh', '-c', script)
+    return {'package_sha256': PARSER_PACKAGE_SHA256, 'package_size': PARSER_PACKAGE_SIZE,
+            'binary_sha256': PARSER_SHA256, 'binary_size': PARSER_SIZE, 'libc': '2.36', 'preexisting': False}
+
+
+def parser_write_projection(value, raw, state):
+    """Refuse Docker aliases and non-private covering mounts at either write path."""
+    targets = ('/usr/sbin', '/tmp')
+    def overlaps(path):
+        need(type(path) is str and path.startswith('/') and '..' not in Path(path).parts
+             and str(Path(path)) == path, 'fixture_parser_write_boundary')
+        return any(path == target or path.startswith(target + '/') or target.startswith(path.rstrip('/') + '/')
+                   for target in targets)
+    host = value.get('HostConfig', {})
+    need(not host.get('VolumesFrom'), 'fixture_parser_write_boundary')
+    for bind in host.get('Binds') or []:
+        need(type(bind) is str and len(bind.split(':')) in (2, 3)
+             and not overlaps(bind.split(':')[1]), 'fixture_parser_write_boundary')
+    mounts = value.get('Mounts', []) + (host.get('Mounts') or [])
+    for mount in mounts:
+        destination = mount.get('Destination', mount.get('Target'))
+        if overlaps(destination):
+            need(destination == '/tmp' and mount.get('Type') == 'tmpfs'
+                 and not mount.get('Source') and mount.get('Propagation', '') in ('', 'rprivate', 'private'),
+                 'fixture_parser_write_boundary')
+    for destination in host.get('Tmpfs') or {}:
+        need(not overlaps(destination) or destination == '/tmp', 'fixture_parser_write_boundary')
+    root, root_rows, _ = mount_projection(raw, '/usr/sbin')
+    temporary, tmp_rows, _ = mount_projection(raw, '/tmp')
+    declared_tmpfs = '/tmp' in (host.get('Tmpfs') or {}) or any(
+        mount.get('Destination', mount.get('Target')) == '/tmp' and mount.get('Type') == 'tmpfs' for mount in mounts)
+    need(root['target'] == '/' and root['root'] == '/' and root['filesystem'] == 'overlay'
+         and len(root_rows) == 1 and len(tmp_rows) == 1
+         and (temporary == root or temporary['target'] == '/tmp' and temporary['root'] == '/'
+              and temporary['filesystem'] == 'tmpfs')
+         and declared_tmpfs == (temporary != root)
+         and all(not row['propagation'] for row in (root, temporary)), 'fixture_parser_write_boundary')
+    # Root writes must land in this private daemon's disposable upper directory.
+    directories = []
+    for option_name in ('upperdir=', 'workdir='):
+        paths = [option.removeprefix(option_name) for option in root['super_options'] if option.startswith(option_name)]
+        need(len(paths) == 1 and any((state / child) in Path(paths[0]).parents for child in ('data', 'containerd'))
+             and '..' not in Path(paths[0]).parts, 'fixture_parser_write_boundary')
+        directories.append(paths[0])
+    need(directories[0] != directories[1], 'fixture_parser_write_boundary')
+    projection = {'docker': {'Mounts': value.get('Mounts', []), 'HostConfig': {key: host.get(key) for key in
+                  ('Binds', 'Mounts', 'Tmpfs', 'VolumesFrom')}}, 'mounts': [root, temporary]}
+    return hashlib.sha256(json.dumps(projection, sort_keys=True).encode()).hexdigest(), directories
+
+
+def node_write_boundaries(cluster, identity, uid):
+    need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid, 'fixture_node_identity_changed')
+    state = Path(os.environ['DOCKER_HOST'].removeprefix('unix://')).parent
+    directory = json.loads(command(['docker', 'info', '--format', '{{json .DockerRootDir}}']).stdout)
+    need(directory == str(state / 'data'), 'fixture_parser_write_boundary')
+    values = json.loads(command(['docker', 'inspect', '--', identity['container_id']]).stdout)
+    need(type(values) is list and len(values) == 1 and values[0]['Id'] == identity['container_id']
+         and values[0]['State']['Pid'] == identity['container_pid'], 'fixture_node_identity_changed')
+    need(node_exec(identity, 'readlink', '-f', '/', '/tmp', '/usr', '/usr/sbin').stdout.splitlines()
+             == [b'/', b'/tmp', b'/usr', b'/usr/sbin']
+         and node_exec(identity, 'stat', '-c', '%u:%g:%a:%F', '/', '/tmp', '/usr', '/usr/sbin').stdout.splitlines()
+             in ([b'0:0:755:directory', b'0:0:1777:directory', b'0:0:755:directory', b'0:0:755:directory'],
+                 [b'0:0:755:directory', b'0:0:700:directory', b'0:0:755:directory', b'0:0:755:directory']),
+         'fixture_parser_write_boundary')
+    digest, directories = parser_write_projection(values[0], node_exec(identity, 'cat', '/proc/self/mountinfo').stdout, state)
+    # Read-only host-side identity proof, including root-owned daemon directories
+    # inaccessible to the invoking user. No host file is created or changed.
+    script = ('import os,pathlib,stat,sys\n'
+              'root=pathlib.Path(sys.argv[1]);uid=int(sys.argv[2])\n'
+              'for name in sys.argv[3:]:\n'
+              ' path=pathlib.Path(name);assert root in path.parents and path==path.resolve(strict=True)\n'
+              ' for item in [root,*reversed(list(path.parents)[:list(path.parents).index(root)]),path]:\n'
+              '  info=item.lstat();assert stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)\n'
+              '  assert info.st_uid in (0,uid) and not info.st_mode & 0o022\n')
+    command(['sudo', '-n', 'python3', '-I', '-B', '-c', script, str(state), str(os.getuid()), *directories])
+    return {'projection_sha256': digest}
+
+
+def install_parser(identity, namespace, payload, guard):
+    need(len(payload) == PARSER_SIZE and hashlib.sha256(payload).hexdigest() == PARSER_SHA256, 'fixture_parser_member')
+    parser_admission(identity)
+    guard()
+    prefix = node_exec(identity, 'mktemp', '-d', '/tmp/devres-apparmor.XXXXXXXX').stdout.decode('ascii').strip()
+    need(re.fullmatch(r'/tmp/devres-apparmor\.[A-Za-z0-9]{8}', prefix), 'fixture_parser_node')
+    script = ('set -eu\n'
+              'test "$(readlink /proc/self/ns/mnt)" = "$1"\n'
+              'test "$(id -u)" = 0\n'
+              'test ! -L "$2"\n'
+              'test "$(stat -c %u:%g:%a "$2")" = 0:0:700\n'
+              'umask 077\n'
+              'dd of="$2/apparmor_parser" oflag=excl,nofollow status=none\n'
+              'chmod 500 "$2/apparmor_parser"\n')
+    guard()
+    command(['docker', 'exec', '-i', identity['container_id'], '/bin/sh', '-c', script,
+             'fixture-parser-copy', namespace, prefix], data=payload)
+    path = prefix + '/apparmor_parser'
+    need(node_exec(identity, 'sha256sum', path).stdout.decode('ascii').split()[0] == PARSER_SHA256,
+         'fixture_parser_node')
+    parser_admission(identity)
+    guard()
+    node_exec(identity, 'ln', '-s', '--no-target-directory', path, '/usr/sbin/apparmor_parser')
+    parser_placement_state(identity, prefix)
+    version = node_exec(identity, '/sbin/apparmor_parser', '--version', maximum=4096).stdout.decode('ascii').splitlines()
+    need(version and version[0] == 'AppArmor parser version 3.0.8', 'fixture_parser_version')
+    guard()
+    return {'prefix': prefix, 'version': '3.0.8', 'mode': 0o500, 'binary_sha256': PARSER_SHA256}
+
+
+def parser_placement_state(identity, prefix):
+    need(re.fullmatch(r'/tmp/devres-apparmor\.[A-Za-z0-9]{8}', prefix), 'fixture_parser_node')
+    need(node_exec(identity, 'readlink', '/sbin/apparmor_parser').stdout.decode('ascii').strip() == prefix + '/apparmor_parser'
+         and node_exec(identity, 'stat', '-Lc', '%u:%g:%a:%s:%h', '/sbin/apparmor_parser').stdout.strip()
+             == ('0:0:500:' + str(PARSER_SIZE) + ':1').encode()
+         and node_exec(identity, 'sha256sum', '/sbin/apparmor_parser').stdout.decode('ascii').split()[0] == PARSER_SHA256,
+         'fixture_parser_node')
+
+
 def prepare_node_apparmor(cluster, server_image):
     """Expose kernel policy only inside this newly owned Docker node namespace."""
     source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -683,11 +880,15 @@ def prepare_node_apparmor(cluster, server_image):
     before = {'kubelet_pid': kubelet_process(identity), 'containerd': containerd_process(identity),
               'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
               'host_mounts_sha256': host_digest}
+    parser = parser_admission(identity)
+    boundaries = node_write_boundaries(cluster, identity, uid)
+    payload = genuine_parser(cluster.scratch)
     bound = {'profile': cluster.profile, 'node_uid': uid, **identity,
              'host_mount_namespace': host_namespace, 'node_mount_namespace': namespace}
     intent = {'version': 1, 'synthetic': True, 'state': 'prepared', 'identity': bound,
               'source_sha256': source, 'apparmor_sha256': APPARMOR_SHA256, 'before': before,
-              'securityfs_preexisting': present, 'server_image': server_image}
+              'securityfs_preexisting': present, 'server_image': server_image, 'parser': parser,
+              'write_boundaries': boundaries}
     need(receipt(cluster, 'npm-assessment-node-preparation-intent.json', intent), 'fixture_evidence_retention_incomplete')
     need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid, 'fixture_node_identity_changed')
     if not present:
@@ -706,38 +907,50 @@ def prepare_node_apparmor(cluster, server_image):
          and (present or {'ro', 'nosuid', 'nodev', 'noexec'} <= set(mounted['options'])),
          'fixture_node_securityfs_not_confined')
     node_exec(identity, '/bin/sh', '-c', 'test -d /sys/kernel/security/apparmor')
+    need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid
+         and node_namespace(identity) == namespace
+         and hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == source, 'fixture_node_identity_changed')
+    def guard():
+        need(node_write_boundaries(cluster, identity, uid) == boundaries, 'fixture_parser_write_boundary')
+    placement = install_parser(identity, namespace, payload, guard)
+    need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid
+         and node_namespace(identity) == namespace and host_mount_state()[:2] == (host_namespace, host_digest)
+         and postgres_process(cluster) == before['postgres']
+         and postgres_runtime(identity, before['postgres']) == before['postgres_runtime'],
+         'fixture_node_preparation_identity_changed')
     # Kubelet caches its first AppArmor support result. Restart only this owned
     # node's process after visibility changes, before any assessment participant.
-    if not present:
-        need(node_namespace(identity) == namespace, 'fixture_node_identity_changed')
-        need(containerd_process(identity) == before['containerd'], 'fixture_node_runtime_process')
-        node_exec(identity, 'systemctl', 'restart', 'containerd', timeout=60)
-        node_exec(identity, 'systemctl', 'restart', 'kubelet', timeout=60)
+    need(node_namespace(identity) == namespace, 'fixture_node_identity_changed')
+    need(containerd_process(identity) == before['containerd'], 'fixture_node_runtime_process')
+    node_exec(identity, 'systemctl', 'restart', 'containerd', timeout=60)
+    node_exec(identity, 'systemctl', 'restart', 'kubelet', timeout=60)
     cluster.k('wait', '--for=condition=Ready', 'node/' + cluster.profile, '--timeout=180s', timeout=190)
     cluster.k('rollout', 'status', 'deployment/postgres', '--timeout=180s', namespace='devres-acceptance', timeout=190)
     postgres = postgres_process(cluster)
     after = {'kubelet_pid': kubelet_process(identity), 'containerd': containerd_process(identity),
              'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
              'host_mounts_sha256': host_mount_state()[1]}
+    parser_placement_state(identity, placement['prefix'])
+    guard()
     need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid
          and node_namespace(identity) == namespace and host_mount_state()[:2] == (host_namespace, host_digest)
          and after['postgres'] == before['postgres'] and after['postgres_runtime'] == before['postgres_runtime']
          and after['containerd']['binary_sha256'] == before['containerd']['binary_sha256']
-         and (present or after['containerd']['pid'] != before['containerd']['pid'])
-         and (present or after['kubelet_pid'] != before['kubelet_pid'])
+         and after['containerd']['pid'] != before['containerd']['pid']
+         and after['kubelet_pid'] != before['kubelet_pid']
          and hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == source,
          'fixture_node_preparation_identity_changed')
     result = {**intent, 'state': 'complete', 'after': after, 'securityfs_created': not present,
-              'kubelet_restarted': not present, 'containerd_restarted': not present}
+              'kubelet_restarted': True, 'containerd_restarted': True, 'parser_placement': placement}
     need(receipt(cluster, 'npm-assessment-node-preparation.json', result), 'fixture_evidence_retention_incomplete')
     return result
 
 
 def validate_node_preparation(name, value):
     fields = {'version', 'synthetic', 'state', 'identity', 'source_sha256', 'apparmor_sha256',
-              'before', 'securityfs_preexisting', 'server_image'}
+              'before', 'securityfs_preexisting', 'server_image', 'parser', 'write_boundaries'}
     complete = name == 'npm-assessment-node-preparation.json'
-    need(set(value) == fields | ({'after', 'securityfs_created', 'kubelet_restarted', 'containerd_restarted'} if complete else set()),
+    need(set(value) == fields | ({'after', 'securityfs_created', 'kubelet_restarted', 'containerd_restarted', 'parser_placement'} if complete else set()),
          'fixture_receipt_node_fields')
     need(value['state'] == ('complete' if complete else 'prepared')
          and type(value['securityfs_preexisting']) is bool
@@ -745,6 +958,12 @@ def validate_node_preparation(name, value):
          and type(value['source_sha256']) is str and re.fullmatch('[0-9a-f]{64}', value['source_sha256'])
          and type(value['server_image']) is str and re.fullmatch(r'[A-Za-z0-9._:/@+\-]{1,256}', value['server_image']),
          'fixture_receipt_node_identity')
+    need(value['parser'] == {'package_sha256': PARSER_PACKAGE_SHA256, 'package_size': PARSER_PACKAGE_SIZE,
+         'binary_sha256': PARSER_SHA256, 'binary_size': PARSER_SIZE, 'libc': '2.36', 'preexisting': False},
+         'fixture_receipt_node_parser')
+    need(type(value['write_boundaries']) is dict and set(value['write_boundaries']) == {'projection_sha256'}
+         and type(value['write_boundaries']['projection_sha256']) is str
+         and re.fullmatch('[0-9a-f]{64}', value['write_boundaries']['projection_sha256']), 'fixture_receipt_node_parser')
     identity = value['identity']
     need(type(identity) is dict and set(identity) == {'profile', 'node_uid', 'container_id', 'container_pid',
          'host_mount_namespace', 'node_mount_namespace'}, 'fixture_receipt_node_identity')
@@ -782,7 +1001,8 @@ def validate_node_preparation(name, value):
     if complete:
         need(type(value['securityfs_created']) is bool and type(value['kubelet_restarted']) is bool
              and type(value['containerd_restarted']) is bool
-             and value['securityfs_created'] == value['kubelet_restarted'] == value['containerd_restarted'] == (not value['securityfs_preexisting'])
+             and value['securityfs_created'] == (not value['securityfs_preexisting'])
+             and value['kubelet_restarted'] is True and value['containerd_restarted'] is True
              and value['before']['postgres'] == value['after']['postgres']
              and value['before']['postgres_runtime'] == value['after']['postgres_runtime']
              and value['before']['host_mounts_sha256'] == value['after']['host_mounts_sha256']
@@ -790,6 +1010,11 @@ def validate_node_preparation(name, value):
              and (not value['containerd_restarted'] or value['before']['containerd']['pid'] != value['after']['containerd']['pid'])
              and (not value['kubelet_restarted'] or value['before']['kubelet_pid'] != value['after']['kubelet_pid']),
              'fixture_receipt_node_preservation')
+        placement = value['parser_placement']
+        need(type(placement) is dict and set(placement) == {'prefix', 'version', 'mode', 'binary_sha256'}
+             and type(placement['prefix']) is str and re.fullmatch(r'/tmp/devres-apparmor\.[A-Za-z0-9]{8}', placement['prefix'])
+             and placement['version'] == '3.0.8' and placement['mode'] == 0o500
+             and placement['binary_sha256'] == PARSER_SHA256, 'fixture_receipt_node_parser')
 
 
 ATTACHED_TASKS = r'''
@@ -994,18 +1219,84 @@ def seed(cluster, image):
     return receipt
 
 
+def probe_authority(cluster, expected, actual):
+    """Compare the complete executable authority, allowing explicit API defaults."""
+    metadata = actual.get('metadata', {})
+    need(type(metadata.get('uid')) is str and re.fullmatch(UUID_PATTERN, metadata['uid'])
+         and all(metadata.get(key) == expected['metadata'][key] for key in ('name', 'namespace', 'labels')),
+         'assessment_egress_evidence_invalid')
+    annotations = metadata.get('annotations') or {}
+    need(type(annotations) is dict and set(annotations) <= {'cni.projectcalico.org/containerID',
+         'cni.projectcalico.org/podIP', 'cni.projectcalico.org/podIPs'}, 'assessment_egress_evidence_invalid')
+    for key, value in annotations.items():
+        need(type(value) is str and len(value) <= 512, 'assessment_egress_evidence_invalid')
+        if key.endswith('/containerID'):
+            need(re.fullmatch('[a-f0-9]{64}', value), 'assessment_egress_evidence_invalid')
+        elif value:
+            try:
+                addresses = value.split(',')
+                need(len(addresses) <= 2 and all(ipaddress.ip_interface(item).network.prefixlen
+                     == ipaddress.ip_interface(item).max_prefixlen for item in addresses), 'assessment_egress_evidence_invalid')
+            except ValueError:
+                raise FixtureError('assessment_egress_evidence_invalid') from None
+    spec = dict(actual['spec'])
+    defaults = {'hostNetwork': False, 'hostPID': False, 'hostIPC': False, 'hostUsers': True,
+        'dnsPolicy': 'ClusterFirst', 'schedulerName': 'default-scheduler', 'priority': 0,
+        'preemptionPolicy': 'PreemptLowerPriority', 'terminationGracePeriodSeconds': 30,
+        'enableServiceLinks': True, 'serviceAccount': 'assessment', 'os': {'name': 'linux'},
+        'initContainers': [], 'ephemeralContainers': [], 'imagePullSecrets': [], 'hostAliases': [],
+        'readinessGates': [], 'schedulingGates': [], 'resourceClaims': [], 'overhead': {},
+        'setHostnameAsFQDN': False, 'hostname': '', 'subdomain': ''}
+    for key, value in defaults.items():
+        if key in spec:
+            need(type(spec[key]) is type(value) and spec.pop(key) == value, 'assessment_egress_evidence_invalid')
+    if 'tolerations' in spec:
+        tolerations = spec.pop('tolerations')
+        need(type(tolerations) is list and all(type(item) is dict for item in tolerations)
+             and sorted(tolerations, key=lambda item: item.get('key', '')) == [
+            {'key': 'node.kubernetes.io/not-ready', 'operator': 'Exists', 'effect': 'NoExecute', 'tolerationSeconds': 300},
+            {'key': 'node.kubernetes.io/unreachable', 'operator': 'Exists', 'effect': 'NoExecute', 'tolerationSeconds': 300}],
+            'assessment_egress_evidence_invalid')
+    need(type(spec.get('containers')) is list and len(spec['containers']) == 1, 'assessment_egress_evidence_invalid')
+    container = dict(spec['containers'][0])
+    for key, value in {'terminationMessagePath': '/dev/termination-log', 'terminationMessagePolicy': 'File',
+                       'stdin': False, 'stdinOnce': False, 'tty': False, 'env': [], 'envFrom': [],
+                       'args': [], 'ports': [], 'resizePolicy': [], 'volumeDevices': []}.items():
+        if key in container:
+            need(type(container[key]) is type(value) and container.pop(key) == value, 'assessment_egress_evidence_invalid')
+    spec['containers'] = [container]
+    need(spec == expected['spec'] and spec['nodeName'] == cluster.profile, 'assessment_egress_evidence_invalid')
+    return metadata['uid']
+
+
 def network_probe(cluster, image):
     """A denied destination is a local Kubernetes API, never a public provider."""
     pod = template(image)
     pod.update({'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': 'assessment-network',
                 'namespace': NAMESPACE, 'labels': {'app': 'backend'}}})
-    pod['spec'].update({'restartPolicy': 'Never', 'activeDeadlineSeconds': 30})
+    pod['spec'].update({'restartPolicy': 'Never', 'activeDeadlineSeconds': 30, 'nodeName': cluster.profile})
     pod['spec']['volumes'] = [{'name': 'tmp', 'emptyDir': {'sizeLimit': '16Mi'}}]
     container = pod['spec']['containers'][0]
     container['name'] = 'probe'
-    container['volumeMounts'] = [{'name': 'tmp', 'mountPath': '/tmp'}]
+    container['volumeMounts'] = [{'name': 'tmp', 'mountPath': '/tmp'},
+                               {'name': 'tmp', 'mountPath': '/sys/kernel/security', 'readOnly': True}]
     container['command'] = ['python3', '-I', '-B', '-c', """
-import json,socket
+import errno,json,os,socket
+with open('/proc/self/attr/current') as source:
+    label=source.read(256).strip()
+assert label in ('devres-runtime (enforce)','devres-runtime//&unconfined (enforce)')
+with open('/tmp/apparmor-canary','xb') as output:
+    output.write(b'owned-synthetic-apparmor-canary')
+os.chmod('/tmp/apparmor-canary',0o600)
+with open('/tmp/apparmor-canary','rb') as source:
+    assert source.read()==b'owned-synthetic-apparmor-canary'
+try:
+    with open('/sys/kernel/security/apparmor-canary','rb') as source:
+        source.read()
+except OSError as error:
+    assert error.errno==errno.EACCES
+else:
+    raise AssertionError('canonical AppArmor alias read unexpectedly admitted')
 with socket.create_connection(('postgres.devres-acceptance.svc.cluster.local',5432),timeout=5):
     pass
 addresses=socket.getaddrinfo('kubernetes.default.svc.cluster.local',443,type=socket.SOCK_STREAM)
@@ -1023,15 +1314,19 @@ for family,kind,protocol,_name,address in addresses:
     finally:
         connection.close()
 assert denied==len(addresses)
-print(json.dumps({'dns':True,'postgres_tcp':True,'local_api_denied':True,'public_requests':0}))
+print(json.dumps({'dns':True,'postgres_tcp':True,'local_api_denied':True,'public_requests':0,
+                  'apparmor_enforcing':True,'canonical_alias_read_denied':True}))
 """]
-    cluster.apply(pod)
-    uid = cluster.pod('assessment-network')['metadata']['uid']
+    cluster.create(pod)
+    admitted = cluster.pod('assessment-network')
+    uid = admitted['metadata']['uid']
     primary = None
     try:
+        need(probe_authority(cluster, pod, admitted) == uid, 'assessment_egress_evidence_invalid')
         cluster.k('wait', '--for=jsonpath={.status.phase}=Succeeded', 'pod/assessment-network', '--timeout=40s', timeout=50)
         value = json.loads(cluster.k('logs', 'assessment-network', maximum=4096).stdout)
-        need(value == {'dns': True, 'postgres_tcp': True, 'local_api_denied': True, 'public_requests': 0}, 'assessment_egress_evidence_invalid')
+        need(value == {'dns': True, 'postgres_tcp': True, 'local_api_denied': True, 'public_requests': 0,
+             'apparmor_enforcing': True, 'canonical_alias_read_denied': True}, 'assessment_egress_evidence_invalid')
         return value
     except BaseException as error:
         primary = error

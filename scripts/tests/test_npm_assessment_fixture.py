@@ -26,6 +26,10 @@ IDENTITY = {'expected_artifact': 'sha256:' + '1' * 64, 'matched_artifact': 'sha2
             'runtime_reference_digest': 'sha256:' + '2' * 64, 'resolved_cri_id': 'sha256:' + '3' * 64,
             'known_digests': ['sha256:' + '1' * 64, 'sha256:' + '3' * 64],
             'expected_configs': ['sha256:' + '3' * 64], 'resolved_config': 'sha256:' + '3' * 64}
+PARSER = {'package_sha256': fixture.PARSER_PACKAGE_SHA256, 'package_size': fixture.PARSER_PACKAGE_SIZE,
+          'binary_sha256': fixture.PARSER_SHA256, 'binary_size': fixture.PARSER_SIZE, 'libc': '2.36', 'preexisting': False}
+PLACEMENT = {'prefix': '/tmp/devres-apparmor.ABCDef01', 'version': '3.0.8', 'mode': 0o500,
+             'binary_sha256': fixture.PARSER_SHA256}
 
 
 class SyntheticFixtureTests(unittest.TestCase):
@@ -216,6 +220,151 @@ class SyntheticFixtureTests(unittest.TestCase):
             self.assertEqual(calls.call_args.args[1:], ('systemctl', 'show', '--property=KillMode', '--value', 'containerd'))
             process.assert_not_called()
 
+    def test_parser_archive_accepts_only_integrity_bound_regular_member(self):
+        payload = b'owned synthetic native ELF data'
+        def package(scenario):
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode='w:xz') as archive:
+                for _ in range(2 if scenario == 'duplicate' else 1):
+                    member = tarfile.TarInfo('./sbin/apparmor_parser')
+                    member.mode, member.uid, member.gid = 0o755, 0, 0
+                    member.size = len(payload)
+                    if scenario == 'symlink': member.type, member.linkname, member.size = tarfile.SYMTYPE, '/etc/foreign', 0
+                    archive.addfile(member, io.BytesIO(payload) if member.isfile() else None)
+            result = bytearray(b'!<arch>\n')
+            for name, data in ((b'debian-binary', b'2.0\n'), (b'control.tar.xz', b'unused'), (b'data.tar.xz', output.getvalue())):
+                result.extend(name.ljust(16) + b'0'.ljust(12) + b'0'.ljust(6) + b'0'.ljust(6) + b'100644'.ljust(8) + str(len(data)).encode().ljust(10) + b'`\n')
+                result.extend(data)
+                if len(data) % 2: result.extend(b'\n')
+            return bytes(result)
+        for scenario in ('valid', 'symlink', 'duplicate', 'wrong-member-hash'):
+            raw = package(scenario)
+            with self.subTest(scenario=scenario), patch.object(fixture, 'PARSER_PACKAGE_SIZE', len(raw)), \
+                 patch.object(fixture, 'PARSER_PACKAGE_SHA256', hashlib.sha256(raw).hexdigest()), \
+                 patch.object(fixture, 'PARSER_SIZE', len(payload)), \
+                 patch.object(fixture, 'PARSER_SHA256', '0' * 64 if scenario == 'wrong-member-hash' else hashlib.sha256(payload).hexdigest()):
+                if scenario == 'valid': self.assertEqual(fixture.parser_payload(raw), payload)
+                else:
+                    with self.assertRaises(fixture.FixtureError): fixture.parser_payload(raw)
+                with patch.object(fixture.tarfile, 'open') as archive:
+                    with self.assertRaisesRegex(fixture.FixtureError, 'fixture_parser_package'):
+                        fixture.parser_payload(raw[:-1] + bytes([raw[-1] ^ 1]))
+                    archive.assert_not_called()
+
+    def test_parser_downloader_pins_endpoint_bounds_bytes_and_refuses_redirects(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            response = unittest.mock.MagicMock()
+            response.__enter__.return_value = response
+            response.geturl.return_value = fixture.PARSER_URL
+            response.read.return_value = b'package-data'
+            opener = unittest.mock.Mock(open=unittest.mock.Mock(return_value=response))
+            with patch.object(fixture.urllib.request, 'build_opener', return_value=opener) as factory, \
+                 patch.object(fixture, 'parser_payload', return_value=b'parser-data'):
+                self.assertEqual(fixture.genuine_parser(Path(temporary)), b'parser-data')
+                opener.open.assert_called_once_with(fixture.PARSER_URL, timeout=30)
+                response.read.assert_called_once_with(fixture.PARSER_PACKAGE_SIZE + 1)
+                self.assertEqual((Path(temporary) / 'apparmor-native-package.deb').stat().st_mode & 0o777, 0o600)
+                with self.assertRaisesRegex(fixture.FixtureError, 'fixture_parser_download'):
+                    factory.call_args.args[0].redirect_request(None, None, None, None, None, None)
+            response.geturl.return_value = 'https://foreign.invalid/redirect'
+            response.read.reset_mock()
+            with patch.object(fixture.urllib.request, 'build_opener', return_value=opener), patch.object(fixture, 'parser_payload') as payload:
+                with self.assertRaisesRegex(fixture.FixtureError, 'fixture_parser_download'):
+                    fixture.genuine_parser(Path(temporary))
+                response.read.assert_not_called();payload.assert_not_called()
+
+    def test_parser_copy_requires_admission_hash_version_and_never_overwrites(self):
+        payload, identity = b'synthetic-parser-data', {'container_id': '1' * 64, 'container_pid': 42}
+        digest = hashlib.sha256(payload).hexdigest()
+        for scenario in ('valid', 'foreign-node', 'copy-hash', 'wrong-version', 'late-copy-boundary', 'late-link-boundary'):
+            calls = []
+            guard_calls = []
+            def guard():
+                guard_calls.append(True)
+                if len(guard_calls) == (2 if scenario == 'late-copy-boundary' else 3 if scenario == 'late-link-boundary' else -1):
+                    raise fixture.FixtureError('fixture_parser_write_boundary')
+            def execute(_identity, *args, **_kwargs):
+                calls.append(args)
+                if args[0] == 'mktemp': value = b'/tmp/devres-apparmor.ABCDef01\n'
+                elif args[0] == 'sha256sum': value = ((('0' * 64) if scenario == 'copy-hash' else digest) + ' file\n').encode()
+                elif args[0] == 'readlink': value = b'/tmp/devres-apparmor.ABCDef01/apparmor_parser\n'
+                elif args[0] == 'stat': value = ('0:0:500:' + str(len(payload)) + ':1\n').encode()
+                elif args[0] == 'ln': value = b''
+                elif args[0] == '/sbin/apparmor_parser': value = b'AppArmor parser version ' + (b'3.0.8' if scenario != 'wrong-version' else b'unknown') + b'\n'
+                else: raise AssertionError(args)
+                return subprocess.CompletedProcess([], 0, value, b'')
+            with self.subTest(scenario=scenario), patch.object(fixture, 'PARSER_SIZE', len(payload)), \
+                 patch.object(fixture, 'PARSER_SHA256', digest), patch.object(fixture, 'node_exec', side_effect=execute), \
+                 patch.object(fixture, 'parser_admission', side_effect=fixture.FixtureError('fixture_parser_node') if scenario == 'foreign-node' else None), \
+                 patch.object(fixture, 'command', return_value=subprocess.CompletedProcess([], 0, b'', b'')) as copy_command:
+                if scenario == 'valid': self.assertEqual(fixture.install_parser(identity, 'mnt:[20]', payload, guard)['version'], '3.0.8')
+                else:
+                    with self.assertRaises(fixture.FixtureError): fixture.install_parser(identity, 'mnt:[20]', payload, guard)
+                if scenario == 'foreign-node':
+                    self.assertEqual(calls, []);copy_command.assert_not_called()
+                elif scenario == 'late-copy-boundary':
+                    copy_command.assert_not_called();self.assertFalse(any(call[0] == 'ln' for call in calls))
+                else:
+                    self.assertEqual(copy_command.call_args.kwargs['data'], payload)
+                    self.assertEqual(copy_command.call_args.args[0][:4], ['docker', 'exec', '-i', identity['container_id']])
+                    self.assertFalse(any('-f' in call for call in calls if call[0] == 'ln'))
+                    if scenario in ('copy-hash', 'late-link-boundary'): self.assertFalse(any(call[0] == 'ln' for call in calls))
+                    if scenario == 'valid': self.assertIn('--no-target-directory', next(call for call in calls if call[0] == 'ln'))
+
+    def test_parser_write_projection_rejects_docker_aliases_foreign_overlay_and_propagation(self):
+        state = Path('/tmp/owned-daemon')
+        mountinfo = b'1 0 0:1 / / rw - overlay overlay rw,upperdir=/tmp/owned-daemon/containerd/snapshots/1/fs,workdir=/tmp/owned-daemon/containerd/snapshots/1/work\n2 1 0:2 / /tmp rw - tmpfs tmpfs rw\n'
+        value = {'HostConfig': {'Tmpfs': {'/tmp': 'rw'}}, 'Mounts': [{'Type': 'tmpfs', 'Destination': '/tmp'}]}
+        digest, directories = fixture.parser_write_projection(value, mountinfo, state)
+        self.assertEqual(len(digest),64);self.assertEqual(directories, ['/tmp/owned-daemon/containerd/snapshots/1/fs','/tmp/owned-daemon/containerd/snapshots/1/work'])
+        for scenario in ('ancestor-bind', 'tmp-bind', 'descendant-volume', 'volumes-from', 'foreign-upper', 'usr-mount', 'tmp-child', 'shared', 'slave', 'undeclared-tmpfs', 'tmpfs-source','foreign-work','missing-work','duplicate-work'):
+            candidate, raw = copy.deepcopy(value), mountinfo
+            if scenario == 'ancestor-bind': candidate['HostConfig']['Binds'] = ['/foreign:/usr:rw']
+            elif scenario == 'tmp-bind': candidate['Mounts'] = [{'Type': 'bind', 'Destination': '/tmp'}]
+            elif scenario == 'descendant-volume': candidate['Mounts'].append({'Type':'volume','Destination':'/usr/sbin/parser'})
+            elif scenario == 'volumes-from': candidate['HostConfig']['VolumesFrom'] = ['foreign']
+            elif scenario == 'foreign-upper': raw = raw.replace(b'/tmp/owned-daemon/containerd', b'/var/lib/docker')
+            elif scenario == 'usr-mount': raw += b'3 1 0:3 / /usr rw - ext4 /dev/foreign rw\n'
+            elif scenario == 'tmp-child': raw += b'3 2 0:3 / /tmp/staged rw - ext4 /dev/foreign rw\n'
+            elif scenario == 'shared': raw = raw.replace(b'/ / rw -', b'/ / rw shared:50 -')
+            elif scenario == 'slave': raw = raw.replace(b'/ /tmp rw -', b'/ /tmp rw master:50 -')
+            elif scenario == 'undeclared-tmpfs': candidate = {'HostConfig': {}, 'Mounts': []}
+            elif scenario == 'tmpfs-source': candidate['Mounts'][0]['Source'] = '/foreign/tmpfs'
+            elif scenario == 'foreign-work': raw = raw.replace(b'workdir=/tmp/owned-daemon/containerd/snapshots/1/work',b'workdir=/foreign/work')
+            elif scenario == 'missing-work': raw = raw.replace(b',workdir=/tmp/owned-daemon/containerd/snapshots/1/work',b'')
+            elif scenario == 'duplicate-work': raw = raw.replace(b'\n2 ',b',workdir=/tmp/owned-daemon/containerd/snapshots/1/work\n2 ')
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(fixture.FixtureError, 'fixture_parser_write_boundary'):
+                fixture.parser_write_projection(candidate, raw, state)
+
+    def test_parser_late_workdir_drift_refuses_copy_before_payload_or_link(self):
+        state=Path('/tmp/owned-daemon')
+        raw=b'1 0 0:1 / / rw - overlay overlay rw,upperdir=/tmp/owned-daemon/containerd/1/fs,workdir=/tmp/owned-daemon/containerd/1/work\n'
+        value={'HostConfig':{},'Mounts':[]}
+        baseline=fixture.parser_write_projection(value,raw,state)[0]
+        changed=raw.replace(b'/1/work',b'/2/work')
+        mounts=iter([raw,changed])
+        def guard():
+            fixture.need(fixture.parser_write_projection(value,next(mounts),state)[0]==baseline,'fixture_parser_write_boundary')
+        payload=b'synthetic-parser'
+        with patch.object(fixture,'PARSER_SIZE',len(payload)),patch.object(fixture,'PARSER_SHA256',hashlib.sha256(payload).hexdigest()), \
+             patch.object(fixture,'parser_admission'),patch.object(fixture,'node_exec',return_value=subprocess.CompletedProcess([],0,b'/tmp/devres-apparmor.ABCDef01\n',b'')) as node, \
+             patch.object(fixture,'command') as copy_command:
+            with self.assertRaisesRegex(fixture.FixtureError,'fixture_parser_write_boundary'):
+                fixture.install_parser({'container_id':'1'*64,'container_pid':42},'mnt:[20]',payload,guard)
+            copy_command.assert_not_called();self.assertEqual(node.call_count,1)
+
+    def test_parser_write_admission_refuses_canonical_path_drift_before_privileged_check(self):
+        identity = {'container_id':'1'*64,'container_pid':42}
+        cluster = types.SimpleNamespace(profile='devres-acceptance-fixture')
+        inspected = [{'Id':identity['container_id'],'State':{'Pid':42}}]
+        with patch.dict(os.environ, {'DOCKER_HOST':'unix:///tmp/owned-daemon/docker.sock'}), \
+             patch.object(fixture,'node_docker_identity',return_value=identity), patch.object(fixture,'node_uid',return_value='owned-uid'), \
+             patch.object(fixture,'command',side_effect=[subprocess.CompletedProcess([],0,b'"/tmp/owned-daemon/data"',b''),subprocess.CompletedProcess([],0,json.dumps(inspected).encode(),b'')]) as commands, \
+             patch.object(fixture,'node_exec',return_value=subprocess.CompletedProcess([],0,b'/foreign-tmp\n/usr\n/usr/sbin\n',b'')):
+            with self.assertRaisesRegex(fixture.FixtureError,'fixture_parser_write_boundary'):
+                fixture.node_write_boundaries(cluster,identity,'owned-uid')
+            self.assertEqual(commands.call_count,2)
+
     def test_node_process_rejects_foreign_executable_and_records_exact_start_identity(self):
         identity = {'container_id': '1' * 64, 'container_pid': 1234}
         fields = ['S', '1'] + ['0'] * 17 + ['4242']
@@ -243,7 +392,7 @@ class SyntheticFixtureTests(unittest.TestCase):
         for scenario in ('fresh', 'ready', 'host-namespace', 'host-propagation', 'lost-intent', 'host-changed',
                          'postgres-replaced', 'shim-replaced', 'daemon-replaced'):
             with self.subTest(scenario=scenario):
-                cluster = types.SimpleNamespace(profile='devres-acceptance-fixture', k=unittest.mock.Mock())
+                cluster = types.SimpleNamespace(profile='devres-acceptance-fixture', scratch=Path('/tmp'), k=unittest.mock.Mock())
                 mutations, records = [], []
                 mounts = [after_mount, after_mount] if scenario == 'ready' else [before_mount, after_mount]
                 if scenario == 'host-propagation': mounts[0] = before_mount.replace(b'shared:11', b'shared:3')
@@ -270,27 +419,32 @@ class SyntheticFixtureTests(unittest.TestCase):
                     records.append((name, value))
                     return scenario != 'lost-intent'
                 host_namespace = 'mnt:[20]' if scenario == 'host-namespace' else 'mnt:[10]'
-                states = [(host_namespace, '3' * 64, {'shared:3'})] * 4
+                states = [(host_namespace, '3' * 64, {'shared:3'})] * 8
                 if scenario == 'host-changed': states[1] = (host_namespace, '4' * 64, {'shared:3'})
                 with patch.object(fixture, 'node_docker_identity', return_value=identity), \
                      patch.object(fixture, 'node_uid', return_value=uid), \
                      patch.object(fixture, 'node_namespace', return_value='mnt:[20]'), \
                      patch.object(fixture, 'host_mount_state', side_effect=states), \
                      patch.object(fixture, 'node_exec', side_effect=execute), \
-                     patch.object(fixture, 'kubelet_process', side_effect=[100, 100 if scenario == 'ready' else 200]), \
+                     patch.object(fixture, 'kubelet_process', side_effect=[100, 200]), \
+                     patch.object(fixture, 'parser_admission', return_value=PARSER), \
+                     patch.object(fixture, 'node_write_boundaries', return_value={'projection_sha256':'a'*64}), \
+                     patch.object(fixture, 'genuine_parser', return_value=b'fixture-parser'), \
+                     patch.object(fixture, 'install_parser', side_effect=lambda *_args: mutations.append('parser') or PLACEMENT), \
+                     patch.object(fixture, 'parser_placement_state'), \
                      patch.object(fixture, 'containerd_process', side_effect=[daemon,
                          {**daemon, 'pid': 91} if scenario == 'daemon-replaced' else daemon,
                          {**daemon, 'pid': 190, 'start_ticks': 1900}]), \
                      patch.object(fixture, 'postgres_runtime', side_effect=[runtime,
-                         {**runtime, 'shim': {**runtime['shim'], 'pid': 2999}} if scenario == 'shim-replaced' else runtime]), \
+                         {**runtime, 'shim': {**runtime['shim'], 'pid': 2999}} if scenario == 'shim-replaced' else runtime, runtime]), \
                      patch.object(fixture, 'postgres_process', side_effect=[postgres,
                          {**postgres, 'uid': '3' * 8 + '-' + '3' * 4 + '-' + '3' * 4 + '-' + '3' * 4 + '-' + '3' * 12}
-                         if scenario == 'postgres-replaced' else postgres]), \
+                         if scenario == 'postgres-replaced' else postgres, postgres]), \
                      patch.object(fixture, 'receipt', side_effect=save):
                     if scenario in ('fresh', 'ready'):
                         result = fixture.prepare_node_apparmor(cluster, 'candidate:server')
                         self.assertEqual(result['state'], 'complete')
-                        self.assertEqual(mutations, [] if scenario == 'ready' else ['mount', 'containerd', 'kubelet'])
+                        self.assertEqual(mutations, ([] if scenario == 'ready' else ['mount']) + ['parser', 'containerd', 'kubelet'])
                         self.assertEqual(result['before']['postgres'], result['after']['postgres'])
                         self.assertEqual(cluster.k.call_count, 2)
                         malformed = copy.deepcopy(result)
@@ -301,10 +455,10 @@ class SyntheticFixtureTests(unittest.TestCase):
                         with self.assertRaises(fixture.FixtureError):
                             fixture.prepare_node_apparmor(cluster, 'candidate:server')
                         if scenario in ('postgres-replaced', 'shim-replaced'):
-                            self.assertEqual(mutations, ['mount', 'containerd', 'kubelet'])
-                            self.assertEqual(cluster.k.call_count, 2)
+                            self.assertEqual(mutations, ['mount', 'parser'])
+                            cluster.k.assert_not_called()
                         else:
-                            self.assertEqual(mutations, ['mount'] if scenario in ('host-changed', 'daemon-replaced') else [])
+                            self.assertEqual(mutations, ['mount'] + (['parser'] if scenario == 'daemon-replaced' else []) if scenario in ('host-changed', 'daemon-replaced') else [])
                             self.assertNotIn('kubelet', mutations)
                             cluster.k.assert_not_called()
 
@@ -395,8 +549,12 @@ class SyntheticFixtureTests(unittest.TestCase):
                     events.append(('delete', name, uid))
                     if cleanup_failure:
                         raise fixture.FixtureError('assessment_cleanup_uid_changed')
-                cluster = types.SimpleNamespace(apply=lambda _pod: events.append('apply'),
-                    pod=lambda _name: {'metadata': {'uid': 'owned'}},
+                uid = '12345678-1234-1234-1234-123456789abc'
+                admitted = {}
+                def apply(pod):
+                    admitted.update(copy.deepcopy(pod));admitted['metadata']['uid'] = uid;events.append('apply')
+                cluster = types.SimpleNamespace(profile='devres-acceptance-fixture', create=apply,
+                    pod=lambda _name: admitted,
                     k=unittest.mock.Mock(side_effect=error), delete=delete)
                 def inspect(_cluster, uid):
                     events.append(('inspect', uid))
@@ -406,7 +564,121 @@ class SyntheticFixtureTests(unittest.TestCase):
                         fixture.network_probe(cluster, 'harness:fixture')
                 self.assertIs(caught.exception, error)
                 self.assertEqual(error.probe_metadata, metadata)
-                self.assertEqual(events, ['apply', ('inspect', 'owned'), ('delete', 'assessment-network', 'owned')])
+                self.assertEqual(events, ['apply', ('inspect', uid), ('delete', 'assessment-network', uid)])
+
+    def test_network_probe_uses_create_only_without_last_applied_metadata(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            cluster = fixture.Cluster('devres-acceptance-fixture',Path(temporary))
+            admitted, calls = {}, []
+            def query(*args,**kwargs):
+                calls.append((args,kwargs))
+                if args[:3] == ('create','-f','-'):
+                    value=json.loads(kwargs['data']);self.assertEqual(value['kind'],'List');self.assertEqual(len(value['items']),1)
+                    admitted.update(value['items'][0]);admitted['metadata']['uid']='12345678-1234-1234-1234-123456789abc'
+                    return subprocess.CompletedProcess([],0,b'',b'')
+                raise fixture.FixtureError('fixture_command_failed')
+            with patch.object(cluster,'k',side_effect=query),patch.object(cluster,'pod',return_value=admitted), \
+                 patch.object(cluster,'apply') as apply,patch.object(cluster,'delete'),patch.object(fixture,'network_failure_metadata',return_value=None):
+                with self.assertRaises(fixture.FixtureError):fixture.network_probe(cluster,'harness:fixture')
+            apply.assert_not_called()
+            self.assertEqual(calls[0][0],('create','-f','-'));self.assertEqual(calls[0][1]['namespace'],fixture.NAMESPACE)
+            self.assertNotIn('annotations',admitted['metadata'])
+            self.assertTrue(all(args[0]!='apply' for args,_kwargs in calls))
+
+    def test_network_probe_enforcement_code_rejects_unconfined_alias_access_and_wrong_errno(self):
+        admitted = {}
+        def apply(pod):
+            admitted.update(copy.deepcopy(pod));admitted['metadata']['uid'] = '12345678-1234-1234-1234-123456789abc'
+        cluster = types.SimpleNamespace(profile='devres-acceptance-fixture', create=apply, pod=lambda _name: admitted,
+            k=unittest.mock.Mock(side_effect=fixture.FixtureError('fixture_command_failed')), delete=unittest.mock.Mock())
+        with patch.object(fixture, 'network_failure_metadata', return_value=None):
+            with self.assertRaises(fixture.FixtureError): fixture.network_probe(cluster, 'harness:fixture')
+        container = admitted['spec']['containers'][0]
+        self.assertEqual(container['volumeMounts'], [{'name': 'tmp', 'mountPath': '/tmp'},
+                         {'name': 'tmp', 'mountPath': '/sys/kernel/security', 'readOnly': True}])
+        self.assertEqual(admitted['spec']['volumes'], [{'name': 'tmp', 'emptyDir': {'sizeLimit': '16Mi'}}])
+        self.assertEqual(container['securityContext'], fixture.template('harness:fixture')['spec']['containers'][0]['securityContext'])
+        source = container['command'][-1]
+        class DeniedConnection:
+            def settimeout(self, _timeout): pass
+            def connect(self, _address): raise OSError('owned synthetic denied API')
+            def close(self): pass
+        for scenario in ('valid', 'unconfined', 'alias-readable', 'alias-absent', 'positive-unreadable'):
+            def open_file(path, mode='r', *_args, **_kwargs):
+                if path == '/proc/self/attr/current': return io.StringIO('unconfined' if scenario == 'unconfined' else 'devres-runtime (enforce)')
+                if path == '/tmp/apparmor-canary' and mode == 'xb': return io.BytesIO()
+                if path == '/tmp/apparmor-canary':
+                    if scenario == 'positive-unreadable': raise PermissionError(13, 'synthetic')
+                    return io.BytesIO(b'owned-synthetic-apparmor-canary')
+                if path == '/sys/kernel/security/apparmor-canary':
+                    if scenario == 'alias-readable': return io.BytesIO(b'owned-synthetic-apparmor-canary')
+                    raise OSError(2 if scenario == 'alias-absent' else 13, 'synthetic')
+                raise AssertionError(path)
+            output = io.StringIO()
+            with self.subTest(scenario=scenario), patch('builtins.open', side_effect=open_file), \
+                 patch.object(os, 'chmod'), patch.object(socket, 'create_connection', return_value=contextlib.nullcontext()), \
+                 patch.object(socket, 'getaddrinfo', return_value=[(2, 1, 6, '', ('10.0.0.1',443))]), \
+                 patch.object(socket, 'socket', return_value=DeniedConnection()), contextlib.redirect_stdout(output):
+                if scenario == 'valid':
+                    exec(compile(source, '<owned-first-party-network-probe>', 'exec'), {})
+                    result = json.loads(output.getvalue());self.assertTrue(result['apparmor_enforcing']);self.assertTrue(result['canonical_alias_read_denied'])
+                else:
+                    with self.assertRaises((AssertionError, OSError)):
+                        exec(compile(source, '<owned-first-party-network-probe>', 'exec'), {})
+
+    def test_network_probe_refuses_changed_admitted_alias_before_wait_and_uid_cleans_it(self):
+        uid = '12345678-1234-1234-1234-123456789abc'
+        for scenario in ('alias', 'uid', 'image', 'command'):
+            admitted = {}
+            def apply(pod):
+                admitted.update(copy.deepcopy(pod));admitted['metadata']['uid'] = uid
+                container = admitted['spec']['containers'][0]
+                if scenario == 'alias': container['volumeMounts'][1]['readOnly'] = False
+                elif scenario == 'uid': admitted['spec']['securityContext']['runAsUser'] = 0
+                elif scenario == 'image': container['image'] = 'foreign:fixture'
+                elif scenario == 'command': container['command'] = ['foreign-command']
+            cluster = types.SimpleNamespace(profile='devres-acceptance-fixture', create=apply, pod=lambda _name: admitted, k=unittest.mock.Mock(), delete=unittest.mock.Mock())
+            with self.subTest(scenario=scenario), patch.object(fixture, 'network_failure_metadata', return_value=None):
+                with self.assertRaisesRegex(fixture.FixtureError, 'assessment_egress_evidence_invalid'):
+                    fixture.network_probe(cluster, 'harness:fixture')
+            cluster.k.assert_not_called();cluster.delete.assert_called_once_with('assessment-network', uid)
+
+    def test_probe_authority_accepts_only_safe_api_defaults_and_rejects_every_executable_mutation(self):
+        expected = fixture.template('harness:fixture')
+        expected['metadata'] = {'name':'assessment-network','namespace':fixture.NAMESPACE,'labels':{'app':'backend'}}
+        expected['spec'].update(nodeName='devres-acceptance-fixture',restartPolicy='Never',activeDeadlineSeconds=30)
+        cluster = types.SimpleNamespace(profile='devres-acceptance-fixture')
+        actual = copy.deepcopy(expected);actual['metadata']['uid'] = '12345678-1234-1234-1234-123456789abc'
+        actual['spec'].update(hostNetwork=False,hostPID=False,hostIPC=False,initContainers=[],ephemeralContainers=[],
+            serviceAccount='assessment',dnsPolicy='ClusterFirst',schedulerName='default-scheduler',priority=0,
+            preemptionPolicy='PreemptLowerPriority',terminationGracePeriodSeconds=30,enableServiceLinks=True)
+        actual['spec']['containers'][0].update(terminationMessagePath='/dev/termination-log',terminationMessagePolicy='File',
+            stdin=False,tty=False,env=[],args=[])
+        self.assertEqual(fixture.probe_authority(cluster,expected,actual),actual['metadata']['uid'])
+        mutations = (
+            ('hostNetwork',lambda value:value['spec'].update(hostNetwork=True)),
+            ('hostPID',lambda value:value['spec'].update(hostPID=True)),
+            ('hostIPC',lambda value:value['spec'].update(hostIPC=True)),
+            ('init',lambda value:value['spec'].update(initContainers=[{'image':'foreign'}])),
+            ('ephemeral',lambda value:value['spec'].update(ephemeralContainers=[{'image':'foreign'}])),
+            ('extra-container',lambda value:value['spec']['containers'].append({'image':'foreign'})),
+            ('service-account',lambda value:value['spec'].update(serviceAccountName='foreign')),
+            ('automount',lambda value:value['spec'].update(automountServiceAccountToken=True)),
+            ('node',lambda value:value['spec'].update(nodeName='foreign')),
+            ('labels',lambda value:value['metadata']['labels'].update(app='foreign')),
+            ('annotation',lambda value:value['metadata'].update(annotations={'container.apparmor.security.beta.kubernetes.io/probe':'unconfined'})),
+            ('dns',lambda value:value['spec'].update(dnsPolicy='Default')),
+            ('env',lambda value:value['spec']['containers'][0].update(env=[{'name':'LD_PRELOAD','value':'foreign'}])),
+            ('envFrom',lambda value:value['spec']['containers'][0].update(envFrom=[{'secretRef':{'name':'foreign'}}])),
+            ('args',lambda value:value['spec']['containers'][0].update(args=['foreign'])),
+            ('privileged',lambda value:value['spec']['containers'][0]['securityContext'].update(privileged=True)),
+            ('hostpath',lambda value:value['spec']['volumes'].append({'name':'foreign','hostPath':{'path':'/'}})),
+            ('runtimeclass',lambda value:value['spec'].update(runtimeClassName='foreign')),
+            ('unknown',lambda value:value['spec'].update(foreignFutureAuthority=True)))
+        for name, mutate in mutations:
+            candidate = copy.deepcopy(actual);mutate(candidate)
+            with self.subTest(name=name), self.assertRaisesRegex(fixture.FixtureError,'assessment_egress_evidence_invalid'):
+                fixture.probe_authority(cluster,expected,candidate)
 
     def test_setup_failure_receipt_rejects_private_fields_and_unbounded_counters(self):
         value = {'version': 1, 'synthetic': True, 'phase': 'policy', 'case': 'none',
