@@ -1617,6 +1617,17 @@ All fixture state belongs below `/tmp`; temporarily loaded profile ownership mus
 be checked before cleanup. No local result authorizes replay of a production
 cycle, recovery apply/run, provider traffic or publication.
 
+The assessment admits only an owned `/tmp` Docker socket and rejects a
+`DOCKER_CONTEXT` override. It proves namespace and policy absence before creating
+them, then binds cleanup to a unique owner label and API UIDs. On a newly owned
+minikube node without securityfs, preparation mounts it read-only inside that
+node's distinct mount namespace and restarts only its admitted containerd and
+kubelet once. Existing securityfs is observed without changing its flags.
+Preparation requires unchanged PostgreSQL Pod/container/process/shim identities
+and the host's securityfs mount projection; it never restarts a host daemon.
+Finite setup failures are retained after cleanup attempts; a complete result
+requires checked cleanup.
+
 See the [local paused-status verification record](paused-assessment-acceptance.md)
 for completed checks, the default-stack regression, local image identities and the
 remaining Kubernetes acceptance gate. The optional real-image assessment runs with

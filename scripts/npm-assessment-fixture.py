@@ -16,7 +16,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -30,6 +32,7 @@ PROFILE = 'devres-runtime'
 APPARMOR_SHA256 = '4375146629c956b8e63cc4b358ef52c6bcda458621b7dcf8601b0f3d922b3e7e'
 MAX_METADATA = 2 * 1024 * 1024
 IMAGE_DIGEST = r'sha256:[0-9a-f]{64}'
+UUID_PATTERN = r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}'
 OBSERVER_STAGES = frozenset(('saved_state', 'statistics', 'kind_inventory', 'evidence_page',
     'defaults', 'attribution', 'writer_token', 'writer_transport'))
 OBSERVER_REASONS = frozenset(('none', 'ok', 'unavailable', 'integrity', 'capacity', 'invalid', 'unknown', 'cancelled'))
@@ -47,6 +50,29 @@ OBSERVER_ERRORS = frozenset(('unknown', 'interrupted', 'fixture_command_failed',
 OBSERVER_RESTORATIONS = frozenset(('sql-grant', 'objectstore-start', 'objectstore-ready',
     'backend-stop', 'writer-stop', 'policy-remove', 'writer-config', 'reader-config',
     'writer-template', 'reader-template', 'writer-start', 'backend-start', 'semantic-ready'))
+SETUP_PHASES = frozenset(('admission', 'node-preparation', 'apparmor', 'namespace', 'identity', 'policy',
+    'configuration', 'network', 'seed', 'baseline', 'positive', 'invariants', 'matrix', 'cleanup'))
+SETUP_CODES = OBSERVER_ERRORS | frozenset(('fixture_command_timeout', 'fixture_apply_objects_required',
+    'fixture_apply_namespace_invalid', 'owned_tmp_fixture_required', 'fresh_assessment_namespace_required',
+    'apparmor_lock_owner', 'apparmor_canonical_hash_mismatch', 'apparmor_profile_already_loaded',
+    'apparmor_asset_changed', 'apparmor_not_enforcing', 'apparmor_cleanup_incomplete_profile_retained',
+    'apparmor_task_check_invalid', 'one_fixture_database_required', 'one_fixture_provider_table_required',
+    'assessment_positive_failed', 'assessment_mutated_retained_metadata', 'assessment_container_ended',
+    'assessment_supervision_deadline', 'assessment_namespace_cleanup_unconfirmed',
+    'fixture_owned_docker_required', 'fixture_node_identity', 'fixture_node_mount_namespace',
+    'fixture_host_mount_namespace_refused', 'fixture_host_mount_propagation_refused',
+    'fixture_node_apparmor_kernel_disabled', 'fixture_postgres_process', 'fixture_node_kubelet_process',
+    'fixture_node_identity_changed', 'fixture_host_mount_changed', 'fixture_node_securityfs_not_confined',
+    'fixture_node_preparation_identity_changed', 'fixture_node_mountinfo_invalid', 'fixture_node_mountinfo_missing',
+    'fixture_node_runtime_process', 'fixture_containerd_stop_mode', 'fixture_postgres_runtime_process',
+    'fixture_docker_context_refused', 'fixture_owned_resource_kind', 'fixture_owned_resource_unavailable',
+    'fixture_owned_resource_list', 'fixture_owned_resource_missing', 'fixture_owned_resource_foreign',
+    'fixture_owned_resource_replaced', 'fixture_owned_resource_cleanup_unconfirmed', 'fixture_apply_operation_invalid'))
+CONTROL_COMMANDS = frozenset(('unknown', 'apparmor-policy', 'apparmor-state', 'apparmor-tasks',
+    'docker-metadata', 'docker-exec', 'kubectl.apply', 'kubectl.create', 'kubectl.exec',
+    'kubectl.wait', 'kubectl.delete', 'kubectl.get', 'kubectl.logs', 'kubectl.patch', 'kubectl.rollout'))
+PROBE_NETWORK_CODES = frozenset(('unknown', 'api_admitted', 'dns_failure', 'postgres_connection', 'apparmor_message'))
+FIXTURE_OWNER_LABEL = 'devres.fixture-owner'
 MAX_IMAGE_METADATA = 1024 * 1024
 DATABASE_ADMIN = 'postgres://devres:fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
 DATABASE_READER = 'postgres://devres_assessment_reader:assessment-fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
@@ -62,15 +88,76 @@ def need(value, code):
 
 
 def command(args, *, data=None, timeout=60, check=True, maximum=MAX_METADATA):
-    result = subprocess.run(args, input=data, capture_output=True, timeout=timeout, check=False)
-    need(len(result.stdout) <= maximum and len(result.stderr) <= MAX_METADATA, 'fixture_command_output_bound')
+    if args[:1] == ['docker']:
+        need(not os.environ.get('DOCKER_CONTEXT'), 'fixture_docker_context_refused')
+    try:
+        result = subprocess.run(args, input=data, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        error.command_outcome = command_outcome(args, 'timeout')
+        raise
+    if len(result.stdout) > maximum or len(result.stderr) > MAX_METADATA:
+        error = FixtureError('fixture_command_output_bound')
+        error.command_outcome = command_outcome(args, 'output_bound', result)
+        raise error
     if check:
-        need(result.returncode == 0, 'fixture_command_failed')
+        if result.returncode != 0:
+            error = FixtureError('fixture_command_failed')
+            error.command_outcome = command_outcome(args, 'nonzero', result)
+            raise error
     return result
+
+
+def command_outcome(args, outcome, result=None):
+    """Keep only closed control-operation names and counters, never argv or output."""
+    kind = 'unknown'
+    if args[:2] == ['sudo', '-n']:
+        kind = {'apparmor_parser': 'apparmor-policy', 'cat': 'apparmor-state',
+                'python3': 'apparmor-tasks'}.get(args[2] if len(args) > 2 else '', 'unknown')
+    elif args[:1] == ['docker']:
+        kind = 'docker-exec' if args[1:2] == ['exec'] else 'docker-metadata'
+    elif args[:1] == ['minikube'] and 'kubectl' in args:
+        tail = args[args.index('kubectl') + 1:]
+        operation = next((arg for arg in tail if 'kubectl.' + arg in CONTROL_COMMANDS), None)
+        if operation is not None:
+            kind = 'kubectl.' + operation
+    code = None if result is None else result.returncode
+    return {'command': kind, 'outcome': outcome,
+        'exit_code': code if type(code) is int and -255 <= code <= 255 else None,
+        'stdout_bytes': None if result is None else min(len(result.stdout), MAX_METADATA + 1),
+        'stderr_bytes': None if result is None else min(len(result.stderr), MAX_METADATA + 1)}
+
+
+def closed_failure(error):
+    code = ('fixture_command_timeout' if isinstance(error, subprocess.TimeoutExpired)
+            else str(error) if isinstance(error, FixtureError) else 'unknown')
+    if code not in SETUP_CODES:
+        code = 'unknown'
+    command = getattr(error, 'command_outcome', None)
+    try:
+        validate_command_outcome(command)
+    except Exception:
+        command = None
+    return {'code': code, 'command_outcome': command}
+
+
+def validate_command_outcome(value):
+    need(value is None or type(value) is dict and set(value) == {
+        'command', 'outcome', 'exit_code', 'stdout_bytes', 'stderr_bytes'}, 'fixture_receipt_command')
+    if value is None:
+        return
+    need(type(value['command']) is str and value['command'] in CONTROL_COMMANDS
+         and value['outcome'] in ('nonzero', 'timeout', 'output_bound'),
+         'fixture_receipt_command')
+    need(value['exit_code'] is None or type(value['exit_code']) is int and -255 <= value['exit_code'] <= 255,
+         'fixture_receipt_command')
+    for name in ('stdout_bytes', 'stderr_bytes'):
+        need(value[name] is None or type(value[name]) is int and 0 <= value[name] <= MAX_METADATA + 1,
+             'fixture_receipt_command')
 
 
 def docker_config_digests(image, timeout=32):
     """Read bounded save metadata in a stream; never extract or retain layers."""
+    need(not os.environ.get('DOCKER_CONTEXT'), 'fixture_docker_context_refused')
     need(type(timeout) in (int, float) and 0 < timeout <= 32, 'candidate_export_deadline')
     process = subprocess.Popen(['docker', 'image', 'save', '--', image], stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
@@ -268,7 +355,9 @@ def validate_receipt(name, value):
              and (identity['resolved_config'] is None or identity['resolved_config'] in identity['expected_configs']), 'fixture_receipt_image')
     need(type(value) is dict and value.get('version') == 1 and type(value.get('version')) is int
          and value.get('synthetic') is True, 'fixture_receipt_identity')
-    if name == 'npm-assessment-receipt.json':
+    if name in ('npm-assessment-node-preparation-intent.json', 'npm-assessment-node-preparation.json'):
+        validate_node_preparation(name, value)
+    elif name == 'npm-assessment-receipt.json':
         need(set(value) == {'version', 'synthetic', 'apparmor_sha256', 'server_image', 'provider_requests', 'selection',
                             'network', 'result', 'faults', 'metadata_unchanged'}, 'fixture_receipt_fields')
         need(value['apparmor_sha256'] == APPARMOR_SHA256 and value['provider_requests'] == 0
@@ -284,6 +373,22 @@ def validate_receipt(name, value):
         need(type(value['faults']) is list and len(value['faults']) == 14, 'fixture_receipt_faults')
         for record in value['faults']:
             result(record)
+    elif name == 'npm-assessment-setup-failure.json':
+        fields = {'version', 'synthetic', 'phase', 'case', 'failure', 'cleanup_failure',
+                  'namespace_cleanup', 'apparmor_cleanup'}
+        need(set(value) in (fields, fields | {'probe'}), 'fixture_receipt_fields')
+        need(value['phase'] in SETUP_PHASES and value['case'] in CASES | {'none'}
+             and value['namespace_cleanup'] in ('not-created', 'removed', 'incomplete')
+             and value['apparmor_cleanup'] in ('removed', 'unknown'), 'fixture_receipt_setup_failure')
+        for record in (value['failure'], value['cleanup_failure']):
+            if record is None:
+                continue
+            need(type(record) is dict and set(record) == {'code', 'command_outcome'}
+                 and type(record['code']) is str and record['code'] in SETUP_CODES, 'fixture_receipt_setup_failure')
+            validate_command_outcome(record['command_outcome'])
+        need(value['failure'] is not None, 'fixture_receipt_setup_failure')
+        if 'probe' in value:
+            validate_probe_failure(value['probe'])
     elif name == 'paused-status-failure.json':
         need(set(value) == {'version', 'synthetic', 'phase', 'case', 'code', 'command_outcome',
             'exit_code', 'stages'}, 'fixture_receipt_fields')
@@ -425,6 +530,268 @@ def policies():
                                'ports': [{'port': 5432, 'protocol': 'TCP'}]}]}}]
 
 
+NODE_SECURITYFS = '/sys/kernel/security'
+
+
+def mount_projection(raw, target=NODE_SECURITYFS):
+    rows = []
+    for line in raw.decode('utf-8').splitlines():
+        fields = line.split()
+        separator = fields.index('-')
+        need(separator >= 6 and len(fields) >= separator + 4, 'fixture_node_mountinfo_invalid')
+        rows.append({'id': fields[0], 'parent': fields[1], 'device': fields[2], 'root': fields[3],
+            'target': fields[4], 'options': fields[5].split(','), 'propagation': fields[6:separator],
+            'filesystem': fields[separator + 1], 'source': fields[separator + 2],
+            'super_options': fields[separator + 3].split(',')})
+    covering = [row for row in rows if target == row['target'] or target.startswith(row['target'].rstrip('/') + '/')]
+    need(covering, 'fixture_node_mountinfo_missing')
+    cover = max(covering, key=lambda row: len(row['target']))
+    related = [row for row in rows if row is cover or row['target'].startswith(target + '/')]
+    shared = {field for row in rows for field in row['propagation'] if field.startswith('shared:')}
+    return cover, related, shared
+
+
+def host_mount_state():
+    namespace = os.readlink('/proc/self/ns/mnt')
+    raw = Path('/proc/self/mountinfo').read_bytes()
+    _cover, related, shared = mount_projection(raw)
+    digest = hashlib.sha256(json.dumps(related, sort_keys=True).encode()).hexdigest()
+    return namespace, digest, shared
+
+
+def node_docker_identity(cluster):
+    endpoint = os.environ.get('DOCKER_HOST', '')
+    need(not os.environ.get('DOCKER_CONTEXT') and os.environ.get('DEVRES_TMP_STATE') == '1' and endpoint.startswith('unix:///tmp/'),
+         'fixture_owned_docker_required')
+    socket = Path(endpoint.removeprefix('unix://'))
+    need(Path('/tmp') in socket.parents and socket.parent != Path('/tmp') and '..' not in socket.parts
+         and not any(path.is_symlink() for path in (socket, *socket.parents))
+         and stat.S_ISSOCK(socket.stat().st_mode) and socket.parent.stat().st_uid == os.getuid()
+         and not socket.parent.stat().st_mode & 0o077, 'fixture_owned_docker_required')
+    objects = json.loads(command(['docker', 'inspect', '--', cluster.profile]).stdout)
+    need(type(objects) is list and len(objects) == 1, 'fixture_node_identity')
+    value = objects[0]
+    labels = value.get('Config', {}).get('Labels', {}) or {}
+    state = value.get('State', {})
+    need(value.get('Name') == '/' + cluster.profile
+         and labels.get('created_by.minikube.sigs.k8s.io') == 'true'
+         and labels.get('name.minikube.sigs.k8s.io') == cluster.profile
+         and value.get('HostConfig', {}).get('Privileged') is True
+         and value.get('HostConfig', {}).get('PidMode', '') != 'host'
+         and value.get('HostConfig', {}).get('NetworkMode', '') != 'host'
+         and state.get('Running') is True and type(state.get('Pid')) is int and state['Pid'] > 1
+         and type(value.get('Id')) is str and re.fullmatch('[0-9a-f]{64}', value['Id']), 'fixture_node_identity')
+    return {'container_id': value['Id'], 'container_pid': state['Pid']}
+
+
+def node_exec(identity, *args, **kwargs):
+    need(not os.environ.get('DOCKER_CONTEXT'), 'fixture_docker_context_refused')
+    return command(['docker', 'exec', identity['container_id'], *args], **kwargs)
+
+
+def node_namespace(identity):
+    value = node_exec(identity, 'readlink', '/proc/self/ns/mnt').stdout.decode('ascii').strip()
+    need(re.fullmatch(r'mnt:\[[0-9]{1,20}\]', value), 'fixture_node_mount_namespace')
+    return value
+
+
+def node_uid(cluster):
+    value = json.loads(cluster.k('get', 'node', cluster.profile, '-o', 'json').stdout)
+    labels = value.get('metadata', {}).get('labels', {})
+    uid = value.get('metadata', {}).get('uid')
+    need(value.get('metadata', {}).get('name') == cluster.profile
+         and labels.get('kubernetes.io/hostname') == cluster.profile
+         and labels.get('minikube.k8s.io/name') == cluster.profile
+         and type(uid) is str and re.fullmatch(UUID_PATTERN, uid), 'fixture_node_identity')
+    return uid
+
+
+def postgres_process(cluster):
+    rows = json.loads(cluster.k('get', 'pods', '-l', 'app=postgres', '-o', 'json', namespace='devres-acceptance').stdout)['items']
+    need(len(rows) == 1, 'fixture_postgres_process')
+    pod = rows[0]
+    statuses = pod.get('status', {}).get('containerStatuses', [])
+    uid = pod.get('metadata', {}).get('uid')
+    need(len(statuses) == 1 and statuses[0].get('ready') is True
+         and type(uid) is str and re.fullmatch(UUID_PATTERN, uid)
+         and type(statuses[0].get('containerID')) is str
+         and re.fullmatch('containerd://[0-9a-f]{64}', statuses[0]['containerID'])
+         and type(statuses[0].get('restartCount')) is int and 0 <= statuses[0]['restartCount'] < 2**31,
+         'fixture_postgres_process')
+    return {'uid': uid, 'container_id': statuses[0]['containerID'],
+            'restart_count': statuses[0]['restartCount']}
+
+
+def kubelet_process(identity):
+    value = node_exec(identity, 'systemctl', 'show', '--property=MainPID', '--value', 'kubelet').stdout.decode('ascii').strip()
+    need(re.fullmatch('[0-9]{1,10}', value) and int(value) > 1, 'fixture_node_kubelet_process')
+    return int(value)
+
+
+def node_process(identity, pid, executable):
+    need(type(pid) is int and 1 < pid < 2**31, 'fixture_node_runtime_process')
+    path = '/proc/' + str(pid)
+    name = node_exec(identity, 'readlink', path + '/exe').stdout.decode('ascii').strip()
+    need(name in ('/usr/bin/' + executable, '/usr/local/bin/' + executable), 'fixture_node_runtime_process')
+    raw = node_exec(identity, 'cat', path + '/stat').stdout.decode('ascii')
+    head, tail = raw.rsplit(') ', 1)
+    fields = tail.split()
+    need(head.startswith(str(pid) + ' (') and len(fields) >= 20
+         and re.fullmatch('[0-9]{1,20}', fields[19]), 'fixture_node_runtime_process')
+    binary = node_exec(identity, 'sha256sum', path + '/exe').stdout.decode('ascii').split()[0]
+    need(re.fullmatch('[0-9a-f]{64}', binary), 'fixture_node_runtime_process')
+    return {'pid': pid, 'start_ticks': int(fields[19]), 'binary_sha256': binary}, int(fields[1])
+
+
+def containerd_process(identity):
+    mode = node_exec(identity, 'systemctl', 'show', '--property=KillMode', '--value', 'containerd').stdout.strip()
+    need(mode == b'process', 'fixture_containerd_stop_mode')
+    raw = node_exec(identity, 'systemctl', 'show', '--property=MainPID', '--value', 'containerd').stdout.decode('ascii').strip()
+    need(re.fullmatch('[0-9]{1,10}', raw), 'fixture_node_runtime_process')
+    process, _parent = node_process(identity, int(raw), 'containerd')
+    return {**process, 'kill_mode': 'process'}
+
+
+def postgres_runtime(identity, postgres):
+    container = postgres['container_id'].removeprefix('containerd://')
+    raw = json.loads(node_exec(identity, 'crictl', 'inspect', container).stdout)
+    pid = raw.get('info', {}).get('pid')
+    need(raw.get('status', {}).get('id') == container and type(pid) is int and 1 < pid < 2**31,
+         'fixture_postgres_runtime_process')
+    fields = node_exec(identity, 'cat', '/proc/' + str(pid) + '/stat').stdout.decode('ascii').rsplit(') ', 1)[1].split()
+    need(len(fields) >= 20 and re.fullmatch('[0-9]{1,20}', fields[19]), 'fixture_postgres_runtime_process')
+    shim, _parent = node_process(identity, int(fields[1]), 'containerd-shim-runc-v2')
+    return {'pid': pid, 'start_ticks': int(fields[19]), 'shim': shim}
+
+
+def prepare_node_apparmor(cluster, server_image):
+    """Expose kernel policy only inside this newly owned Docker node namespace."""
+    source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    identity = node_docker_identity(cluster)
+    uid = node_uid(cluster)
+    namespace = node_namespace(identity)
+    need(node_exec(identity, 'readlink', '/proc/1/ns/mnt').stdout.decode('ascii').strip() == namespace,
+         'fixture_host_mount_namespace_refused')
+    host_namespace, host_digest, host_shared = host_mount_state()
+    need(namespace != host_namespace, 'fixture_host_mount_namespace_refused')
+    cover, _rows, _shared = mount_projection(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    need(not (set(cover['propagation']) & host_shared), 'fixture_host_mount_propagation_refused')
+    module = node_exec(identity, 'cat', '/sys/module/apparmor/parameters/enabled').stdout.strip()
+    need(module == b'Y', 'fixture_node_apparmor_kernel_disabled')
+    present = cover['target'] == NODE_SECURITYFS and cover['filesystem'] == 'securityfs'
+    postgres = postgres_process(cluster)
+    before = {'kubelet_pid': kubelet_process(identity), 'containerd': containerd_process(identity),
+              'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
+              'host_mounts_sha256': host_digest}
+    bound = {'profile': cluster.profile, 'node_uid': uid, **identity,
+             'host_mount_namespace': host_namespace, 'node_mount_namespace': namespace}
+    intent = {'version': 1, 'synthetic': True, 'state': 'prepared', 'identity': bound,
+              'source_sha256': source, 'apparmor_sha256': APPARMOR_SHA256, 'before': before,
+              'securityfs_preexisting': present, 'server_image': server_image}
+    need(receipt(cluster, 'npm-assessment-node-preparation-intent.json', intent), 'fixture_evidence_retention_incomplete')
+    need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid, 'fixture_node_identity_changed')
+    if not present:
+        # The fixed command runs in the admitted container ID, not a host PID.
+        # Refuse namespace drift immediately before the namespace-local mount.
+        script = ('set -eu\n'
+                  'test "$(readlink /proc/self/ns/mnt)" = "$1"\n'
+                  'test "$(id -u)" = 0\n'
+                  'mount -t securityfs -o ro,nosuid,nodev,noexec securityfs /sys/kernel/security\n')
+        node_exec(identity, '/bin/sh', '-c', script, 'fixture-node-securityfs', namespace)
+    current_host_namespace, current_host_digest, _ = host_mount_state()
+    need((current_host_namespace, current_host_digest) == (host_namespace, host_digest),
+         'fixture_host_mount_changed')
+    mounted, _rows, _shared = mount_projection(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    need(mounted['target'] == NODE_SECURITYFS and mounted['filesystem'] == 'securityfs'
+         and (present or {'ro', 'nosuid', 'nodev', 'noexec'} <= set(mounted['options'])),
+         'fixture_node_securityfs_not_confined')
+    node_exec(identity, '/bin/sh', '-c', 'test -d /sys/kernel/security/apparmor')
+    # Kubelet caches its first AppArmor support result. Restart only this owned
+    # node's process after visibility changes, before any assessment participant.
+    if not present:
+        need(node_namespace(identity) == namespace, 'fixture_node_identity_changed')
+        need(containerd_process(identity) == before['containerd'], 'fixture_node_runtime_process')
+        node_exec(identity, 'systemctl', 'restart', 'containerd', timeout=60)
+        node_exec(identity, 'systemctl', 'restart', 'kubelet', timeout=60)
+    cluster.k('wait', '--for=condition=Ready', 'node/' + cluster.profile, '--timeout=180s', timeout=190)
+    cluster.k('rollout', 'status', 'deployment/postgres', '--timeout=180s', namespace='devres-acceptance', timeout=190)
+    postgres = postgres_process(cluster)
+    after = {'kubelet_pid': kubelet_process(identity), 'containerd': containerd_process(identity),
+             'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
+             'host_mounts_sha256': host_mount_state()[1]}
+    need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid
+         and node_namespace(identity) == namespace and host_mount_state()[:2] == (host_namespace, host_digest)
+         and after['postgres'] == before['postgres'] and after['postgres_runtime'] == before['postgres_runtime']
+         and after['containerd']['binary_sha256'] == before['containerd']['binary_sha256']
+         and (present or after['containerd']['pid'] != before['containerd']['pid'])
+         and (present or after['kubelet_pid'] != before['kubelet_pid'])
+         and hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == source,
+         'fixture_node_preparation_identity_changed')
+    result = {**intent, 'state': 'complete', 'after': after, 'securityfs_created': not present,
+              'kubelet_restarted': not present, 'containerd_restarted': not present}
+    need(receipt(cluster, 'npm-assessment-node-preparation.json', result), 'fixture_evidence_retention_incomplete')
+    return result
+
+
+def validate_node_preparation(name, value):
+    fields = {'version', 'synthetic', 'state', 'identity', 'source_sha256', 'apparmor_sha256',
+              'before', 'securityfs_preexisting', 'server_image'}
+    complete = name == 'npm-assessment-node-preparation.json'
+    need(set(value) == fields | ({'after', 'securityfs_created', 'kubelet_restarted', 'containerd_restarted'} if complete else set()),
+         'fixture_receipt_node_fields')
+    need(value['state'] == ('complete' if complete else 'prepared')
+         and type(value['securityfs_preexisting']) is bool
+         and value['apparmor_sha256'] == APPARMOR_SHA256
+         and type(value['source_sha256']) is str and re.fullmatch('[0-9a-f]{64}', value['source_sha256'])
+         and type(value['server_image']) is str and re.fullmatch(r'[A-Za-z0-9._:/@+\-]{1,256}', value['server_image']),
+         'fixture_receipt_node_identity')
+    identity = value['identity']
+    need(type(identity) is dict and set(identity) == {'profile', 'node_uid', 'container_id', 'container_pid',
+         'host_mount_namespace', 'node_mount_namespace'}, 'fixture_receipt_node_identity')
+    need(type(identity['profile']) is str and re.fullmatch('devres-acceptance-[a-z0-9-]+', identity['profile'])
+         and type(identity['node_uid']) is str and re.fullmatch(UUID_PATTERN, identity['node_uid'])
+         and type(identity['container_id']) is str and re.fullmatch('[0-9a-f]{64}', identity['container_id'])
+         and type(identity['container_pid']) is int and 1 < identity['container_pid'] < 2**31
+         and all(type(identity[key]) is str and re.fullmatch(r'mnt:\[[0-9]{1,20}\]', identity[key])
+                 for key in ('host_mount_namespace', 'node_mount_namespace'))
+         and identity['host_mount_namespace'] != identity['node_mount_namespace'], 'fixture_receipt_node_identity')
+    def process(record, daemon=False):
+        need(type(record) is dict and set(record) == {'pid', 'start_ticks', 'binary_sha256'} | ({'kill_mode'} if daemon else set())
+             and type(record['pid']) is int and 1 < record['pid'] < 2**31
+             and type(record['start_ticks']) is int and 0 <= record['start_ticks'] < 2**64
+             and type(record['binary_sha256']) is str and re.fullmatch('[0-9a-f]{64}', record['binary_sha256'])
+             and (not daemon or record['kill_mode'] == 'process'), 'fixture_receipt_node_process')
+    for snapshot in ([value['before'], value['after']] if complete else [value['before']]):
+        need(type(snapshot) is dict and set(snapshot) == {'kubelet_pid', 'containerd', 'postgres', 'postgres_runtime', 'host_mounts_sha256'}
+             and type(snapshot['kubelet_pid']) is int and 1 < snapshot['kubelet_pid'] < 2**31
+             and type(snapshot['host_mounts_sha256']) is str and re.fullmatch('[0-9a-f]{64}', snapshot['host_mounts_sha256']),
+             'fixture_receipt_node_process')
+        process(snapshot['containerd'], daemon=True)
+        postgres = snapshot['postgres']
+        need(type(postgres) is dict and set(postgres) == {'uid', 'container_id', 'restart_count'}
+             and type(postgres['uid']) is str and re.fullmatch(UUID_PATTERN, postgres['uid'])
+             and type(postgres['container_id']) is str and re.fullmatch('containerd://[0-9a-f]{64}', postgres['container_id'])
+             and type(postgres['restart_count']) is int and 0 <= postgres['restart_count'] < 2**31,
+             'fixture_receipt_node_process')
+        runtime = snapshot['postgres_runtime']
+        need(type(runtime) is dict and set(runtime) == {'pid', 'start_ticks', 'shim'}
+             and type(runtime['pid']) is int and 1 < runtime['pid'] < 2**31
+             and type(runtime['start_ticks']) is int and 0 <= runtime['start_ticks'] < 2**64,
+             'fixture_receipt_node_process')
+        process(runtime['shim'])
+    if complete:
+        need(type(value['securityfs_created']) is bool and type(value['kubelet_restarted']) is bool
+             and type(value['containerd_restarted']) is bool
+             and value['securityfs_created'] == value['kubelet_restarted'] == value['containerd_restarted'] == (not value['securityfs_preexisting'])
+             and value['before']['postgres'] == value['after']['postgres']
+             and value['before']['postgres_runtime'] == value['after']['postgres_runtime']
+             and value['before']['host_mounts_sha256'] == value['after']['host_mounts_sha256']
+             and value['before']['containerd']['binary_sha256'] == value['after']['containerd']['binary_sha256']
+             and (not value['containerd_restarted'] or value['before']['containerd']['pid'] != value['after']['containerd']['pid'])
+             and (not value['kubelet_restarted'] or value['before']['kubelet_pid'] != value['after']['kubelet_pid']),
+             'fixture_receipt_node_preservation')
+
+
 ATTACHED_TASKS = r'''
 import errno,json,os,pathlib
 attached=0
@@ -512,9 +879,76 @@ class Cluster:
         return command(self.argv(*args, namespace=namespace), **kwargs)
 
     def apply(self, objects):
+        return self.write('apply', objects)
+
+    def create(self, objects):
+        return self.write('create', objects)
+
+    def write(self, operation, objects):
+        need(operation in ('apply', 'create'), 'fixture_apply_operation_invalid')
         if not isinstance(objects, list):
             objects = [objects]
-        return self.k('apply', '-f', '-', data=json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': objects}).encode())
+        need(objects and all(type(value) is dict and type(value.get('metadata')) is dict for value in objects),
+             'fixture_apply_objects_required')
+        groups = {}
+        for value in objects:
+            namespace = value['metadata'].get('namespace', NAMESPACE)
+            need(type(namespace) is str and re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', namespace),
+                 'fixture_apply_namespace_invalid')
+            groups.setdefault(namespace, []).append(value)
+        # kubectl's explicit namespace is enforced for every namespaced object.
+        # Validate/group the whole list before I/O; policy grants stay unchanged.
+        for namespace, items in groups.items():
+            result = self.k(operation, '-f', '-', namespace=namespace,
+                data=json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': items}).encode())
+        return result
+
+    def owned_objects(self, kind):
+        need(kind in ('namespace', 'policy'), 'fixture_owned_resource_kind')
+        name, version, expected, path = (NAMESPACE, 'v1', 'NamespaceList', '/api/v1/namespaces') if kind == 'namespace' else (
+            'postgres-owned-assessment', 'networking.k8s.io/v1', 'NetworkPolicyList',
+            '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies')
+        # Normal kubectl get rewrites typed API lists to a generic core List.
+        # Keep the API schema for authoritative absence and identity admission.
+        result = self.k('get', '--raw=' + path + '?fieldSelector=metadata.name%3D' + name,
+                        namespace=NAMESPACE if kind == 'namespace' else 'devres-acceptance')
+        need(result.returncode == 0, 'fixture_owned_resource_unavailable')
+        value = json.loads(result.stdout)
+        need(type(value) is dict and value.get('apiVersion') == version and value.get('kind') == expected
+             and type(value.get('items')) is list
+             and len(value['items']) <= 1 and all(type(item) is dict and type(item.get('metadata')) is dict
+                 and item['metadata'].get('name') == name for item in value['items']), 'fixture_owned_resource_list')
+        return value['items']
+
+    def admit_owned(self, kind, objects=None):
+        objects = self.owned_objects(kind) if objects is None else objects
+        need(len(objects) == 1, 'fixture_owned_resource_missing')
+        metadata = objects[0]['metadata']
+        uid = metadata.get('uid')
+        need(type(uid) is str and re.fullmatch(UUID_PATTERN, uid)
+             and metadata.get('labels', {}).get(FIXTURE_OWNER_LABEL) == self.fixture_owner,
+             'fixture_owned_resource_foreign')
+        admitted = getattr(self, kind + '_uid', None)
+        need(admitted is None or uid == admitted, 'fixture_owned_resource_replaced')
+        setattr(self, kind + '_uid', uid)
+        return uid
+
+    def cleanup_owned(self, kind):
+        objects = self.owned_objects(kind)
+        if not objects:
+            return
+        uid = self.admit_owned(kind, objects)
+        if kind == 'namespace':
+            path = '/api/v1/namespaces/' + NAMESPACE
+            resource, name, limit, namespace = 'namespace', NAMESPACE, 120, NAMESPACE
+        else:
+            path = '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies/postgres-owned-assessment'
+            resource, name, limit, namespace = 'networkpolicy', 'postgres-owned-assessment', 60, 'devres-acceptance'
+        options = {'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': {'uid': uid}}
+        self.k('delete', '--raw=' + path, '-f', '-', data=json.dumps(options).encode(), namespace=namespace)
+        self.k('wait', '--for=delete', resource + '/' + name, '--timeout=' + str(limit) + 's',
+               timeout=limit + 10, namespace=namespace)
+        need(not self.owned_objects(kind), 'fixture_owned_resource_cleanup_unconfirmed')
 
     def sql(self, statement, *, database=DATABASE):
         return self.k('exec', 'deployment/postgres', '--', 'psql', '-X', '-q', '-At',
@@ -593,13 +1027,77 @@ print(json.dumps({'dns':True,'postgres_tcp':True,'local_api_denied':True,'public
 """]
     cluster.apply(pod)
     uid = cluster.pod('assessment-network')['metadata']['uid']
+    primary = None
     try:
         cluster.k('wait', '--for=jsonpath={.status.phase}=Succeeded', 'pod/assessment-network', '--timeout=40s', timeout=50)
         value = json.loads(cluster.k('logs', 'assessment-network', maximum=4096).stdout)
         need(value == {'dns': True, 'postgres_tcp': True, 'local_api_denied': True, 'public_requests': 0}, 'assessment_egress_evidence_invalid')
         return value
+    except BaseException as error:
+        primary = error
+        # This Pod mounts no configuration, credentials or corpus. Inspect only
+        # its fixed first-party probe output in memory before UID-fenced cleanup.
+        try:
+            error.probe_metadata = network_failure_metadata(cluster, uid)
+        except BaseException:
+            pass
+        raise
     finally:
-        cluster.delete('assessment-network', uid)
+        try:
+            cluster.delete('assessment-network', uid)
+        except BaseException:
+            if primary is not None:
+                raise primary from None
+            raise
+
+
+def validate_probe_failure(value):
+    need(type(value) is dict and set(value) == {'pod_phase', 'container_reason', 'exit_code', 'network'},
+         'fixture_receipt_probe')
+    need(type(value['pod_phase']) is str and value['pod_phase'] in ('Pending', 'Running', 'Succeeded', 'Failed', 'Unknown', 'unknown')
+         and type(value['container_reason']) is str and value['container_reason'] in helper().POD_REASONS | {'none', 'unknown'}
+         and type(value['network']) is str and value['network'] in PROBE_NETWORK_CODES, 'fixture_receipt_probe')
+    need(value['exit_code'] is None or type(value['exit_code']) is int and 0 <= value['exit_code'] <= 255,
+         'fixture_receipt_probe')
+
+
+def network_failure_metadata(cluster, uid):
+    value = {'pod_phase': 'unknown', 'container_reason': 'unknown', 'exit_code': None, 'network': 'unknown'}
+    try:
+        before = json.loads(cluster.k('get', 'pod', 'assessment-network', '-o', 'json', timeout=5).stdout)
+        need(before['metadata']['uid'] == uid, 'assessment_process_changed')
+        output = cluster.k('logs', 'assessment-network', '--limit-bytes=4096', check=False,
+                           maximum=4096, timeout=5).stdout
+        after = json.loads(cluster.k('get', 'pod', 'assessment-network', '-o', 'json', timeout=5).stdout)
+        need(after['metadata']['uid'] == uid
+             and before.get('status', {}).get('containerStatuses') == after.get('status', {}).get('containerStatuses'),
+             'assessment_process_changed')
+        status = after.get('status', {})
+        phase = status.get('phase')
+        if phase in ('Pending', 'Running', 'Succeeded', 'Failed', 'Unknown'):
+            value['pod_phase'] = phase
+        containers = status.get('containerStatuses', [])
+        state = containers[0].get('state', {}) if len(containers) == 1 else {}
+        detail = state.get('terminated', state.get('waiting', {}))
+        reason = detail.get('reason', 'none')
+        if reason in helper().POD_REASONS | {'none'}:
+            value['container_reason'] = reason
+        code = detail.get('exitCode')
+        if type(code) is int and 0 <= code <= 255:
+            value['exit_code'] = code
+        # Only finite categories derived from the controlled probe are retained.
+        # Runtime messages, traceback text, addresses and file paths have no field.
+        if b'assessment egress unexpectedly admitted local API' in output:
+            value['network'] = 'api_admitted'
+        elif b'gaierror' in output:
+            value['network'] = 'dns_failure'
+        elif b'socket.create_connection' in output:
+            value['network'] = 'postgres_connection'
+        elif 'apparmor' in str(detail.get('message', '')).lower():
+            value['network'] = 'apparmor_message'
+    except Exception:
+        return {'pod_phase': 'unknown', 'container_reason': 'unknown', 'exit_code': None, 'network': 'unknown'}
+    return value
 
 
 def retained_rows_snapshot(cluster):
@@ -650,6 +1148,7 @@ def validate_runtime(payload):
 
 
 def assess(cluster, server_image, selected, api, case='success'):
+    cluster.assessment_case = case
     name = 'assessment-' + case
     selection = api.Selection(selected['job_id'], selected['revision'])
     expected = getattr(cluster, 'expected_image', None)
@@ -768,6 +1267,7 @@ def lifecycle_exclusion(cluster, harness_image):
 
 
 def failure_matrix(cluster, server_image, selected, api, config, harness_image):
+    cluster.assessment_case = 'none'
     seal = cluster.sql('SELECT data_integrity FROM devres_npm_advisory_job_history').decode().strip()
     need(re.fullmatch('blake3:[0-9a-f]{64}', seal), 'synthetic_original_history_seal_required')
     def history_seal(value):
@@ -793,6 +1293,7 @@ def failure_matrix(cluster, server_image, selected, api, config, harness_image):
     results = []
     before = snapshot(cluster)
     for case, expected, candidate, setup, restore in cases:
+        cluster.assessment_case = case
         set_config(cluster, candidate)
         try:
             if setup:
@@ -826,20 +1327,74 @@ def failure_matrix(cluster, server_image, selected, api, config, harness_image):
 def run(arguments):
     scratch = Path(arguments.scratch).resolve(strict=True)
     need(Path('/tmp') in scratch.parents and scratch.stat().st_uid == os.getuid(), 'owned_tmp_fixture_required')
+    need(not os.environ.get('DOCKER_CONTEXT'), 'fixture_docker_context_refused')
     cluster = Cluster(arguments.profile, scratch)
+    progress = {'phase': 'admission', 'namespace_cleanup': 'not-created',
+                'apparmor_cleanup': 'unknown', 'primary': None, 'primary_phase': None}
+    try:
+        run_fixture(arguments, cluster, progress)
+    except BaseException as error:
+        primary = progress['primary'] or error
+        if error is primary and progress['primary'] is not None and progress['namespace_cleanup'] == 'removed':
+            # The original exception survived the AppArmor context's finally
+            # block, so its checked unload also completed successfully.
+            progress['apparmor_cleanup'] = 'removed'
+        record = {'version': 1, 'synthetic': True,
+            'phase': progress['primary_phase'] or progress['phase'],
+            'case': getattr(cluster, 'assessment_case', 'none'), 'failure': closed_failure(primary),
+            'cleanup_failure': None if error is primary else closed_failure(error),
+            'namespace_cleanup': progress['namespace_cleanup'], 'apparmor_cleanup': progress['apparmor_cleanup']}
+        probe = getattr(primary, 'probe_metadata', None)
+        if probe is not None:
+            try:
+                validate_probe_failure(probe)
+                record['probe'] = probe
+            except BaseException:
+                pass
+        # Cleanup attempts precede persistence; lost diagnostics never replace
+        # the primary failure or keep a credential-bearing participant alive.
+        try:
+            receipt(cluster, 'npm-assessment-setup-failure.json', record)
+        except BaseException:
+            pass
+        raise primary from None
+
+
+def run_fixture(arguments, cluster, progress):
+    scratch = cluster.scratch
     api = helper()
+    need(not cluster.owned_objects('namespace') and not cluster.owned_objects('policy'),
+         'fresh_assessment_namespace_required')
+    cluster.fixture_owner = secrets.token_hex(16)
+    cluster.namespace_uid = cluster.policy_uid = None
     namespace = {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': NAMESPACE,
-        'labels': {'pod-security.kubernetes.io/enforce': 'restricted', 'pod-security.kubernetes.io/enforce-version': 'latest'}}}
-    need(cluster.k('get', 'namespace', NAMESPACE, '-o', 'name', check=False).returncode != 0, 'fresh_assessment_namespace_required')
+        'labels': {FIXTURE_OWNER_LABEL: cluster.fixture_owner,
+                   'pod-security.kubernetes.io/enforce': 'restricted', 'pod-security.kubernetes.io/enforce-version': 'latest'}}}
+    progress['phase'] = 'node-preparation'
+    prepare_node_apparmor(cluster, arguments.server_image)
     cleanup_confirmed = [True]
+    progress['phase'] = 'apparmor'
     with apparmor(scratch, lambda: cleanup_confirmed[0]) as profile_hash:
         created = False
+        policy_attempted = False
         try:
-            cluster.apply(namespace)
+            progress['phase'] = 'namespace'
+            # An uncertain apply response still requires owned-namespace cleanup.
             created = True
             cleanup_confirmed[0] = False
+            progress['namespace_cleanup'] = 'incomplete'
+            cluster.create(namespace)
+            cluster.admit_owned('namespace')
+            progress['phase'] = 'identity'
             cluster.apply({'apiVersion': 'v1', 'kind': 'ServiceAccount', 'metadata': {'name': 'assessment', 'namespace': NAMESPACE}, 'automountServiceAccountToken': False})
-            cluster.apply(policies())
+            progress['phase'] = 'policy'
+            documents = policies()
+            for document in documents:
+                document['metadata'].setdefault('labels', {})[FIXTURE_OWNER_LABEL] = cluster.fixture_owner
+            policy_attempted = True
+            cluster.create(documents)
+            cluster.admit_owned('policy')
+            progress['phase'] = 'configuration'
             config = configuration((scratch / 'fixture/backend.toml').read_text())
             config_path = scratch / 'assessment-serving.toml'
             descriptor = os.open(config_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -847,26 +1402,53 @@ def run(arguments):
                 stream.write(config)
             cluster.k('create', 'secret', 'generic', 'devres-assessment-config', '--from-file=serving.toml=' + str(config_path))
             cluster.k('create', 'secret', 'generic', 'devres-assessment-s3', '--from-literal=access-key=synthetic-unused', '--from-literal=secret-key=synthetic-unused')
+            progress['phase'] = 'network'
             network = network_probe(cluster, arguments.harness_image)
+            progress['phase'] = 'seed'
             selected = seed(cluster, arguments.harness_image)
+            progress['phase'] = 'baseline'
             before = snapshot(cluster)
+            progress['phase'] = 'positive'
             result = assess(cluster, arguments.server_image, selected, api)
             need(result['phase'] == 'report_transferred', 'assessment_positive_failed')
+            progress['phase'] = 'invariants'
             need(snapshot(cluster) == before, 'assessment_mutated_retained_metadata')
+            progress['phase'] = 'matrix'
             faults = failure_matrix(cluster, arguments.server_image, selected, api, config, arguments.harness_image)
             result_receipt = {'version': 1, 'synthetic': True, 'apparmor_sha256': profile_hash,
                        'server_image': arguments.server_image, 'provider_requests': 0,
                        'selection': selected, 'network': network, 'result': result, 'faults': faults, 'metadata_unchanged': True}
-            receipt(cluster, 'npm-assessment-receipt.json', result_receipt)
+        except BaseException as error:
+            progress['primary'] = error
+            progress['primary_phase'] = progress['phase']
+            raise
         finally:
             # Never keep a credential-bearing Pod alive for receipt persistence.
             if created:
-                cluster.k('delete', 'namespace', NAMESPACE, '--wait=true', '--timeout=120s', timeout=130)
-                cluster.k('delete', 'networkpolicy', 'postgres-owned-assessment', '--ignore-not-found', namespace='devres-acceptance')
-                namespaces = json.loads(cluster.k('get', 'namespaces', '-o', 'json').stdout)
-                need(not any(item['metadata']['name'] == NAMESPACE for item in namespaces['items']), 'assessment_namespace_cleanup_unconfirmed')
+                progress['phase'] = 'cleanup'
+                failures = []
+                cleanups = [lambda: cluster.cleanup_owned('namespace')]
+                if policy_attempted:
+                    cleanups.append(lambda: cluster.cleanup_owned('policy'))
+                for cleanup in cleanups:
+                    try:
+                        cleanup()
+                    except BaseException as error:
+                        failures.append(error)
+                try:
+                    need(not cluster.owned_objects('namespace'), 'assessment_namespace_cleanup_unconfirmed')
+                    progress['namespace_cleanup'] = 'removed'
+                except BaseException as error:
+                    failures.append(error)
+                if failures:
+                    if progress['primary'] is None:
+                        progress['primary'] = failures[0]
+                        progress['primary_phase'] = 'cleanup'
+                    raise failures[0]
                 cleanup_confirmed[0] = True
+    progress['apparmor_cleanup'] = 'removed'
     need(not getattr(cluster, 'receipt_failures', []), 'fixture_evidence_retention_incomplete')
+    need(receipt(cluster, 'npm-assessment-receipt.json', result_receipt), 'fixture_evidence_retention_incomplete')
     print('Synthetic real-image Kubernetes npm recovery assessment passed')
 
 
