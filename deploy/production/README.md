@@ -41,6 +41,10 @@ release and current diagnostic helpers without replaying either consumed cycle.
 Its [execution evidence](upgrade-9373f71e-evidence.md) records the failed target,
 automatic schema-18 restoration and failed fallback private status call;
 application roles remain withdrawn with all nine sources paused.
+The [3dae7d91 recovery procedure](upgrade-3dae7d91.md) adds a fresh source-bound
+cycle with strict paused observation and one restore-and-withdraw failure path.
+Its preparation and eventual execution evidence remain separate from acceptance
+of a running production service.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
