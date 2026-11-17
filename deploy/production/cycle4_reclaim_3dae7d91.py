@@ -149,7 +149,12 @@ def mount_rows(body):
     rows=[]
     for line in body.splitlines():
         fields=line.split();need(len(fields)>=10 and '-' in fields,'mountinfo_invalid')
-        rows.append({'device':fields[2],'root':unescape_mount(fields[3]),'target':unescape_mount(fields[4])})
+        separator=fields.index('-')
+        need(separator>=6 and len(fields)==separator+4,'mountinfo_invalid')
+        rows.append({'device':fields[2],'root':unescape_mount(fields[3]),'target':unescape_mount(fields[4]),
+            'id':int(fields[0]),'parent':int(fields[1]),'options':fields[5].split(','),
+            'propagation':fields[6:separator],'filesystem':fields[separator+1],
+            'source':unescape_mount(fields[separator+2]),'super_options':fields[separator+3].split(',')})
     return rows
 
 
@@ -168,10 +173,11 @@ def command(arguments,maximum=32*1024**2):
     return result.stdout
 
 
-def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None):
-    """Fresh actual-use checks, not equality of unrelated process inventories."""
+def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,alias_qualification_sha=None):
+    """Classify every namespace mapping before checking any process reference."""
     exposure=set(roots)|set(aliases);namespaces={};processes=0;started=time.monotonic()
-    proc=Path(proc);all_mounts=[]
+    proc=Path(proc);all_mounts=[];inventory=[]
+    qualified=validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc) if alias_qualification_sha else None
     self_mounts=mount_rows((proc/'self/mountinfo').read_text())
     for path in sorted(proc.iterdir(),key=lambda p:p.name):
         if not path.name.isdecimal():continue
@@ -179,7 +185,44 @@ def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None):
         try:
             namespace=os.readlink(path/'ns/mnt')
             if namespace not in namespaces:
-                body=(path/'mountinfo').read_text();namespaces[namespace]=sha(body.encode());all_mounts+=mount_rows(body)
+                body=(path/'mountinfo').read_text();namespaces[namespace]=sha(body.encode())
+                all_mounts += [(namespace,mount) for mount in mount_rows(body)]
+            inventory.append((path,namespace))
+        except FileNotFoundError:continue
+        except PermissionError:raise Refused('process_inventory_incomplete') from None
+    physical=[]
+    for root in roots:
+        device=str(os.major(root.stat().st_dev))+':'+str(os.minor(root.stat().st_dev))
+        bases=[m for m in self_mounts if m['device']==device and under(root,Path(m['target']))]
+        need(bool(bases),'leaf_filesystem_mapping_missing')
+        base=max(bases,key=lambda m:len(Path(m['target']).parts))
+        physical.append((device,Path(base['root'])/root.relative_to(Path(base['target']))))
+    permitted={} if qualified is None else {item['alias']:(item['namespace'],item['mount']) for item in qualified['snapshot']['mappings']}
+    observed=set()
+    for namespace,mount in all_mounts:
+        need(not path_used(mount['target'],exposure),'leaf_or_nested_mount')
+        for device,relative in physical:
+            if mount['device']!=device:continue
+            mounted=Path(mount['root'])
+            need(not under(mounted,relative),'leaf_exposed_by_mount')
+            if under(relative,mounted):
+                derived=Path(mount['target'])/relative.relative_to(mounted)
+                if derived not in exposure:
+                    key=str(derived)
+                    need(key in permitted and permitted[key]==(namespace,mount),'unknown_ancestor_mount_alias')
+                    observed.add(key)
+        target=Path(mount['target'])
+        try:
+            need(not (target.exists() and any((target.stat().st_dev,target.stat().st_ino)==
+                (root.stat().st_dev,root.stat().st_ino) for root in roots)),'leaf_bind_mount')
+        except PermissionError:raise Refused('mount_inventory_incomplete') from None
+    need(observed==set(permitted),'qualified_alias_mapping_missing')
+    exposure.update(Path(name) for name in observed)
+    # No reference scan can precede this expansion. New namespace drift during
+    # the second pass fails closed, including drift of the pinned OS process.
+    for path,namespace in inventory:
+        try:
+            need(os.readlink(path/'ns/mnt')==namespace,'process_namespace_changed')
             references=[path/'cwd',path/'root',path/'exe']
             with os.scandir(path/'fd') as entries:references += [Path(entry.path) for entry in entries]
             for reference in references:
@@ -189,30 +232,25 @@ def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None):
             for line in (path/'maps').read_text().splitlines():
                 fields=line.split(None,5)
                 if len(fields)==6:need(not path_used(fields[5],exposure),'active_process_mapping')
-        except FileNotFoundError:continue  # A vanished process cannot retain a live handle.
+            need(os.readlink(path/'ns/mnt')==namespace,'process_namespace_changed')
+        except FileNotFoundError:continue
         except PermissionError:raise Refused('process_inventory_incomplete') from None
-    physical=[]
-    for root in roots:
-        device=str(os.major(root.stat().st_dev))+':'+str(os.minor(root.stat().st_dev))
-        bases=[m for m in self_mounts if m['device']==device and under(root,Path(m['target']))]
-        need(bool(bases),'leaf_filesystem_mapping_missing')
-        base=max(bases,key=lambda m:len(Path(m['target']).parts))
-        physical.append((device,Path(base['root'])/root.relative_to(Path(base['target']))))
-    for mount in all_mounts:
-        need(not path_used(mount['target'],exposure),'leaf_or_nested_mount')
-        for device,relative in physical:
-            if mount['device']!=device:continue
-            mounted=Path(mount['root'])
-            need(not under(mounted,relative),'leaf_exposed_by_mount')
-            if under(relative,mounted):
-                derived=Path(mount['target'])/relative.relative_to(mounted)
-                need(derived in exposure,'unknown_ancestor_mount_alias')
-        # A top-volume bind alias is permitted; direct leaf binds never are.
-        target=Path(mount['target'])
-        try:
-            need(not (target.exists() and any((target.stat().st_dev,target.stat().st_ino)==
-                (root.stat().st_dev,root.stat().st_ino) for root in roots)),'leaf_bind_mount')
-        except PermissionError:raise Refused('mount_inventory_incomplete') from None
+    def mount_bookend():
+        checked=set()
+        for path in proc.iterdir():
+            if not path.name.isdecimal():continue
+            try:
+                namespace=os.readlink(path/'ns/mnt')
+                need(namespace in namespaces,'process_namespace_changed')
+                if namespace not in checked:
+                    need(sha((path/'mountinfo').read_bytes())==namespaces[namespace],'process_mounts_changed')
+                    checked.add(namespace)
+            except FileNotFoundError:continue
+            except PermissionError:raise Refused('process_inventory_incomplete') from None
+    mount_bookend()
+    if qualified is not None:
+        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc)==qualified,
+             'livepatch_alias_qualification_changed')
     sockets=set(socket_paths) if socket_paths is not None else {Path('/var/run/docker.sock'),*Path('/run/user').glob('*/docker.sock')}
     configured=os.environ.get('DOCKER_HOST')
     if configured:
@@ -245,15 +283,21 @@ def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None):
         need(not any(token.encode() in body for token in tokens),'owned_firewall_reference')
         need(not any(str(root).encode() in body for root in exposure),'leaf_firewall_reference')
         firewall.append(sha(body))
+    mount_bookend()
+    if qualified is not None:
+        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc)==qualified,
+             'livepatch_alias_qualification_changed')
     return {'verified':True,'process_count':processes,'mount_namespaces':len(namespaces),
+        'alias_qualification_sha256':alias_qualification_sha,'qualified_alias_count':len(observed),
         'mounts_sha256':sha(encode(sorted(all_mounts,key=encode))),
         'docker_sha256':sha(encode(docker)),'firewall_sha256':sha(encode(firewall))}
 
 
 class Engine:
     """Parameterized for local fake trees; the CLI never accepts alternate roots."""
-    def __init__(self,cycles=CYCLES,journal=JOURNAL,guard=system_guard):
-        self.cycles=cycles;self.journal=Path(journal);self.guard=guard
+    def __init__(self,cycles=CYCLES,journal=JOURNAL,guard=system_guard,*,qualification_sha=None):
+        self.cycles=cycles;self.journal=Path(journal);self.qualification_sha=qualification_sha
+        self.guard=(lambda roots,aliases,tokens:system_guard(roots,aliases,tokens,alias_qualification_sha=qualification_sha)) if qualification_sha and guard is system_guard else guard
         self.whitelist={cycle.bundle/relative:(cycle,relative) for cycle in cycles for relative in LEAVES}
 
     def canonical(self,path):
@@ -374,6 +418,7 @@ class Engine:
             if key not in seen:allocated+=item['blocks']*512;seen.add(key)
         proof=self.guard(leaves,aliases,sorted(set(tokens)))
         return {'version':1,'kind':'cycle4-completed-fixture-reclaim','script_sha256':sha(Path(__file__).read_bytes()),
+            'alias_qualification_sha256':self.qualification_sha,
             'leaves':[str(path) for path in leaves],'delete_roots':[str(path) for path in delete],
             'aliases':[str(path) for path in aliases],'tokens':sorted(set(tokens)),
             'ancestors':ancestors,'trees':inventories,'protected':protected,
@@ -527,24 +572,180 @@ class LiveBoundary:
         finally:self.lock.__exit__(kind,error,trace)
 
 
+ALIAS_SCOPE=Path('/var/lib/devres-production-reclaim-qualifications/3dae7d91-20261117')
+ALIAS_RECEIPT=ALIAS_SCOPE/'livepatch-hostfs.json'
+ALIAS_INTENT=ALIAS_SCOPE/'intent.json'
+ORIGINAL_RECLAIM=Path('/usr/local/libexec/devres-upgrade-3dae7d91/reclaim-completed-fixtures.original-ba1cbc57.py')
+ORIGINAL_RECLAIM_SHA='ba1cbc57bea7905e05fb193f016495af53808bf97715b70ad0a49b0e839bfff7'
+ALIAS_MANIFEST_SHA='a23b1015e38926627bfe2d8883d3ebe46d9c23dadcbe68ba1695529f0808be5e'
+ALIAS_EDGE_SHA='e1134a7092ac1e05ec97128bda976c174fc25e6b83d98cf9844bee575e57540a'
+LIVEPATCH_PID=1166
+LIVEPATCH_BOOT='f9c0269b-c802-4a04-bda2-64ef0d4128bf'
+LIVEPATCH_START=21054
+LIVEPATCH_NAMESPACE='mnt:[4026532742]'
+LIVEPATCH_EXE='/snap/canonical-livepatch/418/canonical-livepatchd'
+LIVEPATCH_EXE_SHA='4f4e55fa28eb0d66281c11f21d2c275c9e0f43188507ec886af70720ddb25885'
+LIVEPATCH_EXE_IDENTITY={'dev':1792,'ino':2,'uid':0,'gid':0,'mode':0o755,'size':12337562}
+LIVEPATCH_NS_IDENTITY={'dev':5,'ino':4026532742,'uid':0,'gid':0,'mode':0o444}
+LIVEPATCH_CGROUP='0::/system.slice/snap.canonical-livepatch.canonical-livepatchd.service'
+LIVEPATCH_MOUNTS_SHA='748b8d049f6fded24981b56b52c5a57b3281b94688a31e6ced8cf308c927efd6'
+LIVEPATCH_PREFIX=Path('/var/lib/snapd/hostfs')
+ALIAS_LEAVES=tuple(cycle.bundle/relative for cycle in CYCLES if cycle.name in ('cycle1','cycle3') for relative in LEAVES)
+
+
+def _read_stable(path,maximum=32*1024**2):
+    with open(path,'rb') as stream:
+        before=os.fstat(stream.fileno());body=stream.read(maximum+1);after=os.fstat(stream.fileno())
+    need(len(body)<=maximum and (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)==
+         (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns),'qualification_read_changed')
+    return body
+
+
+def _livepatch_process(path):
+    raw=(path/'stat').read_text();head,tail=raw.rsplit(') ',1);fields=tail.split()
+    need(head.startswith(path.name+' (') and len(fields)>=20 and fields[19].isdecimal(),'livepatch_process_invalid')
+    uids=next((line.split()[1:] for line in (path/'status').read_text().splitlines() if line.startswith('Uid:')),None)
+    executable=os.readlink(path/'exe');body=_read_stable(path/'exe')
+    info=os.stat(path/'exe');namespace=os.readlink(path/'ns/mnt');ns=os.stat(path/'ns/mnt')
+    return {'pid':int(path.name),'uids':uids,'start_ticks':int(fields[19]),'exe':executable,'exe_sha256':sha(body),
+        'exe_identity':{'dev':info.st_dev,'ino':info.st_ino,'uid':info.st_uid,'gid':info.st_gid,
+            'mode':stat.S_IMODE(info.st_mode),'size':info.st_size},
+        'namespace':namespace,'namespace_identity':{'dev':ns.st_dev,'ino':ns.st_ino,'uid':ns.st_uid,
+            'gid':ns.st_gid,'mode':stat.S_IMODE(ns.st_mode)},'cgroup':(path/'cgroup').read_text().strip(),
+        'root':os.readlink(path/'root'),'cwd':os.readlink(path/'cwd')}
+
+
+def capture_livepatch_aliases(roots,aliases,*,proc=Path('/proc')):
+    """Only the observed process/namespace/12 mappings; not a general snap rule."""
+    proc=Path(proc);roots=sorted(map(Path,roots),key=str);aliases=sorted(map(Path,aliases),key=str)
+    need(roots==sorted(ALIAS_LEAVES,key=str) and len(aliases)==6,'exact_livepatch_leaf_scope_required')
+    pid=proc/str(LIVEPATCH_PID);before=_livepatch_process(pid)
+    need((proc/'sys/kernel/random/boot_id').read_text().strip()==LIVEPATCH_BOOT
+         and before['pid']==LIVEPATCH_PID and before['uids']==['0']*4 and before['start_ticks']==LIVEPATCH_START
+         and before['exe']==LIVEPATCH_EXE and before['exe_sha256']==LIVEPATCH_EXE_SHA
+         and before['exe_identity']==LIVEPATCH_EXE_IDENTITY and before['namespace']==LIVEPATCH_NAMESPACE
+         and before['namespace_identity']==LIVEPATCH_NS_IDENTITY
+         and before['cgroup']==LIVEPATCH_CGROUP and before['root']=='/'
+         and before['cwd']=='/var/snap/canonical-livepatch/418','exact_livepatch_process_required')
+    body=_read_stable(pid/'mountinfo',8*1024**2);need(sha(body)==LIVEPATCH_MOUNTS_SHA,'exact_livepatch_mounts_required')
+    members=[];count=0;started=time.monotonic()
+    for path in proc.iterdir():
+        if not path.name.isdecimal():continue
+        count+=1;need(count<=100000 and time.monotonic()-started<60,'livepatch_membership_bound')
+        try:
+            if os.readlink(path/'ns/mnt')==LIVEPATCH_NAMESPACE:members.append(int(path.name))
+        except FileNotFoundError:continue
+        except PermissionError:raise Refused('livepatch_membership_incomplete') from None
+    need(sorted(members)==[LIVEPATCH_PID],'exact_livepatch_membership_required')
+    rows=mount_rows(body.decode());mappings=[]
+    expected={LIVEPATCH_PREFIX/str(path).lstrip('/') for path in (*roots,*aliases)}
+    for root in roots:
+        info=identity(root);device=str(os.major(info['dev']))+':'+str(os.minor(info['dev']))
+        for mount in rows:
+            relative=Path(mount['root'])
+            if mount['device']!=device or not under(root,relative):continue
+            alias=Path(mount['target'])/root.relative_to(relative)
+            if alias in roots or alias in aliases:continue
+            need(alias in expected,'unobserved_livepatch_alias')
+            exposed=pid/'root'/str(alias).lstrip('/')
+            need(identity(exposed)==info,'livepatch_alias_inode_changed')
+            mappings.append({'namespace':LIVEPATCH_NAMESPACE,'mount':mount,'alias':str(alias),
+                'leaf':str(root),'leaf_identity':info})
+    need(len(mappings)==12 and {Path(item['alias']) for item in mappings}==expected,'exact_twelve_livepatch_aliases_required')
+    need(_livepatch_process(pid)==before and _read_stable(pid/'mountinfo',8*1024**2)==body
+         and (proc/'sys/kernel/random/boot_id').read_text().strip()==LIVEPATCH_BOOT,'livepatch_snapshot_changed')
+    return {'boot_id':LIVEPATCH_BOOT,'process':before,'members':members,'mountinfo_sha256':sha(body),
+        'roots':[str(path) for path in roots],'aliases':[str(path) for path in aliases],
+        'mappings':sorted(mappings,key=lambda item:item['alias'])}
+
+
+def _alias_record(receipt_sha,roots,aliases):
+    info=file_record(ALIAS_RECEIPT);body=ALIAS_RECEIPT.read_bytes()
+    need(re.fullmatch('[0-9a-f]{64}',receipt_sha or '') and sha(body)==receipt_sha
+         and file_record(ALIAS_RECEIPT)==info,'external_alias_qualification_required')
+    value=json.loads(body)
+    need(value.get('version')==1 and value.get('kind')=='cycle4-livepatch-hostfs-reclaim-qualification'
+         and value.get('script_sha256')==sha(Path(__file__).read_bytes())
+         and value.get('original_source_sha256')==ORIGINAL_RECLAIM_SHA
+         and file_record(ORIGINAL_RECLAIM)['sha256']==ORIGINAL_RECLAIM_SHA
+         and value.get('original_source_identity')==file_record(ORIGINAL_RECLAIM)
+         and value.get('original_guard_denied') is True and value.get('original_error')=='unknown_ancestor_mount_alias'
+         and value.get('read_only') is True and value.get('maximum_attempts')==1,'source_bound_alias_qualification_required')
+    need(load(ALIAS_INTENT)=={'version':1,'maximum_attempts':1,'script_sha256':value['script_sha256'],
+        'original_source_sha256':ORIGINAL_RECLAIM_SHA},'alias_qualification_intent_changed')
+    _,edge_sha,manifest_sha=bound_edge_bridge()
+    need(manifest_sha==ALIAS_MANIFEST_SHA and edge_sha==ALIAS_EDGE_SHA
+         and value['live_boundary']['current_source_manifest_sha256']==manifest_sha
+         and value['live_boundary']['edge_readmission_sha256']==edge_sha,'alias_qualification_boundary_changed')
+    need(value['snapshot']['roots']==[str(p) for p in sorted(map(Path,roots),key=str)]
+         and value['snapshot']['aliases']==[str(p) for p in sorted(map(Path,aliases),key=str)],'alias_qualification_scope_changed')
+    return value
+
+
+def validate_livepatch_aliases(receipt_sha,roots,aliases,*,proc=Path('/proc'),live_boundary=None):
+    value=_alias_record(receipt_sha,roots,aliases)
+    need(value['snapshot']==capture_livepatch_aliases(roots,aliases,proc=proc),'livepatch_qualification_stale')
+    if live_boundary is not None:need(value['live_boundary']==live_boundary,'alias_qualification_boundary_changed')
+    return value
+
+
+def qualify_livepatch_aliases(boundary):
+    roots=sorted(ALIAS_LEAVES,key=str);engine=Engine();aliases=engine.aliases(roots)
+    tokens=sorted({engine.validate_receipts(*engine.whitelist[root]) for root in roots})
+    original_identity=file_record(ORIGINAL_RECLAIM)
+    need(original_identity['sha256']==ORIGINAL_RECLAIM_SHA,'original_reclaim_source_required')
+    source_sha=sha(Path(__file__).read_bytes())
+    before=boundary.check()
+    need(before['current_source_manifest_sha256']==ALIAS_MANIFEST_SHA and before['edge_readmission_sha256']==ALIAS_EDGE_SHA,
+         'fixed_livepatch_boundary_required')
+    safe_path(ALIAS_SCOPE);need(not ALIAS_SCOPE.exists(),'alias_qualification_already_consumed')
+    ALIAS_SCOPE.mkdir(mode=0o700,parents=True);sync(ALIAS_SCOPE.parent)
+    new(ALIAS_INTENT,{'version':1,'maximum_attempts':1,'script_sha256':source_sha,
+        'original_source_sha256':ORIGINAL_RECLAIM_SHA})
+    spec=importlib.util.spec_from_file_location('reclaim_original_unknown_alias_guard',ORIGINAL_RECLAIM)
+    module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+    try:module.system_guard(roots,aliases,tokens)
+    except module.Refused as error:
+        need(str(error)=='unknown_ancestor_mount_alias','exact_original_alias_denial_required')
+    else:raise Refused('original_guard_must_deny_alias')
+    snapshot=capture_livepatch_aliases(roots,aliases)
+    need(capture_livepatch_aliases(roots,aliases)==snapshot and boundary.check()==before
+         and file_record(ORIGINAL_RECLAIM)==original_identity
+         and sha(Path(__file__).read_bytes())==source_sha,'alias_qualification_boundary_changed')
+    new(ALIAS_RECEIPT,{'version':1,'kind':'cycle4-livepatch-hostfs-reclaim-qualification','maximum_attempts':1,
+        'script_sha256':source_sha,'original_source_sha256':ORIGINAL_RECLAIM_SHA,
+        'original_source_identity':original_identity,'original_guard_denied':True,'original_error':'unknown_ancestor_mount_alias','read_only':True,
+        'live_boundary':before,'snapshot':snapshot})
+    return {'alias_qualification_sha256':sha(ALIAS_RECEIPT.read_bytes()),'alias_count':12,'guard_accepted':False}
+
+
 def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='operation',required=True)
     inspect=sub.add_parser('inspect');inspect.add_argument('--leaf',type=Path,action='append',required=True)
     inspect.add_argument('--output',type=Path,required=True)
+    sub.add_parser('qualify-aliases')
+    inspect.add_argument('--alias-qualification-sha256')
     apply=sub.add_parser('apply');apply.add_argument('--preview',type=Path,required=True)
     apply.add_argument('--preview-sha256',required=True);apply.add_argument('--script-sha256',required=True)
+    apply.add_argument('--alias-qualification-sha256')
     args=parser.parse_args();need(os.geteuid()==0,'root_required')
-    engine=Engine()
+    qualification_sha=getattr(args,'alias_qualification_sha256',None)
+    engine=Engine(qualification_sha=qualification_sha)
     with LiveBoundary() as boundary:
-        if args.operation=='inspect':
+        if args.operation=='qualify-aliases':
+            result=qualify_livepatch_aliases(boundary)
+        elif args.operation=='inspect':
             need(args.output.is_absolute() and Path('/tmp') in args.output.parents,'private_tmp_preview_required')
+            if qualification_sha:validate_livepatch_aliases(qualification_sha,args.leaf,engine.aliases(args.leaf),live_boundary=boundary.check())
             value=engine.preview(args.leaf);value['live_boundary']=boundary.check();new(args.output,value)
             result={'preview':True,'preview_sha256':sha(encode(value)),
                 'allocated_file_bytes':value['allocated_file_bytes'],'leaf_count':len(value['leaves'])}
         else:
             file_record(Path(__file__))
             value=load(args.preview)
+            need(value.get('alias_qualification_sha256')==qualification_sha,'external_alias_qualification_changed')
+            if qualification_sha:validate_livepatch_aliases(qualification_sha,value['leaves'],[Path(p) for p in value['aliases']],live_boundary=boundary.check())
             need(value.get('live_boundary')==boundary.check(),'external_live_boundary_changed')
             completed=engine.apply(value,args.preview_sha256,args.script_sha256)
             new(engine.journal/'live-boundary-completed.json',{'verified':True,

@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock,patch
 
@@ -139,6 +140,15 @@ class ReclaimTests(unittest.TestCase):
         with patch.object(self.engine,'_clear',side_effect=OSError('not retained')),self.assertRaises(OSError):self.apply(preview)
         self.assertTrue((self.engine.journal/'failed.json').exists())
         with self.assertRaisesRegex(n.Refused,'already_consumed'):self.apply(preview)
+    def test_preview_and_apply_bind_the_same_external_alias_qualification(self):
+        write(self.clone/'data',b'disposable')
+        first=n.Engine((self.cycle,),self.root/'new-journal',self.guard,qualification_sha='1'*64)
+        preview=first.preview([self.clone])
+        self.assertEqual(preview['alias_qualification_sha256'],'1'*64)
+        changed=n.Engine((self.cycle,),self.root/'new-journal',self.guard,qualification_sha='2'*64)
+        with self.assertRaisesRegex(n.Refused,'preview_stale'):
+            changed.apply(preview,n.sha(n.encode(preview)),preview['script_sha256'])
+        self.assertTrue((self.clone/'data').exists());self.assertFalse(changed.journal.exists())
     def test_quiescence_failure_prevents_mutation(self):
         self.guard.side_effect=n.Refused('active_process_reference')
         with self.assertRaisesRegex(n.Refused,'active_process_reference'):self.engine.preview([self.clone])
@@ -155,7 +165,8 @@ class ReclaimTests(unittest.TestCase):
 class KernelPathTests(unittest.TestCase):
     def test_mount_parser_decodes_kernel_escapes_without_shell_interpretation(self):
         value=n.mount_rows('23 1 8:1 /parent /tmp/with\\040space rw - ext4 /dev/x rw\n')[0]
-        self.assertEqual(value,{'device':'8:1','root':'/parent','target':'/tmp/with space'})
+        self.assertEqual(value,{'device':'8:1','root':'/parent','target':'/tmp/with space','id':23,'parent':1,
+            'options':['rw'],'propagation':[],'filesystem':'ext4','source':'/dev/x','super_options':['rw']})
     def test_deleted_descriptors_and_paths_under_any_alias_are_detected(self):
         roots=[Path('/real/leaf'),Path('/tmp/alias/leaf')]
         self.assertTrue(n.path_used('/real/leaf/data (deleted)',roots))
@@ -225,6 +236,187 @@ class SystemGuardTests(unittest.TestCase):
     def test_owned_firewall_token_is_refused(self):
         self.command.return_value=('devres_cp_'+'a'*24).encode()
         with self.assertRaisesRegex(n.Refused,'owned_firewall_reference'):self.run_guard()
+
+
+class LivepatchAliasTests(unittest.TestCase):
+    """Real guard, fixed receipt lifecycle and synthetic namespace path views."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(dir='/tmp');self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);self.proc=self.root/'proc';self.proc.mkdir()
+        self.leaves=[];self.aliases=[];self.mirrors=[]
+        for cycle in ('cycle1','cycle3'):
+            bundle=self.root/cycle/'bundle';work=self.root/cycle/'work'
+            for relative in n.LEAVES:
+                leaf=bundle/relative;leaf.mkdir(parents=True);self.leaves.append(leaf)
+                prefix='checkpoint-state' if relative.startswith('checkpoint-volume/') else 'restore-rehearsal-state'
+                alias=work/prefix/Path(relative).name;self.aliases.append(alias)
+            for volume,prefix in (('checkpoint-volume','checkpoint-state'),('restore-rehearsal-volume','restore-rehearsal-state')):
+                (work/prefix).mkdir(parents=True)
+                self.mirrors.append((bundle/volume,work/prefix))
+        self.pid=self.proc/str(n.LIVEPATCH_PID);self.other=self.proc/'123'
+        self.namespace_root=self.root/'namespace-root';self.namespace_root.mkdir()
+        for path in (self.pid,self.other):
+            (path/'fd').mkdir(parents=True);(path/'ns').mkdir()
+            (path/'maps').write_text('');(path/'cwd').symlink_to('/var/snap/canonical-livepatch/418' if path==self.pid else '/')
+            (path/'root').symlink_to(self.namespace_root if path==self.pid else Path('/'))
+        self.executable=Path(sys.executable).resolve();(self.pid/'exe').symlink_to(self.executable)
+        (self.other/'exe').symlink_to('/usr/bin/true')
+        (self.pid/'ns/mnt').symlink_to('/proc/self/ns/mnt');(self.other/'ns/mnt').symlink_to('mnt:[1]')
+        (self.proc/'self').symlink_to(self.other)
+        (self.proc/'sys/kernel/random').mkdir(parents=True);(self.proc/'sys/kernel/random/boot_id').write_text(n.LIVEPATCH_BOOT)
+        fields=['S','1']+['0']*17+[str(n.LIVEPATCH_START)]
+        (self.pid/'stat').write_text(str(n.LIVEPATCH_PID)+' (livepatch) '+' '.join(fields))
+        (self.pid/'status').write_text('Uid: 0 0 0 0\n');(self.pid/'cgroup').write_text(n.LIVEPATCH_CGROUP+'\n')
+        info=self.leaves[0].stat();self.device=f'{os.major(info.st_dev)}:{os.minor(info.st_dev)}'
+        base=f'1 0 {self.device} / / rw - ext4 /dev/test rw'
+        self.self_mounts=[base]+[f'{index+2} 1 {self.device} {source} {target} rw - ext4 /dev/test rw'
+            for index,(source,target) in enumerate(self.mirrors)]
+        (self.other/'mountinfo').write_text('\n'.join(self.self_mounts)+'\n')
+        self.prefix=Path('/snap-hostfs')
+        self.live_mounts=[f'124 277 {self.device} / {self.prefix} rw master:1 - ext4 /dev/test rw']
+        self.live_mounts += [f'{index+500} 211 {self.device} {source} {self.prefix/str(target).lstrip("/")} rw master:1 - ext4 /dev/test rw'
+            for index,(source,target) in enumerate(self.mirrors)]
+        (self.pid/'mountinfo').write_text('\n'.join(self.live_mounts)+'\n')
+        for leaf,alias in zip(self.leaves,self.aliases):
+            for source in (leaf,alias):
+                location=self.namespace_root/self.prefix.relative_to('/')/str(source).lstrip('/')
+                location.parent.mkdir(parents=True,exist_ok=True);location.symlink_to(leaf,target_is_directory=True)
+        exe=self.executable.stat();ns=os.stat('/proc/self/ns/mnt')
+        self.scope=self.root/'qualification';self.receipt=self.scope/'livepatch-hostfs.json';self.intent=self.scope/'intent.json'
+        self.original=self.root/'original-reclaim.py'
+        write(self.original,b"class Refused(RuntimeError):pass\ndef system_guard(roots,aliases,tokens):raise Refused('unknown_ancestor_mount_alias')\n")
+        constants={'ALIAS_LEAVES':tuple(self.leaves),'LIVEPATCH_PREFIX':self.prefix,
+            'LIVEPATCH_EXE':str(self.executable),'LIVEPATCH_EXE_SHA':n.sha(self.executable.read_bytes()),
+            'LIVEPATCH_EXE_IDENTITY':{'dev':exe.st_dev,'ino':exe.st_ino,'uid':exe.st_uid,'gid':exe.st_gid,'mode':stat.S_IMODE(exe.st_mode),'size':exe.st_size},
+            'LIVEPATCH_NS_IDENTITY':{'dev':ns.st_dev,'ino':ns.st_ino,'uid':ns.st_uid,'gid':ns.st_gid,'mode':stat.S_IMODE(ns.st_mode)},
+            'LIVEPATCH_MOUNTS_SHA':n.sha((self.pid/'mountinfo').read_bytes()),'ALIAS_SCOPE':self.scope,'ALIAS_RECEIPT':self.receipt,
+            'ALIAS_INTENT':self.intent,'ORIGINAL_RECLAIM':self.original,'ORIGINAL_RECLAIM_SHA':n.sha(self.original.read_bytes())}
+        pins=patch.multiple(n,**constants);pins.start();self.addCleanup(pins.stop)
+        real_readlink=os.readlink;observed_namespace=n.LIVEPATCH_NAMESPACE
+        def readlink(path,*args,**kwargs):
+            if Path(path)==self.pid/'root':return '/'
+            if Path(path)==self.pid/'ns/mnt':return observed_namespace
+            return real_readlink(path,*args,**kwargs)
+        links=patch.object(os,'readlink',side_effect=readlink);links.start();self.addCleanup(links.stop)
+        # A synthetic symlink supplies the same inode as a real bind mount.
+        # Only the namespace alias leaves receive this kernel-view emulation;
+        # production still uses lstat semantics and refuses symlink leaves.
+        real_stat=os.stat
+        namespace_prefix=self.pid/'root'/str(self.prefix).lstrip('/')
+        def namespace_stat(path,*args,**kwargs):
+            if isinstance(path,(str,bytes,os.PathLike)) and not isinstance(path,bytes) and n.under(Path(path),namespace_prefix):
+                kwargs['follow_symlinks']=True
+            return real_stat(path,*args,**kwargs)
+        stats=patch.object(os,'stat',side_effect=namespace_stat);stats.start();self.addCleanup(stats.stop)
+        self.boundary=SimpleNamespace(check=Mock(return_value={'current_source_manifest_sha256':n.ALIAS_MANIFEST_SHA,
+            'edge_readmission_sha256':n.ALIAS_EDGE_SHA,'state_sha256':'frozen'}))
+        bridge=patch.object(n,'bound_edge_bridge',return_value=(None,n.ALIAS_EDGE_SHA,n.ALIAS_MANIFEST_SHA));bridge.start();self.addCleanup(bridge.stop)
+        self.commands=patch.object(n,'command',return_value=b'{}');self.command=self.commands.start();self.addCleanup(self.commands.stop)
+        environment=patch.dict(os.environ,{'DOCKER_HOST':''});environment.start();self.addCleanup(environment.stop)
+    def capture(self):return n.capture_livepatch_aliases(self.leaves,self.aliases,proc=self.proc)
+    def qualify(self):
+        engine=SimpleNamespace(aliases=lambda roots:self.aliases,validate_receipts=lambda cycle,relative:'a'*24,
+            whitelist={root:(None,None) for root in self.leaves})
+        original=n.capture_livepatch_aliases
+        def capture(roots,aliases,**kwargs):return original(roots,aliases,proc=self.proc)
+        with patch.object(n,'Engine',return_value=engine),patch.object(n,'capture_livepatch_aliases',side_effect=capture):
+            return n.qualify_livepatch_aliases(self.boundary)
+    def guard(self,sha=None):return n.system_guard(self.leaves,self.aliases,['a'*24],proc=self.proc,socket_paths=[],alias_qualification_sha=sha)
+    def test_fixed_qualification_preserves_bytes_and_only_adds_twelve_aliases(self):
+        original=n.file_record(self.original);roots={str(path):n.identity(path) for path in self.leaves}
+        with self.assertRaisesRegex(n.Refused,'unknown_ancestor_mount_alias'):self.guard()
+        result=self.qualify();pin=result['alias_qualification_sha256']
+        self.assertEqual(result['alias_count'],12);self.assertFalse(result['guard_accepted'])
+        value=n.validate_livepatch_aliases(pin,self.leaves,self.aliases,proc=self.proc,live_boundary=self.boundary.check())
+        self.assertEqual(len(value['snapshot']['mappings']),12);self.assertEqual(n.file_record(self.original),original)
+        self.assertEqual({str(path):n.identity(path) for path in self.leaves},roots)
+        proof=self.guard(pin);self.assertTrue(proof['verified']);self.assertEqual(proof['qualified_alias_count'],12)
+        with self.assertRaisesRegex(n.Refused,'already_consumed'):self.qualify()
+    def test_every_expanded_alias_is_checked_before_docker_and_firewall(self):
+        pin=self.qualify()['alias_qualification_sha256'];value=n.load(self.receipt)
+        for item in value['snapshot']['mappings']:
+            target=item['alias']+'/held (deleted)';descriptor=self.other/'fd/9';descriptor.symlink_to(target)
+            with self.subTest(alias=item['alias']),self.assertRaisesRegex(n.Refused,'active_process_reference'):self.guard(pin)
+            descriptor.unlink();self.command.assert_not_called()
+    def test_expanded_maps_cwd_and_root_are_still_refused(self):
+        pin=self.qualify()['alias_qualification_sha256'];alias=n.load(self.receipt)['snapshot']['mappings'][0]['alias']
+        (self.other/'maps').write_text('1-2 r--p 0 00:00 1 '+alias+'/mapped\n')
+        with self.assertRaisesRegex(n.Refused,'active_process_mapping'):self.guard(pin)
+        (self.other/'maps').write_text('')
+        for name in ('cwd','root'):
+            path=self.other/name;path.unlink();path.symlink_to(alias)
+            with self.subTest(name=name),self.assertRaisesRegex(n.Refused,'active_process_reference'):self.guard(pin)
+            path.unlink();path.symlink_to('/')
+    def test_foreign_namespace_and_thirteenth_alias_cannot_reuse_qualification(self):
+        pin=self.qualify()['alias_qualification_sha256'];foreign=self.proc/'456';(foreign/'ns').mkdir(parents=True)
+        (foreign/'ns/mnt').symlink_to('mnt:[foreign]');(foreign/'mountinfo').write_bytes((self.pid/'mountinfo').read_bytes())
+        with self.assertRaisesRegex(n.Refused,'unknown_ancestor_mount_alias'):self.guard(pin)
+        (foreign/'ns/mnt').unlink();(foreign/'ns').rmdir();(foreign/'mountinfo').unlink();foreign.rmdir()
+        (self.other/'mountinfo').write_text('\n'.join(self.self_mounts+[f'990 1 {self.device} / /unapproved rw - ext4 /dev/test rw'])+'\n')
+        with self.assertRaisesRegex(n.Refused,'unknown_ancestor_mount_alias'):self.guard(pin)
+    def test_process_boot_membership_and_mount_identity_are_exact(self):
+        pin=self.qualify()['alias_qualification_sha256']
+        for path,body in ((self.pid/'stat',(self.pid/'stat').read_bytes().replace(str(n.LIVEPATCH_START).encode(),b'99999')),
+            (self.pid/'cgroup',b'0::/foreign'),(self.pid/'status',b'Uid: 1 1 1 1\n'),
+            (self.proc/'sys/kernel/random/boot_id',b'different'),
+            (self.pid/'mountinfo',(self.pid/'mountinfo').read_bytes().replace(b'master:1',b'master:2'))):
+            original=path.read_bytes();path.write_bytes(body)
+            with self.subTest(path=path),self.assertRaises(n.Refused):self.guard(pin)
+            path.write_bytes(original)
+        joined=self.proc/'999';(joined/'ns').mkdir(parents=True);(joined/'ns/mnt').symlink_to(n.LIVEPATCH_NAMESPACE)
+        with self.assertRaisesRegex(n.Refused,'membership'):self.guard(pin)
+    def test_wrong_inode_source_external_sha_and_live_boundary_refuse(self):
+        pin=self.qualify()['alias_qualification_sha256']
+        with self.assertRaisesRegex(n.Refused,'external_alias'):self.guard('0'*64)
+        with self.assertRaisesRegex(n.Refused,'boundary_changed'):
+            n.validate_livepatch_aliases(pin,self.leaves,self.aliases,proc=self.proc,live_boundary={'state_sha256':'changed'})
+        mapping=n.load(self.receipt)['snapshot']['mappings'][0]
+        path=self.namespace_root/mapping['alias'].lstrip('/');path.unlink();path.symlink_to(self.leaves[-1])
+        with self.assertRaisesRegex(n.Refused,'inode_changed'):self.guard(pin)
+        path.unlink();path.symlink_to(Path(mapping['leaf']))
+        write(self.original,b'changed')
+        with self.assertRaisesRegex(n.Refused,'source_bound'):self.guard(pin)
+    def test_mount_drift_during_reference_pass_is_refused(self):
+        pin=self.qualify()['alias_qualification_sha256'];read=Path.read_text;changed=[False]
+        def reading(path,*args,**kwargs):
+            if path==self.other/'maps' and not changed[0]:
+                changed[0]=True;(self.pid/'mountinfo').write_text('\n'.join(self.live_mounts)+'\n990 1 '+self.device+' / /foreign rw - ext4 /dev/test rw\n')
+            return read(path,*args,**kwargs)
+        with patch.object(Path,'read_text',reading),self.assertRaisesRegex(n.Refused,'mounts_changed'):self.guard(pin)
+        self.command.assert_not_called()
+    def test_scope_executable_and_namespace_are_fixed_not_generic_livepatch(self):
+        with self.assertRaisesRegex(n.Refused,'leaf_scope'):n.capture_livepatch_aliases(self.leaves[:1],self.aliases,proc=self.proc)
+        for key,value in (('LIVEPATCH_EXE_SHA','0'*64),('LIVEPATCH_PID',999),('LIVEPATCH_NAMESPACE','mnt:[foreign]')):
+            with self.subTest(key=key),patch.object(n,key,value),self.assertRaises((n.Refused,FileNotFoundError)):
+                self.capture()
+    def test_qualified_leaf_symlink_is_refused_instead_of_followed(self):
+        # Remove the fixture-only bind emulation for this one alias. Production
+        # always sees lstat semantics; a real symlink is not an admitted mapping.
+        real_stat=os.stat
+        alias=self.pid/'root'/str(self.prefix).lstrip('/')/str(self.leaves[0]).lstrip('/')
+        underlying=self.namespace_root/str(self.prefix).lstrip('/')/str(self.leaves[0]).lstrip('/')
+        with patch.object(os,'stat',side_effect=lambda path,*args,**kwargs:os.lstat(underlying) if Path(path)==alias else real_stat(path,*args,**kwargs)), self.assertRaisesRegex(n.Refused,'directory_required'):
+            self.capture()
+    def test_wrong_original_denial_consumes_qualification_without_receipt_or_retry(self):
+        write(self.original,b"class Refused(RuntimeError):pass\ndef system_guard(roots,aliases,tokens):raise Refused('different_denial')\n")
+        with patch.object(n,'ORIGINAL_RECLAIM_SHA',n.sha(self.original.read_bytes())):
+            with self.assertRaisesRegex(n.Refused,'exact_original_alias_denial'):self.qualify()
+            self.assertTrue(self.intent.exists());self.assertFalse(self.receipt.exists())
+            with self.assertRaisesRegex(n.Refused,'already_consumed'):self.qualify()
+    def test_qualification_bookend_failure_has_consumed_intent_but_no_receipt(self):
+        original=self.boundary.check.return_value
+        self.boundary.check.side_effect=[original,{**original,'state_sha256':'changed'}]
+        with self.assertRaisesRegex(n.Refused,'boundary_changed'):self.qualify()
+        self.assertTrue(self.intent.exists());self.assertFalse(self.receipt.exists())
+    def test_original_source_is_hashed_before_import_or_new_intent(self):
+        write(self.original,b'raise AssertionError("must never import")')
+        with patch.object(n.importlib.util,'spec_from_file_location') as loader,self.assertRaisesRegex(n.Refused,'original_reclaim_source'):
+            self.qualify()
+        loader.assert_not_called();self.assertFalse(self.intent.exists())
+    def test_direct_leaf_mount_is_never_qualified(self):
+        pin=self.qualify()['alias_qualification_sha256']
+        (self.other/'mountinfo').write_text('\n'.join(self.self_mounts+[f'991 1 {self.device} {self.leaves[0]} /direct rw - ext4 /dev/test rw'])+'\n')
+        with self.assertRaisesRegex(n.Refused,'leaf_exposed_by_mount'):self.guard(pin)
 
 
 class LiveBoundaryTests(unittest.TestCase):

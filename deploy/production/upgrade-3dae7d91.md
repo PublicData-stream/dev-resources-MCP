@@ -62,6 +62,15 @@ retained reader/writer bytes and notices in isolation, and rehearse the actual
 adapted Restore class against another real PostgreSQL/cache copy. Revalidate the
 backup after rehearsal; activation admission expires after five minutes.
 
+Reclaim inspection also encounters Canonical Livepatch's separate hostfs view.
+Only a source-bound qualification of the observed boot, process, executable,
+namespace, complete mount table and twelve exact aliases may admit that view for
+the six fixed completed fixture leaves. Retain the original guard's refusal and
+pin the qualification SHA-256 for both inspection and apply. Expand all qualified
+aliases before checking any process handle or mapping, recheck the qualification
+at the bookends, and continue refusing every other unknown alias or active use.
+Do not stop Livepatch, alter its service, unmount its view or change its authority.
+
 ## Bootstrap, assessment and paused observation
 
 Bootstrap the target writer and verify schema 19, retained manifests, notices,
