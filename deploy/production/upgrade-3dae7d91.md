@@ -159,6 +159,13 @@ digest archive path losing the image name. Local tags retain the existing image
 load path and require config verification. Neither path retries, retags an image
 or changes the assessment Pod's `Never` pull policy.
 
+After successful assessment and checked namespace, policy and profile cleanup,
+restore only its newly created parser and securityfs mount to their exact
+preimages. Reset the owned node's containerd/kubelet capability caches while
+preserving PostgreSQL process/shim and host mount identities. Final assessment
+success requires this restoration receipt, so subsequent S3 fixtures run with
+their original prerequisites and unchanged Pod settings.
+
 Obtain independent MCP/API, Upstream/Storage and Security Boundary reviews of the
 integrated implementation. Commit reviewed tooling and sanitized outcome
 evidence separately, signed, with the Codex assistance trailer. Do not push or

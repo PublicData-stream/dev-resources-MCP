@@ -1627,13 +1627,22 @@ creates the absent canonical parser in the node's private overlay storage, backe
 by host `/tmp`. It runs no package scripts and replaces no libraries or profiles.
 Parser file writes require admitted private upper/work directories and unchanged
 write-path mounts; they do not change minikube's propagation or noexec flags.
-Preparation verifies the real parser version and restarts only the admitted
-containerd and kubelet once. Existing securityfs is observed without changing its
-flags.
+Preparation verifies the real parser version and resets only the admitted
+containerd and kubelet. Existing securityfs is observed without changing its flags.
 Preparation requires unchanged PostgreSQL Pod/container/process/shim identities
 and the host's securityfs mount projection; it never restarts a host daemon.
 Finite setup failures are retained after cleanup attempts; a complete result
 requires checked cleanup.
+
+After the controlled cases, unchanged metadata, UID-bound namespace/policy cleanup
+and checked profile unload, restore the node's original prerequisites. Remove only
+the parser created by this run, matched by its complete recorded file identity,
+and unmount only this run's exact securityfs mount. Preserve preexisting files and
+mounts. A second owned containerd/kubelet reset clears cached capability detection;
+PostgreSQL process/shim and host mount identities must remain unchanged. Exclusive
+restoration intent and completion receipts precede the final assessment receipt.
+Any restoration failure stops the fixture and triggers owned-node cleanup. Later
+S3 and serving fixtures retain their original Pod settings and runtime prerequisites.
 
 The synthetic network probe verifies the enforcing kernel profile and a controlled
 read denial: a same-UID readable canary is exposed through the same emptyDir at a

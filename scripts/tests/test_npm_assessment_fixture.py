@@ -29,8 +29,9 @@ IDENTITY = {'expected_artifact': 'sha256:' + '1' * 64, 'matched_artifact': 'sha2
             'expected_configs': ['sha256:' + '3' * 64], 'resolved_config': 'sha256:' + '3' * 64}
 PARSER = {'package_sha256': fixture.PARSER_PACKAGE_SHA256, 'package_size': fixture.PARSER_PACKAGE_SIZE,
           'binary_sha256': fixture.PARSER_SHA256, 'binary_size': fixture.PARSER_SIZE, 'libc': '2.36', 'preexisting': False}
+PARSER_FILE = {'device': 1, 'inode': 2, 'ctime': '2026-11-17 12:00:00.123456789 +0000'}
 PLACEMENT = {'path': '/usr/sbin/apparmor_parser', 'version': '3.0.8', 'mode': 0o500,
-             'binary_sha256': fixture.PARSER_SHA256}
+             'binary_sha256': fixture.PARSER_SHA256, 'file_identity': PARSER_FILE}
 
 
 class SyntheticFixtureTests(unittest.TestCase):
@@ -415,7 +416,8 @@ class SyntheticFixtureTests(unittest.TestCase):
                 calls.append(args)
                 if args[0] == 'sha256sum': value = ((('0' * 64) if scenario == 'copy-hash' else digest) + ' file\n').encode()
                 elif args[0] == 'readlink': value = b'/usr/sbin/apparmor_parser\n'
-                elif args[0] == 'stat': value = ('regular file:0:0:500:' + str(len(payload)) + ':1\n').encode()
+                elif args[:3] == ('env','LC_ALL=C','stat'):
+                    value=(PARSER_FILE['ctime']+'\n').encode() if args[4]=='%z' else ('regular file:0:0:500:'+str(len(payload))+':1:1:2\n').encode()
                 elif args[0] == '/sbin/apparmor_parser': value = b'AppArmor parser version ' + (b'3.0.8' if scenario != 'wrong-version' else b'unknown') + b'\n'
                 else: raise AssertionError(args)
                 return subprocess.CompletedProcess([], 0, value, b'')
@@ -537,6 +539,21 @@ class SyntheticFixtureTests(unittest.TestCase):
                 fixture.node_process(identity, 700, 'containerd')
             self.assertEqual(calls.call_count, 1)
 
+    def test_kubelet_identity_accepts_only_canonical_versioned_binary_and_closed_parser_inode(self):
+        identity={'container_id':'1'*64,'container_pid':1234}
+        fields=['S','1']+['0']*17+['4242']
+        for path,accepted in (('/var/lib/minikube/binaries/v1.37.0/kubelet',True),
+                              ('/var/lib/minikube/binaries/../kubelet',False),
+                              ('/var/lib/minikube/binaries/v1.37.0/foreign',False),('/tmp/kubelet',False)):
+            outputs=[(path+'\n').encode(),('700 (kubelet) '+' '.join(fields)).encode(),('4'*64+' file\n').encode()]
+            with self.subTest(path=path),patch.object(fixture,'node_exec',side_effect=[subprocess.CompletedProcess([],0,value,b'') for value in outputs]):
+                if accepted:self.assertEqual(fixture.node_process(identity,700,'kubelet')[0]['start_ticks'],4242)
+                else:
+                    with self.assertRaises(fixture.FixtureError):fixture.node_process(identity,700,'kubelet')
+        for value in ({**PARSER_FILE,'inode':0},{**PARSER_FILE,'device':-1},{**PARSER_FILE,'ctime':'PRIVATE_METADATA'},
+                      {**PARSER_FILE,'unknown':'PRIVATE_METADATA'}):
+            with self.assertRaises(fixture.FixtureError):fixture.validate_parser_file_identity(value)
+
     def test_node_preparation_guards_host_namespace_propagation_and_identity(self):
         before_mount = b'1 0 0:1 / / rw shared:10 - overlay overlay rw\n2 1 0:2 / /sys rw shared:11 - sysfs sysfs rw\n'
         after_mount = before_mount + b'3 2 0:3 / /sys/kernel/security ro,nosuid,nodev,noexec - securityfs securityfs rw\n'
@@ -589,7 +606,8 @@ class SyntheticFixtureTests(unittest.TestCase):
                      patch.object(fixture, 'node_write_boundaries', return_value={'projection_sha256':'a'*64}), \
                      patch.object(fixture, 'genuine_parser', return_value=b'fixture-parser'), \
                      patch.object(fixture, 'install_parser', side_effect=lambda *_args: mutations.append('parser') or PLACEMENT), \
-                     patch.object(fixture, 'parser_placement_state'), \
+                     patch.object(fixture, 'parser_placement_state',return_value=PARSER_FILE), \
+                     patch.object(fixture, 'node_process',side_effect=lambda _identity,pid,_name: ({'pid':pid,'start_ticks':pid*10,'binary_sha256':'4'*64},1)), \
                      patch.object(fixture, 'containerd_process', side_effect=[daemon,
                          {**daemon, 'pid': 91} if scenario == 'daemon-replaced' else daemon,
                          {**daemon, 'pid': 190, 'start_ticks': 1900}]), \
@@ -619,6 +637,159 @@ class SyntheticFixtureTests(unittest.TestCase):
                             self.assertEqual(mutations, ['mount'] + (['parser'] if scenario == 'daemon-replaced' else []) if scenario in ('host-changed', 'daemon-replaced') else [])
                             self.assertNotIn('kubelet', mutations)
                             cluster.k.assert_not_called()
+
+    def test_owned_node_restoration_preserves_preimages_and_refuses_drift_replay_or_live_tasks(self):
+        old_mount=b'1 0 0:1 / / rw shared:10 - overlay overlay rw\n2 1 0:2 / /sys rw shared:11 - sysfs sysfs rw\n'
+        new_mount=old_mount+b'3 2 0:3 / /sys/kernel/security ro,nosuid,nodev,noexec - securityfs securityfs rw\n'
+        identity={'container_id':'1'*64,'container_pid':1234};uid='12345678-1234-1234-1234-123456789abc'
+        postgres={'uid':'23456789-1234-1234-1234-123456789abc','container_id':'containerd://'+'2'*64,'restart_count':0}
+        runtime={'pid':2000,'start_ticks':3000,'shim':{'pid':1999,'start_ticks':2999,'binary_sha256':'6'*64}}
+        def processes(kubelet,daemon):
+            return {'kubelet_pid':kubelet,'kubelet_process':{'pid':kubelet,'start_ticks':kubelet*10,'binary_sha256':'4'*64},
+                'containerd':{'pid':daemon,'start_ticks':daemon*10,'binary_sha256':'5'*64,'kill_mode':'process'},
+                'postgres':postgres,'postgres_runtime':runtime,'host_mounts_sha256':'3'*64}
+        for scenario in ('valid','preexisting','wrong-uid','wrong-cid','wrong-ns','wrong-inode','wrong-ctime','wrong-mount',
+                         'wrong-preimage','pg-drift','shim-drift','kubelet-binary-drift','host-drift','private-storage-drift',
+                         'namespace-live','policy-live','profile-live','attached-live','replay','lost-intent',
+                         'unlink-failure','umount-failure','reset-failure','pg-after-reset'):
+            with self.subTest(scenario=scenario),tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+                mutations=[];parser_present=[True]
+                original=new_mount if scenario=='preexisting' else old_mount
+                mounted,after_sha=fixture.securityfs_state(new_mount)
+                _cover,before_sha=fixture.securityfs_state(original)
+                prepared={'version':1,'synthetic':True,'state':'complete','identity':{**identity,'profile':'devres-acceptance-fixture',
+                    'node_uid':uid,'host_mount_namespace':'mnt:[10]','node_mount_namespace':'mnt:[20]'},
+                    'source_sha256':hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),'apparmor_sha256':fixture.APPARMOR_SHA256,
+                    'before':processes(80,50),'after':processes(100,90),'securityfs_preexisting':scenario=='preexisting',
+                    'server_image':'candidate:server','parser':PARSER,'write_boundaries':{'projection_sha256':'a'*64},
+                    'securityfs_before_sha256':before_sha,'securityfs_after_sha256':after_sha,'securityfs_mount':mounted,
+                    'securityfs_created':scenario!='preexisting','kubelet_restarted':True,'containerd_restarted':True,
+                    'parser_placement':PLACEMENT}
+                fixture.validate_node_preparation('npm-assessment-node-preparation.json',prepared)
+                cluster=fixture.Cluster('devres-acceptance-fixture',Path(temporary));cluster.k=unittest.mock.Mock()
+                def objects(kind):return [{}] if scenario==kind+'-live' else []
+                cluster.owned_objects=objects
+                def execute(_identity,*args,**kwargs):
+                    self.assertEqual(_identity,identity)
+                    if args==('cat','/proc/self/mountinfo'):
+                        raw=original if 'umount' in mutations else new_mount
+                        if scenario=='wrong-mount':raw=raw.replace(b'3 2 0:3',b'4 2 0:3')
+                        if scenario=='wrong-preimage' and 'umount' in mutations:raw=raw.replace(b'shared:11',b'shared:12')
+                        return subprocess.CompletedProcess([],0,raw,b'')
+                    if args[:1]==('unlink',):
+                        self.assertEqual(args,('unlink','--','/usr/sbin/apparmor_parser'));mutations.append('unlink');parser_present[0]=False
+                        if scenario=='unlink-failure':raise fixture.FixtureError('fixture_command_failed')
+                    elif args[:1]==('umount',):
+                        self.assertEqual(args,('umount','--',fixture.NODE_SECURITYFS));mutations.append('umount')
+                        if scenario=='umount-failure':raise fixture.FixtureError('fixture_command_failed')
+                    elif args[:2]==('/bin/sh','-c'):
+                        self.assertFalse(parser_present[0]);self.assertIn('test ! -e /usr/sbin/apparmor_parser',args[2])
+                    elif args[:2]==('systemctl','restart'):
+                        self.assertIn(args[2],('containerd','kubelet'));mutations.append(args[2])
+                        if scenario=='reset-failure':raise fixture.FixtureError('fixture_command_failed')
+                    else:raise AssertionError(args)
+                    return subprocess.CompletedProcess([],0,b'',b'')
+                file_identity=copy.deepcopy(PARSER_FILE)
+                if scenario=='wrong-inode':file_identity['inode']+=1
+                if scenario=='wrong-ctime':file_identity['ctime']='2026-11-17 12:00:00.123456788 +0000'
+                def pg(_cluster):
+                    return {**postgres,'restart_count':1} if scenario=='pg-drift' or scenario=='pg-after-reset' and 'containerd' in mutations else postgres
+                def daemon(_identity):return processes(100,190 if 'containerd' in mutations else 90)['containerd']
+                def kubelet_runtime(_identity,pid,_name):
+                    value=processes(pid,90)['kubelet_process']
+                    if scenario=='kubelet-binary-drift':value={**value,'binary_sha256':'7'*64}
+                    return value,1
+                actual_receipt=fixture.receipt
+                def save(_cluster,name,value):
+                    if scenario=='lost-intent' and name=='npm-assessment-node-restoration-intent.json':return False
+                    return actual_receipt(_cluster,name,value)
+                if scenario=='replay':
+                    intent={'version':1,'synthetic':True,'state':'prepared','preparation':prepared,
+                        'preparation_sha256':hashlib.sha256(json.dumps(prepared,sort_keys=True).encode()+b'\n').hexdigest(),
+                        'before':prepared['after'],'after':None,'parser_removed':False,'securityfs_restored':False,'securityfs_final_sha256':None}
+                    fixture.private_json(Path(temporary)/'npm-assessment-node-restoration-intent.json',intent)
+                with patch.dict(os.environ,{'DEVRES_E2E_DIAGNOSTICS_DIR':''}), \
+                     patch.object(fixture,'node_docker_identity',return_value={**identity,'container_id':'2'*64} if scenario=='wrong-cid' else identity), \
+                     patch.object(fixture,'node_uid',return_value='34567890-1234-1234-1234-123456789abc' if scenario=='wrong-uid' else uid), \
+                     patch.object(fixture,'node_namespace',return_value='mnt:[30]' if scenario=='wrong-ns' else 'mnt:[20]'), \
+                     patch.object(fixture,'host_mount_state',return_value=('mnt:[10]','9'*64 if scenario=='host-drift' else '3'*64,{'shared:3'})), \
+                     patch.object(fixture,'node_write_boundaries',return_value={'projection_sha256':'b'*64 if scenario=='private-storage-drift' else 'a'*64}), \
+                     patch.object(fixture,'no_attached_tasks',return_value=scenario!='attached-live'), \
+                     patch.object(fixture,'command',return_value=subprocess.CompletedProcess([],0,b'devres-runtime (enforce)\n' if scenario=='profile-live' else b'docker-default (enforce)\n',b'')), \
+                     patch.object(fixture,'parser_placement_state',return_value=file_identity),patch.object(fixture,'node_exec',side_effect=execute), \
+                     patch.object(fixture,'postgres_process',side_effect=pg), \
+                     patch.object(fixture,'postgres_runtime',return_value={**runtime,'shim':{**runtime['shim'],'pid':1998}} if scenario=='shim-drift' else runtime), \
+                     patch.object(fixture,'containerd_process',side_effect=daemon), \
+                     patch.object(fixture,'kubelet_process',side_effect=lambda _identity:200 if 'kubelet' in mutations else 100), \
+                     patch.object(fixture,'node_process',side_effect=kubelet_runtime),patch.object(fixture,'receipt',side_effect=save):
+                    if scenario in ('valid','preexisting'):
+                        fixture.restore_node_apparmor(cluster,prepared)
+                        self.assertEqual(mutations,['unlink']+([] if scenario=='preexisting' else ['umount'])+['containerd','kubelet'])
+                        value=json.loads((Path(temporary)/'npm-assessment-node-restoration.json').read_bytes())
+                        fixture.validate_node_restoration('npm-assessment-node-restoration.json',value)
+                        self.assertEqual(value['securityfs_final_sha256'],before_sha)
+                    else:
+                        with self.assertRaises(fixture.FixtureError):fixture.restore_node_apparmor(cluster,prepared)
+                        self.assertFalse((Path(temporary)/'npm-assessment-node-restoration.json').exists())
+                        if scenario=='unlink-failure':self.assertEqual(mutations,['unlink'])
+                        elif scenario in ('umount-failure','wrong-preimage'):self.assertEqual(mutations,['unlink','umount'])
+                        elif scenario=='reset-failure':self.assertEqual(mutations,['unlink','umount','containerd'])
+                        elif scenario=='pg-after-reset':self.assertEqual(mutations,['unlink','umount','containerd','kubelet'])
+                        else:self.assertEqual(mutations,[])
+                        failure=json.loads((Path(temporary)/'npm-assessment-node-restoration-failure.json').read_bytes())
+                        fixture.validate_receipt('npm-assessment-node-restoration-failure.json',failure)
+                        self.assertNotIn('stderr',json.dumps(failure))
+
+    def test_securityfs_restoration_refuses_stacked_or_descendant_mounts(self):
+        raw=b'1 0 0:1 / /sys rw - sysfs sysfs rw\n2 1 0:2 / /sys/kernel/security ro,nosuid,nodev,noexec - securityfs securityfs rw\n'
+        fixture.securityfs_state(raw)
+        for extra in (b'3 1 0:3 / /sys/kernel/security ro - securityfs securityfs rw\n',
+                      b'3 2 0:3 / /sys/kernel/security/foreign rw - tmpfs tmpfs rw\n'):
+            with self.assertRaises(fixture.FixtureError):fixture.securityfs_state(raw+extra)
+
+    def test_restoration_follows_checked_task_cleanup_and_precedes_final_success(self):
+        for failed in (False,True):
+            with self.subTest(failed=failed),tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+                events=[];records=[];prepared=object()
+                class Cluster:
+                    profile='devres-acceptance-fixture';scratch=Path(temporary)
+                    def owned_objects(self,_kind):return []
+                    def apply(self,_objects):pass
+                    def create(self,_objects):pass
+                    def admit_owned(self,_kind):return '12345678-1234-1234-1234-123456789abc'
+                    def cleanup_owned(self,kind):events.append(kind+'-cleaned')
+                    def k(self,*_args,**_kwargs):return subprocess.CompletedProcess([],0,b'',b'')
+                cluster=Cluster();(cluster.scratch/'fixture').mkdir();(cluster.scratch/'fixture/backend.toml').write_text('synthetic')
+                @contextlib.contextmanager
+                def profile(_scratch,stopped):
+                    try:yield fixture.APPARMOR_SHA256
+                    finally:
+                        self.assertTrue(stopped());events.append('profile-cleaned')
+                error=fixture.FixtureError('fixture_node_restoration_identity')
+                def restore(actual_cluster,actual_prepared):
+                    self.assertIs(actual_cluster,cluster);self.assertIs(actual_prepared,prepared)
+                    self.assertIn('namespace-cleaned',events);self.assertIn('policy-cleaned',events)
+                    self.assertEqual(events[-1],'profile-cleaned');events.append('restore-attempt')
+                    if failed:raise error
+                    events.append('restored')
+                def receipt(_cluster,name,value):events.append(name);records.append((name,value));return True
+                args=types.SimpleNamespace(profile=cluster.profile,scratch=temporary,harness_image='harness:fixture',server_image='candidate:server')
+                with patch.object(fixture,'Cluster',return_value=cluster),patch.object(fixture,'prepare_node_apparmor',return_value=prepared), \
+                     patch.object(fixture,'apparmor',side_effect=profile),patch.object(fixture,'restore_node_apparmor',side_effect=restore), \
+                     patch.object(fixture,'configuration',return_value='synthetic'),patch.object(fixture,'network_probe',return_value={}), \
+                     patch.object(fixture,'seed',return_value={}),patch.object(fixture,'snapshot',return_value={}), \
+                     patch.object(fixture,'assess',return_value={'phase':'report_transferred'}),patch.object(fixture,'failure_matrix',return_value=[]), \
+                     patch.object(fixture,'receipt',side_effect=receipt):
+                    if failed:
+                        with self.assertRaises(fixture.FixtureError) as caught:fixture.run(args)
+                        self.assertIs(caught.exception,error)
+                        self.assertNotIn('npm-assessment-receipt.json',events)
+                        self.assertEqual(records[-1][1]['phase'],'node-restoration')
+                        self.assertEqual(records[-1][1]['namespace_cleanup'],'removed')
+                        self.assertEqual(records[-1][1]['apparmor_cleanup'],'removed')
+                    else:
+                        fixture.run(args)
+                        self.assertEqual(events[-2:],['restored','npm-assessment-receipt.json'])
 
     def test_apply_groups_explicit_namespaces_without_changing_policy_grants(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:

@@ -58,7 +58,7 @@ OBSERVER_ERRORS = frozenset(('unknown', 'interrupted', 'fixture_command_failed',
 OBSERVER_RESTORATIONS = frozenset(('sql-grant', 'objectstore-start', 'objectstore-ready',
     'backend-stop', 'writer-stop', 'policy-remove', 'writer-config', 'reader-config',
     'writer-template', 'reader-template', 'writer-start', 'backend-start', 'semantic-ready'))
-SETUP_PHASES = frozenset(('admission', 'node-preparation', 'apparmor', 'namespace', 'identity', 'policy',
+SETUP_PHASES = frozenset(('admission', 'node-preparation', 'node-restoration', 'apparmor', 'namespace', 'identity', 'policy',
     'configuration', 'network', 'seed', 'baseline', 'positive', 'invariants', 'matrix', 'cleanup'))
 SETUP_CODES = OBSERVER_ERRORS | frozenset(('fixture_command_timeout', 'fixture_apply_objects_required',
     'fixture_apply_namespace_invalid', 'owned_tmp_fixture_required', 'fresh_assessment_namespace_required',
@@ -79,7 +79,8 @@ SETUP_CODES = OBSERVER_ERRORS | frozenset(('fixture_command_timeout', 'fixture_a
 SETUP_CODES = SETUP_CODES | frozenset(('fixture_parser_package', 'fixture_parser_archive',
     'fixture_parser_member', 'fixture_parser_download', 'fixture_parser_node', 'fixture_parser_version',
     'fixture_parser_write_boundary', 'fixture_image_reference', 'fixture_image_identity',
-    'fixture_image_storage', 'fixture_image_graph', 'fixture_image_architecture'))
+    'fixture_image_storage', 'fixture_image_graph', 'fixture_image_architecture',
+    'fixture_node_restoration_identity', 'fixture_node_restoration_cleanup', 'fixture_node_restoration_preimage'))
 CONTROL_COMMANDS = frozenset(('unknown', 'apparmor-policy', 'apparmor-state', 'apparmor-tasks',
     'docker-metadata', 'docker-exec', 'kubectl.apply', 'kubectl.create', 'kubectl.exec',
     'kubectl.wait', 'kubectl.delete', 'kubectl.get', 'kubectl.logs', 'kubectl.patch', 'kubectl.rollout'))
@@ -551,6 +552,13 @@ def validate_receipt(name, value):
          and value.get('synthetic') is True, 'fixture_receipt_identity')
     if name in ('npm-assessment-node-preparation-intent.json', 'npm-assessment-node-preparation.json'):
         validate_node_preparation(name, value)
+    elif name in ('npm-assessment-node-restoration-intent.json', 'npm-assessment-node-restoration.json'):
+        validate_node_restoration(name, value)
+    elif name == 'npm-assessment-node-restoration-failure.json':
+        need(set(value) == {'version', 'synthetic', 'phase', 'failure'}
+             and value['phase'] in ('admission', 'parser-remove', 'securityfs-restore', 'runtime-reset', 'verify'),
+             'fixture_receipt_node_restoration')
+        validate_closed_failure(value['failure'])
     elif name in ('npm-assessment-image-preparation-intent.json', 'npm-assessment-image-preparation.json'):
         validate_image_preparation(name, value)
     elif name == 'npm-assessment-image-preparation-failure.json':
@@ -833,7 +841,9 @@ def node_process(identity, pid, executable):
     need(type(pid) is int and 1 < pid < 2**31, 'fixture_node_runtime_process')
     path = '/proc/' + str(pid)
     name = node_exec(identity, 'readlink', path + '/exe').stdout.decode('ascii').strip()
-    need(name in ('/usr/bin/' + executable, '/usr/local/bin/' + executable), 'fixture_node_runtime_process')
+    need(name in ('/usr/bin/' + executable, '/usr/local/bin/' + executable)
+         or executable == 'kubelet' and re.fullmatch(r'/var/lib/minikube/binaries/v[0-9]+\.[0-9]+\.[0-9]+/kubelet', name),
+         'fixture_node_runtime_process')
     raw = node_exec(identity, 'cat', path + '/stat').stdout.decode('ascii')
     head, tail = raw.rsplit(') ', 1)
     fields = tail.split()
@@ -1011,19 +1021,43 @@ def install_parser(identity, namespace, payload, guard):
     command(['docker', 'exec', '-i', identity['container_id'], '/bin/sh', '-c', script,
              'fixture-parser-copy', namespace], data=payload)
     guard()
-    parser_placement_state(identity)
+    file_identity = parser_placement_state(identity)
     version = node_exec(identity, '/sbin/apparmor_parser', '--version', maximum=4096).stdout.decode('ascii').splitlines()
     need(version and version[0] == 'AppArmor parser version 3.0.8', 'fixture_parser_version')
     guard()
-    return {'path': '/usr/sbin/apparmor_parser', 'version': '3.0.8', 'mode': 0o500, 'binary_sha256': PARSER_SHA256}
+    need(parser_placement_state(identity) == file_identity, 'fixture_parser_node')
+    return {'path': '/usr/sbin/apparmor_parser', 'version': '3.0.8', 'mode': 0o500,
+            'binary_sha256': PARSER_SHA256, 'file_identity': file_identity}
 
 
 def parser_placement_state(identity):
     need(node_exec(identity, 'readlink', '-f', '/sbin/apparmor_parser').stdout.decode('ascii').strip() == '/usr/sbin/apparmor_parser'
-         and node_exec(identity, 'stat', '-c', '%F:%u:%g:%a:%s:%h', '/usr/sbin/apparmor_parser').stdout.strip()
-             == ('regular file:0:0:500:' + str(PARSER_SIZE) + ':1').encode()
          and node_exec(identity, 'sha256sum', '/sbin/apparmor_parser').stdout.decode('ascii').split()[0] == PARSER_SHA256,
          'fixture_parser_node')
+    fields = node_exec(identity, 'env', 'LC_ALL=C', 'stat', '-c', '%F:%u:%g:%a:%s:%h:%d:%i',
+                       '/usr/sbin/apparmor_parser').stdout.decode('ascii').strip().split(':')
+    need(len(fields) == 8 and fields[:6] == ['regular file', '0', '0', '500', str(PARSER_SIZE), '1']
+         and all(field.isdecimal() and 0 < int(field) < 2**64 for field in fields[6:]), 'fixture_parser_node')
+    ctime = node_exec(identity, 'env', 'LC_ALL=C', 'stat', '-c', '%z', '/usr/sbin/apparmor_parser').stdout.decode('ascii').strip()
+    value = {'device': int(fields[6]), 'inode': int(fields[7]), 'ctime': ctime}
+    validate_parser_file_identity(value)
+    return value
+
+
+def validate_parser_file_identity(value):
+    need(type(value) is dict and set(value) == {'device', 'inode', 'ctime'}
+         and all(type(value[key]) is int and 0 < value[key] < 2**64 for key in ('device', 'inode'))
+         and type(value['ctime']) is str and re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9} [+-][0-9]{4}', value['ctime']),
+         'fixture_receipt_node_parser')
+
+
+def securityfs_state(raw):
+    cover, related, _shared = mount_projection(raw)
+    # Stacked mounts at the exact path are ambiguous even when their cover is
+    # identical. Never unmount an unrecorded replacement or a child mount.
+    need(sum(line.split()[4] == NODE_SECURITYFS for line in raw.decode().splitlines()) <= 1
+         and len(related) == 1, 'fixture_node_restoration_preimage')
+    return cover, hashlib.sha256(json.dumps(related, sort_keys=True).encode()).hexdigest()
 
 
 def prepare_node_apparmor(cluster, server_image):
@@ -1036,13 +1070,15 @@ def prepare_node_apparmor(cluster, server_image):
          'fixture_host_mount_namespace_refused')
     host_namespace, host_digest, host_shared = host_mount_state()
     need(namespace != host_namespace, 'fixture_host_mount_namespace_refused')
-    cover, _rows, _shared = mount_projection(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    cover, security_before = securityfs_state(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
     need(not (set(cover['propagation']) & host_shared), 'fixture_host_mount_propagation_refused')
     module = node_exec(identity, 'cat', '/sys/module/apparmor/parameters/enabled').stdout.strip()
     need(module == b'Y', 'fixture_node_apparmor_kernel_disabled')
     present = cover['target'] == NODE_SECURITYFS and cover['filesystem'] == 'securityfs'
     postgres = postgres_process(cluster)
-    before = {'kubelet_pid': kubelet_process(identity), 'containerd': containerd_process(identity),
+    kubelet = kubelet_process(identity)
+    before = {'kubelet_pid': kubelet, 'kubelet_process': node_process(identity, kubelet, 'kubelet')[0],
+              'containerd': containerd_process(identity),
               'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
               'host_mounts_sha256': host_digest}
     parser = parser_admission(identity)
@@ -1053,7 +1089,7 @@ def prepare_node_apparmor(cluster, server_image):
     intent = {'version': 1, 'synthetic': True, 'state': 'prepared', 'identity': bound,
               'source_sha256': source, 'apparmor_sha256': APPARMOR_SHA256, 'before': before,
               'securityfs_preexisting': present, 'server_image': server_image, 'parser': parser,
-              'write_boundaries': boundaries}
+              'write_boundaries': boundaries, 'securityfs_before_sha256': security_before}
     need(receipt(cluster, 'npm-assessment-node-preparation-intent.json', intent), 'fixture_evidence_retention_incomplete')
     need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid, 'fixture_node_identity_changed')
     if not present:
@@ -1067,7 +1103,7 @@ def prepare_node_apparmor(cluster, server_image):
     current_host_namespace, current_host_digest, _ = host_mount_state()
     need((current_host_namespace, current_host_digest) == (host_namespace, host_digest),
          'fixture_host_mount_changed')
-    mounted, _rows, _shared = mount_projection(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    mounted, security_after = securityfs_state(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
     need(mounted['target'] == NODE_SECURITYFS and mounted['filesystem'] == 'securityfs'
          and (present or {'ro', 'nosuid', 'nodev', 'noexec'} <= set(mounted['options'])),
          'fixture_node_securityfs_not_confined')
@@ -1092,36 +1128,45 @@ def prepare_node_apparmor(cluster, server_image):
     cluster.k('wait', '--for=condition=Ready', 'node/' + cluster.profile, '--timeout=180s', timeout=190)
     cluster.k('rollout', 'status', 'deployment/postgres', '--timeout=180s', namespace='devres-acceptance', timeout=190)
     postgres = postgres_process(cluster)
-    after = {'kubelet_pid': kubelet_process(identity), 'containerd': containerd_process(identity),
+    kubelet = kubelet_process(identity)
+    after = {'kubelet_pid': kubelet, 'kubelet_process': node_process(identity, kubelet, 'kubelet')[0],
+             'containerd': containerd_process(identity),
              'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
              'host_mounts_sha256': host_mount_state()[1]}
-    parser_placement_state(identity)
+    need(parser_placement_state(identity) == placement['file_identity'], 'fixture_parser_node')
     guard()
     need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid
          and node_namespace(identity) == namespace and host_mount_state()[:2] == (host_namespace, host_digest)
          and after['postgres'] == before['postgres'] and after['postgres_runtime'] == before['postgres_runtime']
          and after['containerd']['binary_sha256'] == before['containerd']['binary_sha256']
+         and after['kubelet_process']['binary_sha256'] == before['kubelet_process']['binary_sha256']
          and after['containerd']['pid'] != before['containerd']['pid']
          and after['kubelet_pid'] != before['kubelet_pid']
          and hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == source,
          'fixture_node_preparation_identity_changed')
     result = {**intent, 'state': 'complete', 'after': after, 'securityfs_created': not present,
-              'kubelet_restarted': True, 'containerd_restarted': True, 'parser_placement': placement}
+              'kubelet_restarted': True, 'containerd_restarted': True, 'parser_placement': placement,
+              'securityfs_after_sha256': security_after, 'securityfs_mount': mounted}
     need(receipt(cluster, 'npm-assessment-node-preparation.json', result), 'fixture_evidence_retention_incomplete')
     return result
 
 
 def validate_node_preparation(name, value):
+    need(type(value) is dict and type(value.get('version')) is int and value['version'] == 1
+         and value.get('synthetic') is True, 'fixture_receipt_node_identity')
     fields = {'version', 'synthetic', 'state', 'identity', 'source_sha256', 'apparmor_sha256',
-              'before', 'securityfs_preexisting', 'server_image', 'parser', 'write_boundaries'}
+              'before', 'securityfs_preexisting', 'server_image', 'parser', 'write_boundaries', 'securityfs_before_sha256'}
     complete = name == 'npm-assessment-node-preparation.json'
-    need(set(value) == fields | ({'after', 'securityfs_created', 'kubelet_restarted', 'containerd_restarted', 'parser_placement'} if complete else set()),
+    need(set(value) == fields | ({'after', 'securityfs_created', 'kubelet_restarted', 'containerd_restarted',
+         'parser_placement', 'securityfs_after_sha256', 'securityfs_mount'} if complete else set()),
          'fixture_receipt_node_fields')
     need(value['state'] == ('complete' if complete else 'prepared')
          and type(value['securityfs_preexisting']) is bool
          and value['apparmor_sha256'] == APPARMOR_SHA256
          and type(value['source_sha256']) is str and re.fullmatch('[0-9a-f]{64}', value['source_sha256'])
          and type(value['server_image']) is str and re.fullmatch(r'[A-Za-z0-9._:/@+\-]{1,256}', value['server_image']),
+         'fixture_receipt_node_identity')
+    need(type(value['securityfs_before_sha256']) is str and re.fullmatch('[a-f0-9]{64}', value['securityfs_before_sha256']),
          'fixture_receipt_node_identity')
     need(value['parser'] == {'package_sha256': PARSER_PACKAGE_SHA256, 'package_size': PARSER_PACKAGE_SIZE,
          'binary_sha256': PARSER_SHA256, 'binary_size': PARSER_SIZE, 'libc': '2.36', 'preexisting': False},
@@ -1146,11 +1191,13 @@ def validate_node_preparation(name, value):
              and type(record['binary_sha256']) is str and re.fullmatch('[0-9a-f]{64}', record['binary_sha256'])
              and (not daemon or record['kill_mode'] == 'process'), 'fixture_receipt_node_process')
     for snapshot in ([value['before'], value['after']] if complete else [value['before']]):
-        need(type(snapshot) is dict and set(snapshot) == {'kubelet_pid', 'containerd', 'postgres', 'postgres_runtime', 'host_mounts_sha256'}
+        need(type(snapshot) is dict and set(snapshot) == {'kubelet_pid', 'kubelet_process', 'containerd', 'postgres', 'postgres_runtime', 'host_mounts_sha256'}
              and type(snapshot['kubelet_pid']) is int and 1 < snapshot['kubelet_pid'] < 2**31
              and type(snapshot['host_mounts_sha256']) is str and re.fullmatch('[0-9a-f]{64}', snapshot['host_mounts_sha256']),
              'fixture_receipt_node_process')
         process(snapshot['containerd'], daemon=True)
+        process(snapshot['kubelet_process'])
+        need(snapshot['kubelet_process']['pid'] == snapshot['kubelet_pid'], 'fixture_receipt_node_process')
         postgres = snapshot['postgres']
         need(type(postgres) is dict and set(postgres) == {'uid', 'container_id', 'restart_count'}
              and type(postgres['uid']) is str and re.fullmatch(UUID_PATTERN, postgres['uid'])
@@ -1172,14 +1219,133 @@ def validate_node_preparation(name, value):
              and value['before']['postgres_runtime'] == value['after']['postgres_runtime']
              and value['before']['host_mounts_sha256'] == value['after']['host_mounts_sha256']
              and value['before']['containerd']['binary_sha256'] == value['after']['containerd']['binary_sha256']
+             and value['before']['kubelet_process']['binary_sha256'] == value['after']['kubelet_process']['binary_sha256']
              and (not value['containerd_restarted'] or value['before']['containerd']['pid'] != value['after']['containerd']['pid'])
              and (not value['kubelet_restarted'] or value['before']['kubelet_pid'] != value['after']['kubelet_pid']),
              'fixture_receipt_node_preservation')
         placement = value['parser_placement']
-        need(type(placement) is dict and set(placement) == {'path', 'version', 'mode', 'binary_sha256'}
+        need(type(placement) is dict and set(placement) == {'path', 'version', 'mode', 'binary_sha256', 'file_identity'}
              and placement['path'] == '/usr/sbin/apparmor_parser'
              and placement['version'] == '3.0.8' and placement['mode'] == 0o500
              and placement['binary_sha256'] == PARSER_SHA256, 'fixture_receipt_node_parser')
+        validate_parser_file_identity(placement['file_identity'])
+        mounted = value['securityfs_mount']
+        need(type(mounted) is dict and set(mounted) == {'id', 'parent', 'device', 'root', 'target', 'options',
+             'propagation', 'filesystem', 'source', 'super_options'} and mounted['target'] == NODE_SECURITYFS
+             and mounted['filesystem'] == 'securityfs' and mounted['root'] == '/'
+             and all(type(mounted[key]) is str and re.fullmatch('[0-9]{1,20}', mounted[key]) for key in ('id', 'parent'))
+             and type(mounted['device']) is str and re.fullmatch('[0-9]{1,20}:[0-9]{1,20}', mounted['device'])
+             and type(mounted['source']) is str and re.fullmatch(r'[A-Za-z0-9._:/+\-]{1,128}', mounted['source'])
+             and all(type(mounted[key]) is list and len(mounted[key]) <= 32
+                 and all(type(item) is str and re.fullmatch(r'[A-Za-z0-9._:=/+\-]{1,256}', item) for item in mounted[key])
+                 for key in ('options', 'propagation', 'super_options'))
+             and (not value['securityfs_created'] or {'ro', 'nosuid', 'nodev', 'noexec'} <= set(mounted['options']))
+             and value['securityfs_after_sha256'] == hashlib.sha256(json.dumps([mounted], sort_keys=True).encode()).hexdigest()
+             and (value['securityfs_created'] or value['securityfs_after_sha256'] == value['securityfs_before_sha256']),
+             'fixture_receipt_node_identity')
+
+
+def validate_node_restoration(name, value):
+    need(set(value) == {'version', 'synthetic', 'state', 'preparation', 'preparation_sha256', 'before', 'after',
+         'parser_removed', 'securityfs_restored', 'securityfs_final_sha256'}, 'fixture_receipt_node_restoration')
+    prepared = value['preparation']
+    validate_node_preparation('npm-assessment-node-preparation.json', prepared)
+    need(value['preparation_sha256'] == hashlib.sha256(json.dumps(prepared, sort_keys=True).encode() + b'\n').hexdigest()
+         and value['before'] == prepared['after'], 'fixture_receipt_node_restoration')
+    complete = name == 'npm-assessment-node-restoration.json'
+    need(value['state'] == ('complete' if complete else 'prepared') and value['parser_removed'] is complete
+         and value['securityfs_restored'] is complete, 'fixture_receipt_node_restoration')
+    if complete:
+        validate_node_preparation('npm-assessment-node-preparation.json',
+                                  {**prepared, 'before': value['before'], 'after': value['after']})
+        need(value['securityfs_final_sha256'] == prepared['securityfs_before_sha256'], 'fixture_receipt_node_restoration')
+    else:
+        need(value['after'] is None and value['securityfs_final_sha256'] is None, 'fixture_receipt_node_restoration')
+
+
+def restore_node_apparmor(cluster, prepared):
+    cluster.node_restoration_phase = 'admission'
+    try:
+        restore_node_apparmor_fixture(cluster, prepared)
+    except BaseException as error:
+        receipt(cluster, 'npm-assessment-node-restoration-failure.json', {'version': 1, 'synthetic': True,
+            'phase': cluster.node_restoration_phase, 'failure': closed_failure(error)})
+        raise
+
+
+def restore_node_apparmor_fixture(cluster, prepared):
+    """Return only this owned node's temporary prerequisites to their preimage."""
+    validate_node_preparation('npm-assessment-node-preparation.json', prepared)
+    bound = prepared['identity']
+    need(bound['profile'] == cluster.profile, 'fixture_node_restoration_identity')
+    identity = {key: bound[key] for key in ('container_id', 'container_pid')}
+    def identity_guard():
+        need(hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == prepared['source_sha256']
+             and node_docker_identity(cluster) == identity and node_uid(cluster) == bound['node_uid']
+             and node_namespace(identity) == bound['node_mount_namespace']
+             and host_mount_state()[:2] == (bound['host_mount_namespace'], prepared['after']['host_mounts_sha256'])
+             and node_write_boundaries(cluster, identity, bound['node_uid']) == prepared['write_boundaries'],
+             'fixture_node_restoration_identity')
+    def snapshot_processes():
+        postgres = postgres_process(cluster)
+        kubelet = kubelet_process(identity)
+        return {'kubelet_pid': kubelet, 'kubelet_process': node_process(identity, kubelet, 'kubelet')[0],
+                'containerd': containerd_process(identity),
+                'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
+                'host_mounts_sha256': host_mount_state()[1]}
+    identity_guard()
+    need(not cluster.owned_objects('namespace') and not cluster.owned_objects('policy') and no_attached_tasks(),
+         'fixture_node_restoration_cleanup')
+    profiles = command(['sudo', '-n', 'cat', '/sys/kernel/security/apparmor/profiles']).stdout.splitlines()
+    need(not any(line.startswith((b'devres-runtime ', b'devres-runtime//')) for line in profiles),
+         'fixture_node_restoration_cleanup')
+    need(parser_placement_state(identity) == prepared['parser_placement']['file_identity'], 'fixture_node_restoration_identity')
+    mounted, security = securityfs_state(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    need(mounted == prepared['securityfs_mount'] and security == prepared['securityfs_after_sha256']
+         and not (set(mounted['propagation']) & host_mount_state()[2]), 'fixture_node_restoration_preimage')
+    before = snapshot_processes()
+    need(before == prepared['after'], 'fixture_node_restoration_identity')
+    intent = {'version': 1, 'synthetic': True, 'state': 'prepared', 'preparation': prepared,
+        'preparation_sha256': hashlib.sha256(json.dumps(prepared, sort_keys=True).encode() + b'\n').hexdigest(),
+        'before': before, 'after': None, 'parser_removed': False, 'securityfs_restored': False,
+        'securityfs_final_sha256': None}
+    need(receipt(cluster, 'npm-assessment-node-restoration-intent.json', intent), 'fixture_evidence_retention_incomplete')
+    identity_guard()
+    need(parser_placement_state(identity) == prepared['parser_placement']['file_identity'], 'fixture_node_restoration_identity')
+    cluster.node_restoration_phase = 'parser-remove'
+    node_exec(identity, 'unlink', '--', '/usr/sbin/apparmor_parser')
+    node_exec(identity, '/bin/sh', '-c', 'test ! -e /usr/sbin/apparmor_parser && test ! -L /usr/sbin/apparmor_parser')
+    cluster.node_restoration_phase = 'securityfs-restore'
+    identity_guard()
+    mounted, security = securityfs_state(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    need(mounted == prepared['securityfs_mount'] and security == prepared['securityfs_after_sha256']
+         and not (set(mounted['propagation']) & host_mount_state()[2]),
+         'fixture_node_restoration_preimage')
+    if prepared['securityfs_created']:
+        node_exec(identity, 'umount', '--', NODE_SECURITYFS)
+    _cover, final_security = securityfs_state(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    need(final_security == prepared['securityfs_before_sha256'], 'fixture_node_restoration_preimage')
+    cluster.node_restoration_phase = 'runtime-reset'
+    identity_guard()
+    need(snapshot_processes() == before, 'fixture_node_restoration_identity')
+    node_exec(identity, 'systemctl', 'restart', 'containerd', timeout=60)
+    node_exec(identity, 'systemctl', 'restart', 'kubelet', timeout=60)
+    cluster.k('wait', '--for=condition=Ready', 'node/' + cluster.profile, '--timeout=180s', timeout=190)
+    cluster.k('rollout', 'status', 'deployment/postgres', '--timeout=180s', namespace='devres-acceptance', timeout=190)
+    cluster.node_restoration_phase = 'verify'
+    identity_guard()
+    after = snapshot_processes()
+    node_exec(identity, '/bin/sh', '-c', 'test ! -e /usr/sbin/apparmor_parser && test ! -L /usr/sbin/apparmor_parser')
+    _cover, final_security = securityfs_state(node_exec(identity, 'cat', '/proc/self/mountinfo').stdout)
+    need(final_security == prepared['securityfs_before_sha256'] and after['postgres'] == before['postgres']
+         and after['postgres_runtime'] == before['postgres_runtime']
+         and after['containerd']['binary_sha256'] == before['containerd']['binary_sha256']
+         and after['kubelet_process']['binary_sha256'] == before['kubelet_process']['binary_sha256']
+         and after['containerd']['pid'] != before['containerd']['pid'] and after['kubelet_pid'] != before['kubelet_pid'],
+         'fixture_node_restoration_identity')
+    need(receipt(cluster, 'npm-assessment-node-restoration.json', {**intent, 'state': 'complete', 'after': after,
+         'parser_removed': True, 'securityfs_restored': True, 'securityfs_final_sha256': final_security}),
+         'fixture_evidence_retention_incomplete')
 
 
 ATTACHED_TASKS = r'''
@@ -1831,7 +1997,7 @@ def run_fixture(arguments, cluster, progress):
         'labels': {FIXTURE_OWNER_LABEL: cluster.fixture_owner,
                    'pod-security.kubernetes.io/enforce': 'restricted', 'pod-security.kubernetes.io/enforce-version': 'latest'}}}
     progress['phase'] = 'node-preparation'
-    prepare_node_apparmor(cluster, arguments.server_image)
+    prepared_node = prepare_node_apparmor(cluster, arguments.server_image)
     cleanup_confirmed = [True]
     progress['phase'] = 'apparmor'
     with apparmor(scratch, lambda: cleanup_confirmed[0]) as profile_hash:
@@ -1907,6 +2073,8 @@ def run_fixture(arguments, cluster, progress):
                     raise failures[0]
                 cleanup_confirmed[0] = True
     progress['apparmor_cleanup'] = 'removed'
+    progress['phase'] = 'node-restoration'
+    restore_node_apparmor(cluster, prepared_node)
     need(not getattr(cluster, 'receipt_failures', []), 'fixture_evidence_retention_incomplete')
     need(receipt(cluster, 'npm-assessment-receipt.json', result_receipt), 'fixture_evidence_retention_incomplete')
     print('Synthetic real-image Kubernetes npm recovery assessment passed')
