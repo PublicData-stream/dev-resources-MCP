@@ -173,11 +173,11 @@ def command(arguments,maximum=32*1024**2):
     return result.stdout
 
 
-def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,alias_qualification_sha=None):
+def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,alias_qualification_sha=None,retained_data_qualification_sha=None):
     """Classify every namespace mapping before checking any process reference."""
     exposure=set(roots)|set(aliases);namespaces={};processes=0;started=time.monotonic()
     proc=Path(proc);all_mounts=[];inventory=[]
-    qualified=validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc) if alias_qualification_sha else None
+    qualified=validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha) if alias_qualification_sha else None
     self_mounts=mount_rows((proc/'self/mountinfo').read_text())
     for path in sorted(proc.iterdir(),key=lambda p:p.name):
         if not path.name.isdecimal():continue
@@ -249,7 +249,7 @@ def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,ali
             except PermissionError:raise Refused('process_inventory_incomplete') from None
     mount_bookend()
     if qualified is not None:
-        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc)==qualified,
+        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha)==qualified,
              'livepatch_alias_qualification_changed')
     sockets=set(socket_paths) if socket_paths is not None else {Path('/var/run/docker.sock'),*Path('/run/user').glob('*/docker.sock')}
     configured=os.environ.get('DOCKER_HOST')
@@ -285,19 +285,21 @@ def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,ali
         firewall.append(sha(body))
     mount_bookend()
     if qualified is not None:
-        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc)==qualified,
+        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha)==qualified,
              'livepatch_alias_qualification_changed')
     return {'verified':True,'process_count':processes,'mount_namespaces':len(namespaces),
-        'alias_qualification_sha256':alias_qualification_sha,'qualified_alias_count':len(observed),
+        'alias_qualification_sha256':alias_qualification_sha,'retained_data_qualification_sha256':retained_data_qualification_sha,'qualified_alias_count':len(observed),
         'mounts_sha256':sha(encode(sorted(all_mounts,key=encode))),
         'docker_sha256':sha(encode(docker)),'firewall_sha256':sha(encode(firewall))}
 
 
 class Engine:
     """Parameterized for local fake trees; the CLI never accepts alternate roots."""
-    def __init__(self,cycles=CYCLES,journal=JOURNAL,guard=system_guard,*,qualification_sha=None):
+    def __init__(self,cycles=CYCLES,journal=JOURNAL,guard=system_guard,*,qualification_sha=None,retained_data_qualification_sha=None):
         self.cycles=cycles;self.journal=Path(journal);self.qualification_sha=qualification_sha
-        self.guard=(lambda roots,aliases,tokens:system_guard(roots,aliases,tokens,alias_qualification_sha=qualification_sha)) if qualification_sha and guard is system_guard else guard
+        self.retained_data_qualification_sha=retained_data_qualification_sha
+        need(retained_data_qualification_sha is None or self.journal==DATA_JOURNAL,'fixed_retained_data_apply_journal_required')
+        self.guard=(lambda roots,aliases,tokens:system_guard(roots,aliases,tokens,alias_qualification_sha=qualification_sha,retained_data_qualification_sha=retained_data_qualification_sha)) if qualification_sha and guard is system_guard else guard
         self.whitelist={cycle.bundle/relative:(cycle,relative) for cycle in cycles for relative in LEAVES}
 
     def canonical(self,path):
@@ -354,6 +356,10 @@ class Engine:
         return token
 
     def protected(self,selected,delete):
+        retained=None
+        if self.retained_data_qualification_sha:
+            retained=validate_retained_data_scope(self.retained_data_qualification_sha,selected,self.aliases(selected),delete=delete)
+        body_roots=[] if retained is None else [Path(item['path']) for item in retained['producer_data']['roots']]
         paths=set();cycles={self.whitelist[path][0] for path in selected}
         for cycle in cycles:
             manifest=load(cycle.work/'source-manifest.json');paths.add(cycle.work/'source-manifest.json')
@@ -364,7 +370,7 @@ class Engine:
                      and re.fullmatch('[0-9a-f]{64}',wanted or ''),'source_manifest_invalid')
                 path=(cycle.install if name in SPECIAL else cycle.work)/name
                 need(file_record(path)['sha256']==wanted,'historical_source_changed');paths.add(path)
-            skipped={cycle.bundle/'checkpoint-volume'/'pg-checkpoint',cycle.bundle/'checkpoint-volume'/'fallback-cache'}
+            skipped={cycle.bundle/'checkpoint-volume'/'pg-checkpoint',cycle.bundle/'checkpoint-volume'/'fallback-cache',*body_roots}
             for base in (cycle.bundle,cycle.work):
                 for folder,dirs,files in os.walk(base,followlinks=False):
                     current=Path(folder)
@@ -388,6 +394,9 @@ class Engine:
                     artifact_path=self.canonical(artifact['path'])
                     need(not any(under(artifact_path,leaf) for leaf in selected),'backup_artifact_inside_reclaim_leaf')
                     need(file_record(artifact_path)['sha256']==artifact['sha256'],'backup_artifact_changed')
+        if retained is not None:
+            records['producer-retained-data']={'kind':'structural-nonmodification','payloads_rehashed':False,
+                'qualification_sha256':self.retained_data_qualification_sha,'producer_data':retained['producer_data']}
         return records
 
     def preview(self,selected):
@@ -418,7 +427,7 @@ class Engine:
             if key not in seen:allocated+=item['blocks']*512;seen.add(key)
         proof=self.guard(leaves,aliases,sorted(set(tokens)))
         return {'version':1,'kind':'cycle4-completed-fixture-reclaim','script_sha256':sha(Path(__file__).read_bytes()),
-            'alias_qualification_sha256':self.qualification_sha,
+            'alias_qualification_sha256':self.qualification_sha,'retained_data_qualification_sha256':self.retained_data_qualification_sha,
             'leaves':[str(path) for path in leaves],'delete_roots':[str(path) for path in delete],
             'aliases':[str(path) for path in aliases],'tokens':sorted(set(tokens)),
             'ancestors':ancestors,'trees':inventories,'protected':protected,
@@ -682,7 +691,10 @@ def _alias_record(receipt_sha,roots,aliases):
     return value
 
 
-def validate_livepatch_aliases(receipt_sha,roots,aliases,*,proc=Path('/proc'),live_boundary=None):
+def validate_livepatch_aliases(receipt_sha,roots,aliases,*,proc=Path('/proc'),live_boundary=None,retained_data_qualification_sha=None):
+    if retained_data_qualification_sha is not None:
+        need(receipt_sha==FROZEN_ALIAS_SHA,'exact_historical_alias_pin_required')
+        return validate_retained_data_scope(retained_data_qualification_sha,roots,aliases,proc=proc,live_boundary=live_boundary)['alias_qualification']
     value=_alias_record(receipt_sha,roots,aliases)
     need(value['snapshot']==capture_livepatch_aliases(roots,aliases,proc=proc),'livepatch_qualification_stale')
     if live_boundary is not None:need(value['live_boundary']==live_boundary,'alias_qualification_boundary_changed')
@@ -719,33 +731,203 @@ def qualify_livepatch_aliases(boundary):
     return {'alias_qualification_sha256':sha(ALIAS_RECEIPT.read_bytes()),'alias_count':12,'guard_accepted':False}
 
 
+# A new explicit envelope preserves the consumed bfe helper/33 alias admission.
+FROZEN_RECLAIM=Path('/usr/local/libexec/devres-upgrade-3dae7d91/reclaim-completed-fixtures.livepatch-bfe19552.py')
+FROZEN_RECLAIM_SHA='bfe195526a19847a06fc352f6d407c65f34356ad309ecb2e7352814f9f43561a'
+FROZEN_ALIAS_SHA='33acd1ef6093aae4129a0cf2c632f77895333d7c9a321ee605cdb6afdb6b5de9'
+DATA_SCOPE=Path('/var/lib/devres-production-reclaim-qualifications/3dae7d91-20261117-producer-data-v1')
+DATA_INTENT=DATA_SCOPE/'intent.json'
+DATA_RECEIPT=DATA_SCOPE/'qualification.json'
+DATA_JOURNAL=Path('/var/lib/devres-production-reclaim/3dae7d91-20261117-producer-data-v1')
+PRODUCER_CYCLE=CYCLES[0]
+PRODUCER_ROOT=PRODUCER_CYCLE.bundle/'checkpoint-volume/proof-successor-v1'
+PRODUCER_BODY_NAMES=('pg-checkpoint','pg-clone','fallback-cache','rehearsal/cache','rehearsal/writer-cache')
+PRODUCER_BODY_AUTHORITY={'pg-checkpoint':(70,70,0o700),'pg-clone':(70,70,0o700),
+    'fallback-cache':(0,0,0o700),'rehearsal/cache':(65532,65532,0o700),
+    'rehearsal/writer-cache':(65532,65532,0o2770)}
+PRODUCER_PINS={
+    PRODUCER_CYCLE.install/'proof-continuation.py':'1f547b63a08f3ff5b5dd91944cbd092acc243df9f1d03656831edb80a33ac43d',
+    PRODUCER_CYCLE.install/'physical-checkpoint.py':'c8efc0d0e398e057dfb0395db18e74e4bdbb95998c93e1f64ea797b5eadd2eef',
+    PRODUCER_CYCLE.bundle/'checkpoint-volume/completed.json':'0ddc0a989e44e2d4c9ae680ebce8918218a2557c0a43502b57461c2b03d82a60',
+    PRODUCER_CYCLE.bundle/'checkpoint-volume/backup-receipt.json':'8a0c3f3a5db9a6528fcdafc40e480b123bc47d18a5bb5b95d0dbcea71f25e3c1',
+    PRODUCER_ROOT/'admission.json':'e056d3eef3263134948491d55056ba1a33c4833f6c9738023a0c244dde277e00',
+    PRODUCER_ROOT/'completed.json':'fccedcb2bb880607426b2eb18b6a757bda43bdcf17121cc9cc1283ae1afa39ae',
+    PRODUCER_ROOT/'backup-receipt.json':'a66f78e586eac3cc7efa496177aff78dfe341afd6a8a0742481c00d19e788ea4',
+    PRODUCER_ROOT/'cache-baselines.json':'abfe1c988855985aec8350af3f31009eed5635b5307adf93fb45017f55dbc163',
+    PRODUCER_ROOT/'pg-file-manifest.jsonl':'454b91828731d83441a8056338161ef448e376b682eccbb2f75bc8a8f27941eb',
+    PRODUCER_ROOT/'checkpoint-completed.json':'2342c68c03fd2b1c43ef9176e4374f414d1e597c0232f50b3440ea0085f608dd'}
+
+
+def frozen_reclaim():
+    need(file_record(FROZEN_RECLAIM)['sha256']==FROZEN_RECLAIM_SHA,'exact_frozen_reclaim_required')
+    spec=importlib.util.spec_from_file_location('reclaim_preserved_bfe_namespace_authority',FROZEN_RECLAIM)
+    module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+    need(file_record(FROZEN_RECLAIM)['sha256']==FROZEN_RECLAIM_SHA,'exact_frozen_reclaim_required')
+    return module
+
+
+def producer_canonical(path):
+    path=Path(path)
+    source=PRODUCER_CYCLE.work/'checkpoint-state'
+    return PRODUCER_CYCLE.bundle/'checkpoint-volume'/path.relative_to(source) if under(path,source) else path
+
+
+def producer_data_projection(selected,delete):
+    """Existing complete provenance plus structural noninterference; no body read."""
+    canonical=Engine(cycles=CYCLES).canonical
+    selected=[canonical(Path(path)) for path in selected];delete=[canonical(Path(path)) for path in delete]
+    need(sorted(selected,key=str)==sorted(ALIAS_LEAVES,key=str),'exact_retained_data_leaf_scope_required')
+    safe_path(PRODUCER_ROOT);parent=identity(PRODUCER_ROOT)
+    need(parent['uid']==os.geteuid() and parent['mode']==0o700,'private_producer_root_required')
+    pins={}
+    for path,wanted in PRODUCER_PINS.items():
+        record=file_record(path);need(record['sha256']==wanted,'retained_data_producer_changed');pins[str(path)]=record
+    cp=PRODUCER_CYCLE.bundle/'checkpoint-volume';admission=load(PRODUCER_ROOT/'admission.json')
+    completed=load(PRODUCER_ROOT/'completed.json');outer=load(cp/'completed.json')
+    checkpoint=load(PRODUCER_ROOT/'checkpoint-completed.json')
+    cache_sha=pins[str(PRODUCER_ROOT/'cache-baselines.json')]['sha256']
+    pg_sha=pins[str(PRODUCER_ROOT/'pg-file-manifest.jsonl')]['sha256']
+    need(admission.get('version')==1 and admission.get('kind')=='isolated-proof-successor-v1'
+         and admission.get('maximum_attempts')==1 and admission.get('only_change')=='restore_original_writer_cache_ceiling'
+         and producer_canonical(admission.get('successor_scope',''))==PRODUCER_ROOT
+         and producer_canonical(admission.get('original_scope',''))==cp
+         and admission.get('source_sha256')==pins[str(PRODUCER_CYCLE.install/'proof-continuation.py')]['sha256']
+         and admission.get('checkpoint_source_sha256')==pins[str(PRODUCER_CYCLE.install/'physical-checkpoint.py')]['sha256']
+         and admission.get('global_manifest_sha256')==file_record(PRODUCER_CYCLE.work/'source-manifest.json')['sha256'],
+         'retained_data_admission_changed')
+    need(admission.get('immutable_sha256',{}).get('cache-baselines.json')==cache_sha
+         and completed.get('cache_baselines_sha256')==cache_sha and file_record(cp/'cache-baselines.json')['sha256']==cache_sha
+         and completed.get('pg_files_sha256')==checkpoint.get('pg_files_sha256')==pg_sha
+         and completed.get('checkpoint_receipt_sha256')==pins[str(PRODUCER_ROOT/'checkpoint-completed.json')]['sha256']
+         and outer.get('proof_continuation',{}).get('admission_sha256')==pins[str(PRODUCER_ROOT/'admission.json')]['sha256']
+         and outer.get('proof_continuation',{}).get('source_sha256')==admission['source_sha256']
+         and completed.get('old_clone_verified') is True and completed.get('fallback_writer_verified') is True,
+         'complete_retained_data_provenance_required')
+    roots=[]
+    body_paths=[PRODUCER_ROOT/name for name in PRODUCER_BODY_NAMES]
+    need(all(not under(path,other) and not under(other,path) for path in body_paths for other in [*selected,*delete]),
+         'retained_data_deletion_overlap')
+    expected=PRODUCER_BODY_AUTHORITY
+    for name in PRODUCER_BODY_NAMES:
+        path=PRODUCER_ROOT/name;safe_path(path);info=identity(path)
+        need(info['dev']==parent['dev'] and tuple(info[key] for key in ('uid','gid','mode'))==expected[name],
+             'retained_data_root_authority_changed')
+        need(not any(under(path,other) or under(other,path) for other in [*selected,*delete]),
+             'retained_data_deletion_overlap')
+        need(all((info['dev'],info['ino'])!=(identity(other)['dev'],identity(other)['ino']) for other in [*selected,*delete]),
+             'retained_data_inode_overlap')
+        alias=PRODUCER_CYCLE.work/'checkpoint-state'/path.relative_to(cp)
+        safe_path(alias);need(identity(alias)==info,'retained_data_work_alias_changed')
+        roots.append({'path':str(path),'identity':info,'work_alias':str(alias)})
+    need(len({(item['identity']['dev'],item['identity']['ino']) for item in roots})==5
+         and all(not under(Path(first['path']),Path(second['path'])) for first in roots for second in roots if first is not second),
+         'distinct_retained_body_roots_required')
+    # Explicit backup artifacts are always metadata, never hidden by a body prune.
+    for path in (cp/'backup-receipt.json',PRODUCER_ROOT/'backup-receipt.json'):
+        backup=load(path)
+        need(backup.get('verified') is True and type(backup.get('artifacts')) is list,'verified_retained_backup_required')
+        need(any(Path(item['path']).name=='cache-baselines.json' and item['sha256']==cache_sha for item in backup['artifacts']),
+             'retained_cache_manifest_not_bound')
+        for item in backup['artifacts']:
+            artifact=producer_canonical(item['path'])
+            need(not any(under(artifact,Path(root['path'])) for root in roots),'retained_data_metadata_overlap')
+            need(file_record(artifact)['sha256']==item['sha256'],'retained_data_backup_artifact_changed')
+    return {'roots':roots,'producer_root_identity':parent,'provenance':pins,
+        'payloads_rehashed':False,'preservation_scope':'structurally_disjoint_unlink_only'}
+
+
+def _retained_data_record(receipt_sha,selected,aliases,delete=None,*,proc=Path('/proc'),live_boundary=None):
+    safe_path(JOURNAL);safe_path(DATA_JOURNAL)
+    info=file_record(DATA_RECEIPT);body=DATA_RECEIPT.read_bytes()
+    need(re.fullmatch('[0-9a-f]{64}',receipt_sha or '') and sha(body)==receipt_sha
+         and file_record(DATA_RECEIPT)==info,'external_retained_data_qualification_required')
+    value=json.loads(body)
+    need(value.get('version')==1 and value.get('kind')=='cycle4-producer-data-reclaim-qualification'
+         and value.get('script_sha256')==sha(Path(__file__).read_bytes()) and value.get('maximum_attempts')==1
+         and value.get('previous_source_sha256')==FROZEN_RECLAIM_SHA
+         and value.get('previous_qualification_sha256')==FROZEN_ALIAS_SHA
+         and value.get('previous_source_identity')==file_record(FROZEN_RECLAIM)
+         and value.get('payloads_rehashed') is False
+         and value.get('previous_reclaim_journal')=={'path':str(JOURNAL),'absent':True}
+         and value.get('new_reclaim_journal')==str(DATA_JOURNAL) and not JOURNAL.exists(),
+         'source_bound_retained_data_qualification_required')
+    need(load(DATA_INTENT)=={'version':1,'maximum_attempts':1,'script_sha256':value['script_sha256'],
+        'previous_source_sha256':FROZEN_RECLAIM_SHA,'previous_qualification_sha256':FROZEN_ALIAS_SHA,
+        'previous_journal':str(JOURNAL),'new_journal':str(DATA_JOURNAL)},'retained_data_intent_changed')
+    old=frozen_reclaim()
+    historical=old.validate_livepatch_aliases(FROZEN_ALIAS_SHA,selected,aliases,proc=proc,
+        live_boundary=live_boundary if live_boundary is not None else value['live_boundary'])
+    need(historical==value['alias_qualification'],'historical_alias_qualification_changed')
+    if delete is None:
+        engine=Engine(cycles=CYCLES);delete=[root for leaf in selected for root in engine.delete_roots(Path(leaf),engine.whitelist[Path(leaf)][1])]
+    need(value['producer_data']==producer_data_projection(selected,delete),'retained_data_projection_changed')
+    return value
+
+
+def validate_retained_data_scope(receipt_sha,selected,aliases,delete=None,*,proc=Path('/proc'),live_boundary=None):
+    return _retained_data_record(receipt_sha,selected,aliases,delete,proc=proc,live_boundary=live_boundary)
+
+
+def qualify_retained_data_scope(boundary):
+    old=frozen_reclaim();selected=list(ALIAS_LEAVES);engine=Engine(cycles=CYCLES);aliases=engine.aliases(selected)
+    delete=[root for leaf in selected for root in engine.delete_roots(leaf,engine.whitelist[leaf][1])]
+    before=boundary.check();source_sha=sha(Path(__file__).read_bytes());source_identity=file_record(FROZEN_RECLAIM)
+    need(not DATA_SCOPE.exists(),'retained_data_qualification_already_consumed')
+    safe_path(JOURNAL);safe_path(DATA_JOURNAL)
+    need(not JOURNAL.exists() and not DATA_JOURNAL.exists(),'only_inspect_only_fresh_reclaim_continues')
+    safe_path(DATA_SCOPE)
+    DATA_SCOPE.mkdir(mode=0o700,parents=True);sync(DATA_SCOPE.parent)
+    new(DATA_INTENT,{'version':1,'maximum_attempts':1,'script_sha256':source_sha,
+        'previous_source_sha256':FROZEN_RECLAIM_SHA,'previous_qualification_sha256':FROZEN_ALIAS_SHA,
+        'previous_journal':str(JOURNAL),'new_journal':str(DATA_JOURNAL)})
+    historical=old.validate_livepatch_aliases(FROZEN_ALIAS_SHA,selected,aliases,live_boundary=before)
+    projection=producer_data_projection(selected,delete)
+    safe_path(JOURNAL);safe_path(DATA_JOURNAL)
+    need(producer_data_projection(selected,delete)==projection and boundary.check()==before
+         and old.validate_livepatch_aliases(FROZEN_ALIAS_SHA,selected,aliases,live_boundary=before)==historical
+         and sha(Path(__file__).read_bytes())==source_sha and file_record(FROZEN_RECLAIM)==source_identity
+         and not JOURNAL.exists() and not DATA_JOURNAL.exists(),'retained_data_qualification_bookend_changed')
+    new(DATA_RECEIPT,{'version':1,'kind':'cycle4-producer-data-reclaim-qualification','maximum_attempts':1,
+        'script_sha256':source_sha,'previous_source_sha256':FROZEN_RECLAIM_SHA,
+        'previous_source_identity':source_identity,'previous_qualification_sha256':FROZEN_ALIAS_SHA,
+        'alias_qualification':historical,'live_boundary':before,'producer_data':projection,'payloads_rehashed':False,
+        'previous_reclaim_journal':{'path':str(JOURNAL),'absent':True},'new_reclaim_journal':str(DATA_JOURNAL)})
+    return {'retained_data_qualification_sha256':sha(DATA_RECEIPT.read_bytes()),'retained_body_root_count':5,
+        'payloads_rehashed':False,'guard_accepted':False}
+
+
 def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='operation',required=True)
     inspect=sub.add_parser('inspect');inspect.add_argument('--leaf',type=Path,action='append',required=True)
     inspect.add_argument('--output',type=Path,required=True)
-    sub.add_parser('qualify-aliases')
-    inspect.add_argument('--alias-qualification-sha256')
+    sub.add_parser('qualify-aliases');sub.add_parser('qualify-data-scope')
+    inspect.add_argument('--alias-qualification-sha256');inspect.add_argument('--retained-data-qualification-sha256')
     apply=sub.add_parser('apply');apply.add_argument('--preview',type=Path,required=True)
     apply.add_argument('--preview-sha256',required=True);apply.add_argument('--script-sha256',required=True)
-    apply.add_argument('--alias-qualification-sha256')
+    apply.add_argument('--alias-qualification-sha256');apply.add_argument('--retained-data-qualification-sha256')
     args=parser.parse_args();need(os.geteuid()==0,'root_required')
     qualification_sha=getattr(args,'alias_qualification_sha256',None)
-    engine=Engine(qualification_sha=qualification_sha)
+    data_sha=getattr(args,'retained_data_qualification_sha256',None)
+    need(data_sha is None or qualification_sha==FROZEN_ALIAS_SHA,'historical_alias_pin_required_with_data_scope')
+    engine=Engine(journal=DATA_JOURNAL if data_sha else JOURNAL,qualification_sha=qualification_sha,retained_data_qualification_sha=data_sha)
     with LiveBoundary() as boundary:
         if args.operation=='qualify-aliases':
             result=qualify_livepatch_aliases(boundary)
+        elif args.operation=='qualify-data-scope':
+            result=qualify_retained_data_scope(boundary)
         elif args.operation=='inspect':
             need(args.output.is_absolute() and Path('/tmp') in args.output.parents,'private_tmp_preview_required')
-            if qualification_sha:validate_livepatch_aliases(qualification_sha,args.leaf,engine.aliases(args.leaf),live_boundary=boundary.check())
+            if qualification_sha:validate_livepatch_aliases(qualification_sha,args.leaf,engine.aliases(args.leaf),live_boundary=boundary.check(),retained_data_qualification_sha=data_sha)
             value=engine.preview(args.leaf);value['live_boundary']=boundary.check();new(args.output,value)
             result={'preview':True,'preview_sha256':sha(encode(value)),
                 'allocated_file_bytes':value['allocated_file_bytes'],'leaf_count':len(value['leaves'])}
         else:
             file_record(Path(__file__))
             value=load(args.preview)
+            need(value.get('retained_data_qualification_sha256')==data_sha,'external_retained_data_qualification_changed')
             need(value.get('alias_qualification_sha256')==qualification_sha,'external_alias_qualification_changed')
-            if qualification_sha:validate_livepatch_aliases(qualification_sha,value['leaves'],[Path(p) for p in value['aliases']],live_boundary=boundary.check())
+            if qualification_sha:validate_livepatch_aliases(qualification_sha,value['leaves'],[Path(p) for p in value['aliases']],live_boundary=boundary.check(),retained_data_qualification_sha=data_sha)
             need(value.get('live_boundary')==boundary.check(),'external_live_boundary_changed')
             completed=engine.apply(value,args.preview_sha256,args.script_sha256)
             new(engine.journal/'live-boundary-completed.json',{'verified':True,

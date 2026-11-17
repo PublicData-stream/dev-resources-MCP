@@ -71,6 +71,17 @@ aliases before checking any process handle or mapping, recheck the qualification
 at the bookends, and continue refusing every other unknown alias or active use.
 Do not stop Livepatch, alter its service, unmount its view or change its authority.
 
+The retained first-cycle proof successor contains complete PostgreSQL and cache
+copies as well as its evidence. A separately source-bound inventory qualification
+may exclude only its five producer-defined data roots from the metadata walk.
+Validate the frozen producers, admission, completed receipts and complete baseline
+manifests; retain their hashes and the data-root identities. Keep every evidence
+file outside those roots protected, preserve the metadata count and byte limits,
+and require both path separation and the existing external-hardlink refusal.
+This proves that reclaim does not modify those copies; it does not establish a
+fresh content verification of the retained cache bodies. Chain the existing
+Livepatch qualification through its unchanged producer and preserve both scopes.
+
 ## Bootstrap, assessment and paused observation
 
 Bootstrap the target writer and verify schema 19, retained manifests, notices,

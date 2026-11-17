@@ -419,6 +419,193 @@ class LivepatchAliasTests(unittest.TestCase):
         with self.assertRaisesRegex(n.Refused,'leaf_exposed_by_mount'):self.guard(pin)
 
 
+class ProducerDataScopeTests(unittest.TestCase):
+    """Synthetic producer metadata + prior self-hash API model, not live acceptance."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(dir='/tmp');self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        cycles=[]
+        for index,name in enumerate(('cycle1','cycle3')):
+            parent=self.root/name;parent.mkdir();value=fixture(parent)
+            cycles.append(n.Cycle(name,value.bundle,value.work,value.install))
+        self.cycles=tuple(cycles);self.cycle=cycles[0];cp=self.cycle.bundle/'checkpoint-volume'
+        self.producer=cp/'proof-successor-v1';self.producer.mkdir(mode=0o700)
+        self.leaves=[cycle.bundle/relative for cycle in cycles for relative in n.LEAVES]
+        self.roots=[self.producer/name for name in n.PRODUCER_BODY_NAMES]
+        for path in self.roots:path.mkdir(mode=0o700,parents=True,exist_ok=True)
+        self.body=self.producer/'rehearsal/writer-cache/capture.json';write(self.body,b'public retained cache body')
+        write(self.producer/'fallback-cache/object.json',b'another retained body')
+        self.evidence=self.producer/'rehearsal/files/retained.toml';write(self.evidence,b'operational configuration')
+        for cycle in cycles:
+            for volume,prefix in (('checkpoint-volume','checkpoint-state'),('restore-rehearsal-volume','restore-rehearsal-state')):
+                (cycle.work/prefix).mkdir()
+            for relative in ('checkpoint-volume/rehearsal/cache','checkpoint-volume/rehearsal/writer-cache',
+                'restore-rehearsal-volume/runtime/cache-serving','restore-rehearsal-volume/runtime/isolated-pv'):
+                (cycle.bundle/relative).mkdir(parents=True,exist_ok=True)
+        self.alias_root=self.cycle.work/'checkpoint-state/proof-successor-v1'
+        for name in n.PRODUCER_BODY_NAMES:(self.alias_root/name).mkdir(mode=0o700,parents=True,exist_ok=True)
+        write(self.alias_root/'rehearsal/writer-cache/capture.json',b'same retained alias payload')
+        identity=n.identity
+        def projected_identity(path):
+            path=Path(path)
+            for cycle in self.cycles:
+                for prefix,volume in (('checkpoint-state','checkpoint-volume'),('restore-rehearsal-state','restore-rehearsal-volume')):
+                    alias=cycle.work/prefix
+                    if n.under(path,alias):return identity(cycle.bundle/volume/path.relative_to(alias))
+            return identity(path)
+        aliases=patch.object(n,'identity',side_effect=projected_identity);aliases.start();self.addCleanup(aliases.stop)
+        write(self.cycle.install/'physical-checkpoint.py',b'# immutable producer checkpoint source')
+        write(self.cycle.install/'proof-continuation.py',b'# immutable admitted continuation source')
+        manifest=n.load(self.cycle.work/'source-manifest.json')
+        manifest['physical-checkpoint.py']=n.sha((self.cycle.install/'physical-checkpoint.py').read_bytes())
+        write(self.cycle.work/'source-manifest.json',manifest)
+        cache={'manifests':{'writer':{'sha256':'b'*64,'rows':[{'path':'capture.json','kind':'file'}]}}}
+        write(cp/'cache-baselines.json',cache);write(self.producer/'cache-baselines.json',cache)
+        pg=b'{"kind":"file","path":"PG_VERSION","sha256":"retained"}\n';write(self.producer/'pg-file-manifest.jsonl',pg)
+        checkpoint={'pg_files_sha256':n.sha(pg)};write(self.producer/'checkpoint-completed.json',checkpoint)
+        admission={'version':1,'kind':'isolated-proof-successor-v1','maximum_attempts':1,
+            'only_change':'restore_original_writer_cache_ceiling',
+            'successor_scope':str(self.alias_root),'original_scope':str(self.cycle.work/'checkpoint-state'),
+            'source_sha256':n.sha((self.cycle.install/'proof-continuation.py').read_bytes()),
+            'checkpoint_source_sha256':manifest['physical-checkpoint.py'],
+            'global_manifest_sha256':n.sha((self.cycle.work/'source-manifest.json').read_bytes()),
+            'immutable_sha256':{'cache-baselines.json':n.sha((cp/'cache-baselines.json').read_bytes())}}
+        write(self.producer/'admission.json',admission)
+        completed={'cache_baselines_sha256':n.sha((cp/'cache-baselines.json').read_bytes()),
+            'pg_files_sha256':n.sha(pg),'checkpoint_receipt_sha256':n.sha((self.producer/'checkpoint-completed.json').read_bytes()),
+            'old_clone_verified':True,'fallback_writer_verified':True}
+        write(self.producer/'completed.json',completed)
+        write(cp/'completed.json',{'old_clone_verified':True,'proof_continuation':{
+            'admission_sha256':n.sha((self.producer/'admission.json').read_bytes()),'source_sha256':admission['source_sha256']}})
+        artifacts=[{'path':str(path),'sha256':n.sha(path.read_bytes())} for path in
+            (self.producer/'cache-baselines.json',self.producer/'pg-file-manifest.jsonl',self.producer/'completed.json')]
+        write(self.producer/'backup-receipt.json',{'verified':True,'artifacts':artifacts})
+        write(cp/'backup-receipt.json',{'verified':True,'artifacts':artifacts})
+        pins={path:n.sha(path.read_bytes()) for path in (self.cycle.install/'proof-continuation.py',
+            self.cycle.install/'physical-checkpoint.py',cp/'completed.json',cp/'backup-receipt.json',
+            *(self.producer/name for name in ('admission.json','completed.json','backup-receipt.json','cache-baselines.json','pg-file-manifest.jsonl','checkpoint-completed.json')))}
+        self.old_source=self.root/'preserved-prior.py';self.old_receipt=self.root/'prior-qualification.json'
+        code=("import hashlib,json,pathlib\nRECEIPT=pathlib.Path("+repr(str(self.old_receipt))+")\ndef need(value):\n if not value:raise RuntimeError('prior_binding_refused')\ndef validate_livepatch_aliases(pin,roots,aliases,proc=None,live_boundary=None):\n body=RECEIPT.read_bytes();need(hashlib.sha256(body).hexdigest()==pin)\n value=json.loads(body);need(value['script_sha256']==hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest())\n need(value['snapshot']['roots']==sorted(map(str,roots)))\n need(value['snapshot']['aliases']==sorted(map(str,aliases)))\n if live_boundary is not None:need(value['live_boundary']==live_boundary)\n return value\n").encode()
+        write(self.old_source,code)
+        self.scope=self.root/'new-data-scope';self.receipt=self.scope/'qualification.json';self.intent=self.scope/'intent.json'
+        values={'CYCLES':self.cycles,'ALIAS_LEAVES':tuple(self.leaves),'PRODUCER_CYCLE':self.cycle,
+            'PRODUCER_ROOT':self.producer,'PRODUCER_PINS':pins,
+            'PRODUCER_BODY_AUTHORITY':{name:(os.geteuid(),os.getegid(),0o700) for name in n.PRODUCER_BODY_NAMES},
+            'FROZEN_RECLAIM':self.old_source,'FROZEN_RECLAIM_SHA':n.sha(code),'DATA_SCOPE':self.scope,
+            'DATA_RECEIPT':self.receipt,'DATA_INTENT':self.intent,
+            'JOURNAL':self.root/'previous-journal','DATA_JOURNAL':self.root/'new-apply-journal'}
+        constants=patch.multiple(n,**values);constants.start();self.addCleanup(constants.stop)
+        engine=n.Engine(cycles=self.cycles);self.aliases=engine.aliases(self.leaves)
+        self.fp={'current_source_manifest_sha256':n.ALIAS_MANIFEST_SHA,'edge_readmission_sha256':n.ALIAS_EDGE_SHA,'state_sha256':'exact'}
+        self.boundary=SimpleNamespace(check=Mock(return_value=self.fp))
+        prior={'script_sha256':n.sha(code),'snapshot':{'roots':sorted(map(str,self.leaves)),
+            'aliases':sorted(map(str,self.aliases)),'mappings':[]},'live_boundary':self.fp}
+        write(self.old_receipt,prior);pin=patch.object(n,'FROZEN_ALIAS_SHA',n.sha(self.old_receipt.read_bytes()));pin.start();self.addCleanup(pin.stop)
+        self.guard=Mock(return_value={'verified':True})
+    def qualify(self):return n.qualify_retained_data_scope(self.boundary)
+    def engine(self,pin):return n.Engine(self.cycles,self.root/'new-apply-journal',self.guard,
+        qualification_sha=n.FROZEN_ALIAS_SHA,retained_data_qualification_sha=pin)
+    def test_exact_producer_scope_chain_prunes_only_five_data_roots_without_body_reads(self):
+        before={path:n.file_record(path) for path in (self.body,self.evidence,self.old_source,self.old_receipt)}
+        result=self.qualify();pin=result['retained_data_qualification_sha256'];self.assertFalse(result['payloads_rehashed'])
+        original=n.file_record
+        def records(path,*args,**kwargs):
+            canonical=n.producer_canonical(path)
+            if any(n.under(canonical,root) and canonical!=root for root in self.roots):raise AssertionError('retained body read')
+            return original(path,*args,**kwargs)
+        with patch.object(n,'file_record',side_effect=records):
+            preview=self.engine(pin).preview(self.leaves)
+        self.assertIn(str(self.evidence),preview['protected']);self.assertNotIn(str(self.body),preview['protected'])
+        self.assertEqual(preview['protected']['producer-retained-data']['kind'],'structural-nonmodification')
+        self.assertEqual(preview['retained_data_qualification_sha256'],pin)
+        self.assertEqual({path:n.file_record(path) for path in before},before)
+        with self.assertRaisesRegex(n.Refused,'already_consumed'):self.qualify()
+    def test_every_body_root_is_structurally_disjoint_including_known_work_aliases(self):
+        engine=n.Engine(cycles=self.cycles);delete=[root for leaf in self.leaves for root in engine.delete_roots(leaf,engine.whitelist[leaf][1])]
+        for root in self.roots:
+            for overlap in (root,root/'child',root.parent,self.alias_root/root.relative_to(self.producer),self.alias_root/root.relative_to(self.producer)/'child'):
+                with self.subTest(root=root,overlap=overlap),self.assertRaisesRegex(n.Refused,'deletion_overlap'):
+                    n.producer_data_projection(self.leaves,delete+[overlap])
+    def test_producer_hash_and_outside_metadata_changes_never_authorize_prune(self):
+        write(self.cycle.install/'proof-continuation.py',b'changed')
+        with self.assertRaisesRegex(n.Refused,'producer_changed'):self.qualify()
+        self.assertTrue(self.intent.exists());self.assertFalse(self.receipt.exists())
+    def test_root_symlink_device_mode_and_work_alias_drift_are_refused(self):
+        original=n.identity
+        for mutation in ('device','inode-alias','mode'):
+            def identity(path):
+                result=original(path)
+                if Path(path)==self.roots[0]:result={**result,('dev' if mutation=='device' else 'mode'):(result['dev']+1 if mutation=='device' else 0o777)}
+                if mutation=='inode-alias' and Path(path)==self.alias_root/'pg-checkpoint':result={**result,'ino':result['ino']+1}
+                return result
+            with self.subTest(mutation=mutation),patch.object(n,'identity',side_effect=identity),self.assertRaises(n.Refused):
+                n.producer_data_projection(self.leaves,[])
+        target=self.roots[1];target.rmdir();target.symlink_to(self.roots[0])
+        with self.assertRaisesRegex(n.Refused,'symlink'):n.producer_data_projection(self.leaves,[])
+    def test_frozen_source_and_old_self_hash_are_checked_without_global_rebinding(self):
+        result=self.qualify();pin=result['retained_data_qualification_sha256']
+        frozen=n.frozen_reclaim();self.assertEqual(Path(frozen.__file__),self.old_source)
+        self.assertEqual(frozen.validate_livepatch_aliases.__code__.co_filename,str(self.old_source))
+        self.assertEqual(frozen.RECEIPT,self.old_receipt)
+        old=n.load(self.old_receipt);old['script_sha256']='0'*64;write(self.old_receipt,old)
+        with self.assertRaises(RuntimeError):n.validate_retained_data_scope(pin,self.leaves,self.aliases)
+    def test_wrong_external_pin_source_or_boundary_refuses(self):
+        pin=self.qualify()['retained_data_qualification_sha256']
+        with self.assertRaisesRegex(n.Refused,'external_retained'):n.validate_retained_data_scope('0'*64,self.leaves,self.aliases)
+        with self.assertRaises(RuntimeError):n.validate_retained_data_scope(pin,self.leaves,self.aliases,live_boundary={'state_sha256':'changed'})
+        write(self.old_source,b'raise AssertionError("must not import")')
+        with patch.object(n.importlib.util,'spec_from_file_location') as loader,self.assertRaises(n.Refused):
+            n.validate_retained_data_scope(pin,self.leaves,self.aliases)
+        loader.assert_not_called()
+    def test_new_outside_metadata_is_protected_and_fails_stale_preview_before_intent(self):
+        pin=self.qualify()['retained_data_qualification_sha256'];engine=self.engine(pin)
+        leaf=self.leaves[0];write(leaf/'delete.bin',b'disposable');preview=engine.preview(self.leaves)
+        outside=self.producer/'rehearsal/files/new-operational.json';write(outside,{'keep':True})
+        with self.assertRaisesRegex(n.Refused,'preview_stale'):
+            engine.apply(preview,n.sha(n.encode(preview)),preview['script_sha256'])
+        self.assertTrue((leaf/'delete.bin').exists());self.assertFalse(engine.journal.exists())
+        self.assertIn(str(outside),engine.preview(self.leaves)['protected'])
+    def test_external_hardlink_to_retained_body_still_refuses_before_any_apply(self):
+        pin=self.qualify()['retained_data_qualification_sha256'];os.link(self.body,self.leaves[0]/'alias.json')
+        with self.assertRaisesRegex(n.Refused,'external_hardlink'):self.engine(pin).preview(self.leaves)
+        self.assertFalse(self.engine(pin).journal.exists())
+    def test_qualification_bookend_drift_consumes_intent_without_new_receipt(self):
+        self.boundary.check.side_effect=[self.fp,{**self.fp,'state_sha256':'changed'}]
+        with self.assertRaisesRegex(n.Refused,'bookend_changed'):self.qualify()
+        self.assertTrue(self.intent.exists());self.assertFalse(self.receipt.exists())
+    def test_consumed_previous_journal_cannot_be_rearmed_by_a_new_scope(self):
+        write(n.JOURNAL/'intent.json',{'consumed':True})
+        with self.assertRaisesRegex(n.Refused,'inspect_only'):self.qualify()
+        self.assertFalse(self.intent.exists());self.assertFalse(self.receipt.exists())
+    def test_later_previous_intent_blocks_apply_but_current_apply_journal_validation_is_allowed(self):
+        pin=self.qualify()['retained_data_qualification_sha256'];engine=self.engine(pin)
+        preview=engine.preview(self.leaves)
+        write(n.DATA_JOURNAL/'intent.json',{'current-own-intent':True})
+        self.assertEqual(n.validate_retained_data_scope(pin,self.leaves,self.aliases)['new_reclaim_journal'],str(n.DATA_JOURNAL))
+        (n.DATA_JOURNAL/'intent.json').unlink();n.DATA_JOURNAL.rmdir()
+        write(n.JOURNAL/'intent.json',{'consumed':True})
+        with self.assertRaisesRegex(n.Refused,'source_bound_retained'):
+            engine.apply(preview,n.sha(n.encode(preview)),preview['script_sha256'])
+        self.assertFalse(n.DATA_JOURNAL.exists())
+    def test_new_journal_is_fresh_at_qualification_and_fixed_for_apply(self):
+        write(n.DATA_JOURNAL/'intent.json',{'consumed':True})
+        with self.assertRaisesRegex(n.Refused,'inspect_only'):self.qualify()
+        self.assertFalse(self.intent.exists())
+        with self.assertRaisesRegex(n.Refused,'fixed_retained_data_apply_journal'):
+            n.Engine(self.cycles,self.root/'different-journal',self.guard,qualification_sha=n.FROZEN_ALIAS_SHA,retained_data_qualification_sha='1'*64)
+    def test_dangling_or_aliased_journals_never_prove_inspect_only_history(self):
+        for journal in (n.JOURNAL,n.DATA_JOURNAL):
+            journal.symlink_to(self.root/'absent-journal-target')
+            with self.subTest(journal=journal),self.assertRaisesRegex(n.Refused,'symlink'):self.qualify()
+            self.assertFalse(self.intent.exists());journal.unlink()
+        pin=self.qualify()['retained_data_qualification_sha256']
+        n.JOURNAL.symlink_to(self.root/'absent-previous-journal')
+        with self.assertRaisesRegex(n.Refused,'symlink'):n.validate_retained_data_scope(pin,self.leaves,self.aliases)
+    def test_old_alias_authority_cannot_be_used_by_new_source_without_explicit_envelope(self):
+        alias=patch.object(n,'ALIAS_RECEIPT',self.old_receipt);alias.start();self.addCleanup(alias.stop)
+        with self.assertRaises(n.Refused):n.validate_livepatch_aliases(n.FROZEN_ALIAS_SHA,self.leaves,self.aliases)
+
+
 class LiveBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir='/tmp');self.addCleanup(self.temp.cleanup)
