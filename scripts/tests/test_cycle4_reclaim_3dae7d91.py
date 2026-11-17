@@ -606,6 +606,218 @@ class ProducerDataScopeTests(unittest.TestCase):
         with self.assertRaises(n.Refused):n.validate_livepatch_aliases(n.FROZEN_ALIAS_SHA,self.leaves,self.aliases)
 
 
+class DiscoveryMetadataScopeTests(unittest.TestCase):
+    """Real new engine, synthetic root authority and a self-checking prior API model."""
+    def setUp(self):
+        ProducerDataScopeTests.setUp(self)
+        self.cache=self.cycle.work/'.kube/cache/discovery/127.0.0.1_6443'
+        self.operational=self.root/'operational-cache';self.operational.mkdir(mode=0o700)
+        for name in n.DISCOVERY_RELATIVE:
+            path=self.cache/name
+            value=({'apiVersion':'v1','kind':'APIGroupList','groups':[]} if name=='servergroups.json' else
+                {'apiVersion':'v1','kind':'APIResourceList','groupVersion':str(Path(name).parent),'resources':[]})
+            write(path,value);path.chmod(0o660)
+        self.cache_files={self.cache/name for name in n.DISCOVERY_RELATIVE}
+        self.cache_parents={p for f in self.cache_files for p in f.parents if p==self.cycle.work or self.cycle.work in p.parents}
+        for parent in self.cache_parents:parent.chmod(0o700)
+        self.metadata_scope=self.root/'metadata-scope';self.metadata_receipt=self.metadata_scope/'qualification.json'
+        self.data_source=self.root/'preserved-data.py';self.data_receipt=self.root/'preserved-data-qualification.json'
+        code=("import hashlib,json,pathlib\nRECEIPT=pathlib.Path("+repr(str(self.data_receipt))+")\ndef validate_retained_data_scope(pin,roots,aliases,delete=None,proc=None,live_boundary=None):\n body=RECEIPT.read_bytes();value=json.loads(body)\n if hashlib.sha256(body).hexdigest()!=pin or value['script_sha256']!=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest():raise RuntimeError('old_data_source_or_receipt_changed')\n if value['roots']!=sorted(map(str,roots)) or value['aliases']!=sorted(map(str,aliases)):raise RuntimeError('old_data_scope_changed')\n if live_boundary is not None and live_boundary!=value['live_boundary']:raise RuntimeError('old_data_boundary_changed')\n return value\n").encode()
+        code+=b'\nCYCLES=()\nDATA_JOURNAL=RECEIPT.parent/"old-data-journal"\nFROZEN_ALIAS_SHA="prior"\nclass Refused(RuntimeError):pass\nclass Engine:\n def __init__(self,**kwargs):pass\n def protected(self,selected,delete):\n  raise Refused("protected_file_authority_changed")\n'
+        write(self.data_source,code)
+        delete=[r for leaf in self.leaves for r in n.Engine(cycles=self.cycles).delete_roots(leaf,n.Engine(cycles=self.cycles).whitelist[leaf][1])]
+        previous={'script_sha256':n.sha(code),'roots':sorted(map(str,self.leaves)),
+            'aliases':sorted(map(str,self.aliases)),'live_boundary':self.fp,
+            'alias_qualification':n.load(self.old_receipt),'producer_data':n.producer_data_projection(self.leaves,delete)}
+        write(self.data_receipt,previous)
+        values={'FROZEN_DATA_RECLAIM':self.data_source,'FROZEN_DATA_RECLAIM_SHA':n.sha(code),
+            'FROZEN_DATA_SHA':n.sha(self.data_receipt.read_bytes()),'METADATA_SCOPE':self.metadata_scope,
+            'METADATA_INTENT':self.metadata_scope/'intent.json','METADATA_RECEIPT':self.metadata_receipt,
+            'METADATA_JOURNAL':self.root/'metadata-journal','DISCOVERY_OPERATIONAL_CACHE':self.operational,
+            'DISCOVERY_WORK':self.cycle.work,'DISCOVERY_ROOT':self.cache}
+        constants=patch.multiple(n,**values);constants.start();self.addCleanup(constants.stop)
+        env=patch.dict(os.environ,{'KUBECACHEDIR':str(self.operational)});env.start();self.addCleanup(env.stop)
+        identity=n.identity
+        def root_identity(path):
+            result=identity(path)
+            if Path(path) in self.cache_parents|{self.operational}:result={**result,'uid':0,'gid':0}
+            return result
+        authority=patch.object(n,'identity',side_effect=root_identity);authority.start();self.addCleanup(authority.stop)
+        record=n.file_record
+        def root_record(path,*args,**kwargs):
+            result=record(path,*args,**kwargs)
+            if Path(path) in self.cache_files:result={**result,'uid':0,'gid':0}
+            return result
+        authority=patch.object(n,'file_record',side_effect=root_record);authority.start();self.addCleanup(authority.stop)
+    def qualify(self):return n.qualify_discovery_metadata(self.boundary)['metadata_qualification_sha256']
+    def engine(self,pin):return n.Engine(self.cycles,n.METADATA_JOURNAL,self.guard,
+        qualification_sha=n.FROZEN_ALIAS_SHA,retained_data_qualification_sha=n.FROZEN_DATA_SHA,metadata_qualification_sha=pin)
+    def test_exact_29_records_are_preserved_by_full_preview_and_apply(self):
+        pin=self.qualify();engine=self.engine(pin);leaf=self.leaves[0];write(leaf/'disposable.bin',b'owned disposable')
+        before={p:n.file_record(p,private=False) for p in self.cache_files}
+        preview=engine.preview(self.leaves)
+        self.assertEqual(preview['metadata_qualification_sha256'],pin)
+        self.assertEqual(len(preview['protected']['discovery-metadata']['projection']['parents']),58)
+        self.assertTrue(all(preview['protected'][str(p)]==value for p,value in before.items()))
+        completed=engine.apply(preview,n.sha(n.encode(preview)),preview['script_sha256'])
+        self.assertTrue(completed['verified']);self.assertFalse((leaf/'disposable.bin').exists())
+        self.assertEqual({p:n.file_record(p,private=False) for p in self.cache_files},before)
+        self.assertFalse(n.JOURNAL.exists());self.assertFalse(n.DATA_JOURNAL.exists())
+        self.assertEqual(n.validate_discovery_metadata(pin,self.leaves,self.aliases)['history']['new_journal'],str(n.METADATA_JOURNAL))
+    def test_default_old_authority_still_refuses_and_no_global_file_record_relaxation(self):
+        with self.assertRaisesRegex(n.Refused,'protected_file_authority_changed'):
+            n.Engine(cycles=self.cycles).protected(self.leaves,[])
+        with self.assertRaisesRegex(n.Refused,'private_metadata_required'):n.file_record(next(iter(self.cache_files)))
+    def test_30th_file_missing_file_and_extra_directory_are_refused(self):
+        extra=self.cache/'extra.json';write(extra,{'unapproved':True})
+        with self.assertRaisesRegex(n.Refused,'membership'):n.discovery_projection()
+        extra.unlink();extra=self.cache/'foreign';extra.mkdir()
+        with self.assertRaisesRegex(n.Refused,'membership'):n.discovery_projection()
+        extra.rmdir();next(iter(self.cache_files)).unlink()
+        with self.assertRaisesRegex(n.Refused,'membership'):n.discovery_projection()
+    def test_parent_mode_symlink_uid_and_file_mode_gid_link_refuse(self):
+        parent=next(p for p in self.cache_parents if p!=self.cycle.work);parent.chmod(0o750)
+        with self.assertRaisesRegex(n.Refused,'ancestor'):n.discovery_projection()
+        parent.chmod(0o700);file=next(iter(self.cache_files));file.chmod(0o664)
+        with self.assertRaisesRegex(n.Refused,'file_authority'):n.discovery_projection()
+        file.chmod(0o660);os.link(file,self.root/'external-link')
+        with self.assertRaisesRegex(n.Refused,'bounded_regular'):n.discovery_projection()
+        (self.root/'external-link').unlink();saved=file.read_bytes();file.unlink();file.symlink_to(self.data_receipt)
+        with self.assertRaisesRegex(n.Refused,'symlink'):n.discovery_projection()
+        file.unlink();write(file,saved);file.chmod(0o660)
+        original=n.identity
+        with patch.object(n,'identity',side_effect=lambda p:{**original(p),'uid':1} if Path(p)==parent else original(p)):
+            with self.assertRaisesRegex(n.Refused,'ancestor'):n.discovery_projection()
+        original=n.file_record
+        with patch.object(n,'file_record',side_effect=lambda p,*a,**kw:{**original(p,*a,**kw),'gid':1} if Path(p)==file else original(p,*a,**kw)):
+            with self.assertRaisesRegex(n.Refused,'file_authority'):n.discovery_projection()
+    def test_environment_is_checked_before_boundary_or_frozen_import(self):
+        for value in ('',str(self.root/'other-cache')):
+            with patch.dict(os.environ,{'KUBECACHEDIR':value}),patch.object(n,'frozen_data_reclaim') as loader:
+                with self.assertRaisesRegex(n.Refused,'environment'):self.qualify()
+                self.boundary.check.assert_not_called();loader.assert_not_called()
+        self.operational.chmod(0o750)
+        with self.assertRaisesRegex(n.Refused,'operational_cache'):self.qualify()
+        self.boundary.check.assert_not_called()
+    def test_record_refresh_even_same_bytes_or_parent_inode_change_is_refused(self):
+        pin=self.qualify();file=next(iter(self.cache_files));temp=file.with_name('temporary')
+        write(temp,file.read_bytes());temp.chmod(0o660);temp.replace(file)
+        with self.assertRaisesRegex(n.Refused,'projection_changed'):n.validate_discovery_metadata(pin,self.leaves,self.aliases)
+        self.assertFalse(n.METADATA_JOURNAL.exists())
+    def test_wrong_external_pin_source_old_receipt_and_scope_refuse(self):
+        pin=self.qualify()
+        with self.assertRaisesRegex(n.Refused,'external_discovery'):n.validate_discovery_metadata('0'*64,self.leaves,self.aliases)
+        with self.assertRaisesRegex(RuntimeError,'old_data_scope'):n.validate_discovery_metadata(pin,self.leaves[:-1],self.aliases)
+        with self.assertRaisesRegex(RuntimeError,'old_data_boundary'):n.validate_discovery_metadata(pin,self.leaves,self.aliases,live_boundary={'changed':True})
+        write(self.data_receipt,{**n.load(self.data_receipt),'changed':True})
+        with self.assertRaisesRegex(RuntimeError,'old_data_source_or_receipt'):n.validate_discovery_metadata(pin,self.leaves,self.aliases)
+        write(self.data_source,b'raise AssertionError("must not import")')
+        with patch.object(n.importlib.util,'spec_from_file_location') as loader,self.assertRaises(n.Refused):
+            n.validate_discovery_metadata(pin,self.leaves,self.aliases)
+        loader.assert_not_called()
+    def test_consumed_prior_or_new_journal_prevents_qualification_and_later_prior_blocks_apply(self):
+        for journal in (n.JOURNAL,n.DATA_JOURNAL,n.METADATA_JOURNAL):
+            write(journal/'intent.json',{'consumed':True})
+            with self.subTest(journal=journal),self.assertRaisesRegex(n.Refused,'inspect_only_metadata'):self.qualify()
+            self.assertFalse(n.METADATA_INTENT.exists());(journal/'intent.json').unlink();journal.rmdir()
+        pin=self.qualify();engine=self.engine(pin);preview=engine.preview(self.leaves)
+        write(n.DATA_JOURNAL/'intent.json',{'consumed':True})
+        with self.assertRaisesRegex(n.Refused,'inspect_only_metadata'):
+            engine.apply(preview,n.sha(n.encode(preview)),preview['script_sha256'])
+        self.assertFalse(n.METADATA_JOURNAL.exists())
+    def test_qualification_one_intent_and_bookend_drift_never_emits_receipt(self):
+        self.boundary.check.side_effect=[self.fp,{**self.fp,'state_sha256':'changed'}]
+        with self.assertRaisesRegex(n.Refused,'bookend'):self.qualify()
+        self.assertTrue(n.METADATA_INTENT.exists());self.assertFalse(n.METADATA_RECEIPT.exists())
+        with self.assertRaisesRegex(n.Refused,'already_consumed'):self.qualify()
+    def test_unrelated_0660_metadata_still_refuses_and_cache_env_replacement_refuses(self):
+        pin=self.qualify();other=self.cycle.bundle/'unapproved.json';write(other,{});other.chmod(0o660)
+        with self.assertRaisesRegex(n.Refused,'protected_file_authority'):self.engine(pin).preview(self.leaves)
+        other.unlink();self.operational.rename(self.root/'retained-old-operational');self.operational.mkdir(mode=0o700)
+        with self.assertRaisesRegex(n.Refused,'source_bound_discovery'):n.validate_discovery_metadata(pin,self.leaves,self.aliases)
+    def test_dangling_journal_and_discovery_parent_are_refused(self):
+        n.DATA_JOURNAL.symlink_to(self.root/'missing')
+        with self.assertRaisesRegex(n.Refused,'symlink'):self.qualify()
+        self.assertFalse(n.METADATA_INTENT.exists())
+    def test_original_guard_must_reject_with_exact_authority_reason(self):
+        class OldRefused(RuntimeError):pass
+        for error in (None,OldRefused('protected_inventory_bound'),RuntimeError('unexpected')):
+            engine=SimpleNamespace(protected=Mock(side_effect=error))
+            old=SimpleNamespace(Engine=Mock(return_value=engine),CYCLES=(),DATA_JOURNAL=n.DATA_JOURNAL,
+                FROZEN_ALIAS_SHA=n.FROZEN_ALIAS_SHA,Refused=OldRefused)
+            with self.subTest(error=error),self.assertRaises((n.Refused,RuntimeError)):
+                n.previous_discovery_denial(old,self.leaves,[])
+        old.Engine.return_value.protected.side_effect=OldRefused('protected_file_authority_changed')
+        self.assertTrue(n.previous_discovery_denial(old,self.leaves,[])['denied'])
+    def test_cli_invalid_pin_or_environment_fails_before_boundary_entry(self):
+        argv=['reclaim','inspect','--leaf','/tmp/unused','--output','/tmp/unusable','--metadata-qualification-sha256']
+        for pin in ('','short','A'*64):
+            with patch.object(sys,'argv',argv+[pin]),patch.object(n.os,'geteuid',return_value=0),patch.object(n.os,'umask') as umask,patch.object(n,'LiveBoundary') as boundary:
+                with self.assertRaisesRegex(n.Refused,'external_discovery'):n.main()
+                boundary.assert_not_called();umask.assert_called_once_with(0o077)
+        with patch.object(sys,'argv',argv+['a'*64]),patch.object(n.os,'geteuid',return_value=0),patch.dict(os.environ,{'KUBECACHEDIR':''}),patch.object(n.os,'umask') as umask,patch.object(n,'LiveBoundary') as boundary:
+            with self.assertRaisesRegex(n.Refused,'environment'):n.main()
+            boundary.assert_not_called();umask.assert_called_once_with(0o077)
+    def test_recreated_cache_or_sealed_header_drift_refuses_before_engine_and_boundary(self):
+        pin=self.qualify();saved=n.METADATA_RECEIPT.read_bytes()
+        self.operational.rename(self.root/'retained-original-operational');self.operational.mkdir(mode=0o700)
+        argv=['reclaim','inspect','--leaf','/tmp/unused','--output','/tmp/unusable','--metadata-qualification-sha256']
+        with patch.object(sys,'argv',argv+[pin]),patch.object(n.os,'geteuid',side_effect=[0]+[os.getuid()]*1000),patch.object(n.os,'umask') as umask,patch.object(n,'Engine') as engine,patch.object(n,'LiveBoundary') as boundary:
+            with self.assertRaisesRegex(n.Refused,'source_bound_discovery'):n.main()
+            engine.assert_not_called();boundary.assert_not_called();umask.assert_called_once_with(0o077)
+        self.operational.rmdir();(self.root/'retained-original-operational').rename(self.operational)
+        for field,value in (('script_sha256','0'*64),('kind','foreign'),('version',2)):
+            record={**json.loads(saved),field:value};write(n.METADATA_RECEIPT,record)
+            changed_pin=n.sha(n.METADATA_RECEIPT.read_bytes())
+            with patch.object(sys,'argv',argv+[changed_pin]),patch.object(n.os,'geteuid',side_effect=[0]+[os.getuid()]*1000),patch.object(n.os,'umask'),patch.object(n,'LiveBoundary') as boundary:
+                with self.assertRaisesRegex(n.Refused,'source_bound_discovery'):n.main()
+                boundary.assert_not_called()
+    def test_cache_bind_ancestor_or_submount_refuses_before_any_boundary(self):
+        rows=n.mount_rows(Path('/proc/self/mountinfo').read_text());cover=n.discovery_environment()['covering_mount']
+        for target in (self.operational,self.operational/'nested',self.operational.parent):
+            bind={**cover,'id':999999,'parent':cover['id'],'target':str(target),'root':str(self.cache)}
+            with self.subTest(target=target),patch.object(n,'mount_rows',return_value=[*rows,bind]):
+                with self.assertRaisesRegex(n.Refused,'mount_alias'):self.qualify()
+                self.boundary.check.assert_not_called();self.assertFalse(n.METADATA_INTENT.exists())
+    def test_covering_mount_projection_drift_is_pinned_by_preflight(self):
+        pin=self.qualify();rows=n.mount_rows(Path('/proc/self/mountinfo').read_text())
+        cover=n.discovery_environment()['covering_mount']
+        changed=[{**row,'options':[*row['options'],'changed']} if row==cover else row for row in rows]
+        with patch.object(n,'mount_rows',return_value=changed),self.assertRaisesRegex(n.Refused,'source_bound_discovery'):
+            n.preflight_discovery_metadata(pin)
+    def test_oversized_historical_cache_refuses_before_legacy_guard_hashing(self):
+        next(iter(self.cache_files)).write_bytes(b'x'*65537)
+        with patch.object(n,'previous_discovery_denial') as legacy_guard,self.assertRaisesRegex(n.Refused,'bounded_regular'):
+            self.qualify()
+        legacy_guard.assert_not_called();self.assertFalse(n.METADATA_RECEIPT.exists())
+
+    def test_discovery_size_bound_is_enforced_before_hashing(self):
+        file=next(iter(self.cache_files));file.write_bytes(b'x'*65537)
+        with patch.object(n.hashlib,'file_digest') as digest,self.assertRaisesRegex(n.Refused,'bounded_regular'):
+            n.file_record(file,private=False,maximum=65536)
+        digest.assert_not_called()
+
+    def test_schema_bound_and_parent_inode_refresh_are_refused(self):
+        file=self.cache/'v1/serverresources.json';saved=file.read_bytes()
+        write(file,{**json.loads(saved),'groupVersion':'foreign/v1'});file.chmod(0o660)
+        with self.assertRaisesRegex(n.Refused,'schema'):n.discovery_projection()
+        write(file,saved);file.chmod(0o660);pin=self.qualify()
+        parent=file.parent;parent.rename(self.root/'retained-discovery-parent');parent.mkdir(mode=0o700)
+        write(file,saved);file.chmod(0o660)
+        with self.assertRaisesRegex(n.Refused,'projection_changed'):n.validate_discovery_metadata(pin,self.leaves,self.aliases)
+
+    def test_old_code_uses_own_file_and_unchanged_default_remains_strict(self):
+        pin=self.qualify();old=n.frozen_data_reclaim()
+        self.assertEqual(old.validate_retained_data_scope.__code__.co_filename,str(self.data_source))
+        self.assertEqual(Path(old.__file__),self.data_source)
+        self.assertEqual(old.validate_retained_data_scope(n.FROZEN_DATA_SHA,self.leaves,self.aliases),n.load(self.data_receipt))
+        with patch.object(n,'DATA_RECEIPT',self.data_receipt),self.assertRaises(n.Refused):
+            n.validate_retained_data_scope(n.FROZEN_DATA_SHA,self.leaves,self.aliases)
+        with self.assertRaisesRegex(n.Refused,'fixed_metadata_apply_scope'):
+            n.Engine(self.cycles,n.DATA_JOURNAL,self.guard,qualification_sha=n.FROZEN_ALIAS_SHA,
+                retained_data_qualification_sha=n.FROZEN_DATA_SHA,metadata_qualification_sha=pin)
+
+
 class LiveBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir='/tmp');self.addCleanup(self.temp.cleanup)

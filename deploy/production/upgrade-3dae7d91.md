@@ -82,6 +82,15 @@ This proves that reclaim does not modify those copies; it does not establish a
 fresh content verification of the retained cache bodies. Chain the existing
 Livepatch qualification through its unchanged producer and preserve both scopes.
 
+The first-cycle kubectl discovery cache has 29 retained JSON files with mode
+`0660` inside root-owned `0700` directories. A further source-bound qualification
+may admit only those exact paths and authorities while retaining every file's
+hash, inode, timestamps and directory membership in protection. Preserve the
+original refusal and all predecessor qualifications and journal fences. Run
+operational discovery with its fixed private `/tmp` `KUBECACHEDIR`, bound before
+any guard, so guard requests cannot refresh the historical cache. New files or
+changed retained records require refusal; no historical cache is deleted or chmodded.
+
 ## Bootstrap, assessment and paused observation
 
 Bootstrap the target writer and verify schema 19, retained manifests, notices,

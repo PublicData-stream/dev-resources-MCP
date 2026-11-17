@@ -72,12 +72,12 @@ def identity(path):
             'mode':stat.S_IMODE(value.st_mode)}
 
 
-def file_record(path,private=True):
+def file_record(path,private=True,maximum=MAX_BYTES):
     safe_path(path)
     descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
     with os.fdopen(descriptor,'rb') as stream:
         before=os.fstat(stream.fileno())
-        need(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_size<=MAX_BYTES,
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_size<=maximum,
              'bounded_regular_metadata_required')
         if private:need(before.st_uid==os.geteuid() and not before.st_mode&0o077,'private_metadata_required')
         digest=hashlib.file_digest(stream,'sha256').hexdigest();after=os.fstat(stream.fileno())
@@ -173,11 +173,11 @@ def command(arguments,maximum=32*1024**2):
     return result.stdout
 
 
-def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,alias_qualification_sha=None,retained_data_qualification_sha=None):
+def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,alias_qualification_sha=None,retained_data_qualification_sha=None,metadata_qualification_sha=None):
     """Classify every namespace mapping before checking any process reference."""
     exposure=set(roots)|set(aliases);namespaces={};processes=0;started=time.monotonic()
     proc=Path(proc);all_mounts=[];inventory=[]
-    qualified=validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha) if alias_qualification_sha else None
+    qualified=validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha,metadata_qualification_sha=metadata_qualification_sha) if alias_qualification_sha else None
     self_mounts=mount_rows((proc/'self/mountinfo').read_text())
     for path in sorted(proc.iterdir(),key=lambda p:p.name):
         if not path.name.isdecimal():continue
@@ -249,7 +249,7 @@ def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,ali
             except PermissionError:raise Refused('process_inventory_incomplete') from None
     mount_bookend()
     if qualified is not None:
-        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha)==qualified,
+        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha,metadata_qualification_sha=metadata_qualification_sha)==qualified,
              'livepatch_alias_qualification_changed')
     sockets=set(socket_paths) if socket_paths is not None else {Path('/var/run/docker.sock'),*Path('/run/user').glob('*/docker.sock')}
     configured=os.environ.get('DOCKER_HOST')
@@ -285,21 +285,27 @@ def system_guard(roots,aliases,tokens,*,proc=Path('/proc'),socket_paths=None,ali
         firewall.append(sha(body))
     mount_bookend()
     if qualified is not None:
-        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha)==qualified,
+        need(validate_livepatch_aliases(alias_qualification_sha,roots,aliases,proc=proc,retained_data_qualification_sha=retained_data_qualification_sha,metadata_qualification_sha=metadata_qualification_sha)==qualified,
              'livepatch_alias_qualification_changed')
     return {'verified':True,'process_count':processes,'mount_namespaces':len(namespaces),
-        'alias_qualification_sha256':alias_qualification_sha,'retained_data_qualification_sha256':retained_data_qualification_sha,'qualified_alias_count':len(observed),
+        'alias_qualification_sha256':alias_qualification_sha,'retained_data_qualification_sha256':retained_data_qualification_sha,'metadata_qualification_sha256':metadata_qualification_sha,'qualified_alias_count':len(observed),
         'mounts_sha256':sha(encode(sorted(all_mounts,key=encode))),
         'docker_sha256':sha(encode(docker)),'firewall_sha256':sha(encode(firewall))}
 
 
 class Engine:
     """Parameterized for local fake trees; the CLI never accepts alternate roots."""
-    def __init__(self,cycles=CYCLES,journal=JOURNAL,guard=system_guard,*,qualification_sha=None,retained_data_qualification_sha=None):
+    def __init__(self,cycles=CYCLES,journal=JOURNAL,guard=system_guard,*,qualification_sha=None,retained_data_qualification_sha=None,metadata_qualification_sha=None):
         self.cycles=cycles;self.journal=Path(journal);self.qualification_sha=qualification_sha
         self.retained_data_qualification_sha=retained_data_qualification_sha
-        need(retained_data_qualification_sha is None or self.journal==DATA_JOURNAL,'fixed_retained_data_apply_journal_required')
-        self.guard=(lambda roots,aliases,tokens:system_guard(roots,aliases,tokens,alias_qualification_sha=qualification_sha,retained_data_qualification_sha=retained_data_qualification_sha)) if qualification_sha and guard is system_guard else guard
+        self.metadata_qualification_sha=metadata_qualification_sha
+        if metadata_qualification_sha is not None:
+            need(re.fullmatch('[0-9a-f]{64}',metadata_qualification_sha or ''),'external_discovery_qualification_required')
+            preflight_discovery_metadata(metadata_qualification_sha)
+            need(qualification_sha==FROZEN_ALIAS_SHA and retained_data_qualification_sha==FROZEN_DATA_SHA
+                 and self.journal==METADATA_JOURNAL,'fixed_metadata_apply_scope_required')
+        need(metadata_qualification_sha is not None or retained_data_qualification_sha is None or self.journal==DATA_JOURNAL,'fixed_retained_data_apply_journal_required')
+        self.guard=(lambda roots,aliases,tokens:system_guard(roots,aliases,tokens,alias_qualification_sha=qualification_sha,retained_data_qualification_sha=retained_data_qualification_sha,metadata_qualification_sha=metadata_qualification_sha)) if qualification_sha and guard is system_guard else guard
         self.whitelist={cycle.bundle/relative:(cycle,relative) for cycle in cycles for relative in LEAVES}
 
     def canonical(self,path):
@@ -356,8 +362,11 @@ class Engine:
         return token
 
     def protected(self,selected,delete):
-        retained=None
-        if self.retained_data_qualification_sha:
+        retained=None;metadata=None
+        if self.metadata_qualification_sha is not None:
+            metadata=validate_discovery_metadata(self.metadata_qualification_sha,selected,self.aliases(selected),delete=delete)
+            retained=metadata['retained_data_qualification']
+        elif self.retained_data_qualification_sha:
             retained=validate_retained_data_scope(self.retained_data_qualification_sha,selected,self.aliases(selected),delete=delete)
         body_roots=[] if retained is None else [Path(item['path']) for item in retained['producer_data']['roots']]
         paths=set();cycles={self.whitelist[path][0] for path in selected}
@@ -383,8 +392,10 @@ class Engine:
                             need(len(paths)<=50000,'protected_inventory_bound')
         records={};total=0
         for path in sorted(paths,key=str):
-            record=file_record(path,private=False)
-            need(record['uid'] in (os.geteuid(),70,65532) and not record['mode']&0o077,'protected_file_authority_changed')
+            admitted=metadata is not None and str(path) in metadata['discovery']['files']
+            record=file_record(path,private=False,maximum=65536) if admitted else file_record(path,private=False)
+            if admitted:need(record==metadata['discovery']['files'][str(path)],'protected_discovery_record_changed')
+            else:need(record['uid'] in (os.geteuid(),70,65532) and not record['mode']&0o077,'protected_file_authority_changed')
             total+=record['size'];need(total<=MAX_METADATA_BYTES,'protected_metadata_bytes_bound')
             records[str(path)]=record
             if 'backup-receipt' in path.name and path.suffix=='.json':
@@ -397,6 +408,9 @@ class Engine:
         if retained is not None:
             records['producer-retained-data']={'kind':'structural-nonmodification','payloads_rehashed':False,
                 'qualification_sha256':self.retained_data_qualification_sha,'producer_data':retained['producer_data']}
+        if metadata is not None:
+            records['discovery-metadata']={'qualification_sha256':self.metadata_qualification_sha,
+                'projection':metadata['discovery'],'environment':metadata['environment']}
         return records
 
     def preview(self,selected):
@@ -428,6 +442,7 @@ class Engine:
         proof=self.guard(leaves,aliases,sorted(set(tokens)))
         return {'version':1,'kind':'cycle4-completed-fixture-reclaim','script_sha256':sha(Path(__file__).read_bytes()),
             'alias_qualification_sha256':self.qualification_sha,'retained_data_qualification_sha256':self.retained_data_qualification_sha,
+            'metadata_qualification_sha256':self.metadata_qualification_sha,
             'leaves':[str(path) for path in leaves],'delete_roots':[str(path) for path in delete],
             'aliases':[str(path) for path in aliases],'tokens':sorted(set(tokens)),
             'ancestors':ancestors,'trees':inventories,'protected':protected,
@@ -691,7 +706,10 @@ def _alias_record(receipt_sha,roots,aliases):
     return value
 
 
-def validate_livepatch_aliases(receipt_sha,roots,aliases,*,proc=Path('/proc'),live_boundary=None,retained_data_qualification_sha=None):
+def validate_livepatch_aliases(receipt_sha,roots,aliases,*,proc=Path('/proc'),live_boundary=None,retained_data_qualification_sha=None,metadata_qualification_sha=None):
+    if metadata_qualification_sha is not None:
+        need(receipt_sha==FROZEN_ALIAS_SHA and retained_data_qualification_sha==FROZEN_DATA_SHA,'exact_metadata_predecessor_pins_required')
+        return validate_discovery_metadata(metadata_qualification_sha,roots,aliases,proc=proc,live_boundary=live_boundary)['retained_data_qualification']['alias_qualification']
     if retained_data_qualification_sha is not None:
         need(receipt_sha==FROZEN_ALIAS_SHA,'exact_historical_alias_pin_required')
         return validate_retained_data_scope(retained_data_qualification_sha,roots,aliases,proc=proc,live_boundary=live_boundary)['alias_qualification']
@@ -896,38 +914,215 @@ def qualify_retained_data_scope(boundary):
         'payloads_rehashed':False,'guard_accepted':False}
 
 
+# The previous data admission remains valid only through its exact original module.
+FROZEN_DATA_RECLAIM=Path('/usr/local/libexec/devres-upgrade-3dae7d91/reclaim-completed-fixtures.producer-data-0e78bad.py')
+FROZEN_DATA_RECLAIM_SHA='0e78bad73c08399d82f6212ce27a7fbf75dab47fa9e66daf84592d1811e32111'
+FROZEN_DATA_SHA='a0a8a00ac6fd8fea3306d356aacceafc20cd3cad8b6e999547a5590dd399d964'
+METADATA_SCOPE=Path('/var/lib/devres-production-reclaim-qualifications/3dae7d91-20261117-discovery-metadata-v1')
+METADATA_INTENT=METADATA_SCOPE/'intent.json'
+METADATA_RECEIPT=METADATA_SCOPE/'qualification.json'
+METADATA_JOURNAL=Path('/var/lib/devres-production-reclaim/3dae7d91-20261117-discovery-metadata-v1')
+DISCOVERY_OPERATIONAL_CACHE=Path('/tmp/devres-reclaim-discovery-3dae7d91-20261117')
+DISCOVERY_WORK=CYCLES[0].work
+DISCOVERY_ROOT=DISCOVERY_WORK/'.kube/cache/discovery/127.0.0.1_6443'
+DISCOVERY_RELATIVE=('servergroups.json',*(name+'/serverresources.json' for name in (
+    'admissionregistration.k8s.io/v1','apiextensions.k8s.io/v1','apiregistration.k8s.io/v1','apps/v1',
+    'authentication.k8s.io/v1','authorization.k8s.io/v1','autoscaling/v1','autoscaling/v2','batch/v1',
+    'certificates.k8s.io/v1','coordination.k8s.io/v1','discovery.k8s.io/v1','events.k8s.io/v1',
+    'flowcontrol.apiserver.k8s.io/v1','gateway.networking.k8s.io/v1','gateway.networking.k8s.io/v1beta1',
+    'helm.cattle.io/v1','k3s.cattle.io/v1','metrics.k8s.io/v1beta1','networking.k8s.io/v1','node.k8s.io/v1',
+    'policy/v1','rbac.authorization.k8s.io/v1','resource.k8s.io/v1','scheduling.k8s.io/v1','storage.k8s.io/v1',
+    'storagemigration.k8s.io/v1','v1')))
+
+
+def discovery_environment():
+    """Checked before frozen constructors or any kubectl-capable guard."""
+    need(os.environ.get('KUBECACHEDIR')==str(DISCOVERY_OPERATIONAL_CACHE),'fixed_discovery_cache_environment_required')
+    safe_path(DISCOVERY_OPERATIONAL_CACHE);value=identity(DISCOVERY_OPERATIONAL_CACHE)
+    need(value['uid']==0 and value['gid']==0 and value['mode']==0o700,'private_discovery_operational_cache_required')
+    mounts=mount_rows(Path('/proc/self/mountinfo').read_text())
+    parent=Path('/tmp')
+    need(not any(under(Path(row['target']),DISCOVERY_OPERATIONAL_CACHE) for row in mounts),
+         'discovery_cache_mount_alias_refused')
+    parent_rows=[row for row in mounts if under(parent,Path(row['target']))]
+    cache_rows=[row for row in mounts if under(DISCOVERY_OPERATIONAL_CACHE,Path(row['target']))]
+    need(parent_rows and cache_rows,'discovery_cache_mount_mapping_required')
+    covering=lambda rows:max(rows,key=lambda row:len(Path(row['target']).parts))
+    need(covering(parent_rows)==covering(cache_rows),'discovery_cache_mount_alias_refused')
+    return {'KUBECACHEDIR':str(DISCOVERY_OPERATIONAL_CACHE),'identity':value,'covering_mount':covering(cache_rows)}
+
+
+def discovery_projection():
+    expected={DISCOVERY_ROOT/name for name in DISCOVERY_RELATIVE}
+    expected_dirs={p for path in expected for p in path.parents if p==DISCOVERY_ROOT or DISCOVERY_ROOT in p.parents}
+    actual_files=set();actual_dirs={DISCOVERY_ROOT};count=0
+    safe_path(DISCOVERY_ROOT)
+    for folder,dirs,files in os.walk(DISCOVERY_ROOT,followlinks=False):
+        current=Path(folder)
+        for name in [*dirs,*files]:
+            count+=1;need(count<=100,'discovery_membership_bound')
+            path=current/name;safe_path(path)
+            if name in dirs:actual_dirs.add(path)
+            else:actual_files.add(path)
+    need(actual_files==expected and actual_dirs==expected_dirs,'exact_discovery_metadata_membership_required')
+    parents={}
+    for path in sorted({p for file in expected for p in file.parents if p==DISCOVERY_WORK or DISCOVERY_WORK in p.parents},key=str):
+        safe_path(path);value=identity(path)
+        need(value['uid']==0 and value['gid']==0 and value['mode']==0o700,'private_discovery_ancestor_required')
+        parents[str(path)]=value
+    need(len(expected)==29 and len(parents)==58,'exact_discovery_layout_required')
+    records={}
+    for path in sorted(expected,key=str):
+        record=file_record(path,private=False,maximum=65536)
+        need(record['uid']==0 and record['gid']==0 and record['mode']==0o660 and record['size']<=65536,
+             'exact_discovery_file_authority_required')
+        body=path.read_bytes();need(sha(body)==record['sha256'],'discovery_metadata_changed')
+        value=json.loads(body)
+        if path.name=='servergroups.json':
+            need(type(value) is dict and set(value)=={'apiVersion','kind','groups'}
+                 and value['kind']=='APIGroupList' and value['apiVersion']=='v1' and type(value['groups']) is list,
+                 'discovery_schema_required')
+        else:
+            group=str(path.parent.relative_to(DISCOVERY_ROOT))
+            need(type(value) is dict and set(value)=={'apiVersion','kind','groupVersion','resources'}
+                 and value['kind']=='APIResourceList' and value['apiVersion']=='v1'
+                 and value['groupVersion']==group and type(value['resources']) is list,'discovery_schema_required')
+        need(file_record(path,private=False,maximum=65536)==record,'discovery_metadata_changed');records[str(path)]=record
+    return {'files':records,'parents':parents,'file_count':29,'ancestor_count':58,
+        'payloads_are_discovery_metadata':True,'k3s_library_linkage_verified':False}
+
+
+def frozen_data_reclaim():
+    info=file_record(FROZEN_DATA_RECLAIM)
+    need(info['sha256']==FROZEN_DATA_RECLAIM_SHA,'exact_frozen_data_reclaim_required')
+    spec=importlib.util.spec_from_file_location('reclaim_preserved_0e78_data_authority',FROZEN_DATA_RECLAIM)
+    module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+    need(file_record(FROZEN_DATA_RECLAIM)==info,'exact_frozen_data_reclaim_required')
+    return module
+
+
+def discovery_journal_history(*,fresh=False):
+    for path in (JOURNAL,DATA_JOURNAL,METADATA_JOURNAL):safe_path(path)
+    need(not JOURNAL.exists() and not DATA_JOURNAL.exists()
+         and (not fresh or not METADATA_JOURNAL.exists()),'only_inspect_only_metadata_continues')
+    return {'absent_previous_journals':[str(JOURNAL),str(DATA_JOURNAL)],'new_journal':str(METADATA_JOURNAL)}
+
+
+def discovery_intent(source_sha):
+    return {'version':1,'maximum_attempts':1,'script_sha256':source_sha,
+        'previous_source_sha256':FROZEN_DATA_RECLAIM_SHA,'previous_qualification_sha256':FROZEN_DATA_SHA,
+        'history':discovery_journal_history()}
+
+
+def preflight_discovery_metadata(receipt_sha):
+    # No constructor, historical module, kubectl or network call before this pin.
+    need(re.fullmatch('[0-9a-f]{64}',receipt_sha or ''),'external_discovery_qualification_required')
+    environment=discovery_environment()
+    info=file_record(METADATA_RECEIPT);body=METADATA_RECEIPT.read_bytes()
+    need(sha(body)==receipt_sha and file_record(METADATA_RECEIPT)==info,'external_discovery_qualification_required')
+    value=json.loads(body)
+    need(value.get('version')==1 and value.get('kind')=='cycle4-discovery-metadata-reclaim-qualification'
+         and value.get('maximum_attempts')==1 and value.get('script_sha256')==sha(Path(__file__).read_bytes())
+         and value.get('environment')==environment,'source_bound_discovery_qualification_required')
+    return value
+
+
+def validate_discovery_metadata(receipt_sha,selected,aliases,delete=None,*,proc=Path('/proc'),live_boundary=None):
+    value=preflight_discovery_metadata(receipt_sha)
+    environment=value['environment'];history=discovery_journal_history();source_sha=sha(Path(__file__).read_bytes())
+    need(value.get('previous_source_sha256')==FROZEN_DATA_RECLAIM_SHA
+         and value.get('previous_qualification_sha256')==FROZEN_DATA_SHA
+         and value.get('previous_source_identity')==file_record(FROZEN_DATA_RECLAIM)
+         and value.get('environment')==environment and value.get('history')==history,
+         'source_bound_discovery_qualification_required')
+    need(load(METADATA_INTENT)==discovery_intent(source_sha),'discovery_qualification_intent_changed')
+    old=frozen_data_reclaim()
+    historical=old.validate_retained_data_scope(FROZEN_DATA_SHA,selected,aliases,delete=delete,proc=proc,
+        live_boundary=live_boundary if live_boundary is not None else value['live_boundary'])
+    need(historical==value['retained_data_qualification'],'historical_data_qualification_changed')
+    need(value.get('previous_guard_denial')=={'denied':True,'reason':'protected_file_authority_changed',
+         'source_sha256':FROZEN_DATA_RECLAIM_SHA},'previous_metadata_guard_denial_changed')
+    need(discovery_projection()==value['discovery'],'discovery_projection_changed')
+    need(discovery_environment()==environment and discovery_journal_history()==history,'discovery_validation_bookend_changed')
+    return value
+
+
+def previous_discovery_denial(old,selected,delete):
+    engine=old.Engine(cycles=old.CYCLES,journal=old.DATA_JOURNAL,qualification_sha=old.FROZEN_ALIAS_SHA,
+        retained_data_qualification_sha=FROZEN_DATA_SHA)
+    try:engine.protected(selected,delete)
+    except old.Refused as error:
+        need(str(error)=='protected_file_authority_changed','exact_previous_metadata_authority_denial_required')
+    else:raise Refused('previous_metadata_authority_denial_required')
+    return {'denied':True,'reason':'protected_file_authority_changed','source_sha256':FROZEN_DATA_RECLAIM_SHA}
+
+
+def qualify_discovery_metadata(boundary):
+    environment=discovery_environment();history=discovery_journal_history(fresh=True)
+    safe_path(METADATA_SCOPE);need(not METADATA_SCOPE.exists(),'discovery_qualification_already_consumed')
+    old=frozen_data_reclaim();selected=list(ALIAS_LEAVES);engine=Engine(cycles=CYCLES);aliases=engine.aliases(selected)
+    delete=[root for leaf in selected for root in engine.delete_roots(leaf,engine.whitelist[leaf][1])]
+    source_sha=sha(Path(__file__).read_bytes());source_identity=file_record(FROZEN_DATA_RECLAIM)
+    before=boundary.check();need(discovery_environment()==environment,'discovery_environment_changed')
+    METADATA_SCOPE.mkdir(mode=0o700,parents=True);sync(METADATA_SCOPE.parent)
+    new(METADATA_INTENT,discovery_intent(source_sha))
+    projection=discovery_projection()
+    historical=old.validate_retained_data_scope(FROZEN_DATA_SHA,selected,aliases,delete=delete,live_boundary=before)
+    denial=previous_discovery_denial(old,selected,delete)
+    need(boundary.check()==before and discovery_projection()==projection and discovery_environment()==environment
+         and discovery_journal_history(fresh=True)==history and file_record(FROZEN_DATA_RECLAIM)==source_identity
+         and sha(Path(__file__).read_bytes())==source_sha
+         and old.validate_retained_data_scope(FROZEN_DATA_SHA,selected,aliases,delete=delete,live_boundary=before)==historical,
+         'discovery_qualification_bookend_changed')
+    new(METADATA_RECEIPT,{'version':1,'kind':'cycle4-discovery-metadata-reclaim-qualification','maximum_attempts':1,
+        'script_sha256':source_sha,'previous_source_sha256':FROZEN_DATA_RECLAIM_SHA,
+        'previous_source_identity':source_identity,'previous_qualification_sha256':FROZEN_DATA_SHA,
+        'retained_data_qualification':historical,'live_boundary':before,'discovery':projection,'previous_guard_denial':denial,
+        'environment':environment,'history':history})
+    return {'metadata_qualification_sha256':sha(METADATA_RECEIPT.read_bytes()),'protected_discovery_file_count':29,
+        'private_ancestor_count':58,'guard_accepted':False}
+
+
 def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='operation',required=True)
     inspect=sub.add_parser('inspect');inspect.add_argument('--leaf',type=Path,action='append',required=True)
     inspect.add_argument('--output',type=Path,required=True)
-    sub.add_parser('qualify-aliases');sub.add_parser('qualify-data-scope')
-    inspect.add_argument('--alias-qualification-sha256');inspect.add_argument('--retained-data-qualification-sha256')
+    sub.add_parser('qualify-aliases');sub.add_parser('qualify-data-scope');sub.add_parser('qualify-discovery-metadata')
+    inspect.add_argument('--alias-qualification-sha256');inspect.add_argument('--retained-data-qualification-sha256');inspect.add_argument('--metadata-qualification-sha256')
     apply=sub.add_parser('apply');apply.add_argument('--preview',type=Path,required=True)
     apply.add_argument('--preview-sha256',required=True);apply.add_argument('--script-sha256',required=True)
-    apply.add_argument('--alias-qualification-sha256');apply.add_argument('--retained-data-qualification-sha256')
+    apply.add_argument('--alias-qualification-sha256');apply.add_argument('--retained-data-qualification-sha256');apply.add_argument('--metadata-qualification-sha256')
     args=parser.parse_args();need(os.geteuid()==0,'root_required')
     qualification_sha=getattr(args,'alias_qualification_sha256',None)
     data_sha=getattr(args,'retained_data_qualification_sha256',None)
+    metadata_sha=getattr(args,'metadata_qualification_sha256',None)
+    if metadata_sha is not None:
+        need(re.fullmatch('[0-9a-f]{64}',metadata_sha or ''),'external_discovery_qualification_required')
+    if metadata_sha is not None:preflight_discovery_metadata(metadata_sha)
+    elif args.operation=='qualify-discovery-metadata':discovery_environment()
     need(data_sha is None or qualification_sha==FROZEN_ALIAS_SHA,'historical_alias_pin_required_with_data_scope')
-    engine=Engine(journal=DATA_JOURNAL if data_sha else JOURNAL,qualification_sha=qualification_sha,retained_data_qualification_sha=data_sha)
+    engine=Engine(journal=METADATA_JOURNAL if metadata_sha is not None else DATA_JOURNAL if data_sha else JOURNAL,qualification_sha=qualification_sha,retained_data_qualification_sha=data_sha,metadata_qualification_sha=metadata_sha)
     with LiveBoundary() as boundary:
         if args.operation=='qualify-aliases':
             result=qualify_livepatch_aliases(boundary)
         elif args.operation=='qualify-data-scope':
             result=qualify_retained_data_scope(boundary)
+        elif args.operation=='qualify-discovery-metadata':
+            result=qualify_discovery_metadata(boundary)
         elif args.operation=='inspect':
             need(args.output.is_absolute() and Path('/tmp') in args.output.parents,'private_tmp_preview_required')
-            if qualification_sha:validate_livepatch_aliases(qualification_sha,args.leaf,engine.aliases(args.leaf),live_boundary=boundary.check(),retained_data_qualification_sha=data_sha)
+            if qualification_sha:validate_livepatch_aliases(qualification_sha,args.leaf,engine.aliases(args.leaf),live_boundary=boundary.check(),retained_data_qualification_sha=data_sha,metadata_qualification_sha=metadata_sha)
             value=engine.preview(args.leaf);value['live_boundary']=boundary.check();new(args.output,value)
             result={'preview':True,'preview_sha256':sha(encode(value)),
                 'allocated_file_bytes':value['allocated_file_bytes'],'leaf_count':len(value['leaves'])}
         else:
             file_record(Path(__file__))
             value=load(args.preview)
+            need(value.get('metadata_qualification_sha256')==metadata_sha,'external_metadata_qualification_changed')
             need(value.get('retained_data_qualification_sha256')==data_sha,'external_retained_data_qualification_changed')
             need(value.get('alias_qualification_sha256')==qualification_sha,'external_alias_qualification_changed')
-            if qualification_sha:validate_livepatch_aliases(qualification_sha,value['leaves'],[Path(p) for p in value['aliases']],live_boundary=boundary.check(),retained_data_qualification_sha=data_sha)
+            if qualification_sha:validate_livepatch_aliases(qualification_sha,value['leaves'],[Path(p) for p in value['aliases']],live_boundary=boundary.check(),retained_data_qualification_sha=data_sha,metadata_qualification_sha=metadata_sha)
             need(value.get('live_boundary')==boundary.check(),'external_live_boundary_changed')
             completed=engine.apply(value,args.preview_sha256,args.script_sha256)
             new(engine.journal/'live-boundary-completed.json',{'verified':True,
