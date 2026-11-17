@@ -82,16 +82,20 @@ def render(output, previous_controller_sha, previous_manifest_sha):
     }
     source_map = dict(c3.SOURCE_MAP)
     source_map['deploy/diagnostics/npm_assessment.py'] = 'deploy/diagnostics/npm_assessment.py'
+    source_map['edge-readmission.py'] = 'deploy/production/cycle4_edge_3dae7d91.py'
+    source_map['edge-qualification.py'] = 'deploy/production/cycle4_edge_qualification_3dae7d91.py'
     output.mkdir(mode=0o700, parents=True)
     results = {}
     for name, path in sorted(source_map.items()):
-        original = subprocess.run(['git', 'show', REVISION + ':' + path], cwd=REPOSITORY,
-                                  capture_output=True, timeout=30, check=True).stdout
+        original = ((REPOSITORY / path).read_bytes() if name in ('edge-readmission.py', 'edge-qualification.py') else
+            subprocess.run(['git', 'show', REVISION + ':' + path], cwd=REPOSITORY,
+                           capture_output=True, timeout=30, check=True).stdout)
         # c3's exact transformations still own the immutable schema-19 baseline.
-        body = original if name == 'deploy/diagnostics/npm_assessment.py' else c3.transform(name, original)
+        body = original if name in ('deploy/diagnostics/npm_assessment.py', 'edge-readmission.py', 'edge-qualification.py') else c3.transform(name, original)
         source = body.decode()
-        for old, new in sorted(substitutions.items(), key=lambda x: -len(x[0])):
-            source = source.replace(old, new)
+        if name not in ('edge-readmission.py', 'edge-qualification.py'):
+            for old, new in sorted(substitutions.items(), key=lambda x: -len(x[0])):
+                source = source.replace(old, new)
         if name == 'upgrade-controller.py':
             histories = (*c3.HISTORIES, {'name': 'cycle3', 'work': c3.WORK, 'bundle': c3.BUNDLE,
                 'install': c3.INSTALL, 'controller_sha256': previous_controller_sha,
@@ -100,6 +104,24 @@ def render(output, previous_controller_sha, previous_manifest_sha):
             source = once(source, "PREVIOUS_REVISION='1d76fbcc5693efc9ca927fd05f942078f667f056'", 'PREVIOUS_REVISION=' + repr(c3.TARGET_REVISION))
             source = source.replace("'cycle':3", "'cycle':4")
             source = once(source, '        artifacts=self.prior_hashes()', '        observer_variants(variants)\n        artifacts=self.prior_hashes()')
+            source = once(source,
+                "'desired_active_source_sha256':digest(original),'previous_cycle_source_sha256':PREVIOUS_CONTROLLER_SHA,",
+                "'desired_active_source_sha256':digest(original),'previous_cycle_source_sha256':PREVIOUS_CONTROLLER_SHA,\n"
+                "            'edge_readmission_sha256':cycle4_edge_bridge()[1],")
+            source = function(source, 'predecessor', '''def predecessor(context):
+    bridge, receipt_sha = cycle4_edge_bridge()
+    return bridge.load_controller(Path(PRIOR_CONTROLLER), PRIOR_SHA, PRIOR_BUNDLE, context, receipt_sha=receipt_sha)
+''')
+            source = function(source, 'previous_cycle', '''def previous_cycle(context):
+    require(digest(read(PREVIOUS_CONTROLLER)) == PREVIOUS_CONTROLLER_SHA, 'previous_cycle_controller_changed')
+    require(digest(read(PREVIOUS_WORK/'source-manifest.json')) == PREVIOUS_MANIFEST_SHA, 'previous_cycle_manifest_changed')
+    bridge, receipt_sha = cycle4_edge_bridge()
+    return bridge.load_controller(PREVIOUS_CONTROLLER, PREVIOUS_CONTROLLER_SHA,
+        str(PREVIOUS_BUNDLE), context, receipt_sha=receipt_sha)
+''')
+            source = once(source, "        require(snap==previous.snapshot() and snap['pods']==before['pods'],'previous_cycle_runtime_changed')",
+                "        historical = previous.snapshot()\n"
+                "        require({**snap, 'edge': historical['edge']} == historical and snap['pods'] == before['pods'], 'previous_cycle_runtime_changed')")
             # Keep all base guards; extend their accepted observer/candidate shapes.
             source = once(source, "value.get('runtime') in ('target','fallback')", "value.get('runtime') in ('target','fallback','restored')")
             source = once(source, "value['configs'] in ('old','paused','active')", "value['configs'] in ('old','paused','active','observer')")
@@ -137,6 +159,8 @@ def render(output, previous_controller_sha, previous_manifest_sha):
         elif name == 'acceptance_common.py':
             source = once(source, "'deploy/diagnostics/__init__.py', 'deploy/diagnostics/evidence.py', 'deploy/diagnostics/runner.py',",
                 "'deploy/diagnostics/__init__.py', 'deploy/diagnostics/evidence.py', 'deploy/diagnostics/runner.py', 'deploy/diagnostics/npm_assessment.py',")
+            source = once(source, "SPECIAL_NAMES = {'upgrade-controller.py': CONTROLLER,",
+                "SPECIAL_NAMES = {'edge-readmission.py': CONTROLLER.parent / 'edge-readmission.py', 'edge-qualification.py': CONTROLLER.parent / 'edge-qualification.py', 'upgrade-controller.py': CONTROLLER,")
         elif name == 'safety-supervisor.py':
             source = function(source, 'fence', '''def fence(module, expected):
     current = state()
@@ -167,10 +191,11 @@ def render(output, previous_controller_sha, previous_manifest_sha):
         with os.fdopen(fd, 'wb') as stream:
             stream.write(source.encode()); stream.flush(); os.fsync(stream.fileno())
         results[name] = {'source': path, 'source_sha256': digest(original), 'sha256': digest(source.encode()),
-            'local': str(target), 'remote': str(Path(INSTALL if name in c3.SPECIAL_NAMES else WORK) / name)}
+            'local': str(target), 'remote': str(Path(INSTALL if name in c3.SPECIAL_NAMES or name in ('edge-readmission.py', 'edge-qualification.py') else WORK) / name)}
     manifest = {'version': 1, 'release_commit': REVISION, 'renderer_sha256': digest(Path(__file__).read_bytes()),
         'transform_sources': {p.name: digest(p.read_bytes()) for p in [HERE / n for n in (
-            'cycle3_9373f71e.py', 'cycle4_runtime_3dae7d91.py', 'cycle4_acceptance_3dae7d91.py', 'cycle4_assessment_3dae7d91.py')]},
+            'cycle3_9373f71e.py', 'cycle4_runtime_3dae7d91.py', 'cycle4_acceptance_3dae7d91.py',
+            'cycle4_assessment_3dae7d91.py', 'cycle4_edge_3dae7d91.py', 'cycle4_edge_qualification_3dae7d91.py')]},
         'scope': {'work': WORK, 'bundle': BUNDLE, 'install': INSTALL, 'transfer': TRANSFER}, 'files': results}
     (output / 'render-manifest.json').write_bytes(encoded(manifest))
     (output / 'render-manifest.json').chmod(0o600)

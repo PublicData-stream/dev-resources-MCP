@@ -105,6 +105,7 @@ def harness(root):
         body=body.replace('/usr/local/libexec/devres-upgrade-1d76fbcc',str(install))
         namespace={};exec(body,globals_,namespace);setattr(Base,name,namespace[name])
     exec(compile(RUNTIME_SOURCE,module.__file__,'exec'),globals_)
+    globals_['cycle4_edge_bridge']=lambda:(SimpleNamespace(native_guard=lambda _:{'edge':{}}),'b'*64)
     c=module.Controller();c.root=bundle;c.old=SimpleNamespace(k=cluster.k,settings=lambda:{'node_name':'node'})
     c.state_value={'runtime':'target','configs':'paused','phase':'writer_ready',
         'images':{'postgres':'postgres-pinned','writer':image,'backend':image},
@@ -168,7 +169,7 @@ class RuntimeAssessment(unittest.TestCase):
         self.assertEqual(self.cluster.policies,{})
     def test_protected_snapshot_normalizes_only_validated_temporary_policies(self):
         helper=self.c.helper('npm-recovery.py','runtime_assessment_snapshot_helper');helper.install_network(self.c)
-        self.assertEqual(self.c.protected_snapshot(),{'foundation':[]})
+        self.assertEqual(self.c.protected_snapshot(),{'foundation':[],'edge':{}})
         name=helper.ASSESSMENT_POLICIES[0]
         self.cluster.policies[name]['metadata']['uid']='replacement'
         with self.assertRaisesRegex(RuntimeError,'uid_changed'):self.c.protected_snapshot()

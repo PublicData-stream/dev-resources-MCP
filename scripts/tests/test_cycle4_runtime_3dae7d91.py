@@ -176,6 +176,9 @@ class GeneratedRuntime(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='cycle4-runtime-review-', dir='/tmp')
         self.addCleanup(self.temp.cleanup)
         self.top = Path(self.temp.name)
+        edge_patch = patch.object(self.u, 'cycle4_edge_bridge', return_value=(
+            SimpleNamespace(native_guard=lambda _: {'edge': {}}), 'b' * 64))
+        edge_patch.start(); self.addCleanup(edge_patch.stop)
         self.bundle = self.top / 'bundle'; self.bundle.mkdir(mode=0o700)
         self.cluster = Cluster(self.u)
         self.c = self.u.Controller.__new__(self.u.Controller)
@@ -197,6 +200,7 @@ class GeneratedRuntime(unittest.TestCase):
         for name, value in variants.items():
             self.u.save(self.bundle / ('configs-' + name + '.json'), value)
         prepared = {**protected(), 'at': self.u.stamp(), 'prior_artifacts': self.c.prior_hashes(),
+            'edge_readmission_sha256': 'b' * 64,
             'secrets': snap['secrets'], 'old_pods': snap['pods'],
             'deployments': {role: {'projection': value['projection'], 'manifest': self.cluster.get('deployment', role)}
                 for role, value in snap['deployments'].items()},

@@ -9,10 +9,21 @@ the operational changes below govern temporary assessment and paused observation
 `cycle4_3dae7d91.py` renders an exact source closure below a fresh `/tmp` root.
 Its input predecessor hashes must match the pinned controller and manifest.
 Add the separately qualified target and historical checkpoint probe records,
-bind the complete 27-file source manifest externally, and verify every producer
+bind the complete 29-file source manifest externally, and verify every producer
 before importing or installing it. Operational transformation sources must be
 reviewed, tested and committed with a signature before remote installation.
 Rendering does not authorize or execute any cluster operation.
+
+The separately authorized edge re-admission preserves the same container, image,
+compose and configuration. Its source-bound bridge admits only the observed
+process/start identity, regenerated endpoint/MAC fields and explicit DNS metadata
+transition from `null` to empty arrays. Candidate capture retains the original
+guard denial; offline/live edge-only qualification precedes the new receipt.
+Historical sources, admissions and journals remain unchanged. Root snapshots and
+guards use native reality; historical projections are confined to read-only
+compatibility contexts. Pin the receipt SHA-256 through
+`DEVRES_EDGE_READMISSION_SHA256` before construction and retain it in the prepared
+boundary. Full public MCP/WebTransport acceptance remains a later target gate.
 
 ## Admission and recovery proof
 

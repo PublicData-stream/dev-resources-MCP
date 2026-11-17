@@ -464,6 +464,22 @@ PREVIOUS_SOURCE_NAMES=SPECIAL|{
     'deploy/diagnostics/__init__.py','deploy/diagnostics/evidence.py','deploy/diagnostics/runner.py',
     'mcp_smoke.py','target-native-qualification.json','fallback-native-qualification.json'}
 
+EDGE_BRIDGE=Path('/usr/local/libexec/devres-upgrade-3dae7d91/edge-readmission.py')
+CURRENT_MANIFEST=Path('/tmp/devres-upgrade-3dae7d91-20261117/source-manifest.json')
+
+
+def bound_edge_bridge():
+    expected=os.environ.get('DEVRES_ACCEPTANCE_SOURCE_MANIFEST_SHA256','')
+    need(re.fullmatch('[0-9a-f]{64}',expected) and file_record(CURRENT_MANIFEST)['sha256']==expected,
+         'current_external_source_manifest_required')
+    manifest=load(CURRENT_MANIFEST)
+    need(file_record(EDGE_BRIDGE)['sha256']==manifest.get('edge-readmission.py'),'edge_bridge_source_changed')
+    receipt_sha=os.environ.get('DEVRES_EDGE_READMISSION_SHA256','')
+    need(re.fullmatch('[0-9a-f]{64}',receipt_sha),'edge_receipt_pin_required')
+    spec=importlib.util.spec_from_file_location('reclaim_exact_edge_bridge',EDGE_BRIDGE)
+    module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+    return module,receipt_sha,expected
+
 
 class LiveBoundary:
     """Fixed predecessor proof, held under its original lifecycle/certificate locks."""
@@ -479,23 +495,27 @@ class LiveBoundary:
         need(manifest['upgrade-controller.py']==PREVIOUS_CONTROLLER_SHA,'exact_previous_controller_required')
 
     def check(self):
-        self.source_guard();self.controller.guard();self.controller.storage_guard(18,owner=False)
+        self.source_guard()
+        module,receipt_sha,manifest_sha=bound_edge_bridge()
+        native=module.native_guard(receipt_sha)
+        self.controller.guard();self.controller.storage_guard(18,owner=False)
         state=self.controller.state()
         need(state.get('runtime')=='fallback' and state.get('phase')=='withdrawn' and state.get('configs')=='paused'
              and state.get('replicas')=={'postgres':1,'writer':0,'backend':0}
              and set(state.get('pods',{}))=={'postgres'},'withdrawn_schema18_predecessor_required')
         fingerprint={'controller_sha256':PREVIOUS_CONTROLLER_SHA,'manifest_sha256':PREVIOUS_MANIFEST_SHA,
-            'state_sha256':sha(encode(state)),'prepared_sha256':file_record(PREVIOUS.bundle/'prepared.json')['sha256']}
+            'state_sha256':sha(encode(state)),'prepared_sha256':file_record(PREVIOUS.bundle/'prepared.json')['sha256'],
+            'edge_readmission_sha256':receipt_sha,'current_source_manifest_sha256':manifest_sha,
+            'native_edge_sha256':sha(encode(native))}
         if hasattr(self,'fingerprint'):need(fingerprint==self.fingerprint,'previous_boundary_changed')
         else:self.fingerprint=fingerprint
         return fingerprint
 
     def __enter__(self):
         self.source_guard()
-        path=PREVIOUS.install/'upgrade-controller.py';name='cycle4_reclaim_exact_predecessor'
-        spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec)
-        sys.modules[name]=module;spec.loader.exec_module(module)
-        self.controller=module.Controller(str(PREVIOUS.bundle),str(PREVIOUS.bundle/'plan.json'),'default')
+        module,receipt_sha,_=bound_edge_bridge()
+        self.controller=module.load_controller(PREVIOUS.install/'upgrade-controller.py',PREVIOUS_CONTROLLER_SHA,
+            str(PREVIOUS.bundle),'default',receipt_sha=receipt_sha)
         self.lock=self.controller.locked();self.lock.__enter__()
         try:self.check()
         except BaseException:

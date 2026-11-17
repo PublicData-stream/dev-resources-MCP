@@ -239,6 +239,17 @@ class LiveBoundaryTests(unittest.TestCase):
             'PREVIOUS_MANIFEST_SHA':n.sha((self.cycle.work/'source-manifest.json').read_bytes()),
             'PREVIOUS_SOURCE_NAMES':{'upgrade-controller.py'}}
         self.patch=patch.multiple(n,**values);self.patch.start();self.addCleanup(self.patch.stop)
+        def load_controller(path,expected,bundle,context,*,receipt_sha):
+            self.assertEqual(n.sha(Path(path).read_bytes()),expected)
+            self.assertEqual(receipt_sha,'b'*64)
+            spec=importlib.util.spec_from_file_location('cycle4_reclaim_exact_predecessor',path)
+            value=importlib.util.module_from_spec(spec);sys.modules[spec.name]=value;spec.loader.exec_module(value)
+            return value.Controller(bundle,str(Path(bundle)/'plan.json'),context)
+        bridge=type('Bridge',(),{})()
+        bridge.load_controller=load_controller
+        bridge.native_guard=lambda _:{'edge':{'pid':123}}
+        edge_patch=patch.object(n,'bound_edge_bridge',return_value=(bridge,'b'*64,'c'*64))
+        edge_patch.start();self.addCleanup(edge_patch.stop)
     def test_exact_sources_are_imported_registered_and_checked_inside_lock(self):
         with n.LiveBoundary() as boundary:
             fingerprint=boundary.check();module=sys.modules['cycle4_reclaim_exact_predecessor']

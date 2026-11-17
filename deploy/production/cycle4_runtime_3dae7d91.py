@@ -47,6 +47,21 @@ def observer_variants(variants):
     variants['observer'] = {'backend': reader, 'writer': observer}
 
 
+def cycle4_edge_bridge():
+    """Bind the new bridge and separate receipt before any historical constructor."""
+    expected = os.environ.get('DEVRES_ACCEPTANCE_SOURCE_MANIFEST_SHA256', '')
+    body = read(Path(WORK) / 'source-manifest.json')
+    require(re.fullmatch('[0-9a-f]{64}', expected) and digest(body) == expected, 'edge_external_source_manifest_required')
+    manifest = json.loads(body)
+    path = Path(__file__).parent / 'edge-readmission.py'
+    require(digest(read(path)) == manifest.get('edge-readmission.py'), 'edge_bridge_source_changed')
+    receipt_sha = os.environ.get('DEVRES_EDGE_READMISSION_SHA256', '')
+    require(re.fullmatch('[0-9a-f]{64}', receipt_sha), 'edge_receipt_pin_required')
+    spec = importlib.util.spec_from_file_location('cycle4_exact_edge_bridge', path)
+    value = importlib.util.module_from_spec(spec); sys.modules[spec.name] = value; spec.loader.exec_module(value)
+    return value, receipt_sha
+
+
 _Cycle4BaseController = Controller
 
 
@@ -77,6 +92,10 @@ class Controller(_Cycle4BaseController):
         sys.modules[alias] = value
         spec.loader.exec_module(value)
         return value
+
+    def edge(self):
+        bridge, receipt_sha = cycle4_edge_bridge()
+        return bridge.native_guard(receipt_sha)['edge']
 
     def pods(self):
         values = json.loads(self.old.k('get', 'pods', '-o', 'json'))['items']
@@ -131,6 +150,7 @@ class Controller(_Cycle4BaseController):
 
     def protected_snapshot(self):
         value = super().protected_snapshot()
+        value['edge'] = self.edge()
         foundation = value['foundation']
         if (self.root / 'npm-assessment-network-admission.json').exists():
             helper = self.helper('npm-recovery.py', 'cycle4_network_assessment')
@@ -193,11 +213,15 @@ class Controller(_Cycle4BaseController):
                     'removed_observer_resource_remaining')
 
     def boundary_guard(self, *args, **kwargs):
+        bridge, receipt_sha = cycle4_edge_bridge()
+        bridge.native_guard(receipt_sha)
         result = super().boundary_guard(*args, **kwargs)
+        require(result.get('edge_readmission_sha256') == receipt_sha, 'prepared_edge_receipt_changed')
         record = self.root / 'observer-resource.json'
         if record.exists() and load(record)['phase'] == 'running':
             obj = self.observer_deployment_guard()
             require(obj['spec'].get('replicas') == 1, 'observer_replicas_changed')
+        bridge.native_guard(receipt_sha)
         return result
 
     def npm_assess(self):
