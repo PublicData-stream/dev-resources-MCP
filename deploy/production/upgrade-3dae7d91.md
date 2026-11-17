@@ -1,5 +1,12 @@
 # Fresh target-only production recovery
 
+This scope is consumed. Its single target attempt failed and its one physical
+schema-18 restoration completed; both application roles remain withdrawn.
+See the [execution evidence](upgrade-3dae7d91-evidence.md). The baseline correction
+below applies to future rendered tooling only. Do not rerender into this consumed
+scope, replace installed sources, backfill its evidence or replay a stage. A new
+cycle requires separate authority and fresh admission of restored state.
+
 This procedure deploys signed release `0.1.0-build.3dae7d91`, commit
 `3dae7d914baa9379abc402c5a3bcf311e0db01bf`, from the withdrawn schema-18
 predecessor. It does not replay the consumed `9373f71e` cycle or start an old
