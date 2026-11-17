@@ -320,7 +320,7 @@ def fault_timings(cluster, name, *, clock=time.monotonic, pause=time.sleep):
         if budget <= 0:
             return False
         try:
-            current = backend_identity(cluster, timeout=min(2, budget))
+            current = backend_identity(cluster, timeout=min(5, budget))
         except CommandError as error:
             # The last CLI may exhaust its deliberately shortened budget. End
             # the window using only an earlier fully verified snapshot; an
@@ -338,17 +338,22 @@ def fault_timings(cluster, name, *, clock=time.monotonic, pause=time.sleep):
                 '--tail=-1', '--limit-bytes=65537'), timeout=min(2, remaining()))
         except api.AssessmentError:
             logs = None
-        if not same_process():
-            break
+        verified = same_process()
+        evidence = None
         if logs is not None:
-            observed_logs = True
             evidence = timing_evidence(logs, allow_empty=True)
-            cluster.timing_stages = evidence
             base.need(all(event['stage'] not in ('attribution', 'writer_token', 'writer_transport') for event in evidence),
                       'observer_forwarded_after_storage_failure')
-            # Emit writes one record per stage. A first CRI snapshot can expose
-            # only its prefix; observe the entire bounded window before proving
-            # that no later attribution or second operation was emitted.
+        if not verified:
+            break
+        if evidence is not None:
+            observed_logs = True
+            cluster.timing_stages = evidence
+            # Emit writes one record per stage; an early snapshot may be a prefix.
+            # Accept benign evidence only when bracketed by matching identities.
+            # A final shortened identity budget may expire: this window does not
+            # promise a fully verified terminal snapshot. Fetched forbidden or
+            # malformed timing still fails closed before that boundary exit.
         pause(min(.25, max(0, deadline - clock())))
     base.need(observed_logs, 'observer_timing_unavailable')
     evidence = getattr(cluster, 'timing_stages', [])

@@ -341,7 +341,7 @@ class ObserverFixtureTests(unittest.TestCase):
             def identity(_cluster, **kwargs):
                 nonlocal count
                 count += 1
-                self.assertLessEqual(kwargs['timeout'], 2)
+                self.assertLessEqual(kwargs['timeout'], 5)
                 if count == (2 if slow_after_logs else 1): clock.now += 11
                 return IDENTITY
             with self.subTest(slow_after_logs=slow_after_logs), \
@@ -363,7 +363,7 @@ class ObserverFixtureTests(unittest.TestCase):
         def identity(_cluster, **kwargs):
             nonlocal checks
             checks += 1
-            self.assertLessEqual(kwargs['timeout'], 2)
+            self.assertLessEqual(kwargs['timeout'], 5)
             if checks == 3:
                 clock.now = 10
                 raise fixture.CommandError('observer_command_timeout', 'timeout')
@@ -417,10 +417,37 @@ class ObserverFixtureTests(unittest.TestCase):
         self.assertEqual(cluster.timing_stages, fixture.timing_evidence(payload))
         self.assertEqual(api.report_exchange.call_count, 1)
 
-    def test_post_log_boundary_timeout_discards_current_unverified_forwarding_snapshot(self):
+    def test_post_log_boundary_timeout_rejects_fetched_forbidden_or_malformed_snapshot(self):
+        for late,code in ((timing(stage),'observer_forwarded_after_storage_failure')
+                          for stage in ('attribution','writer_token','writer_transport')):
+            self.assert_boundary_snapshot_refused(late,code)
+        self.assert_boundary_snapshot_refused(timing('unrecognized'),'observer_timing_schema')
+
+    def assert_boundary_snapshot_refused(self,late,code):
         cluster, clock = RecordingCluster(), Clock()
         payload = self.sql_fault_snapshot()
-        api = self.timing_api([payload, payload + timing('attribution')])
+        api = self.timing_api([payload, payload + late])
+        checks = 0
+        def identity(_cluster, **kwargs):
+            nonlocal checks
+            checks += 1
+            if checks == 4:
+                clock.now = 10
+                raise fixture.CommandError('observer_command_timeout', 'timeout')
+            return IDENTITY
+        with self.subTest(code=code,late=late),patch.object(fixture, 'backend_identity', side_effect=identity), \
+             patch.object(fixture.base, 'helper', return_value=api):
+            with self.assertRaisesRegex(fixture.base.FixtureError,'^'+code+'$'):
+                fixture.fault_timings(cluster, 'sql-permission', clock=clock, pause=clock.pause)
+        self.assertEqual(cluster.timing_stages,fixture.timing_evidence(payload))
+        self.assertEqual(api.report_exchange.call_count,2)
+        self.assertEqual(checks,4)
+        self.assertEqual(clock.now,10)
+
+    def test_post_log_boundary_timeout_keeps_only_earlier_identity_verified_benign_snapshot(self):
+        cluster, clock = RecordingCluster(), Clock()
+        payload = self.sql_fault_snapshot()
+        api = self.timing_api([payload, b''])
         checks = 0
         def identity(_cluster, **kwargs):
             nonlocal checks
@@ -434,9 +461,66 @@ class ObserverFixtureTests(unittest.TestCase):
             result = fixture.fault_timings(cluster, 'sql-permission', clock=clock, pause=clock.pause)
         self.assertEqual(result, fixture.timing_evidence(payload))
         self.assertEqual(cluster.timing_stages, result)
-        self.assertNotIn('attribution', [event['stage'] for event in result])
         self.assertEqual(api.report_exchange.call_count, 2)
         self.assertEqual(checks, 4)
+        self.assertEqual(clock.now, 10)
+
+    def timed_control_reads(self,cluster,clock,latency=2.25,replace_at=None):
+        original=cluster.k;calls=[]
+        def command(*args,**kwargs):
+            if args[:2] != ('get','pods'):return original(*args,**kwargs)
+            budget=kwargs['timeout'];calls.append((clock.now,budget))
+            self.assertEqual(budget,min(5,10-clock.now))
+            clock.pause(min(latency,budget))
+            if latency>budget:raise fixture.CommandError('observer_command_timeout','timeout')
+            result=original(*args,**kwargs)
+            if len(calls)==replace_at:
+                value=json.loads(result.stdout);value['items'][0]['metadata']['uid']='replacement'
+                result=SimpleNamespace(stdout=json.dumps(value).encode(),returncode=0)
+            return result
+        return calls,patch.object(cluster,'k',side_effect=command)
+
+    def test_control_reads_over_two_seconds_fit_the_unchanged_ten_second_window(self):
+        cluster,clock=RecordingCluster(),Clock();payload=self.sql_fault_snapshot();api=self.timing_api([payload])
+        calls,control=self.timed_control_reads(cluster,clock)
+        with control,patch.object(fixture.base,'helper',return_value=api):
+            result=fixture.fault_timings(cluster,'sql-permission',clock=clock,pause=clock.pause)
+        self.assertEqual(result,fixture.timing_evidence(payload))
+        self.assertEqual(calls,[(0,5),(2.25,5),(4.75,5),(7.0,3.0),(9.5,.5)])
+        self.assertEqual(api.report_exchange.call_count,2)
+        self.assertEqual(clock.now,10)
+        self.assertTrue(all(call.kwargs['timeout']<=2 for call in api.report_exchange.call_args_list))
+
+    def test_slow_control_timeout_before_deadline_still_fails_immediately(self):
+        cluster,clock=RecordingCluster(),Clock();api=self.timing_api([self.sql_fault_snapshot()])
+        calls,control=self.timed_control_reads(cluster,clock,latency=5.5)
+        with control,patch.object(fixture.base,'helper',return_value=api):
+            with self.assertRaisesRegex(fixture.CommandError,'^observer_command_timeout$'):
+                fixture.fault_timings(cluster,'sql-permission',clock=clock,pause=clock.pause)
+        self.assertEqual(calls,[(0,5)]);self.assertEqual(clock.now,5)
+        api.report_exchange.assert_not_called()
+
+    def test_slow_control_replacement_before_or_after_log_still_fails_closed(self):
+        for replacement in (1,2):
+            cluster,clock=RecordingCluster(),Clock();api=self.timing_api([self.sql_fault_snapshot()])
+            calls,control=self.timed_control_reads(cluster,clock,replace_at=replacement)
+            with self.subTest(replacement=replacement),control,patch.object(fixture.base,'helper',return_value=api):
+                with self.assertRaisesRegex(fixture.base.FixtureError,'^observer_process_changed$'):
+                    fixture.fault_timings(cluster,'sql-permission',clock=clock,pause=clock.pause)
+            self.assertEqual(api.report_exchange.call_count,replacement-1)
+            self.assertFalse(getattr(cluster,'timing_stages',[]))
+            self.assertLess(clock.now,10)
+
+    def test_slow_healthy_controls_do_not_hide_late_forbidden_stages(self):
+        for stage in ('attribution','writer_token','writer_transport'):
+            cluster,clock=RecordingCluster(),Clock();payload=self.sql_fault_snapshot()
+            api=self.timing_api([payload,payload+timing(stage)])
+            calls,control=self.timed_control_reads(cluster,clock)
+            with self.subTest(stage=stage),control,patch.object(fixture.base,'helper',return_value=api):
+                with self.assertRaisesRegex(fixture.base.FixtureError,'^observer_forwarded_after_storage_failure$'):
+                    fixture.fault_timings(cluster,'sql-permission',clock=clock,pause=clock.pause)
+            self.assertEqual(clock.now,9.25);self.assertEqual(api.report_exchange.call_count,2)
+            self.assertEqual(cluster.timing_stages,fixture.timing_evidence(payload))
 
     def test_diagnostics_are_closed_and_captured_before_all_restoration_attempts(self):
         cluster = RecordingCluster()

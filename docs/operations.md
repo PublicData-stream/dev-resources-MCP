@@ -1667,7 +1667,12 @@ The paused fixture starts a fresh observer backend for each storage fault and
 binds bounded timing evidence to that exact process. Fault probes preserve mTLS
 and hostname verification while addressing the pod directly, because an archive
 outage intentionally withdraws Service readiness. Healthy public checks use
-Service DNS. A `paused-status-failure.json` records closed failure metadata before
+Service DNS. Timing observation keeps its ten-second window; identity queries
+use at most five seconds of the remaining window and log reads at most two.
+Benign evidence requires matching process identities before and after its read.
+Fetched forbidden or malformed timing records still fail if the final identity
+budget expires. Earlier verified evidence does not prove a verified terminal
+snapshot. A `paused-status-failure.json` records closed failure metadata before
 restoration replaces the observer; `paused-status-restoration.json` records the
 restoration outcomes separately. These private create-new receipts exclude raw
 stderr, responses, configuration and credentials. Retention or restoration failure
