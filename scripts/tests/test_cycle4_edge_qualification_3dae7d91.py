@@ -597,18 +597,21 @@ class QualificationCLI(unittest.TestCase):
         args = ['edge-qualification.py', '--candidate-sha256', 'a' * 64, '--bridge-sha256', 'b' * 64,
             '--qualification-completion-sha256', 'c' * 64]
         with patch.object(sys, 'argv', args), patch.object(n.os, 'geteuid', return_value=0), \
+                patch.object(n.os, 'umask') as umask, \
                 patch.object(n, 'complete', return_value={'verified': True}) as complete, \
                 patch.object(n, 'qualify') as qualify, patch('sys.stdout', new_callable=io.StringIO):
             n.main()
         complete.assert_called_once_with('a' * 64, 'b' * 64, 'c' * 64); qualify.assert_not_called()
+        umask.assert_called_once_with(0o077)
 
     def test_continuation_and_completion_flags_are_mutually_exclusive(self):
         args = ['edge-qualification.py', '--candidate-sha256', 'a' * 64, '--bridge-sha256', 'b' * 64,
             '--qualification-completion-sha256', 'c' * 64, '--qualification-continuation-sha256', 'd' * 64]
-        with patch.object(sys, 'argv', args), patch.object(n, 'complete') as complete, \
+        with patch.object(sys, 'argv', args), patch.object(n.os, 'umask') as umask, patch.object(n, 'complete') as complete, \
                 patch.object(n, 'qualify') as qualify, patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
             n.main()
         complete.assert_not_called(); qualify.assert_not_called()
+        umask.assert_called_once_with(0o077)
 
 
 class ActualBridgeCompletion(unittest.TestCase):
