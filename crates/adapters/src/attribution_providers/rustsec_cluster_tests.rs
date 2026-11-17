@@ -43,6 +43,164 @@ fn recovery_options(target: &AttributionTarget) -> RustSecRecoveryOptions {
     }
 }
 
+// A dropped client does not acknowledge server-side advisory-lock release. Each
+// fixture ownership handover waits once on a separate session, without changing
+// the production constructors' immediate refusal when a live owner remains.
+#[derive(Debug, PartialEq, Eq)]
+enum QuiescenceError {
+    Deadline,
+    Connect,
+    Configure,
+    Lifecycle,
+    Writer,
+    UnlockWriter,
+    UnlockLifecycle,
+    Close,
+}
+
+async fn wait_for_storage_quiescence(database: &str) -> std::result::Result<(), QuiescenceError> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut connection = sqlx_postgres::PgConnection::connect(database)
+            .await
+            .map_err(|_| QuiescenceError::Connect)?;
+        sqlx_core::raw_sql::raw_sql("SET statement_timeout='1500ms'; SET lock_timeout='1000ms'")
+            .execute(&mut connection)
+            .await
+            .map_err(|_| QuiescenceError::Configure)?;
+        sqlx_core::query::query("SELECT pg_advisory_lock(1835365490, 2)")
+            .execute(&mut connection)
+            .await
+            .map_err(|_| QuiescenceError::Lifecycle)?;
+        sqlx_core::query::query("SELECT pg_advisory_lock(1835365490, 1)")
+            .execute(&mut connection)
+            .await
+            .map_err(|_| QuiescenceError::Writer)?;
+        let writer_unlocked: bool =
+            sqlx_core::query_scalar::query_scalar("SELECT pg_advisory_unlock(1835365490, 1)")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(|_| QuiescenceError::UnlockWriter)?;
+        if !writer_unlocked {
+            return Err(QuiescenceError::UnlockWriter);
+        }
+        let lifecycle_unlocked: bool =
+            sqlx_core::query_scalar::query_scalar("SELECT pg_advisory_unlock(1835365490, 2)")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(|_| QuiescenceError::UnlockLifecycle)?;
+        if !lifecycle_unlocked {
+            return Err(QuiescenceError::UnlockLifecycle);
+        }
+        connection.close().await.map_err(|_| QuiescenceError::Close)
+    })
+    .await
+    .map_err(|_| QuiescenceError::Deadline)?
+}
+
+#[tokio::test]
+async fn rustsec_fixture_quiescence_bounds_stalled_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_connection, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(7),
+        wait_for_storage_quiescence(&format!(
+            "postgres://fixture:fixture-only@{address}/fixture?sslmode=disable"
+        )),
+    )
+    .await
+    .expect("fixture connect deadline must be finite");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    assert_eq!(result, Err(QuiescenceError::Deadline));
+}
+
+#[tokio::test]
+#[ignore = "requires exclusive disposable PostgreSQL"]
+async fn rustsec_fixture_quiescence_preserves_live_lifecycle_participants() {
+    let database = std::env::var("DATABASE_URL").expect("disposable PostgreSQL");
+    for lock in [
+        "SELECT pg_advisory_lock_shared(1835365490, 2)",
+        "SELECT pg_advisory_lock(1835365490, 2)",
+    ] {
+        let mut participant = sqlx_postgres::PgConnection::connect(&database)
+            .await
+            .unwrap();
+        sqlx_core::query::query(lock)
+            .execute(&mut participant)
+            .await
+            .unwrap();
+        let pid: i32 = sqlx_core::query_scalar::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut participant)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(7),
+                wait_for_storage_quiescence(&database)
+            )
+            .await
+            .expect("live participant must cause bounded refusal"),
+            Err(QuiescenceError::Lifecycle)
+        );
+        let retained: (i32, bool) = sqlx_core::query_as::query_as(
+            "SELECT pg_backend_pid(), EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid=1835365490 AND objid=2 AND objsubid=2 AND granted)",
+        )
+        .fetch_one(&mut participant)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (pid, true),
+            "barrier must preserve the live owner"
+        );
+        drop(participant);
+        wait_for_storage_quiescence(&database).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires exclusive disposable PostgreSQL"]
+async fn rustsec_fixture_quiescence_preserves_live_writer() {
+    let database = std::env::var("DATABASE_URL").expect("disposable PostgreSQL");
+    let mut participant = sqlx_postgres::PgConnection::connect(&database)
+        .await
+        .unwrap();
+    sqlx_core::query::query("SELECT pg_advisory_lock(1835365490, 1)")
+        .execute(&mut participant)
+        .await
+        .unwrap();
+    let pid: i32 = sqlx_core::query_scalar::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut participant)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            wait_for_storage_quiescence(&database)
+        )
+        .await
+        .expect("live writer must cause bounded refusal"),
+        Err(QuiescenceError::Writer)
+    );
+    let retained: (i32, bool) = sqlx_core::query_as::query_as(
+        "SELECT pg_backend_pid(), EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid=1835365490 AND objid=1 AND objsubid=2 AND granted)",
+    )
+    .fetch_one(&mut participant)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained,
+        (pid, true),
+        "barrier must preserve the live writer"
+    );
+    drop(participant);
+    wait_for_storage_quiescence(&database).await.unwrap();
+}
+
 async fn compose(
     store: Arc<PgBlobStore>,
     broker: Arc<BulkBroker>,
@@ -227,6 +385,7 @@ async fn rustsec_collector_cluster_seed() {
             .unwrap();
         (snapshot, options)
     };
+    wait_for_storage_quiescence(&database).await.unwrap();
     // Exercise the production maintenance API only after every publication
     // owner has dropped. The journal retains this exact original blocked state.
     let dry = recover_rustsec_attribution(&database, &selected_recovery, false)
@@ -237,10 +396,12 @@ async fn rustsec_collector_cluster_seed() {
         expected_state: Some(dry.state_digest),
         ..selected_recovery
     };
+    wait_for_storage_quiescence(&database).await.unwrap();
     let applied = recover_rustsec_attribution(&database, &selected_recovery, true)
         .await
         .unwrap();
     assert_eq!(applied.outcome, RustSecRecoveryOutcome::Applied);
+    wait_for_storage_quiescence(&database).await.unwrap();
     let (snapshot, expected_get, expected_catalog, expected_notices) = {
         let store = Arc::new(
             PgBlobStore::connect_archive_for_maintenance(&database, &root, archive.clone())
@@ -343,6 +504,7 @@ async fn rustsec_collector_cluster_seed() {
         (snapshot, detail, catalogue, notice_pages)
     };
     // Reopen through the reader composition after dropping every writer handle.
+    wait_for_storage_quiescence(&database).await.unwrap();
     let attempts = broker.attempt_count();
     let reader_archive = std::env::var_os("DEVRES_TEST_S3_READER_CONFIG")
         .map(|path| toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())

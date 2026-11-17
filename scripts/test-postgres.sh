@@ -60,6 +60,7 @@ cargo test --locked -p devres-adapters --lib rustsec_current_atomic_publication_
 cargo test --locked -p devres-adapters --lib storage::visibility -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --lib attribution_storage -- --ignored --test-threads=1
 cargo test --locked -p devres-adapters --example staging-attribution-qualify -- --ignored --test-threads=1
+cargo test --locked -p devres-adapters --lib rustsec_fixture_quiescence -- --ignored --test-threads=1
 BLOB_DIR="$scratch/rustsec-blobs" cargo test --locked -p devres-adapters --lib rustsec_collector_cluster_seed -- --ignored --test-threads=1
 BLOB_DIR="$scratch/rustsec-blobs" cargo test --locked -p devres-adapters --lib rustsec_collector_cluster_readback -- --ignored --test-threads=1
 echo 'Real PostgreSQL persistence checks passed'

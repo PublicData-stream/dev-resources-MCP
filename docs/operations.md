@@ -1650,6 +1650,12 @@ read-only canonical denied path. This does not mount host securityfs into the Po
 The actual probe's complete authority and policy selection must match its admitted
 template; submitted Pod settings alone cannot establish CNI or AppArmor enforcement.
 
+Collector seed tests wait for PostgreSQL to acknowledge quiescence at maintenance
+and reader handoffs. A separate test session acquires lifecycle then writer locks,
+releases only its own locks, and closes before the next actor starts. Session-local
+timeouts and an overall deadline bound the barrier; a live participant causes a
+test failure. Production admission still attempts its lock once.
+
 See the [local paused-status verification record](paused-assessment-acceptance.md)
 for completed checks, the default-stack regression, local image identities and the
 remaining Kubernetes acceptance gate. The optional real-image assessment runs with
