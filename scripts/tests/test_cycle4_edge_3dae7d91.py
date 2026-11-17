@@ -1,4 +1,5 @@
 """Exact edge metadata delta, source-pinned receipts, and read-only facades."""
+import ast
 import contextlib
 import copy
 import importlib.util
@@ -219,6 +220,83 @@ class Receipt(unittest.TestCase):
             n.admit(n.sha(self.candidate_path.read_bytes()),self.scope/'qualification.json',
                 n.sha((self.scope/'qualification.json').read_bytes()),self.producer_sha)
         self.assertFalse(self.admission_path.exists())
+
+
+class RetainedProducerShape(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(dir='/tmp');self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);self.current=self.root/'modern-c3';self.original=self.root/'original-operator'
+        put(self.current/'prepared.json',{'version':1,'foundation':[]})
+        put(self.current/'plan.json',{'context':'default'})
+        put(self.current/'state.json',{'source_sha256':n.CHAIN['/usr/local/libexec/devres-upgrade-9373f71e/upgrade-controller.py'][1],
+            'prepared_sha256':n.sha((self.current/'prepared.json').read_bytes()),
+            'plan_sha256':n.sha((self.current/'plan.json').read_bytes()),'runtime':'fallback','phase':'withdrawn',
+            'configs':'paused','replicas':{'postgres':1,'writer':0,'backend':0},'pods':{'postgres':{'uid':'same'}}})
+        # Original prepare()/settings() schema, independently observed from the
+        # immutable operator: this bundle deliberately has no prepared.json.
+        put(self.original/'settings.json',{'storage_auth':'scaleway_static','node_name':'node'})
+        put(self.original/'release.json',{'version':'0.1.0-build.a938112b','revision':'a938112b',
+            'server':'sha256:fixed','broker':'sha256:fixed','postgres':'sha256:fixed','probe':'sha256:fixed','source_sha256':'fixed'})
+        put(self.original/'kubernetes.json',{'apiVersion':'v1','kind':'List','items':[]})
+        put(self.original/'acceptance-receipt.json',{'version':1,'fixture':False,'binding':{},'checks':{},'evidence':[],
+            'limitations':[],'production_activation_proved':False,'mode':'scaleway_static','verified_at':'retained','expires_at':'retained'})
+        put(self.original/'boot-guard-acceptance.json',{'fixture':False,'guard_restored':True})
+        put(self.original/'state.json',{'version':1,'revision':'a938112b','phase':'collectors_active',
+            'cluster_uid':'retained','namespace_uid':'retained','node_uid':'retained','edge_admitted':True,
+            'edge_installing':False,'legacy_edge_adopted':True,'upgrade_successor':'retained',
+            'settings_sha256':n.sha((self.original/'settings.json').read_bytes()),
+            'runtime_receipt_sha256':n.sha((self.original/'acceptance-receipt.json').read_bytes())})
+        self.patch=patch.multiple(n,CURRENT_BUNDLE=self.current,ORIGINAL_BUNDLE=self.original)
+        self.patch.start();self.addCleanup(self.patch.stop)
+    def test_original_canonical_artifacts_bind_without_inventing_prepared_file(self):
+        self.assertFalse((self.original/'prepared.json').exists())
+        bindings=n._retained_bindings()
+        expected={str(self.current/name) for name in ('state.json','prepared.json','plan.json')}
+        expected|={str(self.original/name) for name in ('state.json','settings.json','release.json','kubernetes.json',
+            'acceptance-receipt.json','boot-guard-acceptance.json')}
+        self.assertEqual(set(bindings),expected)
+        self.assertEqual(bindings[str(self.original/'settings.json')],n.sha((self.original/'settings.json').read_bytes()))
+        self.assertFalse((self.original/'prepared.json').exists())
+    def test_actual_immutable_prepare_and_settings_methods_produce_compatible_bundle(self):
+        # AST hashes match the live source-checked immutable 585017... operator,
+        # even though unrelated functions in the current checkout have evolved.
+        tree=ast.parse((ROOT/'scripts/production-operator.py').read_text())
+        methods={node.name:node for node in ast.walk(tree) if isinstance(node,ast.FunctionDef) and node.name in ('prepare','settings')}
+        expected={'prepare':'11b2525840b29497554c6f5a48e7cf8e7d3aa92f71cf55a4907118d171c11482',
+            'settings':'03052a6f2a5c2b92295eeca0577dc2db98ddd8d6f522e6b0cba74cc37bcecdab'}
+        for name,wanted in expected.items():self.assertEqual(n.sha(ast.dump(methods[name],include_attributes=False).encode()),wanted)
+        settings_file=self.root/'producer-input.json';put(settings_file,{'storage_auth':'scaleway_static','node_name':'node'})
+        output=self.root/'actual-produced-original'
+        def render(folder,settings):
+            put(folder/'release.json',{'version':'retained','revision':'retained'})
+            put(folder/'kubernetes.json',{'apiVersion':'v1','kind':'List','items':[]})
+        renderer=SimpleNamespace(settings_checked=lambda value:value,storage_auth=lambda value:value['storage_auth'],render=render)
+        context={'Path':Path,'os':os,'json':json,'hashlib':__import__('hashlib'),'renderer':lambda:renderer,
+            'read_json':lambda path:json.loads(path.read_bytes()),'private_read':lambda path:path.read_bytes(),
+            'private_write':lambda path,value:put(path,value.encode() if type(value) is str else value),
+            'postgres_inputs':lambda mode:({},[]),'firewall_rules':lambda:'fixture-only',
+            'prepare_tls':lambda folder,mode:None,'OperatorError':RuntimeError,'VERSION':'retained','REVISION':'retained'}
+        for name in ('prepare','settings'):
+            exec(compile(ast.Module(body=[methods[name]],type_ignores=[]),'<immutable-operator-method>','exec'),context)
+        context['prepare'](output,settings_file)
+        self.assertEqual(context['settings'](SimpleNamespace(bundle=output)),json.loads(settings_file.read_bytes()))
+        self.assertFalse((output/'prepared.json').exists())
+        put(output/'acceptance-receipt.json',{'version':1,'fixture':False})
+        put(output/'boot-guard-acceptance.json',{'fixture':False,'guard_restored':True})
+        state=json.loads((output/'state.json').read_bytes())
+        state['runtime_receipt_sha256']=n.sha((output/'acceptance-receipt.json').read_bytes());put(output/'state.json',state)
+        with patch.object(n,'ORIGINAL_BUNDLE',output):bindings=n._retained_bindings()
+        self.assertIn(str(output/'settings.json'),bindings);self.assertIn(str(output/'kubernetes.json'),bindings)
+        self.assertNotIn(str(output/'prepared.json'),bindings)
+    def test_original_settings_or_runtime_receipt_reference_drift_is_rejected(self):
+        for name in ('settings.json','acceptance-receipt.json'):
+            path=self.original/name;body=path.read_bytes();put(path,{'changed':True})
+            with self.subTest(name=name),self.assertRaisesRegex(n.Refused,'original_operator_artifact_binding'):
+                n._retained_bindings()
+            put(path,body)
+    def test_modern_prepared_binding_remains_mandatory(self):
+        put(self.current/'prepared.json',{'changed':True})
+        with self.assertRaisesRegex(n.Refused,'retained_predecessor_binding'):n._retained_bindings()
 
 
 if __name__=='__main__':unittest.main()

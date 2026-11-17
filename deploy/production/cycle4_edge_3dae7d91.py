@@ -186,8 +186,15 @@ def _retained_bindings():
     need(state.get('runtime')=='fallback' and state.get('phase')=='withdrawn' and state.get('configs')=='paused'
          and state.get('replicas')=={'postgres':1,'writer':0,'backend':0}
          and set(state.get('pods',{}))=={'postgres'},'retained_withdrawn_state_required')
+    # The original operator predates upgrade journals: prepare() wrote
+    # settings/state plus rendered release/Kubernetes artifacts, not prepared.json.
+    original=load(ORIGINAL_BUNDLE/'state.json')
+    need(original.get('settings_sha256')==sha(raw(ORIGINAL_BUNDLE/'settings.json'))
+         and original.get('runtime_receipt_sha256')==sha(raw(ORIGINAL_BUNDLE/'acceptance-receipt.json')),
+         'original_operator_artifact_binding_changed')
     paths=[CURRENT_BUNDLE/name for name in ('state.json','prepared.json','plan.json')]
-    paths += [ORIGINAL_BUNDLE/name for name in ('state.json','prepared.json')]
+    paths += [ORIGINAL_BUNDLE/name for name in ('state.json','settings.json','release.json','kubernetes.json',
+        'acceptance-receipt.json','boot-guard-acceptance.json')]
     return {str(path):sha(raw(path)) for path in paths}
 
 
