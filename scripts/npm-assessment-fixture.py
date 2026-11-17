@@ -750,8 +750,8 @@ def parser_admission(identity):
 
 
 def parser_write_projection(value, raw, state):
-    """Refuse Docker aliases and non-private covering mounts at either write path."""
-    targets = ('/usr/sbin', '/tmp')
+    """Refuse aliases and foreign physical storage at the parser write path."""
+    targets = ('/usr/sbin',)
     def overlaps(path):
         need(type(path) is str and path.startswith('/') and '..' not in Path(path).parts
              and str(Path(path)) == path, 'fixture_parser_write_boundary')
@@ -765,26 +765,16 @@ def parser_write_projection(value, raw, state):
     mounts = value.get('Mounts', []) + (host.get('Mounts') or [])
     for mount in mounts:
         destination = mount.get('Destination', mount.get('Target'))
-        if overlaps(destination):
-            need(destination == '/tmp' and mount.get('Type') == 'tmpfs'
-                 and not mount.get('Source') and mount.get('Propagation', '') in ('', 'rprivate', 'private'),
-                 'fixture_parser_write_boundary')
+        need(not overlaps(destination), 'fixture_parser_write_boundary')
     for destination in host.get('Tmpfs') or {}:
-        need(not overlaps(destination) or destination == '/tmp', 'fixture_parser_write_boundary')
+        need(not overlaps(destination), 'fixture_parser_write_boundary')
     root, root_rows, _ = mount_projection(raw, '/usr/sbin')
-    temporary, tmp_rows, _ = mount_projection(raw, '/tmp')
-    declared_tmpfs = '/tmp' in (host.get('Tmpfs') or {}) or any(
-        mount.get('Destination', mount.get('Target')) == '/tmp' and mount.get('Type') == 'tmpfs' for mount in mounts)
     need(root['target'] == '/' and root['root'] == '/' and root['filesystem'] == 'overlay'
-         and len(root_rows) == 1 and len(tmp_rows) == 1
-         and (temporary == root or temporary['target'] == '/tmp' and temporary['root'] == '/'
-              and temporary['filesystem'] == 'tmpfs')
-         and declared_tmpfs == (temporary != root)
+         and len(root_rows) == 1
          # Propagation flags govern mount events. Ordinary file writes must land
          # in the private overlay upper/work storage proved below.
          # Bind/submount aliases remain forbidden; retain peer IDs in the digest.
-         and all(all(re.fullmatch(r'shared:[0-9]+', field) for field in row['propagation'])
-                 for row in (root, temporary)), 'fixture_parser_write_boundary')
+         and all(re.fullmatch(r'shared:[0-9]+', field) for field in root['propagation']), 'fixture_parser_write_boundary')
     # Root writes must land in this private daemon's disposable upper directory.
     directories = []
     for option_name in ('upperdir=', 'workdir='):
@@ -794,7 +784,7 @@ def parser_write_projection(value, raw, state):
         directories.append(paths[0])
     need(directories[0] != directories[1], 'fixture_parser_write_boundary')
     projection = {'docker': {'Mounts': value.get('Mounts', []), 'HostConfig': {key: host.get(key) for key in
-                  ('Binds', 'Mounts', 'Tmpfs', 'VolumesFrom')}}, 'mounts': [root, temporary]}
+                  ('Binds', 'Mounts', 'Tmpfs', 'VolumesFrom')}}, 'mounts': [root]}
     return hashlib.sha256(json.dumps(projection, sort_keys=True).encode()).hexdigest(), directories
 
 
@@ -806,11 +796,10 @@ def node_write_boundaries(cluster, identity, uid):
     values = json.loads(command(['docker', 'inspect', '--', identity['container_id']]).stdout)
     need(type(values) is list and len(values) == 1 and values[0]['Id'] == identity['container_id']
          and values[0]['State']['Pid'] == identity['container_pid'], 'fixture_node_identity_changed')
-    need(node_exec(identity, 'readlink', '-f', '/', '/tmp', '/usr', '/usr/sbin').stdout.splitlines()
-             == [b'/', b'/tmp', b'/usr', b'/usr/sbin']
-         and node_exec(identity, 'stat', '-c', '%u:%g:%a:%F', '/', '/tmp', '/usr', '/usr/sbin').stdout.splitlines()
-             in ([b'0:0:755:directory', b'0:0:1777:directory', b'0:0:755:directory', b'0:0:755:directory'],
-                 [b'0:0:755:directory', b'0:0:700:directory', b'0:0:755:directory', b'0:0:755:directory']),
+    need(node_exec(identity, 'readlink', '-f', '/', '/usr', '/usr/sbin').stdout.splitlines()
+             == [b'/', b'/usr', b'/usr/sbin']
+         and node_exec(identity, 'stat', '-c', '%u:%g:%a:%F', '/', '/usr', '/usr/sbin').stdout.splitlines()
+             == [b'0:0:755:directory', b'0:0:755:directory', b'0:0:755:directory'],
          'fixture_parser_write_boundary')
     digest, directories = parser_write_projection(values[0], node_exec(identity, 'cat', '/proc/self/mountinfo').stdout, state)
     # Read-only host-side identity proof, including root-owned daemon directories

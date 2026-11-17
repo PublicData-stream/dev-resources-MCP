@@ -331,18 +331,17 @@ class SyntheticFixtureTests(unittest.TestCase):
         value = {'HostConfig': {'Tmpfs': {'/tmp': 'rw'}}, 'Mounts': [{'Type': 'tmpfs', 'Destination': '/tmp'}]}
         digest, directories = fixture.parser_write_projection(value, mountinfo, state)
         self.assertEqual(len(digest),64);self.assertEqual(directories, ['/tmp/owned-daemon/containerd/snapshots/1/fs','/tmp/owned-daemon/containerd/snapshots/1/work'])
-        for scenario in ('ancestor-bind', 'tmp-bind', 'descendant-volume', 'volumes-from', 'foreign-upper', 'usr-mount', 'tmp-child', 'slave', 'undeclared-tmpfs', 'tmpfs-source','foreign-work','missing-work','duplicate-work'):
+        for scenario in ('ancestor-bind', 'parser-bind', 'descendant-volume', 'volumes-from', 'foreign-upper', 'usr-mount', 'usr-child', 'slave', 'usr-tmpfs','foreign-work','missing-work','duplicate-work'):
             candidate, raw = copy.deepcopy(value), mountinfo
             if scenario == 'ancestor-bind': candidate['HostConfig']['Binds'] = ['/foreign:/usr:rw']
-            elif scenario == 'tmp-bind': candidate['Mounts'] = [{'Type': 'bind', 'Destination': '/tmp'}]
+            elif scenario == 'parser-bind': candidate['Mounts'] = [{'Type': 'bind', 'Destination': '/usr/sbin/apparmor_parser'}]
             elif scenario == 'descendant-volume': candidate['Mounts'].append({'Type':'volume','Destination':'/usr/sbin/parser'})
             elif scenario == 'volumes-from': candidate['HostConfig']['VolumesFrom'] = ['foreign']
             elif scenario == 'foreign-upper': raw = raw.replace(b'/tmp/owned-daemon/containerd', b'/var/lib/docker')
             elif scenario == 'usr-mount': raw += b'3 1 0:3 / /usr rw - ext4 /dev/foreign rw\n'
-            elif scenario == 'tmp-child': raw += b'3 2 0:3 / /tmp/staged rw - ext4 /dev/foreign rw\n'
-            elif scenario == 'slave': raw = raw.replace(b'/ /tmp rw -', b'/ /tmp rw master:50 -')
-            elif scenario == 'undeclared-tmpfs': candidate = {'HostConfig': {}, 'Mounts': []}
-            elif scenario == 'tmpfs-source': candidate['Mounts'][0]['Source'] = '/foreign/tmpfs'
+            elif scenario == 'usr-child': raw += b'3 1 0:3 / /usr/sbin/staged rw - ext4 /dev/foreign rw\n'
+            elif scenario == 'slave': raw = raw.replace(b'/ / rw -', b'/ / rw master:50 -')
+            elif scenario == 'usr-tmpfs': candidate['HostConfig']['Tmpfs']['/usr/sbin'] = 'rw'
             elif scenario == 'foreign-work': raw = raw.replace(b'workdir=/tmp/owned-daemon/containerd/snapshots/1/work',b'workdir=/foreign/work')
             elif scenario == 'missing-work': raw = raw.replace(b',workdir=/tmp/owned-daemon/containerd/snapshots/1/work',b'')
             elif scenario == 'duplicate-work': raw = raw.replace(b'\n2 ',b',workdir=/tmp/owned-daemon/containerd/snapshots/1/work\n2 ')
@@ -371,14 +370,17 @@ class SyntheticFixtureTests(unittest.TestCase):
         # private-propagation defaults. No parser ELF is staged on node /tmp.
         state=Path('/tmp/owned-daemon')
         raw=(b'489 349 0:53 / / rw,relatime shared:330 - overlay overlay rw,lowerdir=/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/18/fs:/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/13/fs,upperdir=/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/19/fs,workdir=/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/19/work,nouserxattr\n'
-             b'505 489 0:74 / /tmp rw,nosuid,nodev,noexec,relatime shared:340 - tmpfs tmpfs rw,inode64\n')
+             b'505 489 0:74 / /tmp rw,nosuid,nodev,noexec,relatime shared:340 - tmpfs tmpfs rw,inode64\n'
+             b'387 505 253:1 /devres-state/data/volumes/devres-acceptance-fixture/_data/hostpath_pv /tmp/hostpath_pv rw,relatime shared:341 master:113 - ext4 /dev/vda1 rw\n'
+             b'390 505 253:1 /devres-state/data/volumes/devres-acceptance-fixture/_data/hostpath-provisioner /tmp/hostpath-provisioner rw,relatime shared:341 master:113 - ext4 /dev/vda1 rw\n')
         value={'HostConfig':{'Binds':['devres-acceptance-fixture:/var','/lib/modules:/lib/modules:ro'],
                             'Mounts':None,'Tmpfs':{'/run':'','/tmp':''},'VolumesFrom':None},
                'Mounts':[{'Type':'volume','Destination':'/var','Source':'/tmp/owned-daemon/data/volumes/devres-acceptance-fixture/_data','Propagation':''},
                          {'Type':'bind','Destination':'/lib/modules','Source':'/lib/modules','Propagation':'rprivate'}]}
         digest,directories=fixture.parser_write_projection(value,raw,state)
         self.assertEqual(len(directories),2)
-        self.assertNotEqual(digest,fixture.parser_write_projection(value,raw.replace(b'shared:340',b'shared:341'),state)[0])
+        self.assertNotEqual(digest,fixture.parser_write_projection(value,raw.replace(b'shared:330',b'shared:331'),state)[0])
+        self.assertEqual(digest,fixture.parser_write_projection(value,raw.replace(b'shared:340',b'shared:350'),state)[0])
         with self.assertRaisesRegex(fixture.FixtureError,'fixture_parser_write_boundary'):
             fixture.parser_write_projection(value,raw.replace(b'upperdir=/tmp/owned-daemon/',b'upperdir=/foreign/'),state)
 
@@ -389,7 +391,7 @@ class SyntheticFixtureTests(unittest.TestCase):
         with patch.dict(os.environ, {'DOCKER_HOST':'unix:///tmp/owned-daemon/docker.sock'}), \
              patch.object(fixture,'node_docker_identity',return_value=identity), patch.object(fixture,'node_uid',return_value='owned-uid'), \
              patch.object(fixture,'command',side_effect=[subprocess.CompletedProcess([],0,b'"/tmp/owned-daemon/data"',b''),subprocess.CompletedProcess([],0,json.dumps(inspected).encode(),b'')]) as commands, \
-             patch.object(fixture,'node_exec',return_value=subprocess.CompletedProcess([],0,b'/foreign-tmp\n/usr\n/usr/sbin\n',b'')):
+             patch.object(fixture,'node_exec',return_value=subprocess.CompletedProcess([],0,b'/foreign-root\n/usr\n/usr/sbin\n',b'')):
             with self.assertRaisesRegex(fixture.FixtureError,'fixture_parser_write_boundary'):
                 fixture.node_write_boundaries(cluster,identity,'owned-uid')
             self.assertEqual(commands.call_count,2)
