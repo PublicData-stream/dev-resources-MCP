@@ -126,6 +126,9 @@ def transform(name, source):
         source = replace_once(source, "    common.need(runtime == common.RUNTIME, 'runtime_environment_mismatch')",
             "    common.need(runtime == common.RUNTIME == 'target', 'target_only_deployment')")
         source = replace_once(source,
+            "        if runtime == 'target':\n            verify_restore_rehearsal(controller, sources)",
+            "        if runtime == 'target':\n            controller.require_operational_baseline()\n            verify_restore_rehearsal(controller, sources)")
+        source = replace_once(source,
             "    return 0 if value.get('target_deployed') or args.runtime == 'fallback' and value.get('fallback_deployed') else 1",
             "    return 0 if value.get('target_deployed') is True else 1")
     elif name == 'phase-driver.py':
@@ -164,6 +167,22 @@ def transform(name, source):
 
 
 def _operational(source):
+    source = replace_once(source,
+        "        need(state['phase'] in ('prepared','stopped') and state['configs']=='old','baseline_before_target_only')",
+        "        need(state['runtime']=='target' and state['phase']=='stopped' and state['configs']=='old'\n"
+        "             and state['replicas']=={'postgres':1,'writer':0,'backend':0}\n"
+        "             and set(state['pods'])=={'postgres'}\n"
+        "             and state['pods']==load(BUNDLE/'prepared.json')['old_pods'],'baseline_before_target_only')\n"
+        "        sources=common.manifest_sources()\n"
+        "        need(sha(raw(Path(controller.__file__)))==sources['upgrade-controller.py']\n"
+        "             and sha(raw(Path(checkpoint.__file__)))==sources['physical-checkpoint.py']\n"
+        "             and sha(raw(Path(__file__)))==sources['operational-proof.py'],'baseline_source_binding_required')")
+    source = replace_once(source,
+        "        result={'version':1,'kind':'pre-upgrade-operational-baseline','revision':REVISION,'observed_at':now(),",
+        "        result={'version':1,'kind':'pre-upgrade-operational-baseline','revision':REVISION,'observed_at':now(),\n"
+        "                'source_manifest_sha256':sha(raw(common.MANIFEST)),\n"
+        "                'sources':{name:sources[name] for name in ('upgrade-controller.py','physical-checkpoint.py','operational-proof.py')},\n"
+        "                'pre_upgrade':{'phase':state['phase'],'configs':state['configs'],'replicas':state['replicas'],'pods':state['pods']},")
     source = replace_once(source, 'import argparse\n', 'import argparse\nimport contextlib\n')
     source = replace_once(source,
         '    module = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(module)',

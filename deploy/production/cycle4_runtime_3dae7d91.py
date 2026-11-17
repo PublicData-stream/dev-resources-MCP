@@ -80,8 +80,98 @@ def admitted_pod_spec(actual, expected, node):
         require(observed.get(key) == wanted.get(key), 'participant_container_authority_changed')
 
 
+def validate_operational_baseline(value, state, prepared, sources, manifest_sha):
+    """Validate a pre-checkpoint baseline using private files only, never SQL."""
+    code = 'pre_upgrade_operational_baseline_required'
+    require(type(value) is dict and value.get('version') == 1
+            and value.get('kind') == 'pre-upgrade-operational-baseline'
+            and value.get('revision') == REVISION
+            and value.get('prepared_sha256') == state['prepared_sha256']
+            and value.get('source_manifest_sha256') == manifest_sha
+            and value.get('sources') == {name: sources[name] for name in
+                ('upgrade-controller.py', 'physical-checkpoint.py', 'operational-proof.py')}, code)
+    require(state['runtime'] == 'target' and state['phase'] == 'stopped' and state['configs'] == 'old'
+            and state['replicas'] == {'postgres': 1, 'writer': 0, 'backend': 0}
+            and state['pods'] == prepared['old_pods'] and set(state['pods']) == {'postgres'}
+            and value.get('pre_upgrade') == {'phase': 'stopped', 'configs': 'old',
+                'replicas': state['replicas'], 'pods': prepared['old_pods']}, code)
+    database = value['database']
+    require(type(database) is dict and database.get('schema') == 18
+            and database.get('system_id') == '7706567225121447965'
+            and database.get('control') == {'format_version': 1, 'required_policy_epoch': 2,
+                'required_policy_fingerprint': 'devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices'}, code)
+    archive = database['archive']
+    require({key: archive[key] for key in ('backend', 'binding', 'epoch', 'pending_binding', 'initializing_s3')} == {
+                'backend': 's3', 'binding': 'blake3:7cf193132e3e32eb53c877dfcce166453e5bbb1b0d3f9a39f922f194f82f38e3',
+                'epoch': 2, 'pending_binding': None, 'initializing_s3': False}
+            and re.fullmatch('[0-9a-f]{32}', archive['store_id']), code)
+    fingerprint = lambda record: digest(json.dumps(record, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode())
+    authority = value['authority']
+    require(type(authority) is dict and set(authority) == {'roles', 'memberships'}
+            and type(authority['roles']) is list and len(authority['roles']) == 3
+            and {role['rolname'] for role in authority['roles']} == {'devres_admin', 'devres_reader', 'devres_writer'}
+            and all(re.fullmatch('[0-9a-f]{64}', role['verifier_sha256']) for role in authority['roles'])
+            and type(authority['memberships']) is list
+            and value.get('authority_sha256') == fingerprint(authority), code)
+    generation = database['pinned_generation']
+    require(type(generation) is dict and generation.get('id') == 'blake3:254338b7453b0764ba106f0298fd5113f4d90f9aca8028761372660e1614ec81'
+            and generation.get('data', {}).get('policy_epoch') == 1
+            and type(generation['data'].get('notices')) is list and generation['data']['notices']
+            and re.fullmatch('blake3:[0-9a-f]{64}', generation.get('data_integrity', ''))
+            and value.get('generation_sha256') == fingerprint(generation), code)
+    for key in ('collectors', 'observed_preimage_collectors'):
+        flags = value[key]
+        require(type(flags) is dict and set(flags) == set(ROLES)
+                and all(type(row) is dict and set(row) == set(PROVIDERS)
+                    and all(type(flag) is bool for flag in row.values()) for row in flags.values()), code)
+    require(not any(flag for row in value['observed_preimage_collectors'].values() for flag in row.values()), code)
+    require(instant(prepared['at']) <= instant(value['observed_at']) <= utc_now() + dt.timedelta(seconds=5), code)
+    return value
+
+
 class Controller(_Cycle4BaseController):
     """Preserve the original guards while admitting exact temporary resources."""
+
+    def require_operational_baseline(self):
+        """No constructor, query, baseline creation or production mutation here."""
+        try:
+            state = self.state()
+            manifest_body = read(Path(WORK) / 'source-manifest.json')
+            manifest_sha = digest(manifest_body)
+            require(manifest_sha == os.environ.get('DEVRES_ACCEPTANCE_SOURCE_MANIFEST_SHA256'),
+                    'pre_upgrade_operational_baseline_required')
+            sources = json.loads(manifest_body)
+            paths = {'upgrade-controller.py': Path(__file__),
+                'physical-checkpoint.py': Path(__file__).parent / 'physical-checkpoint.py',
+                'operational-proof.py': Path(WORK) / 'operational-proof.py'}
+            require(all(re.fullmatch('[0-9a-f]{64}', sources[name]) and digest(read(path)) == sources[name]
+                    for name, path in paths.items()) and state['source_sha256'] == sources['upgrade-controller.py'],
+                    'pre_upgrade_operational_baseline_required')
+            prepared_body = read(self.root / 'prepared.json')
+            require(digest(prepared_body) == state['prepared_sha256'], 'pre_upgrade_operational_baseline_required')
+            path = Path(WORK) / 'operational-baseline.json'
+            body = read(path)
+            def unique(pairs):
+                result = {}
+                for key, item in pairs:
+                    require(key not in result, 'pre_upgrade_operational_baseline_required')
+                    result[key] = item
+                return result
+            value = json.loads(body, object_pairs_hook=unique)
+            validate_operational_baseline(value, state, json.loads(prepared_body), sources, manifest_sha)
+            require(read(path) == body and read(self.root / 'prepared.json') == prepared_body
+                    and read(Path(WORK) / 'source-manifest.json') == manifest_body and self.state() == state,
+                    'pre_upgrade_operational_baseline_required')
+            return {'verified': True, 'sha256': digest(body)}
+        except Exception:
+            require(False, 'pre_upgrade_operational_baseline_required')
+
+    def run(self, operation, approval, approval_sha, receipt=None, receipt_sha=None):
+        # This also protects direct controller/phase-driver entry, before PG
+        # rebind, accepted-backup persistence, configuration or image mutation.
+        if operation == 'apply':
+            self.require_operational_baseline()
+        return super().run(operation, approval, approval_sha, receipt, receipt_sha)
 
     def helper(self, name, alias):
         manifest = load(Path(WORK) / 'source-manifest.json')

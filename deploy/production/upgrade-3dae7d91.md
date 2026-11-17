@@ -52,6 +52,37 @@ PostgreSQL running. Preserve actual paused Secret preimages separately from the
 retained original active settings. Keep all historical manifests, journals,
 checkpoints, baseline caches, source offers and preserved production generations.
 
+Immediately after the new controller's `stop` completes, create the standalone
+operational baseline while the database is still schema 18, the controller phase
+is `stopped`, configurations are `old`, only PostgreSQL is present, and its process
+identity is the original prepared P1. This must precede checkpoint `run`, which
+restarts PostgreSQL as P2. Use the reviewed manifest's producer hashes and the
+fixed operational environment, including `KUBECACHEDIR`:
+
+```sh
+python3 -B "$WORK/operational-proof.py" baseline --label pre-upgrade \
+  --controller "$INSTALL/upgrade-controller.py" --controller-sha "$CONTROLLER_SHA" \
+  --checkpoint "$INSTALL/physical-checkpoint.py" --checkpoint-sha "$CHECKPOINT_SHA"
+```
+
+Require exclusive creation of the private `operational-baseline.json`. Its revision,
+prepared SHA, manifest/producer/controller/checkpoint sources, schema-18 identity,
+original P1/stopped/configold context, role-authority and historical-generation
+seals must match. The producer refuses a later phase or replacement P2; never
+create or backfill this baseline after target startup. Before launching the target
+supervisor, validate it through the source-bound controller's file-only
+`require_operational_baseline()` under its lifecycle lock. This check does not run
+the ordinary original-P1 process guard after the checkpoint restart. Deployment
+entry repeats the prerequisite before its deployment intent, and direct controller
+`apply` repeats it before backup-driven PG rebind, accepted-backup persistence or
+configuration/image changes. Missing or invalid evidence stops admission.
+
+This baseline prerequisite corrects future rendered tooling. It does not authorize
+editing a consumed source closure, repairing evidence in the failed cycle, or
+starting another deployment attempt. The observed missing baseline is a strongly
+supported explanation of the generic migration-proof failure; the exact exception
+trace was not retained.
+
 Before copying, enforce the unchanged 128-GiB reserve and concurrent PostgreSQL,
 cache, rehearsal, restore-staging and growth gates. Reclaim only independently
 admitted disposable copies from completed fixtures; never reclaim a checkpoint,

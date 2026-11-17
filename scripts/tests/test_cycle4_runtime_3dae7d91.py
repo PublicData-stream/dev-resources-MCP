@@ -409,5 +409,119 @@ class GeneratedRuntime(unittest.TestCase):
         self.c.rollback.assert_not_called()
 
 
+class OperationalBaselineGate(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        GeneratedRuntime.setUpClass.__func__(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        GeneratedRuntime.tearDownClass.__func__(cls)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='cycle4-baseline-admission-', dir='/tmp')
+        self.addCleanup(self.temp.cleanup)
+        self.top = Path(self.temp.name)
+        self.work = self.top / 'work'; self.work.mkdir(mode=0o700)
+        self.bundle = self.top / 'bundle'; self.bundle.mkdir(mode=0o700)
+        self.c = self.u.Controller.__new__(self.u.Controller)
+        self.c.root = self.bundle; self.c.context = 'default'; self.c.plan_raw = b'plan'
+        self.p1 = {'postgres': {'uid': 'original-p1', 'container_id': 'first-party-fixture'}}
+        self.prepared = {'revision': self.u.REVISION, 'at': self.u.stamp(), 'old_pods': self.p1}
+        self.u.save(self.bundle / 'prepared.json', self.prepared)
+        self.state = {'version': 1, 'revision': self.u.REVISION, 'runtime': 'target', 'phase': 'stopped',
+            'configs': 'old', 'source_sha256': self.u.digest(Path(self.u.__file__).read_bytes()),
+            'plan_sha256': self.u.digest(self.c.plan_raw), 'prepared_sha256': self.u.digest(self.u.encoded(self.prepared)),
+            'replicas': {'postgres': 1, 'writer': 0, 'backend': 0}, 'pods': self.p1,
+            'images': {'postgres': self.u.PG_IMAGE, 'writer': self.u.OLD_IMAGE, 'backend': self.u.OLD_IMAGE}}
+        self.u.save(self.bundle / 'state.json', self.state)
+        self.sources = {name: self.u.digest((self.output / name).read_bytes()) for name in
+            ('upgrade-controller.py', 'physical-checkpoint.py', 'operational-proof.py')}
+        (self.work / 'operational-proof.py').write_bytes((self.output / 'operational-proof.py').read_bytes())
+        (self.work / 'operational-proof.py').chmod(0o600)
+        self.u.save(self.work / 'source-manifest.json', self.sources)
+        self.manifest_sha = self.u.digest(self.u.encoded(self.sources))
+        patcher = patch.object(self.u, 'WORK', str(self.work)); patcher.start(); self.addCleanup(patcher.stop)
+        patcher = patch.dict(os.environ, {'DEVRES_ACCEPTANCE_SOURCE_MANIFEST_SHA256': self.manifest_sha})
+        patcher.start(); self.addCleanup(patcher.stop)
+        authority = {'roles': [{'rolname': name, 'verifier_sha256': 'a' * 64} for name in
+            ('devres_admin', 'devres_reader', 'devres_writer')], 'memberships': []}
+        generation = {'id': 'blake3:254338b7453b0764ba106f0298fd5113f4d90f9aca8028761372660e1614ec81',
+            'data': {'policy_epoch': 1, 'notices': ['first-party 원문 fixture']}, 'data_integrity': 'blake3:' + 'b' * 64}
+        canonical = lambda value: self.u.digest(json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode())
+        self.baseline = {'version': 1, 'kind': 'pre-upgrade-operational-baseline', 'revision': self.u.REVISION,
+            'observed_at': self.u.stamp(), 'prepared_sha256': self.state['prepared_sha256'],
+            'source_manifest_sha256': self.manifest_sha, 'sources': self.sources,
+            'pre_upgrade': {'phase': 'stopped', 'configs': 'old', 'replicas': self.state['replicas'], 'pods': self.p1},
+            'database': {'schema': 18, 'system_id': '7706567225121447965', 'control': {
+                'format_version': 1, 'required_policy_epoch': 2,
+                'required_policy_fingerprint': 'devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices'},
+                'archive': {'backend': 's3', 'binding': 'blake3:7cf193132e3e32eb53c877dfcce166453e5bbb1b0d3f9a39f922f194f82f38e3',
+                    'epoch': 2, 'pending_binding': None, 'initializing_s3': False, 'store_id': 'a' * 32},
+                'pinned_generation': generation}, 'authority': authority,
+            'authority_sha256': canonical(authority), 'generation_sha256': canonical(generation),
+            'collectors': {role: dict.fromkeys(self.u.PROVIDERS, True) for role in self.u.ROLES},
+            'observed_preimage_collectors': {role: dict.fromkeys(self.u.PROVIDERS, False) for role in self.u.ROLES}}
+
+    def write_baseline(self, value=None):
+        path = self.work / 'operational-baseline.json'
+        path.write_bytes(self.u.encoded(self.baseline if value is None else value)); path.chmod(0o600)
+        return path
+
+    def assert_no_apply(self):
+        before = (self.bundle / 'state.json').read_bytes()
+        with patch.object(self.u._Cycle4BaseController, 'run') as base_run:
+            with self.assertRaisesRegex(RuntimeError, '^pre_upgrade_operational_baseline_required$'):
+                self.c.run('apply', None, None)
+            base_run.assert_not_called()
+        self.assertEqual((self.bundle / 'state.json').read_bytes(), before)
+        self.assertFalse((self.bundle / 'accepted-backup.json').exists())
+
+    def test_missing_baseline_cannot_enter_direct_apply_or_mutate_state(self):
+        self.assert_no_apply()
+        self.assertFalse((self.work / 'operational-baseline.json').exists())
+
+    def test_valid_baseline_enters_original_apply_flow_without_import_or_query(self):
+        path = self.write_baseline(); before = path.read_bytes()
+        with patch.object(self.u._Cycle4BaseController, 'run', return_value='original-flow') as base_run:
+            self.assertEqual(self.c.run('apply', 'approval', 'approval-sha', 'backup', 'backup-sha'), 'original-flow')
+        base_run.assert_called_once_with('apply', 'approval', 'approval-sha', 'backup', 'backup-sha')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(self.c.require_operational_baseline()['verified'])
+
+    def test_malformed_or_duplicate_json_never_reaches_apply(self):
+        path = self.write_baseline()
+        for body in (b'{', b'[]', b'{"version":1,"version":1}'):
+            path.write_bytes(body); self.assert_no_apply()
+
+    def test_revision_prepared_schema_manifest_sources_and_p1_mismatches_are_refused(self):
+        changes = (lambda v: v.update(revision='foreign'), lambda v: v.update(prepared_sha256='0' * 64),
+            lambda v: v['database'].update(schema=19), lambda v: v.update(source_manifest_sha256='0' * 64),
+            lambda v: v['sources'].update({'operational-proof.py': '0' * 64}),
+            lambda v: v['pre_upgrade'].update(phase='writer_ready'), lambda v: v['pre_upgrade'].update(configs='paused'),
+            lambda v: v['pre_upgrade'].update(pods={'postgres': {'uid': 'replacement-p2'}}),
+            lambda v: v.update(authority_sha256='0' * 64), lambda v: v.update(generation_sha256='0' * 64),
+            lambda v: v['observed_preimage_collectors']['writer'].update(npm=True))
+        for change in changes:
+            value = copy.deepcopy(self.baseline); change(value)
+            with self.subTest(change=change):
+                self.write_baseline(value); self.assert_no_apply()
+
+    def test_nonprivate_linked_or_source_changed_baseline_is_refused(self):
+        path = self.write_baseline(); path.chmod(0o644); self.assert_no_apply(); path.chmod(0o600)
+        os.link(path, self.top / 'external-baseline-link'); self.assert_no_apply(); (self.top / 'external-baseline-link').unlink()
+        path.unlink(); path.symlink_to(self.bundle / 'prepared.json'); self.assert_no_apply(); path.unlink()
+        self.write_baseline(); source = self.work / 'operational-proof.py'; source.write_bytes(b'changed source')
+        self.assert_no_apply()
+
+    def test_baseline_cannot_be_admitted_after_phase_or_pg_preimage_changes(self):
+        self.write_baseline()
+        for change in (lambda s: s.update(phase='applied'), lambda s: s.update(configs='paused'),
+                       lambda s: s.update(pods={'postgres': {'uid': 'replacement-p2'}})):
+            changed = copy.deepcopy(self.state); change(changed)
+            with self.subTest(change=change), patch.object(self.c, 'state', return_value=changed):
+                self.assert_no_apply()
+
+
 if __name__ == '__main__':
     unittest.main()

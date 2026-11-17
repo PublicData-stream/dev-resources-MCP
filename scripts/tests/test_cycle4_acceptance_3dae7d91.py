@@ -4,6 +4,7 @@ import contextlib
 import copy
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -349,6 +350,118 @@ class SameProcessMigration(Sources):
             with patch.dict(sys.modules):
                 value = env.source_module(path, 'a' * 64, name)
                 self.assertIs(value.registered, value)
+
+
+class BaselineDeploymentEntry(Sources):
+    def test_baseline_refusal_precedes_intent_apply_writer_and_rehearsal(self):
+        for reason in ('missing', 'malformed', 'prepared-mismatch'):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory(dir='/tmp') as tmp, patch.dict(os.environ):
+                root = Path(tmp); work = root / 'target'
+                c = SimpleNamespace(state=lambda: {'runtime': 'target', 'phase': 'stopped'},
+                    locked=contextlib.nullcontext,
+                    require_operational_baseline=Mock(side_effect=RuntimeError('pre_upgrade_operational_baseline_required')))
+                supervisor = SimpleNamespace(private_save=Mock(), run_stage=Mock())
+                sources = {'runner.py': 'r' * 64}
+                common = SimpleNamespace(need=need, RUNTIME='target', ROOT=root, WORK=work,
+                    manifest_sources=Mock(return_value=sources), bound_module=Mock(return_value=supervisor),
+                    controller=Mock(return_value=(None, c)))
+                rehearsal, complete = Mock(), Mock()
+                env = self.functions('deploy.py', ['run', 'controller_phase'], common=common, os=os,
+                    verify_restore_rehearsal=rehearsal, complete=complete)
+                with self.assertRaisesRegex(RuntimeError, '^pre_upgrade_operational_baseline_required$'):
+                    env.run('target', 'a' * 64)
+                c.require_operational_baseline.assert_called_once()
+                rehearsal.assert_not_called(); supervisor.private_save.assert_not_called()
+                supervisor.run_stage.assert_not_called(); complete.assert_not_called()
+                self.assertFalse(work.exists())
+
+    def test_valid_baseline_preserves_lifecycle_order_and_one_deployment_intent(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as tmp, patch.dict(os.environ):
+            root = Path(tmp); work = root / 'target'; events = []
+            c = SimpleNamespace(state=lambda: {'runtime': 'target', 'phase': 'stopped'},
+                locked=contextlib.nullcontext,
+                require_operational_baseline=lambda: events.append('baseline'))
+            supervisor = SimpleNamespace(private_save=lambda path, value: events.append(path.name))
+            sources = {name: 'a' * 64 for name in ('runner.py', 'upgrade-controller.py', 'physical-checkpoint.py')}
+            common = SimpleNamespace(need=need, RUNTIME='target', ROOT=root, WORK=work,
+                CONTROLLER=root/'controller', CHECKPOINT=root/'checkpoint',
+                manifest_sources=lambda _: sources, bound_module=lambda *args: supervisor,
+                controller=lambda: (None, c))
+            lifecycle = self.functions('deploy.py', ['run_lifecycle'], common=common, os=os,
+                source_command=lambda name, *args: [name, *args]).run_lifecycle
+            def complete(runtime, sources, controller, supervisor, manifest_sha):
+                lifecycle(lambda label, *args: events.append(label), sources, runtime)
+                return {'target_deployed': True}
+            env = self.functions('deploy.py', ['run', 'controller_phase'], common=common, os=os,
+                verify_restore_rehearsal=lambda *args: events.append('rehearsal'), complete=complete)
+            self.assertTrue(env.run('target', 'a' * 64)['target_deployed'])
+            self.assertEqual(events, ['baseline', 'rehearsal', 'deployment-intent.json', 'apply', 'start-writer',
+                'migration-before-npm', 'npm-recovery', 'start-observer', 'paused-acceptance',
+                'activate-existing', 'active-acceptance', 'deployment-result.json'])
+
+
+class BaselineProducer(Sources):
+    def producer(self, state):
+        bundle = Path('/tmp/synthetic-baseline-bundle')
+        c = SimpleNamespace(locked=contextlib.nullcontext, guard=Mock(), state=lambda: copy.deepcopy(state))
+        controller = SimpleNamespace(Controller=Mock(return_value=c), __file__='/tmp/synthetic-controller.py')
+        archive = {'backend': 's3', 'binding': 'bound', 'epoch': 2}
+        checkpoint = SimpleNamespace(SYSID='system', ARCHIVE=archive, __file__='/tmp/synthetic-checkpoint.py')
+        bodies = {Path(controller.__file__): b'controller', Path(checkpoint.__file__): b'checkpoint',
+            Path('operational-proof.py'): b'operational', Path('/tmp/synthetic-manifest.json'): b'manifest'}
+        sources = {name: hashlib.sha256(body).hexdigest() for name, body in
+            (('upgrade-controller.py', b'controller'), ('physical-checkpoint.py', b'checkpoint'),
+             ('operational-proof.py', b'operational'))}
+        common = SimpleNamespace(manifest_sources=Mock(return_value=sources), MANIFEST=Path('/tmp/synthetic-manifest.json'))
+        database = {'schema': 18, 'control': {'format_version': 1, 'required_policy_epoch': 2,
+            'required_policy_fingerprint': 'policy'}, 'system_id': 'system', 'archive': archive, 'pinned_generation': {'fixture': True}}
+        authority = {'roles': [{}, {}, {}]}
+        sql = Mock(side_effect=[database, authority]); save = Mock()
+        flags = lambda _controller, value: ({role: {'npm': value['configs'] == 'active'} for role in ('backend', 'writer')}, {})
+        env = self.functions('operational-proof.py', ['baseline'], controller=controller, checkpoint=checkpoint,
+            BUNDLE=bundle, BASELINE=Path('/tmp/synthetic-operational-baseline.json'), REVISION='release',
+            copy=copy, sql=sql, BASE_IDENTITY_SQL='base', AUTH_SQL='auth', POLICY2='policy', now=lambda: 'now',
+            load=lambda _: {'old_pods': {'postgres': {'uid': 'p1'}}}, source_flags=flags,
+            generation_hash=lambda _: 'generation', sha=lambda body: hashlib.sha256(body).hexdigest(),
+            enc=lambda value: json.dumps(value, sort_keys=True).encode(), save=save, common=common,
+            Path=Path, raw=lambda path: bodies[Path(path)], __file__='operational-proof.py')
+        return env, c, controller, checkpoint, sql, save, sources
+
+    def test_stopped_original_p1_producer_seals_revision_prepared_sources_and_context(self):
+        state = {'runtime': 'target', 'phase': 'stopped', 'configs': 'old', 'prepared_sha256': 'prepared',
+            'replicas': {'postgres': 1, 'writer': 0, 'backend': 0}, 'pods': {'postgres': {'uid': 'p1'}}}
+        env, c, controller, checkpoint, sql, save, sources = self.producer(state)
+        self.assertTrue(env.baseline(controller, checkpoint, 'pre-upgrade')['baseline_created'])
+        self.assertEqual(sql.call_args_list, [unittest.mock.call('base'), unittest.mock.call('auth')])
+        self.assertEqual(c.guard.call_count, 2)
+        value = save.call_args.args[1]
+        self.assertEqual(value['sources'], sources)
+        self.assertEqual(value['source_manifest_sha256'], hashlib.sha256(b'manifest').hexdigest())
+        self.assertEqual(value['pre_upgrade'], {key: state[key] for key in ('phase', 'configs', 'replicas', 'pods')})
+        self.assertEqual(value['prepared_sha256'], 'prepared')
+        self.assertEqual(value['observed_preimage_collectors']['writer']['npm'], False)
+        self.assertEqual(value['collectors']['writer']['npm'], True)
+
+    def test_producer_source_mismatch_is_finite_and_precedes_sql_or_baseline_write(self):
+        state = {'runtime': 'target', 'phase': 'stopped', 'configs': 'old', 'prepared_sha256': 'prepared',
+            'replicas': {'postgres': 1, 'writer': 0, 'backend': 0}, 'pods': {'postgres': {'uid': 'p1'}}}
+        env, _, controller, checkpoint, sql, save, sources = self.producer(state)
+        env.common.manifest_sources.return_value = {**sources, 'operational-proof.py': '0' * 64}
+        with self.assertRaisesRegex(RuntimeError, 'baseline_source_binding_required'):
+            env.baseline(controller, checkpoint, 'pre-upgrade')
+        sql.assert_not_called(); save.assert_not_called()
+
+    def test_producer_refuses_prepared_target_started_config_changed_or_pg_replaced_before_sql(self):
+        original = {'runtime': 'target', 'phase': 'stopped', 'configs': 'old', 'prepared_sha256': 'prepared',
+            'replicas': {'postgres': 1, 'writer': 0, 'backend': 0}, 'pods': {'postgres': {'uid': 'p1'}}}
+        for change in (lambda s: s.update(phase='prepared'), lambda s: s.update(phase='applied'),
+                       lambda s: s.update(phase='writer_ready'), lambda s: s.update(configs='paused'),
+                       lambda s: s.update(pods={'postgres': {'uid': 'p2'}})):
+            state = copy.deepcopy(original); change(state)
+            env, _, controller, checkpoint, sql, save, _ = self.producer(state)
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, 'baseline_before_target_only'):
+                env.baseline(controller, checkpoint, 'pre-upgrade')
+            sql.assert_not_called(); save.assert_not_called()
 
 
 if __name__ == '__main__':
