@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import socket
 from pathlib import Path
 import subprocess
@@ -28,7 +29,7 @@ IDENTITY = {'expected_artifact': 'sha256:' + '1' * 64, 'matched_artifact': 'sha2
             'expected_configs': ['sha256:' + '3' * 64], 'resolved_config': 'sha256:' + '3' * 64}
 PARSER = {'package_sha256': fixture.PARSER_PACKAGE_SHA256, 'package_size': fixture.PARSER_PACKAGE_SIZE,
           'binary_sha256': fixture.PARSER_SHA256, 'binary_size': fixture.PARSER_SIZE, 'libc': '2.36', 'preexisting': False}
-PLACEMENT = {'prefix': '/tmp/devres-apparmor.ABCDef01', 'version': '3.0.8', 'mode': 0o500,
+PLACEMENT = {'path': '/usr/sbin/apparmor_parser', 'version': '3.0.8', 'mode': 0o500,
              'binary_sha256': fixture.PARSER_SHA256}
 
 
@@ -276,20 +277,18 @@ class SyntheticFixtureTests(unittest.TestCase):
     def test_parser_copy_requires_admission_hash_version_and_never_overwrites(self):
         payload, identity = b'synthetic-parser-data', {'container_id': '1' * 64, 'container_pid': 42}
         digest = hashlib.sha256(payload).hexdigest()
-        for scenario in ('valid', 'foreign-node', 'copy-hash', 'wrong-version', 'late-copy-boundary', 'late-link-boundary'):
+        for scenario in ('valid', 'foreign-node', 'copy-hash', 'wrong-version', 'late-copy-boundary', 'late-file-boundary'):
             calls = []
             guard_calls = []
             def guard():
                 guard_calls.append(True)
-                if len(guard_calls) == (2 if scenario == 'late-copy-boundary' else 3 if scenario == 'late-link-boundary' else -1):
+                if len(guard_calls) == (1 if scenario == 'late-copy-boundary' else 2 if scenario == 'late-file-boundary' else -1):
                     raise fixture.FixtureError('fixture_parser_write_boundary')
             def execute(_identity, *args, **_kwargs):
                 calls.append(args)
-                if args[0] == 'mktemp': value = b'/tmp/devres-apparmor.ABCDef01\n'
-                elif args[0] == 'sha256sum': value = ((('0' * 64) if scenario == 'copy-hash' else digest) + ' file\n').encode()
-                elif args[0] == 'readlink': value = b'/tmp/devres-apparmor.ABCDef01/apparmor_parser\n'
-                elif args[0] == 'stat': value = ('0:0:500:' + str(len(payload)) + ':1\n').encode()
-                elif args[0] == 'ln': value = b''
+                if args[0] == 'sha256sum': value = ((('0' * 64) if scenario == 'copy-hash' else digest) + ' file\n').encode()
+                elif args[0] == 'readlink': value = b'/usr/sbin/apparmor_parser\n'
+                elif args[0] == 'stat': value = ('regular file:0:0:500:' + str(len(payload)) + ':1\n').encode()
                 elif args[0] == '/sbin/apparmor_parser': value = b'AppArmor parser version ' + (b'3.0.8' if scenario != 'wrong-version' else b'unknown') + b'\n'
                 else: raise AssertionError(args)
                 return subprocess.CompletedProcess([], 0, value, b'')
@@ -307,9 +306,24 @@ class SyntheticFixtureTests(unittest.TestCase):
                 else:
                     self.assertEqual(copy_command.call_args.kwargs['data'], payload)
                     self.assertEqual(copy_command.call_args.args[0][:4], ['docker', 'exec', '-i', identity['container_id']])
-                    self.assertFalse(any('-f' in call for call in calls if call[0] == 'ln'))
-                    if scenario in ('copy-hash', 'late-link-boundary'): self.assertFalse(any(call[0] == 'ln' for call in calls))
-                    if scenario == 'valid': self.assertIn('--no-target-directory', next(call for call in calls if call[0] == 'ln'))
+                    self.assertFalse(any(call[0] in ('ln','mktemp','mount') for call in calls))
+                    if scenario in ('copy-hash', 'late-file-boundary'):
+                        self.assertFalse(any(call[0] == '/sbin/apparmor_parser' for call in calls))
+                    if scenario == 'valid':
+                        # Exercise the rendered dd interface on disposable files,
+                        # including a symlink to a separate readable preimage.
+                        script=copy_command.call_args.args[0][6]
+                        arguments=shlex.split(next(line for line in script.splitlines() if line.startswith('dd ')))
+                        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+                            directory=Path(temporary);preimage=directory/'preimage';preimage.write_bytes(b'preserved')
+                            existing=directory/'existing';existing.write_bytes(b'existing')
+                            symlink=directory/'symlink';symlink.symlink_to(preimage)
+                            for name,path in (('new',directory/'new'),('existing',existing),('symlink',symlink)):
+                                command=[('of='+str(path)) if item.startswith('of=') else item for item in arguments]
+                                result=subprocess.run(command,input=payload,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)
+                                self.assertEqual(result.returncode,0 if name=='new' else 1)
+                                self.assertEqual(preimage.read_bytes(),b'preserved');self.assertEqual(existing.read_bytes(),b'existing')
+                            self.assertEqual((directory/'new').read_bytes(),payload)
 
     def test_parser_write_projection_rejects_docker_aliases_foreign_overlay_and_propagation(self):
         state = Path('/tmp/owned-daemon')
@@ -317,7 +331,7 @@ class SyntheticFixtureTests(unittest.TestCase):
         value = {'HostConfig': {'Tmpfs': {'/tmp': 'rw'}}, 'Mounts': [{'Type': 'tmpfs', 'Destination': '/tmp'}]}
         digest, directories = fixture.parser_write_projection(value, mountinfo, state)
         self.assertEqual(len(digest),64);self.assertEqual(directories, ['/tmp/owned-daemon/containerd/snapshots/1/fs','/tmp/owned-daemon/containerd/snapshots/1/work'])
-        for scenario in ('ancestor-bind', 'tmp-bind', 'descendant-volume', 'volumes-from', 'foreign-upper', 'usr-mount', 'tmp-child', 'shared', 'slave', 'undeclared-tmpfs', 'tmpfs-source','foreign-work','missing-work','duplicate-work'):
+        for scenario in ('ancestor-bind', 'tmp-bind', 'descendant-volume', 'volumes-from', 'foreign-upper', 'usr-mount', 'tmp-child', 'slave', 'undeclared-tmpfs', 'tmpfs-source','foreign-work','missing-work','duplicate-work'):
             candidate, raw = copy.deepcopy(value), mountinfo
             if scenario == 'ancestor-bind': candidate['HostConfig']['Binds'] = ['/foreign:/usr:rw']
             elif scenario == 'tmp-bind': candidate['Mounts'] = [{'Type': 'bind', 'Destination': '/tmp'}]
@@ -326,7 +340,6 @@ class SyntheticFixtureTests(unittest.TestCase):
             elif scenario == 'foreign-upper': raw = raw.replace(b'/tmp/owned-daemon/containerd', b'/var/lib/docker')
             elif scenario == 'usr-mount': raw += b'3 1 0:3 / /usr rw - ext4 /dev/foreign rw\n'
             elif scenario == 'tmp-child': raw += b'3 2 0:3 / /tmp/staged rw - ext4 /dev/foreign rw\n'
-            elif scenario == 'shared': raw = raw.replace(b'/ / rw -', b'/ / rw shared:50 -')
             elif scenario == 'slave': raw = raw.replace(b'/ /tmp rw -', b'/ /tmp rw master:50 -')
             elif scenario == 'undeclared-tmpfs': candidate = {'HostConfig': {}, 'Mounts': []}
             elif scenario == 'tmpfs-source': candidate['Mounts'][0]['Source'] = '/foreign/tmpfs'
@@ -342,7 +355,7 @@ class SyntheticFixtureTests(unittest.TestCase):
         value={'HostConfig':{},'Mounts':[]}
         baseline=fixture.parser_write_projection(value,raw,state)[0]
         changed=raw.replace(b'/1/work',b'/2/work')
-        mounts=iter([raw,changed])
+        mounts=iter([changed])
         def guard():
             fixture.need(fixture.parser_write_projection(value,next(mounts),state)[0]==baseline,'fixture_parser_write_boundary')
         payload=b'synthetic-parser'
@@ -351,7 +364,23 @@ class SyntheticFixtureTests(unittest.TestCase):
              patch.object(fixture,'command') as copy_command:
             with self.assertRaisesRegex(fixture.FixtureError,'fixture_parser_write_boundary'):
                 fixture.install_parser({'container_id':'1'*64,'container_pid':42},'mnt:[20]',payload,guard)
-            copy_command.assert_not_called();self.assertEqual(node.call_count,1)
+            copy_command.assert_not_called();self.assertEqual(node.call_count,0)
+
+    def test_real_minikube_shared_overlay_and_noexec_tmp_remain_physically_owned_and_topology_bound(self):
+        # Sanitized exact Docker29/minikube1.39 observed refusal, not invented
+        # private-propagation defaults. No parser ELF is staged on node /tmp.
+        state=Path('/tmp/owned-daemon')
+        raw=(b'489 349 0:53 / / rw,relatime shared:330 - overlay overlay rw,lowerdir=/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/18/fs:/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/13/fs,upperdir=/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/19/fs,workdir=/tmp/owned-daemon/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/19/work,nouserxattr\n'
+             b'505 489 0:74 / /tmp rw,nosuid,nodev,noexec,relatime shared:340 - tmpfs tmpfs rw,inode64\n')
+        value={'HostConfig':{'Binds':['devres-acceptance-fixture:/var','/lib/modules:/lib/modules:ro'],
+                            'Mounts':None,'Tmpfs':{'/run':'','/tmp':''},'VolumesFrom':None},
+               'Mounts':[{'Type':'volume','Destination':'/var','Source':'/tmp/owned-daemon/data/volumes/devres-acceptance-fixture/_data','Propagation':''},
+                         {'Type':'bind','Destination':'/lib/modules','Source':'/lib/modules','Propagation':'rprivate'}]}
+        digest,directories=fixture.parser_write_projection(value,raw,state)
+        self.assertEqual(len(directories),2)
+        self.assertNotEqual(digest,fixture.parser_write_projection(value,raw.replace(b'shared:340',b'shared:341'),state)[0])
+        with self.assertRaisesRegex(fixture.FixtureError,'fixture_parser_write_boundary'):
+            fixture.parser_write_projection(value,raw.replace(b'upperdir=/tmp/owned-daemon/',b'upperdir=/foreign/'),state)
 
     def test_parser_write_admission_refuses_canonical_path_drift_before_privileged_check(self):
         identity = {'container_id':'1'*64,'container_pid':42}

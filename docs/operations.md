@@ -1622,10 +1622,11 @@ The assessment admits only an owned `/tmp` Docker socket and rejects a
 them, then binds cleanup to a unique owner label and API UIDs. On a newly owned
 minikube node without securityfs, preparation mounts it read-only inside that
 node's distinct mount namespace. For the pinned Debian 12 node, it reads only the
-SHA-256-pinned native AppArmor parser member from a fixed Debian package, stages
-that executable in node-private `/tmp` storage, and links an absent canonical
-parser entry point. It runs no package scripts and replaces no libraries or
-profiles. Actual write-path mounts and node identity must remain admitted.
+SHA-256-pinned native AppArmor parser member from a fixed Debian package and
+creates the absent canonical parser in the node's private overlay storage, backed
+by host `/tmp`. It runs no package scripts and replaces no libraries or profiles.
+Parser file writes require admitted private upper/work directories and unchanged
+write-path mounts; they do not change minikube's propagation or noexec flags.
 Preparation verifies the real parser version and restarts only the admitted
 containerd and kubelet once. Existing securityfs is observed without changing its
 flags.

@@ -780,7 +780,11 @@ def parser_write_projection(value, raw, state):
          and (temporary == root or temporary['target'] == '/tmp' and temporary['root'] == '/'
               and temporary['filesystem'] == 'tmpfs')
          and declared_tmpfs == (temporary != root)
-         and all(not row['propagation'] for row in (root, temporary)), 'fixture_parser_write_boundary')
+         # Propagation flags govern mount events. Ordinary file writes must land
+         # in the private overlay upper/work storage proved below.
+         # Bind/submount aliases remain forbidden; retain peer IDs in the digest.
+         and all(all(re.fullmatch(r'shared:[0-9]+', field) for field in row['propagation'])
+                 for row in (root, temporary)), 'fixture_parser_write_boundary')
     # Root writes must land in this private daemon's disposable upper directory.
     directories = []
     for option_name in ('upperdir=', 'workdir='):
@@ -826,37 +830,27 @@ def install_parser(identity, namespace, payload, guard):
     need(len(payload) == PARSER_SIZE and hashlib.sha256(payload).hexdigest() == PARSER_SHA256, 'fixture_parser_member')
     parser_admission(identity)
     guard()
-    prefix = node_exec(identity, 'mktemp', '-d', '/tmp/devres-apparmor.XXXXXXXX').stdout.decode('ascii').strip()
-    need(re.fullmatch(r'/tmp/devres-apparmor\.[A-Za-z0-9]{8}', prefix), 'fixture_parser_node')
     script = ('set -eu\n'
               'test "$(readlink /proc/self/ns/mnt)" = "$1"\n'
               'test "$(id -u)" = 0\n'
-              'test ! -L "$2"\n'
-              'test "$(stat -c %u:%g:%a "$2")" = 0:0:700\n'
+              'test "$(readlink -f /sbin)" = /usr/sbin\n'
               'umask 077\n'
-              'dd of="$2/apparmor_parser" oflag=excl,nofollow status=none\n'
-              'chmod 500 "$2/apparmor_parser"\n')
-    guard()
+              'dd of=/usr/sbin/apparmor_parser conv=excl oflag=nofollow status=none\n'
+              'chmod 500 /usr/sbin/apparmor_parser\n')
     command(['docker', 'exec', '-i', identity['container_id'], '/bin/sh', '-c', script,
-             'fixture-parser-copy', namespace, prefix], data=payload)
-    path = prefix + '/apparmor_parser'
-    need(node_exec(identity, 'sha256sum', path).stdout.decode('ascii').split()[0] == PARSER_SHA256,
-         'fixture_parser_node')
-    parser_admission(identity)
+             'fixture-parser-copy', namespace], data=payload)
     guard()
-    node_exec(identity, 'ln', '-s', '--no-target-directory', path, '/usr/sbin/apparmor_parser')
-    parser_placement_state(identity, prefix)
+    parser_placement_state(identity)
     version = node_exec(identity, '/sbin/apparmor_parser', '--version', maximum=4096).stdout.decode('ascii').splitlines()
     need(version and version[0] == 'AppArmor parser version 3.0.8', 'fixture_parser_version')
     guard()
-    return {'prefix': prefix, 'version': '3.0.8', 'mode': 0o500, 'binary_sha256': PARSER_SHA256}
+    return {'path': '/usr/sbin/apparmor_parser', 'version': '3.0.8', 'mode': 0o500, 'binary_sha256': PARSER_SHA256}
 
 
-def parser_placement_state(identity, prefix):
-    need(re.fullmatch(r'/tmp/devres-apparmor\.[A-Za-z0-9]{8}', prefix), 'fixture_parser_node')
-    need(node_exec(identity, 'readlink', '/sbin/apparmor_parser').stdout.decode('ascii').strip() == prefix + '/apparmor_parser'
-         and node_exec(identity, 'stat', '-Lc', '%u:%g:%a:%s:%h', '/sbin/apparmor_parser').stdout.strip()
-             == ('0:0:500:' + str(PARSER_SIZE) + ':1').encode()
+def parser_placement_state(identity):
+    need(node_exec(identity, 'readlink', '-f', '/sbin/apparmor_parser').stdout.decode('ascii').strip() == '/usr/sbin/apparmor_parser'
+         and node_exec(identity, 'stat', '-c', '%F:%u:%g:%a:%s:%h', '/usr/sbin/apparmor_parser').stdout.strip()
+             == ('regular file:0:0:500:' + str(PARSER_SIZE) + ':1').encode()
          and node_exec(identity, 'sha256sum', '/sbin/apparmor_parser').stdout.decode('ascii').split()[0] == PARSER_SHA256,
          'fixture_parser_node')
 
@@ -930,7 +924,7 @@ def prepare_node_apparmor(cluster, server_image):
     after = {'kubelet_pid': kubelet_process(identity), 'containerd': containerd_process(identity),
              'postgres': postgres, 'postgres_runtime': postgres_runtime(identity, postgres),
              'host_mounts_sha256': host_mount_state()[1]}
-    parser_placement_state(identity, placement['prefix'])
+    parser_placement_state(identity)
     guard()
     need(node_docker_identity(cluster) == identity and node_uid(cluster) == uid
          and node_namespace(identity) == namespace and host_mount_state()[:2] == (host_namespace, host_digest)
@@ -1011,8 +1005,8 @@ def validate_node_preparation(name, value):
              and (not value['kubelet_restarted'] or value['before']['kubelet_pid'] != value['after']['kubelet_pid']),
              'fixture_receipt_node_preservation')
         placement = value['parser_placement']
-        need(type(placement) is dict and set(placement) == {'prefix', 'version', 'mode', 'binary_sha256'}
-             and type(placement['prefix']) is str and re.fullmatch(r'/tmp/devres-apparmor\.[A-Za-z0-9]{8}', placement['prefix'])
+        need(type(placement) is dict and set(placement) == {'path', 'version', 'mode', 'binary_sha256'}
+             and placement['path'] == '/usr/sbin/apparmor_parser'
              and placement['version'] == '3.0.8' and placement['mode'] == 0o500
              and placement['binary_sha256'] == PARSER_SHA256, 'fixture_receipt_node_parser')
 
