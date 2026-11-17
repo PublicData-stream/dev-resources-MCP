@@ -33,6 +33,9 @@ INSTALL = Path('/usr/local/libexec/devres-upgrade-3dae7d91')
 BRIDGE = INSTALL / 'edge-readmission.py'
 SCOPE = Path('/var/lib/devres-production-edge-admissions/3dae7d91-20261117')
 WORK = Path('/tmp/devres-edge-qualification-3dae7d91-20261117')
+CONTINUATION_WORK = Path('/tmp/devres-edge-qualification-3dae7d91-20261117-continuation-v1')
+CHECKER_NAME = 'devres-edge-check-3dae7d91'
+CONTINUATION_CHECKER_NAME = 'devres-edge-check-3dae7d91-continuation-v1'
 HOST = 'dev-resources.mcp.publicdata.stream'
 ADDRESSES = {'ipv4': '62.210.240.40', 'ipv6': '2001:bc8:701:65:56fb:66ff:fe00:da0d'}
 CHECKS = frozenset(('native_image_config_check', 'edge_process_listener_binding', 'public_tls_ipv4', 'public_tls_ipv6',
@@ -173,46 +176,72 @@ def checker_identity(value, snapshot, name, uid=None):
     return value['Id']
 
 
-def inspect_checker(reference):
+def inspect_checker(reference, observations=None):
     result = command(['docker', 'inspect', reference])
+    absent = result['returncode'] == 1 and result['stdout'].strip() == b'[]' and re.fullmatch(
+        rb'(?i)(?:error(?: response from daemon)?:[ \t]*)?no such (?:object|container):[ \t]*'
+        + re.escape(reference.encode()) + rb'[\r\n]*', result['stderr']) is not None
+    if observations is not None:
+        observations.append({'version': 1, 'class': 'absent' if absent else 'present' if result['returncode'] == 0 else 'unknown',
+            'reference_kind': 'container_id' if re.fullmatch('[0-9a-f]{64}', reference) else 'task_name',
+            'returncode': result['returncode'], 'stdout_bytes': len(result['stdout']), 'stderr_bytes': len(result['stderr']),
+            'stdout_sha256': sha(result['stdout']), 'stderr_sha256': sha(result['stderr'])})
     if result['returncode']:
-        need(result['returncode'] == 1 and any(value in result['stderr'] for value in (b'No such object:', b'No such container:')),
-            'checker_inspection_unavailable')
+        need(absent, 'checker_inspection_unavailable')
         return None
     values = json.loads(result['stdout']); need(type(values) is list and len(values) == 1, 'single_checker_required')
     return values[0]
 
 
-def offline_check(snapshot, work):
-    name = 'devres-edge-check-3dae7d91'
+def offline_check(snapshot, work, *, name=CHECKER_NAME):
+    need(name in (CHECKER_NAME, CONTINUATION_CHECKER_NAME), 'fixed_checker_scope_required')
     argv = checker_arguments(snapshot, name); uid = None; created = False; cleanup = False
+    observations = []; value = None; failure = None; cleanup_failure = None
     save(work / 'offline-intent.json', {'maximum_attempts': 1, 'name': name, 'image': snapshot['docker']['image'], 'argv_sha256': sha(encode(argv))})
     try:
-        need(inspect_checker(name) is None, 'fresh_checker_name_required')
+        need(inspect_checker(name, observations) is None, 'fresh_checker_name_required')
         created = True
         made = command(argv, timeout=60)
         save(work / 'offline-create.stdout', made['stdout']); save(work / 'offline-create.stderr', made['stderr'])
         need(made['returncode'] == 0 and re.fullmatch(b'[0-9a-f]{64}\n?', made['stdout']), 'checker_create_failed')
         uid = made['stdout'].decode().strip()
-        inspected = inspect_checker(uid)
+        inspected = inspect_checker(uid, observations)
         checker_identity(inspected, snapshot, name, uid)
         result = command(['docker', 'start', '--attach', uid], timeout=60)
         save(work / 'offline-check.stdout', result['stdout']); save(work / 'offline-check.stderr', result['stderr'])
         need(result['returncode'] == 0, 'native_image_config_check_failed')
-        after = inspect_checker(uid)
+        after = inspect_checker(uid, observations)
         checker_identity(after, snapshot, name, uid)
         need(after['State']['Status'] == 'exited' and after['State']['ExitCode'] == 0, 'native_checker_exit_required')
-        return {'verified': True, 'image': snapshot['docker']['image'], 'no_network': True,
+        value = {'verified': True, 'image': snapshot['docker']['image'], 'no_network': True,
             'readonly_mounts': True, 'stdout_sha256': sha(result['stdout']), 'stderr_sha256': sha(result['stderr'])}
+    except BaseException as error:
+        failure = error
     finally:
-        if created:
-            found = inspect_checker(uid or name)
-            if found is not None:
-                owned = checker_identity(found, snapshot, name, uid)
-                need(command(['docker', 'rm', '--force', owned])['returncode'] == 0, 'checker_cleanup_failed')
-                need(inspect_checker(owned) is None, 'checker_cleanup_incomplete')
-            cleanup = True
-        save(work / 'offline-cleanup.json', {'known_complete': cleanup or not created, 'uid': uid, 'owned_only': True})
+        try:
+            if created:
+                found = inspect_checker(uid or name, observations)
+                if found is not None:
+                    owned = checker_identity(found, snapshot, name, uid)
+                    need(command(['docker', 'rm', '--force', owned])['returncode'] == 0, 'checker_cleanup_failed')
+                    need(inspect_checker(owned, observations) is None, 'checker_cleanup_incomplete')
+                cleanup = True
+        except BaseException as error:
+            cleanup_failure = error
+        # Persistence runs after cleanup; a broken evidence destination cannot
+        # leave an owned checker running or replace the original failure.
+        try:
+            save(work / 'offline-inspections.json', {'version': 1, 'observations': observations,
+                'primary_failed': failure is not None, 'cleanup_failed': cleanup_failure is not None})
+            save(work / 'offline-cleanup.json', {'known_complete': cleanup or not created, 'uid': uid, 'owned_only': True})
+        except BaseException as error:
+            if failure is None and cleanup_failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+    if cleanup_failure is not None:
+        raise cleanup_failure
+    return value
 
 
 def validate_listeners(snapshot, tcp, udp):
@@ -347,20 +376,32 @@ def optional_quic_probe(work):
     return {'status': 'transport_tls_only', 'cells': cells, 'native_webtransport_acceptance': False}
 
 
-def qualify(candidate_sha, bridge_sha, *, bridge=None, work=WORK):
+def qualify(candidate_sha, bridge_sha, *, bridge=None, work=None, continuation_sha=None):
     bridge = checked_bridge(bridge_sha) if bridge is None else bridge
     body = raw(SCOPE / 'candidate.json'); need(sha(body) == candidate_sha, 'external_candidate_hash_required')
     candidate = json.loads(body); producer_sha = sha(Path(__file__).read_bytes())
-    need(candidate.get('qualification_producer_sha256') == producer_sha
-        and candidate.get('bridge_source_sha256') == bridge_sha and candidate.get('revision') == REVISION, 'qualification_source_binding_required')
-    need(bridge.candidate_matches_current(candidate), 'candidate_changed_before_qualification')
+    need(candidate.get('revision') == REVISION, 'qualification_revision_required')
+    if continuation_sha is None:
+        need(candidate.get('qualification_producer_sha256') == producer_sha
+            and candidate.get('bridge_source_sha256') == bridge_sha, 'qualification_source_binding_required')
+        current = lambda: bridge.candidate_matches_current(candidate)
+    else:
+        need(re.fullmatch('[0-9a-f]{64}', continuation_sha or ''), 'external_continuation_hash_required')
+        continued = bridge.validate_qualification_continuation(continuation_sha, producer_sha=producer_sha)
+        need(continued.get('candidate_sha256') == candidate_sha and continued.get('producer_sha256') == producer_sha,
+            'qualification_continuation_identity_required')
+        current = lambda: bridge.candidate_matches_current(candidate, continuation_sha=continuation_sha)
+    need(current(), 'candidate_changed_before_qualification')
     context = bridge.qualification_context(candidate)
-    work = Path(work); need(work.is_absolute() and Path('/tmp') in work.parents and not work.exists()
+    work = Path(work if work is not None else CONTINUATION_WORK if continuation_sha else WORK)
+    need(work.is_absolute() and Path('/tmp') in work.parents and not work.exists()
         and not any(p.is_symlink() for p in (work, *work.parents)), 'fresh_qualification_work_required')
     work.mkdir(mode=0o700, parents=True)
-    save(work / 'intent.json', {'candidate_sha256': candidate_sha, 'producer_sha256': producer_sha, 'maximum_attempts': 1})
+    save(work / 'intent.json', {'candidate_sha256': candidate_sha, 'producer_sha256': producer_sha,
+        'qualification_continuation_sha256': continuation_sha, 'maximum_attempts': 1})
     before = control_snapshot(context, candidate)
-    native = offline_check(candidate['after'], work)
+    native = offline_check(candidate['after'], work,
+        name=CONTINUATION_CHECKER_NAME if continuation_sha else CHECKER_NAME)
     pid = candidate['after']['edge']['pid']
     listeners = validate_listeners(candidate['after'], output(['nsenter', '-t', str(pid), '-n', '--', 'ss', '-H', '-ltnp']),
         output(['nsenter', '-t', str(pid), '-n', '--', 'ss', '-H', '-lunp']))
@@ -372,10 +413,11 @@ def qualify(candidate_sha, bridge_sha, *, bridge=None, work=WORK):
     nodeport = {family: negative_connect(address, 30081) for family, address in ADDRESSES.items()}
     quic = optional_quic_probe(work)
     after = control_snapshot(context, candidate)
-    need(before == after and bridge.candidate_matches_current(candidate)
+    need(before == after and current()
         and bridge.qualification_context(candidate)['bindings'] == context['bindings']
         and sha(Path(__file__).read_bytes()) == producer_sha, 'qualification_runtime_bookend_changed')
     detail = {'version': 1, 'candidate_sha256': candidate_sha, 'producer_sha256': producer_sha,
+        'qualification_continuation_sha256': continuation_sha,
         'before': before, 'after': after, 'offline': native, 'listeners': listeners, 'public': public,
         'nodeport': nodeport, 'nodeport_scope': 'retained_tcp_udp_policy_and_negative_tcp_with_backend_withdrawn',
         'quic': quic, 'native_webtransport_acceptance': False, 'full_public_mcp_acceptance': False,
@@ -385,6 +427,8 @@ def qualify(candidate_sha, bridge_sha, *, bridge=None, work=WORK):
         'producer_sha256': producer_sha, 'fixture': False, 'verified': True, 'checks': {name: True for name in CHECKS},
         'full_public_mcp_acceptance': False, 'native_webtransport_acceptance': False,
         'artifacts': [{'path': str(artifact), 'sha256': sha(raw(artifact))}]}
+    if continuation_sha is not None:
+        receipt['qualification_continuation_sha256'] = continuation_sha
     save(SCOPE / 'qualification.json', receipt)
     return {'verified': True, 'qualification_sha256': sha(raw(SCOPE / 'qualification.json')),
         'full_public_mcp_acceptance': False, 'native_webtransport_acceptance': False}
@@ -394,8 +438,10 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate-sha256', required=True); parser.add_argument('--bridge-sha256', required=True)
+    parser.add_argument('--qualification-continuation-sha256')
     args = parser.parse_args(); need(os.geteuid() == 0, 'root_required')
-    print(json.dumps(qualify(args.candidate_sha256, args.bridge_sha256), sort_keys=True))
+    print(json.dumps(qualify(args.candidate_sha256, args.bridge_sha256,
+        continuation_sha=args.qualification_continuation_sha256), sort_keys=True))
 
 
 if __name__ == '__main__':

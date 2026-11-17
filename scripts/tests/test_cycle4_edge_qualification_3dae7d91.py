@@ -51,7 +51,7 @@ class Docker:
         if args[:2] == ['docker', 'inspect']:
             if self.created and not self.removed:
                 return {'returncode': 0, 'stdout': n.encode([self.inspect()]), 'stderr': b''}
-            return {'returncode': 1, 'stdout': b'[]', 'stderr': b'Error: No such object: owned-checker'}
+            return {'returncode': 1, 'stdout': b'[]', 'stderr': b'error: no such object: ' + args[2].encode() + b'\n'}
         if args[:2] == ['docker', 'create']:
             self.created = True
             return {'returncode': 0, 'stdout': self.uid.encode() + b'\n', 'stderr': b''}
@@ -105,6 +105,53 @@ class NativeCheck(unittest.TestCase):
                 self.assertRaisesRegex(n.Refused, 'checker_inspection_unavailable'):
             n.offline_check(self.value, self.root)
         self.assertFalse((self.root / 'offline-create.stdout').exists())
+        recorded = json.loads((self.root / 'offline-inspections.json').read_bytes())
+        self.assertEqual(recorded['observations'][0]['class'], 'unknown')
+        self.assertNotIn('daemon unavailable', (self.root / 'offline-inspections.json').read_text())
+
+    def test_inspection_absence_requires_exact_reference_output_and_finite_grammar(self):
+        name = n.CHECKER_NAME
+        for message in ('error: no such object: ', 'Error: No such object: ', 'Error response from daemon: No such container: '):
+            value = {'returncode': 1, 'stdout': b'[]\n', 'stderr': (message + name + '\n').encode()}
+            observations = []
+            with patch.object(n, 'command', return_value=value):
+                self.assertIsNone(n.inspect_checker(name, observations))
+            self.assertEqual(observations[0]['class'], 'absent')
+        invalid = [
+            {'returncode': 1, 'stdout': b'[]', 'stderr': b'error: no such object: other-name\n'},
+            {'returncode': 1, 'stdout': b'[{}]', 'stderr': ('error: no such object: ' + name).encode()},
+            {'returncode': 1, 'stdout': b'[]', 'stderr': ('daemon unavailable; no such object: ' + name).encode()},
+            {'returncode': 2, 'stdout': b'[]', 'stderr': ('error: no such object: ' + name).encode()},
+        ]
+        for value in invalid:
+            with self.subTest(value=value), patch.object(n, 'command', return_value=value), \
+                    self.assertRaisesRegex(n.Refused, 'checker_inspection_unavailable'):
+                n.inspect_checker(name)
+
+    def test_diagnostic_persistence_failure_happens_after_owned_cleanup(self):
+        docker = Docker(self.value); original = n.save
+        def save(path, value):
+            if path.name == 'offline-inspections.json':
+                raise OSError('evidence_destination_unavailable')
+            return original(path, value)
+        with patch.object(n, 'command', side_effect=docker.command), patch.object(n, 'save', side_effect=save), \
+                self.assertRaisesRegex(OSError, 'evidence_destination_unavailable'):
+            n.offline_check(self.value, self.root)
+        self.assertTrue(docker.removed)
+
+    def test_cleanup_failure_does_not_replace_primary_failure_or_claim_completion(self):
+        docker = Docker(self.value, fail=True)
+        original = docker.command
+        def command(args, **kwargs):
+            if args[:2] == ['docker', 'inspect'] and any(v[:3] == ['docker', 'start', '--attach'] for v in docker.calls):
+                return {'returncode': 1, 'stdout': b'', 'stderr': b'daemon unavailable'}
+            return original(args, **kwargs)
+        with patch.object(n, 'command', side_effect=command), self.assertRaisesRegex(n.Refused, 'native_image_config_check_failed'):
+            n.offline_check(self.value, self.root)
+        self.assertFalse(docker.removed)
+        self.assertFalse(json.loads((self.root / 'offline-cleanup.json').read_bytes())['known_complete'])
+        diagnostics = json.loads((self.root / 'offline-inspections.json').read_bytes())
+        self.assertTrue(diagnostics['primary_failed']); self.assertTrue(diagnostics['cleanup_failed'])
 
     def test_checker_cannot_cleanup_foreign_container_or_writable_mount(self):
         docker = Docker(self.value)
@@ -291,6 +338,38 @@ class QualificationBookends(unittest.TestCase):
         self.qualify()
         with self.assertRaisesRegex(n.Refused, 'fresh_qualification_work'):
             self.qualify()
+
+    def test_source_repair_requires_explicit_bound_continuation_and_preserves_old_work(self):
+        self.candidate['qualification_producer_sha256'] = 'a' * 64
+        self.candidate['bridge_source_sha256'] = 'b' * 64
+        write(self.scope / 'candidate.json', self.candidate)
+        self.candidate_sha = n.sha((self.scope / 'candidate.json').read_bytes())
+        with self.assertRaisesRegex(n.Refused, 'qualification_source_binding_required'):
+            self.qualify()
+        self.work.mkdir(mode=0o700); write(self.work / 'intent.json', {'consumed': True})
+        old = {p.name: p.read_bytes() for p in self.work.iterdir()}
+        continued_work = self.root / 'continuation-work'
+        continuation_sha = 'e' * 64
+        self.bridge.validate_qualification_continuation = Mock(return_value={
+            'candidate_sha256': self.candidate_sha, 'producer_sha256': self.producer_sha})
+        with patch.object(n, 'CONTINUATION_WORK', continued_work):
+            result = n.qualify(self.candidate_sha, self.bridge_sha, bridge=self.bridge, continuation_sha=continuation_sha)
+        self.assertTrue(result['verified'])
+        self.bridge.validate_qualification_continuation.assert_called_once_with(continuation_sha, producer_sha=self.producer_sha)
+        self.assertEqual({p.name: p.read_bytes() for p in self.work.iterdir()}, old)
+        self.assertTrue((continued_work / 'intent.json').exists())
+        self.assertEqual(n.offline_check.call_args.kwargs['name'], n.CONTINUATION_CHECKER_NAME)
+        receipt = json.loads((self.scope / 'qualification.json').read_bytes())
+        self.assertEqual(receipt['qualification_continuation_sha256'], continuation_sha)
+        self.assertEqual(receipt['producer_sha256'], self.producer_sha)
+        self.assertEqual(json.loads((self.scope / 'candidate.json').read_bytes())['qualification_producer_sha256'], 'a' * 64)
+
+    def test_wrong_continuation_candidate_or_producer_is_refused_before_new_work(self):
+        self.bridge.validate_qualification_continuation = Mock(return_value={
+            'candidate_sha256': '0' * 64, 'producer_sha256': self.producer_sha})
+        with self.assertRaisesRegex(n.Refused, 'qualification_continuation_identity_required'):
+            n.qualify(self.candidate_sha, self.bridge_sha, bridge=self.bridge, work=self.work, continuation_sha='e' * 64)
+        self.assertFalse(self.work.exists())
 
 
 if __name__ == '__main__':

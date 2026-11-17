@@ -237,8 +237,164 @@ def capture_current():
         'original_error':'admitted_sse_edge_changed','retained_context':_retained_bindings(),**captured}
 
 
-def candidate_matches_current(candidate):
-    return {key:value for key,value in candidate.items() if key!='qualification_producer_sha256'}==capture_current()
+
+# Exactly one operator-observed absence-classifier failure, before Docker create.
+PREVIOUS_CANDIDATE_SHA='65f0c06c099c545172282f08e5d5748022e628429f33e47ae50f3ab904365f7b'
+PREVIOUS_BRIDGE_SHA='76ba79b119aa988b0d34a40134a5f8645ddcb56f567e2834426f3e1c2672981a'
+PREVIOUS_PRODUCER_SHA='b85845717156c495fc0f508f319333fbc3968a3ff39342578f5a3187517847e8'
+ORIGINAL_BRIDGE=SCOPE/'original-bridge.py'
+ORIGINAL_QUALIFIER=SCOPE/'original-qualification.py'
+PREVIOUS_WORK=Path('/tmp/devres-edge-qualification-3dae7d91-20261117')
+CONTINUATION_WORK=Path('/tmp/devres-edge-qualification-3dae7d91-20261117-continuation-v1')
+OLD_CHECKER='devres-edge-check-3dae7d91'
+CONTINUATION_CHECKER='devres-edge-check-3dae7d91-continuation-v1'
+CONTINUATION=SCOPE/'qualification-continuation.json'
+CONTINUATION_INTENT=SCOPE/'qualification-continuation-intent.json'
+PREVIOUS_WORK_HASHES={
+    'intent.json':'e9a1f5e07a308cc0f4a58f84516a4cb2a960e348484a8f1cb7d28ac3bb8d9146',
+    'offline-intent.json':'6b002769acd8e7de5ab43ff4b1d968b135f6e91ffbf0b809211f6e56ac73b7f7',
+    'offline-cleanup.json':'e4fda31d5b1e4fd3f69a24dc701a69b39414a4ce43058178f24c87f8c11aba70'}
+
+
+def _preserved_identity(path):
+    info=Path(path).lstat()
+    need(info.st_uid==os.geteuid() and not info.st_mode&0o077,'preserved_private_identity_required')
+    return {'device':info.st_dev,'inode':info.st_ino,'uid':info.st_uid,'gid':info.st_gid,
+        'mode':stat.S_IMODE(info.st_mode),'links':info.st_nlink,'size':info.st_size,
+        'mtime_ns':info.st_mtime_ns,'ctime_ns':info.st_ctime_ns}
+
+
+def _original_versions():
+    need(sha(raw(ORIGINAL_BRIDGE))==PREVIOUS_BRIDGE_SHA and sha(raw(ORIGINAL_QUALIFIER))==PREVIOUS_PRODUCER_SHA,
+         'fixed_original_qualification_sources_required')
+    # Both exact first-party versions were reviewed: the bridge imports only
+    # checked frozen dependencies; the producer command/argv functions are pure
+    # until explicitly invoked. Its old sibling bridge-loader is never called.
+    bridge=checked_module(ORIGINAL_BRIDGE,PREVIOUS_BRIDGE_SHA,'cycle4_original_edge_bridge')
+    producer=checked_module(ORIGINAL_QUALIFIER,PREVIOUS_PRODUCER_SHA,'cycle4_original_edge_qualifier')
+    return bridge,producer
+
+
+def _original_qualification_case():
+    need(sha(raw(CANDIDATE))==PREVIOUS_CANDIDATE_SHA,'fixed_original_candidate_required')
+    candidate=load(CANDIDATE)
+    need(candidate.get('bridge_source_sha256')==PREVIOUS_BRIDGE_SHA
+         and candidate.get('qualification_producer_sha256')==PREVIOUS_PRODUCER_SHA,'fixed_original_candidate_sources_required')
+    need(load(SCOPE/'candidate-intent.json')=={'maximum_attempts':1,'bridge_source_sha256':PREVIOUS_BRIDGE_SHA,
+        'qualification_producer_sha256':PREVIOUS_PRODUCER_SHA},'fixed_original_candidate_intent_required')
+    need(not any(p.is_symlink() for p in (PREVIOUS_WORK,*PREVIOUS_WORK.parents))
+         and PREVIOUS_WORK.is_dir() and {p.name for p in PREVIOUS_WORK.iterdir()}==set(PREVIOUS_WORK_HASHES),
+         'exact_precreate_failure_inventory_required')
+    identities={};hashes={}
+    for name,wanted in PREVIOUS_WORK_HASHES.items():
+        path=PREVIOUS_WORK/name;body=raw(path)
+        need(sha(body)==wanted,'original_failure_artifact_changed')
+        hashes[name]=wanted;identities[name]=_preserved_identity(path)
+    need(load(PREVIOUS_WORK/'intent.json')=={'candidate_sha256':PREVIOUS_CANDIDATE_SHA,
+        'maximum_attempts':1,'producer_sha256':PREVIOUS_PRODUCER_SHA},'fixed_original_qualification_intent_required')
+    need(load(PREVIOUS_WORK/'offline-cleanup.json')=={'known_complete':True,'owned_only':True,'uid':None},
+         'original_precreate_cleanup_required')
+    bridge,producer=_original_versions()
+    offline=load(PREVIOUS_WORK/'offline-intent.json')
+    need(offline=={'maximum_attempts':1,'name':OLD_CHECKER,'image':candidate['after']['docker']['image'],
+        'argv_sha256':sha(encode(producer.checker_arguments(candidate['after'],OLD_CHECKER)))},
+        'original_offline_create_not_admitted')
+    return {'candidate_sha256':PREVIOUS_CANDIDATE_SHA,'candidate_identity':_preserved_identity(CANDIDATE),
+        'candidate_intent_identity':_preserved_identity(SCOPE/'candidate-intent.json'),
+        'original_bridge_sha256':PREVIOUS_BRIDGE_SHA,'original_bridge_identity':_preserved_identity(ORIGINAL_BRIDGE),
+        'original_producer_sha256':PREVIOUS_PRODUCER_SHA,'original_producer_identity':_preserved_identity(ORIGINAL_QUALIFIER),
+        'work':str(PREVIOUS_WORK),'work_identity':_preserved_identity(PREVIOUS_WORK),
+        'work_hashes':hashes,'work_file_identities':identities,'no_checker_create_artifacts':True}
+
+
+def _absence_proof(producer,name):
+    result=producer.command(['docker','inspect',name],timeout=20)
+    stdout,stderr=result['stdout'],result['stderr']
+    need(result.get('returncode')==1 and type(stdout) is type(stderr) is bytes
+         and stdout.strip()==b'[]' and len(stdout)<=64 and len(stderr)<=512
+         and re.fullmatch(rb'(?:error:\s*)?no such (?:object|container):\s*'+re.escape(name.encode()),
+             stderr.strip(),re.IGNORECASE) is not None,'fixed_checker_absence_not_proved')
+    return {'reference':name,'class':'absent','returncode':1,'stdout_sha256':sha(stdout),
+        'stderr_sha256':sha(stderr),'stdout_bytes':len(stdout),'stderr_bytes':len(stderr),
+        'grammar':'reference_exact_docker_absence_v1'}
+
+
+def prepare_qualification_continuation(candidate_sha,previous_bridge_sha,previous_producer_sha,producer_sha):
+    need((candidate_sha,previous_bridge_sha,previous_producer_sha)==
+         (PREVIOUS_CANDIDATE_SHA,PREVIOUS_BRIDGE_SHA,PREVIOUS_PRODUCER_SHA),'only_fixed_qualification_failure_continues')
+    need(re.fullmatch('[0-9a-f]{64}',producer_sha or '') and producer_sha!=PREVIOUS_PRODUCER_SHA
+         and sha(raw(QUALIFIER))==producer_sha,'revised_qualification_producer_required')
+    need(not ADMISSION.exists() and not CONTINUATION.exists() and not CONTINUATION_INTENT.exists()
+         and not (SCOPE/'qualification.json').exists()
+         and not (SCOPE/'qualification-detail.json').exists() and not CONTINUATION_WORK.exists(),
+         'unadmitted_fresh_continuation_required')
+    case=_original_qualification_case();old_bridge,old_producer=_original_versions();candidate=load(CANDIDATE)
+    need({key:value for key,value in candidate.items() if key!='qualification_producer_sha256'}==old_bridge.capture_current(),
+         'original_candidate_native_reality_changed')
+    source_sha=sha(Path(__file__).read_bytes());need(source_sha!=PREVIOUS_BRIDGE_SHA,'revised_bridge_required')
+    new(CONTINUATION_INTENT,{'version':1,'maximum_attempts':1,'candidate_sha256':candidate_sha,
+        'bridge_source_sha256':source_sha,'producer_sha256':producer_sha})
+    proof={name:_absence_proof(old_producer,name) for name in (OLD_CHECKER,CONTINUATION_CHECKER)}
+    need(_original_qualification_case()==case,'original_failure_changed_during_continuation')
+    new(CONTINUATION,{'version':1,'kind':'cycle4-native-edge-qualification-continuation','maximum_attempts':1,
+        'candidate_sha256':candidate_sha,'bridge_source_sha256':source_sha,'producer_sha256':producer_sha,
+        'previous_bridge_sha256':previous_bridge_sha,'previous_producer_sha256':previous_producer_sha,
+        'original_case':case,'work':str(CONTINUATION_WORK),'checker':CONTINUATION_CHECKER,'absence':proof,
+        'historical_failure':'operator_observed_lowercase_absence_classifier_before_create',
+        'historical_stderr_retained':False,'new_absence_proof_retained':True})
+    return {'qualification_continuation_sha256':sha(raw(CONTINUATION)),'maximum_attempts':1,
+        'original_candidate_unchanged':True,'original_work_unchanged':True,'guard_accepted':False}
+
+
+def _qualification_continuation(continuation_sha,producer_sha=None):
+    body=raw(CONTINUATION)
+    need(re.fullmatch('[0-9a-f]{64}',continuation_sha or '') and sha(body)==continuation_sha,
+         'external_qualification_continuation_pin_required')
+    value=json.loads(body);need(value.get('version')==1
+         and value.get('kind')=='cycle4-native-edge-qualification-continuation' and value.get('maximum_attempts')==1
+         and value.get('candidate_sha256')==PREVIOUS_CANDIDATE_SHA
+         and value.get('bridge_source_sha256')==sha(Path(__file__).read_bytes())
+         and value.get('previous_bridge_sha256')==PREVIOUS_BRIDGE_SHA
+         and value.get('previous_producer_sha256')==PREVIOUS_PRODUCER_SHA
+         and value.get('producer_sha256')!=PREVIOUS_PRODUCER_SHA
+         and value.get('work')==str(CONTINUATION_WORK) and value.get('checker')==CONTINUATION_CHECKER,
+         'fixed_qualification_continuation_required')
+    need(re.fullmatch('[0-9a-f]{64}',value.get('producer_sha256',''))
+         and sha(raw(QUALIFIER))==value['producer_sha256']
+         and (producer_sha is None or producer_sha==value['producer_sha256']), 'continuation_producer_changed')
+    need(load(CONTINUATION_INTENT)=={'version':1,'maximum_attempts':1,'candidate_sha256':PREVIOUS_CANDIDATE_SHA,
+        'bridge_source_sha256':value['bridge_source_sha256'],'producer_sha256':value['producer_sha256']},
+        'continuation_intent_changed')
+    need(value.get('original_case')==_original_qualification_case(),'original_failure_case_changed')
+    proof=value.get('absence',{})
+    need(set(proof)=={OLD_CHECKER,CONTINUATION_CHECKER} and all(
+        p.get('reference')==name and p.get('class')=='absent' and p.get('returncode')==1
+        and p.get('grammar')=='reference_exact_docker_absence_v1'
+        and 0<p.get('stdout_bytes',0)<=64 and 0<p.get('stderr_bytes',0)<=512
+        and re.fullmatch('[0-9a-f]{64}',p.get('stdout_sha256',''))
+        and re.fullmatch('[0-9a-f]{64}',p.get('stderr_sha256','')) for name,p in proof.items()),
+        'source_bound_absence_proof_required')
+    need(value.get('historical_failure')=='operator_observed_lowercase_absence_classifier_before_create'
+         and value.get('historical_stderr_retained') is False and value.get('new_absence_proof_retained') is True,
+         'qualification_failure_provenance_changed')
+    return value
+
+
+def validate_qualification_continuation(continuation_sha,*,producer_sha=None):
+    value=_qualification_continuation(continuation_sha,producer_sha)
+    need(candidate_matches_current(load(CANDIDATE),continuation_sha=continuation_sha),
+         'continued_candidate_native_reality_changed')
+    return value
+
+
+def candidate_matches_current(candidate,*,continuation_sha=None):
+    if continuation_sha is None:
+        return {key:value for key,value in candidate.items() if key!='qualification_producer_sha256'}==capture_current()
+    value=_qualification_continuation(continuation_sha)
+    need(sha(encode(candidate))==value['candidate_sha256'] and candidate==load(CANDIDATE),
+         'continuation_candidate_changed')
+    old_bridge,_producer=_original_versions()
+    return {key:item for key,item in candidate.items() if key!='qualification_producer_sha256'}==old_bridge.capture_current()
 
 
 def prepare_candidate(qualification_producer_sha):
@@ -253,10 +409,17 @@ def prepare_candidate(qualification_producer_sha):
     return {'candidate_sha256':sha(raw(CANDIDATE)),'original_guard_denied':True,'guard_accepted':False}
 
 
-def validate_qualification(candidate,candidate_sha,qualification,producer_sha):
+def validate_qualification(candidate,candidate_sha,qualification,producer_sha,*,continuation_sha=None):
+    if continuation_sha is not None:
+        continuation=_qualification_continuation(continuation_sha,producer_sha)
+        need(candidate_sha==continuation['candidate_sha256']
+             and candidate.get('qualification_producer_sha256')==PREVIOUS_PRODUCER_SHA
+             and qualification.get('qualification_continuation_sha256')==continuation_sha, 'qualification_continuation_binding_required')
+    else:
+        need(candidate.get('qualification_producer_sha256')==producer_sha
+             and qualification.get('qualification_continuation_sha256') is None, 'original_qualification_producer_required')
     need(qualification.get('version')==1 and qualification.get('kind')=='cycle4-native-edge-qualification'
          and qualification.get('candidate_sha256')==candidate_sha and qualification.get('producer_sha256')==producer_sha
-         and candidate.get('qualification_producer_sha256')==producer_sha
          and qualification.get('fixture') is False and qualification.get('verified') is True,
          'real_source_bound_edge_qualification_required')
     checks=qualification.get('checks')
@@ -273,26 +436,31 @@ def validate_qualification(candidate,candidate_sha,qualification,producer_sha):
              and sha(raw(path))==item.get('sha256'),'edge_qualification_artifact_changed')
 
 
-def admit(candidate_sha,qualification_path,qualification_sha,qualification_producer_sha):
+def admit(candidate_sha,qualification_path,qualification_sha,qualification_producer_sha,*,continuation_sha=None):
     need(Path(qualification_path)==SCOPE/'qualification.json','fixed_qualification_path_required')
-    candidate=load(CANDIDATE);candidate_identity(candidate);qualification=load(qualification_path)
+    candidate=load(CANDIDATE);candidate_identity(candidate,continuation_sha=continuation_sha);qualification=load(qualification_path)
     need(sha(raw(CANDIDATE))==candidate_sha and sha(raw(qualification_path))==qualification_sha,
          'external_qualification_hash_required')
     need(sha(raw(QUALIFIER))==qualification_producer_sha,'qualification_producer_source_changed')
-    validate_qualification(candidate,candidate_sha,qualification,qualification_producer_sha)
-    need(candidate_matches_current(candidate),'candidate_native_reality_changed')
+    validate_qualification(candidate,candidate_sha,qualification,qualification_producer_sha,continuation_sha=continuation_sha)
+    need(candidate_matches_current(candidate,continuation_sha=continuation_sha),'candidate_native_reality_changed')
     new(ADMISSION,{'version':1,'kind':'cycle4-native-edge-readmission','revision':REVISION,'verified':True,
         'bridge_source_sha256':sha(Path(__file__).read_bytes()),'candidate_sha256':candidate_sha,
         'qualification_sha256':qualification_sha,'qualification_producer_sha256':qualification_producer_sha,
+        'qualification_continuation_sha256':continuation_sha,
         'candidate':candidate,'qualification':qualification})
     return {'admission_sha256':sha(raw(ADMISSION)),'historical_files_unchanged':True,
             'full_public_mcp_acceptance':False,'native_webtransport_acceptance':False}
 
 
 
-def candidate_identity(candidate):
+def candidate_identity(candidate,*,continuation_sha=None):
+    expected_bridge_sha=sha(Path(__file__).read_bytes())
+    if continuation_sha is not None:
+        _qualification_continuation(continuation_sha)
+        expected_bridge_sha=PREVIOUS_BRIDGE_SHA
     need(candidate.get('version')==1 and candidate.get('kind')=='cycle4-edge-readmission-candidate'
-         and candidate.get('revision')==REVISION and candidate.get('bridge_source_sha256')==sha(Path(__file__).read_bytes())
+         and candidate.get('revision')==REVISION and candidate.get('bridge_source_sha256')==expected_bridge_sha
          and candidate.get('public_identity_sha256')==PUBLIC_SHA and candidate.get('original_guard_denied') is True
          and candidate.get('original_error')=='admitted_sse_edge_changed','candidate_source_identity_required')
 
@@ -303,12 +471,13 @@ def _receipt(receipt_sha):
     need(value.get('version')==1 and value.get('kind')=='cycle4-native-edge-readmission'
          and value.get('revision')==REVISION and value.get('verified') is True
          and value.get('bridge_source_sha256')==sha(Path(__file__).read_bytes()),'edge_receipt_source_identity')
-    candidate_identity(value['candidate'])
+    continuation_sha=value.get('qualification_continuation_sha256')
+    candidate_identity(value['candidate'],continuation_sha=continuation_sha)
     need(sha(raw(CANDIDATE))==value['candidate_sha256'] and load(CANDIDATE)==value['candidate']
          and sha(raw(SCOPE/'qualification.json'))==value['qualification_sha256']
          and load(SCOPE/'qualification.json')==value['qualification']
          and sha(raw(QUALIFIER))==value['qualification_producer_sha256'],'edge_receipt_inputs_changed')
-    validate_qualification(value['candidate'],value['candidate_sha256'],value['qualification'],value['qualification_producer_sha256'])
+    validate_qualification(value['candidate'],value['candidate_sha256'],value['qualification'],value['qualification_producer_sha256'],continuation_sha=continuation_sha)
     need(value['candidate']['historical_sources']==source_guard()
          and value['candidate']['old_admission_sha256']==sha(raw(OLD_ADMISSION))
          and value['candidate']['retained_context']==_retained_bindings(),'historical_binding_changed')
@@ -402,9 +571,19 @@ def main():
     approve=sub.add_parser('admit');approve.add_argument('--candidate-sha256',required=True)
     approve.add_argument('--qualification',type=Path,required=True);approve.add_argument('--qualification-sha256',required=True)
     approve.add_argument('--qualification-producer-sha256',required=True)
+    approve.add_argument('--qualification-continuation-sha256')
+    continuation=sub.add_parser('qualification-continuation')
+    continuation.add_argument('--candidate-sha256',required=True)
+    continuation.add_argument('--previous-bridge-sha256',required=True)
+    continuation.add_argument('--previous-producer-sha256',required=True)
+    continuation.add_argument('--qualification-producer-sha256',required=True)
     args=parser.parse_args();need(os.geteuid()==0,'root_required')
     if args.operation=='candidate':result=prepare_candidate(args.qualification_producer_sha256)
-    else:result=admit(args.candidate_sha256,args.qualification,args.qualification_sha256,args.qualification_producer_sha256)
+    elif args.operation=='qualification-continuation':
+        result=prepare_qualification_continuation(args.candidate_sha256,args.previous_bridge_sha256,
+            args.previous_producer_sha256,args.qualification_producer_sha256)
+    else:result=admit(args.candidate_sha256,args.qualification,args.qualification_sha256,args.qualification_producer_sha256,
+        continuation_sha=args.qualification_continuation_sha256)
     print(json.dumps(result,sort_keys=True))
 
 

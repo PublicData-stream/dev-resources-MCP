@@ -222,6 +222,114 @@ class Receipt(unittest.TestCase):
         self.assertFalse(self.admission_path.exists())
 
 
+class QualificationContinuation(Receipt):
+    def setUp(self):
+        super().setUp()
+        (self.scope/'qualification.json').unlink()
+        self.original_bridge=self.scope/'original-bridge.py';self.original_producer=self.scope/'original-qualification.py'
+        data={key:value for key,value in self.candidate.items() if key not in ('bridge_source_sha256','qualification_producer_sha256')}
+        bridge_code=("import pathlib,hashlib,copy\nDATA="+repr(data)+"\ndef capture_current():\n value=copy.deepcopy(DATA)\n value['bridge_source_sha256']=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()\n return value\n").encode()
+        # Keep the preserved producer a small first-party fixture with actual
+        # bounded-command API; no sibling bridge loader is imported or invoked.
+        producer_code=b"def checker_arguments(snapshot,name):return ['docker','create','--name',name,snapshot['docker']['image']]\ndef command(argv,timeout=20):return {'returncode':1,'stdout':bytes([91,93,10]),'stderr':('error: no such object: '+argv[-1]+chr(10)).encode()}\n"
+        put(self.original_bridge,bridge_code);put(self.original_producer,producer_code)
+        self.old_bridge_sha=n.sha(bridge_code);self.old_producer_sha=n.sha(producer_code)
+        self.candidate['bridge_source_sha256']=self.old_bridge_sha
+        self.candidate['qualification_producer_sha256']=self.old_producer_sha;put(self.candidate_path,self.candidate)
+        self.old_candidate_sha=n.sha(self.candidate_path.read_bytes())
+        put(self.scope/'candidate-intent.json',{'maximum_attempts':1,'bridge_source_sha256':self.old_bridge_sha,
+            'qualification_producer_sha256':self.old_producer_sha})
+        self.old_work=self.scope/'old-work';self.new_work=self.scope/'continuation-work';self.old_work.mkdir(mode=0o700)
+        put(self.old_work/'intent.json',{'candidate_sha256':self.old_candidate_sha,'maximum_attempts':1,'producer_sha256':self.old_producer_sha})
+        put(self.old_work/'offline-intent.json',{'maximum_attempts':1,'name':n.OLD_CHECKER,'image':self.candidate['after']['docker']['image'],
+            'argv_sha256':n.sha(n.encode(['docker','create','--name',n.OLD_CHECKER,self.candidate['after']['docker']['image']]))})
+        put(self.old_work/'offline-cleanup.json',{'known_complete':True,'owned_only':True,'uid':None})
+        self.continuation=self.scope/'qualification-continuation.json';self.continuation_intent=self.scope/'qualification-continuation-intent.json'
+        values={'ORIGINAL_BRIDGE':self.original_bridge,'ORIGINAL_QUALIFIER':self.original_producer,
+            'PREVIOUS_CANDIDATE_SHA':self.old_candidate_sha,'PREVIOUS_BRIDGE_SHA':self.old_bridge_sha,
+            'PREVIOUS_PRODUCER_SHA':self.old_producer_sha,'PREVIOUS_WORK':self.old_work,'CONTINUATION_WORK':self.new_work,
+            'CONTINUATION':self.continuation,'CONTINUATION_INTENT':self.continuation_intent,
+            'PREVIOUS_WORK_HASHES':{path.name:n.sha(path.read_bytes()) for path in self.old_work.iterdir()}}
+        self.cont_patch=patch.multiple(n,**values);self.cont_patch.start();self.addCleanup(self.cont_patch.stop)
+    def prepare(self):
+        return n.prepare_qualification_continuation(self.old_candidate_sha,self.old_bridge_sha,self.old_producer_sha,self.producer_sha)
+    def qualified(self,continuation_sha):
+        qualification={**self.qualification,'candidate_sha256':self.old_candidate_sha,
+            'qualification_continuation_sha256':continuation_sha}
+        put(self.scope/'qualification.json',qualification)
+        return n.admit(self.old_candidate_sha,self.scope/'qualification.json',n.sha((self.scope/'qualification.json').read_bytes()),
+            self.producer_sha,continuation_sha=continuation_sha)
+    # Receipt's tests cover the non-continuation path, with its own setup. The
+    # continuation-specific fixture intentionally retains the original producer.
+    def test_real_qualified_receipt_is_source_pinned_and_cannot_be_rewritten(self):
+        result=self.prepare();continued=n.validate_qualification_continuation(result['qualification_continuation_sha256'],producer_sha=self.producer_sha)
+        self.assertEqual(continued['producer_sha256'],self.producer_sha)
+        self.assertEqual(continued['candidate_sha256'],self.old_candidate_sha)
+        admitted=self.qualified(result['qualification_continuation_sha256'])
+        with patch.object(n,'source_guard',return_value={'frozen':'hash'}),patch.object(n,'_retained_bindings',return_value={'frozen':'same'}):
+            self.assertEqual(n._receipt(admitted['admission_sha256'])['qualification_continuation_sha256'],result['qualification_continuation_sha256'])
+    def test_fixture_or_incomplete_qualification_never_admits(self):
+        result=self.prepare();qualification={**self.qualification,'fixture':True,'candidate_sha256':self.old_candidate_sha,
+            'qualification_continuation_sha256':result['qualification_continuation_sha256']}
+        put(self.scope/'qualification.json',qualification)
+        with self.assertRaises(n.Refused):
+            n.admit(self.old_candidate_sha,self.scope/'qualification.json',n.sha((self.scope/'qualification.json').read_bytes()),
+                self.producer_sha,continuation_sha=result['qualification_continuation_sha256'])
+        self.assertFalse(self.admission_path.exists())
+    def test_changed_candidate_source_artifact_or_native_reality_never_admits(self):
+        result=self.prepare();put(self.old_work/'offline-cleanup.json',{'known_complete':False,'owned_only':True,'uid':None})
+        with self.assertRaises(n.Refused):n.validate_qualification_continuation(result['qualification_continuation_sha256'])
+    def test_actual_native_change_during_qualification_does_not_publish_receipt(self):
+        result=self.prepare()
+        old=n._original_versions
+        def changed_versions():
+            _bridge,producer=old();return SimpleNamespace(capture_current=lambda:{'different':True}),producer
+        with patch.object(n,'_original_versions',side_effect=changed_versions),self.assertRaisesRegex(n.Refused,'native_reality_changed'):
+            n.validate_qualification_continuation(result['qualification_continuation_sha256'])
+        self.assertFalse(self.admission_path.exists())
+    def test_original_bytes_identities_and_no_retry_are_preserved(self):
+        original={path:(path.read_bytes(),path.stat().st_ino) for path in [self.candidate_path,self.original_bridge,self.original_producer,*self.old_work.iterdir()]}
+        result=self.prepare()
+        self.assertFalse(self.new_work.exists())
+        self.assertFalse(result['guard_accepted'])
+        self.assertEqual({path:(path.read_bytes(),path.stat().st_ino) for path in original},original)
+        with self.assertRaisesRegex(n.Refused,'fresh_continuation'):self.prepare()
+    def test_default_admission_cannot_substitute_new_producer_or_bridge(self):
+        self.prepare()
+        with self.assertRaisesRegex(n.Refused,'candidate_source_identity'):n.candidate_identity(self.candidate)
+        put(self.scope/'qualification.json',{**self.qualification,'candidate_sha256':self.old_candidate_sha})
+        with self.assertRaisesRegex(n.Refused,'candidate_source_identity'):
+            n.admit(self.old_candidate_sha,self.scope/'qualification.json',n.sha((self.scope/'qualification.json').read_bytes()),self.producer_sha)
+    def test_any_other_old_work_inventory_or_case_is_refused(self):
+        put(self.old_work/'offline-create.stdout',b'created-id')
+        with self.assertRaisesRegex(n.Refused,'precreate_failure_inventory'):self.prepare()
+        self.assertFalse(self.continuation_intent.exists())
+    def test_wrong_old_source_pin_and_unknown_docker_error_are_refused(self):
+        with self.assertRaisesRegex(n.Refused,'only_fixed_qualification_failure'):
+            n.prepare_qualification_continuation('0'*64,self.old_bridge_sha,self.old_producer_sha,self.producer_sha)
+        with patch.object(n,'_absence_proof',side_effect=n.Refused('fixed_checker_absence_not_proved')),self.assertRaises(n.Refused):self.prepare()
+        self.assertTrue(self.continuation_intent.exists());self.assertFalse(self.continuation.exists())
+        with self.assertRaisesRegex(n.Refused,'fresh_continuation'):self.prepare()
+    def test_absence_grammar_refuses_permission_or_wrong_reference(self):
+        for result in ({'returncode':1,'stdout':b'[]\n','stderr':b'permission denied'},
+            {'returncode':1,'stdout':b'[]\n','stderr':b'error: no such object: foreign'},
+            {'returncode':0,'stdout':b'[]\n','stderr':b'error: no such object: '+n.OLD_CHECKER.encode()}):
+            producer=SimpleNamespace(command=lambda args,timeout=20:result)
+            with self.subTest(result=result),self.assertRaises(n.Refused):n._absence_proof(producer,n.OLD_CHECKER)
+    def test_native_guard_and_loader_revalidate_sealed_continuation(self):
+        result=self.prepare();admitted=self.qualified(result['qualification_continuation_sha256'])
+        controller=SimpleNamespace(_actual=lambda:(self.candidate['after'],b'compose'))
+        with (patch.object(n,'source_guard',return_value={'frozen':'hash'}),
+              patch.object(n,'_retained_bindings',return_value={'frozen':'same'}),
+              patch.object(n,'_wrapper',return_value=object()),
+              patch.object(n,'_compression_controller',return_value=controller) as factory):
+            self.assertEqual(n.native_guard(admitted['admission_sha256']),self.candidate['after'])
+            self.assertIs(n.load_controller(n.WRAPPER,n.WRAPPER_SHA,n.CHAIN[str(n.WRAPPER)][2],'default',receipt_sha=admitted['admission_sha256']),controller)
+            put(self.original_producer,b'changed source')
+            with self.assertRaises(n.Refused):n.native_guard(admitted['admission_sha256'])
+            with self.assertRaises(n.Refused):n.load_controller(n.WRAPPER,n.WRAPPER_SHA,n.CHAIN[str(n.WRAPPER)][2],'default',receipt_sha=admitted['admission_sha256'])
+
+
 class RetainedProducerShape(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir='/tmp');self.addCleanup(self.temp.cleanup)

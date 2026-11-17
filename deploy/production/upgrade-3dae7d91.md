@@ -25,6 +25,14 @@ compatibility contexts. Pin the receipt SHA-256 through
 `DEVRES_EDGE_READMISSION_SHA256` before construction and retain it in the prepared
 boundary. Full public MCP/WebTransport acceptance remains a later target gate.
 
+The first edge qualification stopped before checker creation because Docker's
+lowercase missing-container diagnostic was not recognized. Preserve that candidate,
+producer sources and three-file failure journal exactly. A single explicitly
+hashed continuation may qualify that same candidate with the corrected diagnostic
+parser, a fresh fixed work directory and checker name. It requires source-verified
+old and new producers, confirmed checker absence and the unchanged native edge.
+It cannot admit another failure, restart, candidate or deployment attempt.
+
 ## Admission and recovery proof
 
 Require explicit context `default`, namespace `devres`, unchanged node/PV/Secret
