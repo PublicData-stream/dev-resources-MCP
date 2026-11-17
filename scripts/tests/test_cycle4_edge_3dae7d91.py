@@ -330,6 +330,107 @@ class QualificationContinuation(Receipt):
             with self.assertRaises(n.Refused):n.load_controller(n.WRAPPER,n.WRAPPER_SHA,n.CHAIN[str(n.WRAPPER)][2],'default',receipt_sha=admitted['admission_sha256'])
 
 
+class QualificationCompletion(unittest.TestCase):
+    def setUp(self):
+        self.fixture=QualificationContinuation()
+        self.fixture.setUp();self.addCleanup(self.fixture.doCleanups)
+        f=self.fixture;f.prepare()
+        self.scope=f.scope;self.work=f.new_work;self.work.mkdir(mode=0o700)
+        self.prior_bridge=self.scope/'continuation-bridge.py'
+        self.prior_producer=self.scope/'continuation-qualification.py'
+        put(self.prior_bridge,b'# exact consumed continuation bridge\n')
+        put(self.prior_producer,b"def checker_arguments(snapshot,name):return ['docker','create','--name',name,snapshot['docker']['image']]\ndef command(*args,**kwargs):raise AssertionError('completion_cannot_execute_checker')\ndef offline_check(*args,**kwargs):raise AssertionError('completion_cannot_execute_checker')\n")
+        self.bridge_sha=n.sha(self.prior_bridge.read_bytes());self.prior_producer_sha=n.sha(self.prior_producer.read_bytes())
+        control=n.load(f.continuation);control['bridge_source_sha256']=self.bridge_sha;control['producer_sha256']=self.prior_producer_sha
+        put(f.continuation,control)
+        put(f.continuation_intent,{'version':1,'maximum_attempts':1,'candidate_sha256':f.old_candidate_sha,
+            'bridge_source_sha256':self.bridge_sha,'producer_sha256':self.prior_producer_sha})
+        self.control_sha=n.sha(f.continuation.read_bytes())
+        self.offline_uid='4'*64
+        documents={'intent.json':{'candidate_sha256':f.old_candidate_sha,'maximum_attempts':1,
+                'producer_sha256':self.prior_producer_sha,'qualification_continuation_sha256':self.control_sha},
+            'offline-intent.json':{'maximum_attempts':1,'name':n.CONTINUATION_CHECKER,'image':f.candidate['after']['docker']['image'],
+                'argv_sha256':n.sha(n.encode(['docker','create','--name',n.CONTINUATION_CHECKER,f.candidate['after']['docker']['image']]))},
+            'offline-create.stdout':self.offline_uid.encode()+b'\n','offline-create.stderr':b'',
+            'offline-check.stdout':b'fixed first-party config validated\n','offline-check.stderr':b'',
+            'offline-inspections.json':{'version':1,'primary_failed':False,'cleanup_failed':False,'observations':[
+                {'class':kind,'returncode':code} for kind,code in [('absent',1),('present',0),('present',0),('present',0),('absent',1)]]},
+            'offline-cleanup.json':{'known_complete':True,'owned_only':True,'uid':self.offline_uid}}
+        for name,value in documents.items():put(self.work/name,value)
+        self.completion=self.scope/'qualification-completion.json';self.intent=self.scope/'qualification-completion-intent.json'
+        self.completion_work=self.scope/'completion-work'
+        self.patch=patch.multiple(n,PRIOR_CONTINUATION_SHA=self.control_sha,
+            PRIOR_CONTINUATION_INTENT_SHA=n.sha(f.continuation_intent.read_bytes()),
+            PRIOR_CONTINUATION_BRIDGE_SHA=self.bridge_sha,PRIOR_CONTINUATION_PRODUCER_SHA=self.prior_producer_sha,
+            PRIOR_CONTINUATION_BRIDGE=self.prior_bridge,PRIOR_CONTINUATION_PRODUCER=self.prior_producer,
+            COMPLETION=self.completion,COMPLETION_INTENT=self.intent,COMPLETION_WORK=self.completion_work,
+            OFFLINE_UID=self.offline_uid,SUCCESSFUL_OFFLINE_HASHES={path.name:n.sha(path.read_bytes()) for path in self.work.iterdir()})
+        self.patch.start();self.addCleanup(self.patch.stop)
+    def prepare(self):
+        f=self.fixture
+        return n.prepare_qualification_completion(f.old_candidate_sha,self.control_sha,self.bridge_sha,self.prior_producer_sha,f.producer_sha)
+    def admit(self,completion_sha):
+        f=self.fixture
+        put(self.scope/'qualification.json',{**f.qualification,'candidate_sha256':f.old_candidate_sha,
+            'qualification_continuation_sha256':self.control_sha,'qualification_completion_sha256':completion_sha})
+        return n.admit(f.old_candidate_sha,self.scope/'qualification.json',n.sha((self.scope/'qualification.json').read_bytes()),
+            f.producer_sha,completion_sha=completion_sha)
+    def test_reuses_exact_successful_offline_bytes_without_any_checker_or_replay(self):
+        paths=[self.fixture.candidate_path,self.fixture.continuation,self.fixture.continuation_intent,
+            self.prior_bridge,self.prior_producer,*self.work.iterdir()]
+        original={path:(path.read_bytes(),n._preserved_identity(path)) for path in paths}
+        with patch.object(n,'_absence_proof',side_effect=AssertionError('no Docker command')):
+            result=self.prepare()
+            value=n.validate_qualification_completion(result['qualification_completion_sha256'],producer_sha=self.fixture.producer_sha)
+        self.assertTrue(value['offline']['verified']);self.assertFalse(value['new_checker_permitted'])
+        self.assertEqual(value['offline']['stdout_sha256'],n.sha((self.work/'offline-check.stdout').read_bytes()))
+        self.assertFalse(self.completion_work.exists());self.assertFalse(result['guard_accepted'])
+        self.assertEqual({path:(path.read_bytes(),n._preserved_identity(path)) for path in paths},original)
+        with self.assertRaisesRegex(n.Refused,'fresh_completion'):self.prepare()
+    def test_default_paths_cannot_use_historical_continuation_or_completion(self):
+        result=self.prepare()
+        with self.assertRaisesRegex(n.Refused,'fixed_qualification_continuation'):
+            n.validate_qualification_continuation(self.control_sha)
+        with self.assertRaisesRegex(n.Refused,'candidate_source_identity'):n.candidate_identity(self.fixture.candidate)
+        with self.assertRaisesRegex(n.Refused,'one_qualification_control'):
+            n.candidate_matches_current(self.fixture.candidate,continuation_sha=self.control_sha,completion_sha=result['qualification_completion_sha256'])
+    def test_missing_or_extra_offline_artifact_refuses_before_intent(self):
+        put(self.work/'second-create.stdout',b'forbidden duplicate')
+        with self.assertRaisesRegex(n.Refused,'successful_offline_inventory'):self.prepare()
+        self.assertFalse(self.intent.exists())
+    def test_failed_cleanup_or_other_source_is_not_reusable(self):
+        put(self.work/'offline-cleanup.json',{'known_complete':False,'owned_only':True,'uid':self.offline_uid})
+        with self.assertRaisesRegex(n.Refused,'successful_offline_artifact_changed'):self.prepare()
+        self.assertFalse(self.intent.exists())
+    def test_changed_prior_sources_refuse_before_import(self):
+        put(self.prior_producer,b'raise AssertionError("must not import")')
+        with (patch.object(n,'checked_module',side_effect=AssertionError('must hash before import')),
+              self.assertRaisesRegex(n.Refused,'completed_continuation_sources')):
+            self.prepare()
+    def test_native_drift_before_or_after_seal_never_accepts(self):
+        with patch.object(n,'_completion_native_matches',return_value=False),self.assertRaisesRegex(n.Refused,'native_reality_changed'):self.prepare()
+        self.assertFalse(self.intent.exists())
+        result=self.prepare()
+        with patch.object(n,'_completion_native_matches',return_value=False),self.assertRaisesRegex(n.Refused,'native_reality_changed'):
+            n.validate_qualification_completion(result['qualification_completion_sha256'])
+        self.assertFalse(self.fixture.admission_path.exists())
+    def test_consumed_completion_intent_prevents_retry_after_bookend_failure(self):
+        with patch.object(n,'_completion_native_matches',side_effect=[True,False]),self.assertRaisesRegex(n.Refused,'completion_bookend_changed'):self.prepare()
+        self.assertTrue(self.intent.exists());self.assertFalse(self.completion.exists())
+        with self.assertRaisesRegex(n.Refused,'fresh_completion'):self.prepare()
+    def test_completion_receipt_revalidated_by_native_guard_and_constructor(self):
+        result=self.prepare();admitted=self.admit(result['qualification_completion_sha256']);f=self.fixture
+        controller=SimpleNamespace(_actual=lambda:(f.candidate['after'],b'compose'))
+        with (patch.object(n,'source_guard',return_value={'frozen':'hash'}),
+              patch.object(n,'_retained_bindings',return_value={'frozen':'same'}),
+              patch.object(n,'_wrapper',return_value=object()),patch.object(n,'_compression_controller',return_value=controller)):
+            self.assertEqual(n.native_guard(admitted['admission_sha256']),f.candidate['after'])
+            self.assertIs(n.load_controller(n.WRAPPER,n.WRAPPER_SHA,n.CHAIN[str(n.WRAPPER)][2],'default',receipt_sha=admitted['admission_sha256']),controller)
+            put(self.work/'offline-check.stdout',b'changed')
+            with self.assertRaises(n.Refused):n.native_guard(admitted['admission_sha256'])
+            with self.assertRaises(n.Refused):n.load_controller(n.WRAPPER,n.WRAPPER_SHA,n.CHAIN[str(n.WRAPPER)][2],'default',receipt_sha=admitted['admission_sha256'])
+
+
 class RetainedProducerShape(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir='/tmp');self.addCleanup(self.temp.cleanup)

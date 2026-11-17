@@ -346,21 +346,21 @@ def prepare_qualification_continuation(candidate_sha,previous_bridge_sha,previou
         'original_candidate_unchanged':True,'original_work_unchanged':True,'guard_accepted':False}
 
 
-def _qualification_continuation(continuation_sha,producer_sha=None):
+def _continuation_record(continuation_sha,bridge_sha,producer_sha,qualifier):
     body=raw(CONTINUATION)
     need(re.fullmatch('[0-9a-f]{64}',continuation_sha or '') and sha(body)==continuation_sha,
          'external_qualification_continuation_pin_required')
     value=json.loads(body);need(value.get('version')==1
          and value.get('kind')=='cycle4-native-edge-qualification-continuation' and value.get('maximum_attempts')==1
          and value.get('candidate_sha256')==PREVIOUS_CANDIDATE_SHA
-         and value.get('bridge_source_sha256')==sha(Path(__file__).read_bytes())
+         and value.get('bridge_source_sha256')==bridge_sha
          and value.get('previous_bridge_sha256')==PREVIOUS_BRIDGE_SHA
          and value.get('previous_producer_sha256')==PREVIOUS_PRODUCER_SHA
          and value.get('producer_sha256')!=PREVIOUS_PRODUCER_SHA
          and value.get('work')==str(CONTINUATION_WORK) and value.get('checker')==CONTINUATION_CHECKER,
          'fixed_qualification_continuation_required')
     need(re.fullmatch('[0-9a-f]{64}',value.get('producer_sha256',''))
-         and sha(raw(QUALIFIER))==value['producer_sha256']
+         and sha(raw(qualifier))==value['producer_sha256']
          and (producer_sha is None or producer_sha==value['producer_sha256']), 'continuation_producer_changed')
     need(load(CONTINUATION_INTENT)=={'version':1,'maximum_attempts':1,'candidate_sha256':PREVIOUS_CANDIDATE_SHA,
         'bridge_source_sha256':value['bridge_source_sha256'],'producer_sha256':value['producer_sha256']},
@@ -380,6 +380,10 @@ def _qualification_continuation(continuation_sha,producer_sha=None):
     return value
 
 
+def _qualification_continuation(continuation_sha,producer_sha=None):
+    return _continuation_record(continuation_sha,sha(Path(__file__).read_bytes()),producer_sha,QUALIFIER)
+
+
 def validate_qualification_continuation(continuation_sha,*,producer_sha=None):
     value=_qualification_continuation(continuation_sha,producer_sha)
     need(candidate_matches_current(load(CANDIDATE),continuation_sha=continuation_sha),
@@ -387,7 +391,145 @@ def validate_qualification_continuation(continuation_sha,*,producer_sha=None):
     return value
 
 
-def candidate_matches_current(candidate,*,continuation_sha=None):
+# A completion reuses this exact successful checker; it never creates another.
+PRIOR_CONTINUATION_SHA='4aaca6765a46892dd44c83eb4b2fe9fd300440daff4252c214214e52e4005de1'
+PRIOR_CONTINUATION_INTENT_SHA='e6d9b799e490b88e831445c2f7f07f5c3c12464b0cd697dd3ad95ddd1831b12f'
+PRIOR_CONTINUATION_BRIDGE_SHA='1ddfd47620eedde47ec919447e793a1cb27ebe667e216ba59a9878eb893aa6d6'
+PRIOR_CONTINUATION_PRODUCER_SHA='16c3f131b1acb32f8157f0ee9fcdcf9ace24d6d688afe3099560dbf079576d12'
+PRIOR_CONTINUATION_BRIDGE=SCOPE/'continuation-bridge.py'
+PRIOR_CONTINUATION_PRODUCER=SCOPE/'continuation-qualification.py'
+COMPLETION=SCOPE/'qualification-completion.json'
+COMPLETION_INTENT=SCOPE/'qualification-completion-intent.json'
+COMPLETION_WORK=Path('/tmp/devres-edge-qualification-3dae7d91-20261117-completion-v1')
+OFFLINE_UID='04c58a2cb324b5c864d1090398244f1016e544d5c14259dc523fa2ca1be37aa2'
+SUCCESSFUL_OFFLINE_HASHES={
+    'intent.json':'9867aeae0fb853990c3dc2beb6c6aeefeb89db87e4fe8bff9d6125ea0c7962ae',
+    'offline-intent.json':'cfa542aa445217e26ecffe13d9cbae3ed3384c17cfe981fbc17178be5d65825e',
+    'offline-create.stdout':'66c0a021dbe185ec5e6db7898584c7d28069e9fa1e08a3a760937a93b6d05478',
+    'offline-create.stderr':'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    'offline-check.stdout':'f011a7b18578b6606874ea2c80acbbda40148b4024115ca41354eb315c85669c',
+    'offline-check.stderr':'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    'offline-inspections.json':'b70aad55e8e345a6df83a7219dbe1bffec3bd96f7a5801373d390ea99ed9a972',
+    'offline-cleanup.json':'8e4644cffcb2ef848d5729143bc2d830b23e10df3df4744321d677a4c9e3fd9d'}
+
+
+def _successful_offline_case():
+    # Explicit historical source verification, with no globals rewritten and no
+    # old guard asked to accept a replacement producer. Hash before any import.
+    need(sha(raw(CONTINUATION))==PRIOR_CONTINUATION_SHA
+         and sha(raw(CONTINUATION_INTENT))==PRIOR_CONTINUATION_INTENT_SHA,
+         'fixed_completed_continuation_required')
+    need(sha(raw(PRIOR_CONTINUATION_BRIDGE))==PRIOR_CONTINUATION_BRIDGE_SHA
+         and sha(raw(PRIOR_CONTINUATION_PRODUCER))==PRIOR_CONTINUATION_PRODUCER_SHA,
+         'fixed_completed_continuation_sources_required')
+    control=_continuation_record(PRIOR_CONTINUATION_SHA,PRIOR_CONTINUATION_BRIDGE_SHA,
+        PRIOR_CONTINUATION_PRODUCER_SHA,PRIOR_CONTINUATION_PRODUCER)
+    need(not any(p.is_symlink() for p in (CONTINUATION_WORK,*CONTINUATION_WORK.parents))
+         and CONTINUATION_WORK.is_dir()
+         and {p.name for p in CONTINUATION_WORK.iterdir()}==set(SUCCESSFUL_OFFLINE_HASHES),
+         'exact_successful_offline_inventory_required')
+    identities={}
+    for name,wanted in SUCCESSFUL_OFFLINE_HASHES.items():
+        path=CONTINUATION_WORK/name
+        need(sha(raw(path))==wanted,'successful_offline_artifact_changed')
+        identities[name]=_preserved_identity(path)
+    need(load(CONTINUATION_WORK/'intent.json')=={'candidate_sha256':PREVIOUS_CANDIDATE_SHA,
+        'maximum_attempts':1,'producer_sha256':PRIOR_CONTINUATION_PRODUCER_SHA,
+        'qualification_continuation_sha256':PRIOR_CONTINUATION_SHA},'successful_offline_intent_required')
+    producer=checked_module(PRIOR_CONTINUATION_PRODUCER,PRIOR_CONTINUATION_PRODUCER_SHA,'cycle4_successful_offline_producer')
+    candidate=load(CANDIDATE)
+    need(load(CONTINUATION_WORK/'offline-intent.json')=={'maximum_attempts':1,'name':CONTINUATION_CHECKER,
+        'image':candidate['after']['docker']['image'],
+        'argv_sha256':sha(encode(producer.checker_arguments(candidate['after'],CONTINUATION_CHECKER)))},
+        'successful_offline_argv_required')
+    need(raw(CONTINUATION_WORK/'offline-create.stdout')==OFFLINE_UID.encode()+b'\n'
+         and not raw(CONTINUATION_WORK/'offline-create.stderr')
+         and not raw(CONTINUATION_WORK/'offline-check.stderr')
+         and load(CONTINUATION_WORK/'offline-cleanup.json')=={'known_complete':True,'owned_only':True,'uid':OFFLINE_UID},
+         'successful_offline_uid_cleanup_required')
+    inspections=load(CONTINUATION_WORK/'offline-inspections.json')
+    need(set(inspections)=={'version','observations','primary_failed','cleanup_failed'}
+         and inspections['version']==1 and inspections['primary_failed'] is False and inspections['cleanup_failed'] is False
+         and [row.get('class') for row in inspections['observations']]==['absent','present','present','present','absent']
+         and [row.get('returncode') for row in inspections['observations']]==[1,0,0,0,1],
+         'successful_offline_checked_cleanup_required')
+    offline={'verified':True,'image':candidate['after']['docker']['image'],'no_network':True,'readonly_mounts':True,
+        'stdout_sha256':SUCCESSFUL_OFFLINE_HASHES['offline-check.stdout'],
+        'stderr_sha256':SUCCESSFUL_OFFLINE_HASHES['offline-check.stderr']}
+    return {'original_case':control['original_case'],'qualification_continuation_sha256':PRIOR_CONTINUATION_SHA,
+        'continuation_identity':_preserved_identity(CONTINUATION),
+        'continuation_intent_identity':_preserved_identity(CONTINUATION_INTENT),
+        'bridge_identity':_preserved_identity(PRIOR_CONTINUATION_BRIDGE),
+        'producer_identity':_preserved_identity(PRIOR_CONTINUATION_PRODUCER),
+        'work':str(CONTINUATION_WORK),'work_identity':_preserved_identity(CONTINUATION_WORK),
+        'work_hashes':SUCCESSFUL_OFFLINE_HASHES,'work_file_identities':identities,'offline':offline}
+
+
+def _completion_native_matches(candidate):
+    old_bridge,_producer=_original_versions()
+    return {key:item for key,item in candidate.items() if key!='qualification_producer_sha256'}==old_bridge.capture_current()
+
+
+def prepare_qualification_completion(candidate_sha,continuation_sha,previous_bridge_sha,previous_producer_sha,producer_sha):
+    need((candidate_sha,continuation_sha,previous_bridge_sha,previous_producer_sha)==(PREVIOUS_CANDIDATE_SHA,
+        PRIOR_CONTINUATION_SHA,PRIOR_CONTINUATION_BRIDGE_SHA,PRIOR_CONTINUATION_PRODUCER_SHA),
+        'only_fixed_successful_checker_completes')
+    need(re.fullmatch('[0-9a-f]{64}',producer_sha or '') and producer_sha!=PRIOR_CONTINUATION_PRODUCER_SHA
+         and sha(raw(QUALIFIER))==producer_sha,'completion_producer_source_required')
+    need(not any(path.exists() for path in (ADMISSION,COMPLETION,COMPLETION_INTENT,COMPLETION_WORK,
+        SCOPE/'qualification.json',SCOPE/'qualification-detail.json')),'fresh_completion_required')
+    case=_successful_offline_case();candidate=load(CANDIDATE)
+    need(_completion_native_matches(candidate),'completion_native_reality_changed')
+    source_sha=sha(Path(__file__).read_bytes())
+    need(source_sha!=PRIOR_CONTINUATION_BRIDGE_SHA,'revised_completion_bridge_required')
+    new(COMPLETION_INTENT,{'version':1,'maximum_attempts':1,'candidate_sha256':candidate_sha,
+        'qualification_continuation_sha256':continuation_sha,'bridge_source_sha256':source_sha,'producer_sha256':producer_sha})
+    need(_successful_offline_case()==case and _completion_native_matches(candidate),'completion_bookend_changed')
+    new(COMPLETION,{'version':1,'kind':'cycle4-native-edge-qualification-completion','maximum_attempts':1,
+        'candidate_sha256':candidate_sha,'qualification_continuation_sha256':continuation_sha,
+        'bridge_source_sha256':source_sha,'producer_sha256':producer_sha,'successful_offline_case':case,
+        'work':str(COMPLETION_WORK),'offline':case['offline'],'new_checker_permitted':False})
+    return {'qualification_completion_sha256':sha(raw(COMPLETION)),'offline_reused':True,
+        'new_checker_permitted':False,'guard_accepted':False}
+
+
+def _qualification_completion(completion_sha,producer_sha=None):
+    body=raw(COMPLETION)
+    need(re.fullmatch('[0-9a-f]{64}',completion_sha or '') and sha(body)==completion_sha,
+         'external_qualification_completion_pin_required')
+    value=json.loads(body)
+    need(value.get('version')==1 and value.get('kind')=='cycle4-native-edge-qualification-completion'
+         and value.get('maximum_attempts')==1 and value.get('candidate_sha256')==PREVIOUS_CANDIDATE_SHA
+         and value.get('qualification_continuation_sha256')==PRIOR_CONTINUATION_SHA
+         and value.get('bridge_source_sha256')==sha(Path(__file__).read_bytes())
+         and value.get('producer_sha256')!=PRIOR_CONTINUATION_PRODUCER_SHA
+         and re.fullmatch('[0-9a-f]{64}',value.get('producer_sha256',''))
+         and sha(raw(QUALIFIER))==value['producer_sha256']
+         and (producer_sha is None or value['producer_sha256']==producer_sha)
+         and value.get('work')==str(COMPLETION_WORK) and value.get('new_checker_permitted') is False,
+         'fixed_qualification_completion_required')
+    need(load(COMPLETION_INTENT)=={'version':1,'maximum_attempts':1,'candidate_sha256':PREVIOUS_CANDIDATE_SHA,
+        'qualification_continuation_sha256':PRIOR_CONTINUATION_SHA,
+        'bridge_source_sha256':value['bridge_source_sha256'],'producer_sha256':value['producer_sha256']},
+        'completion_intent_changed')
+    case=_successful_offline_case()
+    need(value.get('successful_offline_case')==case and value.get('offline')==case['offline'],
+         'completion_offline_case_changed')
+    return value
+
+
+def validate_qualification_completion(completion_sha,*,producer_sha=None):
+    value=_qualification_completion(completion_sha,producer_sha)
+    need(_completion_native_matches(load(CANDIDATE)),'completion_native_reality_changed')
+    return value
+
+
+def candidate_matches_current(candidate,*,continuation_sha=None,completion_sha=None):
+    if completion_sha is not None:
+        need(continuation_sha is None,'one_qualification_control_required')
+        value=_qualification_completion(completion_sha)
+        need(sha(encode(candidate))==value['candidate_sha256'] and candidate==load(CANDIDATE),'completion_candidate_changed')
+        return _completion_native_matches(candidate)
     if continuation_sha is None:
         return {key:value for key,value in candidate.items() if key!='qualification_producer_sha256'}==capture_current()
     value=_qualification_continuation(continuation_sha)
@@ -409,8 +551,16 @@ def prepare_candidate(qualification_producer_sha):
     return {'candidate_sha256':sha(raw(CANDIDATE)),'original_guard_denied':True,'guard_accepted':False}
 
 
-def validate_qualification(candidate,candidate_sha,qualification,producer_sha,*,continuation_sha=None):
-    if continuation_sha is not None:
+def validate_qualification(candidate,candidate_sha,qualification,producer_sha,*,continuation_sha=None,completion_sha=None):
+    if completion_sha is not None:
+        need(continuation_sha is None,'one_qualification_control_required')
+        completion=_qualification_completion(completion_sha,producer_sha)
+        need(candidate_sha==completion['candidate_sha256']
+             and candidate.get('qualification_producer_sha256')==PREVIOUS_PRODUCER_SHA
+             and qualification.get('qualification_completion_sha256')==completion_sha
+             and qualification.get('qualification_continuation_sha256')==PRIOR_CONTINUATION_SHA,
+             'qualification_completion_binding_required')
+    elif continuation_sha is not None:
         continuation=_qualification_continuation(continuation_sha,producer_sha)
         need(candidate_sha==continuation['candidate_sha256']
              and candidate.get('qualification_producer_sha256')==PREVIOUS_PRODUCER_SHA
@@ -418,6 +568,7 @@ def validate_qualification(candidate,candidate_sha,qualification,producer_sha,*,
     else:
         need(candidate.get('qualification_producer_sha256')==producer_sha
              and qualification.get('qualification_continuation_sha256') is None, 'original_qualification_producer_required')
+    need(completion_sha is not None or qualification.get('qualification_completion_sha256') is None,'explicit_qualification_completion_required')
     need(qualification.get('version')==1 and qualification.get('kind')=='cycle4-native-edge-qualification'
          and qualification.get('candidate_sha256')==candidate_sha and qualification.get('producer_sha256')==producer_sha
          and qualification.get('fixture') is False and qualification.get('verified') is True,
@@ -436,27 +587,31 @@ def validate_qualification(candidate,candidate_sha,qualification,producer_sha,*,
              and sha(raw(path))==item.get('sha256'),'edge_qualification_artifact_changed')
 
 
-def admit(candidate_sha,qualification_path,qualification_sha,qualification_producer_sha,*,continuation_sha=None):
+def admit(candidate_sha,qualification_path,qualification_sha,qualification_producer_sha,*,continuation_sha=None,completion_sha=None):
     need(Path(qualification_path)==SCOPE/'qualification.json','fixed_qualification_path_required')
-    candidate=load(CANDIDATE);candidate_identity(candidate,continuation_sha=continuation_sha);qualification=load(qualification_path)
+    candidate=load(CANDIDATE);candidate_identity(candidate,continuation_sha=continuation_sha,completion_sha=completion_sha);qualification=load(qualification_path)
     need(sha(raw(CANDIDATE))==candidate_sha and sha(raw(qualification_path))==qualification_sha,
          'external_qualification_hash_required')
     need(sha(raw(QUALIFIER))==qualification_producer_sha,'qualification_producer_source_changed')
-    validate_qualification(candidate,candidate_sha,qualification,qualification_producer_sha,continuation_sha=continuation_sha)
-    need(candidate_matches_current(candidate,continuation_sha=continuation_sha),'candidate_native_reality_changed')
+    validate_qualification(candidate,candidate_sha,qualification,qualification_producer_sha,continuation_sha=continuation_sha,completion_sha=completion_sha)
+    need(candidate_matches_current(candidate,continuation_sha=continuation_sha,completion_sha=completion_sha),'candidate_native_reality_changed')
     new(ADMISSION,{'version':1,'kind':'cycle4-native-edge-readmission','revision':REVISION,'verified':True,
         'bridge_source_sha256':sha(Path(__file__).read_bytes()),'candidate_sha256':candidate_sha,
         'qualification_sha256':qualification_sha,'qualification_producer_sha256':qualification_producer_sha,
-        'qualification_continuation_sha256':continuation_sha,
+        'qualification_continuation_sha256':continuation_sha,'qualification_completion_sha256':completion_sha,
         'candidate':candidate,'qualification':qualification})
     return {'admission_sha256':sha(raw(ADMISSION)),'historical_files_unchanged':True,
             'full_public_mcp_acceptance':False,'native_webtransport_acceptance':False}
 
 
 
-def candidate_identity(candidate,*,continuation_sha=None):
+def candidate_identity(candidate,*,continuation_sha=None,completion_sha=None):
     expected_bridge_sha=sha(Path(__file__).read_bytes())
-    if continuation_sha is not None:
+    if completion_sha is not None:
+        need(continuation_sha is None,'one_qualification_control_required')
+        _qualification_completion(completion_sha)
+        expected_bridge_sha=PREVIOUS_BRIDGE_SHA
+    elif continuation_sha is not None:
         _qualification_continuation(continuation_sha)
         expected_bridge_sha=PREVIOUS_BRIDGE_SHA
     need(candidate.get('version')==1 and candidate.get('kind')=='cycle4-edge-readmission-candidate'
@@ -472,12 +627,13 @@ def _receipt(receipt_sha):
          and value.get('revision')==REVISION and value.get('verified') is True
          and value.get('bridge_source_sha256')==sha(Path(__file__).read_bytes()),'edge_receipt_source_identity')
     continuation_sha=value.get('qualification_continuation_sha256')
-    candidate_identity(value['candidate'],continuation_sha=continuation_sha)
+    completion_sha=value.get('qualification_completion_sha256')
+    candidate_identity(value['candidate'],continuation_sha=continuation_sha,completion_sha=completion_sha)
     need(sha(raw(CANDIDATE))==value['candidate_sha256'] and load(CANDIDATE)==value['candidate']
          and sha(raw(SCOPE/'qualification.json'))==value['qualification_sha256']
          and load(SCOPE/'qualification.json')==value['qualification']
          and sha(raw(QUALIFIER))==value['qualification_producer_sha256'],'edge_receipt_inputs_changed')
-    validate_qualification(value['candidate'],value['candidate_sha256'],value['qualification'],value['qualification_producer_sha256'],continuation_sha=continuation_sha)
+    validate_qualification(value['candidate'],value['candidate_sha256'],value['qualification'],value['qualification_producer_sha256'],continuation_sha=continuation_sha,completion_sha=completion_sha)
     need(value['candidate']['historical_sources']==source_guard()
          and value['candidate']['old_admission_sha256']==sha(raw(OLD_ADMISSION))
          and value['candidate']['retained_context']==_retained_bindings(),'historical_binding_changed')
@@ -571,19 +727,26 @@ def main():
     approve=sub.add_parser('admit');approve.add_argument('--candidate-sha256',required=True)
     approve.add_argument('--qualification',type=Path,required=True);approve.add_argument('--qualification-sha256',required=True)
     approve.add_argument('--qualification-producer-sha256',required=True)
-    approve.add_argument('--qualification-continuation-sha256')
+    approve.add_argument('--qualification-continuation-sha256');approve.add_argument('--qualification-completion-sha256')
     continuation=sub.add_parser('qualification-continuation')
     continuation.add_argument('--candidate-sha256',required=True)
     continuation.add_argument('--previous-bridge-sha256',required=True)
     continuation.add_argument('--previous-producer-sha256',required=True)
     continuation.add_argument('--qualification-producer-sha256',required=True)
+    completion=sub.add_parser('qualification-completion')
+    completion.add_argument('--candidate-sha256',required=True);completion.add_argument('--qualification-continuation-sha256',required=True)
+    completion.add_argument('--previous-bridge-sha256',required=True);completion.add_argument('--previous-producer-sha256',required=True)
+    completion.add_argument('--qualification-producer-sha256',required=True)
     args=parser.parse_args();need(os.geteuid()==0,'root_required')
     if args.operation=='candidate':result=prepare_candidate(args.qualification_producer_sha256)
     elif args.operation=='qualification-continuation':
         result=prepare_qualification_continuation(args.candidate_sha256,args.previous_bridge_sha256,
             args.previous_producer_sha256,args.qualification_producer_sha256)
+    elif args.operation=='qualification-completion':
+        result=prepare_qualification_completion(args.candidate_sha256,args.qualification_continuation_sha256,
+            args.previous_bridge_sha256,args.previous_producer_sha256,args.qualification_producer_sha256)
     else:result=admit(args.candidate_sha256,args.qualification,args.qualification_sha256,args.qualification_producer_sha256,
-        continuation_sha=args.qualification_continuation_sha256)
+        continuation_sha=args.qualification_continuation_sha256,completion_sha=args.qualification_completion_sha256)
     print(json.dumps(result,sort_keys=True))
 
 

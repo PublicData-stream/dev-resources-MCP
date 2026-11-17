@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 
 REVISION = '3dae7d914baa9379abc402c5a3bcf311e0db01bf'
 INSTALL = Path('/usr/local/libexec/devres-upgrade-3dae7d91')
@@ -34,6 +35,7 @@ BRIDGE = INSTALL / 'edge-readmission.py'
 SCOPE = Path('/var/lib/devres-production-edge-admissions/3dae7d91-20261117')
 WORK = Path('/tmp/devres-edge-qualification-3dae7d91-20261117')
 CONTINUATION_WORK = Path('/tmp/devres-edge-qualification-3dae7d91-20261117-continuation-v1')
+COMPLETION_WORK = Path('/tmp/devres-edge-qualification-3dae7d91-20261117-completion-v1')
 CHECKER_NAME = 'devres-edge-check-3dae7d91'
 CONTINUATION_CHECKER_NAME = 'devres-edge-check-3dae7d91-continuation-v1'
 HOST = 'dev-resources.mcp.publicdata.stream'
@@ -42,6 +44,17 @@ CHECKS = frozenset(('native_image_config_check', 'edge_process_listener_binding'
     'public_withdrawn_http_ipv4', 'public_withdrawn_http_ipv6', 'private_nodeport_ipv4', 'private_nodeport_ipv6',
     'retained_firewall_and_private_routes'))
 MAX_OUTPUT = 1024 * 1024
+WITHDRAWN_BODY = b'upstream request failed'
+PUBLIC_COOLDOWN_SECONDS = 31
+PRIVATE_TIMEOUT_SECONDS = 3
+COMPLETION_PHASES = frozenset(('control-before', 'listeners', 'cooldown-initial', 'public-ipv6',
+    'cooldown-inter-family', 'public-ipv4', 'private-nodeports', 'quic', 'control-after', 'publish'))
+EDGE_REVISION = '4f3154d8db0e0a49bce7a528c0a0f4c36d169040'
+ADMISSION_SOURCES = {
+    'source/src/proxy/http/circuit_breakers.rs': '805af69925ad5100f8028ef4657a0f41fb0e0af31ab66478604a2e24fa9ee1cd',
+    'source/src/proxy/http/fast_path/handler.rs': 'ca525719f4f0052acedab70d28ce63f717d20629c56bf3854be666b9e7106ece',
+    'source/src/circuit_breakers/circuit.rs': 'ae8edf5396301acee705f299faa93f7bfa38057bbfbbc6cd6230c58cf07fe89d',
+    'source/crates/oxibelt-admission-policy/src/circuit_breakers.rs': '6227f213da40a39189379cf34cb506f63c5c0a4eca9e6dfc4c3c0e2cf1c6c541'}
 K = ['k3s', 'kubectl', '--context', 'default', '--namespace', 'devres', '--request-timeout=15s']
 
 
@@ -269,7 +282,7 @@ def public_probe(family):
             cert_sha = sha(tls.getpeercert(binary_form=True))
             tls.sendall(('GET /mcp HTTP/1.1\r\nHost: ' + HOST + '\r\nOrigin: https://' + HOST + '\r\nConnection: close\r\n\r\n').encode())
             answer = http.client.HTTPResponse(tls); answer.begin(); body = answer.read(65537)
-            need(answer.status == 502 and len(body) <= 65536 and b'upstream request failed' in body, 'withdrawn_public_route_required')
+            need(answer.status == 502 and body == WITHDRAWN_BODY, 'withdrawn_public_route_required')
     return {'tls_verified': True, 'withdrawn_http_verified': True, 'family': family, 'certificate_sha256': cert_sha,
         'http_status': 502, 'body_sha256': sha(body), 'full_mcp_acceptance': False}
 
@@ -277,10 +290,31 @@ def public_probe(family):
 def negative_connect(address, port):
     family = socket.AF_INET if ipaddress.ip_address(address).version == 4 else socket.AF_INET6
     with socket.socket(family, socket.SOCK_STREAM) as connection:
-        connection.settimeout(3)
-        result = connection.connect_ex((address, port))
-    need(result in (errno.ECONNREFUSED, errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES), 'private_endpoint_connected')
-    return {'connected': False, 'errno': result}
+        connection.settimeout(PRIVATE_TIMEOUT_SECONDS)
+        started = time.monotonic()
+        denied = (errno.ECONNREFUSED, errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES)
+        try:
+            connection.connect((address, port))
+        except OSError as error:
+            elapsed = time.monotonic() - started
+            need(0 <= elapsed <= PRIVATE_TIMEOUT_SECONDS + 2, 'private_endpoint_deadline_unproved')
+            result = error.errno
+            timed_out = isinstance(error, TimeoutError) and result is None
+            need(timed_out and PRIVATE_TIMEOUT_SECONDS <= elapsed <= PRIVATE_TIMEOUT_SECONDS + 2
+                or result in denied, 'private_endpoint_denial_unproved')
+        else:
+            raise Refused('private_endpoint_connected')
+        try:
+            connection.getpeername()
+        except OSError as error:
+            need(error.errno == errno.ENOTCONN, 'private_endpoint_not_disconnected')
+        else:
+            raise Refused('private_endpoint_connected')
+        socket_error = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        need(socket_error in (0, *denied), 'private_endpoint_socket_state_unproved')
+    return {'connected': False, 'outcome': 'socket_timeout' if timed_out else 'transport_error',
+        'errno': result, 'elapsed_ms': int(elapsed * 1000), 'timeout_ms': PRIVATE_TIMEOUT_SECONDS * 1000,
+        'peer_errno': errno.ENOTCONN, 'socket_so_error': socket_error}
 
 
 def nft_expressions(value):
@@ -376,6 +410,51 @@ def optional_quic_probe(work):
     return {'status': 'transport_tls_only', 'cells': cells, 'native_webtransport_acceptance': False}
 
 
+def cooldown_policy(candidate):
+    """Bind fixed spacing to the unchanged production image and absent overrides.
+
+    At the pinned source revision, failure.open_timeout is capped at 30 seconds;
+    jitter never exceeds that cap. The 503 admission response is not an upstream
+    failure control, so this producer always requires a separate exact 502.
+    """
+    snapshot = candidate['after']
+    images = json.loads(output(['docker', 'image', 'inspect', snapshot['docker']['image']]))
+    need(type(images) is list and len(images) == 1 and images[0].get('Id') == snapshot['docker']['image'],
+        'cooldown_image_identity_required')
+    labels = images[0].get('Config', {}).get('Labels', {}) or {}
+    need(labels.get('org.opencontainers.image.revision') == EDGE_REVISION
+        and labels.get('org.opencontainers.image.source') == 'https://github.com/OxiBelt/OxiBelt'
+        and labels.get('org.opencontainers.image.version') == '0.11.0-build.4f3154d8', 'cooldown_source_revision_required')
+    files = []
+    for mount in snapshot['docker']['mounts']:
+        if mount['Destination'].startswith('/etc/oxibelt/config/'):
+            path = Path(mount['Source'])
+            files.extend(sorted(path.rglob('*.toml')) if path.is_dir() else [path])
+    need(len(files) == len(set(files)) == 16, 'fixed_cooldown_configuration_required')
+    def no_override(value):
+        if type(value) is dict:
+            return all('circuit' not in key.lower() and 'breaker' not in key.lower() and no_override(item)
+                for key, item in value.items())
+        return type(value) is not list or all(no_override(item) for item in value)
+    hashes = {}
+    for path in files:
+        body = raw(path, private=False, maximum=65536)
+        need(no_override(tomllib.loads(body.decode())), 'cooldown_configuration_override_refused')
+        hashes[str(path)] = sha(body)
+    return {'source_revision': EDGE_REVISION, 'source_sha256': ADMISSION_SOURCES,
+        'configuration_files': len(files), 'configuration_sha256': sha(encode(hashes)),
+        'configuration_overrides': False, 'max_open_timeout_ms': 30000,
+        'fixed_quiet_ms': PUBLIC_COOLDOWN_SECONDS * 1000, 'requests_per_family': 1, 'http_503_accepted': False}
+
+
+def public_cooldown():
+    started = time.monotonic()
+    time.sleep(PUBLIC_COOLDOWN_SECONDS)
+    elapsed = time.monotonic() - started
+    need(PUBLIC_COOLDOWN_SECONDS <= elapsed <= PUBLIC_COOLDOWN_SECONDS + 5, 'fixed_public_cooldown_unproved')
+    return {'required_ms': PUBLIC_COOLDOWN_SECONDS * 1000, 'elapsed_ms': int(elapsed * 1000)}
+
+
 def qualify(candidate_sha, bridge_sha, *, bridge=None, work=None, continuation_sha=None):
     bridge = checked_bridge(bridge_sha) if bridge is None else bridge
     body = raw(SCOPE / 'candidate.json'); need(sha(body) == candidate_sha, 'external_candidate_hash_required')
@@ -434,14 +513,108 @@ def qualify(candidate_sha, bridge_sha, *, bridge=None, work=None, continuation_s
         'full_public_mcp_acceptance': False, 'native_webtransport_acceptance': False}
 
 
+def complete(candidate_sha, bridge_sha, completion_sha, *, bridge=None):
+    """Finish the one consumed qualification without creating another checker."""
+    bridge = checked_bridge(bridge_sha) if bridge is None else bridge
+    need(re.fullmatch('[0-9a-f]{64}', completion_sha or ''), 'external_completion_hash_required')
+    body = raw(SCOPE / 'candidate.json'); need(sha(body) == candidate_sha, 'external_candidate_hash_required')
+    candidate = json.loads(body); producer_sha = sha(Path(__file__).read_bytes())
+    need(candidate.get('revision') == REVISION, 'qualification_revision_required')
+    completion = bridge.validate_qualification_completion(completion_sha, producer_sha=producer_sha)
+    continuation_sha = completion.get('qualification_continuation_sha256')
+    need(completion.get('candidate_sha256') == candidate_sha and completion.get('producer_sha256') == producer_sha
+        and re.fullmatch('[0-9a-f]{64}', continuation_sha or ''), 'qualification_completion_identity_required')
+    native = completion.get('offline')
+    need(type(native) is dict and set(native) == {'verified', 'image', 'no_network', 'readonly_mounts',
+        'stdout_sha256', 'stderr_sha256'} and all(native[key] is True for key in ('verified', 'no_network', 'readonly_mounts'))
+        and native['image'] == candidate['after']['docker']['image']
+        and all(re.fullmatch('[0-9a-f]{64}', native[key] or '') for key in ('stdout_sha256', 'stderr_sha256')),
+        'sealed_successful_offline_proof_required')
+    current = lambda: bridge.candidate_matches_current(candidate, completion_sha=completion_sha)
+    need(current(), 'candidate_changed_before_completion')
+    context = bridge.qualification_context(candidate)
+    work = COMPLETION_WORK
+    need(work.is_absolute() and Path('/tmp') in work.parents and not work.exists()
+        and not any(p.is_symlink() for p in (work, *work.parents))
+        and not (SCOPE / 'qualification.json').exists() and not (SCOPE / 'qualification-detail.json').exists(),
+        'fresh_qualification_completion_work_required')
+    work.mkdir(mode=0o700, parents=True)
+    identity = {'version': 1, 'candidate_sha256': candidate_sha, 'producer_sha256': producer_sha,
+        'qualification_completion_sha256': completion_sha, 'qualification_continuation_sha256': continuation_sha,
+        'maximum_attempts': 1, 'offline_reused': True, 'new_checker_allowed': False}
+    save(work / 'intent.json', identity)
+    events = []; phase = 'control-before'
+    def stage(value):
+        nonlocal phase
+        need(value in COMPLETION_PHASES, 'closed_completion_phase_required')
+        phase = value; events.append({'ordinal': len(events), 'phase': value})
+    try:
+        stage('control-before')
+        before = control_snapshot(context, candidate); policy = cooldown_policy(candidate)
+        stage('listeners')
+        pid = candidate['after']['edge']['pid']
+        listeners = validate_listeners(candidate['after'], output(['nsenter', '-t', str(pid), '-n', '--', 'ss', '-H', '-ltnp']),
+            output(['nsenter', '-t', str(pid), '-n', '--', 'ss', '-H', '-lunp']))
+        stage('cooldown-initial'); initial_quiet = public_cooldown()
+        stage('public-ipv6'); public = {'ipv6': public_probe('ipv6')}
+        stage('cooldown-inter-family'); inter_family_quiet = public_cooldown()
+        stage('public-ipv4'); public['ipv4'] = public_probe('ipv4')
+        need(listeners.get('verified') is True and all(v.get('tls_verified') is True
+            and v.get('withdrawn_http_verified') is True and v.get('http_status') == 502
+            and v.get('body_sha256') == sha(WITHDRAWN_BODY) for v in public.values()),
+            'complete_available_edge_checks_required')
+        need(public['ipv4']['certificate_sha256'] == public['ipv6']['certificate_sha256'], 'dualstack_public_certificate_changed')
+        stage('private-nodeports'); nodeport = {family: negative_connect(address, 30081) for family, address in ADDRESSES.items()}
+        stage('quic'); quic = optional_quic_probe(work)
+        stage('control-after'); after = control_snapshot(context, candidate)
+        need(before == after and policy == cooldown_policy(candidate) and current()
+            and bridge.qualification_context(candidate)['bindings'] == context['bindings']
+            and bridge.validate_qualification_completion(completion_sha, producer_sha=producer_sha) == completion
+            and sha(Path(__file__).read_bytes()) == producer_sha, 'qualification_runtime_bookend_changed')
+        stage('publish')
+        journal = {**identity, 'events': events, 'verified': True, 'full_public_mcp_acceptance': False,
+            'native_webtransport_acceptance': False}
+        save(work / 'completion-journal.json', journal)
+        detail = {**identity, 'before': before, 'after': after, 'offline': native, 'listeners': listeners,
+            'public': public, 'admission_policy': policy, 'quiet': {'initial': initial_quiet, 'inter_family': inter_family_quiet},
+            'nodeport': nodeport, 'nodeport_scope': 'retained_tcp_udp_policy_and_negative_tcp_with_backend_withdrawn',
+            'quic': quic, 'native_webtransport_acceptance': False, 'full_public_mcp_acceptance': False,
+            'live_backend_private_isolation': 'mandatory_after_activation', 'journal_sha256': sha(raw(work / 'completion-journal.json'))}
+        artifact = SCOPE / 'qualification-detail.json'; save(artifact, detail)
+        receipt = {'version': 1, 'kind': 'cycle4-native-edge-qualification', 'candidate_sha256': candidate_sha,
+            'producer_sha256': producer_sha, 'qualification_completion_sha256': completion_sha,
+            'qualification_continuation_sha256': continuation_sha, 'fixture': False, 'verified': True,
+            'checks': {name: True for name in CHECKS}, 'full_public_mcp_acceptance': False,
+            'native_webtransport_acceptance': False, 'artifacts': [{'path': str(artifact), 'sha256': sha(raw(artifact))}]}
+        save(SCOPE / 'qualification.json', receipt)
+        return {'verified': True, 'qualification_sha256': sha(raw(SCOPE / 'qualification.json')),
+            'qualification_completion_sha256': completion_sha, 'full_public_mcp_acceptance': False,
+            'native_webtransport_acceptance': False}
+    except BaseException as error:
+        # Only a closed phase/class enters the failure journal. Retention cannot
+        # turn a consumed completion into another attempt or mask its failure.
+        code = ('refused' if isinstance(error, Refused) else 'timeout' if isinstance(error, TimeoutError)
+            else 'interrupted' if isinstance(error, (KeyboardInterrupt, SystemExit)) else 'unknown')
+        try:
+            save(work / 'completion-failure.json', {**identity, 'events': events, 'phase': phase,
+                'failure': code, 'verified': False})
+        except BaseException:
+            pass
+        raise
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate-sha256', required=True); parser.add_argument('--bridge-sha256', required=True)
-    parser.add_argument('--qualification-continuation-sha256')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--qualification-continuation-sha256')
+    mode.add_argument('--qualification-completion-sha256')
     args = parser.parse_args(); need(os.geteuid() == 0, 'root_required')
-    print(json.dumps(qualify(args.candidate_sha256, args.bridge_sha256,
-        continuation_sha=args.qualification_continuation_sha256), sort_keys=True))
+    result = (complete(args.candidate_sha256, args.bridge_sha256, args.qualification_completion_sha256)
+        if args.qualification_completion_sha256 is not None else qualify(args.candidate_sha256, args.bridge_sha256,
+            continuation_sha=args.qualification_continuation_sha256))
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == '__main__':

@@ -31,7 +31,18 @@ producer sources and three-file failure journal exactly. A single explicitly
 hashed continuation may qualify that same candidate with the corrected diagnostic
 parser, a fresh fixed work directory and checker name. It requires source-verified
 old and new producers, confirmed checker absence and the unchanged native edge.
-It cannot admit another failure, restart, candidate or deployment attempt.
+It cannot substitute another pre-create failure, restart, candidate or deployment
+attempt.
+
+That continuation completed the offline checker and UID-bound cleanup before the
+public probe encountered the pinned OxiBelt admission circuit. A separately hashed
+single completion preserves and verifies those successful artifacts and finishes
+only the remaining read-only checks. It never creates another checker. Public
+probes retain the exact upstream `502` response requirement, with an initial and
+inter-family 31-second wait covering the pinned default circuit-open cap; `503`
+admission responses do not qualify. Private negatives distinguish a timed-out
+connection from a successful connection. All source, candidate, native edge and
+retained control bookends remain mandatory.
 
 ## Admission and recovery proof
 
