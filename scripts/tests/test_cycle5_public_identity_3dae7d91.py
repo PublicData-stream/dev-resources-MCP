@@ -3,6 +3,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import stat
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -16,6 +18,49 @@ SPEC.loader.exec_module(M)
 
 def encode(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+
+class FrozenSource(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/tmp')
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)/'legacy-public-identity-builder.py'
+        self.body = b"VALUE = 'verified first-party fixture'\nif __name__ == '__main__': raise RuntimeError('main must not execute')\n"
+        self.path.write_bytes(self.body)
+        self.path.chmod(0o600)
+        self.record = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0,
+                                      st_nlink=1, st_size=len(self.body))
+        for name, value in (('LEGACY', self.path), ('LEGACY_SHA', hashlib.sha256(self.body).hexdigest())):
+            p = patch.object(M, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_executes_verified_private_copy_without_running_old_main(self):
+        with patch.object(M.os, 'fstat', return_value=self.record):
+            helper = M.frozen_helpers()
+        self.assertEqual(helper.VALUE, 'verified first-party fixture')
+        self.assertEqual(helper.__file__, str(self.path))
+        self.assertEqual(self.path.read_bytes(), self.body)
+
+    def test_transfer_owned_or_group_readable_or_linked_copy_is_refused(self):
+        for key, value in (('st_uid', 1001), ('st_gid', 1001), ('st_mode', stat.S_IFREG | 0o640),
+                           ('st_mode', stat.S_IFIFO | 0o600), ('st_nlink', 2)):
+            record = SimpleNamespace(**{**vars(self.record), key: value})
+            with self.subTest(key=key, value=value), patch.object(M.os, 'fstat', return_value=record):
+                with self.assertRaisesRegex(RuntimeError, 'legacy_helper_private_source_required'):
+                    M.frozen_helpers()
+
+    def test_changed_source_or_symlink_is_refused_before_execution(self):
+        self.path.write_bytes(b'raise AssertionError("must never execute")\n')
+        self.record.st_size = self.path.stat().st_size
+        with patch.object(M.os, 'fstat', return_value=self.record):
+            with self.assertRaisesRegex(RuntimeError, 'legacy_helper_source_changed'):
+                M.frozen_helpers()
+        other = self.path.with_name('actual.py')
+        self.path.rename(other)
+        self.path.symlink_to(other)
+        with self.assertRaisesRegex(RuntimeError, 'legacy_helper_symlink'):
+            M.frozen_helpers()
 
 
 class Identity(unittest.TestCase):

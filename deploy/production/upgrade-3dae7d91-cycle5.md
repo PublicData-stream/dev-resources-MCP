@@ -66,6 +66,11 @@ support and active capacity/certificate timers before the target attempt.
 
 The [public-identity preparer](cycle5_public_identity_3dae7d91.py) binds its own
 reviewed source and the frozen fourth-cycle preparation helper before use.
+Exclusively copy the latter's exact
+`58c70e657bad9eb5fc3186486e38d4dc43d20e28c334779a591315661a35b2ef` bytes into
+`$WORK/legacy-public-identity-builder.py`, owned by root with mode 0600 and one
+link. Preserve the original transfer-owned helper's inode, ownership, permissions
+and bytes. Do not change historical file ownership to satisfy a new admission.
 Externally pin the new controller, source manifest and render manifest. Preview
 and review the candidate, then exclusively create it once. Preserve all four
 historical native-helper GETs and their ledger rows, with exactly one new helper
@@ -78,6 +83,16 @@ ownership evidence, an independently reviewed preview, and mount/process/hardlin
 checks. Select only completed isolated proof/rehearsal data copies. Preserve
 golden checkpoints, full baseline caches, production generations and every
 manifest, journal, receipt and log. Insufficient capacity stops admission.
+
+The [retirement helper](cycle5_reclaim_3dae7d91.py) has two fixed phases with
+separate exclusive journals: `cycle4-completed` selects the eight completed
+fourth-cycle proof/rehearsal leaves; `cycle5-checkpoint-proof` selects only the
+three completed fifth-cycle proof leaves before its actual Restore rehearsal.
+Require an independently reviewed runtime-qualified exact preview, helper source
+hash and finite approval before either apply. Each apply consumes one intent and
+preserves selected root identities. A refused or incomplete apply cannot be
+automatically replayed. File-only inventory does not replace namespace, process,
+Docker and firewall qualification or current production boundary checks.
 
 Prepare the new controller once, perform the source-bound read-only schema check,
 consume the one native store-claim helper GET, and stop the application roles.
