@@ -103,6 +103,7 @@ and record the stopped-role baseline against the original PostgreSQL process.
 ```sh
 python3 -B "$INSTALL/upgrade-controller.py" --context default prepare
 python3 -IB "$WORK/store-claim.py" --checkpoint-sha256 "$CHECKPOINT_SHA"
+mkdir -m 0700 "$WORK/target"
 python3 -B "$WORK/phase-driver.py" stop --controller-sha "$CONTROLLER_SHA"
 python3 -B "$WORK/operational-proof.py" baseline --label pre-upgrade \
   --controller "$INSTALL/upgrade-controller.py" --controller-sha "$CONTROLLER_SHA" \
