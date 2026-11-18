@@ -54,6 +54,7 @@ OBSERVER_ERRORS = frozenset(('unknown', 'interrupted', 'fixture_command_failed',
     'observer_timing_duplicate', 'observer_timing_unavailable', 'observer_earlier_storage_stage_missing',
     'observer_forwarded_after_storage_failure', 'observer_publication_owner_present',
     'observer_startup_mutated_metadata', 'observer_status_mutated_metadata',
+    'retained_row_manifest_query_failed', 'retained_row_manifest_invalid', 'retained_table_inventory_changed',
     'observer_restoration_failed', 'fixture_evidence_retention_incomplete'))
 OBSERVER_RESTORATIONS = frozenset(('sql-grant', 'objectstore-start', 'objectstore-ready',
     'backend-stop', 'writer-stop', 'policy-remove', 'writer-config', 'reader-config',

@@ -35,6 +35,9 @@ APPARMOR_PARSER = '/usr/sbin/apparmor_parser'
 APP = 'devres-npm-assessment'
 INGRESS = 'assessment-postgres-ingress'
 EGRESS = 'assessment-dns-postgres-egress'
+OBSERVER = 'status-observer'
+OBSERVER_SECRET = 'status-observer-config'
+OBSERVER_POLICIES = ('observer-postgres-ingress', 'observer-dns-postgres-egress')
 NATURAL_TRIALS = 10
 NODE = 'k3s-fixture'
 CONTAINERD = '/run/k3s/containerd/containerd.sock'
@@ -57,6 +60,10 @@ exec /bin/k3s server --node-name k3s-fixture --node-ip 192.0.2.2 \
 _spec = importlib.util.spec_from_file_location('npm_readiness_fixture', ROOT / 'scripts/npm-assessment-fixture.py')
 fixture = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixture)
+_proof_spec = importlib.util.spec_from_file_location(
+    'observer_retained_rows', ROOT / 'deploy/production/observer_retained_rows.py')
+proof = importlib.util.module_from_spec(_proof_spec)
+_proof_spec.loader.exec_module(proof)
 # The synthetic seed binary admits only this fixture database's Service DNS name.
 NAMESPACE = fixture.DATABASE_NAMESPACE
 APPARMOR_PROFILE = fixture.PROFILE
@@ -289,11 +296,11 @@ class Cluster:
     def node(self, *args, code='k3s_node_command', **kwargs):
         return command(self.node_argv(*args), code=code, **kwargs)
 
-    def argv(self, *args, namespace=NAMESPACE):
-        return self.node_argv('/bin/kubectl', '--request-timeout=8s', '-n', namespace, *args)
+    def argv(self, *args, namespace=NAMESPACE, request_timeout=8):
+        return self.node_argv('/bin/kubectl', f'--request-timeout={request_timeout}s', '-n', namespace, *args)
 
-    def k(self, *args, namespace=NAMESPACE, code='k3s_fixture_api', **kwargs):
-        result = command(self.argv(*args, namespace=namespace), code=code, **kwargs)
+    def k(self, *args, namespace=NAMESPACE, request_timeout=8, code='k3s_fixture_api', **kwargs):
+        result = command(self.argv(*args, namespace=namespace, request_timeout=request_timeout), code=code, **kwargs)
         # Match the small result interface of the shared fixtures.
         return subprocess.CompletedProcess(args, 0, stdout=result)
 
@@ -561,7 +568,103 @@ def assess(cluster, api, name, case, image, config, selected, database_ip, peer_
             cluster.delete_policy(policy_name, policy_uid)
 
 
-def run_cases(cluster, server, server_config, harness, database):
+def retained_snapshot(cluster):
+    def exec_psql(*args, **kwargs):
+        command = list(args)
+        command[command.index('-U') + 1] = 'devres'
+        command[command.index('-d') + 1] = fixture.DATABASE
+        return cluster.k(*command, **kwargs).stdout
+
+    try:
+        return proof.retained_row_manifest(exec_psql)
+    except proof.RetainedRowsError as error:
+        raise fixture.FixtureError(str(error)) from None
+
+
+def observer_workload(image):
+    spec = fixture.template(image)['spec']
+    spec.update({'restartPolicy': 'Never', 'activeDeadlineSeconds': 360})
+    spec['volumes'] = [volume for volume in spec['volumes'] if volume['name'] != 's3']
+    next(volume for volume in spec['volumes'] if volume['name'] == 'config')['secret']['secretName'] = OBSERVER_SECRET
+    spec['volumes'].append({'name': 'archive', 'emptyDir': {'sizeLimit': '1Mi'}})
+    container = spec['containers'][0]
+    container['volumeMounts'] = [mount for mount in container['volumeMounts'] if mount['name'] != 's3']
+    container['volumeMounts'].append({'name': 'archive', 'mountPath': '/data/blobs', 'readOnly': True})
+    container.update({'name': OBSERVER, 'command': ['devres-server', 'collect', '/etc/devres/config/observer.toml'],
+                      'readinessProbe': {'httpGet': {'path': '/ready', 'port': 9090}, 'periodSeconds': 1}})
+    pod = object_spec('Pod', OBSERVER, spec=spec)
+    pod['metadata']['labels'] = {'app': OBSERVER}
+    return pod
+
+
+def observer_configuration(original):
+    return fixture.configuration(original).replace('[storage]\n', '[storage]\nscratch_dir = "/tmp/observer-scratch"\n', 1) + '''
+[writer_listener]
+access = "status_only"
+bind = "127.0.0.1:9443"
+certificate = "/etc/devres/config/tls.crt"
+private_key = "/etc/devres/config/tls.key"
+allowed_clients = [{namespace = "devres-acceptance", service_account = "assessment"}]
+[writer_listener.auth]
+audience = "devres-writer"
+kube_api_url = "https://kubernetes.default.svc"
+kube_token_file = "/run/devres-kube/token"
+'''
+
+
+def observer_locks(cluster):
+    return json.loads(cluster.sql("SELECT json_build_array(count(*) FILTER (WHERE objid=1),"
+        "count(*) FILTER (WHERE objid=2 AND mode='ShareLock'),"
+        "count(*) FILTER (WHERE objid=2 AND mode='ExclusiveLock')) FROM pg_locks WHERE locktype='advisory'"
+        " AND classid=1835365490 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database"
+        " WHERE datname=current_database())"))
+
+
+def observe_after_assessment(cluster, server, server_config, directory):
+    assessment_left = cluster.k('get', 'pods', '-l', 'app=' + APP, '-o', 'name').stdout
+    assessment_policies = cluster.k('get', 'networkpolicy', INGRESS, EGRESS, '--ignore-not-found', '-o', 'name').stdout
+    fixture.need(not assessment_left.strip() and not assessment_policies.strip() and observer_locks(cluster) == [0, 0, 0],
+                 'k3s_observer_requires_closed_assessment')
+    baseline = retained_snapshot(cluster)
+    certificate, key = directory / 'observer.crt', directory / 'observer.key'
+    command(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+             '-days', '1', '-subj', '/CN=' + OBSERVER, '-keyout', str(key), '-out', str(certificate)],
+            code='k3s_observer_tls_fixture')
+    original = (ROOT / 'deploy/oxibelt/backend.toml').read_text()
+    cluster.write('create', object_spec('Secret', OBSERVER_SECRET, stringData={
+        'observer.toml': observer_configuration(original), 'tls.crt': certificate.read_text(), 'tls.key': key.read_text(),
+    }))
+    ingress_name, egress_name = OBSERVER_POLICIES
+    policies = [cluster.create_policy(ingress(ingress_name, 'postgres', OBSERVER)),
+                cluster.create_policy(egress(egress_name, OBSERVER))]
+    pod = observer_workload(server)
+    expected = cluster.dry_run_pod(pod)
+    cluster.write('create', pod)
+    uid = cluster.pod(OBSERVER)['metadata']['uid']
+    cluster.k('wait', '--for=condition=Ready', 'pod/' + OBSERVER, '--timeout=90s',
+              timeout=95, request_timeout=92, code='k3s_observer_startup')
+    actual = cluster.pod(OBSERVER)
+    pod_admission(actual, expected, uid)
+    status, = actual['status']['containerStatuses']
+    reference = status['imageID'].removeprefix('containerd://').removeprefix('docker-pullable://')
+    fixture.need(status['ready'] and status['restartCount'] == 0 and 'running' in status['state']
+                 and cluster.image_config(reference) == server_config and observer_locks(cluster) == [0, 1, 0],
+                 'k3s_observer_authority_changed')
+    apparmor = isolation_evidence(cluster.k('exec', OBSERVER, '--', '/bin/cat', '/proc/self/attr/current',
+                                            maximum=128, code='k3s_observer_apparmor').stdout, False)
+    fixture.need(retained_snapshot(cluster) == baseline, 'k3s_observer_retained_rows_changed')
+    cluster.delete(OBSERVER, uid)
+    for name, policy_uid in reversed(policies):
+        cluster.delete_policy(name, policy_uid)
+    cluster.k('delete', 'secret', OBSERVER_SECRET)
+    remaining = cluster.k('get', 'pod/' + OBSERVER, *('networkpolicy/' + name for name in OBSERVER_POLICIES),
+                          'secret/' + OBSERVER_SECRET, '--ignore-not-found', '-o', 'name').stdout
+    fixture.need(not remaining.strip() and observer_locks(cluster) == [0, 0, 0], 'k3s_observer_cleanup_unconfirmed')
+    return {'assessment_cleanup': 'verified', 'observer_pod_uid': uid, 'effective_apparmor': apparmor,
+            'read_only_lifecycle_lock': True, 'retained_rows_unchanged': True, 'cleanup': 'complete'}
+
+
+def run_cases(cluster, server, server_config, harness, database, directory):
     cluster.k('create', 'namespace', NAMESPACE)
     cluster.write('create', object_spec('ServiceAccount', 'assessment', automountServiceAccountToken=False),
         object_spec('Secret', 'postgres-fixture', stringData={'password': 'fixture-only'}),
@@ -592,7 +695,7 @@ def run_cases(cluster, server, server_config, harness, database):
                               database_ip, peer_service_ip))
     fixture.need(len({value['pod_uid'] for value in results}) == len(results), 'k3s_assessment_uid_reuse')
     fixture.need(fixture.snapshot(cluster) == baseline, 'k3s_assessment_mutated_database')
-    return results
+    return results, observe_after_assessment(cluster, server, server_config, directory)
 
 
 @contextlib.contextmanager
@@ -753,7 +856,7 @@ def run(args):
                 else:
                     database, database_config = scope.enter_context(import_image(cluster, POSTGRES_IMAGE, directory, marker, 'postgres'))
                     fixture.need(database_config == POSTGRES_CONFIG, 'k3s_postgres_config_mismatch')
-                cases = run_cases(cluster, server, config, harness, database)
+                cases, observer = run_cases(cluster, server, config, harness, database, directory)
             fixture.need(storage_evidence(cluster) == storage, 'k3s_fixture_storage_changed')
         finally:
             if identity is None:
@@ -771,7 +874,7 @@ def run(args):
             'airgap_sha256': AIRGAP_SHA256, 'server_image': args.server_image, 'server_config_digest': config,
             'assessment_apparmor': 'Localhost/' + APPARMOR_PROFILE, 'apparmor_sha256': apparmor_digest,
             'coredns_apparmor': coredns_apparmor, 'postgres_config_digest': database_config,
-            'storage': storage, 'cases': cases, 'database_unchanged': True,
+            'storage': storage, 'cases': cases, 'observer': observer, 'database_unchanged': True,
             'unrelated_destination_denied': True, 'cleanup': 'complete'}
 
 

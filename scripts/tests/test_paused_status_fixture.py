@@ -126,25 +126,29 @@ class ObserverFixtureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fixture.policy_documents(['public-provider.invalid'])
 
-    def test_retained_snapshot_rejects_unexpected_table_before_interpolation(self):
-        class Cluster:
-            def sql(self, _statement): return b'caller_supplied_table; DROP TABLE devres_schema\n'
-        with self.assertRaisesRegex(fixture.base.FixtureError, 'table_admission'):
-            fixture.snapshot(Cluster())
+    def test_snapshot_keeps_production_query_transport_and_fixture_admin_identity(self):
+        cluster = fixture.Cluster('devres-acceptance-test', Path('/tmp/observer'))
+        command = ['exec', '-i', 'deployment/postgres', '-c', 'postgres', '--', 'psql', '-U', 'devres_admin', '-d', 'devres']
 
-    def test_snapshot_hashes_all_fixture_tables_without_exporting_row_bodies(self):
-        class Cluster:
-            def __init__(self): self.calls = []
-            def sql(self, statement):
-                self.calls.append(statement)
-                return b'devres_heads\ndevres_npm_state\n' if len(self.calls) == 1 else b'[{"name":"devres_heads","rows":1,"digest":"fixture"}]'
-        cluster = Cluster()
-        self.assertEqual(fixture.snapshot(cluster)[0]['rows'], 1)
-        self.assertIn('BEGIN READ ONLY', cluster.calls[1])
-        self.assertIn('statement_timeout', cluster.calls[1])
-        self.assertIn('md5(row_to_json(t)::text)', cluster.calls[1])
-        self.assertIn('FROM devres_heads t', cluster.calls[1])
-        self.assertIn('FROM devres_npm_state t', cluster.calls[1])
+        def manifest(run):
+            return run(*command, data=b'proof SQL', timeout=270, request_timeout=260)
+
+        with patch.object(fixture.proof, 'retained_row_manifest', side_effect=manifest), \
+             patch.object(fixture.base, 'command', return_value=SimpleNamespace(stdout=b'proof', returncode=0)) as run:
+            self.assertEqual(fixture.snapshot(cluster), b'proof')
+        command[8] = 'devres'
+        run.assert_called_once_with(cluster.argv(*command, request_timeout=260), check=False, data=b'proof SQL', timeout=270)
+        self.assertIn('--request-timeout=260s', run.call_args.args[0])
+
+    def test_snapshot_retains_closed_proof_failure_code(self):
+        code = 'retained_table_inventory_changed'
+        cluster = RecordingCluster()
+        with patch.object(fixture.proof, 'retained_row_manifest', side_effect=fixture.proof.RetainedRowsError(code)), \
+             patch.object(fixture.base, 'receipt') as receipt:
+            with self.assertRaisesRegex(fixture.base.FixtureError, code) as failure:
+                fixture.snapshot(cluster)
+            fixture.capture_failure(cluster, failure.exception)
+        self.assertEqual(receipt.call_args.args[2]['code'], code)
 
     def test_finite_timing_parser_keeps_stage_codes_and_discards_other_log_data(self):
         logs = (b'private-provider-sentinel must never be retained\n'
@@ -655,7 +659,7 @@ class ObserverFixtureTests(unittest.TestCase):
                                            (subprocess.TimeoutExpired(['private-command'], 1, output=b'private-secret'),
                                             'observer_command_timeout', 'timeout')):
                 settings = {'side_effect': result} if isinstance(result, Exception) else {'return_value': result}
-                with self.subTest(code=code), patch.object(fixture.base.Cluster, 'k', **settings):
+                with self.subTest(code=code), patch.object(fixture.base, 'command', **settings):
                     with self.assertRaisesRegex(fixture.CommandError, '^' + code + '$') as caught:
                         cluster.k('get', 'pods')
                 self.assertEqual(caught.exception.outcome, outcome)

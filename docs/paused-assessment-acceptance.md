@@ -207,3 +207,61 @@ checking that all owned workloads have stopped.
 The receipt distinguishes API observations from observed node rule membership.
 Recovery from a controlled delay establishes the mitigation under those test
 conditions. The historical production failure remains unresolved.
+
+## Retained-row proof for a successor rollout
+
+The [closed `ce5745e0` attempt](../deploy/production/upgrade-ce5745e0-evidence.md)
+reached schema 19 and passed the npm assessment. The retained-row baseline
+timed out at 300 seconds before the observer existed. The accepted restoration
+returned the installation to schema 18 with the applications withdrawn.
+
+The [successor transform](../deploy/production/observer_retained_rows_transform.py)
+embeds the [retained-row helper](../deploy/production/observer_retained_rows.py)
+before the new controller and source manifest are hashed. Apply the transform
+once to the reviewed successor controller source during its render. The
+`ce5745e0` cycle remains closed. The server and native probe binaries can keep
+their existing immutable image pins because the proof runs in the controller.
+
+After assessment cleanup, the controller takes the baseline while only
+PostgreSQL is running and before changing observer configuration. It repeats
+the proof before activation and requires identical receipts and stable
+observer authority. The `sha256-row-multiset-v1` receipt covers every row in
+each admitted first-party heap table. Its PostgreSQL 18 binary record framing
+preserves field types and distinguishes SQL NULL from JSONB null. Sorted
+binary hashes and ordered groups preserve duplicate multiplicity without
+depending on heap order. Only table names, row counts, and aggregate digests
+leave PostgreSQL. The controller uses a single read-only repeatable-read
+transaction with a 240-second limit, 250-millisecond lock limit, and
+session-local memory and temporary-file bounds. It rejects unexpected
+relations, incomplete results, and changed manifests before activation.
+
+On native amd64, preload the production PostgreSQL 18.6 image named in the
+[fixture](../scripts/test-observer-retained-rows.py) into a Docker daemon with
+storage below `/tmp`. Run the functional check and the deterministic synthetic
+benchmark with separate receipt paths:
+
+```sh
+fixture_dir=$(mktemp -d /tmp/devres-observer-proof.XXXXXX)
+python3 -B scripts/test-observer-retained-rows.py --receipt "$fixture_dir/functional.json"
+python3 -B scripts/test-observer-retained-rows.py --benchmark --receipt "$fixture_dir/benchmark.json"
+```
+
+The benchmark times the revised proof after PostgreSQL restart and during two
+repeat runs, then compares the historical query on the same warm data. It
+records per-table heap and TOAST sizes, buffer use, temporary I/O, and disk
+headroom. A container restart clears PostgreSQL shared buffers while
+leaving the host page cache uncontrolled. Minikube's filesystem and plain-S3
+checks run the same retained-row helper alongside the paused MCP, acquisition
+denial, and cleanup checks. The isolated K3s fixture runs it around the real
+status-only server startup after npm assessment cleanup and verifies observer
+removal. Its observer receipt covers SQL and readiness in that fixture.
+
+Before authorizing the next launch, qualify the exact rendered successor with
+the pinned PostgreSQL image and representative resources on a separately
+approved, offline physical copy migrated to schema 19. Record cold-cache and
+two repeat runs, with each proof completing within 200 seconds. Require at
+least 120 seconds of headroom in both full supervisor stages, `start-observer`
+(720 seconds) and `activate-existing` (1,200 seconds). Record the cache
+conditions and per-table measurements with the rendered source and image pins.
+Qualify a fresh checkpoint, rollback, capacity admission, and maintenance
+window through the successor cycle's separate approval process.

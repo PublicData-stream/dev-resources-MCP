@@ -23,6 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('npm_assessment_fixture', ROOT / 'scripts/npm-assessment-fixture.py')
 base = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(base)
+PROOF_SPEC = importlib.util.spec_from_file_location(
+    'observer_retained_rows', ROOT / 'deploy/production/observer_retained_rows.py')
+proof = importlib.util.module_from_spec(PROOF_SPEC)
+PROOF_SPEC.loader.exec_module(proof)
 NAMESPACE = 'devres-acceptance'
 
 
@@ -30,13 +34,16 @@ class Cluster(base.Cluster):
     phase = 'setup'
     fault_case = 'none'
 
-    def argv(self, *args, namespace=NAMESPACE):
-        return super().argv(*args, namespace=namespace)
+    def argv(self, *args, namespace=NAMESPACE, request_timeout=30):
+        return ['minikube', '-p', self.profile, 'kubectl', '--',
+                '--cache-dir=' + str(self.scratch / 'kube-cache'), '--context=' + self.profile,
+                f'--request-timeout={request_timeout}s', '-n', namespace, *args]
 
-    def k(self, *args, namespace=NAMESPACE, **kwargs):
+    def k(self, *args, namespace=NAMESPACE, request_timeout=30, **kwargs):
         check = kwargs.pop('check', True)
         try:
-            result = super().k(*args, namespace=namespace, check=False, **kwargs)
+            result = base.command(self.argv(*args, namespace=namespace, request_timeout=request_timeout),
+                                  check=False, **kwargs)
         except subprocess.TimeoutExpired:
             raise CommandError('observer_command_timeout', 'timeout') from None
         if check and result.returncode:
@@ -168,9 +175,16 @@ def policy_documents(api_addresses):
 
 
 def snapshot(cluster):
-    # The database contains only the small first-party harness corpus. Hash every
-    # retained row, including heads/queues/control rows, without exporting bodies.
-    return base.retained_rows_snapshot(cluster)
+    # The synthetic cluster uses its own local PostgreSQL administrator.
+    def exec_psql(*args, **kwargs):
+        command = list(args)
+        command[command.index('-U') + 1] = 'devres'
+        return cluster.k(*command, **kwargs).stdout
+
+    try:
+        return proof.retained_row_manifest(exec_psql)
+    except proof.RetainedRowsError as error:
+        raise base.FixtureError(str(error)) from None
 
 
 def owner_absent(cluster):

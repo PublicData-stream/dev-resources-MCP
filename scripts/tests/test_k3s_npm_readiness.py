@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -89,6 +90,71 @@ class AssessmentEvidenceTests(unittest.TestCase):
         self.assertEqual(readiness.phase_evidence(events, 'denied')['connect_elapsed_ms'], 30000)
         with self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_denied_assessment_reached_sql'):
             readiness.phase_evidence(events + [event('sql_setup', 'start')], 'denied')
+
+
+class ObserverLifecycleTests(unittest.TestCase):
+    def test_observer_uses_read_only_storage_and_no_assessment_or_kube_credentials(self):
+        config = tomllib.loads(readiness.observer_configuration((ROOT / 'deploy/oxibelt/backend.toml').read_text()))
+        self.assertEqual(config['storage']['database_url'], readiness.fixture.DATABASE_READER)
+        self.assertEqual(config['storage']['scratch_dir'], '/tmp/observer-scratch')
+        self.assertEqual(config['writer_listener']['access'], 'status_only')
+        self.assertFalse(config['npm']['advisories_enabled'])
+        pod = readiness.observer_workload('fixture-image')['spec']
+        self.assertFalse(pod['automountServiceAccountToken'])
+        self.assertEqual({volume['name'] for volume in pod['volumes']}, {'config', 'tmp', 'archive'})
+        self.assertTrue(next(mount for mount in pod['containers'][0]['volumeMounts'] if mount['name'] == 'archive')['readOnly'])
+
+    def test_retained_snapshot_translates_only_the_synthetic_database_identity(self):
+        cluster = mock.Mock()
+        cluster.k.return_value = subprocess.CompletedProcess([], 0, stdout=b'proof')
+        args = ['exec', '-i', 'deployment/postgres', '-c', 'postgres', '--', 'psql', '-U', 'devres_admin', '-d', 'devres']
+
+        def manifest(run):
+            return run(*args, data=b'proof SQL', timeout=270, request_timeout=260)
+
+        with mock.patch.object(readiness.proof, 'retained_row_manifest', side_effect=manifest):
+            self.assertEqual(readiness.retained_snapshot(cluster), b'proof')
+        args[8], args[10] = 'devres', readiness.fixture.DATABASE
+        cluster.k.assert_called_once_with(*args, data=b'proof SQL', timeout=270, request_timeout=260)
+
+    def test_observer_requires_assessment_cleanup_before_reading_the_baseline(self):
+        cluster = mock.Mock()
+        cluster.k.return_value.stdout = b'pod/assessment'
+        with mock.patch.object(readiness, 'retained_snapshot') as snapshot, \
+             self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_observer_requires_closed_assessment'):
+            readiness.observe_after_assessment(cluster, 'image', 'config', Path('/tmp'))
+        snapshot.assert_not_called()
+        cluster.write.assert_not_called()
+
+    def test_observer_checks_same_snapshot_before_stop_and_confirms_cleanup(self):
+        cluster = mock.Mock()
+        cluster.pod.return_value = {'metadata': {'uid': 'fixture'}, 'status': {'containerStatuses': [
+            {'ready': True, 'restartCount': 0, 'state': {'running': {}}, 'imageID': 'containerd://image'},
+        ]}}
+        cluster.image_config.return_value = 'config'
+        cluster.k.side_effect = lambda *args, **_: subprocess.CompletedProcess(args, 0, stdout=(
+            b'devres-runtime (enforce)\n' if args[0] == 'exec' else b''))
+        events = []
+
+        def snapshot(_):
+            events.append('snapshot')
+            return {'sha256': 'same'}
+
+        cluster.write.side_effect = lambda _, body: events.append(body['kind'])
+        cluster.delete.side_effect = lambda *_: events.append('stop')
+        cluster.create_policy.side_effect = [(name, name + '-uid') for name in readiness.OBSERVER_POLICIES]
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory, \
+             mock.patch.object(readiness, 'command'), mock.patch.object(readiness, 'pod_admission'), \
+             mock.patch.object(readiness, 'observer_locks', side_effect=[[0, 0, 0], [0, 1, 0], [0, 0, 0]]), \
+             mock.patch.object(readiness, 'retained_snapshot', side_effect=snapshot):
+            root = Path(directory)
+            for name in ('observer.crt', 'observer.key'):
+                (root / name).write_text('fixture')
+            result = readiness.observe_after_assessment(cluster, 'image', 'config', root)
+        self.assertEqual(events, ['snapshot', 'Secret', 'Pod', 'snapshot', 'stop'])
+        self.assertEqual(result['cleanup'], 'complete')
+        cluster.delete.assert_called_once_with(readiness.OBSERVER, 'fixture')
+        self.assertEqual(cluster.delete_policy.call_count, 2)
 
 
 class PostgresArchiveTests(unittest.TestCase):

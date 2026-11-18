@@ -639,6 +639,7 @@ external python3 /harness/mcp_smoke.py --url https://edge:30443/mcp --ca /fixtur
 # The report stays in an owned /tmp directory inside the pod and is removed afterwards.
 k exec -i deployment/backend -- python3 -I -B - < scripts/npm-diagnosis-fixture.py
 if (( ! live && ! credential_broker )); then
+  # Both fixture storage modes exercise the production retained-row proof.
   observer_args=()
   if (( s3 )); then observer_args+=(--s3); fi
   python3 -I -B scripts/paused-status-fixture.py --profile "$profile" --scratch "$scratch" "${observer_args[@]}"
