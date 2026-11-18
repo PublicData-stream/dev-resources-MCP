@@ -5,6 +5,10 @@ It admits one attempt on the dedicated K3s host, one new native archive store-cl
 GET, and at most one physical restoration. The successful end state is schema
 19, the historical active source settings, and accepted public MCP.
 
+The [execution record](upgrade-ce5745e0-evidence.md) closes the single attempt.
+The observer startup failed and the supervisor restored schema 18 with both
+application roles withdrawn. Any further attempt needs a fresh approved cycle.
+
 The [published release](https://github.com/PublicData-stream/dev-resources-MCP/releases/tag/0.1.0-build.ce5745e0)
 pins commit `ce5745e0a0a5914dad62cd24f8655276b6f780ce`. The runtime uses the
 published server and probe indexes and verifies their Linux amd64 child manifests.
