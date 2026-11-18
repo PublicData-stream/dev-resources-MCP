@@ -348,6 +348,8 @@ class Engine:
         scope=self.scope;cp=scope.bundle/'checkpoint-volume';rr=scope.bundle/'restore-rehearsal-volume'
         for p in (scope.bundle,scope.work,scope.install):
             value=directory_record(p);need(value['uid']==os.geteuid() and not value['mode']&0o077,'private_scope_required')
+        cp_alias=scope.work/'checkpoint-state'
+        need(directory_record(cp_alias)==directory_record(cp),'checkpoint_receipt_alias_identity')
         owner=load(cp/'owner.json');completed=load(cp/'completed.json');checkpoint=load(cp/'checkpoint-completed.json')
         cleanup=load(cp/'clone-cleanup-completed.json');proof=load(cp/'clone-proof-result.json');intent=load(cp/'proof-intent.json')
         token=owner.get('token');need(re.fullmatch('[0-9a-f]{24}',token or ''),'checkpoint_owner_token')
@@ -376,6 +378,8 @@ class Engine:
                  and restored.get('s3_rewound') is False,'real_restore_completion_required')
             rr_owner=load(rr/'owner.json');rr_cleanup=load(rr/'cleanup-completed.json');rr_proof=load(rr/'real-pg-proof.json')
             receipt=load(scope.work/'restore-rehearsal-receipt.json');synthetic=load(rr/'runtime/restore/state.json')
+            rr_alias=scope.work/'restore-rehearsal-state'
+            need(directory_record(rr_alias)==directory_record(rr),'rehearsal_receipt_alias_identity')
             need(rr_owner['sources']==receipt['sources']==C4_SOURCES and rr_owner['scope']=={
                 'device':rr.stat().st_dev,'inode':rr.stat().st_ino},'exact_rehearsal_owner_sources_required')
             need(rr_cleanup['token']==rr_owner['token'] and rr_cleanup['owned_container_removed'] is True
@@ -385,10 +389,13 @@ class Engine:
                      'marker_removed','owned_cleanup_complete','production_untouched','restore_state_machine'),True)
                  and all(rr_proof.get(k) is True for k in ('marker_removed','no_kubernetes_commands','no_production_credentials','no_network')),
                  'completed_restore_rehearsal_required')
-            need({item['path']:item['sha256'] for item in receipt['artifacts']}=={
-                str(rr/'real-pg-proof.json'):file_record(rr/'real-pg-proof.json')['sha256'],
-                str(rr/'cleanup-completed.json'):file_record(rr/'cleanup-completed.json')['sha256']},
+            expected_rr_artifacts={
+                str(rr_alias/'real-pg-proof.json'):file_record(rr/'real-pg-proof.json')['sha256'],
+                str(rr_alias/'cleanup-completed.json'):file_record(rr/'cleanup-completed.json')['sha256']}
+            need(len(receipt['artifacts'])==2 and {item['path']:item['sha256'] for item in receipt['artifacts']}==expected_rr_artifacts,
                 'rehearsal_artifact_chain_changed')
+            need(all(file_record(Path(path))['sha256']==wanted for path,wanted in expected_rr_artifacts.items()),
+                 'rehearsal_artifact_chain_changed')
             need(synthetic['phase']=='restored' and re.fullmatch('[0-9a-f]{24}',synthetic['token']),'synthetic_restore_token')
             tokens+=[rr_owner['token'],synthetic['token']]
             roots += [rr/'runtime'/name for name in ('isolated-pv','cache-serving','cache-writer',
@@ -403,6 +410,8 @@ class Engine:
             need(not (rr/'owner.json').exists() and not (scope.work/'restore-rehearsal-receipt.json').exists(),
                  'proof_retirement_must_precede_rehearsal')
         for p in protected:directory_record(p)
+        copy_aliases=[scope.work/('checkpoint-state' if under(p,cp) else 'restore-rehearsal-state')/
+            p.relative_to(cp if under(p,cp) else rr) for p in roots]
         for name in ('backup-receipt.json','backup-receipt-after-rehearsal.json'):
             path=cp/name
             if not path.exists():
@@ -412,12 +421,15 @@ class Engine:
                 and backup.get('checks')==dict.fromkeys(('coordinated_pg_s3','credentials_preserved',
                     'fallback_writer_verified','old_clone_verified','pg_restarted_without_restore','roles_stopped'),True),
                 'verified_backup_required')
-            required={str(cp/n) for n in ('completed.json','checkpoint-completed.json','clone-proof-result.json',
+            required={str(cp_alias/n):cp/n for n in ('completed.json','checkpoint-completed.json','clone-proof-result.json',
                 'clone-cleanup-completed.json','cache-baselines.json','pg-file-manifest.jsonl','archive-bindings.jsonl','capture-bindings.jsonl')}
-            need(required<={a['path'] for a in backup['artifacts']},'backup_metadata_artifacts_missing')
+            need(set(required)<={a['path'] for a in backup['artifacts']},'backup_metadata_artifacts_missing')
             for artifact in backup['artifacts']:
                 artifact_path=safe_path(artifact['path'])
-                need(not any(under(artifact_path,p) for p in roots),'backup_requires_disposable_copy')
+                need(not any(under(artifact_path,p) for p in roots+copy_aliases),'backup_requires_disposable_copy')
+                if artifact['path'] in required:
+                    need(file_record(required[artifact['path']])['sha256']==artifact['sha256'],
+                         'retained_backup_artifact_changed')
                 need(file_record(artifact_path)['sha256']==artifact['sha256'],'retained_backup_artifact_changed')
         return roots,protected,tokens
 

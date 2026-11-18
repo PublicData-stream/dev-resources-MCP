@@ -93,6 +93,12 @@ hash and finite approval before either apply. Each apply consumes one intent and
 preserves selected root identities. A refused or incomplete apply cannot be
 automatically replayed. File-only inventory does not replace namespace, process,
 Docker and firewall qualification or current production boundary checks.
+Checkpoint and rehearsal receipts retain their exact producer paths below the
+work-directory bind mounts. Verify each bind root's device/inode and authority
+against its physical volume before accepting those paths. Check required metadata
+hashes through both views; refuse backup artifacts beneath disposable copies in
+either view before reading a body. Do not rewrite retained receipt paths or apply
+general path normalization.
 
 Prepare the new controller once, perform the source-bound read-only schema check,
 consume the one native store-claim helper GET, and stop the application roles.

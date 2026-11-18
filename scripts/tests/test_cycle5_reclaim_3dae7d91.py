@@ -18,6 +18,7 @@ class Fixture:
         self.root=root;self.bundle=root/'bundle';self.work=root/'work';self.install=root/'install';self.journal=root/'journal/phase'
         for p in (self.bundle,self.work,self.install,self.journal.parent):p.mkdir(mode=0o700)
         self.cp=self.bundle/'checkpoint-volume';self.cp.mkdir(mode=0o700)
+        (self.work/'checkpoint-state').mkdir(mode=0o700)
         self.scope=m.Scope('cycle5-checkpoint-proof',self.bundle,self.work,self.install,self.journal)
         for p in ('pg-clone','rehearsal/cache','rehearsal/writer-cache','pg-checkpoint','fallback-cache/serving','fallback-cache/writer'):
             path=self.cp/p;path.mkdir(parents=True,mode=0o700);put(path/'payload',b'copy-payload')
@@ -40,11 +41,21 @@ class Fixture:
         backup={'verified':True,'revision':m.REVISION,'schema':18,'kind':'coordinated-schema18-backup',
             'checks':dict.fromkeys(('coordinated_pg_s3','credentials_preserved','fallback_writer_verified','old_clone_verified',
                 'pg_restarted_without_restore','roles_stopped'),True),
-            'artifacts':[{'path':str(self.cp/n),'sha256':m.file_record(self.cp/n)['sha256']} for n in names]}
+            'artifacts':[{'path':str(self.work/'checkpoint-state'/n),'sha256':m.file_record(self.cp/n)['sha256']} for n in names]}
         put(self.cp/'backup-receipt.json',backup)
+        self.sync_alias_metadata()
         self.engine=m.Engine(self.scope,guard=lambda *a,**k:{'runtime_qualified':k['runtime'],'stable':True})
+    def sync_alias_metadata(self):
+        # Actual regular control records are copied with unchanged bytes/modes.
+        # Only directory_record models kernel bind identity; no control read or
+        # file_record/hash validation is mocked or normalized.
+        for physical,alias in ((self.cp,self.work/'checkpoint-state'),
+            (self.bundle/'restore-rehearsal-volume',self.work/'restore-rehearsal-state')):
+            if not physical.exists() or not alias.exists():continue
+            for path in physical.iterdir():
+                if path.is_file():put(alias/path.name,path.read_bytes())
     def edit(self,name,mutate):
-        p=self.cp/name;v=json.loads(p.read_bytes());mutate(v);put(p,v)
+        p=self.cp/name;v=json.loads(p.read_bytes());mutate(v);put(p,v);self.sync_alias_metadata()
     def preview(self):
         # Directory bind aliases are admitted by actual dev/ino equality in
         # production; fixture maps only that path comparison, never receipts.
@@ -63,6 +74,7 @@ class Fixture:
         self.scope=m.Scope('cycle4-completed',self.bundle,self.work,self.install,self.journal)
         self.engine=m.Engine(self.scope,guard=lambda *a,**k:{'runtime_qualified':k['runtime'],'stable':True})
         rr=self.bundle/'restore-rehearsal-volume';rr.mkdir(mode=0o700)
+        (self.work/'restore-rehearsal-state').mkdir(mode=0o700)
         for name in ('restore-controller.py','restore-rehearsal.py'):put(self.install/name,b'# synthetic review source\n')
         sources={n:m.file_record(self.install/n)['sha256'] for n in m.C4_SOURCES}
         put(rr/'owner.json',{'token':'b'*24,'sources':sources,'scope':{'device':rr.stat().st_dev,'inode':rr.stat().st_ino}})
@@ -71,7 +83,7 @@ class Fixture:
         put(self.work/'restore-rehearsal-receipt.json',{'verified':True,'revision':m.REVISION,'kind':'isolated-real-pg-restore-rehearsal',
             'sources':sources,'checks':dict.fromkeys(('full_baseline_caches','isolated_real_pg_restore','marker_removed',
                 'owned_cleanup_complete','production_untouched','restore_state_machine'),True),
-            'artifacts':[{'path':str(rr/n),'sha256':m.file_record(rr/n)['sha256']} for n in ('real-pg-proof.json','cleanup-completed.json')]})
+            'artifacts':[{'path':str(self.work/'restore-rehearsal-state'/n),'sha256':m.file_record(rr/n)['sha256']} for n in ('real-pg-proof.json','cleanup-completed.json')]})
         put(rr/'runtime/restore/state.json',{'phase':'restored','token':'d'*24})
         for name in ('isolated-pv','cache-serving','cache-writer','.failed-serving-'+'d'*24,'.failed-writer-'+'d'*24):
             p=rr/'runtime'/name;p.mkdir(mode=0o700);put(p/'payload',b'synthetic restore copy')
@@ -85,6 +97,7 @@ class Fixture:
         def update(v):
             for a in v['artifacts']:a['sha256']=m.file_record(Path(a['path']))['sha256']
         self.edit('backup-receipt.json',update)
+        self.sync_alias_metadata()
         return sources,m.file_record(self.bundle/'restore/restored.json')['sha256']
 
 
@@ -92,7 +105,15 @@ class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='c5-reclaim-tests-',dir='/tmp');self.root=Path(self.temp.name);self.root.chmod(0o700)
         self.f=Fixture(self.root)
-    def tearDown(self):self.temp.cleanup()
+        original=m.directory_record
+        def directory(path):
+            path=Path(path)
+            for alias,physical in ((self.f.work/'checkpoint-state',self.f.cp),
+                (self.f.work/'restore-rehearsal-state',self.f.bundle/'restore-rehearsal-volume')):
+                if m.under(path,alias):path=physical/path.relative_to(alias);break
+            return original(path)
+        self.alias_patch=patch.object(m,'directory_record',side_effect=directory);self.alias_patch.start()
+    def tearDown(self):self.alias_patch.stop();self.temp.cleanup()
     def test_fixed_cli_scopes_and_distinct_journals(self):
         a=m.production_scope('cycle4-completed');b=m.production_scope('cycle5-checkpoint-proof')
         self.assertNotEqual(a.journal,b.journal);self.assertNotEqual(a.bundle,b.bundle)
@@ -105,11 +126,85 @@ class CandidateTests(unittest.TestCase):
         sources,restored=self.f.make_c4()
         with patch.object(m,'C4_SOURCES',sources),patch.object(m,'C4_RESTORED',restored):
             roots,protected,tokens=self.f.engine.receipts()
+            preview=self.f.preview()
+            self.assertEqual(preview['roots'],[str(path) for path in roots])
         self.assertEqual(len(roots),8);self.assertEqual(len(protected),6);self.assertEqual(len(tokens),3)
         self.assertTrue(all(p.is_relative_to(self.f.bundle) for p in roots))
         self.assertTrue(all(not any(m.under(p,r) for r in roots) for p in protected))
         self.assertEqual(sum(p.name.startswith('.failed-') for p in roots),2)
         self.assertEqual(sum(p.name.startswith('.failed-') for p in protected),3)
+        receipt=json.loads((self.f.work/'restore-rehearsal-receipt.json').read_bytes())
+        self.assertEqual({a['path'] for a in receipt['artifacts']},{str(self.f.work/'restore-rehearsal-state'/n)
+            for n in ('real-pg-proof.json','cleanup-completed.json')})
+        backup=json.loads((self.f.cp/'backup-receipt.json').read_bytes())
+        self.assertTrue(all(Path(a['path']).parent==self.f.work/'checkpoint-state' for a in backup['artifacts']))
+    def test_checkpoint_alias_root_identity_refuses_before_hash(self):
+        original=m.directory_record
+        def changed(path):
+            value=original(path)
+            if Path(path)==self.f.work/'checkpoint-state':value=dict(value,ino=value['ino']+1)
+            return value
+        with patch.object(m,'directory_record',side_effect=changed),patch.object(m,'file_record',side_effect=AssertionError('no hash before alias admission')):
+            with self.assertRaisesRegex(m.Refused,'checkpoint_receipt_alias_identity'):self.f.engine.receipts()
+    def test_rehearsal_alias_root_identity_refuses_before_artifact_hash(self):
+        sources,restored=self.f.make_c4();original=m.directory_record;file_record=m.file_record
+        def changed(path):
+            value=original(path)
+            if Path(path)==self.f.work/'restore-rehearsal-state':value=dict(value,ino=value['ino']+1)
+            return value
+        def record(path,*args,**kwargs):
+            self.assertNotEqual(Path(path).parent,self.f.bundle/'restore-rehearsal-volume')
+            return file_record(path,*args,**kwargs)
+        with patch.object(m,'C4_SOURCES',sources),patch.object(m,'C4_RESTORED',restored),\
+            patch.object(m,'directory_record',side_effect=changed),patch.object(m,'file_record',side_effect=record):
+            with self.assertRaisesRegex(m.Refused,'rehearsal_receipt_alias_identity'):self.f.engine.receipts()
+    def test_rehearsal_only_exact_two_work_paths_and_physical_hashes_are_admitted(self):
+        sources,restored=self.f.make_c4();path=self.f.work/'restore-rehearsal-receipt.json';original=json.loads(path.read_bytes())
+        cases=[]
+        for replacement in (self.f.bundle/'restore-rehearsal-volume/real-pg-proof.json',
+            self.f.work/'other-rehearsal-state/real-pg-proof.json'):
+            value=copy.deepcopy(original);value['artifacts'][0]['path']=str(replacement);cases.append(value)
+        value=copy.deepcopy(original);value['artifacts'][0]['sha256']='0'*64;cases.append(value)
+        value=copy.deepcopy(original);value['artifacts'].append({'path':str(self.root/'unlisted'),'sha256':'0'*64});cases.append(value)
+        value=copy.deepcopy(original);value['artifacts'].append(copy.deepcopy(value['artifacts'][0]));cases.append(value)
+        with patch.object(m,'C4_SOURCES',sources),patch.object(m,'C4_RESTORED',restored):
+            for value in cases:
+                put(path,value)
+                with self.assertRaisesRegex(m.Refused,'rehearsal_artifact_chain_changed'):self.f.engine.receipts()
+            put(path,original);self.assertEqual(len(self.f.engine.receipts()[0]),8)
+    def test_rehearsal_work_child_metadata_divergence_refuses_with_same_root_identity(self):
+        sources,restored=self.f.make_c4()
+        with patch.object(m,'C4_SOURCES',sources),patch.object(m,'C4_RESTORED',restored):
+            for name in ('real-pg-proof.json','cleanup-completed.json'):
+                alias=self.f.work/'restore-rehearsal-state'/name
+                physical=self.f.bundle/'restore-rehearsal-volume'/name
+                before=physical.read_bytes();original=alias.read_bytes()
+                put(alias,b'divergent child metadata')
+                with self.subTest(name=name),self.assertRaisesRegex(m.Refused,'rehearsal_artifact_chain_changed'):
+                    self.f.engine.receipts()
+                self.assertEqual(physical.read_bytes(),before)
+                put(alias,original)
+            self.assertEqual(len(self.f.engine.receipts()[0]),8)
+    def test_backup_required_keys_must_use_exact_checkpoint_work_alias(self):
+        path=self.f.cp/'backup-receipt.json';original=json.loads(path.read_bytes())
+        for replacement in (self.f.cp/'completed.json',self.f.work/'other-checkpoint-state/completed.json'):
+            value=copy.deepcopy(original);value['artifacts'][0]['path']=str(replacement);put(path,value)
+            with self.assertRaisesRegex(m.Refused,'backup_metadata_artifacts_missing'):self.f.engine.receipts()
+        put(path,original)
+    def test_backup_disposable_work_aliases_refuse_before_any_body_hash(self):
+        sources,restored=self.f.make_c4();path=self.f.cp/'backup-receipt.json';original=json.loads(path.read_bytes())
+        file_record=m.file_record
+        for alias in (self.f.work/'checkpoint-state/pg-clone/payload',
+            self.f.work/'checkpoint-state/rehearsal/writer-cache/payload',
+            self.f.work/'restore-rehearsal-state/runtime/isolated-pv/payload',
+            self.f.work/'restore-rehearsal-state/runtime/cache-writer/payload'):
+            value=copy.deepcopy(original);value['artifacts'].append({'path':str(alias),'sha256':'0'*64});put(path,value)
+            def record(target,*args,**kwargs):
+                self.assertNotEqual(Path(target),alias,'must refuse alias before hashing its body')
+                return file_record(target,*args,**kwargs)
+            with patch.object(m,'C4_SOURCES',sources),patch.object(m,'C4_RESTORED',restored),patch.object(m,'file_record',side_effect=record):
+                with self.assertRaisesRegex(m.Refused,'backup_requires_disposable_copy'):self.f.engine.receipts()
+        put(path,original)
     def test_c4_wrong_source_or_restored_receipt_refuses(self):
         sources,restored=self.f.make_c4()
         with patch.object(m,'C4_SOURCES',sources),patch.object(m,'C4_RESTORED','0'*64):
