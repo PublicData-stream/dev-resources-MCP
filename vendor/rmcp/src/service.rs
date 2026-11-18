@@ -89,11 +89,49 @@ pub enum ServiceError {
     SubscriptionLagged { capacity: usize },
     #[error("task cancelled for reason {}", reason.as_deref().unwrap_or("<unknown>"))]
     Cancelled { reason: Option<String> },
-    #[error("request timeout after {}", chrono::Duration::from_std(*timeout).unwrap_or_default())]
+    #[error("request timeout after {}", format_timeout(*timeout))]
     Timeout { timeout: Duration },
     /// The peer kept returning `input_required` beyond the configured round cap.
     #[error("input_required did not complete within {max_rounds} MRTR rounds")]
     InputRequiredRoundsExceeded { max_rounds: usize },
+}
+
+fn format_timeout(duration: Duration) -> String {
+    // The previous formatter used an ISO 8601 duration bounded by signed milliseconds.
+    if duration.is_zero() || duration.as_nanos() > i64::MAX as u128 * 1_000_000 {
+        return "P0D".into();
+    }
+    let seconds = duration.as_secs();
+    let nanos = duration.subsec_nanos();
+    if nanos == 0 {
+        return format!("PT{seconds}S");
+    }
+    let fraction = format!("{nanos:09}");
+    let fraction = fraction.trim_end_matches('0');
+    format!("PT{seconds}.{fraction}S")
+}
+
+#[cfg(test)]
+mod timeout_display_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_retains_iso_duration_in_display() {
+        let max = Duration::from_millis(i64::MAX as u64);
+        for (timeout, wire) in [
+            (Duration::ZERO, "P0D"),
+            (Duration::from_secs(86_401), "PT86401S"),
+            (Duration::from_millis(1_250), "PT1.25S"),
+            (Duration::from_nanos(1), "PT0.000000001S"),
+            (max, "PT9223372036854775.807S"),
+            (max + Duration::from_nanos(1), "P0D"),
+        ] {
+            assert_eq!(
+                ServiceError::Timeout { timeout }.to_string(),
+                format!("request timeout after {wire}"),
+            );
+        }
+    }
 }
 
 trait TransferObject:

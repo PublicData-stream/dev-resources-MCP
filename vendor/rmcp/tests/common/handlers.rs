@@ -13,6 +13,7 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::*,
     service::{MaybeSendFuture, RequestContext},
+    task_manager::current_timestamp,
 };
 #[cfg(feature = "client")]
 use serde_json::json;
@@ -133,7 +134,7 @@ impl ServerHandler for TestServer {
                         "message": "Failed to process request",
                         "error_code": "E1001",
                         "error_details": "Connection timeout",
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "timestamp": current_timestamp(),
                     }),
                     Some("error_handler".to_string()),
                 ),
@@ -146,7 +147,7 @@ impl ServerHandler for TestServer {
                             "request_id": "req-123",
                             "user_id": "user-456"
                         },
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "timestamp": current_timestamp(),
                     }),
                     Some("debug_logger".to_string()),
                 ),
@@ -159,14 +160,14 @@ impl ServerHandler for TestServer {
                             "average_latency_ms": 45,
                             "error_rate": 0.01
                         },
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "timestamp": current_timestamp(),
                     }),
                     Some("monitoring".to_string()),
                 ),
                 _ => (
                     serde_json::json!({
                         "message": format!("Message at level {:?}", request.level),
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "timestamp": current_timestamp(),
                     }),
                     None,
                 ),

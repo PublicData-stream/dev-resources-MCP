@@ -33,6 +33,7 @@ use crate::{
         CallToolResult, DetailedTask, InputRequest, InputRequests, JsonObject, Task, TaskPayload,
         TaskStatus,
     },
+    timestamp::rfc3339,
 };
 
 /// Default TTL (5 minutes, in milliseconds) applied when none is specified.
@@ -43,7 +44,7 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 
 /// Helper to generate an ISO 8601 timestamp for task metadata.
 pub fn current_timestamp() -> String {
-    chrono::Utc::now().to_rfc3339()
+    rfc3339(jiff::Timestamp::now())
 }
 
 /// Handle passed to a running task operation, allowing it to surface
@@ -572,6 +573,22 @@ mod tests {
 
     fn ok_result(text: &str) -> CallToolResult {
         CallToolResult::success(vec![ContentBlock::text(text.to_string())])
+    }
+
+    #[tokio::test]
+    async fn created_task_preserves_timestamp_wire_representation() {
+        let manager = TaskManager::new();
+        let task = manager.spawn(TaskOptions::default(), |_ctx| {
+            Box::pin(async { Ok(ok_result("42")) })
+        });
+        let value = serde_json::to_value(task).unwrap();
+        for field in ["createdAt", "lastUpdatedAt"] {
+            let wire = value[field].as_str().unwrap();
+            let timestamp = wire.parse::<jiff::Timestamp>().unwrap();
+            assert!(wire.ends_with("+00:00"));
+            assert_eq!(wire, rfc3339(timestamp));
+        }
+        assert_eq!(value["createdAt"], value["lastUpdatedAt"]);
     }
 
     #[tokio::test]

@@ -827,6 +827,11 @@ optional = true
 version = "2"
 features = ["serde"]
 
+[dependencies.jiff]
+version = "0.2.38"
+features = ["std"]
+default-features = false
+
 [dependencies.jsonwebtoken]
 version = "11"
 features = ["aws_lc_rs"]
@@ -868,7 +873,6 @@ optional = true
 
 [dependencies.schemars]
 version = "1.0"
-features = ["chrono04"]
 optional = true
 
 [dependencies.serde]
@@ -961,7 +965,6 @@ version = "0.28.0"
 
 [dev-dependencies.schemars]
 version = "1.1.0"
-features = ["chrono04"]
 
 [dev-dependencies.serde_json]
 version = "1.0"
@@ -988,22 +991,9 @@ features = [
 [dev-dependencies.url]
 version = "2.4"
 
-[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies.chrono]
-version = "0.4.38"
-features = [
-    "serde",
-    "clock",
-    "std",
-    "oldtime",
-]
-default-features = false
-
-[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies.chrono]
-version = "0.4.38"
-features = [
-    "serde",
-    "now",
-]
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies.jiff]
+version = "0.2.38"
+features = ["js"]
 default-features = false
 
 [target."cfg(unix)".dependencies.libc]

@@ -47,7 +47,7 @@ axum = "0.8"
 bytes = "1"
 nix = { version = "0.30", default-features = false, features = ["signal", "process", "resource", "fs"] }
 lopdf = { version = "=0.46.0", default-features = false }
-zip = { version = "=9.0.0", default-features = false, features = ["deflate", "bzip2"] }
+zip = { version = "=9.6.1", default-features = false, features = ["deflate", "bzip2"] }
 csv-core = "0.1"
 pulldown-cmark = { version = "0.13.6", default-features = false }
 regex = "=1.13.1"

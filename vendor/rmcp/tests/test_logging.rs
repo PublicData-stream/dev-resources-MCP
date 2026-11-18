@@ -9,6 +9,7 @@ use common::handlers::{TestClientHandler, TestServer};
 use rmcp::{
     ServiceExt,
     model::{LoggingLevel, LoggingMessageNotificationParam, SetLevelRequestParams},
+    task_manager::current_timestamp,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -31,7 +32,7 @@ async fn test_logging_spec_compliance() -> anyhow::Result<()> {
                     LoggingLevel::Info,
                     serde_json::json!({
                         "message": "Server initiated message",
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "timestamp": current_timestamp(),
                     }),
                 )
                 .with_logger("test_server"),
@@ -87,7 +88,9 @@ async fn test_logging_spec_compliance() -> anyhow::Result<()> {
 
         // Verify timestamp
         let timestamp = data["timestamp"].as_str().unwrap();
-        chrono::DateTime::parse_from_rfc3339(timestamp).expect("RFC3339 timestamp");
+        timestamp
+            .parse::<jiff::Timestamp>()
+            .expect("RFC3339 timestamp");
 
         messages.clear();
     }
@@ -329,7 +332,9 @@ async fn test_logging_optional_fields() -> anyhow::Result<()> {
 
         // Verify timestamp
         let timestamp = data["timestamp"].as_str().unwrap();
-        chrono::DateTime::parse_from_rfc3339(timestamp).expect("RFC3339 timestamp");
+        timestamp
+            .parse::<jiff::Timestamp>()
+            .expect("RFC3339 timestamp");
 
         messages.clear();
     }

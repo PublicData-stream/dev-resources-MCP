@@ -21,16 +21,23 @@ Input staging/copies and status translation participate in the same accounting.
 The existing `serde_json` package additionally enables `raw_value` for borrowed
 request-envelope inspection; it adds no package, version or executable capability.
 This is encoded-buffer admission, not a bound on parsed JSON or total process RSS.
-No client transport, process execution, network destination or dependency version
-is added. Existing features and the upstream build script remain selected as
-before; the lockfile records a local path source instead of a registry source.
+The transport hook adds no client transport, process execution, or network
+destination. The lockfile records a local path source instead of a registry
+source for the SDK.
 
-Keep the patch transport-only and compare it to the exact published source when
-updating the SDK. Audit the upstream version as well as the local changes; a path
-source is not an advisory exemption. Current advisory/license/source checks and
-protocol/admission fixtures are required. Image notice collection includes path
-dependencies outside the first-party workspace and preserves their original
-license texts.
+The SDK patch also removes `chrono` and the `schemars` `chrono04` feature for
+[RUSTSEC-2026-0543](https://github.com/RustSec/advisory-db/blob/main/crates/chrono/RUSTSEC-2026-0543.md).
+The SDK uses the already locked `jiff` 0.2.38 with `std` for UTC timestamps and
+the `js` feature only on browser-style WebAssembly targets. It preserves the
+annotation string representation and UTC fractional precision. `jiff` is
+MIT/Apache-2.0, and the existing SDK build script remains selected. The vendored
+original package metadata remains available for provenance.
+
+Compare both local changes with the exact published source when updating the
+SDK. Audit the upstream version as well as the local changes. Current
+advisory/license/source checks and protocol/admission fixtures are required.
+Image notice collection includes path dependencies outside the first-party
+workspace and preserves their original license texts.
 
 Both advisory scanners skip local path identities. After the ordinary fresh
 `cargo audit`, run `python3 scripts/audit-vendored.py --no-fetch`; CI runs both.
@@ -174,7 +181,7 @@ CI uses locked resolution. No Git dependencies or alternative registries are all
 | html5ever | Streaming HTML tokenization without a DOM, scripting, network or rendering. Direct tokenization avoids CSS dependencies and checks budgets between feeds. Raw captures remain unchanged; fixtures cover entities and active content. |
 | tantivy 0.27 | Embedded positional search over whole RFCs and immutable crate/version/document shards, avoiding PostgreSQL position limits and a separate daemon. Defaults disabled; enable mmap, stemmer, stopwords and LZ4 only. Trusted index paths/schemas, restricted query syntax and verified immutable manifests contain the boundary. Its indexing, compression, tokenizer and proc-macro graph receives current advisory/license/source checks. |
 | base64, tokio-util | Bounded PDF encoding and managed collector/import cancellation. Existing graph packages become direct dependencies; neither enables caller-selected executables. |
-| zip 9.0.0, csv-core | ZIP is needed for the official docs.rs all-target HTML bundle; disabling BZIP2/Deflate would exclude supported provider artifacts. Defaults are disabled; enable only deflate and bzip2, with no encryption/extraction. A hand-written ZIP/decompression stack would duplicate security-sensitive parsing. csv-core supplies allocation-free incremental CSV decoding rather than whole-dump deserialization; an additional strict quoting/size layer rejects malformed input before projection. |
+| zip 9.6.1, csv-core | ZIP is needed for the official docs.rs all-target HTML bundle. Deflate and BZIP2 cover the supported provider artifacts, and default features are disabled. The adapter uses bounded seekable readers for ZIP input. `csv-core` supplies incremental CSV decoding with a strict quoting and size layer before projection. |
 | nix | Signal/process features terminate and reap the owned fixed Git process group on cancellation. Killing only the immediate child can leave Git helpers running; no caller-selected executable or package process is admitted. The existing locked package's `fs` feature exposes safe Linux `syncfs` for bounded offline migration batches; no new package or build script is added. |
 | rustsec, semver | Maintained canonical advisory parsing and version matching rather than reimplementing affected ranges. Disable rustsec defaults, including Git, index lookup, and automatic fix support. |
 | tracing/subscriber | Aggregate operational logging without request bodies or audit inputs. |
@@ -325,13 +332,20 @@ choice and passing hash fixtures do not establish current admission results.
 
 ## Crate corpus dependency boundary
 
-ZIP is pinned to 9.0.0; earlier 8.x candidates failed current advisory admission and
-are not suppressed. The selected deflate feature resolves zlib-rs/zopfli; BZIP2
-uses bzip2 0.6.1 and its Rust libbz2-rs-sys 0.2.5 backend. These parsers inspect
-bounded inert artifacts, including CRCs and central-directory/member identities,
-without extracting paths or enabling encrypted archive support. zip is MIT;
-csv-core is Unlicense/MIT, bzip2 is MIT/Apache-2.0, and original transitive notices
-remain in the build notice inventory. None executes inspected package code.
+ZIP is pinned to 9.6.1 for [RUSTSEC-2026-0548](https://rustsec.org/advisories/RUSTSEC-2026-0548)
+and the upstream follow-up fixes, including the
+[Unicode path fix](https://github.com/zip-rs/zip2/security/advisories/GHSA-fpwh-q2m5-vfm2).
+Both adapter paths inspect and consume members through bounded seekable
+`ZipArchive` readers. They use central-directory member identity and treat file
+contents as inert data. The reported streaming-extraction path is absent from
+these callers. The published ZIP crate is MIT and has no build script.
+
+The selected deflate feature resolves zlib-rs and zopfli. BZIP2 uses bzip2 0.6.1
+and its Rust libbz2-rs-sys 0.2.5 backend. The updated ZIP dependency resolves
+`typed-path` 0.13, `constant_time_eq` 0.6.1 and `zeroize` with its derive support.
+The lockfile also resolves a platform-specific `nix` 0.32 for BSD and macOS.
+Encryption features stay disabled. The original transitive license texts and
+notices remain in the build notice inventory.
 
 `deny.toml` contains an exact `libbz2-rs-sys@0.2.5` exception for `bzip2-1.0.6`.
 The actual permissive license text requires preserving copyright/source attribution
