@@ -242,7 +242,8 @@ class SyntheticFixtureTests(unittest.TestCase):
             cluster = fixture.Cluster('devres-acceptance-fixture', Path(temporary))
             for kind, version, expected, endpoint, namespace in (
                     ('namespace', 'v1', 'NamespaceList', '/api/v1/namespaces?fieldSelector=metadata.name%3Ddevres-assessment', fixture.NAMESPACE),
-                    ('policy', 'networking.k8s.io/v1', 'NetworkPolicyList', '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies?fieldSelector=metadata.name%3Dpostgres-owned-assessment', 'devres-acceptance')):
+                    ('policy', 'networking.k8s.io/v1', 'NetworkPolicyList', '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies?fieldSelector=metadata.name%3Dpostgres-owned-assessment', 'devres-acceptance'),
+                    ('readiness_policy', 'networking.k8s.io/v1', 'NetworkPolicyList', '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies?fieldSelector=metadata.name%3Dpostgres-owned-assessment-readiness', 'devres-acceptance')):
                 body = {'apiVersion': version, 'kind': expected, 'items': []}
                 with self.subTest(kind=kind), patch.object(cluster, 'k', return_value=subprocess.CompletedProcess([], 0, json.dumps(body).encode(), b'')) as calls:
                     self.assertEqual(cluster.owned_objects(kind), [])
@@ -266,7 +267,7 @@ class SyntheticFixtureTests(unittest.TestCase):
         original = '12345678-1234-1234-1234-123456789abc'
         replacement = '23456789-1234-1234-1234-123456789abc'
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
-            for kind in ('namespace', 'policy'):
+            for kind in ('namespace', 'policy', 'readiness_policy'):
                 cluster = fixture.Cluster('devres-acceptance-fixture', Path(temporary))
                 cluster.fixture_owner = owner
                 for scenario in ('uncertain-apply', 'replacement', 'foreign-owner'):
@@ -1138,6 +1139,79 @@ class SyntheticFixtureTests(unittest.TestCase):
         self.assertEqual(outbound[1]['to'][0]['namespaceSelector']['matchLabels']['kubernetes.io/metadata.name'], 'devres-acceptance')
         self.assertEqual(policies[2]['spec']['ingress'][0]['from'][0]['namespaceSelector']['matchLabels']['kubernetes.io/metadata.name'], fixture.NAMESPACE)
 
+    def test_readiness_policy_targets_only_the_allowed_assessment_sender(self):
+        _default, baseline_outbound, baseline_inbound = fixture.policies()
+        outbound, inbound = fixture.readiness_policies()
+        self.assertEqual(outbound['spec']['policyTypes'], ['Ingress', 'Egress'])
+        self.assertNotIn('ingress', outbound['spec'])
+        self.assertEqual(outbound['spec']['podSelector'], {'matchLabels': {'app': 'devres-npm-assessment'}})
+        self.assertEqual(outbound['spec']['egress'], baseline_outbound['spec']['egress'])
+        self.assertEqual(inbound['spec']['podSelector'], baseline_inbound['spec']['podSelector'])
+        rule, = inbound['spec']['ingress']
+        self.assertEqual(rule['ports'], [{'port': 5432, 'protocol': 'TCP'}])
+        self.assertEqual(rule['from'], [{
+            'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': fixture.NAMESPACE}},
+            'podSelector': {'matchLabels': {'app': 'devres-npm-assessment', 'devres-assessment': 'cold-readiness'}},
+        }])
+
+    def test_readiness_requires_single_cli_and_denial_stops_before_sql_setup(self):
+        def event(phase, outcome, reason='none', elapsed_ms=None, child_exit=None):
+            return {'phase': phase, 'outcome': outcome, 'reason': reason,
+                    'elapsed_ms': elapsed_ms, 'child_exit': child_exit}
+
+        start = [event('cli_start', 'start'), event('sql_connect', 'start', elapsed_ms=1)]
+        retry = event('sql_connect_retry', 'error', 'timeout', elapsed_ms=3001)
+        sql_setup = [event('sql_setup', 'start'), event('sql_setup', 'ok')]
+        connected = [event('sql_connect', 'ok'), *sql_setup, event('cli_exit', 'ok', child_exit=0)]
+        timed_out = [event('sql_connect', 'error', 'timeout', elapsed_ms=30_002),
+                     event('cli_exit', 'error', 'unknown', child_exit=1)]
+        for retries in ([], [retry]):
+            fixture.validate_readiness_result({'case': 'cold-readiness', 'phase': 'report_transferred',
+                                               'events': [*start, *retries, *connected]})
+        denial = {'case': 'readiness-denied', 'phase': 'terminal', 'exit_code': 1,
+                  'diagnostics': [*start, retry, *timed_out]}
+        fixture.validate_readiness_result(denial)
+        for invalid in ([*start, *timed_out], [*start, retry, retry, *timed_out],
+                        [*start, retry, *sql_setup, *timed_out], [*start, retry, *timed_out, *start],
+                        [*start, retry, {**timed_out[0], 'elapsed_ms': 3002}, timed_out[1]]):
+            with self.subTest(diagnostics=invalid), self.assertRaisesRegex(fixture.FixtureError, 'assessment_readiness_result'):
+                fixture.validate_readiness_result({**denial, 'diagnostics': invalid})
+
+    def test_cold_readiness_uses_create_only_and_production_assessment_label(self):
+        api = fixture.helper()
+        selected = {'job_id': 'blake3:' + '1' * 64, 'revision': 1}
+        with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+            cluster = fixture.Cluster('devres-acceptance-fixture', Path(temporary))
+            cluster.expected_image = IDENTITY
+            admitted = {}
+            uid = '12345678-1234-1234-1234-123456789abc'
+
+            def create(pod):
+                self.assertEqual(pod['metadata']['labels'], {
+                    'app': 'devres-npm-assessment', 'devres-assessment': 'cold-readiness'})
+                self.assertIn('--connect-readiness wait', pod['spec']['containers'][0]['command'][-1])
+                admitted.update(copy.deepcopy(pod))
+                admitted['metadata']['uid'] = uid
+
+            def supervise(*, get_pod, cleanup, **_kwargs):
+                try:
+                    self.assertEqual(get_pod()['metadata']['uid'], uid)
+                    admitted['metadata']['labels'] = {'app': 'backend'}
+                    get_pod()
+                finally:
+                    cleanup()
+
+            with patch.object(cluster, 'create', side_effect=create) as created, \
+                 patch.object(cluster, 'apply') as applied, \
+                 patch.object(cluster, 'pod', side_effect=lambda _name: admitted), \
+                 patch.object(cluster, 'delete') as deleted, \
+                 patch.object(api, 'supervise', side_effect=supervise):
+                with self.assertRaisesRegex(fixture.FixtureError, 'assessment_readiness_labels_changed'):
+                    fixture.assess(cluster, 'candidate:server', selected, api, 'cold-readiness')
+                created.assert_called_once()
+                applied.assert_not_called()
+                deleted.assert_called_once_with('assessment-cold-readiness', uid)
+
     def test_effective_runtime_accepts_only_expected_policy_and_finite_metadata(self):
         payload = (b'APPARMOR=devres-runtime (enforce)\nSECCOMP=2\nNO_NEW_PRIVS=1\n'
                    b'CAP_EFF=0000000000000000\nCONFIG=0:65532:440\nTMP=0:65532:2777\n')
@@ -1195,6 +1269,8 @@ class SyntheticFixtureTests(unittest.TestCase):
             def __init__(self): self.calls = []
             def sql(self, value):
                 self.calls.append(value)
+                if value == 'SHOW ssl':
+                    return b'off\n'
                 return ('blake3:' + '1' * 64).encode()
         cluster = Cluster()
         expected = {'malformed-config': 'config_load', 'wrong-dns': 'sql_connect', 'bad-password': 'sql_connect',
@@ -1202,19 +1278,28 @@ class SyntheticFixtureTests(unittest.TestCase):
                     'wrong-schema': 'schema', 'missing-grant': 'history_select',
                     'output-symlink': 'output_create', 'output-wrong-mode': 'output_create',
                     'output-wrong-owner': 'output_create', 'restore-pending': 'schema',
-                    'corrupt-history': 'history_select', 'held-lifecycle': 'lifecycle'}
-        def assess(_cluster, _image, _selected, _api, case):
+                    'corrupt-history': 'history_select', 'held-lifecycle': 'lifecycle', 'required-tls': 'sql_connect'}
+        readiness_enabled = []
+        def assess(_cluster, _image, _selected, _api, case, *, connect_readiness=False):
+            if connect_readiness:
+                readiness_enabled.append(case)
             if case == 'telemetry-unavailable':
                 return {'phase': 'report_transferred', 'events': None}
             return {'phase': 'terminal', 'exit_code': 1, 'diagnostics': [
                 {'phase': 'cli_start', 'outcome': 'start'},
-                {'phase': expected[case], 'outcome': 'error'},
+                {'phase': expected[case], 'outcome': 'error', 'reason': fixture.READINESS_FAULTS.get(case)},
                 {'phase': 'cli_exit', 'outcome': 'ok' if case == 'ready-denied' else 'error',
                  'child_exit': 0 if case == 'ready-denied' else 1}]}
         with patch.object(fixture, 'snapshot', return_value={'fixture': 'unchanged'}), \
-             patch.object(fixture, 'set_config'), patch.object(fixture, 'assess', side_effect=assess), \
+             patch.object(fixture, 'set_config') as set_config, patch.object(fixture, 'assess', side_effect=assess), \
              patch.object(fixture, 'lifecycle_exclusion', return_value=contextlib.nullcontext()):
-            self.assertEqual(len(fixture.failure_matrix(cluster, 'server', {}, None, 'synthetic config', 'harness')), 14)
+            config = '[storage]\ndatabase_url="' + fixture.DATABASE_READER + '"\n'
+            self.assertEqual(len(fixture.failure_matrix(cluster, 'server', {}, None, config, 'harness')), 14)
+            self.assertEqual(readiness_enabled, [])
+            self.assertEqual(len(fixture.failure_matrix(cluster, 'server', {}, None, config, 'harness',
+                                                        connect_readiness=True)), 15)
+            self.assertEqual(readiness_enabled, list(fixture.READINESS_FAULTS))
+            self.assertTrue(any('?sslmode=require' in call.args[1] for call in set_config.call_args_list))
         self.assertIn('UPDATE devres_schema SET version=19 WHERE singleton', cluster.calls)
         self.assertIn('GRANT SELECT ON devres_npm_advisory_job_history TO devres_assessment_reader', cluster.calls)
         with patch.object(fixture, 'snapshot', return_value={}), patch.object(fixture, 'set_config'), \

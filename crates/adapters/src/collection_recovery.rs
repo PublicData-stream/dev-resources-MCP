@@ -88,5 +88,6 @@ pub struct CollectionRecoveryReport {
 
 pub use crate::storage::collection_recovery::{
     apply_npm_recovery, diagnose_npm_recovery, diagnose_npm_recovery_with_diagnostics,
-    inspect_npm_recovery_operation, run_npm_recovery, verify_npm_recovery_evidence,
+    diagnose_npm_recovery_with_readiness, inspect_npm_recovery_operation, run_npm_recovery,
+    verify_npm_recovery_evidence,
 };

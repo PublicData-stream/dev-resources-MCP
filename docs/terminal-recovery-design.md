@@ -143,6 +143,16 @@ closed events into a File-only kubelet termination record and records the numeri
 child exit separately from READY/hold and container termination. Missing telemetry
 is unknown evidence, not eligibility or a reason to retry.
 
+An independently admitted npm assessment with a compatible server image can
+also pass `--connect-readiness wait`. The CLI uses its configured reader
+connection and authentication settings. It gives PostgreSQL startup up to
+30 seconds, with up to three seconds per attempt and waits of 250 ms, 500 ms,
+one second, and at most two seconds thereafter. Only transient socket failures
+and attempt timeouts are retried. The authenticated session runs the assessment
+once. The optional diagnostics record the first retryable failure and the final
+connection result. The flag is scoped to npm `dry-run`; the default remains a
+single connection attempt.
+
 A status-only listener configuration cannot authorize recovery apply/run,
 rebuild/import, migration, activation or object-storage maintenance. Use separately
 admitted maintenance configuration and credentials outside the paused phase.

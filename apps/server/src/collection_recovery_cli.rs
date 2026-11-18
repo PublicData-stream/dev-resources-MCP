@@ -25,6 +25,7 @@ pub struct Arguments {
     pub artifact: Option<PathBuf>,
     pub evidence: Option<PathBuf>,
     pub checkpoint: Option<PathBuf>,
+    pub connect_readiness: bool,
 }
 fn invalid() -> Error {
     Error::invalid("Invalid exact offline recovery command; see docs/terminal-recovery-design.md.")
@@ -61,6 +62,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
                 | "--job-key"
                 | "--attribution-target"
                 | "--phase-file"
+                | "--connect-readiness"
         ) || value.starts_with('-')
             || flags.insert(flag, value.clone()).is_some()
         {
@@ -70,6 +72,11 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
     }
     let config = PathBuf::from(&args[2]);
     let provider = flags.remove("--provider").ok_or_else(invalid)?;
+    let connect_readiness = match flags.remove("--connect-readiness").as_deref() {
+        None => false,
+        Some("wait") if action == Action::DryRun && provider == "npm" => true,
+        Some(_) => return Err(invalid()),
+    };
     let output = PathBuf::from(flags.remove("--output").ok_or_else(invalid)?);
     private_path(&output)?;
     let phase_file = flags.remove("--phase-file").map(PathBuf::from);
@@ -164,6 +171,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
         artifact,
         evidence,
         checkpoint,
+        connect_readiness,
     })
 }
 fn hash(v: &str) -> bool {
@@ -324,6 +332,35 @@ mod tests {
         *same_parent.last_mut().unwrap() = "/tmp/owned/status".into();
         assert!(parse(&same_parent).is_err());
         assert!(parse(&args("apply", &base)).is_err());
+    }
+    #[test]
+    fn connect_readiness_is_an_explicit_npm_dry_run_option() {
+        let id = format!("blake3:{}", "a".repeat(64));
+        let base = [
+            "--job-id",
+            &id,
+            "--revision",
+            "1",
+            "--recipe",
+            devres_adapters::collection_recovery::NPM_RECOVERY_RECIPE,
+        ];
+        assert!(!parse(&args("dry-run", &base)).unwrap().connect_readiness);
+        let mut ready = args("dry-run", &base);
+        ready.extend(["--connect-readiness", "wait"].map(str::to_owned));
+        assert!(parse(&ready).unwrap().connect_readiness);
+        for action in ["verify-evidence", "apply", "run"] {
+            let mut rejected = ready.clone();
+            rejected[1] = action.into();
+            assert!(parse(&rejected).is_err());
+        }
+        let mut rejected = ready.clone();
+        rejected[4] = "rfc".into();
+        assert!(parse(&rejected).is_err());
+        let mut duplicate = ready.clone();
+        duplicate.extend(["--connect-readiness", "wait"].map(str::to_owned));
+        assert!(parse(&duplicate).is_err());
+        *ready.last_mut().unwrap() = "forever".into();
+        assert!(parse(&ready).is_err());
     }
     #[test]
     fn real_report_write_and_sync_failures_have_distinct_closed_phases() {

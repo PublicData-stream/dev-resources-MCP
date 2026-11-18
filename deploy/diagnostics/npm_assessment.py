@@ -29,12 +29,13 @@ MAX_PHASE_BYTES = 3072
 MAX_PHASE_EVENTS = 48
 MAX_STREAM = MAX_REPORT + MAX_PHASE_BYTES + 256
 PHASES = frozenset(('wrapper_start', 'cli_start', 'cli_exit', 'ready_write', 'hold_start',
-    'parse', 'output_create', 'config_load', 'sql_connect', 'sql_setup', 'lifecycle', 'schema',
-    'policy', 'transaction', 'history_select', 'state_select', 'eligibility', 'rollback',
-    'report_serialize', 'report_write', 'report_sync'))
+    'parse', 'output_create', 'config_load', 'sql_connect', 'sql_connect_retry', 'sql_setup',
+    'lifecycle', 'schema', 'policy', 'transaction', 'history_select', 'state_select', 'eligibility',
+    'rollback', 'report_serialize', 'report_write', 'report_sync'))
 WRAPPER_PHASES = frozenset(('wrapper_start', 'cli_start', 'cli_exit', 'ready_write', 'hold_start'))
 REASONS = frozenset(('none', 'invalid', 'unavailable', 'permission', 'authentication',
-    'connection', 'timeout', 'lock_busy', 'schema', 'integrity', 'missing', 'io', 'capacity', 'unknown'))
+    'connection', 'timeout', 'cancelled', 'lock_busy', 'schema', 'integrity', 'missing', 'io',
+    'capacity', 'unknown'))
 POD_REASONS = frozenset(('Completed', 'Error', 'OOMKilled', 'ContainerCannotRun', 'StartError',
     'DeadlineExceeded', 'Evicted', 'NodeLost', 'ContainerCreating', 'PodInitializing', 'ErrImagePull',
     'ImagePullBackOff', 'CrashLoopBackOff', 'CreateContainerConfigError', 'CreateContainerError',
@@ -70,24 +71,27 @@ def _private_path(value):
 
 
 def wrapper_script(selection, *, cli='/usr/local/bin/devres-server', report=REPORT,
-                   phase_file=PHASE_FILE, termination_file=TERMINATION_FILE, hold_seconds=120):
+                   phase_file=PHASE_FILE, termination_file=TERMINATION_FILE, hold_seconds=120,
+                   connect_readiness=False):
     """Single CLI attempt; telemetry failure cannot replace the child's status.
 
-    Optional paths/hold support isolated first-party fixtures, never caller input
-    or inspected package execution. build_assessment_pod uses the fixed defaults.
+    Optional paths/hold support isolated first-party fixtures. Enable connection
+    readiness only with a compatible server image.
     """
     selection.validate()
     report_path, phases = _private_path(report), _private_path(phase_file)
     if termination_file != TERMINATION_FILE:
         _private_path(termination_file)
-    need(report_path.parent != phases.parent and type(hold_seconds) is int
+    need(report_path.parent != phases.parent and type(hold_seconds) is int and type(connect_readiness) is bool
          and 0 <= hold_seconds <= 120 and PurePosixPath(cli).is_absolute(), 'invalid_assessment_wrapper')
     ready = str(report_path.parent / 'ready')
     q = shlex.quote
-    command = ' '.join(q(value) for value in (cli, 'recover-collection', 'dry-run',
+    args = (cli, 'recover-collection', 'dry-run',
         '/etc/devres/config/serving.toml', '--provider', 'npm', '--job-id', selection.job_id,
-        '--revision', str(selection.revision), '--recipe', selection.recipe, '--output', report,
-        ))
+        '--revision', str(selection.revision), '--recipe', selection.recipe, '--output', report)
+    if connect_readiness:
+        args += ('--connect-readiness', 'wait')
+    command = ' '.join(q(value) for value in args)
     return (
         'set -u\numask 077\ntelemetry=0\ntermination=0\n'
         # A new private directory plus noclobber file prevents link/replace reuse.
@@ -137,6 +141,7 @@ def parse_phases(body):
     need(1 <= len(rows) <= MAX_PHASE_EVENTS, 'phase_record_bound')
     result = []
     elapsed = 0
+    retry_seen = False
     for ordinal, row in enumerate(rows):
         fields = row.split('\t')
         need(len(fields) == 6, 'phase_record_invalid')
@@ -145,6 +150,12 @@ def parse_phases(body):
              and reason in REASONS and re.fullmatch(r'0|[1-9][0-9]{0,18}', millis)
              and int(millis) <= 2**63-1, 'phase_record_invalid')
         need((outcome == 'error') == (reason != 'none'), 'phase_record_invalid')
+        if phase == 'sql_connect_retry':
+            need(not retry_seen and outcome == 'error' and reason in ('connection', 'timeout'),
+                 'phase_record_invalid')
+            retry_seen = True
+        if reason == 'cancelled':
+            need(phase == 'sql_connect' and outcome == 'error', 'phase_record_invalid')
         if phase == 'cli_exit':
             need(re.fullmatch(r'0|[1-9][0-9]{0,2}', child) and int(child) <= 255
                  and (int(child) == 0) == (outcome == 'ok'), 'phase_record_invalid')
@@ -224,7 +235,8 @@ def pod_failure_metadata(pod):
         'containers': containers}
 
 
-def build_assessment_pod(template, image, selection, name, namespace, scope='fixture'):
+def build_assessment_pod(template, image, selection, name, namespace, scope='fixture', *,
+                         connect_readiness=False):
     selection.validate()
     need(all(type(value) is str and re.fullmatch('[a-z0-9][a-z0-9-]{0,62}', value)
              for value in (name, namespace, scope)), 'invalid_assessment_identity')
@@ -262,7 +274,7 @@ def build_assessment_pod(template, image, selection, name, namespace, scope='fix
     container['terminationMessagePath'] = TERMINATION_FILE
     container['terminationMessagePolicy'] = 'File'
     container['command'] = ['/usr/bin/timeout', '--signal=TERM', '--kill-after=5s', '420s',
-                            '/bin/sh', '-c', wrapper_script(selection)]
+                            '/bin/sh', '-c', wrapper_script(selection, connect_readiness=connect_readiness)]
     for key in ('args', 'ports', 'readinessProbe', 'livenessProbe', 'startupProbe', 'env', 'envFrom', 'lifecycle'):
         container.pop(key, None)
     return {'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name, 'namespace': namespace,

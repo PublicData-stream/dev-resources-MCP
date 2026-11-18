@@ -3,6 +3,86 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
+fn readiness_retries_only_the_transient_socket_allowlist() {
+    use std::io::ErrorKind;
+
+    for kind in [
+        ErrorKind::ConnectionRefused,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::ConnectionReset,
+        ErrorKind::NotConnected,
+        ErrorKind::NetworkUnreachable,
+        ErrorKind::HostUnreachable,
+    ] {
+        assert!(matches!(
+            startup_retry_reason(&sqlx_core::Error::Io(kind.into())),
+            Some(Reason::Connection)
+        ));
+    }
+    assert!(matches!(
+        startup_retry_reason(&sqlx_core::Error::Io(ErrorKind::TimedOut.into())),
+        Some(Reason::Timeout)
+    ));
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::InvalidData,
+        ErrorKind::UnexpectedEof,
+        ErrorKind::Other,
+    ] {
+        assert!(startup_retry_reason(&sqlx_core::Error::Io(kind.into())).is_none());
+    }
+    assert!(startup_retry_reason(&sqlx_core::Error::Protocol("synthetic".into())).is_none());
+    assert!(
+        startup_retry_reason(&sqlx_core::Error::Tls(
+            std::io::Error::from(ErrorKind::InvalidData).into()
+        ))
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn readiness_replaces_a_hung_startup_and_cancellation_closes_its_socket() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("postgresql://fixture@{address}/fixture?sslmode=disable");
+    let cancel = CancellationToken::new();
+    let startup = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            connection_with_diagnostics(&url, false, &Diagnostics::default(), Some(&cancel)).await
+        }
+    });
+    let (mut first, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut second, _) = timeout(Duration::from_secs(6), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    cancel.cancel();
+    let outcome = timeout(Duration::from_secs(2), startup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.err().unwrap().code, "cancelled");
+    for socket in [&mut first, &mut second] {
+        let received = timeout(
+            Duration::from_secs(2),
+            socket.take(4096).read_to_end(&mut Vec::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(received < 4096);
+    }
+}
+
+#[test]
 fn future_scanner_does_not_reinterpret_registered_recipe_metadata() {
     let body = crate::integrity::hash(b"x");
     let job = json!({"snapshot":crate::integrity::hash(b"retained job"),"artifact":{"body_hash":body,"bytes":1,"relative_path":crate::integrity::relative_path(&body).unwrap().to_string_lossy()},"validated_at":devres_domain::unix_now(),"next":0,"records":0,"gaps":0,"done":true,"failed":"capacity","processor_version":1,"failure_context":{"version":1,"code":"capacity","materialization_deadline":true}});

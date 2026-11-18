@@ -54,8 +54,14 @@ class ClosedPhases(unittest.TestCase):
         self.assertEqual(container['terminationMessagePolicy'], 'File')
         self.assertNotEqual(n.TERMINATION_FILE, n.PHASE_FILE)
         self.assertFalse(value['spec']['automountServiceAccountToken'])
+        self.assertNotIn('--connect-readiness', container['command'][-1])
         self.assertEqual(subprocess.run(['/bin/sh', '-n', '-c', container['command'][-1]],
             capture_output=True).returncode, 0)
+        with_readiness = n.build_assessment_pod(template, 'pinned', SELECTION, 'assessment',
+            'fixture', connect_readiness=True)
+        command = with_readiness['spec']['containers'][0]['command']
+        self.assertEqual(command[:-1], container['command'][:-1])
+        self.assertIn('--connect-readiness wait', command[-1])
         for change in ({'runAsUser': 0}, {'runAsNonRoot': False}, {'runAsGroup': 0},
                 {'seccompProfile': {'type': 'Unconfined'}}, {'appArmorProfile': {'type': 'Unconfined'}},
                 {'procMount': 'Unmasked'}):
@@ -75,6 +81,22 @@ class ClosedPhases(unittest.TestCase):
                 b'1\tunknown_phase\tok\tnone\t0\t-\n'):
             with self.subTest(value=value[:80]), self.assertRaises(n.AssessmentError):
                 n.parse_phases(value)
+
+    def test_connection_readiness_has_closed_retry_and_cancellation_records(self):
+        start = b'1\tsql_connect\tstart\tnone\t0\t-\n'
+        retry = b'1\tsql_connect_retry\terror\tconnection\t4\t-\n'
+        cancel = b'1\tsql_connect\terror\tcancelled\t8\t-\n'
+        events = n.parse_phases(start + retry + cancel)
+        self.assertEqual([event['reason'] for event in events], ['none', 'connection', 'cancelled'])
+        recovered = n.parse_phases(start + retry.replace(b'\tconnection\t', b'\ttimeout\t')
+            + b'1\tsql_connect\tok\tnone\t8\t-\n')
+        self.assertEqual(recovered[1]['reason'], 'timeout')
+        self.assertEqual(recovered[-1]['outcome'], 'ok')
+        for value in (retry + retry, retry.replace(b'\terror\tconnection\t', b'\tstart\tnone\t'),
+                retry.replace(b'\tconnection\t', b'\tauthentication\t'),
+                cancel.replace(b'\tsql_connect\t', b'\tsql_setup\t')):
+            with self.subTest(value=value), self.assertRaises(n.AssessmentError):
+                n.parse_phases(start + value)
 
     def test_terminal_metadata_is_file_only_and_identity_fenced(self):
         message = '1\tcli_exit\terror\tunknown\t0\t7\n'
@@ -107,25 +129,32 @@ class ClosedPhases(unittest.TestCase):
 
 
 class RealWrapper(unittest.TestCase):
-    def run_case(self, exit_code=0, marker_failure=False, telemetry_failure=False):
+    def run_case(self, exit_code=0, marker_failure=False, telemetry_failure=False,
+                 connect_readiness=False):
         scratch = tempfile.TemporaryDirectory(prefix='devres-assessment-wrapper-', dir='/tmp')
         self.addCleanup(scratch.cleanup)
         root = Path(scratch.name)
         cli = root/'cli'
+        phase_file = root/'phases'/'status'
+        expected_args = ['--connect-readiness', 'wait'] if connect_readiness else []
+        if not telemetry_failure:
+            expected_args += ['--phase-file', str(phase_file)]
         cli.write_text('#!'+sys.executable+'\nimport json,pathlib,sys\n'
-            +'args=sys.argv[1:]\noutput=pathlib.Path(args[args.index("--output")+1])\n'
+            +'args=sys.argv[1:]\noutput_flag=args.index("--output")\n'
+            +'assert args[output_flag+2:]=='+repr(expected_args)+'\n'
+            +'output=pathlib.Path(args[output_flag+1])\n'
             +'output.parent.mkdir(mode=0o700)\n'
             +'output.write_text('+repr(json.dumps(report())+'\n')+')\n'
             +('output.with_name("ready").mkdir()\n' if marker_failure else '')
             +'raise SystemExit('+str(exit_code)+')\n')
         cli.chmod(0o700)
-        phase_file = root/'phases'/'status'
         if telemetry_failure:
             phase_file.parent.mkdir()
             phase_file.write_text('previous private artifact')
         termination = root/'termination'; termination.touch(mode=0o600)
         script = n.wrapper_script(SELECTION, cli=str(cli), report=str(root/'report'/'report.json'),
-            phase_file=str(phase_file), termination_file=str(termination), hold_seconds=0)
+            phase_file=str(phase_file), termination_file=str(termination), hold_seconds=0,
+            connect_readiness=connect_readiness)
         result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, timeout=5)
         return result, phase_file, termination, root/'report'/'report.json'
 
@@ -156,6 +185,17 @@ class RealWrapper(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertEqual(phases.read_text(), 'previous private artifact')
         self.assertEqual(n.parse_phases(termination.read_bytes())[-1]['child_exit'], 7)
+
+    def test_connection_readiness_opt_in_is_independent_of_telemetry(self):
+        for telemetry_failure in (False, True):
+            with self.subTest(telemetry_failure=telemetry_failure):
+                result, _, termination, output = self.run_case(telemetry_failure=telemetry_failure,
+                    connect_readiness=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(output.is_file())
+                events = n.parse_phases(termination.read_bytes())
+                self.assertEqual(sum(event['phase'] == 'cli_start' for event in events), 1)
+                self.assertEqual(sum(event['phase'] == 'cli_exit' for event in events), 1)
 
 
 class Supervisor(unittest.TestCase):

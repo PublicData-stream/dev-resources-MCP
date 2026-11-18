@@ -943,7 +943,8 @@ async fn run_collection_recovery_command(args: &[String]) -> Result<(), ServerEr
     use devres_adapters::collection_recovery::diagnostics::{Phase, Reason};
     use devres_adapters::collection_recovery::{
         RecoveryCheckpoint, RecoveryEvidenceReceipt, apply_npm_recovery,
-        diagnose_npm_recovery_with_diagnostics, run_npm_recovery, verify_npm_recovery_evidence,
+        diagnose_npm_recovery_with_diagnostics, diagnose_npm_recovery_with_readiness,
+        run_npm_recovery, verify_npm_recovery_evidence,
     };
     let diagnostics = collection_recovery_cli::diagnostics(args);
     diagnostics.start(Phase::Parse);
@@ -1010,7 +1011,11 @@ async fn run_collection_recovery_command(args: &[String]) -> Result<(), ServerEr
                     collection_recovery_cli::write_report_with_diagnostics(output, &receipt, &diagnostics)?;
                 }
                 Action::DryRun => {
-                    let report = diagnose_npm_recovery_with_diagnostics(&config.storage.database_url, options, evidence.as_ref(), &diagnostics).await?;
+                    let report = if arguments.connect_readiness {
+                        diagnose_npm_recovery_with_readiness(&config.storage.database_url, options, evidence.as_ref(), &diagnostics, &cancel).await?
+                    } else {
+                        diagnose_npm_recovery_with_diagnostics(&config.storage.database_url, options, evidence.as_ref(), &diagnostics).await?
+                    };
                     collection_recovery_cli::write_report_with_diagnostics(output, &report, &diagnostics)?;
                 }
                 Action::Apply => {

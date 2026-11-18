@@ -9,21 +9,27 @@ credential_broker=0
 live_rfc_args=()
 supplied_image=
 npm_assessment_image=
+npm_assessment_readiness=()
 while (( $# )); do
   case "$1" in
     --image) [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo '--image requires an image' >&2; exit 2; }; supplied_image=$2; shift 2 ;;
     --npm-assessment-image) [[ $# -ge 2 && -n $2 && $2 != -* ]] || { echo '--npm-assessment-image requires the Dockerfile server image' >&2; exit 2; }; npm_assessment_image=$2; shift 2 ;;
+    --npm-assessment-readiness) npm_assessment_readiness=(--connect-readiness); shift ;;
     --live) live=1; shift ;;
     --s3) s3=1; shift ;;
     --credential-broker) credential_broker=1; shift ;;
     --rfc-text-only) live_rfc_args=(--rfc-text-only); shift ;;
-    *) echo 'usage: scripts/test-minikube.sh [--image IMAGE] [--npm-assessment-image SERVER_IMAGE] [--s3 [--credential-broker]] [--live [--rfc-text-only]]' >&2; exit 2 ;;
+    *) echo 'usage: scripts/test-minikube.sh [--image IMAGE] [--npm-assessment-image SERVER_IMAGE [--npm-assessment-readiness]] [--s3 [--credential-broker]] [--live [--rfc-text-only]]' >&2; exit 2 ;;
   esac
 done
 if (( ! live && ${#live_rfc_args[@]} )); then echo '--rfc-text-only requires --live' >&2; exit 2; fi
 if (( s3 && live )); then echo '--s3 is an isolated fixture scenario and does not accept --live' >&2; exit 2; fi
 if (( credential_broker && ! s3 )); then echo '--credential-broker requires --s3' >&2; exit 2; fi
 if [[ -n $npm_assessment_image ]] && (( live )); then echo '--npm-assessment-image is synthetic and does not accept --live' >&2; exit 2; fi
+if ((${#npm_assessment_readiness[@]})) && [[ -z $npm_assessment_image ]]; then
+  echo '--npm-assessment-readiness requires --npm-assessment-image' >&2
+  exit 2
+fi
 # Canonical synthetic RFC captures must never satisfy later live-provider probes.
 collector_providers=(w3c chromium)
 if (( ! live )); then collector_providers+=(rfc rustsec); fi
@@ -233,7 +239,7 @@ k patch deployment writer --type=json -p='[
 k rollout status deployment/postgres --timeout=180s
 if [[ -n $npm_assessment_image ]]; then
   python3 -I -B scripts/npm-assessment-fixture.py --profile "$profile" --scratch "$scratch" \
-    --harness-image "$image" --server-image "$npm_assessment_image"
+    --harness-image "$image" --server-image "$npm_assessment_image" "${npm_assessment_readiness[@]}"
 fi
 k exec -i deployment/postgres -- psql -v ON_ERROR_STOP=1 -U devres -d devres < "$scratch/reader-role.sql" >/dev/null
 if (( credential_broker )); then

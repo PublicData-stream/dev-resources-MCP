@@ -164,3 +164,35 @@ All fixture state belongs below `/tmp`; Cargo target remains `/tmp/rust/target`.
 Native arm64 hosted CI, registry publication, live providers, full corpus/body
 verification, production activation and a fresh production fallback cycle remain
 separate, unexecuted claims. No push, release or deployment was performed.
+
+## PostgreSQL startup readiness qualification
+
+For a candidate with `--connect-readiness wait`, add
+`--npm-assessment-readiness` to the exact-image Minikube command above. This
+adds cold-start and persistent ingress-denial cases using the production
+assessment label. The fixture also checks that configuration, authentication,
+TLS and post-connect failures end the assessment without another connection
+attempt. The existing Minikube run establishes the separate AppArmor boundary.
+
+Run the [offline K3s fixture](../scripts/test-k3s-npm-readiness.py) with the
+same server image and synthetic seed harness. Load the pinned K3s and PostgreSQL
+images into the local rootful Docker daemon with storage below `/tmp`. Download
+the official K3s amd64 air-gap archive to a private directory below `/tmp`. The
+fixture verifies the archive hash and imports the images into an isolated node.
+[K3s v1.37.2+k3s1 artifacts](https://github.com/k3s-io/k3s/releases/tag/v1.37.2%2Bk3s1)
+
+```sh
+python3 -B scripts/test-k3s-npm-readiness.py \
+  --server-image SERVER_IMAGE --harness-image HARNESS_IMAGE \
+  --airgap-images /tmp/OWNED_DIR/k3s-airgap-images-amd64.tar.zst \
+  --receipt /tmp/OWNED_DIR/npm-readiness.json
+```
+
+The K3s receipt records ten fresh starts in the production policy-before-Pod
+order, one controlled delay until the same Pod observes a retryable failure, and
+one persistently denied connection. Require one `legacy_unknown` report after
+the controlled delay, bounded failure before SQL when denial persists, denial
+of an unrelated ready PostgreSQL Service, and identical retained metadata.
+The receipt distinguishes API observations from observed node rule membership.
+Recovery from a controlled delay establishes the mitigation under those test
+conditions. The historical production failure remains unresolved.

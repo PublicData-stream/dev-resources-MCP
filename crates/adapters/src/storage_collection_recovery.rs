@@ -9,6 +9,7 @@ use crate::collection_recovery::{
 use devres_application::npm::{NpmStore, PROCESSOR_VERSION};
 use serde_json::{Value, json};
 use sqlx_core::types::Json;
+use sqlx_postgres::PgConnectOptions;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -540,17 +541,37 @@ pub(crate) async fn verify_history(
 }
 
 async fn connection(database_url: &str, apply: bool) -> Result<PgConnection> {
-    connection_with_diagnostics(database_url, apply, &Diagnostics::default()).await
+    connection_with_diagnostics(database_url, apply, &Diagnostics::default(), None).await
 }
 async fn connection_with_diagnostics(
     database_url: &str,
     apply: bool,
     diagnostics: &Diagnostics,
+    readiness: Option<&CancellationToken>,
 ) -> Result<PgConnection> {
     diagnostics.start(Phase::SqlConnect);
-    let mut conn = PgConnection::connect(database_url)
-        .await
-        .map_err(|error| sql_failure(diagnostics, Phase::SqlConnect, &error))?;
+    let mut conn = if let Some(cancel) = readiness {
+        let options: PgConnectOptions = database_url.parse().map_err(|_| {
+            diagnostics.fail(Phase::SqlConnect, Reason::Invalid);
+            unavailable()
+        })?;
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                diagnostics.fail(Phase::SqlConnect, Reason::Cancelled);
+                return Err(Error::new("cancelled", "Collection recovery cancelled."));
+            }
+            result = connect_when_ready(&options, diagnostics) => result,
+        };
+        result.map_err(|reason| {
+            diagnostics.fail(Phase::SqlConnect, reason);
+            unavailable()
+        })?
+    } else {
+        PgConnection::connect(database_url)
+            .await
+            .map_err(|error| sql_failure(diagnostics, Phase::SqlConnect, &error))?
+    };
     diagnostics.ok(Phase::SqlConnect);
     diagnostics.start(Phase::SqlSetup);
     sqlx_core::raw_sql::raw_sql("SET statement_timeout='3000ms'; SET lock_timeout='1000ms'")
@@ -609,6 +630,57 @@ async fn connection_with_diagnostics(
     )?;
     Ok(conn)
 }
+
+async fn connect_when_ready(
+    options: &PgConnectOptions,
+    diagnostics: &Diagnostics,
+) -> std::result::Result<PgConnection, Reason> {
+    use tokio::time::{Instant, sleep_until, timeout_at};
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut backoff = Duration::from_millis(250);
+    let mut observed_retry = false;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Reason::Timeout);
+        }
+        let attempt_deadline = deadline.min(now + Duration::from_secs(3));
+        let retry = match timeout_at(attempt_deadline, PgConnection::connect_with(options)).await {
+            Ok(Ok(conn)) if Instant::now() < attempt_deadline => return Ok(conn),
+            Ok(Ok(_)) | Err(_) => Reason::Timeout,
+            Ok(Err(error)) => match startup_retry_reason(&error) {
+                Some(reason) => reason,
+                None => return Err(Reason::sql(&error)),
+            },
+        };
+        if !observed_retry {
+            diagnostics.fail(Phase::SqlConnectRetry, retry);
+            observed_retry = true;
+        }
+        sleep_until(deadline.min(Instant::now() + backoff)).await;
+        backoff = (backoff * 2).min(Duration::from_secs(2));
+    }
+}
+
+fn startup_retry_reason(error: &sqlx_core::Error) -> Option<Reason> {
+    use std::io::ErrorKind;
+
+    let sqlx_core::Error::Io(error) = error else {
+        return None;
+    };
+    match error.kind() {
+        ErrorKind::TimedOut => Some(Reason::Timeout),
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::NotConnected
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable => Some(Reason::Connection),
+        _ => None,
+    }
+}
+
 fn sql_failure(diagnostics: &Diagnostics, phase: Phase, error: &sqlx_core::Error) -> Error {
     diagnostics.fail(phase, Reason::sql(error));
     unavailable()
@@ -767,8 +839,29 @@ pub async fn diagnose_npm_recovery_with_diagnostics(
     evidence: Option<&RecoveryEvidenceReceipt>,
     diagnostics: &Diagnostics,
 ) -> Result<CollectionRecoveryReport> {
+    diagnose_npm_recovery_inner(database_url, options, evidence, diagnostics, None).await
+}
+
+/// Private assessment entrypoint with bounded retries during connection startup.
+pub async fn diagnose_npm_recovery_with_readiness(
+    database_url: &str,
+    options: &CollectionRecoveryOptions,
+    evidence: Option<&RecoveryEvidenceReceipt>,
+    diagnostics: &Diagnostics,
+    cancel: &CancellationToken,
+) -> Result<CollectionRecoveryReport> {
+    diagnose_npm_recovery_inner(database_url, options, evidence, diagnostics, Some(cancel)).await
+}
+
+async fn diagnose_npm_recovery_inner(
+    database_url: &str,
+    options: &CollectionRecoveryOptions,
+    evidence: Option<&RecoveryEvidenceReceipt>,
+    diagnostics: &Diagnostics,
+    readiness: Option<&CancellationToken>,
+) -> Result<CollectionRecoveryReport> {
     options.validate(false)?;
-    let mut conn = connection_with_diagnostics(database_url, false, diagnostics).await?;
+    let mut conn = connection_with_diagnostics(database_url, false, diagnostics, readiness).await?;
     diagnostics.start(Phase::Transaction);
     let mut tx = conn
         .begin()

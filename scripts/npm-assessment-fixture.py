@@ -59,13 +59,14 @@ OBSERVER_RESTORATIONS = frozenset(('sql-grant', 'objectstore-start', 'objectstor
     'backend-stop', 'writer-stop', 'policy-remove', 'writer-config', 'reader-config',
     'writer-template', 'reader-template', 'writer-start', 'backend-start', 'semantic-ready'))
 SETUP_PHASES = frozenset(('admission', 'node-preparation', 'node-restoration', 'apparmor', 'namespace', 'identity', 'policy',
-    'configuration', 'network', 'seed', 'baseline', 'positive', 'invariants', 'matrix', 'cleanup'))
+    'configuration', 'network', 'seed', 'baseline', 'positive', 'invariants', 'matrix', 'connect-readiness', 'cleanup'))
 SETUP_CODES = OBSERVER_ERRORS | frozenset(('fixture_command_timeout', 'fixture_apply_objects_required',
     'fixture_apply_namespace_invalid', 'owned_tmp_fixture_required', 'fresh_assessment_namespace_required',
     'apparmor_lock_owner', 'apparmor_canonical_hash_mismatch', 'apparmor_profile_already_loaded',
     'apparmor_asset_changed', 'apparmor_not_enforcing', 'apparmor_cleanup_incomplete_profile_retained',
     'apparmor_task_check_invalid', 'one_fixture_database_required', 'one_fixture_provider_table_required',
     'assessment_positive_failed', 'assessment_mutated_retained_metadata', 'assessment_container_ended',
+    'assessment_readiness_policy_changed', 'assessment_readiness_labels_changed', 'assessment_readiness_result',
     'assessment_supervision_deadline', 'assessment_namespace_cleanup_unconfirmed',
     'fixture_owned_docker_required', 'fixture_node_identity', 'fixture_node_mount_namespace',
     'fixture_host_mount_namespace_refused', 'fixture_host_mount_propagation_refused',
@@ -86,6 +87,11 @@ CONTROL_COMMANDS = frozenset(('unknown', 'apparmor-policy', 'apparmor-state', 'a
     'kubectl.wait', 'kubectl.delete', 'kubectl.get', 'kubectl.logs', 'kubectl.patch', 'kubectl.rollout'))
 PROBE_NETWORK_CODES = frozenset(('unknown', 'api_admitted', 'dns_failure', 'postgres_connection', 'apparmor_message'))
 FIXTURE_OWNER_LABEL = 'devres.fixture-owner'
+ASSESSMENT_APP = 'devres-npm-assessment'
+OWNED_POLICIES = {'policy': 'postgres-owned-assessment', 'readiness_policy': 'postgres-owned-assessment-readiness'}
+READINESS_CASES = ('cold-readiness', 'readiness-denied')
+READINESS_FAULTS = {'malformed-config': 'invalid', 'bad-password': 'authentication',
+                    'wrong-schema': 'schema', 'required-tls': 'unavailable'}
 MAX_IMAGE_METADATA = 1024 * 1024
 DATABASE_ADMIN = 'postgres://devres:fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
 DATABASE_READER = 'postgres://devres_assessment_reader:assessment-fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
@@ -508,7 +514,38 @@ def private_json(path, value):
 
 CASES = frozenset(('success', 'malformed-config', 'wrong-dns', 'bad-password', 'existing-output',
     'output-symlink', 'output-wrong-mode', 'output-wrong-owner', 'ready-denied', 'wrong-schema',
-    'restore-pending', 'corrupt-history', 'missing-grant', 'held-lifecycle', 'telemetry-unavailable'))
+    'restore-pending', 'corrupt-history', 'missing-grant', 'held-lifecycle', 'telemetry-unavailable',
+    'required-tls', *READINESS_CASES))
+
+
+def validate_readiness_result(record):
+    denied = record['case'] == 'readiness-denied'
+    code = 'assessment_readiness_result'
+    if denied:
+        need(record['phase'] == 'terminal' and record['exit_code'] == 1, code)
+        events = record['diagnostics']
+    else:
+        need(record['case'] == 'cold-readiness' and record['phase'] == 'report_transferred', code)
+        events = record['events']
+    need(type(events) is list, code)
+    interesting = {'cli_start', 'cli_exit', 'sql_connect', 'sql_connect_retry', 'sql_setup'}
+    sequence = [(event['phase'], event['outcome'], event['reason'], event['child_exit'])
+                for event in events if event['phase'] in interesting]
+    expected = [('cli_start', 'start', 'none', None), ('sql_connect', 'start', 'none', None)]
+    retries = [row for row in sequence if row[0] == 'sql_connect_retry']
+    need((not denied or retries) and len(retries) <= 1
+         and all(row[1] == 'error' and row[2] in ('connection', 'timeout') and row[3] is None
+                 for row in retries), code)
+    expected.extend(retries)
+    if denied:
+        expected.extend((('sql_connect', 'error', 'timeout', None), ('cli_exit', 'error', 'unknown', 1)))
+    else:
+        expected.extend((('sql_connect', 'ok', 'none', None), ('sql_setup', 'start', 'none', None),
+                         ('sql_setup', 'ok', 'none', None), ('cli_exit', 'ok', 'none', 0)))
+    need(sequence == expected, code)
+    if denied:
+        started, stopped = [event['elapsed_ms'] for event in events if event['phase'] == 'sql_connect']
+        need(type(started) is int and type(stopped) is int and 29_000 <= stopped - started <= 45_000, code)
 
 
 def validate_receipt(name, value):
@@ -566,8 +603,9 @@ def validate_receipt(name, value):
              'fixture_receipt_image_preparation')
         validate_closed_failure(value['failure'])
     elif name == 'npm-assessment-receipt.json':
-        need(set(value) == {'version', 'synthetic', 'apparmor_sha256', 'server_image', 'provider_requests', 'selection',
-                            'network', 'result', 'faults', 'metadata_unchanged'}, 'fixture_receipt_fields')
+        fields = {'version', 'synthetic', 'apparmor_sha256', 'server_image', 'provider_requests', 'selection',
+                  'network', 'result', 'faults', 'metadata_unchanged'}
+        need(set(value) in (fields, fields | {'readiness'}), 'fixture_receipt_fields')
         need(value['apparmor_sha256'] == APPARMOR_SHA256 and value['provider_requests'] == 0
              and value['metadata_unchanged'] is True and type(value['server_image']) is str
              and re.fullmatch(r'[A-Za-z0-9._:/@+\-]{1,256}', value['server_image']), 'fixture_receipt_assessment')
@@ -579,9 +617,17 @@ def validate_receipt(name, value):
         need(value['network'] == {'dns': True, 'postgres_tcp': True, 'local_api_denied': True, 'public_requests': 0,
              'apparmor_enforcing': True, 'canonical_alias_read_denied': True}, 'fixture_receipt_network')
         result(value['result'])
-        need(type(value['faults']) is list and len(value['faults']) == 14, 'fixture_receipt_faults')
+        expect_faults = 15 if 'readiness' in value else 14
+        need(type(value['faults']) is list and len(value['faults']) == expect_faults, 'fixture_receipt_faults')
         for record in value['faults']:
             result(record)
+        if 'readiness' in value:
+            readiness = value['readiness']
+            need(type(readiness) is list and len(readiness) == len(READINESS_CASES), 'fixture_receipt_readiness')
+            for expected_case, record in zip(READINESS_CASES, readiness):
+                result(record)
+                need(record['case'] == expected_case, 'fixture_receipt_readiness')
+                validate_readiness_result(record)
     elif name == 'npm-assessment-setup-failure.json':
         fields = {'version', 'synthetic', 'phase', 'case', 'failure', 'cleanup_failure',
                   'namespace_cleanup', 'apparmor_cleanup'}
@@ -732,11 +778,24 @@ def policies():
                   'egress': [{'to': [dns], 'ports': [{'port': 53, 'protocol': 'UDP'}, {'port': 53, 'protocol': 'TCP'}]},
                              {'to': [postgres], 'ports': [{'port': 5432, 'protocol': 'TCP'}]}]}},
         {'apiVersion': 'networking.k8s.io/v1', 'kind': 'NetworkPolicy',
-         'metadata': {'name': 'postgres-owned-assessment', 'namespace': 'devres-acceptance'},
+         'metadata': {'name': OWNED_POLICIES['policy'], 'namespace': 'devres-acceptance'},
          'spec': {'podSelector': {'matchLabels': {'app': 'postgres'}}, 'policyTypes': ['Ingress'],
                   'ingress': [{'from': [{'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': NAMESPACE}},
                                          'podSelector': {'matchLabels': {'app': 'backend'}}}],
                                'ports': [{'port': 5432, 'protocol': 'TCP'}]}]}}]
+
+
+def readiness_policies():
+    # Keep the same cross-namespace Service path as the synthetic baseline.
+    # The denial case shares egress but has no matching PostgreSQL ingress.
+    _default, outbound, inbound = policies()
+    outbound['metadata']['name'] = 'assessment-readiness-dns-postgres-only'
+    outbound['spec']['podSelector']['matchLabels'] = {'app': ASSESSMENT_APP}
+    outbound['spec']['policyTypes'] = ['Ingress', 'Egress']
+    inbound['metadata']['name'] = OWNED_POLICIES['readiness_policy']
+    inbound['spec']['ingress'][0]['from'][0]['podSelector']['matchLabels'] = {
+        'app': ASSESSMENT_APP, 'devres-assessment': 'cold-readiness'}
+    return [outbound, inbound]
 
 
 NODE_SECURITYFS = '/sys/kernel/security'
@@ -1460,9 +1519,9 @@ class Cluster:
         return result
 
     def owned_objects(self, kind):
-        need(kind in ('namespace', 'policy'), 'fixture_owned_resource_kind')
+        need(kind == 'namespace' or kind in OWNED_POLICIES, 'fixture_owned_resource_kind')
         name, version, expected, path = (NAMESPACE, 'v1', 'NamespaceList', '/api/v1/namespaces') if kind == 'namespace' else (
-            'postgres-owned-assessment', 'networking.k8s.io/v1', 'NetworkPolicyList',
+            OWNED_POLICIES[kind], 'networking.k8s.io/v1', 'NetworkPolicyList',
             '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies')
         # Normal kubectl get rewrites typed API lists to a generic core List.
         # Keep the API schema for authoritative absence and identity admission.
@@ -1498,8 +1557,8 @@ class Cluster:
             path = '/api/v1/namespaces/' + NAMESPACE
             resource, name, limit, namespace = 'namespace', NAMESPACE, 120, NAMESPACE
         else:
-            path = '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies/postgres-owned-assessment'
-            resource, name, limit, namespace = 'networkpolicy', 'postgres-owned-assessment', 60, 'devres-acceptance'
+            resource, name, limit, namespace = 'networkpolicy', OWNED_POLICIES[kind], 60, 'devres-acceptance'
+            path = '/apis/networking.k8s.io/v1/namespaces/devres-acceptance/networkpolicies/' + name
         options = {'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': {'uid': uid}}
         self.k('delete', '--raw=' + path, '-f', '-', data=json.dumps(options).encode(), namespace=namespace)
         self.k('wait', '--for=delete', resource + '/' + name, '--timeout=' + str(limit) + 's',
@@ -1525,7 +1584,7 @@ class Cluster:
         self.k('wait', '--for=delete', 'pod/' + name, '--timeout=60s', timeout=70)
 
 
-def seed(cluster, image):
+def seed(cluster, image, *, database_admin=DATABASE_ADMIN):
     cluster.sql('CREATE DATABASE ' + DATABASE, database='postgres')
     pod = template(image)
     pod.update({'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': 'assessment-seed', 'namespace': NAMESPACE,
@@ -1536,7 +1595,7 @@ def seed(cluster, image):
     container = spec['containers'][0]
     container['name'] = 'seed'
     container['command'] = ['npm-assessment-seed']
-    container['env'] = [{'name': 'DATABASE_URL', 'value': DATABASE_ADMIN}, {'name': 'DEVRES_SYNTHETIC_ASSESSMENT', 'value': '1'}]
+    container['env'] = [{'name': 'DATABASE_URL', 'value': database_admin}, {'name': 'DEVRES_SYNTHETIC_ASSESSMENT', 'value': '1'}]
     container['volumeMounts'] = [{'name': 'tmp', 'mountPath': '/tmp'}]
     cluster.apply(pod)
     cluster.k('wait', '--for=jsonpath={.status.phase}=Succeeded', 'pod/assessment-seed', '--timeout=130s', timeout=140)
@@ -1773,16 +1832,20 @@ def validate_runtime(payload):
     return fields
 
 
-def assess(cluster, server_image, selected, api, case='success'):
+def assess(cluster, server_image, selected, api, case='success', *, connect_readiness=False):
     cluster.assessment_case = case
     name = 'assessment-' + case
+    readiness_policy = case in READINESS_CASES
     selection = api.Selection(selected['job_id'], selected['revision'])
     expected = getattr(cluster, 'expected_image', None)
     if expected is None:
         expected = expected_image_identity(server_image)
         cluster.expected_image = expected
     pod = api.build_assessment_pod(template(server_image), server_image, selection,
-                                   name=name, namespace=NAMESPACE, scope='fixture')
+                                   name=name, namespace=NAMESPACE, scope=case if readiness_policy else 'fixture',
+                                   connect_readiness=connect_readiness or readiness_policy)
+    if readiness_policy:
+        pod['metadata']['labels']['app'] = ASSESSMENT_APP
     injections = {
         'existing-output': 'mkdir -m 700 /tmp/npm-assessment\n: > /tmp/npm-assessment/report.json\n',
         'ready-denied': 'mkdir -m 700 /tmp/npm-assessment\nmkdir -m 700 /tmp/npm-assessment/ready\n',
@@ -1798,12 +1861,19 @@ def assess(cluster, server_image, selected, api, case='success'):
         # adding root, capabilities, a writable corpus or an init container.
         pod['spec']['containers'][0]['volumeMounts'].append(
             {'name': 's3', 'mountPath': '/tmp/npm-assessment', 'readOnly': True})
-    cluster.apply(pod)
+    if readiness_policy:
+        cluster.create(pod)
+    else:
+        cluster.apply(pod)
     uid = cluster.pod(name)['metadata']['uid']
     observed = {}
     failures = []
     def get_pod():
         value = cluster.pod(name)
+        if readiness_policy:
+            metadata = value['metadata']
+            need(metadata.get('name') == name and metadata.get('namespace') == NAMESPACE
+                 and metadata.get('labels') == pod['metadata']['labels'], 'assessment_readiness_labels_changed')
         statuses = value.get('status', {}).get('containerStatuses', [])
         if len(statuses) == 1:
             observed['image_id'] = statuses[0].get('imageID')
@@ -1892,7 +1962,7 @@ def lifecycle_exclusion(cluster, harness_image):
             raise FixtureError('fixture_lifecycle_holder_cleanup_incomplete')
 
 
-def failure_matrix(cluster, server_image, selected, api, config, harness_image):
+def failure_matrix(cluster, server_image, selected, api, config, harness_image, *, connect_readiness=False):
     cluster.assessment_case = 'none'
     seal = cluster.sql('SELECT data_integrity FROM devres_npm_advisory_job_history').decode().strip()
     need(re.fullmatch('blake3:[0-9a-f]{64}', seal), 'synthetic_original_history_seal_required')
@@ -1916,16 +1986,20 @@ def failure_matrix(cluster, server_image, selected, api, config, harness_image):
         ('held-lifecycle', 'lifecycle', config, None, None),
         ('telemetry-unavailable', None, config, None, None),
     )
+    if connect_readiness:
+        need(cluster.sql('SHOW ssl').strip() == b'off', 'assessment_readiness_result')
+        cases += (('required-tls', 'sql_connect', configuration(config, DATABASE_READER + '?sslmode=require'), None, None),)
     results = []
     before = snapshot(cluster)
     for case, expected, candidate, setup, restore in cases:
         cluster.assessment_case = case
+        readiness_fault = connect_readiness and case in READINESS_FAULTS
         set_config(cluster, candidate)
         try:
             if setup:
                 cluster.sql(setup)
             with lifecycle_exclusion(cluster, harness_image) if case == 'held-lifecycle' else contextlib.nullcontext():
-                result = assess(cluster, server_image, selected, api, case)
+                result = assess(cluster, server_image, selected, api, case, connect_readiness=readiness_fault)
             if case == 'telemetry-unavailable':
                 need(result['phase'] == 'report_transferred' and result['events'] is None,
                      'assessment_telemetry_changed_original_success')
@@ -1937,6 +2011,11 @@ def failure_matrix(cluster, server_image, selected, api, config, harness_image):
             events = result['diagnostics']
             need(isinstance(events, list) and any(event['phase'] == expected and event['outcome'] == 'error'
                                                  for event in events), 'assessment_fault_phase_unknown')
+            if readiness_fault:
+                need(not any(event['phase'] == 'sql_connect_retry' for event in events)
+                     and any(event['phase'] == expected and event['outcome'] == 'error'
+                             and event['reason'] == READINESS_FAULTS[case] for event in events),
+                     'assessment_readiness_result')
             starts = [event for event in events if event['phase'] == 'cli_start']
             exits = [event for event in events if event['phase'] == 'cli_exit']
             need(len(starts) == len(exits) == 1, 'assessment_attempt_count_changed')
@@ -1989,10 +2068,13 @@ def run(arguments):
 def run_fixture(arguments, cluster, progress):
     scratch = cluster.scratch
     api = helper()
+    connect_readiness = getattr(arguments, 'connect_readiness', False)
     need(not cluster.owned_objects('namespace') and not cluster.owned_objects('policy'),
          'fresh_assessment_namespace_required')
+    if connect_readiness:
+        need(not cluster.owned_objects('readiness_policy'), 'fresh_assessment_namespace_required')
     cluster.fixture_owner = secrets.token_hex(16)
-    cluster.namespace_uid = cluster.policy_uid = None
+    cluster.namespace_uid = cluster.policy_uid = cluster.readiness_policy_uid = None
     namespace = {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': NAMESPACE,
         'labels': {FIXTURE_OWNER_LABEL: cluster.fixture_owner,
                    'pod-security.kubernetes.io/enforce': 'restricted', 'pod-security.kubernetes.io/enforce-version': 'latest'}}}
@@ -2003,6 +2085,7 @@ def run_fixture(arguments, cluster, progress):
     with apparmor(scratch, lambda: cleanup_confirmed[0]) as profile_hash:
         created = False
         policy_attempted = False
+        readiness_policy_attempted = False
         try:
             progress['phase'] = 'namespace'
             # An uncertain apply response still requires owned-namespace cleanup.
@@ -2040,10 +2123,34 @@ def run_fixture(arguments, cluster, progress):
             progress['phase'] = 'invariants'
             need(snapshot(cluster) == before, 'assessment_mutated_retained_metadata')
             progress['phase'] = 'matrix'
-            faults = failure_matrix(cluster, arguments.server_image, selected, api, config, arguments.harness_image)
+            faults = failure_matrix(cluster, arguments.server_image, selected, api, config, arguments.harness_image,
+                                    connect_readiness=connect_readiness)
             result_receipt = {'version': 1, 'synthetic': True, 'apparmor_sha256': profile_hash,
                        'server_image': arguments.server_image, 'provider_requests': 0,
                        'selection': selected, 'network': network, 'result': result, 'faults': faults, 'metadata_unchanged': True}
+            if connect_readiness:
+                progress['phase'] = 'connect-readiness'
+                cluster.assessment_case = 'none'
+                documents = readiness_policies()
+                for document in documents:
+                    document['metadata']['labels'] = {FIXTURE_OWNER_LABEL: cluster.fixture_owner}
+                readiness_policy_attempted = True
+                cluster.create(documents)
+                outbound_spec = documents[0]
+                outbound = json.loads(cluster.k('get', 'networkpolicy', outbound_spec['metadata']['name'], '-o', 'json').stdout)
+                inbound = cluster.owned_objects('readiness_policy')
+                cluster.admit_owned('readiness_policy', inbound)
+                need(outbound.get('spec') == outbound_spec['spec']
+                     and all(outbound.get('metadata', {}).get(key) == value
+                             for key, value in outbound_spec['metadata'].items())
+                     and inbound[0].get('spec') == documents[1]['spec'], 'assessment_readiness_policy_changed')
+                readiness = []
+                for case in READINESS_CASES:
+                    readiness_result = assess(cluster, arguments.server_image, selected, api, case)
+                    validate_readiness_result(readiness_result)
+                    need(snapshot(cluster) == before, 'assessment_mutated_retained_metadata')
+                    readiness.append(readiness_result)
+                result_receipt['readiness'] = readiness
         except BaseException as error:
             progress['primary'] = error
             progress['primary_phase'] = progress['phase']
@@ -2053,19 +2160,30 @@ def run_fixture(arguments, cluster, progress):
             if created:
                 progress['phase'] = 'cleanup'
                 failures = []
-                cleanups = [lambda: cluster.cleanup_owned('namespace')]
-                if policy_attempted:
-                    cleanups.append(lambda: cluster.cleanup_owned('policy'))
-                for cleanup in cleanups:
+
+                def cleanup(kind):
                     try:
-                        cleanup()
+                        cluster.cleanup_owned(kind)
                     except BaseException as error:
                         failures.append(error)
+
+                ingress = []
+                if policy_attempted:
+                    ingress.append('policy')
+                if readiness_policy_attempted:
+                    ingress.append('readiness_policy')
+                cleanup('namespace')
+                if not connect_readiness:
+                    for kind in ingress:
+                        cleanup(kind)
                 try:
                     need(not cluster.owned_objects('namespace'), 'assessment_namespace_cleanup_unconfirmed')
                     progress['namespace_cleanup'] = 'removed'
                 except BaseException as error:
                     failures.append(error)
+                if connect_readiness and progress['namespace_cleanup'] == 'removed':
+                    for kind in ingress:
+                        cleanup(kind)
                 if failures:
                     if progress['primary'] is None:
                         progress['primary'] = failures[0]
@@ -2087,8 +2205,12 @@ if __name__ == '__main__':
     parser.add_argument('--harness-image', required=True)
     parser.add_argument('--server-image', required=True)
     parser.add_argument('--prepare-image-only', action='store_true')
+    parser.add_argument('--connect-readiness', action='store_true',
+                        help='also test cold and denied connections using a readiness-capable server image')
     try:
         arguments = parser.parse_args()
+        if arguments.prepare_image_only and arguments.connect_readiness:
+            parser.error('--connect-readiness requires running the assessment fixture')
         if arguments.prepare_image_only:
             prepare_image(arguments)
         else:
