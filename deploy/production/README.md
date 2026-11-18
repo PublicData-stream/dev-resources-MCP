@@ -45,6 +45,9 @@ The [3dae7d91 recovery procedure](upgrade-3dae7d91.md) adds a fresh source-bound
 cycle with strict paused observation and one restore-and-withdraw failure path.
 Its preparation and eventual execution evidence remain separate from acceptance
 of a running production service.
+The [ce5745e0 procedure](upgrade-ce5745e0.md) qualifies the published npm startup
+readiness mitigation and binds a fresh attempt to the completed fifth-cycle
+withdrawal. It requires a current checkpoint and rehearsal before launch.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
