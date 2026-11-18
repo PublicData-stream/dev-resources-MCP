@@ -93,8 +93,10 @@ READINESS_CASES = ('cold-readiness', 'readiness-denied')
 READINESS_FAULTS = {'malformed-config': 'invalid', 'bad-password': 'authentication',
                     'wrong-schema': 'schema', 'required-tls': 'unavailable'}
 MAX_IMAGE_METADATA = 1024 * 1024
-DATABASE_ADMIN = 'postgres://devres:fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
-DATABASE_READER = 'postgres://devres_assessment_reader:assessment-fixture-only@postgres.devres-acceptance.svc.cluster.local/' + DATABASE
+DATABASE_NAMESPACE = 'devres-acceptance'
+DATABASE_SERVICE = 'postgres.' + DATABASE_NAMESPACE + '.svc.cluster.local'
+DATABASE_ADMIN = 'postgres://devres:fixture-only@' + DATABASE_SERVICE + '/' + DATABASE
+DATABASE_READER = 'postgres://devres_assessment_reader:assessment-fixture-only@' + DATABASE_SERVICE + '/' + DATABASE
 
 
 class FixtureError(RuntimeError):
@@ -1584,10 +1586,10 @@ class Cluster:
         self.k('wait', '--for=delete', 'pod/' + name, '--timeout=60s', timeout=70)
 
 
-def seed(cluster, image, *, database_admin=DATABASE_ADMIN):
+def seed(cluster, image, *, namespace=NAMESPACE):
     cluster.sql('CREATE DATABASE ' + DATABASE, database='postgres')
     pod = template(image)
-    pod.update({'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': 'assessment-seed', 'namespace': NAMESPACE,
+    pod.update({'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': 'assessment-seed', 'namespace': namespace,
                 'labels': {'app': 'backend'}}})
     spec = pod['spec']
     spec.update({'restartPolicy': 'Never', 'activeDeadlineSeconds': 120})
@@ -1595,7 +1597,7 @@ def seed(cluster, image, *, database_admin=DATABASE_ADMIN):
     container = spec['containers'][0]
     container['name'] = 'seed'
     container['command'] = ['npm-assessment-seed']
-    container['env'] = [{'name': 'DATABASE_URL', 'value': database_admin}, {'name': 'DEVRES_SYNTHETIC_ASSESSMENT', 'value': '1'}]
+    container['env'] = [{'name': 'DATABASE_URL', 'value': DATABASE_ADMIN}, {'name': 'DEVRES_SYNTHETIC_ASSESSMENT', 'value': '1'}]
     container['volumeMounts'] = [{'name': 'tmp', 'mountPath': '/tmp'}]
     cluster.apply(pod)
     cluster.k('wait', '--for=jsonpath={.status.phase}=Succeeded', 'pod/assessment-seed', '--timeout=130s', timeout=140)
@@ -1912,9 +1914,9 @@ def assess(cluster, server_image, selected, api, case='success', *, connect_read
     return result
 
 
-def set_config(cluster, text):
+def set_config(cluster, text, *, namespace=NAMESPACE):
     cluster.apply({'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
-                   'metadata': {'name': 'devres-assessment-config', 'namespace': NAMESPACE},
+                   'metadata': {'name': 'devres-assessment-config', 'namespace': namespace},
                    'data': {'serving.toml': base64.b64encode(text.encode()).decode()}})
 
 

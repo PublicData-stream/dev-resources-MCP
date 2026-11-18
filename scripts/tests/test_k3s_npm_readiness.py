@@ -1,6 +1,13 @@
+import hashlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -9,10 +16,11 @@ readiness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(readiness)
 
 
-def rule(name=readiness.INGRESS, namespace=readiness.NAMESPACE, port=5432, source='ABC'):
-    return (f'-A KUBE-NWPLCY-X -m comment --comment "rule to ACCEPT traffic from source pods to dest pods '
-            f'selected by policy name {name} namespace {namespace}" -m set --match-set KUBE-SRC-{source} src '
-            f'-m set --match-set KUBE-DST-DB dst -p tcp -m tcp --dport {port} -j MARK --set-xmark 0x10000/0x10000\n'
+def rule(name=readiness.INGRESS, namespace=readiness.NAMESPACE, port=5432, source='ABC',
+         protocol='tcp', kind='ingress pods'):
+    return (f'-A KUBE-NWPLCY-X -m comment --comment "{namespace}/{name} {kind}" '
+            f'-m set --match-set KUBE-SRC-{source} src -m set --match-set KUBE-DST-DB dst '
+            f'-p {protocol} -m {protocol} --dport {port} -j MARK --set-xmark 0x10000/0x10000\n'
             ).encode()
 
 
@@ -33,7 +41,8 @@ class PolicyProjectionTests(unittest.TestCase):
     def test_select_only_exact_postgres_policy_namespace_and_port(self):
         text = rule(name='seed-postgres-ingress') + rule(namespace='other') + rule(port=80) + rule()
         self.assertEqual(readiness.match_sets(text), ('KUBE-SRC-ABC', 'KUBE-DST-DB'))
-        self.assertIsNone(readiness.match_sets(rule(namespace='other') + rule(port=80)))
+        self.assertIsNone(readiness.match_sets(rule(namespace='other') + rule(port=80)
+                                                + rule(protocol='udp') + rule(kind='egress pods')))
 
     def test_duplicate_mark_and_return_pair_do_not_look_ambiguous(self):
         self.assertEqual(readiness.match_sets(rule() * 2), ('KUBE-SRC-ABC', 'KUBE-DST-DB'))
@@ -51,6 +60,15 @@ class PolicyProjectionTests(unittest.TestCase):
 
 
 class AssessmentEvidenceTests(unittest.TestCase):
+    def test_peer_probe_requires_no_response_and_an_enforced_profile(self):
+        label = f'{readiness.APPARMOR_PROFILE} (enforce)'
+        self.assertEqual(readiness.isolation_evidence((label + '\npeer_exit=2\n').encode(), True), label)
+        for code in (0, 1, 3, 127):
+            with self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_unrelated_peer_'):
+                readiness.isolation_evidence((label + f'\npeer_exit={code}\n').encode(), True)
+        with self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_assessment_apparmor_unenforced'):
+            readiness.isolation_evidence(b'unconfined\npeer_exit=2\n', True)
+
     def test_natural_success_and_observed_delay_are_distinct(self):
         self.assertIsNone(readiness.phase_evidence(started() + success(), 'natural')['first_retry'])
         retry = event('sql_connect_retry', 'error', 'connection', 100)
@@ -71,6 +89,92 @@ class AssessmentEvidenceTests(unittest.TestCase):
         self.assertEqual(readiness.phase_evidence(events, 'denied')['connect_elapsed_ms'], 30000)
         with self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_denied_assessment_reached_sql'):
             readiness.phase_evidence(events + [event('sql_setup', 'start')], 'denied')
+
+
+class PostgresArchiveTests(unittest.TestCase):
+    def test_import_requires_canonical_tag_and_exact_native_descriptor(self):
+        cluster = mock.Mock()
+        canonical = readiness.POSTGRES_LOCAL_TAG
+        cluster.node.side_effect = [b'', f'{canonical} manifest {readiness.POSTGRES_AMD64}\n'.encode()]
+        cluster.image_status.return_value = {'id': readiness.POSTGRES_CONFIG, 'repoTags': [canonical]}
+        result = readiness.import_postgres_archive(cluster, Path('/tmp/postgres.oci.tar'))
+        self.assertEqual(result, (canonical, readiness.POSTGRES_CONFIG))
+        cluster.node.side_effect = [b'', f'import-2026-11-18:postgres manifest {readiness.POSTGRES_AMD64}\n'.encode()]
+        with self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_postgres_manifest_identity'):
+            readiness.import_postgres_archive(cluster, Path('/tmp/postgres.oci.tar'))
+
+    def test_requires_the_exact_layer_bytes_and_rejects_extra_archive_members(self):
+        def entry(data):
+            return {'size': len(data), 'digest': 'sha256:' + hashlib.sha256(data).hexdigest()}
+
+        def encode(value):
+            return json.dumps(value).encode()
+
+        def blob(descriptor):
+            return 'blobs/sha256/' + descriptor['digest'].split(':', 1)[1]
+
+        def save(path, members):
+            with tarfile.open(path, 'w') as archive:
+                for name, body in members.items():
+                    member = tarfile.TarInfo(name)
+                    member.size = len(body)
+                    archive.addfile(member, io.BytesIO(body))
+
+        layer = b'first-party synthetic layer'
+        config = encode({'architecture': 'amd64', 'os': 'linux'})
+        manifest = encode({'schemaVersion': 2, 'layers': [entry(layer)], 'config': entry(config)})
+        reference = {**entry(manifest), 'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+                     'annotations': {'org.opencontainers.image.ref.name': 'postgres'}}
+        layer_name = blob(entry(layer))
+        members = {'oci-layout': encode({'imageLayoutVersion': '1.0.0'}),
+                   'index.json': encode({'schemaVersion': 2, 'manifests': [reference]}),
+                   blob(entry(manifest)): manifest, blob(entry(config)): config, layer_name: layer}
+        with tempfile.TemporaryDirectory(prefix='devres-k3s-unit-', dir='/tmp') as scratch, \
+                mock.patch.object(readiness, 'POSTGRES_AMD64', reference['digest']), \
+                mock.patch.object(readiness, 'POSTGRES_CONFIG', entry(config)['digest']):
+            path = Path(scratch) / 'image.tar'
+            save(path, members)
+            readiness.verify_postgres_archive(path)
+            copied = Path(scratch) / 'copied.tar'
+            readiness.copy_postgres_archive(path, copied)
+            readiness.verify_postgres_archive(copied, normalized=True)
+            readiness.verify_postgres_archive(path)
+            for bad in ({**members, layer_name: b'X' + layer[1:]}, {**members, '../foreign': b'X'}):
+                save(path, bad)
+                with self.assertRaisesRegex(readiness.fixture.FixtureError, 'official_postgres_oci_archive_required'):
+                    readiness.verify_postgres_archive(path)
+
+
+class DockerStorageTests(unittest.TestCase):
+    def test_root_only_path_uses_read_only_lookup_and_requires_temporary_storage(self):
+        with mock.patch.object(Path, 'resolve', side_effect=PermissionError), \
+                mock.patch.object(readiness, 'command', return_value=b'/tmp/docker/rootful\n') as resolve:
+            self.assertEqual(readiness.local_docker_root('/tmp/current-docker-root'), Path('/tmp/docker/rootful'))
+            self.assertEqual(resolve.call_args.args[0], ['sudo', '-n', 'realpath', '-e', '--', '/tmp/current-docker-root'])
+            resolve.return_value = b'/var/lib/docker\n'
+            with self.assertRaisesRegex(readiness.fixture.FixtureError, 'local_rootful_k3s_docker_storage_required'):
+                readiness.local_docker_root('/tmp/current-docker-root')
+
+    def test_kubelet_storage_evidence_refuses_host_capacity_or_changed_eviction(self):
+        fs = {'node': {'fs': {'capacityBytes': readiness.NODEFS_BYTES},
+                       'runtime': {'imageFs': {'capacityBytes': readiness.IMAGEFS_BYTES}}}}
+        config = {'kubeletconfig': {'evictionHard': dict(readiness.DEFAULT_HARD_EVICTION),
+                                    'evictionMinimumReclaim': dict(readiness.DEFAULT_RECLAIM)}}
+        status = {'status': {'conditions': [{'type': 'DiskPressure', 'status': 'False'}]}}
+
+        def kubelet_manifest(*args, code):
+            values = {'k3s_storage_stats': fs, 'k3s_eviction_config': config, 'k3s_storage_node': status}
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(values[code]).encode())
+
+        cluster = mock.Mock()
+        cluster.k.side_effect = kubelet_manifest
+        self.assertEqual(readiness.storage_evidence(cluster)['imagefs_capacity_bytes'], readiness.IMAGEFS_BYTES)
+        config['kubeletconfig']['evictionHard']['nodefs.available'] = '0%'
+        with self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_fixture_eviction_changed'):
+            readiness.storage_evidence(cluster)
+        fs['node']['fs']['capacityBytes'] = 540_000_000_000
+        with self.assertRaisesRegex(readiness.fixture.FixtureError, 'k3s_fixture_filesystems_not_isolated'):
+            readiness.storage_evidence(cluster)
 
 
 if __name__ == '__main__':

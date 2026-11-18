@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import hashlib
 import importlib.util
+import io
 import ipaddress
 import json
 import os
@@ -16,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
@@ -26,12 +28,22 @@ K3S_IMAGE = 'docker.io/rancher/k3s@sha256:21ea6e0fac4e3930c2ce8aa40ddd41a8b18cb3
 AIRGAP_SHA256 = '35a5af1e69b57b8b627a4f6b1c29ea104209b661067b8c97fd40dc3f860bfcd2'
 AIRGAP_SIZE = 198293778
 POSTGRES_IMAGE = 'postgres:18.6-alpine3.24@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395'
+POSTGRES_AMD64 = 'sha256:300ebd02c6d4de9ee27ad7f6855d5d21b4d3a4a5117767c1197d284c635d9736'
+POSTGRES_CONFIG = 'sha256:38b9ffe2d4c13d7c445b66306be6763dfa6f503689ea0c5b9f84544ccf3ca8e4'
+POSTGRES_LOCAL_TAG = 'docker.io/library/postgres:devres-fixture-native'
+APPARMOR_PARSER = '/usr/sbin/apparmor_parser'
 APP = 'devres-npm-assessment'
 INGRESS = 'assessment-postgres-ingress'
 EGRESS = 'assessment-dns-postgres-egress'
 NATURAL_TRIALS = 10
 NODE = 'k3s-fixture'
 CONTAINERD = '/run/k3s/containerd/containerd.sock'
+GIB = 1024 ** 3
+NODEFS_BYTES = GIB
+IMAGEFS_BYTES = 8 * GIB
+# This pinned K3s release sets its own kubelet defaults in agent.go.
+DEFAULT_HARD_EVICTION = {'nodefs.available': '5%', 'imagefs.available': '5%'}
+DEFAULT_RECLAIM = {'nodefs.available': '10%', 'imagefs.available': '10%'}
 BOOT = '''
 ip link add eth0 type dummy
 ip address add 192.0.2.2/24 dev eth0
@@ -40,13 +52,14 @@ ip route add default via 192.0.2.1 dev eth0
 exec /bin/k3s server --node-name k3s-fixture --node-ip 192.0.2.2 \
   --flannel-iface eth0 --flannel-backend vxlan --kube-proxy-arg proxy-mode=iptables \
   --disable traefik --disable servicelb --disable metrics-server --disable local-storage \
-  --disable gateway-api-crd --snapshotter native
+  --disable gateway-api-crd --snapshotter overlayfs
 '''
-
 _spec = importlib.util.spec_from_file_location('npm_readiness_fixture', ROOT / 'scripts/npm-assessment-fixture.py')
 fixture = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixture)
-NAMESPACE = fixture.NAMESPACE
+# The synthetic seed binary admits only this fixture database's Service DNS name.
+NAMESPACE = fixture.DATABASE_NAMESPACE
+APPARMOR_PROFILE = fixture.PROFILE
 assessment = fixture.helper()
 
 
@@ -85,6 +98,97 @@ def copy_airgap(path, output):
                      'official_k3s_archive_required')
 
 
+def verify_postgres_archive(path, *, normalized=False):
+    """Read only the pinned single-platform OCI graph, without extracting it."""
+    code = 'official_postgres_oci_archive_required'
+    with tarfile.open(path, mode='r:') as archive:
+        members = {}
+        directories = set()
+        for member in archive:
+            if member.isdir():
+                fixture.need(member.name in ('blobs', 'blobs/sha256') and member.name not in directories, code)
+                directories.add(member.name)
+                continue
+            fixture.need(member.isfile() and not member.sparse and member.name not in members and len(members) < 20
+                         and (member.name in ('index.json', 'oci-layout')
+                              or re.fullmatch(r'blobs/sha256/[a-f0-9]{64}', member.name)), code)
+            members[member.name] = member
+
+        def metadata(name):
+            member = members[name]
+            fixture.need(0 < member.size <= 64 * 1024, code)
+            with archive.extractfile(member) as stream:
+                return stream.read()
+
+        layout = json.loads(metadata('oci-layout'))
+        index = json.loads(metadata('index.json'))
+        fixture.need(layout == {'imageLayoutVersion': '1.0.0'} and set(index) == {'schemaVersion', 'manifests'}
+                     and index['schemaVersion'] == 2
+                     and len(index['manifests']) == 1, code)
+        entry = index['manifests'][0]
+        annotations = {'org.opencontainers.image.ref.name': 'postgres'}
+        if normalized:
+            annotations['io.containerd.image.name'] = POSTGRES_LOCAL_TAG
+        fixture.need(set(entry) == {'digest', 'size', 'mediaType', 'annotations'}
+                     and entry['digest'] == POSTGRES_AMD64
+                     and entry['mediaType'] == 'application/vnd.oci.image.manifest.v1+json'
+                     and entry['annotations'] == annotations, code)
+        manifest_name = 'blobs/sha256/' + POSTGRES_AMD64.split(':', 1)[1]
+        manifest_raw = metadata(manifest_name)
+        fixture.need(len(manifest_raw) == entry['size'] and
+                     'sha256:' + hashlib.sha256(manifest_raw).hexdigest() == POSTGRES_AMD64, code)
+        manifest = json.loads(manifest_raw)
+        fixture.need(manifest['schemaVersion'] == 2 and manifest['config']['digest'] == POSTGRES_CONFIG
+                     and 1 <= len(manifest['layers']) <= 12, code)
+        referenced = {'index.json', 'oci-layout', manifest_name}
+        for item in [manifest['config'], *manifest['layers']]:
+            fixture.need(re.fullmatch(fixture.IMAGE_DIGEST, item['digest']), code)
+            name = 'blobs/sha256/' + item['digest'].split(':', 1)[1]
+            member = members[name]
+            fixture.need(member.size == item['size'] and name not in referenced, code)
+            with archive.extractfile(member) as stream:
+                fixture.need('sha256:' + hashlib.file_digest(stream, 'sha256').hexdigest() == item['digest'], code)
+            referenced.add(name)
+        config = json.loads(metadata('blobs/sha256/' + POSTGRES_CONFIG.split(':', 1)[1]))
+        fixture.need(referenced == members.keys() and config['architecture'] == 'amd64'
+                     and config['os'] == 'linux', code)
+        return index
+
+
+def copy_postgres_archive(input_path, output):
+    code = 'official_postgres_oci_archive_required'
+    descriptor = os.open(scratch_path(input_path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as source, output.open('xb') as target:
+        info = os.fstat(source.fileno())
+        fixture.need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                     and 0 < info.st_size <= 256 * 1024 * 1024, code)
+        remaining = info.st_size
+        while remaining:
+            payload = source.read(min(remaining, 1024 * 1024))
+            fixture.need(bool(payload), code)
+            target.write(payload)
+            remaining -= len(payload)
+        fixture.need(not source.read(1), code)
+    index = verify_postgres_archive(output)
+    # The outer tar index is transport metadata. Name the verified descriptor
+    # before CRI observes it, keeping every image blob and its digest intact.
+    index['manifests'][0]['annotations']['io.containerd.image.name'] = POSTGRES_LOCAL_TAG
+    index_bytes = json.dumps(index).encode()
+    named = output.with_name('postgres-named.oci.tar')
+    with tarfile.open(output, 'r:') as source, tarfile.open(named, 'x:', format=tarfile.USTAR_FORMAT) as target:
+        for member in source:
+            clean = tarfile.TarInfo(member.name)
+            if member.name == 'index.json':
+                clean.size = len(index_bytes)
+                target.addfile(clean, io.BytesIO(index_bytes))
+            elif member.isfile():
+                clean.size = member.size
+                with source.extractfile(member) as stream:
+                    target.addfile(clean, stream)
+    verify_postgres_archive(named, normalized=True)
+    named.replace(output)
+
+
 def object_spec(kind, name, *, version='v1', **content):
     return {'apiVersion': version, 'kind': kind,
             'metadata': {'name': name, 'namespace': NAMESPACE}, **content}
@@ -119,17 +223,20 @@ def postgres(name, image):
     pg = {'name': 'postgres', 'image': image, 'imagePullPolicy': 'Never',
           'env': [{'name': 'POSTGRES_USER', 'value': 'devres'},
                   {'name': 'PGDATA', 'value': '/var/lib/postgresql/18/docker'},
-                  {'name': 'POSTGRES_PASSWORD',
-                   'valueFrom': {'secretKeyRef': {'name': 'postgres-fixture', 'key': 'password'}}}],
+                  {'name': 'POSTGRES_PASSWORD_FILE', 'value': '/run/postgres-fixture/password'}],
           'ports': [{'containerPort': 5432, 'name': 'pg'}],
           'readinessProbe': {'exec': {'command': ['pg_isready', '-q', '-h', '127.0.0.1']}, 'periodSeconds': 1},
-          'volumeMounts': [{'name': 'data', 'mountPath': '/var/lib/postgresql'}],
+          'volumeMounts': [{'name': 'data', 'mountPath': '/var/lib/postgresql'},
+                           {'name': 'password', 'mountPath': '/run/postgres-fixture', 'readOnly': True}],
           'resources': {'requests': {'cpu': '100m', 'memory': '128Mi'}, 'limits': {'memory': '512Mi'}},
-          'securityContext': {'allowPrivilegeEscalation': False, 'capabilities': {'drop': ['ALL']}}}
+          'securityContext': {'allowPrivilegeEscalation': False, 'capabilities': {'drop': ['ALL']},
+                              'appArmorProfile': apparmor_profile()}}
     pod = {'automountServiceAccountToken': False,
            'securityContext': {'runAsNonRoot': True, 'runAsUser': 70, 'runAsGroup': 70, 'fsGroup': 70,
                                'seccompProfile': {'type': 'RuntimeDefault'}},
-           'volumes': [{'name': 'data', 'emptyDir': {'sizeLimit': '256Mi'}}], 'containers': [pg]}
+           'volumes': [{'name': 'data', 'emptyDir': {'sizeLimit': '256Mi'}},
+                       {'name': 'password', 'secret': {'secretName': 'postgres-fixture', 'defaultMode': 0o440}}],
+           'containers': [pg]}
     deployment = object_spec('Deployment', name, version='apps/v1', spec={
         'replicas': 1, 'selector': selector(name), 'template': {'metadata': {'labels': label}, 'spec': pod}})
     service = object_spec('Service', name, spec={
@@ -139,15 +246,16 @@ def postgres(name, image):
 
 def match_sets(rules):
     """Project only the source and destination sets for the exact test allow rule."""
-    comment = re.compile(r'\bpolicy name:? ' + re.escape(INGRESS) + r' namespace ' + re.escape(NAMESPACE) + r'$')
+    comment = f'{NAMESPACE}/{INGRESS} ingress pods'
     pairs = set()
     for line in rules.decode('ascii').splitlines():
         if not line.startswith('-A KUBE-NWPLCY-') or INGRESS not in line:
             continue
         fields = shlex.split(line)
-        if '--comment' not in fields or not comment.search(fields[fields.index('--comment') + 1]):
+        if '--comment' not in fields or fields[fields.index('--comment') + 1] != comment:
             continue
-        if '--dport' not in fields or fields[fields.index('--dport') + 1] != '5432':
+        if ('-p' not in fields or fields[fields.index('-p') + 1] != 'tcp'
+                or '--dport' not in fields or fields[fields.index('--dport') + 1] != '5432'):
             continue
         names = {fields[i + 2]: fields[i + 1] for i, field in enumerate(fields[:-2]) if field == '--match-set'}
         source, destination = names.get('src', ''), names.get('dst', '')
@@ -184,8 +292,8 @@ class Cluster:
     def argv(self, *args, namespace=NAMESPACE):
         return self.node_argv('/bin/kubectl', '--request-timeout=8s', '-n', namespace, *args)
 
-    def k(self, *args, namespace=NAMESPACE, **kwargs):
-        result = command(self.argv(*args, namespace=namespace), code='k3s_fixture_api', **kwargs)
+    def k(self, *args, namespace=NAMESPACE, code='k3s_fixture_api', **kwargs):
+        result = command(self.argv(*args, namespace=namespace), code=code, **kwargs)
         # Match the small result interface of the shared fixtures.
         return subprocess.CompletedProcess(args, 0, stdout=result)
 
@@ -250,9 +358,15 @@ class Cluster:
         }).encode())
 
     def image_config(self, reference):
+        return self.image_status(reference)['id']
+
+    def image_status(self, reference):
+        return self.cri('inspecti', reference)['status']
+
+    def cri(self, *args):
         endpoint = 'unix://' + CONTAINERD
         return json.loads(self.node('/bin/crictl', '--runtime-endpoint', endpoint,
-                                    '--image-endpoint', endpoint, 'inspecti', reference))['status']['id']
+                                    '--image-endpoint', endpoint, *args))
 
     def policy_enforced(self, pod_ip, database_ip):
         rules = self.node('/bin/sh', '-ec', 'iptables-save -t filter')
@@ -268,11 +382,59 @@ class Cluster:
         return True
 
 
+def apparmor_profile():
+    return {'type': 'Localhost', 'localhostProfile': APPARMOR_PROFILE}
+
+
+def enforced_apparmor(label):
+    return label in (f'{APPARMOR_PROFILE} (enforce)', f'{APPARMOR_PROFILE}//&unconfined (enforce)')
+
+
+def isolation_evidence(output, probe_peer):
+    lines = output.decode('ascii').splitlines()
+    fixture.need(len(lines) == (2 if probe_peer else 1) and enforced_apparmor(lines[0]),
+                 'k3s_assessment_apparmor_unenforced')
+    if probe_peer:
+        fixture.need(lines[1] not in ('peer_exit=0', 'peer_exit=1'), 'k3s_unrelated_peer_reachable')
+        fixture.need(lines[1] == 'peer_exit=2', 'k3s_unrelated_peer_probe_invalid')
+    return lines[0]
+
+
 def sandbox_apparmor(pod):
-    # Qualify K3s policy without installing a host profile. Calico separately
-    # exercises the exact image with effective production AppArmor enforcement.
+    # Use the same verified temporary enforcing profile as the Minikube fixture.
     for container in pod['spec']['containers']:
-        container['securityContext']['appArmorProfile'] = {'type': 'RuntimeDefault'}
+        container['securityContext']['appArmorProfile'] = apparmor_profile()
+
+
+def prepare_coredns(cluster):
+    namespace = 'kube-system'
+    cluster.k('wait', '--for=create', 'deployment/coredns', '--timeout=30s', namespace=namespace,
+              timeout=35, code='k3s_coredns_manifest')
+    expected_image = 'rancher/mirrored-coredns-coredns:1.14.7'
+    existing = json.loads(cluster.k('get', 'deployment/coredns', '-o', 'json', namespace=namespace).stdout)
+    containers = existing['spec']['template']['spec']['containers']
+    fixture.need(len(containers) == 1 and containers[0]['name'] == 'coredns'
+                 and containers[0]['image'] in (expected_image, 'docker.io/' + expected_image), 'k3s_coredns_manifest')
+    profile = {'containers': [{'name': 'coredns', 'securityContext': {'appArmorProfile': apparmor_profile()}}]}
+    patch = json.dumps({'spec': {'template': {'spec': profile}}})
+    cluster.k('patch', 'deployment/coredns', '--type=strategic', '-p', patch, namespace=namespace,
+              code='k3s_coredns_apparmor')
+    cluster.k('rollout', 'status', 'deployment/coredns', '--timeout=100s', namespace=namespace,
+              timeout=108, code='k3s_coredns_ready')
+    pods = json.loads(cluster.k('get', 'pods', '-l', 'k8s-app=kube-dns', '-o', 'json', namespace=namespace).stdout)
+    active = [item for item in pods['items'] if item['status']['phase'] == 'Running'
+              and not item['metadata'].get('deletionTimestamp')]
+    fixture.need(len(active) == 1, 'k3s_coredns_identity')
+    pod = active[0]
+    container = pod['spec']['containers'][0]
+    reference = pod['status']['containerStatuses'][0]['containerID']
+    fixture.need(container['securityContext']['appArmorProfile'] == apparmor_profile()
+                 and re.fullmatch(r'containerd://[a-f0-9]{64}', reference), 'k3s_coredns_identity')
+    pid = cluster.cri('inspect', reference.removeprefix('containerd://'))['info']['pid']
+    fixture.need(type(pid) is int and pid > 1, 'k3s_coredns_identity')
+    label = cluster.node('cat', f'/proc/{pid}/attr/current', maximum=128, code='k3s_coredns_apparmor').decode().strip()
+    fixture.need(enforced_apparmor(label), 'k3s_coredns_apparmor')
+    return label
 
 
 def phase_evidence(events, case):
@@ -329,6 +491,7 @@ def assess(cluster, api, name, case, image, config, selected, database_ip, peer_
     note('pod_api_seen_ms')
     last = {}
     failures = []
+    apparmor = None
 
     def observe():
         current = cluster.pod(name)
@@ -351,16 +514,20 @@ def assess(cluster, api, name, case, image, config, selected, database_ip, peer_
         return current
 
     def read_report(timeout):
+        nonlocal apparmor
         deadline = time.monotonic() + timeout
         report = api.report_exchange(cluster.argv('exec', name, '--', '/bin/sh', '-c', api.read_script()), timeout=timeout)
         if report is not None:
             note('report_seen_ms')
+            probe = '/bin/cat /proc/self/attr/current'
             if case == 'delayed':
-                probe = ('if /usr/bin/pg_isready -q -t 2 -h "$1" -p 5432; then exit 1; '
-                         'else test "$?" -eq 2; fi')
-                remaining = deadline - time.monotonic()
-                fixture.need(remaining > 0, 'k3s_isolation_probe_deadline')
-                cluster.k('exec', name, '--', '/bin/sh', '-ec', probe, 'sh', str(peer_service_ip), timeout=remaining)
+                probe += ('\nif /usr/lib/postgresql/18/bin/pg_isready -q -t 2 -h "$1" -p 5432 -U devres -d postgres; '
+                          'then result=0; else result=$?; fi\nprintf "peer_exit=%s\\n" "$result"')
+            remaining = deadline - time.monotonic()
+            fixture.need(remaining > 0, 'k3s_isolation_probe_deadline')
+            output = cluster.k('exec', name, '--', '/bin/sh', '-ec', probe, 'sh', str(peer_service_ip),
+                               timeout=remaining, maximum=128, code='k3s_isolation_probe').stdout
+            apparmor = isolation_evidence(output, case == 'delayed')
         return report
 
     try:
@@ -385,7 +552,7 @@ def assess(cluster, api, name, case, image, config, selected, database_ip, peer_
         evidence = phase_evidence(phases, case)
         if case != 'denied':
             fixture.need('ingress_rule_seen_ms' in timeline, 'k3s_postgres_rule_unobserved')
-        return {'pod_uid': uid, 'case': case, 'timeline': timeline, **evidence}
+        return {'pod_uid': uid, 'case': case, 'timeline': timeline, 'effective_apparmor': apparmor, **evidence}
     finally:
         # Refuse to remove policy if the same name still resolves to any Pod.
         absent = cluster.k('get', 'pod', name, '--ignore-not-found', '-o', 'name').stdout
@@ -403,20 +570,17 @@ def run_cases(cluster, server, server_config, harness, database):
         egress('seed-egress', 'backend'), ingress('seed-postgres-ingress', 'postgres', 'backend'),
         ingress('ready-peer-ingress', 'denied-peer', APP),
         *postgres('postgres', database), *postgres('denied-peer', database))
-    cluster.k('rollout', 'status', 'deployment/postgres', '--timeout=70s', timeout=75)
-    cluster.k('rollout', 'status', 'deployment/denied-peer', '--timeout=70s', timeout=75)
+    cluster.k('rollout', 'status', 'deployment/postgres', '--timeout=70s', timeout=75, code='k3s_postgres_ready')
+    cluster.k('rollout', 'status', 'deployment/denied-peer', '--timeout=70s', timeout=75, code='k3s_unrelated_peer_ready')
     peer_service_ip = ipaddress.IPv4Address(cluster.k('get', 'service', 'denied-peer', '-o',
                                                      'jsonpath={.spec.clusterIP}').stdout.decode())
     fixture.need(peer_service_ip in ipaddress.IPv4Network('10.43.0.0/16'),
                  'k3s_unrelated_service_unready')
     cluster.k('wait', '--for=jsonpath={.endpoints[0].conditions.ready}=true', 'endpointslice', '-l',
               'kubernetes.io/service-name=denied-peer', '--timeout=15s', timeout=20)
-    prefix = 'postgres://'
-    endpoint = '@postgres:5432/' + fixture.DATABASE
-    config = fixture.configuration((ROOT / 'deploy/oxibelt/backend.toml').read_text(),
-                                   database=prefix + 'devres_assessment_reader:assessment-fixture-only' + endpoint)
-    fixture.set_config(cluster, config)
-    selected = fixture.seed(cluster, harness, database_admin=prefix + 'devres:fixture-only' + endpoint)
+    config = fixture.configuration((ROOT / 'deploy/oxibelt/backend.toml').read_text())
+    fixture.set_config(cluster, config, namespace=NAMESPACE)
+    selected = fixture.seed(cluster, harness, namespace=NAMESPACE)
     database_ip = cluster.k('get', 'pod', '-l', 'app=postgres', '-o', 'jsonpath={.items[0].status.podIP}').stdout.decode()
     fixture.need(ipaddress.IPv4Address(database_ip).is_private, 'k3s_postgres_ip_invalid')
     baseline = fixture.snapshot(cluster)
@@ -444,12 +608,25 @@ def import_image(cluster, image, directory, marker, role):
         command(['docker', 'image', 'save', '--platform=linux/amd64', '-o', str(archive), alias],
                 code='k3s_image_save', timeout=180)
         cluster.node('/bin/ctr', '--address', CONTAINERD, '-n', 'k8s.io', 'images', 'import', '--platform', 'linux/amd64',
-                     '/fixture/' + archive.name, timeout=180, code='k3s_image_import')
+                     '--snapshotter', 'overlayfs', '/fixture/' + archive.name, timeout=180, code='k3s_image_import')
         config = cluster.image_config(alias)
         fixture.need(config in expected['configs'], 'k3s_image_config_mismatch')
         yield alias, config
     finally:
         command(['docker', 'image', 'rm', alias], code='k3s_image_untag')
+
+
+def import_postgres_archive(cluster, archive):
+    images = ('/bin/ctr', '--address', CONTAINERD, '-n', 'k8s.io', 'images')
+    cluster.node(*images, 'import', '--platform', 'linux/amd64', '--snapshotter', 'overlayfs', '/fixture/' + archive.name,
+                 timeout=180, code='k3s_postgres_archive_import')
+    rows = [line.split() for line in cluster.node(*images, 'ls').decode().splitlines()]
+    fixture.need([row[2] for row in rows if len(row) >= 3 and row[0] == POSTGRES_LOCAL_TAG] == [POSTGRES_AMD64],
+                 'k3s_postgres_manifest_identity')
+    status = cluster.image_status(POSTGRES_LOCAL_TAG)
+    fixture.need(status['id'] == POSTGRES_CONFIG and status['repoTags'] == [POSTGRES_LOCAL_TAG],
+                 'k3s_postgres_archive_identity')
+    return POSTGRES_LOCAL_TAG, POSTGRES_CONFIG
 
 
 def owned_container(name):
@@ -459,6 +636,38 @@ def owned_container(name):
     fixture.need(len(rows) <= 1 and all(re.fullmatch('[a-f0-9]{64}', value) for value in rows),
                  'k3s_node_cleanup_identity')
     return rows[0] if rows else None
+
+
+def local_docker_root(path):
+    code = 'local_rootful_k3s_docker_storage_required'
+    reported = Path(path)
+    fixture.need(reported.is_absolute(), code)
+    try:
+        resolved = reported.resolve(strict=True)
+    except PermissionError:
+        # A rootful Docker store can deny traversal to the Docker group while
+        # remaining under /tmp. Resolve only that reported path as root.
+        output = command(['sudo', '-n', 'realpath', '-e', '--', str(reported)], code=code, maximum=4096)
+        resolved = Path(output.decode().removesuffix('\n'))
+    fixture.need(resolved.is_absolute() and '..' not in resolved.parts and Path('/tmp') in resolved.parents, code)
+    return resolved
+
+
+def storage_evidence(cluster):
+    """Qualify the disposable filesystems while keeping default eviction active."""
+    api = '/api/v1/nodes/' + NODE + '/proxy/'
+    stats = json.loads(cluster.k('get', '--raw=' + api + 'stats/summary', code='k3s_storage_stats').stdout)['node']
+    config = json.loads(cluster.k('get', '--raw=' + api + 'configz', code='k3s_eviction_config').stdout)['kubeletconfig']
+    node = json.loads(cluster.k('get', 'node', NODE, '-o', 'json', code='k3s_storage_node').stdout)
+    nodefs, imagefs = stats['fs'], stats['runtime']['imageFs']
+    fixture.need(nodefs['capacityBytes'] == NODEFS_BYTES and imagefs['capacityBytes'] == IMAGEFS_BYTES,
+                 'k3s_fixture_filesystems_not_isolated')
+    fixture.need(config['evictionHard'] == DEFAULT_HARD_EVICTION
+                 and config['evictionMinimumReclaim'] == DEFAULT_RECLAIM, 'k3s_fixture_eviction_changed')
+    pressure = [row['status'] for row in node['status']['conditions'] if row['type'] == 'DiskPressure']
+    fixture.need(pressure == ['False'], 'k3s_fixture_disk_pressure')
+    return {'nodefs_capacity_bytes': nodefs['capacityBytes'], 'imagefs_capacity_bytes': imagefs['capacityBytes'],
+            'disk_pressure': False, 'eviction_hard': DEFAULT_HARD_EVICTION, 'eviction_reclaim': DEFAULT_RECLAIM}
 
 
 def run(args):
@@ -471,18 +680,32 @@ def run(args):
     info = command(['docker', 'info', '--format', '{{json .DockerRootDir}}\n{{json .Architecture}}\n{{json .SecurityOptions}}'],
                    code='k3s_docker_info')
     root_dir, architecture, security = (json.loads(line) for line in info.splitlines())
-    root = Path(root_dir).resolve(strict=True)
-    fixture.need(architecture == 'x86_64' and not any('rootless' in item for item in security)
-                 and Path('/tmp') in root.parents, 'local_rootful_k3s_docker_storage_required')
+    fixture.need(architecture == 'x86_64' and not any('rootless' in item for item in security),
+                 'local_rootful_k3s_docker_storage_required')
+    local_docker_root(root_dir)
+    parser_info = Path(APPARMOR_PARSER).lstat()
+    fixture.need(stat.S_ISREG(parser_info.st_mode) and parser_info.st_uid == 0 and parser_info.st_mode & 0o111
+                 and not parser_info.st_mode & 0o022, 'installed_k3s_apparmor_parser_required')
     marker = 'devres-k3s-' + secrets.token_hex(8)
-    with tempfile.TemporaryDirectory(prefix=marker + '-', dir='/tmp') as temporary:
+    with tempfile.TemporaryDirectory(prefix=marker + '-', dir='/tmp') as temporary, contextlib.ExitStack() as profile_scope:
         directory = Path(temporary)
         archive = directory / 'airgap.tar.zst'
         copy_airgap(args.airgap_images, archive)
+        postgres_archive = directory / 'postgres.oci.tar'
+        if args.postgres_oci:
+            copy_postgres_archive(args.postgres_oci, postgres_archive)
+        apparmor_digest = profile_scope.enter_context(fixture.apparmor(directory, lambda: owned_container(marker) is None))
         identity = None
         try:
             created = command(['docker', 'create', '--name', marker, '--label', 'devres.fixture-owner=' + marker,
                 '--pull=never', '--privileged', '--network=none', '--cgroupns=private',
+                # Kubelet measures these mounts. Small private filesystems
+                # preserve the original eviction thresholds on a shared host.
+                '--tmpfs', f'/var/lib/kubelet:rw,size={NODEFS_BYTES},mode=0755',
+                '--tmpfs', f'/var/lib/rancher/k3s/agent/containerd:rw,exec,size={IMAGEFS_BYTES},mode=0755',
+                '--mount', 'type=bind,src=/sys/kernel/security,dst=/sys/kernel/security,readonly,'
+                          'bind-propagation=rprivate,bind-recursive=readonly',
+                '--mount', f'type=bind,src={APPARMOR_PARSER},dst=/sbin/apparmor_parser,readonly',
                 '--mount', f'type=bind,src={directory},dst=/fixture,readonly',
                 '--mount', f'type=bind,src={archive},dst=/var/lib/rancher/k3s/agent/images/base.tar.zst,readonly',
                 '--entrypoint', '/bin/sh', K3S_IMAGE, '-ec', BOOT], code='k3s_node_create').decode().strip()
@@ -492,6 +715,10 @@ def run(args):
             command(['docker', 'start', identity], code='k3s_node_start')
             fixture.need(cluster.node('readlink', '/proc/self/ns/net').decode().strip()
                          != os.readlink('/proc/self/ns/net'), 'k3s_host_network_namespace')
+            mounts = cluster.node('cat', '/proc/self/mountinfo').decode().splitlines()
+            securityfs = [line.split() for line in mounts if line.split()[4] == '/sys/kernel/security']
+            fixture.need(len(securityfs) == 1 and 'ro' in securityfs[0][5].split(',')
+                         and securityfs[0][securityfs[0].index('-') + 1] == 'securityfs', 'k3s_apparmor_view_not_read_only')
             deadline = time.monotonic() + 120
             while True:
                 try:
@@ -500,23 +727,34 @@ def run(args):
                     fixture.need(time.monotonic() < deadline, 'k3s_node_ready_timeout')
                     time.sleep(1)
                     continue
-                if any(item['type'] == 'Ready' and item['status'] == 'True' for item in node['status']['conditions']):
+                backend = node['metadata'].get('annotations', {}).get('flannel.alpha.coreos.com/backend-type')
+                ready = any(item['type'] == 'Ready' and item['status'] == 'True'
+                            for item in node.get('status', {}).get('conditions', []))
+                if ready and backend is not None:
                     break
                 fixture.need(time.monotonic() < deadline, 'k3s_node_ready_timeout')
                 time.sleep(1)
             fixture.need(node['status']['nodeInfo']['kubeletVersion'] == K3S_VERSION
                          and node['status']['nodeInfo']['architecture'] == 'amd64'
-                         and node['metadata']['annotations']['flannel.alpha.coreos.com/backend-type'] == 'vxlan',
+                         and backend == 'vxlan',
                          'k3s_node_version_or_network')
-            cluster.k('rollout', 'status', 'deployment/coredns', '--timeout=100s', namespace='kube-system', timeout=108)
-            fixture.need(b':KUBE-SERVICES ' in cluster.node('/bin/sh', '-ec', 'iptables-save -t nat')
-                         and b':KUBE-ROUTER-FORWARD ' in cluster.node('/bin/sh', '-ec', 'iptables-save -t filter'),
-                         'k3s_policy_controller_or_kube_proxy_missing')
+            coredns_apparmor = prepare_coredns(cluster)
+            storage = storage_evidence(cluster)
+            deadline = time.monotonic() + 30
+            while not (b':KUBE-SERVICES ' in cluster.node('/bin/sh', '-ec', 'iptables-save -t nat')
+                       and b':KUBE-ROUTER-FORWARD ' in cluster.node('/bin/sh', '-ec', 'iptables-save -t filter')):
+                fixture.need(time.monotonic() < deadline, 'k3s_policy_controller_or_kube_proxy_missing')
+                time.sleep(1)
             with contextlib.ExitStack() as scope:
                 server, config = scope.enter_context(import_image(cluster, args.server_image, directory, marker, 'server'))
                 harness, _ = scope.enter_context(import_image(cluster, args.harness_image, directory, marker, 'harness'))
-                database, _ = scope.enter_context(import_image(cluster, POSTGRES_IMAGE, directory, marker, 'postgres'))
+                if args.postgres_oci:
+                    database, database_config = import_postgres_archive(cluster, postgres_archive)
+                else:
+                    database, database_config = scope.enter_context(import_image(cluster, POSTGRES_IMAGE, directory, marker, 'postgres'))
+                    fixture.need(database_config == POSTGRES_CONFIG, 'k3s_postgres_config_mismatch')
                 cases = run_cases(cluster, server, config, harness, database)
+            fixture.need(storage_evidence(cluster) == storage, 'k3s_fixture_storage_changed')
         finally:
             if identity is None:
                 # A disconnected create response can arrive after the API has
@@ -531,8 +769,10 @@ def run(args):
                 fixture.need(owned_container(marker) is None, 'k3s_node_cleanup_unconfirmed')
     return {'version': 1, 'synthetic': True, 'k3s_version': K3S_VERSION, 'k3s_image': K3S_IMAGE,
             'airgap_sha256': AIRGAP_SHA256, 'server_image': args.server_image, 'server_config_digest': config,
-            'assessment_apparmor': 'RuntimeDefault',
-            'cases': cases, 'database_unchanged': True, 'unrelated_destination_denied': True, 'cleanup': 'complete'}
+            'assessment_apparmor': 'Localhost/' + APPARMOR_PROFILE, 'apparmor_sha256': apparmor_digest,
+            'coredns_apparmor': coredns_apparmor, 'postgres_config_digest': database_config,
+            'storage': storage, 'cases': cases, 'database_unchanged': True,
+            'unrelated_destination_denied': True, 'cleanup': 'complete'}
 
 
 def main():
@@ -540,6 +780,7 @@ def main():
     parser.add_argument('--server-image', required=True, help='preloaded exact candidate in the local rootful daemon')
     parser.add_argument('--harness-image', required=True, help='preloaded repository harness with the synthetic npm seed')
     parser.add_argument('--airgap-images', required=True, help='official pinned amd64 air-gap archive under /tmp')
+    parser.add_argument('--postgres-oci', help='optional pinned PostgreSQL amd64 OCI archive under /tmp')
     parser.add_argument('--receipt', required=True, help='fresh private JSON path under /tmp')
     args = parser.parse_args()
     def interrupt(signum, _frame):
@@ -551,7 +792,8 @@ def main():
         receipt = scratch_path(args.receipt)
         fixture.need(not receipt.exists() and not receipt.is_symlink(), 'fresh_k3s_receipt_required')
         fixture.private_json(receipt, run(args))
-    except (fixture.FixtureError, OSError, KeyError, ValueError, TypeError, IndexError, assessment.AssessmentError) as error:
+    except (fixture.FixtureError, OSError, KeyError, ValueError, TypeError, IndexError, tarfile.TarError,
+            assessment.AssessmentError) as error:
         category = str(error) if type(error) is fixture.FixtureError else 'k3s_fixture_unavailable'
         print(category, file=sys.stderr)
         return 1

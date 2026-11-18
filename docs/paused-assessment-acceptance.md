@@ -193,6 +193,17 @@ order, one controlled delay until the same Pod observes a retryable failure, and
 one persistently denied connection. Require one `legacy_unknown` report after
 the controlled delay, bounded failure before SQL when denial persists, denial
 of an unrelated ready PostgreSQL Service, and identical retained metadata.
+If the Docker cache cannot load the pinned PostgreSQL image, pass its amd64 OCI
+archive under `/tmp` with `--postgres-oci`. The fixture verifies the pinned
+platform manifest, image configuration, and layers before importing it.
+The test node uses bounded temporary filesystems for kubelet and containerd.
+The fixture checks their reported capacities, the pinned K3s eviction defaults,
+and the absence of disk pressure before and after the trials.
+Both fixtures use the hash-checked `devres-runtime` AppArmor profile and verify
+enforcement on successful assessment Pods. For K3s, the host must provide
+`sudo -n` access and `/usr/sbin/apparmor_parser`. The node uses a read-only
+kernel policy view, and the fixture unloads the temporary profile after
+checking that all owned workloads have stopped.
 The receipt distinguishes API observations from observed node rule membership.
 Recovery from a controlled delay establishes the mitigation under those test
 conditions. The historical production failure remains unresolved.
