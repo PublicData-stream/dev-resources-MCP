@@ -8,6 +8,11 @@ isolated old-reader/writer proof, actual Restore rehearsal and supervised target
 attempt. Target failure permits one physical schema-18 restoration followed by
 PostgreSQL-only withdrawal. No fallback application or automatic retry is allowed.
 
+Execution is closed. The [execution record](upgrade-3dae7d91-cycle5-evidence.md)
+documents target failure at npm assessment and completed schema-18 restoration
+with PostgreSQL-only withdrawal. The paths and single-use intents below are
+consumed historical evidence; a further deployment needs a fresh approved plan.
+
 The application remains release `0.1.0-build.3dae7d91`, commit
 `3dae7d914baa9379abc402c5a3bcf311e0db01bf`, server index
 `sha256:49a899c3c4f0b5d13532ff641f7583b329adea930d1e3877de07a3e5fde91d17`

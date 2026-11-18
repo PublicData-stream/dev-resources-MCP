@@ -6,6 +6,11 @@ and completed schema-18 restoration. This proposal retains the same immutable
 server/probe references in the [procedure](upgrade-3dae7d91.md). It permits no
 release replacement, fallback application or replay of a consumed stage.
 
+Execution closed on 2026-11-18: the [fifth-cycle record](upgrade-3dae7d91-cycle5-evidence.md)
+documents npm assessment failure followed by the single completed schema-18
+restoration and PostgreSQL-only withdrawal. This cycle's authority is consumed;
+another deployment requires a separately approved fresh plan.
+
 ## Scope of the proposed authorization
 
 One fresh source-bound cycle: at most one new native store-claim admission GET,
