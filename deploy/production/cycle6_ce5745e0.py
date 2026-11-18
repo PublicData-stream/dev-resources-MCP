@@ -340,6 +340,8 @@ def render(output, source_archive, probe, target_qualification, fallback_qualifi
     for local, remote, directory in (
         ('cycle6_identity_ce5745e0.py', 'prepare-public-identity.py', WORK),
         ('cycle6_launch_ce5745e0.py', 'launch.py', INSTALL),
+        ('cycle6_reclaim_ce5745e0.py', 'reclaim.py', INSTALL),
+        ('cycle5_reclaim_3dae7d91.py', 'reclaim-engine.py', INSTALL),
     ):
         body = (HERE / local).read_bytes()
         ast.parse(body, filename=local)

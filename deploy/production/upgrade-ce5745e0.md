@@ -65,6 +65,18 @@ production generations and all producer paths. Check actual bytes recovered
 before proceeding. A later retirement of new, completed clone proof bodies has
 its own preview and approval. Insufficient headroom stops the procedure.
 
+Stage `reclaim.py` and its frozen `reclaim-engine.py` from the render. Run
+`reclaim.py inspect --phase historical-completed --source-sha256 "$RECLAIM_SHA" --output "$PREVIEW"`
+with an exclusive private preview path under `/tmp`. The two permitted phases
+are `historical-completed` and `candidate-checkpoint-proof`. The latter also
+requires `--source-manifest-sha256 "$MANIFEST_SHA"` and a completed new isolated
+clone proof. Use the same phase, source and manifest arguments for `apply`, with
+`--preview`, `--preview-sha256`, `--approval`, and `--approval-sha256` from the
+separate approval. Provision the root-private journal parent
+`/var/lib/devres-production-reclaim/ce5745e0-cycle6` before an approved apply.
+Each phase creates its own journal. A stale preview or incomplete apply
+requires reconciliation with the existing journal.
+
 ## Checkpoint and launch
 
 Work under an operator-confirmed window. Use `ssh-mcp` and the explicit production
