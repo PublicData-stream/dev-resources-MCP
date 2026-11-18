@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -9,6 +10,7 @@ import tempfile
 import tomllib
 import unittest
 from unittest import mock
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -103,6 +105,43 @@ class ObserverLifecycleTests(unittest.TestCase):
         self.assertFalse(pod['automountServiceAccountToken'])
         self.assertEqual({volume['name'] for volume in pod['volumes']}, {'config', 'tmp', 'archive'})
         self.assertTrue(next(mount for mount in pod['containers'][0]['volumeMounts'] if mount['name'] == 'archive')['readOnly'])
+        command = pod['containers'][0]['command']
+        reader = urlsplit(config['storage']['database_url'])
+        self.assertEqual(command[4:], [reader.hostname, reader.username, reader.path.removeprefix('/'),
+                                       'devres-server', 'collect', '/etc/devres/config/observer.toml'])
+
+    def test_observer_readiness_retries_then_executes_or_fails_closed(self):
+        pod = readiness.observer_workload('fixture-image')['spec']
+        command = pod['containers'][0]['command']
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            root = Path(directory)
+            probe = root / 'probe'
+            probe.write_text('''#!/bin/sh
+printf '%s\\n' "$*" >> "$PROBE_LOG"
+[ "$(wc -l < "$PROBE_LOG")" -ge "$READY_AFTER" ]
+''')
+            probe.chmod(0o700)
+            command[2] = ('sleep() { printf "%s\\n" "$1" >> "$SLEEP_LOG"; }\n'
+                          + command[2].replace('/usr/lib/postgresql/18/bin/pg_isready', str(probe)))
+            command[7] = '/bin/echo'
+            for ready_after, attempts, returncode in ((3, 3, 0), (11, 10, 1)):
+                with self.subTest(ready_after=ready_after):
+                    probe_log = root / f'probe-{ready_after}'
+                    sleep_log = root / f'sleep-{ready_after}'
+                    result = subprocess.run(command, timeout=10, capture_output=True, text=True, env={
+                        **os.environ, 'PROBE_LOG': str(probe_log), 'SLEEP_LOG': str(sleep_log),
+                        'READY_AFTER': str(ready_after),
+                    })
+                    expected_probe = f'-q -t 1 -h {command[4]} -p 5432 -U {command[5]} -d {command[6]}'
+                    self.assertEqual(probe_log.read_text().splitlines(), [expected_probe] * attempts)
+                    self.assertEqual(sleep_log.read_text().splitlines(), ['1'] * (attempts - 1))
+                    self.assertEqual(result.returncode, returncode)
+                    if returncode == 0:
+                        self.assertEqual(result.stdout, 'collect /etc/devres/config/observer.toml\n')
+                        self.assertEqual(result.stderr, '')
+                    else:
+                        self.assertEqual(result.stdout, '')
+                        self.assertEqual(result.stderr, 'observer PostgreSQL readiness exhausted\n')
 
     def test_retained_snapshot_translates_only_the_synthetic_database_identity(self):
         cluster = mock.Mock()
@@ -153,6 +192,7 @@ class ObserverLifecycleTests(unittest.TestCase):
             result = readiness.observe_after_assessment(cluster, 'image', 'config', root)
         self.assertEqual(events, ['snapshot', 'Secret', 'Pod', 'snapshot', 'stop'])
         self.assertEqual(result['cleanup'], 'complete')
+        self.assertEqual(result['startup_readiness'], 'same_pod_postgresql')
         cluster.delete.assert_called_once_with(readiness.OBSERVER, 'fixture')
         self.assertEqual(cluster.delete_policy.call_count, 2)
 

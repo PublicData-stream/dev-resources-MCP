@@ -252,9 +252,13 @@ records per-table heap and TOAST sizes, buffer use, temporary I/O, and disk
 headroom. A container restart clears PostgreSQL shared buffers while
 leaving the host page cache uncontrolled. Minikube's filesystem and plain-S3
 checks run the same retained-row helper alongside the paused MCP, acquisition
-denial, and cleanup checks. The isolated K3s fixture runs it around the real
+denial, and cleanup checks. The isolated K3s fixture runs the proof around
 status-only server startup after npm assessment cleanup and verifies observer
-removal. Its observer receipt covers SQL and readiness in that fixture.
+removal. An ungated fixture attempt exited before Ready with `Durable storage
+unavailable`. The observer Pod now polls the fixture PostgreSQL service up to
+ten times with bounded `pg_isready` calls before executing the exact server
+command. The receipt identifies this same-Pod readiness gate and covers the
+isolated fixture. The cause of the ungated startup failure remains unresolved.
 
 Before authorizing the next launch, qualify the exact rendered successor with
 the pinned PostgreSQL image and representative resources on a separately

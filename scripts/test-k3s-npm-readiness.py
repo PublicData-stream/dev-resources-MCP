@@ -38,6 +38,20 @@ EGRESS = 'assessment-dns-postgres-egress'
 OBSERVER = 'status-observer'
 OBSERVER_SECRET = 'status-observer-config'
 OBSERVER_POLICIES = ('observer-postgres-ingress', 'observer-dns-postgres-egress')
+OBSERVER_POSTGRES_READINESS = '''
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if /usr/bin/timeout --kill-after=1s 2s /usr/lib/postgresql/18/bin/pg_isready \\
+        -q -t 1 -h "$1" -p 5432 -U "$2" -d "$3"; then
+        shift 3
+        exec "$@"
+    fi
+    if [ "$attempt" -lt 10 ]; then
+        sleep 1
+    fi
+done
+printf '%s\\n' 'observer PostgreSQL readiness exhausted' >&2
+exit 1
+'''
 NATURAL_TRIALS = 10
 NODE = 'k3s-fixture'
 CONTAINERD = '/run/k3s/containerd/containerd.sock'
@@ -590,7 +604,9 @@ def observer_workload(image):
     container = spec['containers'][0]
     container['volumeMounts'] = [mount for mount in container['volumeMounts'] if mount['name'] != 's3']
     container['volumeMounts'].append({'name': 'archive', 'mountPath': '/data/blobs', 'readOnly': True})
-    container.update({'name': OBSERVER, 'command': ['devres-server', 'collect', '/etc/devres/config/observer.toml'],
+    container.update({'name': OBSERVER, 'command': ['/bin/sh', '-ec', OBSERVER_POSTGRES_READINESS, 'sh',
+                      fixture.DATABASE_SERVICE, 'devres_assessment_reader', fixture.DATABASE,
+                      'devres-server', 'collect', '/etc/devres/config/observer.toml'],
                       'readinessProbe': {'httpGet': {'path': '/ready', 'port': 9090}, 'periodSeconds': 1}})
     pod = object_spec('Pod', OBSERVER, spec=spec)
     pod['metadata']['labels'] = {'app': OBSERVER}
@@ -661,6 +677,7 @@ def observe_after_assessment(cluster, server, server_config, directory):
                           'secret/' + OBSERVER_SECRET, '--ignore-not-found', '-o', 'name').stdout
     fixture.need(not remaining.strip() and observer_locks(cluster) == [0, 0, 0], 'k3s_observer_cleanup_unconfirmed')
     return {'assessment_cleanup': 'verified', 'observer_pod_uid': uid, 'effective_apparmor': apparmor,
+            'startup_readiness': 'same_pod_postgresql',
             'read_only_lifecycle_lock': True, 'retained_rows_unchanged': True, 'cleanup': 'complete'}
 
 
