@@ -90,8 +90,10 @@ fourth-cycle proof/rehearsal leaves; `cycle5-checkpoint-proof` selects only the
 three completed fifth-cycle proof leaves before its actual Restore rehearsal.
 Require an independently reviewed runtime-qualified exact preview, helper source
 hash and finite approval before either apply. Each apply consumes one intent and
-preserves selected root identities. A refused or incomplete apply cannot be
-automatically replayed. File-only inventory does not replace namespace, process,
+preserves selected root identities. A refusal before journal/intent creation is
+declined admission: retain it and require newly reviewed source, qualification and
+approval before a fresh admission. Any consumed or ambiguous phase journal remains
+non-replayable. File-only inventory does not replace namespace, process,
 Docker and firewall qualification or current production boundary checks.
 Checkpoint and rehearsal receipts retain their exact producer paths below the
 work-directory bind mounts. Verify each bind root's device/inode and authority
@@ -99,6 +101,17 @@ against its physical volume before accepting those paths. Check required metadat
 hashes through both views; refuse backup artifacts beneath disposable copies in
 either view before reading a body. Do not rewrite retained receipt paths or apply
 general path normalization.
+
+Firewall fingerprints are fresh audit observations. Traffic counters and periodic
+Kubernetes rule regeneration make a global ruleset hash unsuitable as identity for
+these offline copies. Every pre-delete and post-delete runtime qualification must
+still execute all three read-only firewall commands and reject owned tokens and
+selected physical/alias paths in their raw output. The admission comparison
+validates the exact environment schema and three ordered SHA-256 values, then
+excludes only those audit hashes. All data, metadata, source, ancestor and other
+runtime fields remain exact; the original locked production/edge/schema guards
+remain mandatory. Record original, pre-delete and post-delete fingerprints without
+claiming unchanged global firewall policy. No firewall write is authorized.
 
 Prepare the new controller once, perform the source-bound read-only schema check,
 consume the one native store-claim helper GET, and stop the application roles.

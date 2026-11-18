@@ -13,6 +13,11 @@ def put(path,value):
     path.write_bytes(m.encode(value) if not isinstance(value,bytes) else value);path.chmod(0o600)
 
 
+def fixture_environment(runtime=True):
+    return {'runtime_qualified':runtime,'mounts':[],'hostfs':{},'namespaces':{'mnt:[1]':'a'*64},
+        'docker':[],'firewall':['1'*64,'2'*64,'3'*64] if runtime else [],'boot_id':'synthetic-boot'}
+
+
 class Fixture:
     def __init__(self,root):
         self.root=root;self.bundle=root/'bundle';self.work=root/'work';self.install=root/'install';self.journal=root/'journal/phase'
@@ -44,7 +49,7 @@ class Fixture:
             'artifacts':[{'path':str(self.work/'checkpoint-state'/n),'sha256':m.file_record(self.cp/n)['sha256']} for n in names]}
         put(self.cp/'backup-receipt.json',backup)
         self.sync_alias_metadata()
-        self.engine=m.Engine(self.scope,guard=lambda *a,**k:{'runtime_qualified':k['runtime'],'stable':True})
+        self.engine=m.Engine(self.scope,guard=lambda *a,**k:fixture_environment(k['runtime']))
     def sync_alias_metadata(self):
         # Actual regular control records are copied with unchanged bytes/modes.
         # Only directory_record models kernel bind identity; no control read or
@@ -72,7 +77,7 @@ class Fixture:
         return digest,source,approval
     def make_c4(self):
         self.scope=m.Scope('cycle4-completed',self.bundle,self.work,self.install,self.journal)
-        self.engine=m.Engine(self.scope,guard=lambda *a,**k:{'runtime_qualified':k['runtime'],'stable':True})
+        self.engine=m.Engine(self.scope,guard=lambda *a,**k:fixture_environment(k['runtime']))
         rr=self.bundle/'restore-rehearsal-volume';rr.mkdir(mode=0o700)
         (self.work/'restore-rehearsal-state').mkdir(mode=0o700)
         for name in ('restore-controller.py','restore-rehearsal.py'):put(self.install/name,b'# synthetic review source\n')
@@ -331,6 +336,74 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(self.f.engine.protected([Path(p) for p in preview['roots']],[Path(p) for p in preview['protected_roots']]),protected)
         self.assertEqual((self.f.cp/'pg-checkpoint/payload').read_bytes(),b'copy-payload')
         with self.assertRaisesRegex(m.Refused,'already_consumed'):self.f.engine.apply(preview,digest,source,approval)
+    def test_firewall_audit_variance_preserves_full_preview_and_three_completion_pins(self):
+        preview=self.f.preview();original=copy.deepcopy(preview);digest,source,approval=self.f.approved(preview)
+        before=copy.deepcopy(preview);before['environment']['firewall']=['4'*64,'5'*64,'6'*64]
+        after=fixture_environment();after['firewall']=['7'*64,'8'*64,'9'*64]
+        self.f.engine.preview=lambda **k:before
+        with patch.object(self.f.engine,'guard',return_value=after) as guard:
+            result=self.f.engine.apply(preview,digest,source,approval)
+        self.assertEqual(guard.call_count,1);self.assertIs(guard.call_args.kwargs['runtime'],True)
+        self.assertEqual(preview,original);self.assertEqual(m.sha(m.encode(preview)),digest)
+        audit=result['firewall_audit'];self.assertEqual(audit['order'],['nft-stateless','iptables-save','ip6tables-save'])
+        self.assertEqual(audit['original_preview'],original['environment']['firewall'])
+        self.assertEqual(audit['pre_delete'],before['environment']['firewall']);self.assertEqual(audit['post_delete'],after['firewall'])
+        self.assertIs(audit['no_owned_copy_rule_reference_verified'],True)
+        self.assertIs(audit['firewall_policy_unchanged_claimed'],False)
+        self.assertEqual(json.loads((self.f.journal/'completed.json').read_bytes())['firewall_audit'],audit)
+    def test_every_other_environment_field_drift_refuses_before_intent(self):
+        preview=self.f.preview();digest,source,approval=self.f.approved(preview)
+        replacements={'mounts':[{'changed':True}],'hostfs':{'changed':True},'namespaces':{'mnt:[2]':'b'*64},
+            'docker':[{'changed':True}],'boot_id':'changed-boot','runtime_qualified':False}
+        for key,value in replacements.items():
+            with self.subTest(key=key):
+                before=copy.deepcopy(preview);before['environment'][key]=value
+                self.f.engine.preview=lambda **k:before
+                with self.assertRaises(m.Refused):self.f.engine.apply(preview,digest,source,approval)
+                self.assertFalse(self.f.journal.exists())
+        self.assertTrue((self.f.cp/'pg-clone/payload').exists())
+    def test_every_non_environment_preview_field_remains_exact_before_intent(self):
+        preview=self.f.preview();digest,source,approval=self.f.approved(preview)
+        for key in preview:
+            if key=='environment':continue
+            with self.subTest(key=key):
+                before=copy.deepcopy(preview);before[key]={'drift':True}
+                self.f.engine.preview=lambda **k:before
+                with self.assertRaisesRegex(m.Refused,'retirement_preview_stale'):self.f.engine.apply(preview,digest,source,approval)
+                self.assertFalse(self.f.journal.exists())
+    def test_full_original_firewall_audit_still_binds_external_preview_sha(self):
+        preview=self.f.preview();digest,source,approval=self.f.approved(preview)
+        preview['environment']['firewall']=['4'*64,'5'*64,'6'*64]
+        with patch.object(self.f.engine,'preview',side_effect=AssertionError('must validate original full SHA first')):
+            with self.assertRaisesRegex(m.Refused,'external_preview_source_pin'):self.f.engine.apply(preview,digest,source,approval)
+        self.assertFalse(self.f.journal.exists())
+    def test_malformed_admitted_or_fresh_environment_refuses_before_intent(self):
+        baseline=self.f.preview()
+        invalid=[]
+        for key in fixture_environment():
+            value=fixture_environment();del value[key];invalid.append(value)
+        value=fixture_environment();value['unexpected']=True;invalid.append(value)
+        for hashes in (['1'*64]*2,['1'*64]*4,['bad']*3):
+            value=fixture_environment();value['firewall']=hashes;invalid.append(value)
+        for value in invalid:
+            with self.subTest(environment=value):
+                preview=copy.deepcopy(baseline);preview['environment']=value;digest,source,approval=self.f.approved(preview)
+                with patch.object(self.f.engine,'preview',side_effect=AssertionError('invalid original must refuse early')):
+                    with self.assertRaises(m.Refused):self.f.engine.apply(preview,digest,source,approval)
+                self.assertFalse(self.f.journal.exists())
+                digest,source,approval=self.f.approved(baseline);before=copy.deepcopy(baseline);before['environment']=value
+                with patch.object(self.f.engine,'preview',return_value=before):
+                    with self.assertRaises(m.Refused):self.f.engine.apply(baseline,digest,source,approval)
+                self.assertFalse(self.f.journal.exists())
+    def test_post_delete_environment_failure_consumes_intent_and_forbids_retry(self):
+        preview=self.f.preview();digest,source,approval=self.f.approved(preview);self.f.engine.preview=lambda **k:preview
+        after=fixture_environment();after['boot_id']='changed-boot'
+        with patch.object(self.f.engine,'guard',return_value=after):
+            with self.assertRaisesRegex(m.Refused,'runtime_boundary_changed'):self.f.engine.apply(preview,digest,source,approval)
+        self.assertTrue((self.f.journal/'intent.json').exists());self.assertTrue((self.f.journal/'failed.json').exists())
+        self.assertFalse((self.f.journal/'completed.json').exists())
+        with patch.object(self.f.engine,'clear',side_effect=AssertionError('no second deletion')):
+            with self.assertRaisesRegex(m.Refused,'already_consumed'):self.f.engine.apply(preview,digest,source,approval)
     def test_stale_preview_or_wrong_approval_refuses_before_intent(self):
         preview=self.f.preview();digest,source,approval=self.f.approved(preview)
         self.f.engine.preview=lambda **k:dict(preview,entries=-1)
@@ -359,6 +432,24 @@ class CandidateTests(unittest.TestCase):
         self.f.engine.removed_links=m.Counter();self.f.engine.link_ctimes={}
         self.f.engine.clear(a,rows_a);self.f.engine.clear(b,rows_b)
         self.assertEqual(list(a.iterdir()),[]);self.assertEqual(list(b.iterdir()),[])
+
+
+class EnvironmentBindingTests(unittest.TestCase):
+    def test_fixed_seven_field_schema_omits_only_firewall_without_mutation(self):
+        value=fixture_environment();original=copy.deepcopy(value);bound=m.environment_binding(value)
+        self.assertEqual(bound,{k:v for k,v in value.items() if k!='firewall'});self.assertEqual(value,original)
+        changed=copy.deepcopy(value);changed['firewall']=['a'*64,'b'*64,'c'*64]
+        self.assertEqual(m.environment_binding(changed),bound)
+    def test_invalid_schema_runtime_or_digest_list_is_refused(self):
+        cases=[None,[],{},dict(fixture_environment(),extra=True)]
+        for key in fixture_environment():
+            value=fixture_environment();del value[key];cases.append(value)
+        for runtime in (False,1,'true',None):cases.append(dict(fixture_environment(),runtime_qualified=runtime))
+        for hashes in (None,(),['1'*64]*2,['1'*64]*4,['g'*64]*3,['A'*64]*3,['1'*63]*3,[b'1'*64]*3):
+            cases.append(dict(fixture_environment(),firewall=hashes))
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(m.Refused):m.environment_binding(value)
 
 
 class FirewallCanonicalizationTests(unittest.TestCase):
@@ -414,6 +505,40 @@ class ProcessGuardTests(unittest.TestCase):
     def test_readonly_guard_success_has_no_runtime_commands(self):
         with patch.object(m,'command',side_effect=AssertionError('no runtime command')):value=self.guard()
         self.assertFalse(value['runtime_qualified']);self.assertEqual(len(value['namespaces']),1)
+    def test_runtime_guard_runs_all_three_fresh_raw_commands_and_hashes_can_vary(self):
+        calls=[];generation=0
+        def command(arguments,**kwargs):
+            calls.append(arguments)
+            if arguments[0]=='docker':return b''
+            return ('raw-firewall-state-'+str(generation)+'-'+arguments[0]).encode()
+        with patch.dict(os.environ,{'DOCKER_CONTEXT':'','DOCKER_HOST':''}),patch.object(m,'command',side_effect=command):
+            first=self.guard(runtime=True);generation=1;second=self.guard(runtime=True)
+        commands=[args for args in calls if args[0]!='docker']
+        self.assertEqual(commands,[['nft','--stateless','--json','list','ruleset'],['iptables-save'],['ip6tables-save']]*2)
+        self.assertNotEqual(first['firewall'],second['firewall']);self.assertEqual(m.environment_binding(first),m.environment_binding(second))
+    def test_every_raw_firewall_command_still_refuses_owned_token_and_copy_paths(self):
+        alias=self.root/'work-copy-alias'
+        for program in ('nft','iptables-save','ip6tables-save'):
+            for evidence,reason in [(b'a'*24,'owned_firewall_remaining'),
+                (str(self.copy/'payload').encode(),'copy_firewall_reference'),
+                (str(alias/'payload').encode(),'copy_firewall_reference')]:
+                with self.subTest(program=program,reason=reason):
+                    def command(arguments,**kwargs):
+                        if arguments[0]=='docker':return b''
+                        return evidence if arguments[0]==program else b'no-owned-reference'
+                    with patch.dict(os.environ,{'DOCKER_CONTEXT':'','DOCKER_HOST':''}),patch.object(m,'command',side_effect=command):
+                        with self.assertRaisesRegex(m.Refused,reason):
+                            m.environment([self.copy],[alias],['a'*24],set(),proc=self.proc,runtime=True)
+    def test_firewall_command_failure_refuses_without_retry(self):
+        for program in ('nft','iptables-save','ip6tables-save'):
+            calls=[]
+            def command(arguments,**kwargs):
+                calls.append(arguments[0])
+                if arguments[0]==program:raise m.Refused('system_inspection_incomplete')
+                return b'' if arguments[0]=='docker' else b'no-owned-reference'
+            with patch.dict(os.environ,{'DOCKER_CONTEXT':'','DOCKER_HOST':''}),patch.object(m,'command',side_effect=command):
+                with self.assertRaisesRegex(m.Refused,'system_inspection_incomplete'):self.guard(runtime=True)
+            self.assertEqual(calls.count(program),1)
     def test_active_producer_or_fd_refuses(self):
         put(self.pid/'cmdline',b'python3\0/path/physical-checkpoint.py\0')
         with self.assertRaisesRegex(m.Refused,'producer_process'):self.guard()

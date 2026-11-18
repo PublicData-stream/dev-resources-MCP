@@ -5,6 +5,8 @@ Inspect is metadata-only for copy bodies; runtime qualification additionally rea
 Docker/firewall metadata. Apply needs an externally pinned exact preview+approval,
 consumes a fresh phase journal once, and preserves every selected root inode.
 No checkpoint, rehearsal, production restore, SQL, HTTP or object-store operation.
+Firewall hashes are audit evidence: every fresh raw check still rejects owned
+tokens/copy paths. Every other environment field remains bound to the preview.
 """
 from __future__ import annotations
 import argparse
@@ -341,6 +343,18 @@ def environment(roots,aliases,tokens,inodes,*,proc=Path('/proc'),runtime=False):
         'docker':docker,'firewall':firewall,'boot_id':(proc/'sys/kernel/random/boot_id').read_text().strip()}
 
 
+def environment_binding(value):
+    """Validate the full environment; omit only its three firewall audit hashes."""
+    need(type(value) is dict and set(value)=={'runtime_qualified','mounts','hostfs',
+         'namespaces','docker','firewall','boot_id'},'runtime_environment_schema_required')
+    need(value['runtime_qualified'] is True,'full_runtime_qualification_required')
+    need(type(value['firewall']) is list and len(value['firewall'])==3
+         and all(type(item) is str and re.fullmatch('[0-9a-f]{64}',item) for item in value['firewall']),
+         'three_firewall_audit_hashes_required')
+    # environment() fixes the order: nft --stateless, iptables-save, ip6tables-save.
+    return {key:item for key,item in value.items() if key!='firewall'}
+
+
 class Engine:
     def __init__(self,scope,guard=environment):self.scope=scope;self.guard=guard
 
@@ -520,11 +534,12 @@ class Engine:
         need(approval=={'version':1,'approved':True,'kind':'cycle5-completed-copy-retirement',
             'phase':self.scope.phase,'preview_sha256':preview_sha,'source_sha256':script_sha,
             'maximum_applies':1,'operations':['apply']},'exact_external_approval_required')
-        need(preview['phase']==self.scope.phase and preview['environment']['runtime_qualified'] is True,
-             'full_runtime_qualification_required')
+        need(preview['phase']==self.scope.phase,'fixed_phase_required')
+        original_environment=environment_binding(preview['environment'])
         need(not self.scope.journal.exists(),'retirement_intent_already_consumed')
         before=self.preview(runtime=True)
-        need(before==preview,'retirement_preview_stale')
+        need(dict(before,environment=environment_binding(before['environment']))==
+             dict(preview,environment=original_environment),'retirement_preview_stale')
         parent=safe_path(self.scope.journal.parent);s=parent.stat()
         need(s.st_uid==os.geteuid() and not s.st_mode&0o077,'existing_private_journal_parent_required')
         self.scope.journal.mkdir(mode=0o700);sync(parent)
@@ -541,13 +556,17 @@ class Engine:
             need(self.protected(roots,protected)==preview['protected'],'protected_artifacts_changed')
             need(self.receipts()[0]==roots,'producer_completion_changed')
             after=self.guard(roots,[Path(p) for p in preview['aliases']],preview['tokens'],set(),runtime=True)
-            need(after==preview['environment'],'runtime_boundary_changed')
+            need(environment_binding(after)==original_environment,'runtime_boundary_changed')
             need(all(not any(p.iterdir()) for p in roots),'copy_children_remain')
             free_after=os.statvfs(parent).f_bavail*os.statvfs(parent).f_frsize
             result={'version':1,'verified':True,'source_sha256':script_sha,'preview_sha256':preview_sha,
                 'roots_preserved':True,'protected_unchanged':True,'producer_completion_retained':True,
                 'free_before':free_before,'free_after':free_after,'observed_free_delta':free_after-free_before,
-                'directory_timestamps_changed':True,'atime_equivalence_claimed':False}
+                'directory_timestamps_changed':True,'atime_equivalence_claimed':False,
+                'firewall_audit':{'order':['nft-stateless','iptables-save','ip6tables-save'],
+                    'original_preview':list(preview['environment']['firewall']),
+                    'pre_delete':list(before['environment']['firewall']),'post_delete':list(after['firewall']),
+                    'no_owned_copy_rule_reference_verified':True,'firewall_policy_unchanged_claimed':False}}
             new(self.scope.journal/'completed.json',result);return result
         except BaseException:
             try:new(self.scope.journal/'failed.json',{'verified':False,'no_retry':True,'manual_reconciliation_required':True})
