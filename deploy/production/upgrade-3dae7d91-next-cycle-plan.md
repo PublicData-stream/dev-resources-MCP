@@ -1,6 +1,6 @@
-# Proposed fresh cycle after the withdrawn 3dae7d91 attempt
+# Approved fresh cycle after the withdrawn 3dae7d91 attempt
 
-Status: proposed; additional production authority has not been granted. The
+Status: approved on 2026-11-18 for the single bounded cycle below. The
 [execution record](upgrade-3dae7d91-evidence.md) documents the consumed attempt
 and completed schema-18 restoration. This proposal retains the same immutable
 server/probe references in the [procedure](upgrade-3dae7d91.md). It permits no
@@ -64,5 +64,6 @@ separate from test artifacts. Cargo output remains `/tmp/rust/target`, with
 shared-cache Cargo/pnpm commands using the privileged channel. New commits are
 signed on `main` with the required Codex assistance trailer. No GitHub push,
 publication, full provider/corpus acceptance or native ChatGPT UI acceptance is
-included. Approving this proposal authorizes the bounded cycle above, subject
-to every admission gate; it does not waive a failed gate or authorize a retry.
+included. The approval authorizes the bounded cycle above, subject to every
+admission gate; it does not waive a failed gate or authorize a retry. The earlier
+cycle and its execution record remain immutable historical evidence.
