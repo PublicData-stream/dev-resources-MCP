@@ -98,6 +98,67 @@ struct EvidenceManifest {
     files: Vec<EvidenceFile>,
 }
 
+#[derive(Default)]
+pub(super) struct RestoreTrace<'a> {
+    stage: &'static str,
+    inventory: Option<&'a str>,
+    revision: Option<&'a str>,
+    manifest_capture: Option<String>,
+    pack_ordinal: Option<usize>,
+    io_failure: Option<&'static str>,
+}
+
+impl<'a> RestoreTrace<'a> {
+    pub(super) fn pending(inventory: &'a str, revision: &'a str) -> Self {
+        Self {
+            stage: "manifest_lookup",
+            inventory: Some(inventory),
+            revision: Some(revision),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn bind_manifest(&mut self, capture: &str) {
+        self.stage = "manifest_binding";
+        if crate::integrity::valid_hash(capture) {
+            self.manifest_capture = Some(capture.to_owned());
+        }
+    }
+
+    pub(super) fn report(&self, result: &Result<GitSnapshot>) {
+        let stage = if result.is_ok() {
+            "complete"
+        } else {
+            self.stage
+        };
+        tracing::debug!(
+            target: "devres_private_timings",
+            crate_inventory_restore_stage = stage,
+            inventory = self.inventory.filter(|id| crate::integrity::valid_hash(id)),
+            revision = self.revision.filter(|id| valid_oid(id)),
+            manifest_capture = self.manifest_capture.as_deref(),
+            pack_ordinal = self.pack_ordinal,
+            io_failure = self.io_failure,
+            success = result.is_ok(),
+            code = result.as_ref().err().map(|error| collection::safe_code(&error.code)),
+            "Crate inventory restore"
+        );
+    }
+
+    fn io_error(&mut self, error: std::io::Error) -> Error {
+        use std::io::ErrorKind;
+        self.io_failure = Some(match error.kind() {
+            ErrorKind::CrossesDevices => "cross_device",
+            ErrorKind::PermissionDenied => "permission_denied",
+            ErrorKind::StorageFull => "storage_full",
+            ErrorKind::ReadOnlyFilesystem => "read_only_filesystem",
+            ErrorKind::NotFound => "not_found",
+            _ => "other",
+        });
+        git_error()
+    }
+}
+
 pub struct GitRegistry {
     root: PathBuf,
     max_repository_bytes: u64,
@@ -422,31 +483,57 @@ impl GitRegistry {
         manifest: BulkArtifact,
         shutdown: CancellationToken,
     ) -> Result<GitSnapshot> {
+        let mut trace = RestoreTrace::default();
+        let result = self
+            .restore_observed(artifacts, manifest, shutdown, &mut trace)
+            .await;
+        trace.report(&result);
+        result
+    }
+
+    pub(super) async fn restore_observed(
+        &self,
+        artifacts: Arc<BulkArtifactStore>,
+        manifest: BulkArtifact,
+        shutdown: CancellationToken,
+        trace: &mut RestoreTrace<'_>,
+    ) -> Result<GitSnapshot> {
         let deadline = Instant::now() + SYNC_RUNTIME;
+        trace.stage = "restore_gate";
         let _gate = bulk::bounded(&shutdown, deadline, async {
             Ok(self.sync_gate.lock().await)
         })
         .await?;
-        self.initialize(&shutdown, deadline).await?;
+        trace.stage = "manifest_open";
         let file = artifacts
             .open(&manifest.body_hash, MAX_MANIFEST as u64, shutdown.clone())
             .await?;
+        trace.stage = "manifest_read";
         let mut bytes = Vec::new();
         file.take(MAX_MANIFEST as u64 + 1)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| git_error())?;
+            .map_err(|error| trace.io_error(error))?;
         if bytes.len() > MAX_MANIFEST {
             return Err(Error::capacity(
                 "Registry Git manifest exceeds its byte budget.",
             ));
         }
+        trace.stage = "manifest_length";
+        if bytes.len() as u64 != manifest.bytes {
+            return Err(Error::integrity("Registry Git manifest length mismatch."));
+        }
+        trace.stage = "manifest_parse";
         let evidence: EvidenceManifest = serde_json::from_slice(&bytes)
             .map_err(|_| Error::integrity("Invalid registry Git evidence manifest."))?;
+        trace.stage = "manifest_identity";
         if evidence.version != 1
             || evidence.observed_at < 0
             || evidence.observed_at > devres_domain::unix_now()
             || !valid_oid(&evidence.revision)
+            || trace
+                .revision
+                .is_some_and(|revision| evidence.revision != revision)
             || evidence.source_url != "https://github.com/rust-lang/crates.io-index.git"
             || evidence
                 .previous_revision
@@ -457,12 +544,17 @@ impl GitRegistry {
         {
             return Err(Error::integrity("Invalid registry Git evidence identity."));
         }
+        trace.stage = "repository_init";
+        self.initialize(&shutdown, deadline).await?;
         let pack_root = self.root.join(REPO_NAME).join("objects/pack");
         let mut seen = std::collections::HashSet::new();
-        for entry in &evidence.files {
+        for (position, entry) in evidence.files.iter().enumerate() {
+            trace.pack_ordinal = Some(position + 1);
+            trace.stage = "pack_membership";
             if !valid_pack_name(&entry.name) || !seen.insert(entry.name.clone()) {
                 return Err(Error::integrity("Invalid registry Git pack membership."));
             }
+            trace.stage = "pack_materialization";
             let verified = artifacts
                 .materialize(
                     &entry.artifact.body_hash,
@@ -470,15 +562,18 @@ impl GitRegistry {
                     shutdown.clone(),
                 )
                 .await?;
+            trace.stage = "pack_identity";
             if verified.artifact != entry.artifact {
                 return Err(Error::integrity("Registry Git artifact metadata mismatch."));
             }
             let source = &verified.path;
             let destination = pack_root.join(&entry.name);
+            trace.stage = "pack_link";
             match tokio::fs::hard_link(source, &destination).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Existing Git files are not trusted merely because their names match.
+                    trace.stage = "existing_pack_verification";
                     let observed = artifacts
                         .ingest_file(&destination, bulk::MAX_ARTIFACT_BYTES, shutdown.clone())
                         .await?;
@@ -488,16 +583,20 @@ impl GitRegistry {
                         ));
                     }
                 }
-                Err(_) => return Err(git_error()),
+                Err(error) => return Err(trace.io_error(error)),
             }
+            trace.stage = "repository_size";
             directory_size(
                 &self.root.join(REPO_NAME),
                 self.max_repository_bytes,
                 GitScanMode::Settled,
             )?;
         }
+        trace.pack_ordinal = None;
+        trace.stage = "pack_directory_sync";
         sync_directory(&pack_root).await?;
         if !evidence.shallow.is_empty() {
+            trace.stage = "shallow_boundary";
             let bytes = evidence
                 .shallow
                 .iter()
@@ -513,17 +612,21 @@ impl GitRegistry {
                 Ok(mut file) => {
                     file.write_all(bytes.as_bytes())
                         .await
-                        .map_err(|_| git_error())?;
-                    file.sync_all().await.map_err(|_| git_error())?;
+                        .map_err(|error| trace.io_error(error))?;
+                    file.sync_all()
+                        .await
+                        .map_err(|error| trace.io_error(error))?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let metadata = tokio::fs::symlink_metadata(&path)
                         .await
-                        .map_err(|_| git_error())?;
+                        .map_err(|error| trace.io_error(error))?;
                     if !metadata.is_file()
                         || metadata.file_type().is_symlink()
                         || metadata.len() != bytes.len() as u64
-                        || tokio::fs::read(&path).await.map_err(|_| git_error())?
+                        || tokio::fs::read(&path)
+                            .await
+                            .map_err(|error| trace.io_error(error))?
                             != bytes.as_bytes()
                     {
                         return Err(Error::integrity(
@@ -531,10 +634,11 @@ impl GitRegistry {
                         ));
                     }
                 }
-                Err(_) => return Err(git_error()),
+                Err(error) => return Err(trace.io_error(error)),
             }
         }
         let reference = format!("refs/devres/snapshots/{}", evidence.revision);
+        trace.stage = "snapshot_ref_update";
         self.run(
             &["update-ref", &reference, &evidence.revision],
             128,
@@ -542,6 +646,7 @@ impl GitRegistry {
             deadline,
         )
         .await?;
+        trace.stage = "strict_fsck";
         self.run(
             &["fsck", "--strict", "--no-reflogs", &evidence.revision],
             MAX_REQUEST,
@@ -549,6 +654,7 @@ impl GitRegistry {
             deadline,
         )
         .await?;
+        trace.stage = "current_ref_update";
         self.run(
             &["update-ref", "refs/devres/current", &evidence.revision],
             128,
@@ -2430,6 +2536,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "git/restore_diagnostic_tests.rs"]
+mod restore_diagnostic_tests;
 
 #[cfg(test)]
 #[path = "git/scan_tests.rs"]

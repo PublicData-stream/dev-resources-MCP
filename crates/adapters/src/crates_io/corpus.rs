@@ -15,7 +15,7 @@ use crate::{
         DocsOperation, MAX_ARTIFACT_BYTES,
     },
     crates_io::docs::{self as crate_docs, ProcessingBudget},
-    crates_io::git::{GitRegistry, GitSnapshot},
+    crates_io::git::{GitRegistry, GitSnapshot, RestoreTrace},
     crates_io::packages as cargo,
 };
 use devres_application::{
@@ -424,28 +424,40 @@ impl CrateCorpus {
             .map_err(|error| collection::at_phase(error, Phase::RetainedLookup))?;
         let snapshot = if let Some(pending) = &pending {
             self.begin_diagnostics("inventory", Phase::InventoryRestore);
-            let saved = self
-                .store
-                .latest_artifact(&format!("cargo:git-manifest:{}", pending.revision))
-                .await
-                .map_err(|error| collection::at_phase(error, Phase::InventoryRestore))?
-                .ok_or_else(|| {
-                    collection::at_phase(
-                        Error::integrity("Pending registry evidence is absent."),
-                        Phase::InventoryRestore,
+            let mut trace = RestoreTrace::pending(&pending.id, &pending.revision);
+            let restored = async {
+                let saved = self
+                    .store
+                    .latest_artifact(&format!("cargo:git-manifest:{}", pending.revision))
+                    .await
+                    .map_err(|error| collection::at_phase(error, Phase::InventoryRestore))?
+                    .ok_or_else(|| {
+                        collection::at_phase(
+                            Error::integrity("Pending registry evidence is absent."),
+                            Phase::InventoryRestore,
+                        )
+                    })?;
+                trace.bind_manifest(&saved.capture.id);
+                let manifest = BulkArtifact {
+                    relative_path: crate::integrity::relative_path(&saved.capture.body_hash)?
+                        .to_string_lossy()
+                        .into_owned(),
+                    body_hash: saved.capture.body_hash,
+                    bytes: saved.bytes,
+                };
+                self.git
+                    .restore_observed(
+                        self.artifacts.clone(),
+                        manifest,
+                        stop.child_token(),
+                        &mut trace,
                     )
-                })?;
-            let manifest = BulkArtifact {
-                relative_path: crate::integrity::relative_path(&saved.capture.body_hash)?
-                    .to_string_lossy()
-                    .into_owned(),
-                body_hash: saved.capture.body_hash,
-                bytes: saved.bytes,
-            };
-            self.git
-                .restore(self.artifacts.clone(), manifest, stop.child_token())
-                .await
-                .map_err(|error| collection::at_phase(error, Phase::InventoryRestore))?
+                    .await
+                    .map_err(|error| collection::at_phase(error, Phase::InventoryRestore))
+            }
+            .await;
+            trace.report(&restored);
+            restored?
         } else {
             self.begin_diagnostics("inventory", Phase::InventoryAcquisition);
             self.git

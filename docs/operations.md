@@ -797,6 +797,15 @@ registry entries advance this checkpoint as capacity gaps while their raw Git
 evidence remains retained; they do not block unrelated crates from publication.
 A checkpoint does not establish a completion percentage or published research.
 
+For a repeated `inventory_restore` failure, correlate the pending revision with
+its `cargo:git-manifest:<revision>` capture and the exact pack bindings. Use
+`DEVRES_PRIVATE_TIMINGS=1` during a bounded writer diagnostic window to see the
+`crate_inventory_restore_stage` event and related archive stages. A completed
+restore precedes inventory import and snapshot publication. For an isolated
+replay, verify the manifest and pack lengths and digests, then check the shallow
+boundary and revision in a disposable bare repository. Preserve the pending
+generation and cursor for the regular writer retry after repairing the cause.
+
 The hourly Git index and daily public metadata dump are independent clocks. Exact
 archives are checksum-bound; docs.rs representations may change on rebuild and
 missing documentation is retried. Monitor per-kind failures, last successful

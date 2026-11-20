@@ -201,8 +201,7 @@ async fn retained_inventory(
         &["mktree"],
         format!("040000 tree {am}\tam\n").as_bytes(),
     ));
-    // A retained oversized member precedes the ordinary crate in tree order.
-    // Its parsing gap must not prevent inventory and search publication.
+    // The two oversized entries share one blob and precede the ordinary crate.
     let oversized = oid(git(
         &repository,
         &["hash-object", "-w", "--stdin"],
@@ -211,7 +210,7 @@ async fn retained_inventory(
     let one = oid(git(
         &repository,
         &["mktree"],
-        format!("100644 blob {oversized}\ta\n").as_bytes(),
+        format!("100644 blob {oversized}\ta\n100644 blob {oversized}\tb\n").as_bytes(),
     ));
     let tree = oid(git(
         &repository,
@@ -487,23 +486,81 @@ async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {
     let observed_at = unix_now() - 60;
     let (revision, manifest) =
         retained_inventory(&corpus.artifacts, &index(&archives), observed_at).await;
+    let pending = store.begin_inventory(&revision, observed_at).await.unwrap();
+    // Keep the first staged gap distinguishable from the capacity gap that
+    // reprocessing this fixture member would produce.
+    store
+        .stage_gap(&pending.id, "a", "integrity", "1/a")
+        .await
+        .unwrap();
+    let retained_manifest = corpus
+        .persist_artifact(
+            &format!("cargo:git-manifest:{revision}"),
+            "https://github.com/rust-lang/crates.io-index.git",
+            "application/json",
+            manifest.clone(),
+            json!({"transport":"git","revision":revision,"observed_at":observed_at}),
+            false,
+        )
+        .await
+        .unwrap();
+    let manifest_path = root.path().join(&manifest.relative_path);
+    let unavailable_path = root.path().join("unavailable-fixture-manifest");
+    std::fs::rename(&manifest_path, &unavailable_path).unwrap();
+    let failure = corpus
+        .sync_inventory(CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.code, "unavailable");
+    assert_eq!(
+        collection::context(&failure).unwrap().phase,
+        Phase::InventoryRestore
+    );
+    let after_failure = store.pending_inventory().await.unwrap().unwrap();
+    assert_eq!(after_failure.id, pending.id);
+    assert_eq!(after_failure.cursor.as_deref(), Some("1/a"));
+    assert!(store.latest_inventory().await.unwrap().is_none());
+    assert!(store.snapshot(None).await.unwrap().is_none());
+    std::fs::rename(&unavailable_path, &manifest_path).unwrap();
     corpus
-        .import_inventory(&manifest.body_hash, CancellationToken::new())
+        .sync_inventory(CancellationToken::new())
         .await
         .unwrap();
     let before = store.snapshot(None).await.unwrap().unwrap();
+    assert_eq!(before.inventory.id, pending.id);
     assert_eq!(before.inventory.revision, revision);
     assert_eq!(before.inventory.validated_at, observed_at);
+    assert!(store.pending_inventory().await.unwrap().is_none());
     assert_eq!(before.coverage["versions"], 2);
     assert_eq!(before.coverage["inventory_complete"], false);
     assert_eq!(before.coverage["inventory_enumeration_complete"], true);
-    assert_eq!(before.coverage["metadata_gaps"], 1);
-    let gaps: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM devres_crate_inventory_gaps WHERE inventory=$1 AND name='a' AND error='capacity'")
-        .bind(&before.inventory.id)
-        .fetch_one(&sqlx_postgres::PgPool::connect(database.as_str()).await.unwrap())
+    assert_eq!(before.coverage["metadata_gaps"], 2);
+    let pool = sqlx_postgres::PgPool::connect(database.as_str())
         .await
         .unwrap();
-    assert_eq!(gaps, 1);
+    let manifest_id: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT manifest FROM devres_crate_inventories WHERE id=$1 AND published",
+    )
+    .bind(&before.inventory.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(manifest_id, retained_manifest.capture.id);
+    let gaps: Vec<(String, String)> = sqlx_core::query_as::query_as(
+        "SELECT name,error FROM devres_crate_inventory_gaps WHERE inventory=$1 ORDER BY name",
+    )
+    .bind(&before.inventory.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        gaps,
+        [
+            (String::from("a"), String::from("integrity")),
+            (String::from("b"), String::from("capacity")),
+        ]
+    );
+    pool.close().await;
     let research = crate::Research::new(retrieval.clone())
         .await
         .unwrap()
