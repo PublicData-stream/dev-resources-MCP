@@ -223,8 +223,10 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
     }
     Ok(())
 }
+pub(super) const MAX_VERSION_BYTES: usize = 128;
+
 pub(crate) fn validate_version(version: &str) -> Result<semver::Version> {
-    if version.len() > 128 {
+    if version.len() > MAX_VERSION_BYTES {
         return Err(Error::invalid("Crate version is too long."));
     }
     semver::Version::parse(version)

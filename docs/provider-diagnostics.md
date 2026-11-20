@@ -179,6 +179,22 @@ flag, and finite reason/limits. A local prefix scan does not reverify the comple
 artifact. A cold S3 object may be downloaded once into private disposable `/tmp`
 storage and fully digest-checked before parsing. No provider dump is downloaded.
 
+Use `--provider crates --scan-runtime-dump blake3:CAPTURE_HEX` to select one
+retained dump and apply current `crates-dump-v2` parser admission. The report
+links only sealed failure evidence for that capture and confirms the full
+compressed-body digest before parsing. The scan keeps the same 4 GiB compressed,
+8 GiB expanded, and thirty-minute bounds. An S3 scan checks the exact completed
+archive binding and verifies one retained object download in private `/tmp`.
+Confirm space and pod ephemeral-storage allowances before starting the scan.
+A filesystem scan verifies the selected retained file locally. The runtime scan
+reports a fixed archive stage, numeric member ordinal when known, and bounded
+CSV evidence. For a row identity rejection, `identity_field` names the fixed
+validator field. For a version rejection, `identity_cause` distinguishes the
+version byte limit from invalid semantic version syntax. The CSV column remains
+the parser's cursor for that row. The
+scan stops at the first rejection and performs no database staging, enrichment
+publication, or source acquisition.
+
 For missing parser bytes, separately authorized fixed-operation probes must use
 the existing broker destination policy and retained attempt accounting. Count
 all attempts against the shared twenty-request per-provider ceiling. Chromium's
@@ -228,6 +244,12 @@ and record completion/validity flags. It never emits field values, stages rows o
 changes runtime admission. A stopped prefix scan proves neither the complete
 dump's digest nor its gzip trailer, subsequent rows or import completion. Remote
 binary transfer and execution require their own explicit operational authority.
+
+For an offline runtime replay, replace `--measure-first-rejection` with
+`--runtime-v2`. It verifies the full compressed BLAKE3 digest and size before
+using the runtime parser. The capture association remains operator-supplied.
+Use the report's parser completion flag to distinguish a validated stream from
+partial parser evidence after a verified body.
 
 ## Selected RFC metadata
 

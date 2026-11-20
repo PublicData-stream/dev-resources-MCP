@@ -111,6 +111,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
             max_total_bytes: 64 * 1024 * 1024,
             timeout_secs: 300,
             scan_retained_dump: false,
+            scan_runtime_dump: None,
             snapshot: Some(flags.remove("--snapshot").ok_or_else(invalid)?),
             job_keys: vec![flags.remove("--job-key").ok_or_else(invalid)?],
             commit: None,

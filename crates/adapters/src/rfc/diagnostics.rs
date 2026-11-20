@@ -553,6 +553,7 @@ mod tests {
             max_total_bytes: MAX_BYTES,
             timeout_secs: 30,
             scan_retained_dump: false,
+            scan_runtime_dump: None,
             snapshot: Some(snapshot.into()),
             job_keys: vec!["rfc:text:9000".into()],
             commit: None,

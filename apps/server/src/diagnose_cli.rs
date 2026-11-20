@@ -16,7 +16,7 @@ pub struct Arguments {
 pub fn parse(args: &[String]) -> Result<Arguments> {
     let invalid = || {
         Error::invalid(
-            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc|rustsec|mdn|npm --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump] [--snapshot ID --job-key KEY [--job-key KEY]] [--commit OID] [--attribution-target ID]",
+            "usage: devres-server diagnose-collection CONFIG.toml --provider w3c|chromium|crates|rfc|rustsec|mdn|npm --output /tmp/PRIVATE-DIRECTORY/report.json [--latest-failure] [--max-total-bytes N] [--timeout-secs N] [--scan-retained-dump | --scan-runtime-dump CAPTURE] [--snapshot ID --job-key KEY [--job-key KEY]] [--commit OID] [--attribution-target ID]",
         )
     };
     if args.len() < 2 || args[0] != "diagnose-collection" {
@@ -28,6 +28,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
     let mut timeout = None;
     let mut latest = false;
     let mut scan = false;
+    let mut runtime_dump = None;
     let mut snapshot = None;
     let mut job_keys = Vec::new();
     let mut commit = None;
@@ -60,6 +61,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
                 })
             }
             "--snapshot" if snapshot.is_none() => snapshot = Some(value.clone()),
+            "--scan-runtime-dump" if runtime_dump.is_none() => runtime_dump = Some(value.clone()),
             "--job-key" if job_keys.len() < 2 => job_keys.push(value.clone()),
             "--commit" if commit.is_none() => commit = Some(value.clone()),
             "--attribution-target" if attribution_target.is_none() => {
@@ -80,6 +82,7 @@ pub fn parse(args: &[String]) -> Result<Arguments> {
         max_total_bytes: bytes.unwrap_or(64 * 1024 * 1024),
         timeout_secs: timeout.unwrap_or(300),
         scan_retained_dump: scan,
+        scan_runtime_dump: runtime_dump,
         snapshot,
         job_keys,
         commit,
@@ -164,6 +167,27 @@ mod tests {
         ] {
             assert!(parse(&arguments(&extra)).is_err());
         }
+    }
+    #[test]
+    fn crates_runtime_scan_requires_one_exact_tagged_capture() {
+        let capture = format!("blake3:{}", "1".repeat(64));
+        let mut args = arguments(&["--scan-runtime-dump", &capture]);
+        assert!(parse(&args).is_err());
+        args[3] = "crates".into();
+        assert_eq!(
+            parse(&args).unwrap().options.scan_runtime_dump.as_deref(),
+            Some(capture.as_str())
+        );
+        for extra in [
+            vec!["--scan-retained-dump"],
+            vec!["--scan-runtime-dump", &capture],
+        ] {
+            let mut invalid = args.clone();
+            invalid.extend(extra.into_iter().map(str::to_owned));
+            assert!(parse(&invalid).is_err());
+        }
+        *args.last_mut().unwrap() = "1".repeat(64);
+        assert!(parse(&args).is_err());
     }
     #[test]
     fn rfc_requires_exact_bounded_selectors() {

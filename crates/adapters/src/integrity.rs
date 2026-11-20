@@ -48,6 +48,18 @@ pub(crate) fn file_digest_local(
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| Error::integrity("Retained file unavailable."))?;
+    digest_open_file(&mut file, metadata.len(), max_bytes, deadline, cancel)
+}
+
+/// Hash an opened file from its current position through EOF under the caller's
+/// verified length, byte limit, deadline and cancellation token.
+pub(crate) fn digest_open_file(
+    file: &mut std::fs::File,
+    expected_bytes: u64,
+    max_bytes: u64,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<(String, u64)> {
     let mut hasher = blake3::Hasher::new();
     let mut count = 0_u64;
     let mut buffer = [0_u8; 65536];
@@ -70,7 +82,7 @@ pub(crate) fn file_digest_local(
             .ok_or_else(|| Error::capacity("Retained file verification bound exceeded."))?;
         hasher.update(&buffer[..n]);
     }
-    if count != metadata.len() {
+    if count != expected_bytes {
         return Err(Error::integrity("Retained file length changed."));
     }
     Ok((format!("blake3:{}", hasher.finalize().to_hex()), count))

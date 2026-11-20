@@ -1,7 +1,7 @@
 //! Private, offline inspection of one operator-identified retained dump.
 //! No configuration, database, archive client, provider request, or staging port.
 use devres_adapters::{
-    crate_dump::{self, DumpInspection},
+    crate_dump::{self, DumpInspection, RuntimeDumpInspection},
     create_diagnosis_output, integrity,
 };
 use devres_domain::{Error, Result};
@@ -36,6 +36,7 @@ struct Arguments {
     expected_bytes: u64,
     output: PathBuf,
     measure_first_rejection: bool,
+    runtime_v2: bool,
 }
 fn tagged(value: &str) -> bool {
     value.starts_with("blake3:") && integrity::valid_hash(value)
@@ -51,10 +52,15 @@ impl Arguments {
         let (mut retained_file, mut capture, mut body, mut expected_bytes, mut output) =
             (None, None, None, None, None);
         let mut measure_first_rejection = false;
+        let mut runtime_v2 = false;
         let mut arguments = args.iter();
         while let Some(flag) = arguments.next() {
             if flag == "--measure-first-rejection" && !measure_first_rejection {
                 measure_first_rejection = true;
+                continue;
+            }
+            if flag == "--runtime-v2" && !runtime_v2 {
+                runtime_v2 = true;
                 continue;
             }
             let value = arguments.next().ok_or_else(invalid)?;
@@ -86,11 +92,13 @@ impl Arguments {
             expected_bytes: expected_bytes.ok_or_else(invalid)?,
             output: output.ok_or_else(invalid)?,
             measure_first_rejection,
+            runtime_v2,
         };
         let basename = arguments.body.strip_prefix("blake3:").ok_or_else(invalid)?;
         if !tagged(&arguments.capture)
             || !tagged(&arguments.body)
             || arguments.expected_bytes > COMPRESSED
+            || (arguments.runtime_v2 && arguments.measure_first_rejection)
             || !absolute_clean(&arguments.retained_file)
             || arguments
                 .retained_file
@@ -150,6 +158,21 @@ impl Outcome {
     }
 }
 #[derive(Serialize)]
+#[serde(untagged)]
+enum Inspection {
+    Legacy(DumpInspection),
+    Runtime(RuntimeDumpInspection),
+}
+impl Inspection {
+    fn result(&self) -> &DumpInspection {
+        match self {
+            Self::Legacy(inspection) => inspection,
+            Self::Runtime(inspection) => &inspection.inspection,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct Report {
     version: u32,
     capture: String,
@@ -163,22 +186,27 @@ struct Report {
     timeout_secs: u64,
     outcome: Outcome,
     measurement_requested: bool,
-    inspection: DumpInspection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    processor: Option<&'static str>,
+    inspection: Inspection,
 }
 impl Report {
-    fn new(arguments: &Arguments, inspection: DumpInspection) -> Self {
-        let outcome = if inspection.complete {
+    fn new(arguments: &Arguments, inspection: Inspection) -> Self {
+        let result = inspection.result();
+        let outcome = if result.complete {
             Outcome::Validated
         } else {
-            match inspection.code.as_deref() {
+            match result.code.as_deref() {
                 Some("cancelled") => Outcome::Cancelled,
-                Some("capacity") if inspection.csv.is_none() => Outcome::BoundedStop,
+                Some("capacity") if result.csv.is_none() => Outcome::BoundedStop,
                 Some("integrity" | "capacity") => Outcome::Rejected,
                 _ => Outcome::Failed,
             }
         };
         Self {
-            version: if arguments.measure_first_rejection {
+            version: if arguments.runtime_v2 {
+                3
+            } else if arguments.measure_first_rejection {
                 2
             } else {
                 1
@@ -187,13 +215,14 @@ impl Report {
             body_hash: arguments.body.clone(),
             expected_bytes: arguments.expected_bytes,
             identity_association: "operator_supplied",
-            full_body_hash_reverified: false,
-            prefix_only: !inspection.complete,
+            full_body_hash_reverified: arguments.runtime_v2,
+            prefix_only: !result.complete,
             compressed_limit: COMPRESSED,
             expanded_limit: EXPANDED,
             timeout_secs: SECONDS,
             outcome,
             measurement_requested: arguments.measure_first_rejection,
+            processor: arguments.runtime_v2.then_some(crate_dump::PROCESSOR),
             inspection,
         }
     }
@@ -211,10 +240,10 @@ impl Report {
 }
 
 /// Signals cancel cooperatively; the caller keeps awaiting this worker until it stops.
-async fn join_blocking(
+async fn join_blocking<T: Send + 'static>(
     cancel: CancellationToken,
-    operation: impl FnOnce(CancellationToken) -> Result<DumpInspection> + Send + 'static,
-) -> Result<DumpInspection> {
+    operation: impl FnOnce(CancellationToken) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let _guard = cancel.clone().drop_guard();
     tokio::task::spawn_blocking(move || operation(cancel))
         .await
@@ -224,18 +253,24 @@ async fn inspect(arguments: &Arguments, cancel: CancellationToken) -> Result<Rep
     let owned = arguments.clone();
     let inspection = join_blocking(cancel, move |token| {
         owned.preflight()?;
+        let deadline = Instant::now() + Duration::from_secs(SECONDS);
+        if owned.runtime_v2 {
+            return crate_dump::inspect_verified_runtime_dump(
+                owned.retained_file,
+                (&owned.body, owned.expected_bytes),
+                token,
+                deadline,
+                COMPRESSED,
+                EXPANDED,
+            )
+            .map(Inspection::Runtime);
+        }
         let scan = if owned.measure_first_rejection {
             crate_dump::measure_first_rejection
         } else {
             crate_dump::inspect_dump
         };
-        scan(
-            owned.retained_file,
-            token,
-            Instant::now() + Duration::from_secs(SECONDS),
-            COMPRESSED,
-            EXPANDED,
-        )
+        scan(owned.retained_file, token, deadline, COMPRESSED, EXPANDED).map(Inspection::Legacy)
     })
     .await?;
     Ok(Report::new(arguments, inspection))
@@ -258,9 +293,10 @@ async fn run(arguments: Arguments) -> Result<Outcome> {
     let _ = signals.await;
     let report = result?;
     let outcome = report.outcome;
-    let complete = report.inspection.complete;
+    let complete = report.inspection.result().complete;
     let row = report
         .inspection
+        .result()
         .csv
         .as_ref()
         .map_or(0, |diagnostic| diagnostic.row);
@@ -283,6 +319,7 @@ async fn main() {
         Ok(Outcome::Cancelled) => std::process::exit(130),
         Ok(Outcome::Failed) => std::process::exit(1),
         Ok(_) => {}
+        Err(error) if error.code == "cancelled" => std::process::exit(130),
         Err(_) => {
             eprintln!("dump_inspection outcome=failed");
             std::process::exit(1);
@@ -310,6 +347,7 @@ mod tests {
             expected_bytes: size,
             output: root.join("private/report.json"),
             measure_first_rejection: false,
+            runtime_v2: false,
         }
     }
     fn flags(arguments: &Arguments) -> Vec<OsString> {
@@ -335,6 +373,11 @@ mod tests {
         assert!(Arguments::parse(&measured).unwrap().measure_first_rejection);
         measured.push("--measure-first-rejection".into());
         assert!(Arguments::parse(&measured).is_err());
+        let mut runtime = flags(&original);
+        runtime.push("--runtime-v2".into());
+        assert!(Arguments::parse(&runtime).unwrap().runtime_v2);
+        runtime.push("--measure-first-rejection".into());
+        assert!(Arguments::parse(&runtime).is_err());
         let mut too_large = original.clone();
         too_large.expected_bytes = COMPRESSED + 1;
         assert!(Arguments::parse(&flags(&too_large)).is_err());
@@ -491,7 +534,12 @@ mod tests {
         measured.measure_first_rejection = true;
         let measurement = inspect(&measured, CancellationToken::new()).await.unwrap();
         assert_eq!(measurement.version, 2);
-        let observed = measurement.inspection.measurement.as_ref().unwrap();
+        let observed = measurement
+            .inspection
+            .result()
+            .measurement
+            .as_ref()
+            .unwrap();
         assert_eq!(observed.field_kind, crate_dump::CsvFieldKind::Ignored);
         assert_eq!(observed.field_bytes, ignored.len() as u64);
         assert!(
@@ -514,5 +562,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cancelled.outcome, Outcome::Cancelled);
+        arguments.runtime_v2 = true;
+        let runtime = inspect(&arguments, CancellationToken::new()).await.unwrap();
+        assert_eq!(runtime.outcome, Outcome::Validated);
+        assert!(runtime.full_body_hash_reverified);
+        assert_eq!(runtime.processor, Some(crate_dump::PROCESSOR));
+        assert!(runtime.inspection.result().csv.is_none());
+        let mut modified = bytes;
+        modified[0] ^= 1;
+        std::fs::write(&arguments.retained_file, modified).unwrap();
+        let rejected = inspect(&arguments, CancellationToken::new()).await;
+        assert!(matches!(rejected, Err(error) if error.code == "integrity"));
     }
 }

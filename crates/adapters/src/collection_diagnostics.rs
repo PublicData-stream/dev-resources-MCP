@@ -53,6 +53,7 @@ pub struct DiagnosisOptions {
     pub max_total_bytes: u64,
     pub timeout_secs: u64,
     pub scan_retained_dump: bool,
+    pub scan_runtime_dump: Option<String>,
     pub snapshot: Option<String>,
     pub job_keys: Vec<String>,
     pub commit: Option<String>,
@@ -65,6 +66,12 @@ impl DiagnosisOptions {
             || self.timeout_secs == 0
             || self.timeout_secs > 300
             || (self.scan_retained_dump && self.provider != DiagnosisProvider::Crates)
+            || self.scan_runtime_dump.as_deref().is_some_and(|capture| {
+                self.provider != DiagnosisProvider::Crates
+                    || self.scan_retained_dump
+                    || !capture.starts_with("blake3:")
+                    || !integrity::valid_hash(capture)
+            })
         {
             return Err(invalid());
         }
@@ -798,7 +805,7 @@ pub async fn diagnose_collection(
     if cancel.is_cancelled() {
         return Err(Error::new("cancelled", "Collection diagnosis canceled."));
     }
-    let limit = if options.scan_retained_dump {
+    let limit = if options.scan_retained_dump || options.scan_runtime_dump.is_some() {
         Duration::from_secs(1800)
     } else {
         Duration::from_secs(options.timeout_secs)
@@ -849,9 +856,7 @@ pub async fn diagnose_collection(
             }
             DiagnosisProvider::Mdn => mdn_diagnostics::inspect(&mut reader, &mut report).await,
             DiagnosisProvider::Npm => npm_inspection::inspect(&mut reader, &mut report).await,
-            DiagnosisProvider::Crates => {
-                inspect_crates(&mut reader, &mut report, options.scan_retained_dump).await
-            }
+            DiagnosisProvider::Crates => inspect_crates(&mut reader, &mut report, &options).await,
         };
         if let Err(error) = result {
             if error.code == "capacity"
@@ -919,38 +924,65 @@ mod rustsec_diagnostics;
 async fn inspect_crates(
     reader: &mut Reader,
     report: &mut CollectionDiagnosis,
-    scan: bool,
+    options: &DiagnosisOptions,
 ) -> Result<()> {
+    let capture = options.scan_runtime_dump.as_deref();
+    let runtime = capture.is_some();
+    let scan = options.scan_retained_dump || runtime;
     if report.schema >= 15 {
-        let size:Option<i64>=sqlx_core::query_scalar::query_scalar("SELECT octet_length(diagnostic::text)::bigint FROM devres_crate_dump_failures ORDER BY observed_at DESC,id DESC LIMIT 1")
+        let size:Option<i64>=sqlx_core::query_scalar::query_scalar("SELECT octet_length(diagnostic::text)::bigint FROM devres_crate_dump_failures WHERE ($1::text IS NULL OR artifact=$1) ORDER BY observed_at DESC,id DESC LIMIT 1")
+            .bind(capture)
             .fetch_optional(&mut reader.conn).await.map_err(|_|unavailable())?;
         if let Some(size) = size {
             if size > 4096 {
                 return Err(capacity());
             }
             reader.row_admit(size)?;
-            let row=sqlx_core::query::query("SELECT * FROM devres_crate_dump_failures ORDER BY observed_at DESC,id DESC LIMIT 1")
+            let row=sqlx_core::query::query("SELECT * FROM devres_crate_dump_failures WHERE ($1::text IS NULL OR artifact=$1) ORDER BY observed_at DESC,id DESC LIMIT 1")
+                .bind(capture)
                 .fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
             let (_, diagnostic) = super::crate_storage::enrichment_v2::checked_dump_failure(&row)?;
             report.diagnostics.push(diagnostic);
         }
     }
     // Resolve exactly one retained dump observation, never trigger acquisition.
-    let size:Option<i64>=sqlx_core::query_scalar::query_scalar("SELECT octet_length(to_jsonb(c)::text)::bigint+octet_length(a.provenance::text)+octet_length(o.provenance::text) FROM devres_crate_observations o JOIN devres_captures c ON c.id=o.capture_id JOIN devres_crate_artifacts a ON a.capture_id=c.id WHERE c.source_key='cargo:database-dump' ORDER BY o.sequence DESC LIMIT 1")
+    let size:Option<i64>=sqlx_core::query_scalar::query_scalar("SELECT octet_length(to_jsonb(c)::text)::bigint+octet_length(a.provenance::text)+octet_length(o.provenance::text) FROM devres_crate_observations o JOIN devres_captures c ON c.id=o.capture_id JOIN devres_crate_artifacts a ON a.capture_id=c.id WHERE c.source_key='cargo:database-dump' AND ($1::text IS NULL OR c.id=$1) ORDER BY o.sequence DESC LIMIT 1")
+        .bind(capture)
         .fetch_optional(&mut reader.conn).await.map_err(|_|unavailable())?;
     let Some(size) = size else {
-        report.outcome = DiagnosisOutcome::NoRetainedFailure;
+        if runtime {
+            report.complete = false;
+            report.outcome = DiagnosisOutcome::SelectedEvidenceUnavailable;
+        } else {
+            report.outcome = DiagnosisOutcome::NoRetainedFailure;
+        }
         return Ok(());
     };
     reader.row_admit(size)?;
-    let row=sqlx_core::query::query("SELECT c.*,a.bytes,a.provenance,a.provenance_integrity,o.observed_at AS validated_at,o.sequence AS observed_sequence,o.transport AS observed_transport,o.provenance AS observed_provenance,o.provenance_integrity AS observed_integrity FROM devres_crate_observations o JOIN devres_captures c ON c.id=o.capture_id JOIN devres_crate_artifacts a ON a.capture_id=c.id WHERE c.source_key='cargo:database-dump' ORDER BY o.sequence DESC LIMIT 1")
+    let row=sqlx_core::query::query("SELECT c.*,a.bytes,a.provenance,a.provenance_integrity,o.observed_at AS validated_at,o.sequence AS observed_sequence,o.transport AS observed_transport,o.provenance AS observed_provenance,o.provenance_integrity AS observed_integrity FROM devres_crate_observations o JOIN devres_captures c ON c.id=o.capture_id JOIN devres_crate_artifacts a ON a.capture_id=c.id WHERE c.source_key='cargo:database-dump' AND ($1::text IS NULL OR c.id=$1) ORDER BY o.sequence DESC LIMIT 1")
+        .bind(capture)
         .fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
     let artifact = super::crate_storage::read_artifact(row)?;
     // Capture metadata is verified by the shared typed reader, never printed.
-    let _ = capture_metadata_digest(&artifact.capture)?;
+    if let Some(expected) = capture {
+        let retained = &artifact.capture;
+        let identity = integrity::hash(
+            format!(
+                "{}\0{}\0{}\0{}",
+                retained.key, retained.source_url, retained.media_type, retained.body_hash
+            )
+            .as_bytes(),
+        );
+        if identity != expected || identity != retained.id {
+            return Err(failed());
+        }
+    }
     report.dump = Some(
         json!({"capture":artifact.capture.id,"body_hash":artifact.capture.body_hash,"bytes":artifact.bytes,"scan_requested":scan}),
     );
+    if let Some(dump) = report.dump.as_mut().filter(|_| runtime) {
+        dump["inspection_mode"] = json!(crate::crates_io::dump::PROCESSOR);
+    }
     report.complete = false;
     report.outcome = DiagnosisOutcome::AttemptedPayloadUnlinked;
     if scan {
@@ -971,10 +1003,19 @@ async fn inspect_crates(
             .map_err(|_| unavailable())?;
         let deadline = Instant::now() + Duration::from_secs(1800);
         let mut download = false;
-        let cached = retained_local_path(&reader.root, &relative, artifact.bytes)?;
+        let cached = if runtime && reader.remote.is_some() {
+            None
+        } else {
+            retained_local_path(&reader.root, &relative, artifact.bytes)?
+        };
         let path = if let Some(path) = cached {
             path
         } else if let Some(remote) = &reader.remote {
+            if runtime
+                && fs2::available_space(scratch.path()).map_err(|_| unavailable())? < artifact.bytes
+            {
+                return Err(capacity());
+            }
             let key = relative.to_str().ok_or_else(failed)?;
             let row=sqlx_core::query::query("SELECT digest,bytes,evidence FROM devres_archive_file WHERE path=$1 AND complete AND octet_length(evidence)<=16384")
                 .bind(key).fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
@@ -1006,8 +1047,9 @@ async fn inspect_crates(
                 "objects/{}",
                 integrity::relative_path(&binding.digest)?.to_string_lossy()
             );
+            let max_bytes = if runtime { artifact.bytes } else { COMPRESSED };
             let (digest, bytes) = remote
-                .get_to_file(&object, &path, COMPRESSED, &reader.budget.cancel)
+                .get_to_file(&object, &path, max_bytes, &reader.budget.cancel)
                 .await?;
             if digest != binding.digest || bytes != artifact.bytes {
                 return Err(failed());
@@ -1018,20 +1060,58 @@ async fn inspect_crates(
             return Err(unavailable());
         };
         let token = reader.budget.cancel.clone();
-        let inspection = tokio::task::spawn_blocking(move || {
-            crate::crates_io::dump::inspect_dump(path, token, deadline, COMPRESSED, EXPANDED)
-        })
-        .await
-        .map_err(|_| unavailable())??;
-        report.complete = inspection.complete;
+        let expected = (artifact.capture.body_hash, artifact.bytes);
+        let (complete, inspection) =
+            tokio::task::spawn_blocking(move || -> Result<(bool, Value)> {
+                if runtime {
+                    let inspection = if download {
+                        crate::crates_io::dump::inspect_runtime_dump(
+                            path, token, deadline, COMPRESSED, EXPANDED,
+                        )
+                    } else {
+                        crate::crates_io::dump::inspect_verified_runtime_dump(
+                            path,
+                            (&expected.0, expected.1),
+                            token,
+                            deadline,
+                            COMPRESSED,
+                            EXPANDED,
+                        )
+                    }?;
+                    if inspection.inspection.code.as_deref() == Some("cancelled") {
+                        return Err(Error::new("cancelled", "Collection diagnosis canceled."));
+                    }
+                    Ok((
+                        inspection.inspection.complete,
+                        serde_json::to_value(inspection).map_err(|_| failed())?,
+                    ))
+                } else {
+                    let inspection = crate::crates_io::dump::inspect_dump(
+                        path, token, deadline, COMPRESSED, EXPANDED,
+                    )?;
+                    Ok((
+                        inspection.complete,
+                        serde_json::to_value(inspection).map_err(|_| failed())?,
+                    ))
+                }
+            })
+            .await
+            .map_err(|_| unavailable())??;
+        if runtime && reader.budget.cancel.is_cancelled() {
+            return Err(Error::new("cancelled", "Collection diagnosis canceled."));
+        }
+        if runtime && Instant::now() >= deadline {
+            return Err(capacity());
+        }
+        report.complete = complete;
         report.outcome = DiagnosisOutcome::Inspected;
         if let Some(dump) = report.dump.as_mut().and_then(Value::as_object_mut) {
-            dump.insert(
-                "inspection".into(),
-                serde_json::to_value(inspection).map_err(|_| failed())?,
-            );
+            dump.insert("inspection".into(), inspection);
             dump.insert("remote_artifact_verified".into(), json!(download));
-            dump.insert("local_prefix_only".into(), json!(!download));
+            dump.insert("local_prefix_only".into(), json!(!download && !runtime));
+            if runtime {
+                dump.insert("full_body_hash_verified".into(), json!(true));
+            }
             dump.insert("compressed_limit".into(), json!(COMPRESSED));
             dump.insert("expanded_limit".into(), json!(EXPANDED));
         }
@@ -1055,6 +1135,7 @@ mod tests {
             max_total_bytes: MAX_BYTES,
             timeout_secs: 300,
             scan_retained_dump: false,
+            scan_runtime_dump: None,
             snapshot: None,
             job_keys: Vec::new(),
             commit: None,
@@ -1094,6 +1175,123 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+    async fn crates_runtime_replay_selects_only_the_requested_capture_and_sealed_failure() {
+        use devres_application::crate_corpus::{Artifact, CrateCorpusStore};
+        use devres_domain::Capture;
+
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
+        let mut admin = PgConnection::connect(&base).await.unwrap();
+        sqlx_core::raw_sql::raw_sql("CREATE DATABASE devres_crate_diagnosis_fixture")
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path("/devres_crate_diagnosis_fixture");
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let writer = super::super::PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .unwrap();
+        let archive = crate::bulk::BulkArtifactStore::new(root.path(), 64 * 1024 * 1024).unwrap();
+        let mut captures = Vec::new();
+        for now in [10, 11] {
+            let compressed = archive
+                .capture_bytes(
+                    format!("invalid fixture gzip {now}").into_bytes(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let key = "cargo:database-dump";
+            let source = "https://static.crates.io/db-dump.tar.gz";
+            let media = "application/gzip";
+            let id = integrity::hash(
+                format!("{key}\0{source}\0{media}\0{}", compressed.body_hash).as_bytes(),
+            );
+            writer
+                .save_artifact(
+                    &Artifact {
+                        capture: Capture {
+                            id: id.clone(),
+                            key: key.into(),
+                            source_url: source.into(),
+                            media_type: media.into(),
+                            body_hash: compressed.body_hash,
+                            retrieved_at: now,
+                            validated_at: now,
+                        },
+                        bytes: compressed.bytes,
+                        provenance: json!({}),
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+            writer.record_dump_failure(&id, &json!({"version": 1, "table": "versions", "row": now, "column": 3, "selected": true, "reason": "identity", "observed": null, "maximum": null})).await.unwrap();
+            captures.push(id);
+        }
+        let mut options = DiagnosisOptions {
+            provider: DiagnosisProvider::Crates,
+            max_total_bytes: MAX_BYTES,
+            timeout_secs: 30,
+            scan_retained_dump: false,
+            scan_runtime_dump: None,
+            snapshot: None,
+            job_keys: Vec::new(),
+            commit: None,
+            attribution_target: None,
+        };
+        let latest = diagnose_collection(
+            url.as_str(),
+            root.path(),
+            None,
+            options.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(latest.dump.unwrap()["capture"], captures[1]);
+        options.scan_runtime_dump = Some(captures[0].clone());
+        let selected = diagnose_collection(
+            url.as_str(),
+            root.path(),
+            None,
+            options.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!selected.complete);
+        assert_eq!(selected.diagnostics.len(), 1);
+        assert_eq!(selected.diagnostics[0]["artifact"], captures[0]);
+        assert_eq!(selected.diagnostics[0]["diagnostic"]["row"], 10);
+        let dump = selected.dump.unwrap();
+        assert_eq!(dump["capture"], captures[0]);
+        assert_eq!(dump["full_body_hash_verified"], true);
+        assert_eq!(dump["inspection"]["location"]["stage"], "compressed_stream");
+        options.scan_runtime_dump = Some(integrity::hash(b"unknown capture"));
+        let unlinked = diagnose_collection(
+            url.as_str(),
+            root.path(),
+            None,
+            options,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unlinked.outcome,
+            DiagnosisOutcome::SelectedEvidenceUnavailable
+        );
+        assert!(unlinked.diagnostics.is_empty() && unlinked.dump.is_none());
+        drop(writer);
+        sqlx_core::raw_sql::raw_sql("DROP DATABASE devres_crate_diagnosis_fixture WITH (FORCE)")
+            .execute(&mut admin)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
     async fn diagnostic_reader_is_read_only_and_rejects_tampered_aliases_and_keys() {
         let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
         let mut admin = PgConnection::connect(&base).await.unwrap();
@@ -1112,6 +1310,7 @@ mod tests {
             max_total_bytes: MAX_BYTES,
             timeout_secs: 30,
             scan_retained_dump: false,
+            scan_runtime_dump: None,
             snapshot: None,
             job_keys: Vec::new(),
             commit: None,
@@ -1248,6 +1447,7 @@ mod tests {
             max_total_bytes: MAX_BYTES,
             timeout_secs: 1,
             scan_retained_dump: false,
+            scan_runtime_dump: None,
             snapshot: None,
             job_keys: Vec::new(),
             commit: None,

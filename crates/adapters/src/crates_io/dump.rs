@@ -11,9 +11,10 @@ use flate2::read::MultiGzDecoder;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
-    io::{self, BufRead, BufReader, Read},
+    fs::File,
+    io::{self, BufRead, BufReader, Read, Seek},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -47,7 +48,7 @@ struct Budget {
     cancel: CancellationToken,
     deadline: Instant,
     diagnostics: Option<Diagnostics>,
-    csv_diagnostic: Arc<Mutex<Option<CsvDiagnostic>>>,
+    csv_diagnostic: Arc<Mutex<Option<CsvFailure>>>,
     csv_measurement: Arc<Mutex<Option<CsvMeasurement>>>,
     measure_first_rejection: bool,
     legacy_admission: bool,
@@ -87,6 +88,7 @@ struct Expanded<'a, R> {
     bytes: u64,
     budget: &'a Budget,
     failed: Option<Error>,
+    stream_failed: bool,
 }
 impl<R: Read> Read for Expanded<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -100,7 +102,9 @@ impl<R: Read> Read for Expanded<'_, R> {
                 .saturating_sub(self.bytes)
                 .saturating_add(1) as usize,
         );
-        let n = self.inner.read(&mut out[..max])?;
+        let n = self.inner.read(&mut out[..max]).inspect_err(|_| {
+            self.stream_failed = true;
+        })?;
         self.bytes += n as u64;
         self.budget
             .progress(ProgressKind::ExpandedBytes, self.bytes);
@@ -293,42 +297,92 @@ fn numeric<'a>(row: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
     }
     Ok(value)
 }
-fn row_key(table: &str, row: &Map<String, Value>) -> Result<String> {
-    for key in ["id", "crate_id", "version_id", "keyword_id", "category_id"] {
-        if row.contains_key(key) {
-            numeric(row, key)?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IdentityField {
+    Id,
+    CrateId,
+    VersionId,
+    KeywordId,
+    CategoryId,
+    Name,
+    Num,
+}
+impl IdentityField {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::CrateId => "crate_id",
+            Self::VersionId => "version_id",
+            Self::KeywordId => "keyword_id",
+            Self::CategoryId => "category_id",
+            Self::Name => "name",
+            Self::Num => "num",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum VersionIdentityCause {
+    Missing,
+    OverVersionByteLimit { observed: usize, maximum: usize },
+    InvalidSemver,
+}
+
+#[derive(Clone, Copy)]
+struct IdentityFailure {
+    field: IdentityField,
+    cause: Option<VersionIdentityCause>,
+}
+
+impl From<IdentityField> for IdentityFailure {
+    fn from(field: IdentityField) -> Self {
+        Self { field, cause: None }
+    }
+}
+
+fn row_key(table: &str, row: &Map<String, Value>) -> std::result::Result<String, IdentityFailure> {
+    use IdentityField::{CategoryId, CrateId, Id, KeywordId, Name, Num, VersionId};
+    let read_number = |field: IdentityField| numeric(row, field.name()).map_err(|_| field);
+    for field in [Id, CrateId, VersionId, KeywordId, CategoryId] {
+        if row.contains_key(field.name()) {
+            read_number(field)?;
         }
     }
     match table {
         "crates" => crate::crates_io::packages::validate_name(
-            row.get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(malformed)?,
+            row.get("name").and_then(Value::as_str).ok_or(Name)?,
         )
-        .map_err(|_| malformed())?,
+        .map_err(|_| Name)?,
         "versions" => {
-            crate::crates_io::packages::validate_version(
-                row.get("num")
-                    .and_then(Value::as_str)
-                    .ok_or_else(malformed)?,
-            )
-            .map_err(|_| malformed())?;
+            let reject = |cause| IdentityFailure {
+                field: Num,
+                cause: Some(cause),
+            };
+            let version = row
+                .get("num")
+                .and_then(Value::as_str)
+                .ok_or_else(|| reject(VersionIdentityCause::Missing))?;
+            super::packages::validate_version(version).map_err(|_| {
+                let maximum = super::packages::MAX_VERSION_BYTES;
+                reject(if version.len() > maximum {
+                    VersionIdentityCause::OverVersionByteLimit {
+                        observed: version.len(),
+                        maximum,
+                    }
+                } else {
+                    VersionIdentityCause::InvalidSemver
+                })
+            })?;
         }
         _ => {}
     }
     Ok(match table {
-        "crates_keywords" => format!(
-            "{}:{}",
-            numeric(row, "crate_id")?,
-            numeric(row, "keyword_id")?
-        ),
-        "crates_categories" => format!(
-            "{}:{}",
-            numeric(row, "crate_id")?,
-            numeric(row, "category_id")?
-        ),
-        "crate_downloads" => numeric(row, "crate_id")?.to_owned(),
-        _ => numeric(row, "id")?.to_owned(),
+        "crates_keywords" => format!("{}:{}", read_number(CrateId)?, read_number(KeywordId)?),
+        "crates_categories" => format!("{}:{}", read_number(CrateId)?, read_number(CategoryId)?),
+        "crate_downloads" => read_number(CrateId)?.to_owned(),
+        _ => read_number(Id)?.to_owned(),
     })
 }
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -384,6 +438,13 @@ pub struct CsvDiagnostic {
     pub reason: CsvReason,
     pub observed: Option<u64>,
     pub maximum: Option<u64>,
+}
+
+#[derive(Clone)]
+struct CsvFailure {
+    diagnostic: CsvDiagnostic,
+    field_kind: CsvFieldKind,
+    identity_failure: Option<IdentityFailure>,
 }
 
 /// A closed classification of the original rejected field; upstream names are never copied.
@@ -501,6 +562,7 @@ fn csv<R: Read>(
     };
     let mut measurement: Option<CsvMeasurement> = None;
     let mut original_rejection: Option<Error> = None;
+    let mut identity_failure = None;
     let result = (|| -> Result<Value> {
         loop {
             diagnostic.row = if header.is_none() { 0 } else { rows + 1 };
@@ -673,7 +735,10 @@ fn csv<R: Read>(
                                 return Err(malformed());
                             }
                             diagnostic.reason = CsvReason::Identity;
-                            let key = row_key(table, &row)?;
+                            let key = row_key(table, &row).map_err(|failure| {
+                                identity_failure = Some(failure);
+                                malformed()
+                            })?;
                             let value = Value::Object(std::mem::take(&mut row));
                             if !budget.inspection {
                                 emit(key, value)?;
@@ -737,7 +802,11 @@ fn csv<R: Read>(
             }
         }
         if let Ok(mut retained) = budget.csv_diagnostic.lock() {
-            *retained = Some(observation.original.clone());
+            *retained = Some(CsvFailure {
+                diagnostic: observation.original.clone(),
+                field_kind: observation.field_kind,
+                identity_failure: None,
+            });
         }
         if let Ok(mut retained) = budget.csv_measurement.lock() {
             *retained = Some(observation);
@@ -746,7 +815,18 @@ fn csv<R: Read>(
         && matches!(error.code.as_str(), "integrity" | "capacity")
         && let Ok(mut retained) = budget.csv_diagnostic.lock()
     {
-        *retained = Some(diagnostic_error(diagnostic, error));
+        let field_kind = CsvFieldKind::classify(
+            header
+                .as_ref()
+                .and_then(|names| names.get(diagnostic.column as usize))
+                .map(String::as_str),
+            diagnostic.selected,
+        );
+        *retained = Some(CsvFailure {
+            diagnostic: diagnostic_error(diagnostic, error),
+            field_kind,
+            identity_failure,
+        });
     }
     result
 }
@@ -842,12 +922,58 @@ fn drain(reader: &mut impl Read, budget: &Budget) -> Result<()> {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DumpStage {
+    Input,
+    TarHeader,
+    MemberLayout,
+    Csv,
+    MemberBody,
+    Metadata,
+    TrailingBytes,
+    RequiredTables,
+    CompressedStream,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DumpLocation {
+    stage: DumpStage,
+    /// One-based member ordinal. No archive path is emitted.
+    member: Option<u64>,
+}
+
+impl DumpLocation {
+    fn start() -> Self {
+        Self {
+            stage: DumpStage::Input,
+            member: None,
+        }
+    }
+}
+
 fn process(
     path: PathBuf,
     artifact: &str,
     budget: &Budget,
     sender: &mpsc::Sender<Batch>,
 ) -> Result<Value> {
+    process_located(path, artifact, budget, sender, &mut DumpLocation::start())
+}
+
+fn process_located(
+    path: PathBuf,
+    artifact: &str,
+    budget: &Budget,
+    sender: &mpsc::Sender<Batch>,
+    location: &mut DumpLocation,
+) -> Result<Value> {
+    let (input, _) = open_dump(&path, budget)?;
+    process_input(input, artifact, budget, sender, location)
+}
+
+fn open_dump(path: &Path, budget: &Budget) -> Result<(File, u64)> {
     budget.check()?;
     let input = std::fs::OpenOptions::new()
         .read(true)
@@ -860,13 +986,24 @@ fn process(
             "Database dump artifact is not a regular file.",
         ));
     }
-    if metadata.len() > budget.max_compressed {
+    let bytes = metadata.len();
+    if bytes > budget.max_compressed {
         return Err(bounds(
             LimitKind::CompressedBytes,
-            metadata.len(),
+            bytes,
             budget.max_compressed,
         ));
     }
+    Ok((input, bytes))
+}
+
+fn process_input(
+    input: File,
+    artifact: &str,
+    budget: &Budget,
+    sender: &mpsc::Sender<Batch>,
+    location: &mut DumpLocation,
+) -> Result<Value> {
     let mut expanded = Expanded {
         inner: MultiGzDecoder::new(BufReader::with_capacity(
             CHUNK,
@@ -875,6 +1012,7 @@ fn process(
         bytes: 0,
         budget,
         failed: None,
+        stream_failed: false,
     };
     let mut tables = BTreeMap::new();
     let mut metadata = None;
@@ -882,12 +1020,15 @@ fn process(
     let mut layout = None;
     let parsing = (|| -> Result<()> {
         let mut archive = tar::Archive::new(&mut expanded);
+        location.stage = DumpStage::TarHeader;
         for (count, entry) in archive
             .entries()
             .map_err(|_| malformed())?
             .raw(true)
             .enumerate()
         {
+            location.stage = DumpStage::TarHeader;
+            location.member = Some(count as u64 + 1);
             budget.check()?;
             if count >= MAX_MEMBERS {
                 return Err(bounds(
@@ -898,6 +1039,7 @@ fn process(
             }
             budget.progress(ProgressKind::Members, count as u64 + 1);
             let mut entry = entry.map_err(|_| malformed())?;
+            location.stage = DumpStage::MemberLayout;
             let kind = entry.header().entry_type();
             if !kind.is_file() && !kind.is_dir() {
                 return Err(Error::integrity(
@@ -928,6 +1070,7 @@ fn process(
                     return Err(malformed());
                 }
                 if columns(table).is_some() {
+                    location.stage = DumpStage::Csv;
                     let mut batches = Batches {
                         sender,
                         kind: table.into(),
@@ -945,9 +1088,11 @@ fn process(
                     batches.flush()?;
                     tables.insert(table.to_owned(), summary);
                 } else {
+                    location.stage = DumpStage::MemberBody;
                     drain(&mut entry, budget)?;
                 }
             } else if name == "metadata.json" {
+                location.stage = DumpStage::Metadata;
                 if entry.size() > MAX_METADATA as u64 {
                     return Err(bounds(
                         LimitKind::MetadataBytes,
@@ -967,6 +1112,7 @@ fn process(
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
             {
+                location.stage = DumpStage::MemberBody;
                 drain(&mut entry, budget)?;
             } else {
                 return Err(malformed());
@@ -975,9 +1121,14 @@ fn process(
         Ok(())
     })();
     if let Err(error) = parsing {
+        if expanded.stream_failed {
+            location.stage = DumpStage::CompressedStream;
+        }
         return Err(expanded.failed.take().unwrap_or(error));
     }
     // Force all concatenated gzip members/trailers through their CRC checks.
+    location.stage = DumpStage::TrailingBytes;
+    location.member = None;
     let validation = (|| -> Result<()> {
         let mut chunk = [0u8; CHUNK];
         loop {
@@ -993,8 +1144,12 @@ fn process(
         Ok(())
     })();
     if let Err(error) = validation {
+        if expanded.stream_failed {
+            location.stage = DumpStage::CompressedStream;
+        }
         return Err(expanded.failed.take().unwrap_or(error));
     }
+    location.stage = DumpStage::RequiredTables;
     if !tables.contains_key("crates") || !tables.contains_key("versions") {
         return Err(Error::integrity(
             "Required crates.io dump tables are missing.",
@@ -1014,6 +1169,27 @@ pub struct DumpInspection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measurement: Option<CsvMeasurement>,
 }
+
+#[derive(Debug, serde::Serialize)]
+pub struct RuntimeDumpInspection {
+    #[serde(flatten)]
+    pub inspection: DumpInspection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_kind: Option<CsvFieldKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_field: Option<IdentityField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_cause: Option<VersionIdentityCause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<DumpLocation>,
+}
+
+enum InspectionMode<'a> {
+    Legacy,
+    LegacyMeasurement,
+    Runtime { expected: Option<(&'a str, u64)> },
+}
+
 pub fn inspect_dump(
     path: PathBuf,
     cancel: CancellationToken,
@@ -1021,7 +1197,15 @@ pub fn inspect_dump(
     max_compressed: u64,
     max_expanded: u64,
 ) -> Result<DumpInspection> {
-    inspect_dump_mode(path, cancel, deadline, max_compressed, max_expanded, false)
+    inspect_dump_mode(
+        path,
+        cancel,
+        deadline,
+        max_compressed,
+        max_expanded,
+        InspectionMode::Legacy,
+    )
+    .map(|report| report.inspection)
 }
 /// Measure only the first rejected record; this never changes runtime admission.
 pub fn measure_first_rejection(
@@ -1031,7 +1215,54 @@ pub fn measure_first_rejection(
     max_compressed: u64,
     max_expanded: u64,
 ) -> Result<DumpInspection> {
-    inspect_dump_mode(path, cancel, deadline, max_compressed, max_expanded, true)
+    inspect_dump_mode(
+        path,
+        cancel,
+        deadline,
+        max_compressed,
+        max_expanded,
+        InspectionMode::LegacyMeasurement,
+    )
+    .map(|report| report.inspection)
+}
+
+pub(crate) fn inspect_runtime_dump(
+    path: PathBuf,
+    cancel: CancellationToken,
+    deadline: Instant,
+    max_compressed: u64,
+    max_expanded: u64,
+) -> Result<RuntimeDumpInspection> {
+    inspect_dump_mode(
+        path,
+        cancel,
+        deadline,
+        max_compressed,
+        max_expanded,
+        InspectionMode::Runtime { expected: None },
+    )
+}
+
+/// Check all compressed bytes against the expected immutable body before replaying
+/// production parser admission. No archive client or staging is involved.
+pub fn inspect_verified_runtime_dump(
+    path: PathBuf,
+    expected: (&str, u64),
+    cancel: CancellationToken,
+    deadline: Instant,
+    max_compressed: u64,
+    max_expanded: u64,
+) -> Result<RuntimeDumpInspection> {
+    inspect_dump_mode(
+        path,
+        cancel,
+        deadline,
+        max_compressed,
+        max_expanded,
+        InspectionMode::Runtime {
+            expected: Some(expected),
+        },
+    )
 }
 fn inspect_dump_mode(
     path: PathBuf,
@@ -1039,8 +1270,8 @@ fn inspect_dump_mode(
     deadline: Instant,
     max_compressed: u64,
     max_expanded: u64,
-    measure_first_rejection: bool,
-) -> Result<DumpInspection> {
+    mode: InspectionMode<'_>,
+) -> Result<RuntimeDumpInspection> {
     let metadata = std::fs::symlink_metadata(&path)
         .map_err(|_| Error::unavailable("Retained dump is unavailable."))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -1061,15 +1292,47 @@ fn inspect_dump_mode(
         diagnostics: None,
         csv_diagnostic: diagnostic.clone(),
         csv_measurement: measurement.clone(),
-        measure_first_rejection,
-        legacy_admission: true,
+        measure_first_rejection: matches!(mode, InspectionMode::LegacyMeasurement),
+        legacy_admission: !matches!(mode, InspectionMode::Runtime { .. }),
         inspection: true,
         max_expanded: max_expanded.min(MAX_EXPANDED),
         max_compressed,
     };
     let (sender, _receiver) = mpsc::channel(1);
-    let result = process(path, "retained-inspection", &budget, &sender);
-    let csv = diagnostic
+    let mut location = DumpLocation::start();
+    let result = if let InspectionMode::Runtime {
+        expected: Some(expected),
+    } = mode
+    {
+        let (mut input, bytes) = open_dump(&path, &budget)?;
+        if bytes != expected.1 {
+            return Err(Error::integrity("Retained dump failed body verification."));
+        }
+        let (digest, bytes) = crate::integrity::digest_open_file(
+            &mut input,
+            bytes,
+            max_compressed,
+            deadline,
+            &budget.cancel,
+        )?;
+        if (digest.as_str(), bytes) != expected {
+            return Err(Error::integrity("Retained dump failed body verification."));
+        }
+        input
+            .rewind()
+            .map_err(|_| Error::unavailable("Retained dump could not be rewound."))?;
+        process_input(
+            input,
+            "retained-inspection",
+            &budget,
+            &sender,
+            &mut location,
+        )
+    } else {
+        process_located(path, "retained-inspection", &budget, &sender, &mut location)
+    };
+    let location = result.is_err().then_some(location);
+    let diagnostic = diagnostic
         .lock()
         .map_err(|_| Error::unavailable("Dump diagnostic is unavailable."))?
         .clone();
@@ -1077,13 +1340,26 @@ fn inspect_dump_mode(
         .lock()
         .map_err(|_| Error::unavailable("Dump measurement is unavailable."))?
         .clone();
-    Ok(DumpInspection {
-        complete: result.is_ok(),
-        code: result
-            .err()
-            .map(|error| collection::safe_code(&error.code).to_owned()),
-        csv,
-        measurement: measured,
+    let field_kind = diagnostic
+        .as_ref()
+        .filter(|failure| failure.identity_failure.is_none())
+        .map(|failure| failure.field_kind);
+    let identity_failure = diagnostic
+        .as_ref()
+        .and_then(|failure| failure.identity_failure);
+    Ok(RuntimeDumpInspection {
+        inspection: DumpInspection {
+            complete: result.is_ok(),
+            code: result
+                .err()
+                .map(|error| collection::safe_code(&error.code).to_owned()),
+            csv: diagnostic.map(|failure| failure.diagnostic),
+            measurement: measured,
+        },
+        field_kind,
+        identity_field: identity_failure.map(|failure| failure.field),
+        identity_cause: identity_failure.and_then(|failure| failure.cause),
+        location,
     })
 }
 
@@ -1180,7 +1456,7 @@ pub(crate) async fn import_dump_observed(
             .map_err(|_| Error::unavailable("Dump diagnostic is unavailable."))?
             .clone();
         if let Some(failure) = failure {
-            let value = serde_json::to_value(failure).map_err(|_| malformed())?;
+            let value = serde_json::to_value(failure.diagnostic).map_err(|_| malformed())?;
             store
                 .record_dump_failure(&artifact, &value)
                 .await
@@ -1266,7 +1542,12 @@ mod tests {
         );
         let measurement = budget.csv_measurement.lock().unwrap().clone().unwrap();
         assert_eq!(
-            budget.csv_diagnostic.lock().unwrap().as_ref(),
+            budget
+                .csv_diagnostic
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|failure| &failure.diagnostic),
             Some(&measurement.original)
         );
         (error, measurement)
@@ -1655,7 +1936,9 @@ mod tests {
             collection::context(&error).unwrap().limit.unwrap().kind,
             LimitKind::CsvFieldBytes
         );
-        let diagnostic = observed.csv_diagnostic.lock().unwrap().clone().unwrap();
+        let failure = observed.csv_diagnostic.lock().unwrap().clone().unwrap();
+        assert_eq!(failure.field_kind, CsvFieldKind::Description);
+        let diagnostic = failure.diagnostic;
         assert!(diagnostic.selected);
         assert_eq!(
             (diagnostic.row, diagnostic.column, diagnostic.reason),
@@ -1816,6 +2099,74 @@ mod tests {
             .unwrap();
         let bytes = tar.into_inner().unwrap().finish().unwrap();
         assert!(run(&bytes).0.is_err());
+    }
+    #[test]
+    fn runtime_scan_reports_precise_identity_and_stream_evidence() {
+        let body = format!("id,name,ignored\n1,example,{}\n", "x".repeat(MAX_FIELD + 1));
+        let invalid = archive(&[
+            ("data/crates.csv", body.as_bytes()),
+            (
+                "data/versions.csv",
+                b"id,crate_id,num,description\n2,1,not-a-version,private-description\n",
+            ),
+        ]);
+        let file = tempfile::NamedTempFile::new_in("/tmp").unwrap();
+        let inspect = |bytes: &[u8]| {
+            std::fs::write(file.path(), bytes).unwrap();
+            inspect_runtime_dump(
+                file.path().to_owned(),
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+                1024 * 1024,
+                (MAX_ROW * 2) as u64,
+            )
+            .unwrap()
+        };
+        let report = inspect(&invalid);
+        assert_eq!(report.identity_field, Some(IdentityField::Num));
+        assert_eq!(
+            report.identity_cause,
+            Some(VersionIdentityCause::InvalidSemver)
+        );
+        assert_eq!(report.field_kind, None);
+        let location = report.location.as_ref().unwrap();
+        assert_eq!((location.stage, location.member), (DumpStage::Csv, Some(2)));
+        let csv = report.inspection.csv.as_ref().unwrap();
+        assert_eq!(
+            (csv.table, csv.row, csv.reason),
+            (CsvTable::Versions, 1, CsvReason::Identity)
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("private-description")
+        );
+
+        let exact_limit = super::super::packages::MAX_VERSION_BYTES;
+        let long_version = format!("1.0.0+{}", "x".repeat(exact_limit));
+        let row = Map::from_iter([
+            ("id".into(), json!("2")),
+            ("crate_id".into(), json!("1")),
+            ("num".into(), json!(&long_version)),
+        ]);
+        let issue = row_key("versions", &row).unwrap_err();
+        assert_eq!(
+            issue.cause,
+            Some(VersionIdentityCause::OverVersionByteLimit {
+                observed: long_version.len(),
+                maximum: exact_limit,
+            })
+        );
+
+        let mut valid = archive(&[
+            ("data/crates.csv", b"id,name\n1,example\n"),
+            ("data/versions.csv", b"id,crate_id,num\n2,1,1.0.0\n"),
+        ]);
+        let checksum = valid.len() - 8;
+        valid[checksum] ^= 1;
+        let report = inspect(&valid);
+        assert_eq!(report.location.unwrap().stage, DumpStage::CompressedStream);
+        assert_eq!(report.inspection.code.as_deref(), Some("integrity"));
     }
     #[test]
     fn batches_bound_backpressure_and_cancellation_between_batches() {
