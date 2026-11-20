@@ -1,16 +1,26 @@
 # Configuration
 
-Private archive/attribution stage timings are disabled by default. Set the
-operator environment variable `DEVRES_PRIVATE_TIMINGS=1` for a bounded diagnostic
-window. Only the fixed `devres_private_timings` target is enabled alongside normal
+Private archive, attribution and RFC publication diagnostics are disabled by
+default. Set `DEVRES_PRIVATE_TIMINGS=1` for a bounded diagnostic window. Only the
+fixed `devres_private_timings` target is enabled alongside normal
 server logs; arbitrary `RUST_LOG` directives are not accepted. Fields contain only
-stage/provider enums, durations, eligible age and outcomes. Archive rejection
-events additionally contain closed reasons, observed/allowed bounds and available
-numeric cache accounting. Pinned/evictable totals deduplicate physical objects and
-remain unknown if bounded accounting cannot finish. These events contain no source
+stage/provider enums, durations, eligible age, outcomes and RFC publication
+identities. Archive rejection events additionally contain closed reasons,
+observed/allowed bounds and available numeric cache accounting. Pinned/evictable
+totals deduplicate physical objects and remain unknown if bounded accounting
+cannot finish. These events contain no source
 paths, request/audit inputs or credentials. They do not change public error codes,
 retry disposition or persisted limit enums. Disable the switch after collecting the
 needed observation to avoid retaining unnecessary per-operation logs.
+
+Archive `publish_*` stages identify cache and ownership checks, intent recording,
+body and binding writes with verification, and SQL completion. These events
+cover shared archive operations and carry no object identity. The RFC
+`rfc_publication_stage` records a failed snapshot step or a completed snapshot
+save. When available, `rfc_build_id` is the generated BLAKE3 index identity for
+matching archive intents. A successful save records `rfc_snapshot_id` and
+whether the attempt built an index. The `rfc_capture_publication_stage` records
+the failed step for an RFC artifact capture and head update.
 
 Rejection events use `rejection_reason`, `observed_known`, `maximum_known` and
 optional numeric `observed`/`maximum`. `cache_accounting_known` gates resident and

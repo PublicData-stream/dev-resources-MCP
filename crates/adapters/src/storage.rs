@@ -1158,52 +1158,70 @@ impl Store for PgBlobStore {
         response: FetchResponse,
         now: i64,
     ) -> Result<StoredCapture> {
-        self.owner_fence().await?;
-        self.fence().await?;
-        if response.status != 200 || response.body.len() > request.max_bytes {
-            return Err(Error::invalid(
-                "Only successful bounded source bodies may be published",
-            ));
+        let mut stage = "ownership";
+        let result = async {
+            self.owner_fence().await?;
+            self.fence().await?;
+            stage = "prepare";
+            if response.status != 200 || response.body.len() > request.max_bytes {
+                return Err(Error::invalid(
+                    "Only successful bounded source bodies may be published",
+                ));
+            }
+            let imported = corpus_storage::imported_source(&request.key, &request.url)?;
+            let body_hash = hash(&response.body);
+            let id = hash(
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    request.key, request.url, request.media_type, body_hash
+                )
+                .as_bytes(),
+            );
+            let metadata_digest = capture_metadata_digest(&Capture {
+                id: id.clone(),
+                key: request.key.clone(),
+                source_url: request.url.clone(),
+                body_hash: body_hash.clone(),
+                media_type: request.media_type.clone(),
+                retrieved_at: now,
+                validated_at: now,
+            })?;
+            stage = "blob_write";
+            self.write_blob(&body_hash, &response.body).await?;
+            stage = "ownership";
+            let mut owner = self.owner.lock().await;
+            owner.ping().await.map_err(|_| storage_error())?;
+            // Publication uses the same connection that owns the serving fence.
+            stage = "capture_transaction";
+            let mut tx = owner.begin().await.map_err(|_| storage_error())?;
+            sqlx_core::query::query("INSERT INTO devres_captures (id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING")
+                .bind(&id).bind(&request.key).bind(&request.url).bind(&body_hash).bind(&request.media_type).bind(now).bind(&metadata_digest).execute(&mut *tx).await.map_err(|_| storage_error())?;
+            let head_payload = serde_json::json!({"source_key":request.key,"capture_id":id,"validated_at":now,"etag":response.validators.etag,"last_modified":response.validators.last_modified});
+            let head_integrity = events::event_digest("devres_heads", &request.key, &head_payload)?;
+            sqlx_core::query::query("INSERT INTO devres_heads (source_key,capture_id,validated_at,etag,last_modified,head_integrity) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(source_key) DO UPDATE SET capture_id=EXCLUDED.capture_id,validated_at=EXCLUDED.validated_at,etag=EXCLUDED.etag,last_modified=EXCLUDED.last_modified,head_integrity=EXCLUDED.head_integrity")
+                .bind(&request.key).bind(&id).bind(now).bind(&response.validators.etag).bind(&response.validators.last_modified).bind(head_integrity).execute(&mut *tx).await.map_err(|_| storage_error())?;
+            if imported {
+                events::append_import(&mut tx, &id, now, &request.url).await?;
+            } else {
+                events::append_http(&mut tx, &id, now, 200).await?;
+            }
+            tx.commit().await.map_err(|_| storage_error())?;
+            drop(owner);
+            stage = "post_commit_readback";
+            let mut stored = self.capture(&id).await?;
+            stored.capture.validated_at = now;
+            Ok(stored)
         }
-        let imported = corpus_storage::imported_source(&request.key, &request.url)?;
-        let body_hash = hash(&response.body);
-        let id = hash(
-            format!(
-                "{}\0{}\0{}\0{}",
-                request.key, request.url, request.media_type, body_hash
-            )
-            .as_bytes(),
-        );
-        let metadata_digest = capture_metadata_digest(&Capture {
-            id: id.clone(),
-            key: request.key.clone(),
-            source_url: request.url.clone(),
-            body_hash: body_hash.clone(),
-            media_type: request.media_type.clone(),
-            retrieved_at: now,
-            validated_at: now,
-        })?;
-        self.write_blob(&body_hash, &response.body).await?;
-        let mut owner = self.owner.lock().await;
-        owner.ping().await.map_err(|_| storage_error())?;
-        // Publication uses the same connection that owns the serving fence.
-        let mut tx = owner.begin().await.map_err(|_| storage_error())?;
-        sqlx_core::query::query("INSERT INTO devres_captures (id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING")
-            .bind(&id).bind(&request.key).bind(&request.url).bind(&body_hash).bind(&request.media_type).bind(now).bind(&metadata_digest).execute(&mut *tx).await.map_err(|_| storage_error())?;
-        let head_payload = serde_json::json!({"source_key":request.key,"capture_id":id,"validated_at":now,"etag":response.validators.etag,"last_modified":response.validators.last_modified});
-        let head_integrity = events::event_digest("devres_heads", &request.key, &head_payload)?;
-        sqlx_core::query::query("INSERT INTO devres_heads (source_key,capture_id,validated_at,etag,last_modified,head_integrity) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(source_key) DO UPDATE SET capture_id=EXCLUDED.capture_id,validated_at=EXCLUDED.validated_at,etag=EXCLUDED.etag,last_modified=EXCLUDED.last_modified,head_integrity=EXCLUDED.head_integrity")
-            .bind(&request.key).bind(&id).bind(now).bind(&response.validators.etag).bind(&response.validators.last_modified).bind(head_integrity).execute(&mut *tx).await.map_err(|_| storage_error())?;
-        if imported {
-            events::append_import(&mut tx, &id, now, &request.url).await?;
-        } else {
-            events::append_http(&mut tx, &id, now, 200).await?;
+        .await;
+        if result.is_err() && request.key.starts_with("rfc:") {
+            tracing::debug!(
+                target: "devres_private_timings",
+                rfc_capture_publication_stage = stage,
+                success = false,
+                "RFC capture publication failed"
+            );
         }
-        tx.commit().await.map_err(|_| storage_error())?;
-        drop(owner);
-        let mut stored = self.capture(&id).await?;
-        stored.capture.validated_at = now;
-        Ok(stored)
+        result
     }
     async fn revalidate(
         &self,

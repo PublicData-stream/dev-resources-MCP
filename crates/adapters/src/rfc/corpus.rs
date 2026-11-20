@@ -475,12 +475,36 @@ impl RfcCorpus {
         let snapshot = self.publish_snapshot_inner(true).await?;
         Ok(json!({"snapshot":snapshot.id,"coverage":snapshot.coverage}))
     }
+    async fn begin_index_builder(
+        &self,
+        build_id: &str,
+        previous_path: Option<&str>,
+    ) -> Result<OwnedIndexBuilder> {
+        let root = self.root.clone();
+        let id = build_id.to_owned();
+        let base = previous_path.map(str::to_owned);
+        let owner = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            OwnedIndexBuilder::begin(&root, &id, base.as_deref(), owner)
+        })
+        .await
+        .map_err(|_| Error::unavailable("RFC index worker failed."))
+        .and_then(|result| result)
+        .inspect_err(|_| rfc_index::publication_failure("index_prepare", Some(build_id)))
+    }
+
     async fn publish_snapshot_inner(&self, force: bool) -> Result<Snapshot> {
         let _lock = self.snapshot_lock.lock().await;
         let generation = self.dirty.load(Ordering::Relaxed);
-        let catalogue = self.catalogue().await?;
-        let errata = self.store.dataset("errata", None).await?;
-        let all_documents = self.store.documents().await?;
+        let (catalogue, errata, all_documents) = async {
+            Ok::<_, Error>((
+                self.catalogue().await?,
+                self.store.dataset("errata", None).await?,
+                self.store.documents().await?,
+            ))
+        }
+        .await
+        .inspect_err(|_| rfc_index::publication_failure("snapshot_inputs", None))?;
         let mut available = BTreeMap::new();
         for document in all_documents {
             let key = (document.number, document.format.clone());
@@ -536,7 +560,10 @@ impl RfcCorpus {
         let previous = if force {
             None
         } else {
-            self.store.snapshot(None).await?
+            self.store
+                .snapshot(None)
+                .await
+                .inspect_err(|_| rfc_index::publication_failure("snapshot_base", None))?
         };
         let previous_selected = previous
             .as_ref()
@@ -579,12 +606,24 @@ impl RfcCorpus {
                     selected.insert(number, document);
                     break;
                 }
-                let stored = self.retrieval.read_capture(&document.capture.id).await?;
+                let stored = self
+                    .retrieval
+                    .read_capture(&document.capture.id)
+                    .await
+                    .inspect_err(|_| {
+                        rfc_index::publication_failure("capture_read", Some(&build_id))
+                    })?;
                 let format = document.format.clone();
                 let extraction =
                     tokio::task::spawn_blocking(move || rfc::extract_text(&format, &stored.body))
                         .await
-                        .map_err(|_| Error::unavailable("RFC extraction worker failed."))?;
+                        .map_err(|_| {
+                            rfc_index::publication_failure(
+                                "capture_extract_worker",
+                                Some(&build_id),
+                            );
+                            Error::unavailable("RFC extraction worker failed.")
+                        })?;
                 let text = match extraction {
                     Ok(text) => text,
                     Err(error) => {
@@ -593,16 +632,9 @@ impl RfcCorpus {
                     }
                 };
                 if builder.is_none() {
-                    let root = self.root.clone();
-                    let id = build_id.clone();
-                    let base = previous_path.clone();
-                    let owner = self.store.clone();
                     builder = Some(
-                        tokio::task::spawn_blocking(move || {
-                            OwnedIndexBuilder::begin(&root, &id, base.as_deref(), owner)
-                        })
-                        .await
-                        .map_err(|_| Error::unavailable("RFC index worker failed."))??,
+                        self.begin_index_builder(&build_id, previous_path.as_deref())
+                            .await?,
                     );
                 }
                 let Some(mut current) = builder.take() else {
@@ -613,7 +645,10 @@ impl RfcCorpus {
                     (current, outcome)
                 })
                 .await
-                .map_err(|_| Error::unavailable("RFC index worker failed."))?;
+                .map_err(|_| {
+                    rfc_index::publication_failure("index_add_worker", Some(&build_id));
+                    Error::unavailable("RFC index worker failed.")
+                })?;
                 builder = Some(next);
                 match outcome {
                     Ok(()) => {
@@ -633,27 +668,28 @@ impl RfcCorpus {
             .copied()
             .collect::<Vec<_>>();
         if builder.is_none() && (!removed.is_empty() || previous_path.is_none()) {
-            let root = self.root.clone();
-            let base = previous_path.clone();
-            let owner = self.store.clone();
             builder = Some(
-                tokio::task::spawn_blocking(move || {
-                    OwnedIndexBuilder::begin(&root, &build_id, base.as_deref(), owner)
-                })
-                .await
-                .map_err(|_| Error::unavailable("RFC index worker failed."))??,
+                self.begin_index_builder(&build_id, previous_path.as_deref())
+                    .await?,
             );
         }
+        let published_build_id = builder.is_some().then_some(build_id.as_str());
         let index_path = if let Some(mut builder) = builder {
+            let id = build_id.clone();
             Some(
                 tokio::task::spawn_blocking(move || {
                     for number in removed {
-                        builder.remove_document(number)?;
+                        builder.remove_document(number).inspect_err(|_| {
+                            rfc_index::publication_failure("index_remove_document", Some(&id));
+                        })?;
                     }
                     builder.finish()
                 })
                 .await
-                .map_err(|_| Error::unavailable("RFC index worker failed."))??,
+                .map_err(|_| {
+                    rfc_index::publication_failure("index_finalize_worker", Some(&build_id));
+                    Error::unavailable("RFC index worker failed.")
+                })??,
             )
         } else {
             previous_path
@@ -677,7 +713,10 @@ impl RfcCorpus {
         ))
         .map_err(|_| Error::integrity("RFC snapshot identity failed."))?;
         let id = crate::integrity::hash(&identity);
-        if let Some(existing) = self.store.snapshot(Some(&id)).await? {
+        let existing = self.store.snapshot(Some(&id)).await.inspect_err(|_| {
+            rfc_index::publication_failure("snapshot_lookup", published_build_id);
+        })?;
+        if let Some(existing) = existing {
             self.dirty.fetch_sub(generation, Ordering::Relaxed);
             self.last_snapshot.store(unix_now(), Ordering::Relaxed);
             return Ok(existing);
@@ -694,7 +733,18 @@ impl RfcCorpus {
             index_path,
             processor_version: PROCESSOR_VERSION,
         };
-        self.store.save_snapshot(&snapshot).await?;
+        self.store.save_snapshot(&snapshot).await.inspect_err(|_| {
+            rfc_index::publication_failure("snapshot_save", published_build_id);
+        })?;
+        tracing::debug!(
+            target: "devres_private_timings",
+            rfc_publication_stage = "snapshot_save",
+            rfc_build_id = published_build_id,
+            rfc_snapshot_id = snapshot.id.as_str(),
+            rebuilt = published_build_id.is_some(),
+            success = true,
+            "RFC snapshot publication"
+        );
         self.dirty.fetch_sub(generation, Ordering::Relaxed);
         self.last_snapshot.store(unix_now(), Ordering::Relaxed);
         Ok(snapshot)

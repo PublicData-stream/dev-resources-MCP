@@ -4,8 +4,8 @@ use std::fmt;
 use tracing::{Event, Metadata, Subscriber, field::Visit, span};
 
 #[derive(Clone, Default)]
-struct Events(Arc<Mutex<Vec<EventFields>>>);
-type EventFields = BTreeMap<String, String>;
+pub(super) struct Events(pub(super) Arc<Mutex<Vec<EventFields>>>);
+pub(super) type EventFields = BTreeMap<String, String>;
 impl Subscriber for Events {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.target() == "devres_private_timings"
@@ -24,7 +24,7 @@ impl Subscriber for Events {
         }
         let mut fields = Fields(BTreeMap::new());
         event.record(&mut fields);
-        if fields.0.contains_key("rejection_reason") {
+        if fields.0.contains_key("rejection_reason") || fields.0.contains_key("archive_stage") {
             self.0.lock().unwrap().push(fields.0);
         }
     }

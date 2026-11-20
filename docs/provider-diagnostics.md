@@ -286,6 +286,39 @@ phases and attempt times; inspection never migrates them or infers a phase from 
 coarse error code. Schema 16 adds bounded per-job failure context and claim time;
 this does not establish the cause of an older failure or authorize its recovery.
 
+### RFC publication failures
+
+Start by matching the public `server.info` build to the running backend and
+writer, the PostgreSQL schema, and the edge upstream. Use `rfc.corpus_status`
+for the selected snapshot, latest partial snapshot and worker failure. Compare
+two explicit snapshot IDs with the inspector. A new snapshot can reuse an
+index, so compare `diagnostics[0].index.id` as well. Full-text search can request
+publication without a pin and can enqueue attribution even with a pin. Keep
+these searches for the approved acceptance window.
+
+Correlate writer, PostgreSQL and existing object-store audit events in UTC. Check
+free bytes and inodes on the actual writer cache and scratch mounts. Use a
+read-only SQL transaction with a bounded statement and lock timeout to inspect
+the archive owner and epoch, exact representation-job keys and capture/head,
+and the selected snapshot's published order and index identity. Investigate only
+archive intents tied to the observed build. `devres_archive_file` does not record
+creation time. An unlinked incomplete intent cannot date a failure.
+
+For S3, correlate the index members, `integrity.json`, and their separate
+`.devres-integrity/files/` bindings. The sidecar basename is the BLAKE3 of the
+relative file path, with a `.json` suffix. An incomplete intent can narrow the
+failure to remote writes, verification, ownership recheck or SQL completion.
+Complete intents with a missing snapshot leave final cache bookkeeping and
+snapshot lookup or save to investigate. A snapshot row can survive a failure in
+the return path after commit. Check the sealed row and actual selection separately.
+S3 list health only checks list access.
+
+For acceptance, use a disposable reader cache with read-only storage credentials
+to verify the persisted generation before exercising an explicitly pinned,
+nonempty public search. Check the expected capture, its resource and qualified
+attribution, and repeat the historical pin. A writer restart can recover pending
+archive intents across sources and requires maintenance authorization.
+
 Exact historical npm recovery selection is separate from `--latest-failure`.
 Use the [private recovery workflow](terminal-recovery-design.md); missing job
 history or legacy failure phase remains unknown and cannot authorize rearming.

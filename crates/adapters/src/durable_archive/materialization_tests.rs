@@ -1,7 +1,9 @@
 //! Deterministic coordinator checks plus controlled PostgreSQL/S3 acceptance.
+use super::rejection_tests::Events;
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use tracing::instrument::WithSubscriber;
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
@@ -104,6 +106,8 @@ struct Proxy {
     enabled: AtomicBool,
     unavailable: AtomicBool,
     corrupt: AtomicBool,
+    deny_body_put: AtomicBool,
+    deny_binding_put: AtomicBool,
     entered: tokio::sync::Notify,
     active: AtomicUsize,
     peak: AtomicUsize,
@@ -118,6 +122,8 @@ impl Default for Proxy {
             enabled: AtomicBool::new(false),
             unavailable: AtomicBool::new(false),
             corrupt: AtomicBool::new(false),
+            deny_body_put: AtomicBool::new(false),
+            deny_binding_put: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -137,7 +143,11 @@ async fn proxy(
     request: axum::extract::Request,
 ) -> axum::response::Response {
     use axum::body::{Body, to_bytes};
-    if state.unavailable.load(Ordering::SeqCst) {
+    let path = request.uri().path();
+    let rejected_put = request.method() == http::Method::PUT
+        && ((path.contains("/objects/") && state.deny_body_put.load(Ordering::SeqCst))
+            || (path.contains("/bindings/") && state.deny_binding_put.load(Ordering::SeqCst)));
+    if state.unavailable.load(Ordering::SeqCst) || rejected_put {
         return axum::response::Response::builder()
             .status(403)
             .body(Body::empty())
@@ -223,6 +233,60 @@ fn assert_clean(archive: &Archive, directory: &Path) {
     }));
 }
 
+async fn check_publication_stages(archive: &Archive, state: &Proxy, root: &Path) {
+    let file = "archive-publication-fixture";
+    let path = root.join(file);
+    let body = b"fixture publication body";
+    let digest = crate::integrity::hash(body);
+    std::fs::write(&path, body).unwrap();
+    for (denied, failed_stage) in [
+        (&state.deny_body_put, "\"publish_body\""),
+        (&state.deny_binding_put, "\"publish_remote_binding\""),
+    ] {
+        denied.store(true, Ordering::SeqCst);
+        let events = Events::default();
+        let error = archive
+            .publish_one(&path, &digest, body.len() as u64)
+            .with_subscriber(events.clone())
+            .await
+            .unwrap_err();
+        denied.store(false, Ordering::SeqCst);
+        assert_eq!(error.code, "unavailable");
+        assert!(error.details.is_none());
+        assert!(archive.binding_for(file, false).await.unwrap().is_some());
+        assert!(archive.binding_for(file, true).await.unwrap().is_none());
+        let events = events.0.lock().unwrap();
+        let intent = events
+            .iter()
+            .find(|event| event["archive_stage"] == "\"publish_intent\"")
+            .unwrap();
+        assert_eq!(intent["success"], "true");
+        let failure = events.last().unwrap();
+        assert_eq!(failure["archive_stage"], failed_stage);
+        assert_eq!(failure["success"], "false");
+        for event in &*events {
+            assert!(event.keys().all(|field| matches!(
+                field.as_str(),
+                "archive_stage" | "elapsed_micros" | "message" | "success"
+            )));
+            assert!(event.values().all(|value| {
+                !value.contains(file) && !value.contains(&digest) && !value.contains(&error.message)
+            }));
+        }
+    }
+    let events = Events::default();
+    archive
+        .publish_one(&path, &digest, body.len() as u64)
+        .with_subscriber(events.clone())
+        .await
+        .unwrap();
+    assert!(archive.binding_for(file, true).await.unwrap().is_some());
+    let events = events.0.lock().unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last["archive_stage"], "\"publish_completion\"");
+    assert_eq!(last["success"], "true");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
 async fn s3_materialization_parallel_singleflight_cancellation_and_authority() {
@@ -265,6 +329,7 @@ async fn s3_materialization_parallel_singleflight_cancellation_and_authority() {
             .await
             .unwrap();
     let archive = select(root.path()).unwrap().unwrap();
+    check_publication_stages(&archive, &state, root.path()).await;
     let directory = root.path().join("materialization");
     std::fs::create_dir(&directory).unwrap();
     let paths = [directory.join("one"), directory.join("two")];

@@ -65,6 +65,16 @@ fn integrity() -> Error {
     Error::integrity("RFC search index integrity verification failed.")
 }
 
+pub(super) fn publication_failure(stage: &'static str, build_id: Option<&str>) {
+    tracing::debug!(
+        target: "devres_private_timings",
+        rfc_publication_stage = stage,
+        rfc_build_id = build_id,
+        success = false,
+        "RFC snapshot publication"
+    );
+}
+
 fn check_deadline(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         Err(Error::capacity(
@@ -607,6 +617,21 @@ impl IndexBuilder {
     }
 
     pub(crate) fn finish(mut self) -> Result<String> {
+        let mut stage = "index_local_finalize";
+        let result = self.finish_index(&mut stage);
+        if result.is_err()
+            && tracing::enabled!(target: "devres_private_timings", tracing::Level::DEBUG)
+        {
+            let build_id = self
+                .relative
+                .strip_prefix("rfc-indexes/")
+                .and_then(|suffix| path_id(suffix).ok());
+            publication_failure(stage, build_id.as_deref());
+        }
+        result
+    }
+
+    fn finish_index(&mut self, stage: &mut &'static str) -> Result<String> {
         crate::durable_archive::admit_write(&self.storage_root, 0)?;
         let mut writer = self.writer.take().ok_or_else(unavailable)?;
         writer.commit().map_err(|_| unavailable())?;
@@ -658,6 +683,7 @@ impl IndexBuilder {
         File::open(parent)
             .and_then(|file| file.sync_all())
             .map_err(|_| unavailable())?;
+        *stage = "index_archive_record";
         for (name, digest) in &descriptor.files {
             crate::integrity::record_file(
                 &self.storage_root,
@@ -1439,6 +1465,81 @@ mod diagnostic_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct PublicationEvents(std::sync::Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+    impl tracing::Subscriber for PublicationEvents {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "devres_private_timings"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+            }
+            if event
+                .metadata()
+                .fields()
+                .field("rfc_publication_stage")
+                .is_some()
+            {
+                let mut fields = Fields(BTreeMap::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn private_publication_diagnostics_distinguish_local_and_archive_failures() {
+        let _test = TEST_SERIAL.lock().await;
+        for (archive_failure, stage, message) in [
+            (
+                false,
+                "index_local_finalize",
+                "RFC search snapshot already exists.",
+            ),
+            (true, "index_archive_record", "Invalid integrity directory."),
+        ] {
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            let id = crate::integrity::hash(stage.as_bytes());
+            let builder = IndexBuilder::begin(root.path(), &id).unwrap();
+            let final_path = builder.final_path.clone();
+            if archive_failure {
+                fs::write(root.path().join(".devres-integrity"), b"fixture").unwrap();
+            } else {
+                fs::create_dir(&final_path).unwrap();
+            }
+            let events = PublicationEvents::default();
+            let error =
+                tracing::subscriber::with_default(events.clone(), || builder.finish()).unwrap_err();
+            assert_eq!(error.code, "integrity");
+            assert_eq!(error.message, message);
+            assert!(final_path.is_dir());
+            let events = events.0.lock().unwrap();
+            let [event] = events.as_slice() else {
+                panic!("expected exactly one publication event, got {events:?}");
+            };
+            assert_eq!(event.len(), 4);
+            assert_eq!(event["rfc_publication_stage"], format!("{stage:?}"));
+            assert_eq!(event["rfc_build_id"], format!("{id:?}"));
+            assert_eq!(event["success"], "false");
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]

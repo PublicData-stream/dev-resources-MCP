@@ -1132,6 +1132,9 @@ impl MaterializationControl {
     }
 }
 fn stage<T>(name: &'static str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !tracing::enabled!(target: "devres_private_timings", tracing::Level::TRACE) {
+        return operation();
+    }
     let started = Instant::now();
     let result = operation();
     tracing::trace!(
@@ -1139,11 +1142,14 @@ fn stage<T>(name: &'static str, operation: impl FnOnce() -> Result<T>) -> Result
         archive_stage = name,
         elapsed_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         success = result.is_ok(),
-        "archive materialization stage"
+        "archive operation stage"
     );
     result
 }
 async fn stage_async<T>(name: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    if !tracing::enabled!(target: "devres_private_timings", tracing::Level::TRACE) {
+        return future.await;
+    }
     let started = Instant::now();
     let result = future.await;
     tracing::trace!(
@@ -1151,7 +1157,7 @@ async fn stage_async<T>(name: &'static str, future: impl Future<Output = Result<
         archive_stage = name,
         elapsed_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         success = result.is_ok(),
-        "archive materialization stage"
+        "archive operation stage"
     );
     result
 }
@@ -1562,12 +1568,15 @@ impl Archive {
         if self.reader {
             return Err(Error::unavailable("Reader archive cannot publish."));
         }
-        self.health().await?;
-        let relative = self.relative(path)?;
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != bytes {
-            return Err(integrity());
-        }
+        stage_async("publish_health", self.health()).await?;
+        let (relative, metadata) = stage("publish_local_identity", || {
+            let relative = self.relative(path)?;
+            let metadata = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != bytes {
+                return Err(integrity());
+            }
+            Ok((relative, metadata))
+        })?;
         let mut binding = Binding {
             version: 1,
             path: relative.clone(),
@@ -1576,54 +1585,88 @@ impl Archive {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
-        if let Some(existing) = self.binding_for(&relative, false).await? {
-            if existing.digest != digest || existing.bytes != bytes {
-                return Err(integrity());
+        let encoded = stage_async("publish_binding", async {
+            if let Some(existing) = self.binding_for(&relative, false).await? {
+                if existing.digest != digest || existing.bytes != bytes {
+                    return Err(integrity());
+                }
+                binding = existing;
             }
-            binding = existing;
-        }
-        if self.binding_for(&relative, false).await?.is_none() {
-            let (device, inode) = match accounting {
-                Some(identity) => identity,
-                None => self.local_identity(path)?,
-            };
-            binding.device = device;
-            binding.inode = inode;
-        }
-        binding.validate()?;
-        let encoded = binding.encoded()?;
-        {
+            if self.binding_for(&relative, false).await?.is_none() {
+                let (device, inode) = match accounting {
+                    Some(identity) => identity,
+                    None => stage("publish_local_accounting", || self.local_identity(path))?,
+                };
+                binding.device = device;
+                binding.inode = inode;
+            }
+            binding.validate()?;
+            binding.encoded()
+        })
+        .await?;
+        stage_async("publish_intent", async {
             let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
             let mut owner = owner_handle.lock().await;
-            sqlx_core::query::query("INSERT INTO devres_archive_file(path,digest,bytes,device,inode,epoch,evidence) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(path) DO NOTHING").bind(&relative).bind(digest).bind(i64::try_from(bytes).map_err(|_|rejected(RejectionReason::BindingBytes, Some(bytes), Some(i64::MAX as u64), None))?).bind(binding.device.to_string()).bind(binding.inode.to_string()).bind(self.epoch).bind(&encoded).execute(&mut *owner).await.map_err(|_|unavailable())?;
-        }
+            sqlx_core::query::query("INSERT INTO devres_archive_file(path,digest,bytes,device,inode,epoch,evidence) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(path) DO NOTHING")
+                .bind(&relative)
+                .bind(digest)
+                .bind(i64::try_from(bytes).map_err(|_| {
+                    rejected(RejectionReason::BindingBytes, Some(bytes), Some(i64::MAX as u64), None)
+                })?)
+                .bind(binding.device.to_string())
+                .bind(binding.inode.to_string())
+                .bind(self.epoch)
+                .bind(&encoded)
+                .execute(&mut *owner)
+                .await
+                .map_err(|_| unavailable())?;
+            Ok(())
+        })
+        .await?;
         // Intent remains durable on cancellation or an ambiguous network failure.
-        self.remote
-            .put_file_immutable(
-                &binding.object_key()?,
-                path,
-                digest,
-                bytes,
-                &CancellationToken::new(),
-            )
-            .await?;
-        self.remote
-            .put_bytes_immutable(
+        stage_async("publish_body", async {
+            self.remote
+                .put_file_immutable(
+                    &binding.object_key()?,
+                    path,
+                    digest,
+                    bytes,
+                    &CancellationToken::new(),
+                )
+                .await
+        })
+        .await?;
+        stage_async(
+            "publish_remote_binding",
+            self.remote.put_bytes_immutable(
                 &format!(
                     "bindings/{}.json",
                     blake3::hash(relative.as_bytes()).to_hex()
                 ),
                 encoded.as_bytes(),
+            ),
+        )
+        .await?;
+        stage_async("publish_completion_fence", self.fence()).await?;
+        stage_async("publish_completion", async {
+            let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
+            let mut owner = owner_handle.lock().await;
+            let changed = sqlx_core::query::query(
+                "UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3",
             )
-            .await?;
-        self.fence().await?;
-        let owner_handle = self.owner.upgrade().ok_or_else(unavailable)?;
-        let mut owner = owner_handle.lock().await;
-        let changed=sqlx_core::query::query("UPDATE devres_archive_file SET complete=true WHERE path=$1 AND evidence=$2 AND epoch=$3").bind(&relative).bind(&encoded).bind(self.epoch).execute(&mut *owner).await.map_err(|_|unavailable())?.rows_affected();
-        if changed != 1 {
-            return Err(integrity());
-        }
-        Ok(())
+            .bind(&relative)
+            .bind(&encoded)
+            .bind(self.epoch)
+            .execute(&mut *owner)
+            .await
+            .map_err(|_| unavailable())?
+            .rows_affected();
+            if changed != 1 {
+                return Err(integrity());
+            }
+            Ok(())
+        })
+        .await
     }
     fn admit(&self, cache: &mut Cache, extra: u64, protected: &[PathBuf]) -> Result<()> {
         admit_local(
@@ -2075,21 +2118,23 @@ pub(crate) fn publish_file(path: &Path, digest: &str, bytes: u64) -> Result<()> 
     let Some(archive) = select(path)? else {
         return Ok(());
     };
-    {
+    stage("publish_pre_cache", || {
         let mut cache = lock_cache(&archive)?;
         cache.observe(path)?;
-        archive.admit(&mut cache, 0, &[path.to_owned()])?;
-    }
+        archive.admit(&mut cache, 0, &[path.to_owned()])
+    })?;
     run(archive.publish_one(path, digest, bytes))?;
-    let mut cache = lock_cache(&archive)?;
-    cache.clock = cache.clock.saturating_add(1);
-    let touched = cache.clock;
-    cache
-        .files
-        .entry(path.to_owned())
-        .or_insert(CacheEntry { pins: 0, touched });
-    cache.observe(path)?;
-    archive.admit(&mut cache, 0, &[path.to_owned()])
+    stage("publish_post_cache", || {
+        let mut cache = lock_cache(&archive)?;
+        cache.clock = cache.clock.saturating_add(1);
+        let touched = cache.clock;
+        cache
+            .files
+            .entry(path.to_owned())
+            .or_insert(CacheEntry { pins: 0, touched });
+        cache.observe(path)?;
+        archive.admit(&mut cache, 0, &[path.to_owned()])
+    })
 }
 pub fn admit_write(path: &Path, bytes: u64) -> Result<()> {
     if let Some(archive) = select(path)? {
