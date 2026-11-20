@@ -574,14 +574,14 @@ impl GitRegistry {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Existing Git files are not trusted merely because their names match.
                     trace.stage = "existing_pack_verification";
-                    let observed = artifacts
-                        .ingest_file(&destination, bulk::MAX_ARTIFACT_BYTES, shutdown.clone())
-                        .await?;
-                    if observed != entry.artifact {
-                        return Err(Error::integrity(
-                            "Existing registry Git pack differs from retained evidence.",
-                        ));
-                    }
+                    verify_existing_pack(
+                        destination,
+                        verified.artifact.bytes,
+                        &verified.blake3_digest,
+                        &shutdown,
+                        deadline,
+                    )
+                    .await?;
                 }
                 Err(error) => return Err(trace.io_error(error)),
             }
@@ -1628,6 +1628,39 @@ pub(crate) fn valid_pack_name(name: &str) -> bool {
             valid_oid(hash) && matches!(suffix, "pack" | "idx" | "rev" | "bitmap" | "keep")
         })
 }
+
+async fn verify_existing_pack(
+    path: PathBuf,
+    bytes: u64,
+    expected_digest: &str,
+    shutdown: &CancellationToken,
+    deadline: Instant,
+) -> Result<()> {
+    let cancel = shutdown.child_token();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let mut verification = tokio::task::spawn_blocking(move || {
+        crate::integrity::file_digest_local(&path, bytes, deadline.into_std(), &cancel)
+    });
+    let (digest, length) = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            verification.abort();
+            return Err(Error::new("cancelled", "Registry Git pack verification canceled."));
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            verification.abort();
+            return Err(Error::capacity("Registry Git pack verification deadline exceeded."));
+        }
+        result = &mut verification => result.map_err(|_| git_error())??,
+    };
+    if length != bytes || digest != expected_digest {
+        return Err(Error::integrity(
+            "Existing registry Git pack differs from retained evidence.",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn recover_working_stages(repository: &Path) -> Result<()> {
     // A single fenced mutator owns these private temporary files. No immutable
     // archive object or observed snapshot ref is considered disposable.
@@ -2262,6 +2295,159 @@ mod tests {
         assert_eq!(records.recv().await.unwrap().unwrap().bytes, content);
         assert!(records.recv().await.is_none());
     }
+    #[tokio::test]
+    async fn warm_restore_checks_existing_pack_without_archive_writes() {
+        const HEADROOM: u64 = 64 * 1024 * 1024;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let archive = tempfile::tempdir_in("/tmp").unwrap();
+        let registry = GitRegistry::new(root.path(), HEADROOM).unwrap();
+        let shutdown = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        registry.initialize(&shutdown, deadline).await.unwrap();
+        let previous = fixture_commit(&registry, None, None).await;
+        let revision =
+            fixture_commit(&registry, Some(b"{\"name\":\"serde\"}\n"), Some(&previous)).await;
+        registry
+            .run(
+                &["repack", "-a", "-d", "--no-write-bitmap-index"],
+                4096,
+                &shutdown,
+                deadline,
+            )
+            .await
+            .unwrap();
+        let artifacts = Arc::new(BulkArtifactStore::new(archive.path(), HEADROOM).unwrap());
+        let observed_at = devres_domain::unix_now() - 60;
+        let manifest = registry
+            .capture_evidence(
+                &revision,
+                Some(previous.clone()),
+                observed_at,
+                artifacts,
+                &shutdown,
+                deadline,
+            )
+            .await
+            .unwrap();
+        let reader =
+            Arc::new(BulkArtifactStore::for_verification(archive.path(), HEADROOM).unwrap());
+        let restored = registry
+            .restore(reader.clone(), manifest.clone(), shutdown.clone())
+            .await
+            .unwrap();
+        assert_eq!(restored.revision, revision);
+        assert_eq!(restored.observed_at, observed_at);
+        assert_eq!(
+            registry
+                .optional_revision(&shutdown, deadline)
+                .await
+                .unwrap(),
+            Some(revision)
+        );
+
+        registry
+            .run(
+                &["update-ref", "refs/devres/current", &previous],
+                128,
+                &shutdown,
+                deadline,
+            )
+            .await
+            .unwrap();
+        let repo = root.path().join(REPO_NAME);
+        let pack = std::fs::read_dir(repo.join("objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+            .unwrap();
+        let original = std::fs::read(&pack).unwrap();
+        let mut corrupted = original.clone();
+        corrupted[0] ^= 1;
+        // Detach the working file before writing so the retained artifact stays intact.
+        std::fs::remove_file(&pack).unwrap();
+        for contents in [corrupted.as_slice(), &original[..original.len() - 1]] {
+            std::fs::write(&pack, contents).unwrap();
+            let error = registry
+                .restore(reader.clone(), manifest.clone(), shutdown.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "integrity");
+            assert_eq!(
+                error.message,
+                "Existing registry Git pack differs from retained evidence."
+            );
+        }
+        std::fs::remove_file(&pack).unwrap();
+        let retained = crate::integrity::relative_path(&crate::integrity::hash(&original)).unwrap();
+        std::os::unix::fs::symlink(archive.path().join(retained), &pack).unwrap();
+        let error = registry
+            .restore(reader, manifest, shutdown)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "integrity");
+        let current = std::fs::read_to_string(repo.join("refs/devres/current")).unwrap();
+        assert_eq!(current.trim_end(), previous);
+    }
+
+    #[test]
+    fn queued_pack_verification_honors_cancellation_and_deadline() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let pack = root.path().join("pack");
+        let bytes = b"retained fixture";
+        std::fs::write(&pack, bytes).unwrap();
+        let digest = crate::integrity::hash(bytes);
+        let length = bytes.len() as u64;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let (started, running) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            running.await.unwrap();
+            let shutdown = CancellationToken::new();
+            let (canceled, ()) = tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    verify_existing_pack(
+                        pack.clone(),
+                        length,
+                        &digest,
+                        &shutdown,
+                        Instant::now() + Duration::from_secs(30),
+                    ),
+                ),
+                async {
+                    tokio::task::yield_now().await;
+                    shutdown.cancel();
+                },
+            );
+            assert_eq!(canceled.unwrap().unwrap_err().code, "cancelled");
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                verify_existing_pack(
+                    pack,
+                    length,
+                    &digest,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_millis(20),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.code, "capacity");
+            drop(release);
+            blocker.await.unwrap();
+        });
+    }
+
     #[tokio::test]
     async fn actual_git_fetch_uses_only_the_mediated_fixture_transport() {
         let source_root = tempfile::tempdir().unwrap();

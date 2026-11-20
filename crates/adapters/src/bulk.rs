@@ -2550,6 +2550,8 @@ pub struct BulkArtifact {
 pub struct MaterializedArtifact {
     pub artifact: BulkArtifact,
     pub path: PathBuf,
+    /// Verified against independent BLAKE3 evidence for legacy identities.
+    pub(crate) blake3_digest: String,
     _lease: crate::durable_archive::ArchiveLease,
 }
 
@@ -3058,7 +3060,7 @@ impl BulkArtifactStore {
             // A previous failed upload may have left an unreferenced local
             // object. Verify its bytes before retrying durable publication;
             // ordinary reads still require an established archive binding.
-            let existing = self
+            let (existing, _) = self
                 .verify_resident(&body_hash, max_bytes, shutdown.clone())
                 .await?;
             if existing.bytes != bytes {
@@ -3105,10 +3107,11 @@ impl BulkArtifactStore {
         // bound also covers private imports, which already admit up to 24 hours.
         let deadline = std::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
         let lease = lease_path(&path, max_bytes, deadline, shutdown.clone()).await?;
-        let artifact = self.verify_resident(hash, max_bytes, shutdown).await?;
+        let (artifact, blake3_digest) = self.verify_resident(hash, max_bytes, shutdown).await?;
         Ok(MaterializedArtifact {
             artifact,
             path,
+            blake3_digest,
             _lease: lease,
         })
     }
@@ -3118,7 +3121,7 @@ impl BulkArtifactStore {
         hash: &str,
         max_bytes: u64,
         shutdown: CancellationToken,
-    ) -> Result<BulkArtifact> {
+    ) -> Result<(BulkArtifact, String)> {
         if self.verification_only {
             let metadata = tokio::fs::symlink_metadata(&self.root)
                 .await
@@ -3165,13 +3168,16 @@ impl BulkArtifactStore {
         if !hash.starts_with("blake3:") {
             crate::integrity::verify_legacy_digest(&self.root.join(hash), &computed_b3, length)?;
         }
-        Ok(BulkArtifact {
-            body_hash: hash.into(),
-            relative_path: crate::integrity::relative_path(hash)?
-                .to_string_lossy()
-                .into_owned(),
-            bytes: length,
-        })
+        Ok((
+            BulkArtifact {
+                body_hash: hash.into(),
+                relative_path: crate::integrity::relative_path(hash)?
+                    .to_string_lossy()
+                    .into_owned(),
+                bytes: length,
+            },
+            computed_b3,
+        ))
     }
     pub async fn open(
         &self,
@@ -3744,14 +3750,13 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(&descriptor, serde_json::to_vec(&evidence).unwrap()).unwrap();
-        assert_eq!(
-            store
-                .verify(&sha, body.len() as u64, CancellationToken::new())
-                .await
-                .unwrap()
-                .bytes,
-            body.len() as u64
-        );
+        let legacy_artifact = store
+            .materialize(&sha, body.len() as u64, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(legacy_artifact.artifact.bytes, body.len() as u64);
+        assert_eq!(legacy_artifact.artifact.body_hash, sha);
+        assert_eq!(legacy_artifact.blake3_digest, artifact.body_hash);
         let wrong = crate::integrity::FileEvidence {
             digest: crate::integrity::hash(b"different"),
             ..evidence

@@ -805,6 +805,9 @@ restore precedes inventory import and snapshot publication. For an isolated
 replay, verify the manifest and pack lengths and digests, then check the shallow
 boundary and revision in a disposable bare repository. Preserve the pending
 generation and cursor for the regular writer retry after repairing the cause.
+The writer verifies existing Git pack members in place against the retained
+manifest under the restore deadline. A successful restore still requires strict
+Git validation.
 
 The hourly Git index and daily public metadata dump are independent clocks. Exact
 archives are checksum-bound; docs.rs representations may change on rebuild and
