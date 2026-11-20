@@ -193,6 +193,7 @@ struct EvidenceStage(PathBuf);
 impl Drop for EvidenceStage {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = crate::durable_archive::forget_local(&self.0);
     }
 }
 
@@ -213,6 +214,7 @@ pub fn record_file(root: &Path, path: &Path, digest: &str, bytes: u64) -> Result
     {
         return Err(Error::integrity("Invalid durable file evidence identity."));
     }
+    let _payload = crate::durable_archive::protect_local(path)?;
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|_| Error::integrity("Published file unavailable."))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != bytes {
@@ -255,6 +257,7 @@ pub fn record_file(root: &Path, path: &Path, digest: &str, bytes: u64) -> Result
         return Err(Error::capacity("File evidence exceeds its bound."));
     }
     let target = evidence_path(root, path)?;
+    let _descriptor = crate::durable_archive::protect_local(&target)?;
     let parent = target
         .parent()
         .ok_or_else(|| Error::integrity("Invalid evidence path."))?;
@@ -290,32 +293,27 @@ pub fn record_file(root: &Path, path: &Path, digest: &str, bytes: u64) -> Result
     .and_then(|()| file.sync_all())
     .map_err(|_| Error::unavailable("File evidence write failed."))?;
     drop(file);
-    match std::fs::hard_link(&guard.0, &target) {
-        Ok(()) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                .open(&target)
-                .map_err(|_| Error::integrity("Retained file evidence unavailable."))?;
-            let metadata = file
-                .metadata()
-                .map_err(|_| Error::integrity("Invalid retained file evidence."))?;
-            if !metadata.is_file() || metadata.len() != encoded.len() as u64 {
-                return Err(Error::integrity("Conflicting retained file evidence."));
-            }
-            let mut retained = Vec::with_capacity(encoded.len());
-            (&mut file)
-                .take(encoded.len() as u64 + 1)
-                .read_to_end(&mut retained)
-                .map_err(|_| Error::integrity("Retained file evidence read failed."))?;
-            if retained != encoded {
-                return Err(Error::integrity("Conflicting retained file evidence."));
-            }
+    if !crate::durable_archive::link_local(&guard.0, &target)? {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(&target)
+            .map_err(|_| Error::integrity("Retained file evidence unavailable."))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| Error::integrity("Invalid retained file evidence."))?;
+        if !metadata.is_file() || metadata.len() != encoded.len() as u64 {
+            return Err(Error::integrity("Conflicting retained file evidence."));
         }
-        Err(_) => return Err(Error::unavailable("File evidence publication failed.")),
+        let mut retained = Vec::with_capacity(encoded.len());
+        (&mut file)
+            .take(encoded.len() as u64 + 1)
+            .read_to_end(&mut retained)
+            .map_err(|_| Error::integrity("Retained file evidence read failed."))?;
+        if retained != encoded {
+            return Err(Error::integrity("Conflicting retained file evidence."));
+        }
     }
-    crate::durable_archive::observe_local(&target)?;
     std::fs::File::open(parent)
         .and_then(|file| file.sync_all())
         .map_err(|_| Error::unavailable("File evidence directory sync failed."))?;

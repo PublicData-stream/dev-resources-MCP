@@ -476,9 +476,8 @@ impl IndexBuilder {
                                 fs::copy(from, &to)
                             })
                             .map_err(|_| unavailable())?;
-                        } else {
-                            fs::hard_link(from, &to).map_err(|_| unavailable())?;
-                            crate::durable_archive::observe_local(&to)?;
+                        } else if !crate::durable_archive::link_local(&from, &to)? {
+                            return Err(unavailable());
                         }
                     }
                     crate::immutable_index::open_staging(&stage).map_err(|_| integrity())?
@@ -675,8 +674,7 @@ impl IndexBuilder {
         if fs::symlink_metadata(&self.final_path).is_ok() {
             return Err(Error::integrity("RFC search snapshot already exists."));
         }
-        fs::rename(&self.stage, &self.final_path).map_err(|_| unavailable())?;
-        crate::durable_archive::relocate_local_tree(&self.stage, &self.final_path)?;
+        crate::durable_archive::rename_local_tree(&self.stage, &self.final_path)?;
         // After rename, never remove this directory, even if fsync or DB publication fails.
         self.published = true;
         let parent = self.final_path.parent().ok_or_else(integrity)?;

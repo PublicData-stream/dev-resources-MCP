@@ -55,7 +55,7 @@ qualification after restart, including the S3 disposable-cache-loss branch.
 Discovery never persists audit inputs or schedules inventory-derived audit work.
 
 Archive materialization uses two I/O slots per archive instance, per-path work
-coalescing and pending-byte cache reservations. Private fixed-stage timings
+coalescing and reservations for pending bytes and file paths. Private stage timings
 distinguish lock admission, binding/owner checks, remote health/HEAD, transfer,
 verification and cache admission. Warm cache bytes still require remote authority;
 increasing deadlines or bypassing health is not an outage recovery procedure.
@@ -1349,6 +1349,13 @@ that filesystem-only operation.
 After S3 accepts newer publications, the original filesystem tree is only a
 pre-cutover recovery source: rollback requires its matching database backup or a
 verified reverse transfer, never merely changing `storage.backend`.
+
+The `tracked_files` diagnostic reports pressure on the 262,144 local cache
+path slots. It can occur while the file system has ample free bytes. On startup
+with an already active S3 backend, the cache can drop local copies with complete
+bindings while scanning within its limits. If startup still reports path or
+scan pressure, preserve the affected cache and diagnose unbound files and any
+incomplete uploads before preparing a separate disposable cache.
 
 Run disposable acceptance with `scripts/with-tmp-state.sh scripts/test-s3.sh` and
 `scripts/with-tmp-state.sh env CARGO_TARGET_DIR=/tmp/rust/target OXIBELT_TARGET_DIR=/tmp/rust/target scripts/test-minikube.sh --s3`.

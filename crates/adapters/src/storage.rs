@@ -970,6 +970,7 @@ impl PgBlobStore {
         .await
         .map_err(|_| storage_error())??;
         let _retained_lease = retained_lease;
+        let _publication_guard = crate::durable_archive::protect_local(&final_path)?;
         crate::durable_archive::admit_write(&final_path, 0)?;
         let parent = final_path.parent().ok_or_else(storage_error)?;
         crate::integrity::ensure_directory(parent).await?;
@@ -1037,17 +1038,11 @@ impl PgBlobStore {
             let published = tokio::task::spawn_blocking(move || {
                 // Keep staging ownership and quota with the filesystem operation even if its await is canceled.
                 let stage_guard = stage_guard;
-                match std::fs::hard_link(&stage_guard.0, &target) {
-                    Ok(()) => {
-                        crate::durable_archive::observe_local(&target)?;
-                        if let Some(reservation) = reservation {
-                            reservation.retain_at(&target)?;
-                        }
-                        Ok(true)
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                    Err(_) => Err(storage_error()),
+                let published = crate::durable_archive::link_local(&stage_guard.0, &target)?;
+                if published && let Some(reservation) = reservation {
+                    reservation.retain_at(&target)?;
                 }
+                Ok(published)
             })
             .await
             .map_err(|_| storage_error())??;

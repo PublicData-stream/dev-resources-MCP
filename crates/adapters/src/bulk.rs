@@ -3037,13 +3037,15 @@ impl BulkArtifactStore {
         let destination = self.root.join(&relative_path);
         let retained_path = destination.clone();
         let retained_cancel = shutdown.clone();
-        let _retained = tokio::task::spawn_blocking(move || {
-            crate::durable_archive::materialize_if_retained(
+        let (_retained, _publication_guard) = tokio::task::spawn_blocking(move || {
+            let retained = crate::durable_archive::materialize_if_retained(
                 &retained_path,
                 max_bytes,
                 std::time::Instant::now() + Duration::from_secs(24 * 60 * 60),
                 &retained_cancel,
-            )
+            )?;
+            let guard = crate::durable_archive::protect_local(&retained_path)?;
+            Ok::<_, Error>((retained, guard))
         })
         .await
         .map_err(|_| storage_error())??;
@@ -3051,11 +3053,13 @@ impl BulkArtifactStore {
         crate::integrity::ensure_directory(&destination_directory).await?;
         // The filesystem operation and quota ownership transition must have one
         // owner even if its async waiter is canceled after link creation.
-        let stage_path = stage.0.clone();
-        let created =
-            tokio::task::spawn_blocking(move || retain_link(stage_path, destination, reservation))
-                .await
-                .map_err(|_| storage_error())??;
+        let created = tokio::task::spawn_blocking(move || {
+            let result = retain_link(stage.0.clone(), destination, reservation);
+            drop(stage);
+            result
+        })
+        .await
+        .map_err(|_| storage_error())??;
         if !created {
             // A previous failed upload may have left an unreferenced local
             // object. Verify its bytes before retrying durable publication;
@@ -3261,15 +3265,11 @@ fn retain_link(
     destination: PathBuf,
     reservation: ArtifactReservation,
 ) -> Result<bool> {
-    match std::fs::hard_link(stage, &destination) {
-        Ok(()) => {
-            reservation.retain_at(&destination)?;
-            crate::durable_archive::observe_local(&destination)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(_) => Err(storage_error()),
+    let created = crate::durable_archive::link_local(&stage, &destination)?;
+    if created {
+        reservation.retain_at(&destination)?;
     }
+    Ok(created)
 }
 async fn sync_directory(path: &Path) -> Result<()> {
     let path = path.to_owned();

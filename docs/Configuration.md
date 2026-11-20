@@ -560,11 +560,14 @@ Changing authentication alone preserves the exact existing archive binding;
 static keys do not inherit broker lease expiry or automatic revocation.
 
 The local cache must fit pinned search generations, admitted downloads, and
-managed staging. Eviction removes only disposable, unleased materializations.
+managed staging. It tracks at most 262,144 file paths in addition to the
+`cache_max_bytes` bound. A hard-link alias occupies a path slot and shares the
+physical-byte charge. Path or byte pressure can evict an unleased local copy
+whose S3 binding is complete.
 
 Each archive instance admits at most two concurrent materialization I/O operations,
 including directory members. Requests for one logical path share in-progress
-materialization. Pending downloads reserve cache bytes alongside resident files;
+materialization. Pending downloads reserve cache bytes and a path slot;
 remote I/O and hashing do not hold the shared cache bookkeeping lock. Every caller
 still checks exact binding, ownership, remote health and HEAD, including warm reads.
 An oversized working set fails explicitly; public reads retain existing deadlines

@@ -341,9 +341,16 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(path)
         .map_err(|_| failure())?;
-    crate::durable_archive::with_write_budget(path, bytes.len() as u64, || f.write_all(bytes))
-        .and_then(|()| f.sync_all())
-        .map_err(|_| failure())
+    let result =
+        crate::durable_archive::with_write_budget(path, bytes.len() as u64, || f.write_all(bytes))
+            .and_then(|()| f.sync_all())
+            .map_err(|_| failure());
+    if result.is_err() {
+        drop(f);
+        let _ = fs::remove_file(path);
+        let _ = crate::durable_archive::forget_local(path);
+    }
+    result
 }
 struct CancelOnDrop(CancellationToken);
 impl Drop for CancelOnDrop {
@@ -775,6 +782,7 @@ impl MdnIndex {
         if fs2::available_space(&base).map_err(|_| failure())? < 128 * 1024 * 1024 {
             return Err(capacity());
         }
+        let _retained_shard_lease;
         let mut shard = None;
         if !documents.is_empty() {
             let unique: BTreeSet<_> = documents.iter().map(|d| &d.id).collect();
@@ -798,7 +806,7 @@ impl MdnIndex {
             let id = format!("blake3:{}", input_hash.finalize().to_hex());
             let final_path = base.join("shards").join(index_suffix(&id)?);
             if crate::durable_archive::retained(&final_path)? {
-                let _archive_lease = crate::durable_archive::materialize_directory(
+                _retained_shard_lease = crate::durable_archive::materialize_directory(
                     &final_path,
                     MAX_BYTES + MAX_MANIFEST as u64,
                     10_001,
@@ -923,8 +931,7 @@ impl MdnIndex {
                 File::open(&stage)
                     .and_then(|f| f.sync_all())
                     .map_err(|_| failure())?;
-                fs::rename(&stage, &final_path).map_err(|_| failure())?;
-                crate::durable_archive::relocate_local_tree(&stage, &final_path)?;
+                crate::durable_archive::rename_local_tree(&stage, &final_path)?;
                 File::open(final_path.parent().ok_or_else(integrity)?)
                     .and_then(|f| f.sync_all())
                     .map_err(|_| failure())?;
@@ -958,6 +965,7 @@ impl MdnIndex {
         }
         let id = hash(&bytes);
         let final_path = self.root.join(manifest_relative(&id)?);
+        let _publication_guard = crate::durable_archive::protect_local(&final_path)?;
         if final_path.exists() {
             if fs::read(&final_path).map_err(|_| failure())? != bytes {
                 return Err(integrity());
@@ -969,10 +977,14 @@ impl MdnIndex {
                 STAGE.fetch_add(1, AtomicOrdering::Relaxed)
             ));
             write_new(&temporary, &bytes)?;
-            fs::hard_link(&temporary, &final_path).map_err(|_| failure())?;
-            crate::durable_archive::observe_local(&final_path)?;
-            fs::remove_file(&temporary).map_err(|_| failure())?;
-            crate::durable_archive::forget_local(&temporary)?;
+            let linked = crate::durable_archive::link_local(&temporary, &final_path);
+            let removed = fs::remove_file(&temporary).map_err(|_| failure());
+            let forgotten = crate::durable_archive::forget_local(&temporary);
+            if !linked? {
+                return Err(failure());
+            }
+            removed?;
+            forgotten?;
             File::open(final_path.parent().ok_or_else(integrity)?)
                 .and_then(|f| f.sync_all())
                 .map_err(|_| failure())?;

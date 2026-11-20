@@ -45,9 +45,14 @@ fn physical_totals_count_aliases_once_and_preserve_protected_or_unmanaged_bytes(
     std::fs::hard_link(&pinned, &alias).unwrap();
     let mut cache = Cache::scan(root.path()).unwrap();
     for (path, pins) in [(&pinned, 1), (&alias, 0), (&evictable, 0)] {
-        cache
-            .files
-            .insert(path.clone(), CacheEntry { pins, touched: 0 });
+        cache.files.insert(
+            path.clone(),
+            CacheEntry {
+                pins,
+                touched: 0,
+                complete: true,
+            },
+        );
     }
     assert_eq!(cache.used_bytes, 104);
     assert_eq!(cache.private_physical_totals(&[]), Some((32, 64)));
@@ -84,6 +89,7 @@ fn bounded_physical_accounting_reports_unknown_instead_of_partial_totals() {
         CacheEntry {
             pins: 1,
             touched: 0,
+            complete: true,
         },
     );
     assert_eq!(cache.private_physical_totals(&[]), Some((5, 0)));
@@ -100,6 +106,7 @@ fn private_pressure_event_preserves_inner_public_limit_and_original_evidence() {
         CacheEntry {
             pins: 1,
             touched: 0,
+            complete: true,
         },
     );
     cache.reserved_bytes = 32;
@@ -207,6 +214,7 @@ fn eviction_deadline_evidence_excludes_protected_aliases_and_unknown_scope_stays
             CacheEntry {
                 pins: 0,
                 touched: 0,
+                complete: true,
             },
         );
     }

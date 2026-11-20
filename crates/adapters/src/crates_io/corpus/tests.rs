@@ -420,6 +420,141 @@ fn supported_public_api_fixture_is_qualified_for_comparison() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable PostgreSQL and RustFS; run scripts/test-s3.sh"]
+async fn s3_crate_pending_inventory_publishes_under_cache_path_pressure() {
+    let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable PostgreSQL required");
+    let config_path = std::env::var("DEVRES_TEST_S3_CONFIG").expect("disposable S3 required");
+    let mut s3: crate::object_storage::S3Config =
+        toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    s3.prefix.push_str("/crate-cache-path-pressure");
+    s3.cache_max_bytes = 256 * 1024 * 1024;
+    let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+    sqlx_core::query::query("CREATE DATABASE devres_s3_crate_cache_fixture")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut database = url::Url::parse(&base).unwrap();
+    database.set_path("/devres_s3_crate_cache_fixture");
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let store = Arc::new(
+        crate::PgBlobStore::connect_archive(database.as_str(), root.path(), Some(s3))
+            .await
+            .unwrap(),
+    );
+    let fetcher = Arc::new(NoFetcher::default());
+    let retrieval = Arc::new(Retrieval::new(store.clone(), fetcher.clone()));
+    let broker = Arc::new(BulkBroker::fixture("http://127.0.0.1:1/".parse().unwrap()).unwrap());
+    let corpus = Arc::new(
+        CrateCorpus::new(
+            store.clone(),
+            retrieval.clone(),
+            broker,
+            root.path(),
+            CrateConfig {
+                enabled: false,
+                min_free_bytes: 64 * 1024 * 1024,
+                max_git_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    store
+        .attach_artifact_budget(corpus.artifact_budget())
+        .unwrap();
+
+    // Seed the oldest disposable copies before warming the inventory packs.
+    let old_body = b"retained S3 fixture body";
+    let old = corpus
+        .artifacts
+        .capture_bytes(old_body.to_vec(), CancellationToken::new())
+        .await
+        .unwrap();
+    for index in 0..24_u8 {
+        corpus
+            .artifacts
+            .capture_bytes(vec![index], CancellationToken::new())
+            .await
+            .unwrap();
+    }
+    let archives = [archive(VERSIONS[0], "one"), archive(VERSIONS[1], "two")];
+    let observed_at = unix_now() - 60;
+    let (revision, manifest) =
+        retained_inventory(&corpus.artifacts, &index(&archives), observed_at).await;
+    corpus
+        .persist_artifact(
+            &format!("cargo:git-manifest:{revision}"),
+            "https://github.com/rust-lang/crates.io-index.git",
+            "application/json",
+            manifest.clone(),
+            json!({"transport":"git","revision":revision,"observed_at":observed_at}),
+            false,
+        )
+        .await
+        .unwrap();
+    let pending = store.begin_inventory(&revision, observed_at).await.unwrap();
+    store
+        .stage_gap(&pending.id, "a", "integrity", "1/a")
+        .await
+        .unwrap();
+    corpus
+        .git
+        .restore(corpus.artifacts.clone(), manifest, CancellationToken::new())
+        .await
+        .unwrap();
+    let old_path = root.path().join(&old.relative_path);
+    assert!(old_path.is_file());
+    let limit = crate::durable_archive::test_cache_resident_paths(root.path()).unwrap();
+    crate::durable_archive::set_test_file_limit(root.path(), limit).unwrap();
+
+    corpus
+        .sync_inventory(CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(store.pending_inventory().await.unwrap().is_none());
+    let snapshot = store.snapshot(None).await.unwrap().unwrap();
+    assert_eq!(snapshot.inventory.id, pending.id);
+    assert_eq!(snapshot.inventory.revision, revision);
+    let pool = sqlx_postgres::PgPool::connect(database.as_str())
+        .await
+        .unwrap();
+    let resumed_gap: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT error FROM devres_crate_inventory_gaps WHERE inventory=$1 AND name='a'",
+    )
+    .bind(&pending.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(resumed_gap, "integrity");
+    assert!(
+        !old_path.exists(),
+        "the oldest retained copy stayed on disk"
+    );
+    assert_eq!(
+        corpus
+            .artifacts
+            .verify(&old.body_hash, old.bytes, CancellationToken::new())
+            .await
+            .unwrap(),
+        old
+    );
+    assert_eq!(std::fs::read(old_path).unwrap(), old_body);
+    let research = crate::Research::new(retrieval)
+        .await
+        .unwrap()
+        .with_crate_corpus(corpus);
+    let versions = research
+        .call(
+            "packages.crate.versions",
+            json!({"name":"example","snapshot":snapshot.id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(versions["total"], 2);
+    assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
 async fn crate_corpus_captured_inventory_acquisition_research_and_restart() {

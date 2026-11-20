@@ -617,8 +617,7 @@ impl Builder {
         File::open(&self.stage)
             .and_then(|f| f.sync_all())
             .map_err(|_| unavailable())?;
-        fs::rename(&self.stage, &self.destination).map_err(|_| unavailable())?;
-        crate::durable_archive::relocate_local_tree(&self.stage, &self.destination)?;
+        crate::durable_archive::rename_local_tree(&self.stage, &self.destination)?;
         File::open(self.destination.parent().ok_or_else(integrity)?)
             .and_then(|f| f.sync_all())
             .map_err(|_| unavailable())?;

@@ -81,6 +81,7 @@ fn cold_download_reservations_prevent_ordinary_writer_overcommit() {
         CacheEntry {
             pins: 1,
             touched: 0,
+            complete: true,
         },
     );
     cache.reserved_bytes = 32;
@@ -223,7 +224,11 @@ fn evict(path: &Path) {
     forget_local(path).unwrap();
 }
 fn assert_clean(archive: &Archive, directory: &Path) {
-    assert_eq!(lock_cache(archive).unwrap().reserved_bytes, 0);
+    {
+        let cache = lock_cache(archive).unwrap();
+        assert_eq!(cache.reserved_bytes, 0);
+        assert_eq!(cache.reserved_files, 0);
+    }
     assert!(std::fs::read_dir(directory).unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -330,6 +335,30 @@ async fn s3_materialization_parallel_singleflight_cancellation_and_authority() {
             .unwrap();
     let archive = select(root.path()).unwrap().unwrap();
     check_publication_stages(&archive, &state, root.path()).await;
+    let source = root.path().join("archive-publication-fixture");
+    let leased = read(source.clone(), CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap();
+    let group = accounting_identity(&source).unwrap().unwrap();
+    let draft = root.path().join("draft-index");
+    let frozen = root.path().join("frozen-index");
+    std::fs::create_dir(&draft).unwrap();
+    assert!(link_local(&source, &draft.join("member")).unwrap());
+    // Exercise the common Tantivy case where an intermediate staged file was
+    // deleted before the immutable generation directory is renamed.
+    let obsolete = draft.join("obsolete");
+    std::fs::write(&obsolete, []).unwrap();
+    with_write_budget(&obsolete, 0, || Ok(())).unwrap();
+    std::fs::remove_file(&obsolete).unwrap();
+    drop(leased);
+    evict(&source);
+    rename_local_tree(&draft, &frozen).unwrap();
+    let frozen_member = frozen.join("member");
+    assert_eq!(accounting_identity(&frozen_member).unwrap(), Some(group));
+    assert!(!lock_cache(&archive).unwrap().paths.contains_key(&obsolete));
+    evict(&frozen_member);
+    std::fs::remove_dir(&frozen).unwrap();
     let directory = root.path().join("materialization");
     std::fs::create_dir(&directory).unwrap();
     let paths = [directory.join("one"), directory.join("two")];
@@ -366,6 +395,8 @@ async fn s3_materialization_parallel_singleflight_cancellation_and_authority() {
     let (refused_write, retained_metadata) = {
         let mut cache = archive.cache.try_lock().unwrap();
         assert_eq!(cache.reserved_bytes, 8192);
+        assert_eq!(cache.reserved_files, 2);
+        cache.file_limit = cache.observed_slots(0).unwrap();
         let bytes = config.cache_max_bytes - cache.used_bytes - cache.reserved_bytes + 1;
         assert!(cache.used_bytes + bytes <= config.cache_max_bytes);
         // Make the existing working set non-evictable. Otherwise a one-byte
@@ -376,6 +407,13 @@ async fn s3_materialization_parallel_singleflight_cancellation_and_authority() {
     };
     let stage = root.path().join("writer-stage");
     std::fs::write(&stage, []).unwrap();
+    assert!(
+        with_write_budget(&stage, 0, || -> std::io::Result<()> {
+            panic!("reserved file slots were overbooked")
+        })
+        .is_err()
+    );
+    lock_cache(&archive).unwrap().file_limit = MAX_LOCAL_FILES;
     assert!(with_write_budget(&stage, refused_write, || Ok(())).is_err());
     drop(retained_metadata);
     state.gate.add_permits(2);
@@ -388,6 +426,17 @@ async fn s3_materialization_parallel_singleflight_cancellation_and_authority() {
         2
     );
     drop(leases);
+    assert_clean(&archive, &directory);
+    let empty = DownloadReservation::new(
+        &archive,
+        0,
+        &directory.join("empty"),
+        deadline(),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(lock_cache(&archive).unwrap().reserved_files, 1);
+    drop(empty);
     assert_clean(&archive, &directory);
 
     // Both callers reach the same path, but only one cold GET is performed.

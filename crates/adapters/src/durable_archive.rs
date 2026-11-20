@@ -369,8 +369,10 @@ type PhysicalIdentity = (u64, u64);
 type AccountingIdentities = BTreeMap<PathBuf, (PhysicalIdentity, PhysicalIdentity)>;
 const MAX_LOCAL_FILES: usize = 262_144;
 const MAX_LOCAL_ENTRIES: usize = 1_048_576;
+const CACHE_SCAN_RUNTIME: std::time::Duration = std::time::Duration::from_secs(30);
+const CACHE_ADMISSION_RUNTIME: std::time::Duration = std::time::Duration::from_secs(15);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Cache {
     root: Option<PathBuf>,
     files: BTreeMap<PathBuf, CacheEntry>,
@@ -381,7 +383,25 @@ struct Cache {
     // Full cold-download lengths are reserved before remote I/O. All ordinary
     // write admission includes these bytes until they become observed files.
     reserved_bytes: u64,
+    reserved_files: usize,
+    file_limit: usize,
     identities: AccountingIdentities,
+}
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            root: None,
+            files: BTreeMap::new(),
+            clock: 0,
+            paths: BTreeMap::new(),
+            objects: BTreeMap::new(),
+            used_bytes: 0,
+            reserved_bytes: 0,
+            reserved_files: 0,
+            file_limit: MAX_LOCAL_FILES,
+            identities: BTreeMap::new(),
+        }
+    }
 }
 #[derive(Debug)]
 struct LocalObject {
@@ -392,11 +412,56 @@ struct LocalObject {
 struct CacheEntry {
     pins: usize,
     touched: u64,
+    complete: bool,
 }
 fn mutable_git(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root).is_ok_and(|relative| relative.components().any(|part| matches!(part, Component::Normal(name) if name == "history.git" || name == "registry.git")))
 }
 impl Cache {
+    fn observed_slots(&self, additional: usize) -> Option<usize> {
+        self.paths
+            .len()
+            .checked_add(self.reserved_files)?
+            .checked_add(additional)
+    }
+
+    fn slots_fit(&self, additional: usize) -> bool {
+        self.observed_slots(additional)
+            .is_some_and(|count| count <= self.file_limit)
+    }
+
+    fn slot_capacity(&self, additional: usize, protected: Option<&[PathBuf]>) -> Error {
+        rejection_protected(
+            RejectionReason::TrackedFiles,
+            self.observed_slots(additional).map(|value| value as u64),
+            Some(self.file_limit as u64),
+            Some(self),
+            protected,
+        );
+        capacity()
+    }
+
+    fn slot_for(&self, path: &Path) -> usize {
+        usize::from(
+            !self.paths.contains_key(path)
+                && !self
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| mutable_git(root, path)),
+        )
+    }
+
+    fn mark_complete(&mut self, path: &Path) {
+        self.clock = self.clock.saturating_add(1);
+        let entry = self.files.entry(path.to_owned()).or_insert(CacheEntry {
+            pins: 0,
+            touched: self.clock,
+            complete: false,
+        });
+        entry.touched = self.clock;
+        entry.complete = true;
+    }
+
     fn private_physical_totals(&self, protected: &[PathBuf]) -> Option<(u64, u64)> {
         const MAX_PATHS: usize = 4096;
         if self.paths.len() > MAX_PATHS
@@ -421,7 +486,9 @@ impl Cache {
                 match self.files.get(path) {
                     Some(entry) => {
                         has_pin |= entry.pins > 0;
-                        all_evictable &= entry.pins == 0 && !protected.contains(path.as_path());
+                        all_evictable &= entry.complete
+                            && entry.pins == 0
+                            && !protected.contains(path.as_path());
                     }
                     None => all_evictable = false,
                 }
@@ -435,13 +502,19 @@ impl Cache {
         Some((pinned, evictable))
     }
 
-    fn scan(root: &Path) -> Result<Self> {
+    fn walk(
+        &mut self,
+        root: &Path,
+        deadline: Instant,
+        mut visit_file: impl FnMut(&mut Self, PathBuf) -> Result<()>,
+    ) -> Result<()> {
         fn visit(
             cache: &mut Cache,
             directory: &Path,
             depth: usize,
             entries: &mut usize,
             deadline: Instant,
+            visit_file: &mut impl FnMut(&mut Cache, PathBuf) -> Result<()>,
         ) -> Result<()> {
             if depth > 128 {
                 return Err(rejected(
@@ -493,67 +566,168 @@ impl Cache {
                     return Err(integrity());
                 }
                 if metadata.is_dir() {
-                    visit(cache, &path, depth + 1, entries, deadline)?;
+                    visit(cache, &path, depth + 1, entries, deadline, visit_file)?;
                 } else if metadata.is_file() {
-                    cache.observe(&path)?;
+                    visit_file(cache, path)?;
                 } else {
                     return Err(integrity());
                 }
             }
             Ok(())
         }
+        visit(self, root, 0, &mut 0, deadline, &mut visit_file)
+    }
+
+    #[cfg(test)]
+    fn scan(root: &Path) -> Result<Self> {
         let mut cache = Self {
             root: Some(root.to_owned()),
             ..Self::default()
         };
-        visit(
-            &mut cache,
-            root,
-            0,
-            &mut 0,
-            Instant::now() + std::time::Duration::from_secs(30),
-        )?;
+        cache.walk(root, Instant::now() + CACHE_SCAN_RUNTIME, |cache, path| {
+            cache.observe(&path)
+        })?;
         Ok(cache)
     }
-    async fn load(root: &Path, pool: &PgPool) -> Result<Self> {
-        let selected = root.to_owned();
-        let mut cache = tokio::task::spawn_blocking(move || Self::scan(&selected))
-            .await
-            .map_err(|_| unavailable())??;
-        let paths: Vec<_> = cache.paths.keys().cloned().collect();
-        for batch in paths.chunks(1000) {
-            let relative = batch
-                .iter()
-                .map(|path| {
-                    path.strip_prefix(root)
-                        .ok()
-                        .and_then(Path::to_str)
-                        .map(str::to_owned)
-                        .ok_or_else(integrity)
+    async fn load(archive: &Arc<Archive>, prune_committed: bool) -> Result<Self> {
+        const BATCH: usize = 1000;
+        let archive = archive.clone();
+        let root = archive.root.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let mut cache = Self {
+                root: Some(root.clone()),
+                ..Self::default()
+            };
+            let deadline = Instant::now() + CACHE_SCAN_RUNTIME;
+            let mut batch = Vec::with_capacity(BATCH);
+            let mut pruned = false;
+            let mut process_batch = |cache: &mut Self, batch: &mut Vec<PathBuf>| -> Result<()> {
+                let relative = batch
+                    .iter()
+                    .map(|path| path.strip_prefix(&root).ok().and_then(Path::to_str).ok_or_else(integrity))
+                    .collect::<Result<Vec<_>>>()?;
+                let completed = runtime.block_on(async {
+                    tokio::time::timeout_at(deadline.into(), async {
+                        if prune_committed {
+                            archive.fence_with(true).await?;
+                        }
+                        let (admitted, completed): (bool, Vec<String>) = sqlx_core::query_as::query_as(
+                            "SELECT admitted, ARRAY(SELECT path FROM devres_archive_file WHERE admitted AND complete AND path=ANY($1))
+                             FROM (SELECT NOT $2 OR EXISTS(SELECT 1 FROM devres_archive_control
+                                 WHERE singleton AND backend='s3' AND binding=$3 AND epoch=$4
+                                     AND pending_binding IS NULL AND NOT initializing_s3) AS admitted) authority",
+                        )
+                        .bind(&relative)
+                        .bind(prune_committed)
+                        .bind(&archive.binding)
+                        .bind(archive.epoch)
+                        .fetch_one(&archive.pool)
+                        .await
+                        .map_err(|_| unavailable())?;
+                        if !admitted {
+                            return Err(unavailable());
+                        }
+                        Ok(completed)
+                    })
+                    .await
                 })
-                .collect::<Result<Vec<_>>>()?;
-            let completed: Vec<String> = sqlx_core::query_scalar::query_scalar(
-                "SELECT path FROM devres_archive_file WHERE complete AND path=ANY($1)",
-            )
-            .bind(&relative)
-            .fetch_all(pool)
-            .await
-            .map_err(|_| unavailable())?;
-            for path in completed {
-                cache.clock = cache.clock.saturating_add(1);
-                cache.files.insert(
-                    root.join(path),
-                    CacheEntry {
-                        pins: 0,
-                        touched: cache.clock,
-                    },
-                );
+                .map_err(|_| rejected(RejectionReason::ScanDeadline, None, None, Some(cache)))??
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+                for (path, relative) in batch.iter().zip(relative) {
+                    if Instant::now() >= deadline {
+                        return Err(rejected(RejectionReason::ScanDeadline, None, None, Some(cache)));
+                    }
+                    pruned |= cache.load_path(path, completed.contains(relative), prune_committed)?;
+                }
+                batch.clear();
+                Ok(())
+            };
+            cache.walk(&root, deadline, |cache, path| {
+                batch.push(path);
+                if batch.len() == BATCH {
+                    process_batch(cache, &mut batch)?;
+                }
+                Ok(())
+            })?;
+            if !batch.is_empty() {
+                process_batch(&mut cache, &mut batch)?;
             }
-        }
-        Ok(cache)
+            if pruned {
+                // A directory iterator spanning unlink operations can miss a
+                // surviving entry. Verify coverage before using this cache.
+                let mut survivors = 0;
+                cache.walk(&root, deadline, |cache, path| {
+                    if !cache.paths.contains_key(&path) {
+                        return Err(integrity());
+                    }
+                    survivors += 1;
+                    Ok(())
+                })?;
+                if survivors != cache.paths.len() {
+                    return Err(integrity());
+                }
+            }
+            Ok(cache)
+        })
+        .await
+        .map_err(|_| unavailable())?
     }
+
+    fn load_path(&mut self, path: &Path, complete: bool, prune_committed: bool) -> Result<bool> {
+        let prune = prune_committed && !self.slots_fit(self.slot_for(path));
+        if prune {
+            // The caller verified active S3 identity and uses a separate cache.
+            // A path missing a complete DB binding is never pruned here.
+            if complete && !self.is_pinned(path) {
+                self.evict_regular_file(path)?;
+                return Ok(true);
+            }
+            let candidate = self
+                .files
+                .iter()
+                .find(|(_, entry)| entry.complete && entry.pins == 0)
+                .map(|(path, _)| path.clone())
+                .ok_or_else(|| self.slot_capacity(1, None))?;
+            self.evict_regular_file(&candidate)?;
+        }
+        self.observe(path)?;
+        if complete {
+            self.mark_complete(path);
+        }
+        Ok(prune)
+    }
+
+    fn evict_regular_file(&mut self, path: &Path) -> Result<()> {
+        if self.is_pinned(path)
+            || !self
+                .root
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root) && !mutable_git(root, path))
+        {
+            return Err(integrity());
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                match std::fs::remove_file(path) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(_) => return Err(unavailable()),
+                }
+            }
+            Ok(_) => return Err(integrity()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err(unavailable()),
+        }
+        self.detach(path)
+    }
+    fn is_pinned(&self, path: &Path) -> bool {
+        self.files.get(path).is_some_and(|entry| entry.pins > 0)
+    }
+
     fn detach(&mut self, path: &Path) -> Result<()> {
-        if self.files.get(path).is_some_and(|entry| entry.pins > 0) {
+        if self.is_pinned(path) {
             return Ok(());
         }
         if let Some(identity) = self.paths.remove(path) {
@@ -589,18 +763,14 @@ impl Cache {
         }
         let physical = (metadata.dev(), metadata.ino());
         if self.paths.get(path).is_some_and(|old| *old != physical) {
-            if self.files.get(path).is_some_and(|entry| entry.pins > 0) {
+            if self.is_pinned(path) {
                 return Err(integrity());
             }
             self.detach(path)?;
         }
-        if !self.paths.contains_key(path) && self.paths.len() >= MAX_LOCAL_FILES {
-            return Err(rejected(
-                RejectionReason::TrackedFiles,
-                Some(self.paths.len() as u64 + 1),
-                Some(MAX_LOCAL_FILES as u64),
-                Some(self),
-            ));
+        let additional = self.slot_for(path);
+        if !self.slots_fit(additional) {
+            return Err(self.slot_capacity(additional, None));
         }
         let previous = self.objects.get(&physical).map_or(0, |object| object.bytes);
         self.used_bytes = self
@@ -631,6 +801,29 @@ impl Cache {
             if !same {
                 self.detach(&alias)?;
             }
+        }
+        Ok(())
+    }
+
+    fn inherit_identity(&mut self, source: &Path, target: &Path) {
+        if let Some(accounting) = self.identities.get(source).copied()
+            && self.paths.get(target) == Some(&accounting.0)
+        {
+            self.identities.insert(target.to_owned(), accounting);
+        }
+    }
+
+    // The rename caller validates source membership and clears stale target
+    // entries before changing the filesystem. Moving an alias keeps one byte
+    // charge and its existing durable accounting identity.
+    fn retarget(&mut self, source: &Path, target: PathBuf) -> Result<()> {
+        let physical = self.paths.remove(source).ok_or_else(integrity)?;
+        let object = self.objects.get_mut(&physical).ok_or_else(integrity)?;
+        object.paths.remove(source);
+        object.paths.insert(target.clone());
+        self.paths.insert(target.clone(), physical);
+        if let Some(accounting) = self.identities.remove(source) {
+            self.identities.insert(target, accounting);
         }
         Ok(())
     }
@@ -671,8 +864,9 @@ fn admit_local(
         cache,
         extra,
         limit,
+        0,
         protected,
-        Instant::now() + std::time::Duration::from_secs(15),
+        Instant::now() + CACHE_ADMISSION_RUNTIME,
     )
 }
 fn admit_local_until(
@@ -680,6 +874,7 @@ fn admit_local_until(
     cache: &mut Cache,
     extra: u64,
     limit: u64,
+    additional_paths: usize,
     protected: &[PathBuf],
     deadline: Instant,
 ) -> Result<()> {
@@ -699,19 +894,35 @@ fn admit_local_until(
             })
             .map_err(|_| unavailable())
     };
-    if fits(cache) && has_space(cache)? {
+    let slots_fit = |cache: &Cache| cache.slots_fit(additional_paths);
+    let slot_pressure = !slots_fit(cache);
+    if !slot_pressure && fits(cache) && has_space(cache)? {
         return Ok(());
     }
     cache.reconcile(deadline)?;
+    // One bounded reclamation sweep should admit many small new files. A
+    // protected working set may leave room only for the current admission.
+    let headroom = if slot_pressure {
+        (cache.file_limit / 16).min(4096)
+    } else {
+        0
+    };
+    let roomy = |cache: &Cache| cache.slots_fit(additional_paths.saturating_add(headroom));
+    if roomy(cache) && fits(cache) && has_space(cache)? {
+        return Ok(());
+    }
     let mut candidates: Vec<_> = cache
         .files
         .iter()
-        .filter(|(path, entry)| entry.pins == 0 && !protected.contains(path))
+        .filter(|(path, entry)| entry.complete && entry.pins == 0 && !protected.contains(path))
         .map(|(path, entry)| (entry.touched, path.clone()))
         .collect();
     candidates.sort_unstable();
     for (_, path) in candidates {
         if Instant::now() >= deadline {
+            if slots_fit(cache) && fits(cache) && has_space(cache)? {
+                return Ok(());
+            }
             rejection_protected(
                 RejectionReason::EvictionDeadline,
                 None,
@@ -721,17 +932,14 @@ fn admit_local_until(
             );
             return Err(capacity());
         }
-        if fits(cache) && has_space(cache)? {
+        if roomy(cache) && fits(cache) && has_space(cache)? {
             return Ok(());
         }
-        match std::fs::remove_file(&path) {
-            Ok(()) => (),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(_) => return Err(unavailable()),
-        }
-        cache.detach(&path)?;
+        cache.evict_regular_file(&path)?;
     }
-    if fits(cache) && has_space(cache)? {
+    if !slots_fit(cache) {
+        Err(cache.slot_capacity(additional_paths, Some(protected)))
+    } else if fits(cache) && has_space(cache)? {
         Ok(())
     } else if !fits(cache) {
         rejection_protected(
@@ -891,6 +1099,7 @@ mod cache_budget_tests {
             CacheEntry {
                 pins: 1,
                 touched: 0,
+                complete: true,
             },
         );
         cache.files.insert(
@@ -898,6 +1107,7 @@ mod cache_budget_tests {
             CacheEntry {
                 pins: 0,
                 touched: 1,
+                complete: true,
             },
         );
         admit_local(root.path(), &mut cache, 128, 256, &[]).unwrap();
@@ -906,6 +1116,90 @@ mod cache_budget_tests {
         assert_eq!(cache.used_bytes, 128);
         assert!(admit_local(root.path(), &mut cache, 129, 256, &[]).is_err());
         assert!(pinned.is_file());
+    }
+
+    #[test]
+    fn path_pressure_reconciles_missing_stages_and_evicts_only_eligible_paths() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let [pending, stale, protected, pinned, completed, new] = [
+            "pending",
+            "stale-stage",
+            "protected",
+            "pinned",
+            "completed",
+            "new",
+        ]
+        .map(|name| root.path().join(name));
+        for path in [&pending, &stale, &protected, &pinned, &completed] {
+            std::fs::write(path, [1; 16]).unwrap();
+        }
+        let mut cache = Cache::scan(root.path()).unwrap();
+        cache.file_limit = 5;
+        for path in [&protected, &pinned, &completed] {
+            cache.mark_complete(path);
+        }
+        cache.files.get_mut(&pinned).unwrap().pins = 1;
+        let protect = [protected.clone()];
+        let admit = |cache: &mut Cache| {
+            admit_local_until(
+                root.path(),
+                cache,
+                0,
+                1024,
+                1,
+                &protect,
+                Instant::now() + CACHE_ADMISSION_RUNTIME,
+            )
+        };
+        std::fs::remove_file(&stale).unwrap();
+        admit(&mut cache).unwrap();
+        assert!(completed.exists());
+        std::fs::hard_link(&pending, &new).unwrap();
+        cache.observe(&new).unwrap();
+        assert_eq!(cache.paths.len(), 5);
+        assert_eq!(cache.used_bytes, 64);
+        admit(&mut cache).unwrap();
+        assert!(!completed.exists());
+        assert!(
+            [pending, protected, pinned, new]
+                .iter()
+                .all(|path| path.exists())
+        );
+        assert_eq!(cache.used_bytes, 48);
+    }
+
+    #[test]
+    fn startup_overflow_only_prunes_complete_bindings_in_an_active_cache() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let [completed, pending, unmanaged, excess] =
+            ["complete", "pending", "unmanaged", "excess"].map(|name| root.path().join(name));
+        for path in [&completed, &pending, &unmanaged, &excess] {
+            std::fs::write(path, [1]).unwrap();
+        }
+        let mut cache = Cache {
+            root: Some(root.path().to_owned()),
+            file_limit: 2,
+            ..Cache::default()
+        };
+        cache.load_path(&completed, true, false).unwrap();
+        cache.load_path(&pending, false, false).unwrap();
+        assert_eq!(
+            cache.load_path(&unmanaged, false, false).unwrap_err().code,
+            "capacity"
+        );
+        assert!(completed.exists());
+        cache.load_path(&unmanaged, false, true).unwrap();
+        assert!(!completed.exists());
+        assert_eq!(
+            cache.load_path(&excess, false, true).unwrap_err().code,
+            "capacity"
+        );
+        assert!(excess.exists());
+        cache.load_path(&excess, true, true).unwrap();
+        assert!(!excess.exists());
+        assert_eq!(cache.paths.len(), 2);
+        assert!(pending.exists());
+        assert!(unmanaged.exists());
     }
 }
 
@@ -1163,7 +1457,7 @@ async fn stage_async<T>(name: &'static str, future: impl Future<Output = Result<
 }
 struct DownloadReservation {
     archive: Arc<Archive>,
-    bytes: u64,
+    bytes: Option<u64>,
 }
 impl DownloadReservation {
     fn new(
@@ -1179,10 +1473,11 @@ impl DownloadReservation {
             &mut cache,
             bytes,
             archive.remote.config().cache_max_bytes,
+            1,
             &[path.to_owned()],
             deadline,
         )?;
-        cache.reserved_bytes = cache.reserved_bytes.checked_add(bytes).ok_or_else(|| {
+        let reserved_bytes = cache.reserved_bytes.checked_add(bytes).ok_or_else(|| {
             rejected(
                 RejectionReason::AccountingOverflow,
                 None,
@@ -1190,26 +1485,34 @@ impl DownloadReservation {
                 Some(&cache),
             )
         })?;
+        let reserved_files = cache.reserved_files.checked_add(1).ok_or_else(integrity)?;
+        cache.reserved_bytes = reserved_bytes;
+        cache.reserved_files = reserved_files;
         Ok(Self {
             archive: archive.clone(),
-            bytes,
+            bytes: Some(bytes),
         })
     }
     fn commit(&mut self, cache: &mut Cache) -> Result<()> {
-        cache.reserved_bytes = cache
+        let bytes = self.bytes.ok_or_else(integrity)?;
+        let reserved_bytes = cache
             .reserved_bytes
-            .checked_sub(self.bytes)
+            .checked_sub(bytes)
             .ok_or_else(integrity)?;
-        self.bytes = 0;
+        let reserved_files = cache.reserved_files.checked_sub(1).ok_or_else(integrity)?;
+        cache.reserved_bytes = reserved_bytes;
+        cache.reserved_files = reserved_files;
+        self.bytes = None;
         Ok(())
     }
 }
 impl Drop for DownloadReservation {
     fn drop(&mut self) {
-        if self.bytes > 0
+        if let Some(bytes) = self.bytes
             && let Ok(mut cache) = lock_cache(&self.archive)
         {
-            cache.reserved_bytes = cache.reserved_bytes.saturating_sub(self.bytes);
+            cache.reserved_bytes = cache.reserved_bytes.saturating_sub(bytes);
+            cache.reserved_files = cache.reserved_files.saturating_sub(1);
         }
     }
 }
@@ -1227,6 +1530,9 @@ impl Drop for Lease {
             for path in &self.paths {
                 if let Some(entry) = cache.files.get_mut(path) {
                     entry.pins = entry.pins.saturating_sub(1);
+                    if entry.pins == 0 && !entry.complete {
+                        cache.files.remove(path);
+                    }
                 }
             }
         }
@@ -1234,15 +1540,30 @@ impl Drop for Lease {
 }
 impl ArchiveLease {
     fn pin(archive: &Arc<Archive>, cache: &mut Cache, paths: Vec<PathBuf>) -> Self {
+        Self::pin_paths(archive, cache, paths, true)
+    }
+
+    fn protect(archive: &Arc<Archive>, cache: &mut Cache, paths: Vec<PathBuf>) -> Self {
+        Self::pin_paths(archive, cache, paths, false)
+    }
+
+    fn pin_paths(
+        archive: &Arc<Archive>,
+        cache: &mut Cache,
+        paths: Vec<PathBuf>,
+        complete: bool,
+    ) -> Self {
         for path in &paths {
             cache.clock = cache.clock.saturating_add(1);
             let clock = cache.clock;
             let entry = cache.files.entry(path.clone()).or_insert(CacheEntry {
                 pins: 0,
                 touched: clock,
+                complete: false,
             });
             entry.pins += 1;
             entry.touched = clock;
+            entry.complete |= complete;
         }
         Self(Some(Arc::new(Lease {
             archive: archive.clone(),
@@ -1289,8 +1610,6 @@ impl Archive {
                 "Reader requires a separate disposable cache.",
             ));
         }
-        let mut cache = Cache::load(&root, &pool).await?;
-        admit_local(&root, &mut cache, 0, remote.config().cache_max_bytes, &[])?;
         let archive = Arc::new(Self {
             root,
             remote,
@@ -1301,10 +1620,11 @@ impl Archive {
             owner_pid,
             owner_started,
             binding,
-            cache: Mutex::new(cache),
+            cache: Mutex::new(Cache::default()),
             materializations: MaterializationControl::default(),
         });
         archive.health().await?;
+        archive.load_cache(true).await?;
         registry()
             .lock()
             .map_err(|_| unavailable())?
@@ -1401,17 +1721,6 @@ impl Archive {
             )
             .await?;
         remote.health().await?;
-        let mut cache = if transfer && backend == "filesystem" {
-            Cache {
-                root: Some(root.clone()),
-                ..Cache::default()
-            }
-        } else {
-            Cache::load(&root, &pool).await?
-        };
-        if !transfer || backend == "s3" {
-            admit_local(&root, &mut cache, 0, remote.config().cache_max_bytes, &[])?;
-        }
         let archive = Arc::new(Self {
             root,
             remote,
@@ -1422,9 +1731,12 @@ impl Archive {
             owner_pid,
             owner_started,
             binding,
-            cache: Mutex::new(cache),
+            cache: Mutex::new(Cache::default()),
             materializations: MaterializationControl::default(),
         });
+        if !transfer || backend == "s3" {
+            archive.load_cache(committed).await?;
+        }
         archive.recover_pending().await?;
         if !transfer && backend == "filesystem" {
             archive.activate().await?;
@@ -1437,10 +1749,27 @@ impl Archive {
         }
         Ok(archive)
     }
+    async fn load_cache(self: &Arc<Self>, prune_committed: bool) -> Result<()> {
+        let mut cache = Cache::load(self, prune_committed).await?;
+        admit_local(
+            &self.root,
+            &mut cache,
+            0,
+            self.remote.config().cache_max_bytes,
+            &[],
+        )?;
+        *lock_cache(self)? = cache;
+        Ok(())
+    }
+
     async fn fence(&self) -> Result<()> {
+        self.fence_with(self.reader).await
+    }
+
+    async fn fence_with(&self, require_committed_s3: bool) -> Result<()> {
         let _owner = self.owner.upgrade().ok_or_else(unavailable)?;
         let owned:bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=1835365490 AND l.objid::bigint=$3 AND l.objsubid=2 AND l.granted AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid=$1 AND EXTRACT(EPOCH FROM a.backend_start)::text=$2)").bind(self.owner_pid).bind(&self.owner_started).bind(if self.reader { 2_i64 } else { 1_i64 }).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
-        let matches:bool=sqlx_core::query_scalar::query_scalar("SELECT epoch=$1 AND COALESCE(binding,pending_binding)=$2 AND (NOT $3 OR (backend='s3' AND pending_binding IS NULL AND NOT initializing_s3)) FROM devres_archive_control WHERE singleton").bind(self.epoch).bind(&self.binding).bind(self.reader).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
+        let matches:bool=sqlx_core::query_scalar::query_scalar("SELECT epoch=$1 AND COALESCE(binding,pending_binding)=$2 AND (NOT $3 OR (backend='s3' AND pending_binding IS NULL AND NOT initializing_s3)) FROM devres_archive_control WHERE singleton").bind(self.epoch).bind(&self.binding).bind(require_committed_s3).fetch_one(&self.pool).await.map_err(|_|unavailable())?;
         if !owned || !matches {
             return Err(Error::unavailable(
                 "Storage ownership lost; restart required",
@@ -1668,13 +1997,21 @@ impl Archive {
         })
         .await
     }
-    fn admit(&self, cache: &mut Cache, extra: u64, protected: &[PathBuf]) -> Result<()> {
-        admit_local(
+    fn admit(
+        &self,
+        cache: &mut Cache,
+        extra: u64,
+        additional_paths: usize,
+        protected: &[PathBuf],
+    ) -> Result<()> {
+        admit_local_until(
             &self.root,
             cache,
             extra,
             self.remote.config().cache_max_bytes,
+            additional_paths,
             protected,
+            Instant::now() + CACHE_ADMISSION_RUNTIME,
         )
     }
     fn materialize(
@@ -1742,12 +2079,27 @@ impl Archive {
                     {
                         return Err(integrity());
                     }
+                    let additional_paths = cache.slot_for(path);
+                    if additional_paths > 0 {
+                        admit_local_until(
+                            &self.root,
+                            &mut cache,
+                            0,
+                            self.remote.config().cache_max_bytes,
+                            additional_paths,
+                            &[path.to_owned()],
+                            deadline,
+                        )?;
+                    }
                     cache.observe(path)?;
                     // Pin before releasing the mutex for hashing: unrelated
                     // downloads and ordinary writers may concurrently evict.
                     Some(ArchiveLease::pin(self, &mut cache, vec![path.to_owned()]))
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    cache.detach(path)?;
+                    None
+                }
                 Err(_) => return Err(unavailable()),
             }
         };
@@ -1791,16 +2143,17 @@ impl Archive {
             // Publish only our verified stage. A surprising local file must
             // never be overwritten, even if another writer created it.
             std::fs::hard_link(&payload, path).map_err(|_| unavailable())?;
+            reservation.commit(&mut cache)?;
             if let Err(error) = cache.observe(path) {
                 let _ = std::fs::remove_file(path);
                 return Err(error);
             }
-            reservation.commit(&mut cache)?;
             admit_local_until(
                 &self.root,
                 &mut cache,
                 0,
                 self.remote.config().cache_max_bytes,
+                0,
                 &[path.to_owned()],
                 deadline,
             )?;
@@ -2118,59 +2471,171 @@ pub(crate) fn publish_file(path: &Path, digest: &str, bytes: u64) -> Result<()> 
     let Some(archive) = select(path)? else {
         return Ok(());
     };
-    stage("publish_pre_cache", || {
+    let _publication = stage("publish_pre_cache", || {
         let mut cache = lock_cache(&archive)?;
+        let additional_paths = cache.slot_for(path);
+        let paths = vec![path.to_owned()];
+        archive.admit(&mut cache, 0, additional_paths, &paths)?;
         cache.observe(path)?;
-        archive.admit(&mut cache, 0, &[path.to_owned()])
+        archive.admit(&mut cache, 0, 0, &paths)?;
+        Ok(ArchiveLease::protect(&archive, &mut cache, paths))
     })?;
     run(archive.publish_one(path, digest, bytes))?;
     stage("publish_post_cache", || {
         let mut cache = lock_cache(&archive)?;
-        cache.clock = cache.clock.saturating_add(1);
-        let touched = cache.clock;
-        cache
-            .files
-            .entry(path.to_owned())
-            .or_insert(CacheEntry { pins: 0, touched });
         cache.observe(path)?;
-        archive.admit(&mut cache, 0, &[path.to_owned()])
+        cache.mark_complete(path);
+        archive.admit(&mut cache, 0, 0, &[path.to_owned()])
     })
 }
+
+/// Protect an active publication, including a destination it has yet to create.
+/// Protection alone never makes a path eligible for eviction.
+pub(crate) fn protect_local(path: &Path) -> Result<ArchiveLease> {
+    let Some(archive) = select(path)? else {
+        return Ok(ArchiveLease::default());
+    };
+    let mut cache = lock_cache(&archive)?;
+    if std::fs::symlink_metadata(path)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        cache.detach(path)?;
+    }
+    Ok(ArchiveLease::protect(
+        &archive,
+        &mut cache,
+        vec![path.to_owned()],
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_file_limit(path: &Path, limit: usize) -> Result<()> {
+    let archive = select(path)?.ok_or_else(unavailable)?;
+    let mut cache = lock_cache(&archive)?;
+    if limit == 0 || cache.observed_slots(0).is_none_or(|slots| slots > limit) {
+        return Err(integrity());
+    }
+    cache.file_limit = limit;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn test_cache_resident_paths(path: &Path) -> Result<usize> {
+    let archive = select(path)?.ok_or_else(unavailable)?;
+    Ok(lock_cache(&archive)?.paths.len())
+}
+
 pub fn admit_write(path: &Path, bytes: u64) -> Result<()> {
     if let Some(archive) = select(path)? {
         run(archive.health())?;
         let mut cache = lock_cache(&archive)?;
-        archive.admit(&mut cache, bytes, &[path.to_owned()])?;
+        archive.admit(&mut cache, bytes, 0, &[path.to_owned()])?;
     }
     Ok(())
 }
-/// Register a just-created local immutable alias before its source stage disappears.
-pub fn observe_local(path: &Path) -> Result<()> {
-    if let Some(archive) = select(path)? {
-        let mut cache = lock_cache(&archive)?;
-        cache.observe(path)?;
-        archive.admit(&mut cache, 0, &[path.to_owned()])?;
+/// Reserve a path and install an immutable alias without replacing a destination.
+pub(crate) fn link_local(source: &Path, target: &Path) -> Result<bool> {
+    let link = || match std::fs::hard_link(source, target) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => Err(unavailable()),
+    };
+    let Some(archive) = select(target)? else {
+        return link();
+    };
+    let mut cache = lock_cache(&archive)?;
+    // A collision needs no additional slot, even if that file is the reason
+    // another publisher currently owns the last one.
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return Err(unavailable()),
     }
-    Ok(())
+    let source_metadata = std::fs::symlink_metadata(source).map_err(|_| unavailable())?;
+    if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
+        return Err(integrity());
+    }
+    let physical = (source_metadata.dev(), source_metadata.ino());
+    let accounted = cache
+        .paths
+        .get(source)
+        .filter(|identity| **identity == physical)
+        .and_then(|identity| cache.objects.get(identity))
+        .map_or(0, |object| object.bytes);
+    let extra = source_metadata.len().saturating_sub(accounted);
+    let additional_paths = cache.slot_for(target);
+    archive.admit(
+        &mut cache,
+        extra,
+        additional_paths,
+        &[source.to_owned(), target.to_owned()],
+    )?;
+    if link()? {
+        if let Err(error) = cache.observe(target) {
+            let _ = std::fs::remove_file(target);
+            return Err(error);
+        }
+        cache.inherit_identity(source, target);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
-/// Retarget tracked members after an owned staging directory is atomically renamed.
-pub fn relocate_local_tree(from: &Path, to: &Path) -> Result<()> {
-    if let Some(archive) = select(from)? {
-        if !to.starts_with(&archive.root) {
+
+/// Atomically rename an owned staging tree and replace its tracked paths.
+pub(crate) fn rename_local_tree(from: &Path, to: &Path) -> Result<()> {
+    let rename = || std::fs::rename(from, to).map_err(|_| unavailable());
+    let Some(archive) = select(from)? else {
+        return rename();
+    };
+    archive.relative(to)?;
+    if to.starts_with(from) || from.starts_with(to) {
+        return Err(integrity());
+    }
+    let mut cache = lock_cache(&archive)?;
+    let remaps = cache
+        .paths
+        .keys()
+        .filter_map(|path| {
+            path.strip_prefix(from)
+                .ok()
+                .map(|suffix| (path.clone(), to.join(suffix)))
+        })
+        .collect::<Vec<_>>();
+    let mut live = Vec::with_capacity(remaps.len());
+    for (source, target) in remaps {
+        if cache
+            .files
+            .get(&source)
+            .is_some_and(|entry| entry.complete || entry.pins > 0)
+            || cache.is_pinned(&target)
+        {
             return Err(integrity());
         }
-        let mut cache = lock_cache(&archive)?;
-        let members: Vec<_> = cache
-            .paths
-            .keys()
-            .filter(|path| path.starts_with(from))
-            .cloned()
-            .collect();
-        for old in members {
-            let target = to.join(old.strip_prefix(from).map_err(|_| integrity())?);
-            cache.observe(&target)?;
-            cache.detach(&old)?;
+        match std::fs::symlink_metadata(&source) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                cache.observe(&source)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                cache.detach(&source)?;
+                continue;
+            }
+            Ok(_) => return Err(integrity()),
+            Err(_) => return Err(unavailable()),
         }
+        if cache.paths.contains_key(&target) {
+            match std::fs::symlink_metadata(&target) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    cache.detach(&target)?
+                }
+                _ => return Err(integrity()),
+            }
+        }
+        live.push((source, target));
+    }
+    rename()?;
+    for (source, target) in live {
+        cache.retarget(&source, target)?;
     }
     Ok(())
 }
@@ -2180,7 +2645,11 @@ pub fn forget_local(path: &Path) -> Result<()> {
         let mut cache = lock_cache(&archive)?;
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => cache.detach(path)?,
-            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => cache.observe(path)?,
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                let additional_paths = cache.slot_for(path);
+                archive.admit(&mut cache, 0, additional_paths, &[path.to_owned()])?;
+                cache.observe(path)?;
+            }
             Ok(_) => return Err(integrity()),
             Err(_) => return Err(unavailable()),
         }
@@ -2198,16 +2667,9 @@ pub fn with_write_budget<T>(
             return write();
         }
         let mut cache = lock_cache(&archive).map_err(mapped)?;
-        if !cache.paths.contains_key(path) && cache.paths.len() >= MAX_LOCAL_FILES {
-            return Err(mapped(rejected(
-                RejectionReason::TrackedFiles,
-                Some(cache.paths.len() as u64 + 1),
-                Some(MAX_LOCAL_FILES as u64),
-                Some(&cache),
-            )));
-        }
+        let additional_paths = cache.slot_for(path);
         archive
-            .admit(&mut cache, bytes, &[path.to_owned()])
+            .admit(&mut cache, bytes, additional_paths, &[path.to_owned()])
             .map_err(mapped)?;
         let result = write();
         // Failed writes may have persisted a prefix. Charge actual bytes even

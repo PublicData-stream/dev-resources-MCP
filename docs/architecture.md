@@ -513,8 +513,11 @@ still exists. Eviction never releases permanent quota.
 
 Parsers and Tantivy read fully verified local files through leases. Active readers
 pin their members; writable staging directories use separate budgeted handles.
-The cache is disposable and bounded, and a fresh cache can reconstruct historical
-reads from PostgreSQL and S3. Current/supplied package contents remain inert.
+Byte and path admission share eviction of completed, unleased local copies.
+Cold materialization reserves both before remote transfer. Starting with an
+over-cap cache can reclaim completed local copies in bounded batches once the
+S3 backend has been activated. A fresh cache can reconstruct historical reads
+from PostgreSQL and S3. Current/supplied package contents remain inert.
 No inspected package code, caller lockfile, inventory or audit report enters S3.
 
 Offline transfer verifies the filesystem closure, freezes the exact inventory,
