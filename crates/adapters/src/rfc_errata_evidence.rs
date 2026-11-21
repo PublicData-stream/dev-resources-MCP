@@ -108,6 +108,25 @@ fn valid_date(value: &str) -> bool {
     y >= 1969 && (1..=12).contains(&m) && d > 0 && d <= days[m - 1]
 }
 
+pub(crate) fn selected_member(
+    export: &[u8],
+    errata_id: u64,
+    rfc: u64,
+    check: impl Fn() -> Result<()>,
+) -> Result<(serde_json::Value, String)> {
+    let (record, member_body) =
+        crate::rfc::source::select_errata_members(export, &BTreeSet::from([errata_id]), check)?
+            .remove(&errata_id)
+            .ok_or_else(invalid)?;
+    let expected_doc = format!("RFC{rfc:05}");
+    let expected_short = format!("RFC{rfc}");
+    if !matches!(record["doc-id"].as_str(), Some(id) if id == expected_doc || id == expected_short)
+    {
+        return Err(invalid());
+    }
+    Ok((record, member_body))
+}
+
 /// Files in the private bundle are named by their bare BLAKE3 digest. No URL is fetched.
 pub fn verify_errata_evidence(
     bundle: &Path,
@@ -149,30 +168,14 @@ pub fn verify_errata_evidence(
     if integrity::hash(&export) != manifest.export_body {
         return Err(invalid());
     }
-    let records = crate::rfc::source::parse_errata(&export)?;
-    let raws: Vec<&serde_json::value::RawValue> =
-        serde_json::from_slice(&export).map_err(|_| invalid())?;
-    let selected = records
-        .iter()
-        .zip(raws)
-        .find(|(record, _)| {
-            record["errata_id"]
-                .as_u64()
-                .or_else(|| record["errata_id"].as_str()?.parse().ok())
-                == Some(manifest.errata_id)
-        })
-        .ok_or_else(invalid)?;
-    if integrity::hash(selected.1.get().as_bytes()) != manifest.member_body {
-        return Err(invalid());
-    }
-    let expected_doc = format!("RFC{:05}", manifest.rfc);
-    let expected_short = format!("RFC{}", manifest.rfc);
-    if !matches!(selected.0["doc-id"].as_str(),Some(s) if s==expected_doc || s==expected_short) {
+    let (selected, member_body) =
+        selected_member(&export, manifest.errata_id, manifest.rfc, check)?;
+    if member_body != manifest.member_body {
         return Err(invalid());
     }
     let mut missing = Vec::new();
     match manifest.report_date.as_deref() {
-        Some(date) if valid_date(date) && selected.0["submit_date"].as_str() == Some(date) => {}
+        Some(date) if valid_date(date) && selected["submit_date"].as_str() == Some(date) => {}
         Some(_) => return Err(invalid()),
         None => missing.push("report_date"),
     }
@@ -185,7 +188,7 @@ pub fn verify_errata_evidence(
         Some(name)
             if !name.trim().is_empty()
                 && name.len() <= 4096
-                && selected.0["submitter_name"].as_str() == Some(name) => {}
+                && selected["submitter_name"].as_str() == Some(name) => {}
         Some(_) => return Err(invalid()),
         None => missing.push("contributor"),
     }

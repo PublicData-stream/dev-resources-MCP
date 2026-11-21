@@ -45,6 +45,12 @@ async fn main() -> Result<(), ServerError> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args
         .first()
+        .is_some_and(|command| command == "inspect-rfc-errata-capture")
+    {
+        return errata_evidence_cli::inspect_capture(&args).await;
+    }
+    if args
+        .first()
         .is_some_and(|command| command == "verify-rfc-errata-evidence")
     {
         let arguments = errata_evidence_cli::parse(&args)?;

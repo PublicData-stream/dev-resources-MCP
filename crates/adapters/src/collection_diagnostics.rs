@@ -274,6 +274,25 @@ impl Reader {
         options: &DiagnosisOptions,
         cancel: CancellationToken,
     ) -> Result<(Self, i32)> {
+        Self::open_bounded(
+            database,
+            root,
+            s3,
+            options.max_total_bytes,
+            Duration::from_secs(options.timeout_secs),
+            cancel,
+        )
+        .await
+    }
+
+    async fn open_bounded(
+        database: &str,
+        root: &Path,
+        s3: Option<S3Config>,
+        max_bytes: u64,
+        limit: Duration,
+        cancel: CancellationToken,
+    ) -> Result<(Self, i32)> {
         let mut conn =
             tokio::time::timeout(Duration::from_secs(5), PgConnection::connect(database))
                 .await
@@ -307,9 +326,9 @@ impl Reader {
             return Err(failed());
         }
         let mut budget = Budget {
-            remaining: options.max_total_bytes,
+            remaining: max_bytes,
             read: 0,
-            deadline: Instant::now() + Duration::from_secs(options.timeout_secs),
+            deadline: Instant::now() + limit,
             cancel,
         };
         let remote = match s3 {
@@ -479,6 +498,15 @@ impl Reader {
         Ok(bytes)
     }
     async fn file(&mut self, relative: &str, max: u64) -> Result<Vec<u8>> {
+        self.bound_file(relative, max, None).await
+    }
+
+    async fn bound_file(
+        &mut self,
+        relative: &str,
+        max: u64,
+        expected_digest: Option<&str>,
+    ) -> Result<Vec<u8>> {
         checked_relative(relative)?;
         if let Some(remote) = &self.remote {
             self.budget.admit(16 * 1024)?;
@@ -494,6 +522,7 @@ impl Reader {
                 || binding.bytes != u64::try_from(bytes).map_err(|_| failed())?
                 || !digest.starts_with("blake3:")
                 || !integrity::valid_hash(&digest)
+                || expected_digest.is_some_and(|expected| digest != expected)
                 || binding.bytes > max
             {
                 return Err(failed());
@@ -528,7 +557,14 @@ impl Reader {
                 return Err(failed());
             }
             self.budget.admit(metadata.len())?;
-            read_local(&path, max, &self.budget)
+            let bytes = read_local(&path, metadata.len(), &self.budget)?;
+            if bytes.len() as u64 != metadata.len() {
+                return Err(failed());
+            }
+            if let Some(expected) = expected_digest {
+                integrity::verify(expected, &bytes)?;
+            }
+            Ok(bytes)
         }
     }
 }
@@ -912,6 +948,9 @@ pub async fn diagnose_collection(
 
 #[path = "rfc/diagnostics.rs"]
 mod rfc_diagnostics;
+pub use rfc_diagnostics::{
+    RfcErrataCaptureReport, RfcErrataCaptureSelection, inspect_rfc_errata_capture,
+};
 use rfc_diagnostics::{inspect_rfc, rfc_job_identity};
 
 #[path = "mdn/diagnostics.rs"]

@@ -7,6 +7,140 @@ const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
 const MAX_FILES: usize = 10_000;
 const MAX_INDEX: u64 = 32 * 1024 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug)]
+pub struct RfcErrataCaptureSelection<'a> {
+    pub snapshot: Option<&'a str>,
+    pub export_capture: &'a str,
+    pub export_body: &'a str,
+    pub rfc: u32,
+    pub errata_id: u64,
+}
+
+impl RfcErrataCaptureSelection<'_> {
+    pub fn validate(&self) -> Result<()> {
+        if ![self.export_capture, self.export_body]
+            .into_iter()
+            .all(|id| id.starts_with("blake3:") && integrity::valid_hash(id))
+            || self.snapshot.is_some_and(|id| !integrity::valid_hash(id))
+            || !(1..=99_999).contains(&self.rfc)
+            || self.errata_id == 0
+        {
+            return Err(Error::invalid("Invalid RFC errata capture selection."));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RfcErrataCaptureReport {
+    pub version: u32,
+    pub snapshot: String,
+    pub export_capture: String,
+    pub export_body: String,
+    pub member_body: String,
+    pub rfc: u32,
+    pub errata_id: u64,
+    pub captured_at: i64,
+    pub export_bytes: u64,
+    pub archive_backend: &'static str,
+    pub archive_binding_checked: bool,
+    pub applicability_approved: bool,
+    pub publication_authorized: bool,
+}
+
+/// Return an exact retained export separately from its sanitized evidence report.
+/// With no pin, select the highest-ranked snapshot that binds the requested capture.
+pub async fn inspect_rfc_errata_capture(
+    database: &str,
+    root: &Path,
+    s3: Option<S3Config>,
+    selection: RfcErrataCaptureSelection<'_>,
+    cancel: CancellationToken,
+) -> Result<(RfcErrataCaptureReport, Vec<u8>)> {
+    selection.validate()?;
+    let limit = Duration::from_secs(300);
+    let stopping = cancel.child_token();
+    let _cancel_on_drop = stopping.drop_guard_ref();
+    let work = async {
+        let (mut reader, _) =
+            Reader::open_bounded(database, root, s3, MAX_BYTES, limit, stopping.clone()).await?;
+        let id = match selection.snapshot {
+            Some(id) => id.to_owned(),
+            None => sqlx_core::query_scalar::query_scalar("SELECT id FROM devres_rfc_snapshots WHERE errata_capture=$1 ORDER BY complete DESC,published_order DESC LIMIT 1")
+                .bind(selection.export_capture).fetch_optional(&mut reader.conn).await.map_err(|_| unavailable())?
+                .ok_or_else(unavailable)?,
+        };
+        let (snapshot, _) = sealed_snapshot(&mut reader, &id).await?;
+        if snapshot.errata_capture.as_deref() != Some(selection.export_capture) {
+            return Err(failed());
+        }
+        let capture = sealed_capture(&mut reader, selection.export_capture).await?;
+        if capture.key != "rfc:errata"
+            || capture.source_url != crate::rfc::corpus::ERRATA_URL
+            || capture.media_type != "application/json"
+            || capture.body_hash != selection.export_body
+        {
+            return Err(failed());
+        }
+        let relative = integrity::relative_path(&capture.body_hash)?;
+        let archive_backend = if reader.remote.is_some() {
+            "s3"
+        } else {
+            "filesystem"
+        };
+        let export = reader
+            .bound_file(
+                relative.to_str().ok_or_else(failed)?,
+                MAX_BYTES,
+                Some(&capture.body_hash),
+            )
+            .await?;
+        let budget = reader.budget;
+        sqlx_core::raw_sql::raw_sql("ROLLBACK")
+            .execute(&mut reader.conn)
+            .await
+            .map_err(|_| unavailable())?;
+        drop(reader.conn);
+        // Keep CPU admission off the async executor and preserve the parser's own deadline.
+        let rfc = selection.rfc;
+        let errata_id = selection.errata_id;
+        let (export, member_body) = tokio::task::spawn_blocking(move || {
+            let (_, member_body) = crate::rfc_errata_evidence::selected_member(
+                &export,
+                errata_id,
+                u64::from(rfc),
+                || budget.check(),
+            )?;
+            Ok::<_, Error>((export, member_body))
+        })
+        .await
+        .map_err(|_| unavailable())??;
+        Ok((
+            RfcErrataCaptureReport {
+                version: 1,
+                snapshot: snapshot.id,
+                export_capture: capture.id,
+                export_body: capture.body_hash,
+                member_body,
+                rfc,
+                errata_id,
+                captured_at: capture.retrieved_at,
+                export_bytes: export.len() as u64,
+                archive_backend,
+                archive_binding_checked: true,
+                applicability_approved: false,
+                publication_authorized: false,
+            },
+            export,
+        ))
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Error::new("cancelled", "RFC errata capture inspection canceled.")),
+        result = tokio::time::timeout(limit, work) => result.unwrap_or_else(|_| Err(capacity())),
+    }
+}
+
 pub(super) fn rfc_job_identity(key: &str) -> Result<(u32, &str, &str)> {
     let (number, format, assurance) = if let Some(number) = key.strip_prefix("rfc:text:") {
         (number, "txt", "https")
@@ -204,36 +338,29 @@ async fn alias(reader: &mut Reader, namespace: &str, id: &str) -> Result<String>
     Ok(canonical)
 }
 
-async fn capture_reference(reader: &mut Reader, selected: &Capture) -> Result<Value> {
-    let id = alias(reader, "capture", &selected.id).await?;
+async fn sealed_capture(reader: &mut Reader, id: &str) -> Result<Capture> {
     let size: Option<i64> = sqlx_core::query_scalar::query_scalar(
         "SELECT octet_length(to_jsonb(c)::text)::bigint FROM devres_captures c WHERE id=$1",
     )
-    .bind(&id)
+    .bind(id)
     .fetch_optional(&mut reader.conn)
     .await
     .map_err(|_| unavailable())?;
     reader.row_admit(size.ok_or_else(unavailable)?)?;
     let row = sqlx_core::query::query("SELECT id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity FROM devres_captures WHERE id=$1")
-        .bind(&id).fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
+        .bind(id).fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
+    let retrieved_at = row.try_get("retrieved_at").map_err(|_| failed())?;
     let retained = Capture {
         id: row.try_get("id").map_err(|_| failed())?,
         key: row.try_get("source_key").map_err(|_| failed())?,
         source_url: row.try_get("source_url").map_err(|_| failed())?,
         body_hash: row.try_get("body_hash").map_err(|_| failed())?,
         media_type: row.try_get("media_type").map_err(|_| failed())?,
-        retrieved_at: row.try_get("retrieved_at").map_err(|_| failed())?,
-        validated_at: selected.validated_at,
+        retrieved_at,
+        validated_at: retrieved_at,
     };
     let seal: String = row.try_get("metadata_integrity").map_err(|_| failed())?;
-    let body = alias(reader, "body", &selected.body_hash).await?;
-    if capture_metadata_digest(&retained)? != seal
-        || retained.body_hash != body
-        || retained.key != selected.key
-        || retained.source_url != selected.source_url
-        || retained.media_type != selected.media_type
-        || retained.retrieved_at != selected.retrieved_at
-    {
+    if retained.id != id || capture_metadata_digest(&retained)? != seal {
         return Err(failed());
     }
     integrity::verify(
@@ -244,6 +371,21 @@ async fn capture_reference(reader: &mut Reader, selected: &Capture) -> Result<Va
         )
         .as_bytes(),
     )?;
+    Ok(retained)
+}
+
+async fn capture_reference(reader: &mut Reader, selected: &Capture) -> Result<Value> {
+    let id = alias(reader, "capture", &selected.id).await?;
+    let retained = sealed_capture(reader, &id).await?;
+    let body = alias(reader, "body", &selected.body_hash).await?;
+    if retained.body_hash != body
+        || retained.key != selected.key
+        || retained.source_url != selected.source_url
+        || retained.media_type != selected.media_type
+        || retained.retrieved_at != selected.retrieved_at
+    {
+        return Err(failed());
+    }
     let relative = integrity::relative_path(&retained.body_hash)?
         .to_string_lossy()
         .into_owned();
@@ -417,6 +559,28 @@ async fn binding(reader: &mut Reader, path: &str, member: &Member) -> Result<i64
     Ok(epoch)
 }
 
+async fn sealed_snapshot(reader: &mut Reader, id: &str) -> Result<(Snapshot, i64)> {
+    let size: Option<i64> = sqlx_core::query_scalar::query_scalar(
+        "SELECT octet_length(data::text)::bigint FROM devres_rfc_snapshots WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_optional(&mut reader.conn)
+    .await
+    .map_err(|_| unavailable())?;
+    reader.row_admit(size.ok_or_else(unavailable)?)?;
+    let row = sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id=$1")
+        .bind(id).fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
+    let value = payload_integrity::row("devres_rfc_snapshots", &row)?;
+    let snapshot: Snapshot = serde_json::from_value(value).map_err(|_| failed())?;
+    if snapshot.id != id {
+        return Err(failed());
+    }
+    Ok((
+        snapshot,
+        row.try_get("published_order").map_err(|_| failed())?,
+    ))
+}
+
 pub(super) async fn inspect_rfc(
     reader: &mut Reader,
     report: &mut CollectionDiagnosis,
@@ -443,25 +607,8 @@ pub(super) async fn inspect_rfc(
         }
     }
     let id = options.snapshot.as_deref().ok_or_else(invalid)?;
-    let size: Option<i64> = sqlx_core::query_scalar::query_scalar(
-        "SELECT octet_length(data::text)::bigint FROM devres_rfc_snapshots WHERE id=$1",
-    )
-    .bind(id)
-    .fetch_optional(&mut reader.conn)
-    .await
-    .map_err(|_| unavailable())?;
-    let Some(size) = size else {
-        return Err(unavailable());
-    };
-    reader.row_admit(size)?;
-    let row = sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,data,data_integrity FROM devres_rfc_snapshots WHERE id=$1")
-        .bind(id).fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
-    let value = payload_integrity::row("devres_rfc_snapshots", &row)?;
-    let snapshot: Snapshot = serde_json::from_value(value).map_err(|_| failed())?;
-    if snapshot.id != id {
-        return Err(failed());
-    }
-    report.cutoff = row.try_get("published_order").map_err(|_| failed())?;
+    let (snapshot, published_order) = sealed_snapshot(reader, id).await?;
+    report.cutoff = published_order;
     report.diagnostics[0]["snapshot"] = json!({"id":snapshot.id,"created_at":snapshot.created_at,"complete":snapshot.complete,"sealed_metadata":"verified","representations":snapshot.documents.len(),"search_representations":snapshot.search_documents.len(),"catalogue_capture":snapshot.catalogue_capture,"errata_capture":snapshot.errata_capture});
     for (position, key) in options.job_keys.iter().enumerate() {
         let (number, format, assurance) = rfc_job_identity(key)?;
@@ -559,6 +706,180 @@ mod tests {
             commit: None,
             attribution_target: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL; run scripts/test-postgres.sh"]
+    async fn rfc_errata_capture_extraction_binds_snapshot_and_exact_archive_bytes() {
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").expect("disposable database required");
+        let mut admin = PgConnection::connect(&base).await.unwrap();
+        sqlx_core::raw_sql::raw_sql("CREATE DATABASE devres_rfc_errata_extract_fixture")
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path("/devres_rfc_errata_extract_fixture");
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let writer = crate::PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .unwrap();
+        let raw = r#"{ "errata_id": "8173", "doc-id": "RFC09525", "errata_status_code": "Held for Document Update", "errata_type_code": "Editorial", "orig_text": "private prose sentinel" }"#;
+        let export = format!("[\n\t{raw}\n]\n");
+        let mut captures = Vec::new();
+        for (kind, key, path, media_type, body) in [
+            (
+                "catalogue",
+                "rfc:index",
+                "rfc-index.xml",
+                "application/xml",
+                "fixture catalogue",
+            ),
+            (
+                "errata",
+                "rfc:errata",
+                "api/v1/errata.json",
+                "application/json",
+                export.as_str(),
+            ),
+        ] {
+            let capture = writer
+                .publish(
+                    &FetchRequest {
+                        key: key.into(),
+                        url: format!("https://www.rfc-editor.org/{path}"),
+                        ttl_secs: 86400,
+                        max_bytes: 4096,
+                        media_type: media_type.into(),
+                    },
+                    FetchResponse {
+                        status: 200,
+                        body: body.as_bytes().to_vec(),
+                        validators: Validators::default(),
+                    },
+                    10,
+                )
+                .await
+                .unwrap()
+                .capture;
+            writer
+                .save_dataset(
+                    kind,
+                    &Dataset {
+                        capture: capture.clone(),
+                        records: if kind == "errata" {
+                            crate::rfc::source::parse_errata(body.as_bytes()).unwrap()
+                        } else {
+                            Vec::new()
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            captures.push(capture);
+        }
+        let [catalogue, errata] = captures.as_slice() else {
+            panic!("fixture requires a catalogue and errata capture");
+        };
+        let matching_id = integrity::hash(b"matching snapshot");
+        let unrelated_id = integrity::hash(b"newer unrelated snapshot");
+        for (id, errata_capture) in [
+            (&matching_id, Some(errata.id.clone())),
+            (&unrelated_id, None),
+        ] {
+            writer
+                .save_snapshot(&Snapshot {
+                    id: id.clone(),
+                    catalogue_capture: catalogue.id.clone(),
+                    errata_capture,
+                    documents: Vec::new(),
+                    search_documents: Vec::new(),
+                    coverage: json!({}),
+                    created_at: 10,
+                    complete: true,
+                    index_path: None,
+                    processor_version: 1,
+                })
+                .await
+                .unwrap();
+        }
+        let mut conn = PgConnection::connect(url.as_str()).await.unwrap();
+        sqlx_core::raw_sql::raw_sql("CREATE ROLE devres_rfc_errata_extract_reader LOGIN PASSWORD 'disposable-reader'; GRANT USAGE ON SCHEMA public TO devres_rfc_errata_extract_reader; GRANT SELECT ON ALL TABLES IN SCHEMA public TO devres_rfc_errata_extract_reader;")
+            .execute(&mut conn).await.unwrap();
+        url.set_username("devres_rfc_errata_extract_reader")
+            .unwrap();
+        url.set_password(Some("disposable-reader")).unwrap();
+        let select = |selection, cancel| {
+            inspect_rfc_errata_capture(url.as_str(), root.path(), None, selection, cancel)
+        };
+        let selection = RfcErrataCaptureSelection {
+            snapshot: None,
+            export_capture: &errata.id,
+            export_body: &errata.body_hash,
+            rfc: 9525,
+            errata_id: 8173,
+        };
+        for snapshot in [None, Some(matching_id.as_str())] {
+            let (report, body) = select(
+                RfcErrataCaptureSelection {
+                    snapshot,
+                    ..selection
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.snapshot, matching_id);
+            assert_eq!(report.member_body, integrity::hash(raw.as_bytes()));
+            assert_eq!(body, export.as_bytes());
+            assert!(report.archive_binding_checked);
+            assert!(!report.publication_authorized);
+            assert!(
+                !serde_json::to_string(&report)
+                    .unwrap()
+                    .contains("private prose sentinel")
+            );
+        }
+        let other_body = integrity::hash(b"wrong body");
+        for invalid_selection in [
+            RfcErrataCaptureSelection {
+                snapshot: Some(&unrelated_id),
+                ..selection
+            },
+            RfcErrataCaptureSelection {
+                export_body: &other_body,
+                ..selection
+            },
+            RfcErrataCaptureSelection {
+                rfc: 9524,
+                ..selection
+            },
+            RfcErrataCaptureSelection {
+                errata_id: 8174,
+                ..selection
+            },
+        ] {
+            let error = select(invalid_selection, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "integrity");
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            select(selection, cancel).await.unwrap_err().code,
+            "cancelled"
+        );
+        let path = root
+            .path()
+            .join(integrity::relative_path(&errata.body_hash).unwrap());
+        std::fs::write(path, export.replace("private", "altered")).unwrap();
+        assert_eq!(
+            select(selection, CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code,
+            "integrity"
+        );
     }
 
     async fn fixture_target_state(conn: &mut PgConnection, id: &str, value: &Value) {
@@ -1272,6 +1593,29 @@ mod tests {
             .finish("rfc:text:9000", Some(&captured), None, 100)
             .await
             .unwrap();
+        let raw = r#"{ "errata_id": 8173, "doc-id": "RFC09525", "errata_status_code": "Held for Document Update", "errata_type_code": "Editorial" }"#;
+        let export = format!("[\n{raw}\n]\n");
+        let (mut request, response) = publish(
+            "rfc:errata",
+            crate::rfc::corpus::ERRATA_URL,
+            export.as_bytes(),
+        );
+        request.media_type = "application/json".into();
+        let errata = writer
+            .publish(&request, response, 10)
+            .await
+            .unwrap()
+            .capture;
+        writer
+            .save_dataset(
+                "errata",
+                &Dataset {
+                    capture: errata.clone(),
+                    records: crate::rfc::source::parse_errata(export.as_bytes()).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
         let index_id = integrity::hash(b"S3 RFC metadata-only index");
         let relative = tokio::task::block_in_place(|| {
             let mut builder =
@@ -1295,7 +1639,7 @@ mod tests {
             .save_snapshot(&Snapshot {
                 id: id.clone(),
                 catalogue_capture: catalogue.id,
-                errata_capture: None,
+                errata_capture: Some(errata.id.clone()),
                 documents: vec![document.clone()],
                 search_documents: vec![document],
                 coverage: json!({}),
@@ -1334,10 +1678,28 @@ mod tests {
                 .unwrap()
                 > 0
         );
+        let (report, bytes) = inspect_rfc_errata_capture(
+            reader_url.as_str(),
+            reader_root.path(),
+            Some(reader_config.clone()),
+            RfcErrataCaptureSelection {
+                snapshot: Some(&id),
+                export_capture: &errata.id,
+                export_body: &errata.body_hash,
+                rfc: 9525,
+                errata_id: 8173,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.archive_backend, "s3");
+        assert_eq!(report.member_body, integrity::hash(raw.as_bytes()));
+        assert_eq!(bytes, export.as_bytes());
         assert_eq!(
             std::fs::read_dir(reader_root.path()).unwrap().count(),
             0,
-            "metadata reads must not warm a reader cache"
+            "diagnostics must not warm a reader cache"
         );
         // Consistently bound metadata must still match the exact object length.
         // Construct a new immutable generation; never overwrite a retained object.

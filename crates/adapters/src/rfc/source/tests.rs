@@ -201,6 +201,51 @@ fn errata_preserve_raw_fields_and_reject_invalid_or_duplicate_records() {
     assert_eq!(parse_errata(b"[]").unwrap(), Vec::<Value>::new());
 }
 
+#[test]
+fn errata_member_selection_hashes_the_original_slice_and_checks_the_whole_export() {
+    let member = r#"{ "doc-id": "RFC09525", "errata_id": "08173", "errata_status_code": "Held for Document Update", "errata_type_code": "Editorial", "notes": "\u0061" }"#;
+    let neighbor = r#"{"errata_id":8174,"doc-id":"RFC9525","errata_status_code":"Reported","errata_type_code":"Editorial"}"#;
+    let export = format!("[\n {neighbor},\n {member} \n]");
+    let wanted = BTreeSet::from([8173, 8175]);
+    let selected = select_errata_members(export.as_bytes(), &wanted, || Ok(())).unwrap();
+    let parsed = parse_errata(export.as_bytes()).unwrap();
+    assert_eq!(
+        parsed.iter().map(errata_id).collect::<Vec<_>>(),
+        [Some(8174), Some(8173)]
+    );
+    assert_eq!(selected.len(), 1);
+    let (record, digest) = &selected[&8173];
+    assert_eq!(record, &parsed[1]);
+    assert_eq!(record["notes"], "a");
+    assert_eq!(digest, &crate::integrity::hash(member.as_bytes()));
+    assert_ne!(
+        digest,
+        &crate::integrity::hash(record.to_string().as_bytes())
+    );
+
+    let duplicate = neighbor.replace("8174", "\"08174\"");
+    let export = format!("[{member},{neighbor},{duplicate}]");
+    let error = select_errata_members(export.as_bytes(), &wanted, || Ok(())).unwrap_err();
+    assert_eq!(error.code, "integrity");
+    assert_eq!(error.message, "Duplicate RFC errata identity.");
+}
+
+#[test]
+fn errata_member_selection_propagates_cancellation_after_a_match() {
+    let export = br#"[{"errata_id":8173,"doc-id":"RFC9525","errata_status_code":"Reported","errata_type_code":"Editorial"},{"errata_id":8174,"doc-id":"RFC9525","errata_status_code":"Reported","errata_type_code":"Editorial"}]"#;
+    let calls = std::cell::Cell::new(0);
+    let error = select_errata_members(export, &BTreeSet::from([8173]), || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 3 {
+            return Err(Error::new("cancelled", "Fixture cancelled."));
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.code, "cancelled");
+    assert_eq!(error.message, "Fixture cancelled.");
+}
+
 #[derive(Default)]
 struct NeverPublish(std::sync::atomic::AtomicUsize);
 #[async_trait]

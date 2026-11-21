@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::{Duration, Instant},
 };
 
@@ -45,7 +45,7 @@ pub struct GetInput {
     pub capture: Option<String>,
 }
 
-const MAX_INDEX: usize = 64 * 1024 * 1024;
+pub(super) const MAX_INDEX: usize = 64 * 1024 * 1024;
 const MAX_TEXT: usize = 16 * 1024 * 1024;
 const MAX_ENTRY: usize = 256 * 1024;
 
@@ -1058,131 +1058,180 @@ pub(crate) fn extract_text(format: &str, bytes: &[u8]) -> Result<String> {
 }
 
 pub(crate) fn parse_errata(bytes: &[u8]) -> Result<Vec<Value>> {
+    let mut records = Vec::new();
+    scan_errata(bytes, || Ok(()), |_, record, _| records.push(record))?;
+    Ok(records)
+}
+
+pub(crate) fn errata_id(record: &Value) -> Option<u64> {
+    let value = record.get("errata_id")?;
+    value
+        .as_u64()
+        .or_else(|| {
+            let digits = value.as_str()?;
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse().ok()
+        })
+        .filter(|value| *value > 0)
+}
+
+pub(crate) fn select_errata_members(
+    bytes: &[u8],
+    selected: &BTreeSet<u64>,
+    check: impl Fn() -> Result<()>,
+) -> Result<BTreeMap<u64, (Value, String)>> {
+    let mut members = BTreeMap::new();
+    scan_errata(bytes, check, |id, record, raw| {
+        if selected.contains(&id) {
+            members.insert(id, (record, crate::integrity::hash(raw.as_bytes())));
+        }
+    })?;
+    Ok(members)
+}
+
+fn scan_errata(
+    bytes: &[u8],
+    check: impl Fn() -> Result<()>,
+    record: impl FnMut(u64, Value, &str),
+) -> Result<()> {
+    check()?;
     if bytes.len() > MAX_INDEX {
         return Err(Error::capacity("RFC errata exceeds byte limit."));
     }
     let deadline = Instant::now() + Duration::from_secs(15);
-    struct BoundedRecords<'a> {
+    struct BoundedRecords<'a, Check, Record> {
         deadline: Instant,
-        capacity: &'a std::cell::Cell<bool>,
+        failure: &'a std::cell::Cell<Option<Error>>,
+        check: Check,
+        record: Record,
     }
-    impl<'de> serde::de::Visitor<'de> for BoundedRecords<'_> {
-        type Value = Vec<Value>;
+    impl<'de, Check, Record> serde::de::Visitor<'de> for BoundedRecords<'_, Check, Record>
+    where
+        Check: Fn() -> Result<()>,
+        Record: FnMut(u64, Value, &str),
+    {
+        type Value = Result<()>;
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("a bounded RFC errata array")
         }
         fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
+            mut self,
             mut sequence: A,
         ) -> std::result::Result<Self::Value, A::Error> {
-            let mut records = Vec::new();
-            while let Some(raw) = sequence.next_element::<&'de serde_json::value::RawValue>()? {
-                if records.len() >= 50000
-                    || raw.get().len() > MAX_ENTRY
-                    || Instant::now() >= self.deadline
-                {
-                    self.capacity.set(true);
-                    return Err(serde::de::Error::custom("RFC errata capacity exceeded"));
+            let interrupted = |error| -> A::Error {
+                self.failure.set(Some(error));
+                serde::de::Error::custom("RFC errata scan interrupted")
+            };
+            let mut count = 0;
+            let mut ids = HashSet::new();
+            let mut validation = Ok(());
+            loop {
+                (self.check)().map_err(interrupted)?;
+                if Instant::now() >= self.deadline {
+                    return Err(interrupted(Error::capacity(
+                        "RFC errata processing deadline exceeded.",
+                    )));
                 }
+                let Some(raw) = sequence.next_element::<&'de serde_json::value::RawValue>()? else {
+                    break;
+                };
+                if count >= 50000 || raw.get().len() > MAX_ENTRY {
+                    return Err(interrupted(Error::capacity(
+                        "RFC errata exceeds processing bounds.",
+                    )));
+                }
+                count += 1;
                 let record: Value =
                     serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
                 if record.as_object().is_some_and(|object| object.len() > 64) {
-                    self.capacity.set(true);
-                    return Err(serde::de::Error::custom(
-                        "RFC errata field capacity exceeded",
-                    ));
+                    return Err(interrupted(Error::capacity(
+                        "RFC errata exceeds processing bounds.",
+                    )));
                 }
-                records.push(record);
+                // Preserve the parser's syntax and envelope checks before member
+                // validation errors, even when only selected members are kept.
+                if validation.is_ok() {
+                    validation = validate_errata_member(&record, &mut ids)
+                        .map(|id| (self.record)(id, record, raw.get()));
+                }
             }
-            Ok(records)
+            Ok(validation)
         }
     }
-    let capacity = std::cell::Cell::new(false);
+    let failure = std::cell::Cell::new(None);
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    let records = serde::Deserializer::deserialize_seq(
+    let validation = serde::Deserializer::deserialize_seq(
         &mut decoder,
         BoundedRecords {
             deadline,
-            capacity: &capacity,
+            failure: &failure,
+            check: &check,
+            record,
         },
     )
     .map_err(|_| {
-        if capacity.get() {
-            Error::capacity("RFC errata exceeds processing bounds.")
-        } else {
-            Error::integrity("Malformed RFC errata JSON.")
-        }
+        failure
+            .take()
+            .unwrap_or_else(|| Error::integrity("Malformed RFC errata JSON."))
     })?;
     decoder
         .end()
         .map_err(|_| Error::integrity("Trailing RFC errata JSON."))?;
-    let mut ids = HashSet::new();
-    for record in &records {
-        if Instant::now() >= deadline {
-            return Err(Error::capacity("RFC errata processing deadline exceeded."));
-        }
-        let object = record
-            .as_object()
-            .ok_or_else(|| Error::integrity("RFC errata record is not an object."))?;
-        let identity = object
-            .get("errata_id")
-            .and_then(|value| {
-                value.as_u64().or_else(|| {
-                    let digits = value.as_str()?;
-                    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-                        return None;
-                    }
-                    digits.parse().ok()
-                })
-            })
-            .filter(|value| *value > 0)
-            .ok_or_else(|| Error::integrity("Invalid RFC errata identity."))?;
-        if !ids.insert(identity) {
-            return Err(Error::integrity("Duplicate RFC errata identity."));
-        }
-        rfc_number(
-            object
-                .get("doc-id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::integrity("RFC errata lacks an RFC identity."))?,
-        )?;
-        for field in ["errata_status_code", "errata_type_code"] {
-            if object
-                .get(field)
-                .and_then(Value::as_str)
-                .is_none_or(|value| value.trim().is_empty() || value.len() > 128)
-            {
-                return Err(Error::integrity("Invalid RFC errata classification."));
-            }
-        }
-        let mut pending = vec![(record, 0usize)];
-        let mut nodes = 0usize;
-        let mut text_bytes = 0usize;
-        while let Some((value, depth)) = pending.pop() {
-            nodes += 1;
-            if depth > 64 || nodes > 4096 {
-                return Err(Error::capacity(
-                    "RFC errata record exceeds structure limit.",
-                ));
-            }
-            match value {
-                Value::String(text) => text_bytes = text_bytes.saturating_add(text.len()),
-                Value::Array(values) => {
-                    pending.extend(values.iter().map(|value| (value, depth + 1)))
-                }
-                Value::Object(values) => {
-                    text_bytes =
-                        text_bytes.saturating_add(values.keys().map(String::len).sum::<usize>());
-                    pending.extend(values.values().map(|value| (value, depth + 1)));
-                }
-                _ => {}
-            }
-            if text_bytes > MAX_ENTRY {
-                return Err(Error::capacity("RFC errata record exceeds text limit."));
-            }
+    check()?;
+    validation
+}
+
+fn validate_errata_member(record: &Value, ids: &mut HashSet<u64>) -> Result<u64> {
+    let object = record
+        .as_object()
+        .ok_or_else(|| Error::integrity("RFC errata record is not an object."))?;
+    let identity =
+        errata_id(record).ok_or_else(|| Error::integrity("Invalid RFC errata identity."))?;
+    if !ids.insert(identity) {
+        return Err(Error::integrity("Duplicate RFC errata identity."));
+    }
+    rfc_number(
+        object
+            .get("doc-id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::integrity("RFC errata lacks an RFC identity."))?,
+    )?;
+    for field in ["errata_status_code", "errata_type_code"] {
+        if object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty() || value.len() > 128)
+        {
+            return Err(Error::integrity("Invalid RFC errata classification."));
         }
     }
-    Ok(records)
+    let mut pending = vec![(record, 0usize)];
+    let mut nodes = 0usize;
+    let mut text_bytes = 0usize;
+    while let Some((value, depth)) = pending.pop() {
+        nodes += 1;
+        if depth > 64 || nodes > 4096 {
+            return Err(Error::capacity(
+                "RFC errata record exceeds structure limit.",
+            ));
+        }
+        match value {
+            Value::String(text) => text_bytes = text_bytes.saturating_add(text.len()),
+            Value::Array(values) => pending.extend(values.iter().map(|value| (value, depth + 1))),
+            Value::Object(values) => {
+                text_bytes =
+                    text_bytes.saturating_add(values.keys().map(String::len).sum::<usize>());
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+        if text_bytes > MAX_ENTRY {
+            return Err(Error::capacity("RFC errata record exceeds text limit."));
+        }
+    }
+    Ok(identity)
 }
 
 #[cfg(test)]

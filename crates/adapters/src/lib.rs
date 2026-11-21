@@ -97,7 +97,8 @@ pub use rustsec::{AdvisoryCorpus, RustSecConfig};
 pub use storage::PgBlobStore;
 pub use storage::collection_diagnostics::{
     CollectionDiagnosis, DiagnosisOptions, DiagnosisOutcome, DiagnosisProvider,
-    create_diagnosis_output, diagnose_collection,
+    RfcErrataCaptureReport, RfcErrataCaptureSelection, create_diagnosis_output,
+    diagnose_collection, inspect_rfc_errata_capture,
 };
 pub use storage::{
     RUSTSEC_CAPTURE_REPAIR_VERSION, RUSTSEC_CAPTURE_REPAIR_VERSION_V2, RustSecRecoveryOptions,
