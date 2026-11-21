@@ -200,9 +200,12 @@ async fn cold_reader_snapshot_delegates_publication_and_loads_exact_receipt() {
 async fn readonly_errata_fallback_keeps_snapshot_receipt_across_concurrent_new_head() {
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let (corpus, store, writer) = fixture(root.path());
-    let result = crate::rfc::tools::call(&corpus, "rfc.errata", json!({"number":1}))
+    let page = crate::rfc::tools::errata(&corpus, json!({"number":1}), None)
         .await
         .unwrap();
+    let crate::rfc::tools::ErrataPage::Aggregate(result) = page else {
+        panic!("expected aggregate errata");
+    };
     assert_eq!(result["snapshot"], snapshot_id());
     assert_eq!(result["items"][0]["doc-id"], "RFC1");
     assert_eq!(writer.publications.load(Ordering::SeqCst), 1);

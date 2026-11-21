@@ -253,6 +253,18 @@ impl Research {
     }
 
     async fn call_inner(&self, tool: &str, input: Value) -> Result<Value> {
+        if tool == "rfc.errata" {
+            let corpus = self
+                .corpus
+                .as_deref()
+                .ok_or_else(|| Error::unavailable("RFC corpus storage is not configured."))?;
+            return match rfc_tools::errata(corpus, input, self.attribution_gate.as_deref()).await? {
+                rfc_tools::ErrataPage::Aggregate(output) => {
+                    self.qualify_output(tool, "rfc", output).await
+                }
+                rfc_tools::ErrataPage::VerifiedMembers(output) => Ok(output),
+            };
+        }
         let provider = if tool == "fetch" {
             input
                 .get("id")
@@ -487,7 +499,6 @@ impl Research {
                 | "rfc.catalog_search"
                 | "rfc.fulltext_search"
                 | "rfc.format_get"
-                | "rfc.errata"
                 | "rfc.series_get"
                 | "rfc.corpus_status"
         ) {

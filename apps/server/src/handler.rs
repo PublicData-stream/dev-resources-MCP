@@ -251,16 +251,21 @@ impl ServerHandler for McpHandler {
             self.counters.failures.fetch_add(1, Ordering::Relaxed);
             return Ok(CallToolResult::structured_error(serde_json::json!({"code":"resource_limit","message":"Tool result exceeds its limit."})).into());
         }
-        let links = capture_links(&value);
-        let notices = attribution_notices(&value);
-        let mut result = CallToolResult::structured(value);
-        result.content.extend(notices);
-        result.content.extend(links);
+        let result = render_tool_result(value);
         ensure_serialized_limit(&result, self.limits.max_message_bytes / 2)
             .map_err(|_| ErrorData::internal_error("tool result exceeds limit", None))?;
         let _ = progress.report(ProgressStage::Complete).await;
         Ok(result.into())
     }
+}
+
+fn render_tool_result(value: serde_json::Value) -> CallToolResult {
+    let links = capture_links(&value);
+    let notices = attribution_notices(&value);
+    let mut result = CallToolResult::structured(value);
+    result.content.extend(notices);
+    result.content.extend(links);
+    result
 }
 
 fn bounded_error_details(
@@ -374,5 +379,37 @@ mod tests {
         assert!(
             capture_links(&serde_json::json!({"resource_uri":"file:///etc/passwd"})).is_empty()
         );
+    }
+
+    #[test]
+    fn errata_member_response_renders_only_its_projected_content() {
+        let url = "https://www.rfc-editor.org/errata/eid8173";
+        let mut page = serde_json::json!({
+            "items":[{"source_url":url}],
+            "capture":{"id":"export","body_hash":"export-digest"},
+            "attribution":{"status":"metadata_only","copied_content":false},
+            "snapshot":"snapshot",
+        });
+        let link_only = render_tool_result(page.clone());
+        assert_eq!(link_only.content.len(), 1);
+        assert_eq!(link_only.structured_content.as_ref(), Some(&page));
+        let rendered = serde_json::to_string(&link_only).unwrap();
+        assert!(rendered.contains(url));
+        for absent in ["devres://capture/", "orig_text", "correct_text", "notes"] {
+            assert!(!rendered.contains(absent));
+        }
+
+        page["items"][0]["orig_text"] = serde_json::json!("Fixture original");
+        page["attribution"] = serde_json::json!({
+            "status":"ready","readable_notice":"Fixture attribution",
+            "resource_uri":"devres://attribution/member",
+        });
+        let qualified = render_tool_result(page);
+        assert_eq!(qualified.content.len(), 3);
+        let rendered = serde_json::to_string(&qualified).unwrap();
+        assert!(rendered.contains("Fixture original"));
+        assert!(rendered.contains("Fixture attribution"));
+        assert!(rendered.contains("devres://attribution/member"));
+        assert!(!rendered.contains("devres://capture/"));
     }
 }

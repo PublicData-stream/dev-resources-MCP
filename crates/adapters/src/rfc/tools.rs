@@ -2,7 +2,7 @@
 use crate::{
     research::{Page, capture_json, decode, list_limit, text_limit, text_page},
     rfc::corpus::{
-        BODY_LIMIT, RfcCorpus, media_type, representation_key, representation_url,
+        BODY_LIMIT, ERRATA_URL, RfcCorpus, media_type, representation_key, representation_url,
         select_search_documents,
     },
     rfc::index as rfc_index,
@@ -10,13 +10,19 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use devres_application::{
+    attribution_gate::{AttributionGate, RfcErrataMember},
     collection::{Phase, attach_phase},
     corpus::{Dataset, Snapshot},
 };
 use devres_domain::{Error, FetchRequest, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
+use tokio_util::sync::CancellationToken;
+
 static RESEARCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+const PILOT_RFC: u32 = 9525;
+const PILOT_ERRATUM: u64 = 8173;
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -256,6 +262,186 @@ fn attach_snapshot(value: &mut Value, snapshot: &Snapshot) {
     value["freshness"] = json!({"oldest_validated_at":oldest,"stale":age>86400,"expired":age>7*86400,"coverage_is_at_snapshot_publication":true});
 }
 
+pub(crate) enum ErrataPage {
+    Aggregate(Value),
+    VerifiedMembers(Value),
+}
+
+pub(crate) async fn errata(
+    corpus: &RfcCorpus,
+    input: Value,
+    gate: Option<&dyn AttributionGate>,
+) -> Result<ErrataPage> {
+    let admission = RESEARCH_SLOTS
+        .try_acquire()
+        .map_err(|_| Error::capacity("RFC research capacity exhausted."))?;
+    let input: ErrataInput = decode(input)?;
+    check_number(input.number)?;
+    Page {
+        offset: input.offset,
+        limit: input.limit,
+    }
+    .checked()?;
+    for filter in [&input.status, &input.kind].into_iter().flatten() {
+        check_query(filter, false)?;
+    }
+    let snapshot =
+        if input.snapshot.is_none() && corpus.store.dataset("errata", None).await?.is_none() {
+            corpus.refresh_errata().await?;
+            corpus.publish_snapshot().await?
+        } else {
+            corpus.selected_snapshot(input.snapshot.as_deref()).await?
+        };
+    let dataset = dataset_for(corpus, &snapshot, "errata").await?;
+    let records = dataset
+        .records
+        .into_iter()
+        .filter(|r| {
+            errata_number(r) == Some(input.number)
+                && input.status.as_ref().is_none_or(|s| {
+                    r["errata_status_code"]
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(s))
+                })
+                && input.kind.as_ref().is_none_or(|s| {
+                    r["errata_type_code"]
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(s))
+                })
+        })
+        .collect();
+    let mut value = page(records, input.offset, input.limit);
+    value["capture"] = capture_json(&dataset.capture, 86400);
+    attach_snapshot(&mut value, &snapshot);
+    if input.number != PILOT_RFC {
+        return Ok(ErrataPage::Aggregate(value));
+    }
+    let capture = &dataset.capture;
+    if snapshot.errata_capture.as_deref() != Some(capture.id.as_str())
+        || capture.key != "rfc:errata"
+        || capture.source_url != ERRATA_URL
+        || capture.media_type != "application/json"
+    {
+        return Err(invalid_errata_binding());
+    }
+    value["capture"]
+        .as_object_mut()
+        .ok_or_else(invalid_errata_binding)?
+        .remove("resource_uri");
+    value["attribution"] = json!({"status":"metadata_only","copied_content":false});
+    let items = value["items"]
+        .as_array_mut()
+        .ok_or_else(invalid_errata_binding)?;
+    if items.is_empty() {
+        return Ok(ErrataPage::VerifiedMembers(value));
+    }
+    let ids = items
+        .iter()
+        .map(|record| rfc::errata_id(record).ok_or_else(invalid_errata_binding))
+        .collect::<Result<BTreeSet<_>>>()?;
+    if ids.len() != items.len() {
+        return Err(invalid_errata_binding());
+    }
+
+    let cancel = CancellationToken::new();
+    let _stop_on_drop = cancel.clone().drop_guard();
+    let expected = capture.clone();
+    let retrieval = corpus.retrieval.clone();
+    // Archive hydration can already be running when the request is dropped.
+    // Retain the permit through that read and the cancellable parser.
+    let (_admission, mut retained_members) = tokio::spawn(async move {
+        let retained = retrieval.read_capture(&expected.id).await?;
+        check_errata_cancel(&cancel)?;
+        if retained.capture.id != expected.id
+            || retained.capture.key != expected.key
+            || retained.capture.source_url != expected.source_url
+            || retained.capture.media_type != expected.media_type
+            || retained.capture.body_hash != expected.body_hash
+            || retained.capture.retrieved_at != expected.retrieved_at
+        {
+            return Err(invalid_errata_binding());
+        }
+        if retained.body.len() > rfc::MAX_INDEX {
+            return Err(Error::capacity("RFC errata exceeds byte limit."));
+        }
+        tokio::task::spawn_blocking(move || {
+            check_errata_cancel(&cancel)?;
+            crate::integrity::verify(&retained.capture.body_hash, &retained.body)?;
+            let members =
+                rfc::select_errata_members(&retained.body, &ids, || check_errata_cancel(&cancel))?;
+            Ok((admission, members))
+        })
+        .await
+        .map_err(|_| Error::unavailable("RFC errata processing failed."))?
+    })
+    .await
+    .map_err(|_| Error::unavailable("RFC errata processing failed."))??;
+    let mut attribution = None;
+    for item in items {
+        let id = rfc::errata_id(item).ok_or_else(invalid_errata_binding)?;
+        let (record, digest) = retained_members
+            .remove(&id)
+            .ok_or_else(invalid_errata_binding)?;
+        if *item != record || errata_number(&record) != Some(PILOT_RFC) {
+            return Err(invalid_errata_binding());
+        }
+        let source_url = format!("https://www.rfc-editor.org/errata/eid{id}");
+        let member = RfcErrataMember {
+            export_capture: &capture.id,
+            export_body: &capture.body_hash,
+            member_body: &digest,
+            rfc: PILOT_RFC,
+            errata_id: id,
+        };
+        let ready = match gate {
+            Some(gate) => gate.qualify_rfc_erratum(&member).await?,
+            None => None,
+        };
+        if id == PILOT_ERRATUM
+            && ["orig_text", "correct_text", "notes"]
+                .iter()
+                .all(|field| record[*field].is_string())
+            && let Some(ready) = ready
+            && ready["status"] == "ready"
+            && ready["readable_notice"]
+                .as_str()
+                .is_some_and(|notice| !notice.trim().is_empty())
+            && ready["resource_uri"]
+                .as_str()
+                .and_then(|uri| uri.strip_prefix("devres://attribution/"))
+                .is_some_and(devres_domain::valid_content_id)
+        {
+            *item = json!({
+                "errata_id":record["errata_id"],"doc-id":record["doc-id"],
+                "errata_status_code":record["errata_status_code"],
+                "errata_type_code":record["errata_type_code"],"orig_text":record["orig_text"],
+                "correct_text":record["correct_text"],"notes":record["notes"],
+                "source_url":source_url,
+                "citation":{"capture":member.export_capture,"body_hash":member.export_body,
+                    "member_body":member.member_body},
+            });
+            attribution = Some(ready);
+        } else {
+            *item = json!({"source_url":source_url});
+        }
+    }
+    if let Some(attribution) = attribution {
+        value["attribution"] = attribution;
+    }
+    Ok(ErrataPage::VerifiedMembers(value))
+}
+
+fn invalid_errata_binding() -> Error {
+    Error::integrity("RFC errata member does not match its retained capture.")
+}
+
+fn check_errata_cancel(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::new("cancelled", "RFC errata processing canceled."));
+    }
+    Ok(())
+}
+
 pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result<Value> {
     let _admission = RESEARCH_SLOTS.try_acquire().map_err(|_| {
         let error = Error::capacity("RFC research capacity exhausted.");
@@ -402,48 +588,6 @@ pub(crate) async fn call(corpus: &RfcCorpus, tool: &str, input: Value) -> Result
             Ok(value)
         }
         "rfc.format_get" => format_get(corpus, decode(input)?).await,
-        "rfc.errata" => {
-            let input: ErrataInput = decode(input)?;
-            check_number(input.number)?;
-            Page {
-                offset: input.offset,
-                limit: input.limit,
-            }
-            .checked()?;
-            for filter in [&input.status, &input.kind].into_iter().flatten() {
-                check_query(filter, false)?;
-            }
-            let snapshot = if input.snapshot.is_none()
-                && corpus.store.dataset("errata", None).await?.is_none()
-            {
-                corpus.refresh_errata().await?;
-                corpus.publish_snapshot().await?
-            } else {
-                corpus.selected_snapshot(input.snapshot.as_deref()).await?
-            };
-            let dataset = dataset_for(corpus, &snapshot, "errata").await?;
-            let records = dataset
-                .records
-                .into_iter()
-                .filter(|r| {
-                    errata_number(r) == Some(input.number)
-                        && input.status.as_ref().is_none_or(|s| {
-                            r["errata_status_code"]
-                                .as_str()
-                                .is_some_and(|v| v.eq_ignore_ascii_case(s))
-                        })
-                        && input.kind.as_ref().is_none_or(|s| {
-                            r["errata_type_code"]
-                                .as_str()
-                                .is_some_and(|v| v.eq_ignore_ascii_case(s))
-                        })
-                })
-                .collect();
-            let mut value = page(records, input.offset, input.limit);
-            value["capture"] = capture_json(&dataset.capture, 86400);
-            attach_snapshot(&mut value, &snapshot);
-            Ok(value)
-        }
         "rfc.series_get" => {
             let input: SeriesInput = decode(input)?;
             check_number(input.number)?;
@@ -649,7 +793,7 @@ pub(crate) fn schemas() -> Vec<Value> {
         ),
         tool(
             "rfc.errata",
-            "Read original errata records and statuses against a pinned research snapshot; never modifies RFC text.",
+            "Read errata against a research snapshot. RFC 9525 members without prose qualification return their official links.",
             json!({"number":number,"status":text,"type":text,"snapshot":snapshot,"offset":offset,"limit":limit}),
             vec!["number"],
         ),

@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use devres_adapters::{Research, rfc::RfcConfig, rfc::RfcCorpus};
 use devres_application::{
     Cached, Fetcher, Retrieval, Store,
+    attribution_gate::{AttributionGate, RfcErrataMember},
     corpus::{Dataset, Document, Job, JobSpec, RfcCorpusStore, Snapshot},
 };
 use devres_domain::{
@@ -33,6 +34,8 @@ const XML_INDEX: &str = r#"<rfc-index xmlns="https://www.rfc-editor.org/rfc-inde
 const TEXT: &str = "RFC9000 αβ content. Multiplexed transport and exact research phrase.";
 const HTML_TEXT: &str = "<!doctype html><html><body><p>Multiplexed transport and exact research phrase.</p></body></html>";
 const PDF_BYTES: &[u8] = b"%PDF-1.7\nsynthetic fixture\n%%EOF\n";
+const PILOT_MEMBER: &str = r#"{ "errata_id": "8173", "doc-id": "RFC09525", "errata_status_code": "Held for Document Update", "errata_type_code": "Editorial", "orig_text": "pilot original sentinel", "correct_text": "pilot corrected sentinel", "notes": "pilot notes sentinel", "submitter_email": "private contact sentinel", "url": "https://untrusted.invalid" }"#;
+const NEIGHBOR_MEMBER: &str = r#"{"errata_id":8174,"doc-id":"RFC9525","errata_status_code":"Verified","errata_type_code":"Technical","notes":"neighbor prose sentinel"}"#;
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -58,6 +61,12 @@ struct State {
     snapshots: BTreeMap<String, Snapshot>,
     active: Option<String>,
     snapshot_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    capture_pause: Option<Arc<CapturePause>>,
+}
+
+struct CapturePause {
+    entered: tokio::sync::Semaphore,
+    proceed: tokio::sync::Semaphore,
 }
 #[derive(Default)]
 struct Memory(Mutex<State>, std::sync::atomic::AtomicBool);
@@ -67,13 +76,15 @@ impl Store for Memory {
         Ok(self.0.lock().await.heads.get(key).cloned())
     }
     async fn capture(&self, id: &str) -> Result<StoredCapture> {
-        self.0
-            .lock()
-            .await
-            .captures
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Error::not_found("Synthetic capture absent."))
+        let (capture, pause) = {
+            let state = self.0.lock().await;
+            (state.captures.get(id).cloned(), state.capture_pause.clone())
+        };
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.proceed.acquire().await.unwrap().forget();
+        }
+        capture.ok_or_else(|| Error::not_found("Synthetic capture absent."))
     }
     async fn publish(
         &self,
@@ -423,8 +434,313 @@ impl Harness {
         self.store.save_snapshot(&snapshot).await.unwrap();
         snapshot
     }
+    async fn seed_pilot_errata(&self, base: &Snapshot, id: &str, export: &str) -> Snapshot {
+        let stored = self
+            .source("rfc:errata", ERRATA, "application/json", export.as_bytes())
+            .await;
+        let mut snapshot = base.clone();
+        snapshot.id = id.into();
+        snapshot.errata_capture = Some(stored.capture.id.clone());
+        self.store
+            .save_dataset(
+                "errata",
+                &Dataset {
+                    capture: stored.capture,
+                    records: serde_json::from_str(export).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        self.store.save_snapshot(&snapshot).await.unwrap();
+        snapshot
+    }
 }
 use devres_application::Clock as _;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureRights {
+    Permitted,
+    Restricted,
+    Unresolved,
+}
+
+struct PilotAttribution {
+    capture: String,
+    export_body: String,
+    rights: [FixtureRights; 3],
+}
+
+#[async_trait]
+impl AttributionGate for PilotAttribution {
+    async fn qualify(&self, provider: &str, evidence: &Value) -> Result<Value> {
+        if provider == "capture" {
+            assert_eq!(
+                evidence["contents"][0]["_meta"]["source_evidence"]["capture"]["source_url"],
+                ERRATA
+            );
+            return Err(Error::unavailable("Aggregate attribution blocked."));
+        }
+        assert_eq!(provider, "rfc");
+        assert_eq!(evidence["capture"]["source_url"], ERRATA);
+        Err(Error::unavailable("Aggregate attribution blocked."))
+    }
+
+    async fn qualify_rfc_erratum(&self, member: &RfcErrataMember<'_>) -> Result<Option<Value>> {
+        assert_eq!(member.rfc, 9525);
+        if member.errata_id != 8173 {
+            return Ok(None);
+        }
+        let exact = member.export_capture == self.capture
+            && member.export_body == self.export_body
+            && member.member_body == format!("blake3:{}", blake3::hash(PILOT_MEMBER.as_bytes()));
+        Ok(
+            (exact && self.rights == [FixtureRights::Permitted; 3]).then(|| {
+                json!({
+                    "status":"ready",
+                    "readable_notice":"Fixture IETF and contributor attribution.",
+                "resource_uri":format!("devres://attribution/blake3:{}", "1".repeat(64)),
+                })
+            }),
+        )
+    }
+
+    async fn bundle(&self, _: &str, _: usize, _: usize) -> Result<Value> {
+        Err(Error::not_found("No fixture resource."))
+    }
+
+    async fn status(&self) -> Result<Value> {
+        Ok(json!({}))
+    }
+}
+
+#[tokio::test]
+async fn pilot_errata_qualifies_exact_members_after_filtering_and_pagination() {
+    use FixtureRights::{Permitted, Restricted, Unresolved};
+
+    let _fixture_processors = FIXTURE_PROCESSORS.lock().await;
+    let harness = Harness::new(false).await;
+    let base = harness
+        .seed_snapshot("Transport Protocol", &"4".repeat(64))
+        .await;
+    let old_export = format!("[\n{PILOT_MEMBER},\n{NEIGHBOR_MEMBER}\n]");
+    let old = harness
+        .seed_pilot_errata(&base, &"5".repeat(64), &old_export)
+        .await;
+    let same = harness
+        .seed_pilot_errata(&base, &"6".repeat(64), &old_export)
+        .await;
+    let newer_export = format!("[ {PILOT_MEMBER}, {NEIGHBOR_MEMBER} ]");
+    let new = harness
+        .seed_pilot_errata(&base, &"7".repeat(64), &newer_export)
+        .await;
+    let link = json!({"source_url":"https://www.rfc-editor.org/errata/eid8173"});
+    let neighbor = json!({"source_url":"https://www.rfc-editor.org/errata/eid8174"});
+    let capture = old.errata_capture.unwrap();
+    assert_eq!(same.errata_capture.as_deref(), Some(capture.as_str()));
+    for rights in [
+        [Permitted, Restricted, Permitted],
+        [Permitted, Permitted, Unresolved],
+        [Permitted; 3],
+    ] {
+        let research = Research::new(harness.retrieval.clone())
+            .await
+            .unwrap()
+            .with_corpus(harness.corpus.clone())
+            .with_attribution_gate(Arc::new(PilotAttribution {
+                capture: capture.clone(),
+                export_body: digest(old_export.as_bytes()),
+                rights,
+            }));
+        let pinned = research
+            .call("rfc.errata", json!({"number":9525,"snapshot":old.id}))
+            .await
+            .unwrap();
+        assert_eq!(pinned["snapshot"], old.id);
+        assert_eq!(pinned["capture"]["id"], capture);
+        assert!(pinned["capture"].get("resource_uri").is_none());
+        assert_eq!(pinned["total"], 2);
+        assert_eq!(pinned["items"][1], neighbor);
+        let serialized = pinned.to_string();
+        for private in [
+            "neighbor prose sentinel",
+            "private contact sentinel",
+            "untrusted.invalid",
+        ] {
+            assert!(!serialized.contains(private));
+        }
+        if rights == [Permitted; 3] {
+            let item = &pinned["items"][0];
+            assert_eq!(item["orig_text"], "pilot original sentinel");
+            assert_eq!(item["correct_text"], "pilot corrected sentinel");
+            assert_eq!(item["notes"], "pilot notes sentinel");
+            assert_eq!(item["citation"]["capture"], capture);
+            assert_eq!(item["citation"]["body_hash"], digest(old_export.as_bytes()));
+            assert_eq!(
+                item["citation"]["member_body"],
+                format!("blake3:{}", blake3::hash(PILOT_MEMBER.as_bytes()))
+            );
+            assert_eq!(
+                pinned["attribution"]["resource_uri"],
+                format!("devres://attribution/blake3:{}", "1".repeat(64))
+            );
+            let filtered = research
+                .call(
+                    "rfc.errata",
+                    json!({"number":9525,"type":"editorial","status":"held for document update","snapshot":same.id}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(filtered["total"], 1);
+            assert_eq!(&filtered["items"][0], item);
+        } else {
+            assert_eq!(pinned["items"][0], link);
+            assert_eq!(pinned["attribution"]["copied_content"], false);
+            assert!(!serialized.contains("sentinel"));
+        }
+        let latest = research
+            .call("rfc.errata", json!({"number":9525,"limit":1}))
+            .await
+            .unwrap();
+        assert_eq!(latest["snapshot"], new.id);
+        assert_eq!(latest["items"], json!([link]));
+        assert_eq!(latest["next_offset"], 1);
+        let next = research
+            .call(
+                "rfc.errata",
+                json!({"number":9525,"snapshot":new.id,"offset":1,"limit":1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next["items"], json!([neighbor]));
+        assert_eq!(next["next_offset"], Value::Null);
+        let empty = research
+            .call(
+                "rfc.errata",
+                json!({"number":9525,"status":"Rejected","snapshot":new.id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty["total"], 0);
+        assert_eq!(empty["items"], json!([]));
+        let aggregate = research
+            .call("rfc.errata", json!({"number":9000,"snapshot":base.id}))
+            .await
+            .unwrap_err();
+        assert_eq!(aggregate.code, "unavailable");
+        let resource = research
+            .read_resource(&format!("devres://capture/{capture}"))
+            .await
+            .unwrap_err();
+        assert_eq!(resource.code, "unavailable");
+    }
+    let no_gate = harness
+        .research
+        .call("rfc.errata", json!({"number":9525,"snapshot":old.id}))
+        .await
+        .unwrap();
+    assert_eq!(no_gate["items"], json!([link, neighbor]));
+    assert!(harness.fixture.calls.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn pilot_errata_rejects_inconsistent_capture_or_member() {
+    let _fixture_processors = FIXTURE_PROCESSORS.lock().await;
+    let harness = Harness::new(false).await;
+    let base = harness
+        .seed_snapshot("Transport Protocol", &"8".repeat(64))
+        .await;
+    let snapshot = harness
+        .seed_pilot_errata(&base, &"9".repeat(64), &format!("[{PILOT_MEMBER}]"))
+        .await;
+    let capture = snapshot.errata_capture.unwrap();
+    let dataset_key = ("errata".to_owned(), capture.clone());
+    let mut state = harness.store.0.lock().await;
+    let dataset = state.datasets.get_mut(&dataset_key).unwrap();
+    let original = dataset.records[0].clone();
+    dataset.records[0]["errata_id"] = json!(9001);
+    drop(state);
+
+    let call = || {
+        harness
+            .research
+            .call("rfc.errata", json!({"number":9525,"snapshot":snapshot.id}))
+    };
+    assert_eq!(call().await.unwrap_err().code, "integrity");
+    let mut state = harness.store.0.lock().await;
+    state.datasets.get_mut(&dataset_key).unwrap().records[0] = original;
+    state.captures.get_mut(&capture).unwrap().body = b"[]".to_vec().into();
+    drop(state);
+    assert_eq!(call().await.unwrap_err().code, "integrity");
+}
+
+#[tokio::test]
+async fn pilot_errata_holds_admission_until_cancelled_capture_reads_finish() {
+    let _fixture_processors = FIXTURE_PROCESSORS.lock().await;
+    let harness = Harness::new(false).await;
+    let base = harness
+        .seed_snapshot("Transport Protocol", &"a".repeat(64))
+        .await;
+    let snapshot = harness
+        .seed_pilot_errata(&base, &"b".repeat(64), &format!("[{PILOT_MEMBER}]"))
+        .await;
+    let research = Arc::new(harness.research);
+    let pause = Arc::new(CapturePause {
+        entered: tokio::sync::Semaphore::new(0),
+        proceed: tokio::sync::Semaphore::new(0),
+    });
+    harness.store.0.lock().await.capture_pause = Some(pause.clone());
+    let input = json!({"number":9525,"snapshot":snapshot.id});
+    let cancel = CancellationToken::new();
+    let calls = (0..2)
+        .map(|_| {
+            let (research, input, cancel) = (research.clone(), input.clone(), cancel.clone());
+            tokio::spawn(async move {
+                research
+                    .call_with_context(
+                        "rfc.errata",
+                        input,
+                        cancel,
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::timeout(Duration::from_secs(5), pause.entered.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    cancel.cancel();
+    for call in calls {
+        assert_eq!(call.await.unwrap().unwrap_err().code, "cancelled");
+    }
+    assert_eq!(
+        research
+            .call("rfc.errata", input.clone())
+            .await
+            .unwrap_err()
+            .code,
+        "capacity"
+    );
+    harness.store.0.lock().await.capture_pause = None;
+    pause.proceed.add_permits(2);
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match research.call("rfc.errata", input.clone()).await {
+                Err(error) if error.code == "capacity" => tokio::task::yield_now().await,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        result["items"][0]["source_url"],
+        "https://www.rfc-editor.org/errata/eid8173"
+    );
+}
 
 #[tokio::test]
 async fn additive_metadata_series_errata_filters_and_status_are_snapshot_bound() {
