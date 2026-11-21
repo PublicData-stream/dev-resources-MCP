@@ -220,18 +220,34 @@ pub(crate) async fn repair(
         .wiki_get("captures", id)
         .await?
         .ok_or_else(unavailable)?;
-    let actual = target(&retained.data)?.ok_or_else(unavailable)?;
+    if retained.key != id {
+        return Err(unavailable());
+    }
+    qualify_retained(requested, id, &retained.data)
+}
+
+fn qualify_retained(
+    requested: &AttributionTarget,
+    id: &str,
+    retained: &Value,
+) -> Result<AttributionGeneration> {
+    let actual = target(retained)?.ok_or_else(unavailable)?;
     if actual != *requested
-        || retained.key != id
-        || retained.data["acquisition_policy_epoch"].as_u64()
-            != Some(u64::from(ATTRIBUTION_POLICY_EPOCH))
-        || retained.data["acquisition_policy_fingerprint"].as_str()
-            != Some(ATTRIBUTION_POLICY_FINGERPRINT)
+        || retained
+            .pointer("/artifact/body_hash")
+            .and_then(Value::as_str)
+            != actual.evidence["source"]["body_hash"].as_str()
     {
         return Err(unavailable());
     }
+    let acquisition = [ATTRIBUTION_POLICY_V2, ATTRIBUTION_POLICY_V3]
+        .into_iter()
+        .find(|policy| {
+            retained["acquisition_policy_epoch"].as_u64() == Some(u64::from(policy.epoch))
+                && retained["acquisition_policy_fingerprint"].as_str() == Some(policy.fingerprint)
+        })
+        .ok_or_else(unavailable)?;
     let license = retained
-        .data
         .pointer("/license/url")
         .and_then(Value::as_str)
         .ok_or_else(unavailable)?;
@@ -243,7 +259,7 @@ pub(crate) async fn repair(
     ) {
         return Err(unavailable());
     }
-    let observed_at = retained.data["observed_at"]
+    let observed_at = retained["observed_at"]
         .as_i64()
         .filter(|n| *n >= 0 && *n <= devres_domain::unix_now().saturating_add(300))
         .ok_or_else(unavailable)?;
@@ -251,7 +267,7 @@ pub(crate) async fn repair(
     let revision = source["revision_id"].as_u64().ok_or_else(unavailable)?;
     let mut permalink =
         url::Url::parse("https://en.wikipedia.org/w/index.php").map_err(|_| unavailable())?;
-    let title = retained.data["title"].as_str().ok_or_else(unavailable)?;
+    let title = retained["title"].as_str().ok_or_else(unavailable)?;
     super::source::validate_title(title)?;
     permalink
         .query_pairs_mut()
@@ -274,6 +290,7 @@ pub(crate) async fn repair(
         receipts: vec![
             json!({"kind":"upstream_validation","source_url":source["source_url"],"body_hash":source["body_hash"],"status":200,"validated_at":observed_at,
             "policy_epoch":ATTRIBUTION_POLICY_EPOCH,"policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT,
+            "acquisition_policy_epoch":acquisition.epoch,"acquisition_policy_fingerprint":acquisition.fingerprint,
             "source_fingerprint":requested.subject.fingerprint,"capture":id,"qualification":"contemporaneous_acquisition"}),
         ],
     })
@@ -300,6 +317,45 @@ mod tests {
         );
         public["source_url"] = json!("https://attacker.invalid/w/rest.php/v1/page/X/with_html");
         assert!(target(&public).is_err());
+    }
+    #[test]
+    fn policy_three_requalifies_only_exact_compatible_wikipedia_receipts() {
+        let mut retained = source();
+        retained["title"] = json!("Artificial intelligence");
+        retained["observed_at"] = json!(10);
+        let requested = target(&retained).unwrap().unwrap();
+        let id = &requested.subject.key;
+        for policy in [ATTRIBUTION_POLICY_V2, ATTRIBUTION_POLICY_V3] {
+            retained["acquisition_policy_epoch"] = json!(policy.epoch);
+            retained["acquisition_policy_fingerprint"] = json!(policy.fingerprint);
+            let generation = qualify_retained(&requested, id, &retained).unwrap();
+            assert_eq!(generation.policy_epoch, ATTRIBUTION_POLICY_V3.epoch);
+            assert_eq!(
+                generation.receipts[0]["acquisition_policy_epoch"],
+                policy.epoch
+            );
+            assert_eq!(
+                generation.receipts[0]["body_hash"],
+                requested.evidence["source"]["body_hash"]
+            );
+        }
+        for (path, wrong) in [
+            ("/acquisition_policy_epoch", json!(1)),
+            ("/acquisition_policy_fingerprint", json!("unknown")),
+            ("/license/url", json!("https://example.invalid/")),
+            (
+                "/artifact/body_hash",
+                json!(crate::integrity::hash(b"changed")),
+            ),
+        ] {
+            let mut invalid = retained.clone();
+            *invalid.pointer_mut(path).unwrap() = wrong;
+            assert!(qualify_retained(&requested, id, &invalid).is_err());
+        }
+        let wrong_hash = json!(crate::integrity::hash(b"signed metadata digest mismatch"));
+        retained["body_hash"] = retained["artifact"]["body_hash"].clone();
+        retained["artifact"]["body_hash"] = wrong_hash;
+        assert!(qualify_retained(&requested, id, &retained).is_err());
     }
     #[test]
     fn discovery_exemption_cannot_carry_copied_content_or_arbitrary_urls() {

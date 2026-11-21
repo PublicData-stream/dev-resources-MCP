@@ -17,6 +17,7 @@ use tokio::{
     io::AsyncReadExt,
     sync::{Mutex, Semaphore},
 };
+use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 #[path = "storage_acceptance.rs"]
@@ -165,6 +166,33 @@ fn capture_metadata_digest(capture: &Capture) -> Result<String> {
         "body_hash":capture.body_hash,"media_type":capture.media_type,
         "retrieved_at":capture.retrieved_at
     }))
+}
+
+fn checked_capture_metadata(row: &sqlx_postgres::PgRow, validated_at: i64) -> Result<Capture> {
+    let capture = Capture {
+        id: row.try_get("id").map_err(|_| storage_error())?,
+        key: row.try_get("source_key").map_err(|_| storage_error())?,
+        source_url: row.try_get("source_url").map_err(|_| storage_error())?,
+        body_hash: row.try_get("body_hash").map_err(|_| storage_error())?,
+        media_type: row.try_get("media_type").map_err(|_| storage_error())?,
+        retrieved_at: row.try_get("retrieved_at").map_err(|_| storage_error())?,
+        validated_at,
+    };
+    let expected: String = row
+        .try_get("metadata_integrity")
+        .map_err(|_| Error::integrity("Capture integrity evidence missing."))?;
+    if capture_metadata_digest(&capture)? != expected {
+        return Err(Error::integrity("Capture metadata integrity failed."));
+    }
+    crate::integrity::verify(
+        &capture.id,
+        format!(
+            "{}\0{}\0{}\0{}",
+            capture.key, capture.source_url, capture.media_type, capture.body_hash
+        )
+        .as_bytes(),
+    )?;
+    Ok(capture)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -867,6 +895,15 @@ impl PgBlobStore {
         Ok(())
     }
     async fn blob(&self, content_hash: &str) -> Result<Body> {
+        self.blob_bounded(content_hash, MAX_BLOB, &CancellationToken::new())
+            .await
+    }
+    async fn blob_bounded(
+        &self,
+        content_hash: &str,
+        max_bytes: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Body> {
         if !valid_hash(content_hash) {
             return Err(Error::integrity("Invalid content hash"));
         }
@@ -874,12 +911,13 @@ impl PgBlobStore {
             .root
             .join(crate::integrity::relative_path(content_hash)?);
         let selected = path.clone();
+        let cancel = cancel.clone();
         let cache_lease = tokio::task::spawn_blocking(move || {
             crate::durable_archive::materialize_file(
                 &selected,
-                MAX_BLOB as u64,
+                max_bytes as u64,
                 std::time::Instant::now() + std::time::Duration::from_secs(15),
-                &tokio_util::sync::CancellationToken::new(),
+                &cancel,
             )
         })
         .await
@@ -891,7 +929,7 @@ impl PgBlobStore {
         if !metadata.is_file() {
             return Err(Error::integrity("Invalid stored blob"));
         }
-        if metadata.len() > MAX_BLOB as u64 {
+        if metadata.len() > max_bytes as u64 {
             return Err(Error::capacity(
                 "Bulk binary capture requires typed bounded processing.",
             ));
@@ -1071,35 +1109,14 @@ impl PgBlobStore {
         result
     }
     async fn load_row(&self, row: sqlx_postgres::PgRow, head: bool) -> Result<StoredCapture> {
-        let capture = Capture {
-            id: row.try_get("id").map_err(|_| storage_error())?,
-            key: row.try_get("source_key").map_err(|_| storage_error())?,
-            source_url: row.try_get("source_url").map_err(|_| storage_error())?,
-            body_hash: row.try_get("body_hash").map_err(|_| storage_error())?,
-            media_type: row.try_get("media_type").map_err(|_| storage_error())?,
-            retrieved_at: row.try_get("retrieved_at").map_err(|_| storage_error())?,
-            validated_at: row
-                .try_get(if head {
-                    "head_validated_at"
-                } else {
-                    "capture_validated_at"
-                })
-                .map_err(|_| storage_error())?,
-        };
-        let expected: String = row
-            .try_get("metadata_integrity")
-            .map_err(|_| Error::integrity("Capture integrity evidence missing."))?;
-        if capture_metadata_digest(&capture)? != expected {
-            return Err(Error::integrity("Capture metadata integrity failed."));
-        }
-        crate::integrity::verify(
-            &capture.id,
-            format!(
-                "{}\0{}\0{}\0{}",
-                capture.key, capture.source_url, capture.media_type, capture.body_hash
-            )
-            .as_bytes(),
-        )?;
+        let validated_at = row
+            .try_get(if head {
+                "head_validated_at"
+            } else {
+                "capture_validated_at"
+            })
+            .map_err(|_| storage_error())?;
+        let capture = checked_capture_metadata(&row, validated_at)?;
         if head {
             let proof: String = row
                 .try_get("head_integrity")

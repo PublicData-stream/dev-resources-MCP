@@ -148,6 +148,11 @@ impl WriterCoordinator {
                     .await?;
             }
             WriterEffect::AttributionEnqueue { target } => {
+                if target.subject.namespace == crate::rfc_erratum_attribution::NAMESPACE {
+                    return Err(Error::invalid(
+                        "Reviewed RFC errata require the writer's private evidence bundle.",
+                    ));
+                }
                 self.attribution.enqueue_public(&target).await?
             }
         }

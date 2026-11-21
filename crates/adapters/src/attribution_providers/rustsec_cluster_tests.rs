@@ -2,7 +2,7 @@
 //! Every source request is redirected by cfg(test) code to this loopback fixture.
 use super::*;
 use crate::{AttributionAdapter, PgBlobStore, Research};
-use crate::{RustSecRecoveryOptions, RustSecRecoveryOutcome, recover_rustsec_attribution};
+use crate::{RustSecRecoveryOptions, recover_rustsec_attribution};
 use devres_application::{
     Retrieval,
     advisory::{AdvisoryStore, RustSecConfig},
@@ -39,6 +39,8 @@ fn recovery_options(target: &AttributionTarget) -> RustSecRecoveryOptions {
             &json!({"version":1,"policy_epoch":ATTRIBUTION_POLICY_EPOCH,"subject":target.subject}),
         )
         .unwrap(),
+        policy_epoch: ATTRIBUTION_POLICY_EPOCH,
+        policy_fingerprint: ATTRIBUTION_POLICY_FINGERPRINT.into(),
         ..RustSecRecoveryOptions::current_policy()
     }
 }
@@ -330,7 +332,7 @@ async fn rustsec_collector_cluster_seed() {
             .with_attempt_budget(20)
             .unwrap(),
     );
-    let (selected_snapshot, selected_recovery) = {
+    let selected_snapshot = {
         let store = Arc::new(
             PgBlobStore::connect_archive_for_maintenance(&database, &root, archive.clone())
                 .await
@@ -364,43 +366,16 @@ async fn rustsec_collector_cluster_seed() {
             "refuse to claim unrelated fixture queue work"
         );
         drop(check);
-        let job = store
-            .attribution_claim(&["rustsec".into()], devres_domain::unix_now(), 0)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.target, target);
-        store
-            .attribution_fail_classified(
-                &job,
-                None,
-                "blocked",
-                &AttributionFailure::new(
-                    AttributionPhase::Mapping,
-                    AttributionFailureReason::UnsupportedSource,
-                    AttributionDisposition::Blocked,
-                ),
-            )
-            .await
-            .unwrap();
-        (snapshot, options)
+        assert_eq!(
+            recover_rustsec_attribution(&database, &options, false)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid_input",
+            "the historical recovery recipe cannot operate on a current-policy target"
+        );
+        snapshot
     };
-    wait_for_storage_quiescence(&database).await.unwrap();
-    // Exercise the production maintenance API only after every publication
-    // owner has dropped. The journal retains this exact original blocked state.
-    let dry = recover_rustsec_attribution(&database, &selected_recovery, false)
-        .await
-        .unwrap();
-    assert_eq!(dry.outcome, RustSecRecoveryOutcome::Eligible);
-    let selected_recovery = RustSecRecoveryOptions {
-        expected_state: Some(dry.state_digest),
-        ..selected_recovery
-    };
-    wait_for_storage_quiescence(&database).await.unwrap();
-    let applied = recover_rustsec_attribution(&database, &selected_recovery, true)
-        .await
-        .unwrap();
-    assert_eq!(applied.outcome, RustSecRecoveryOutcome::Applied);
     wait_for_storage_quiescence(&database).await.unwrap();
     let (snapshot, expected_get, expected_catalog, expected_notices) = {
         let store = Arc::new(
@@ -493,11 +468,6 @@ async fn rustsec_collector_cluster_seed() {
                 .await
                 .unwrap()
                 .is_some()
-        );
-        let journal = recover_rustsec_attribution(&database, &selected_recovery, false).await;
-        assert!(
-            journal.is_err(),
-            "maintenance owner excludes concurrent inspector lifecycle lock"
         );
         stop.cancel();
         worker.await.unwrap().unwrap();
@@ -602,13 +572,9 @@ async fn rustsec_collector_cluster_readback() {
         .attribution_ready(&target.subject)
         .await
         .unwrap()
-        .expect("recovered bundle remains ready");
+        .expect("qualified bundle remains ready");
     assert_eq!(qualified.generation.subject, target.subject);
-    let journal = recover_rustsec_attribution(&database, &recovery_options(&target), false)
-        .await
-        .unwrap();
-    assert_eq!(journal.outcome, RustSecRecoveryOutcome::AlreadyApplied);
-    assert!(!journal.eligible);
+    assert_eq!(qualified.generation.policy_epoch, ATTRIBUTION_POLICY_EPOCH);
     assert_eq!(
         store
             .advisory_snapshot(Some(snapshot), "rustsec")

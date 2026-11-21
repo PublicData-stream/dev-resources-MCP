@@ -1,7 +1,10 @@
 //! Source admission bridge for application-owned attribution repair policy.
+use crate::rfc_erratum_attribution::{self, ReviewedRfcErratum};
 use async_trait::async_trait;
-use devres_application::attribution::AttributionStore;
-use devres_application::attribution_runtime::AttributionAcquirer;
+use devres_application::{
+    attribution::AttributionStore, attribution_gate::RfcErrataMember,
+    attribution_runtime::AttributionAcquirer,
+};
 use devres_domain::{Result, attribution::*};
 use serde_json::Value;
 use std::sync::Arc;
@@ -11,6 +14,7 @@ pub struct AttributionAdapter {
     broker: Arc<crate::bulk::BulkBroker>,
     store: Arc<dyn AttributionStore>,
     wikipedia: Option<Arc<dyn devres_application::wikipedia::WikipediaStore>>,
+    reviewed_rfc_erratum: Option<ReviewedRfcErratum>,
 }
 impl AttributionAdapter {
     pub fn new(broker: Arc<crate::bulk::BulkBroker>, store: Arc<dyn AttributionStore>) -> Self {
@@ -18,6 +22,7 @@ impl AttributionAdapter {
             broker,
             store,
             wikipedia: None,
+            reviewed_rfc_erratum: None,
         }
     }
     pub fn with_wikipedia(
@@ -26,6 +31,16 @@ impl AttributionAdapter {
     ) -> Self {
         self.wikipedia = Some(store);
         self
+    }
+    pub fn with_reviewed_rfc_erratum(mut self, reviewed: Option<ReviewedRfcErratum>) -> Self {
+        self.reviewed_rfc_erratum = reviewed;
+        self
+    }
+    pub fn reviewed_rfc_erratum_target(&self) -> Result<Option<AttributionTarget>> {
+        self.reviewed_rfc_erratum
+            .as_ref()
+            .map(|_| rfc_erratum_attribution::pilot_target())
+            .transpose()
     }
     fn repair_source<'a>(
         &'a self,
@@ -132,6 +147,12 @@ impl AttributionAcquirer for AttributionAdapter {
     fn targets(&self, provider: &str, value: &Value) -> Result<Vec<AttributionTarget>> {
         crate::attribution_providers::targets(provider, value)
     }
+    fn rfc_erratum_target(
+        &self,
+        member: &RfcErrataMember<'_>,
+    ) -> Result<Option<AttributionTarget>> {
+        rfc_erratum_attribution::approved_target(member)
+    }
     async fn ensure_public(&self, subject: &AttributionSubject) -> Result<()> {
         if subject.provider != "wikipedia" {
             return Ok(());
@@ -149,6 +170,20 @@ impl AttributionAcquirer for AttributionAdapter {
         target: &AttributionTarget,
         cancel: CancellationToken,
     ) -> Result<AttributionGeneration> {
+        if target.subject.namespace == rfc_erratum_attribution::NAMESPACE {
+            let reviewed = self.reviewed_rfc_erratum.as_ref().ok_or_else(|| {
+                devres_domain::Error::unavailable("Reviewed RFC erratum evidence unavailable.")
+            })?;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(devres_domain::Error::new(
+                    "cancelled",
+                    "Attribution repair cancelled.",
+                )),
+                result = self.store.attribution_verify_target(target) => result?,
+            }
+            return reviewed.generation(target);
+        }
         self.store.attribution_verify_target(target).await?;
         if target
             .evidence

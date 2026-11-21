@@ -89,10 +89,10 @@ fn reference(value: &Reference) -> Result<()> {
     }
     Ok(())
 }
-fn validate_checkpoint(value: &Checkpoint) -> Result<()> {
+fn validate_checkpoint(value: &Checkpoint, policy: AttributionPolicyManifest) -> Result<()> {
     if value.version != 1
-        || value.policy_epoch != ATTRIBUTION_POLICY_EPOCH
-        || value.policy_fingerprint != ATTRIBUTION_POLICY_FINGERPRINT
+        || value.policy_epoch != policy.epoch
+        || value.policy_fingerprint != policy.fingerprint
         || value.recipe != "forward-origins-v2"
         || value.after < 0
         || value.cutoff.is_some_and(|cutoff| cutoff < value.after)
@@ -127,6 +127,46 @@ fn validate_checkpoint(value: &Checkpoint) -> Result<()> {
         }
     }
     bounded(value)?;
+    Ok(())
+}
+
+async fn checkpoints(
+    conn: &mut PgConnection,
+    policy: AttributionPolicyManifest,
+) -> Result<Vec<(String, Checkpoint)>> {
+    let rows = sqlx_core::query::query("SELECT provider,CASE WHEN octet_length(data::text)<=$1 THEN data END AS data,data_integrity FROM devres_attribution_origins ORDER BY provider LIMIT 5")
+        .bind(MAX_VALUE as i64).fetch_all(conn).await.map_err(|_| storage_error())?;
+    rows.into_iter()
+        .map(|row| {
+            let provider: String = row.try_get("provider").map_err(|_| invalid())?;
+            if !supports(&provider) {
+                return Err(invalid());
+            }
+            let value =
+                serde_json::from_value(checked(TABLE, &provider, &row)?).map_err(|_| invalid())?;
+            validate_checkpoint(&value, policy)?;
+            Ok((provider, value))
+        })
+        .collect()
+}
+
+pub(super) async fn reset_checkpoints(
+    conn: &mut PgConnection,
+    previous: AttributionPolicyManifest,
+) -> Result<()> {
+    let exists: bool = sqlx_core::query_scalar::query_scalar(
+        "SELECT to_regclass('public.devres_attribution_origins') IS NOT NULL",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|_| storage_error())?;
+    if exists {
+        checkpoints(conn, previous).await?;
+        sqlx_core::query::query("DELETE FROM devres_attribution_origins")
+            .execute(conn)
+            .await
+            .map_err(|_| storage_error())?;
+    }
     Ok(())
 }
 
@@ -408,7 +448,7 @@ fn source(provider: &str, snapshot: Value, member: Value) -> Result<AttributionT
         ),
         _ => return Err(invalid()),
     };
-    let mut targets = crate::attribution_providers::targets(provider, &evidence)?;
+    let mut targets = crate::attribution_providers::retained_origin_targets(provider, &evidence)?;
     if targets.len() != 1 {
         return Err(invalid());
     }
@@ -788,7 +828,7 @@ impl PgBlobStore {
                 ..Default::default()
             },
         };
-        validate_checkpoint(&checkpoint)?;
+        validate_checkpoint(&checkpoint, ATTRIBUTION_REQUIRED_POLICY)?;
         let table = table(provider)?;
         if checkpoint.cutoff.is_none() {
             let sql =
@@ -918,7 +958,7 @@ impl PgBlobStore {
                 Err(error) => return Err(error),
             }
         }
-        validate_checkpoint(&checkpoint)?;
+        validate_checkpoint(&checkpoint, ATTRIBUTION_REQUIRED_POLICY)?;
         let data = bounded(&checkpoint)?;
         sqlx_core::query::query("INSERT INTO devres_attribution_origins(provider,data,data_integrity) VALUES($1,$2,$3) ON CONFLICT(provider) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
             .bind(provider).bind(Json(&data)).bind(payload_integrity::digest(TABLE,"",provider,&data)?).execute(&mut *tx).await.map_err(source_error)?;
@@ -933,21 +973,18 @@ impl PgBlobStore {
         Ok(output)
     }
 
-    pub(super) async fn verify_attribution_origins(&self) -> Result<()> {
-        self.attribution_origin_status().await?;
+    pub(super) async fn verify_attribution_origins(
+        &self,
+        policy: AttributionPolicyManifest,
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await.map_err(|_| storage_error())?;
+        checkpoints(&mut conn, policy).await?;
         Ok(())
     }
     pub(super) async fn attribution_origin_status(&self) -> Result<Vec<Value>> {
-        let rows = sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_origins ORDER BY provider LIMIT 5").fetch_all(&self.pool).await.map_err(|_| storage_error())?;
+        let mut conn = self.pool.acquire().await.map_err(|_| storage_error())?;
         let mut output = Vec::new();
-        for row in rows {
-            let provider: String = row.try_get("provider").map_err(|_| invalid())?;
-            if !supports(&provider) {
-                return Err(invalid());
-            }
-            let value: Checkpoint =
-                serde_json::from_value(checked(TABLE, &provider, &row)?).map_err(|_| invalid())?;
-            validate_checkpoint(&value)?;
+        for (provider, value) in checkpoints(&mut conn, ATTRIBUTION_REQUIRED_POLICY).await? {
             output.push(json!({"provider":provider,"policy_epoch":value.policy_epoch,"recipe":value.recipe,"completed_passes":value.passes,"pending_frames":value.frontier.len(),"gap":value.gap}));
         }
         Ok(output)
@@ -1327,7 +1364,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(checkpoint.0["policy_epoch"], 2);
+        assert_eq!(checkpoint.0["policy_epoch"], ATTRIBUTION_POLICY_EPOCH);
         drop(store);
         let store = PgBlobStore::connect(url.as_str(), root.path())
             .await

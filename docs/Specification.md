@@ -92,9 +92,9 @@ payload bounds remain withheld. Status counters describe target transitions with
 the current process and do not establish unique-document counts or corpus completion.
 Valid metadata containing copied prose without its exact notice dependency is
 classified as `qualification / unqualified_scope / blocked`; that condition does
-not establish malformed evidence. The classification does not permit copying the
-prose, change policy v2, or reset historical blocked targets. See the separate
-[errata qualification proposal](rfc-errata-qualification-design.md).
+not establish malformed evidence. Policy 3 adds an independently qualified
+member recipe for RFC 9525 erratum 8173. Historical aggregate targets retain
+their recorded classifications. See [errata qualification](rfc-errata-qualification-design.md).
 
 ## MCP and transport
 
@@ -150,7 +150,7 @@ behavior.
 | `rfc.catalog_search` | Metadata query, conjunctive filters and snapshot-based paging |
 | `rfc.fulltext_search` | Technical AND tokens or English phrases/OR/exclusions; filters, assurance and pinned snapshot |
 | `rfc.format_get` | RFC number, txt/html/xml/pdf, optional capture; source text or base64 PDF byte page |
-| `rfc.errata` | RFC number, optional status/type and snapshot; original errata records |
+| `rfc.errata` | RFC number, optional status/type and snapshot; errata records or verified official links |
 | `rfc.series_get` | STD/BCP/FYI number and snapshot; constituent RFC metadata |
 | `rfc.corpus_status` | Aggregate collection, freshness, failures and snapshot coverage; no administrative controls |
 | `packages.crate.search` | Query and page; bounded upstream crate search |
@@ -202,6 +202,21 @@ stream, area, working group, series membership and inclusive `YYYY-MM` publicati
 bounds. Missing publication precision cannot satisfy a date bound. RFC query and
 filter strings cap at 256 Unicode characters. The RFC branch of generic `search`
 remains metadata-only.
+
+For RFC 9525, `rfc.errata` applies the status/type filters and pagination before
+checking the selected members against the retained export. Erratum 8173 with
+a matching ready policy-3 generation includes the retained `orig_text`,
+`correct_text` and `notes` with readable attribution, an immutable notice
+resource and a citation carrying the exact capture, export and member identities.
+Each verified member without prose qualification has a single `source_url` field
+such as
+`{"source_url":"https://www.rfc-editor.org/errata/eid8173"}`. The response
+retains the snapshot, export capture identity, `total`, `offset`, and
+`next_offset`. A page without copied content reports
+`attribution.status = "metadata_only"`. An unavailable or inconsistent retained
+member follows the existing tool error path. Generic capture resources still
+require their own attribution qualification. Errata results for other RFCs use
+the aggregate attribution path.
 
 Full-text defaults to lowercase technical tokens with document-level AND. English
 mode adds stemming and stopwords and accepts quoted phrases, `OR`, and minus

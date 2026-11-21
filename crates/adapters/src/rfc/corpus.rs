@@ -34,6 +34,8 @@ pub struct RfcConfig {
     pub errata_refresh_secs: u64,
     pub body_refresh_secs: u64,
     pub collection_interval_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub erratum_8173_evidence_dir: Option<PathBuf>,
 }
 impl Default for RfcConfig {
     fn default() -> Self {
@@ -43,6 +45,7 @@ impl Default for RfcConfig {
             errata_refresh_secs: 86400,
             body_refresh_secs: 86400,
             collection_interval_secs: 1,
+            erratum_8173_evidence_dir: None,
         }
     }
 }

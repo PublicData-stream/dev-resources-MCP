@@ -375,7 +375,11 @@ pub(super) async fn inspect(
         let row=sqlx_core::query::query("SELECT id,provider,policy_epoch,status,priority,retry_at,data,data_integrity FROM devres_attribution_targets WHERE id=$1 AND provider='rustsec'")
             .bind(id).fetch_one(&mut reader.conn).await.map_err(|_|unavailable())?;
         selected["attribution_target"] =
-            super::super::attribution_storage::recovery::checked_target_summary(&row)?;
+            super::super::attribution_storage::recovery::checked_target_summary(
+                &mut reader.conn,
+                &row,
+            )
+            .await?;
     }
     if !report.complete {
         report.outcome = DiagnosisOutcome::AttemptedPayloadUnlinked;

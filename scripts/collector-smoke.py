@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 from mcp_smoke import Client, MODERN, LEGACY
 
-ATTRIBUTION_POLICY_EPOCH = 2
-ATTRIBUTION_POLICY_FINGERPRINT = 'devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices'
+ATTRIBUTION_POLICY_EPOCH = 3
+ATTRIBUTION_POLICY_FINGERPRINT = 'devres-attribution-v3:verified-forward-origins:member-scopes:rfc-erratum-8173:readable-notices'
 MAX_NOTICE_BYTES = 65536
 NOTICE_PAGE_BYTES = 1024
 # A UTF-8 page can trim up to three bytes from its requested end.

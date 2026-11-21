@@ -96,6 +96,7 @@ async fn current_visibility_overrides_ready_attribution_and_known_bundle_urls() 
 struct Memory {
     queued: Mutex<Vec<AttributionTarget>>,
     ready: Mutex<Option<QualifiedAttribution>>,
+    ready_error: Mutex<Option<&'static str>>,
     failures: AtomicUsize,
     attempts: AtomicUsize,
     last_retry: Mutex<Option<i64>>,
@@ -117,6 +118,9 @@ impl AttributionStore for Memory {
         &self,
         _: &AttributionSubject,
     ) -> Result<Option<QualifiedAttribution>> {
+        if let Some(code) = *self.ready_error.lock().await {
+            return Err(Error::new(code, "Fixture attribution lookup failed."));
+        }
         Ok(self.ready.lock().await.clone())
     }
     async fn attribution_claim(
@@ -275,6 +279,132 @@ fn generation() -> AttributionGeneration {
         receipts: vec![json!({"status":200,"body_hash":"exact"})],
     }
 }
+
+struct ErratumAcquirer(AttributionTarget);
+
+#[async_trait]
+impl AttributionAcquirer for ErratumAcquirer {
+    fn targets(&self, _: &str, _: &Value) -> Result<Vec<AttributionTarget>> {
+        Err(Error::integrity(
+            "Member qualification used aggregate mapping.",
+        ))
+    }
+
+    fn rfc_erratum_target(
+        &self,
+        member: &RfcErrataMember<'_>,
+    ) -> Result<Option<AttributionTarget>> {
+        Ok((member.export_capture == "fixture-capture"
+            && member.export_body == "fixture-export"
+            && member.member_body == "fixture-member"
+            && member.rfc == 9525
+            && member.errata_id == 8173)
+            .then(|| self.0.clone()))
+    }
+
+    async fn repair(
+        &self,
+        _: &AttributionTarget,
+        _: CancellationToken,
+    ) -> Result<AttributionGeneration> {
+        Err(Error::integrity("Reader attempted member repair."))
+    }
+}
+
+#[tokio::test]
+async fn reviewed_erratum_uses_ready_member_notice_without_request_enqueue() {
+    let store = Arc::new(Memory::default());
+    let mut target = target();
+    target.subject.provider = "rfc".into();
+    target.subject.namespace = "errata-member".into();
+    let runtime = AttributionRuntime::new(
+        store.clone(),
+        Arc::new(ErratumAcquirer(target.clone())),
+        vec![],
+    )
+    .unwrap();
+    let mut member = RfcErrataMember {
+        export_capture: "fixture-capture",
+        export_body: "fixture-export",
+        member_body: "fixture-member",
+        rfc: 9525,
+        errata_id: 8173,
+    };
+    assert!(
+        runtime
+            .qualify_rfc_erratum(&member)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for code in ["unavailable", "capacity"] {
+        *store.ready_error.lock().await = Some(code);
+        assert!(
+            runtime
+                .qualify_rfc_erratum(&member)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    *store.ready_error.lock().await = Some("integrity");
+    assert_eq!(
+        runtime.qualify_rfc_erratum(&member).await.unwrap_err().code,
+        "integrity"
+    );
+    *store.ready_error.lock().await = None;
+    let id = format!("blake3:{}", "a".repeat(64));
+    let mut generation = generation();
+    generation.subject = target.subject;
+    *store.ready.lock().await = Some(QualifiedAttribution {
+        id: id.clone(),
+        generation: generation.clone(),
+    });
+    let qualified = runtime.qualify_rfc_erratum(&member).await.unwrap().unwrap();
+    assert_eq!(qualified["policy_epoch"], ATTRIBUTION_POLICY_EPOCH);
+    assert_eq!(
+        qualified["resource_uri"],
+        format!("devres://attribution/{id}")
+    );
+    assert!(
+        qualified["readable_notice"]
+            .as_str()
+            .unwrap()
+            .ends_with("original notice")
+    );
+    assert_eq!(
+        runtime.bundle(&id, 0, 4096).await.unwrap()["contents"][0]["text"],
+        qualified["readable_notice"]
+    );
+    member.member_body = "changed-member";
+    assert!(
+        runtime
+            .qualify_rfc_erratum(&member)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    member.member_body = "fixture-member";
+    generation.policy_epoch = ATTRIBUTION_POLICY_V2.epoch;
+    generation.policy_fingerprint = ATTRIBUTION_POLICY_V2.fingerprint.into();
+    *store.ready.lock().await = Some(QualifiedAttribution {
+        id: id.clone(),
+        generation,
+    });
+    assert!(
+        runtime
+            .qualify_rfc_erratum(&member)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        runtime.bundle(&id, 0, 4096).await.unwrap()["contents"][0]["_meta"]["attribution"]["policy_epoch"],
+        2
+    );
+    assert!(store.queued.lock().await.is_empty());
+}
+
 #[async_trait]
 impl AttributionAcquirer for Acquirer {
     fn targets(&self, _: &str, _: &Value) -> Result<Vec<AttributionTarget>> {

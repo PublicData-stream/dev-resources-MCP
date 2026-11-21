@@ -38,6 +38,8 @@ pub mod mdn;
 pub mod npm;
 pub mod rfc;
 pub mod rfc_errata_evidence;
+mod rfc_erratum_attribution;
+pub use rfc_erratum_attribution::ReviewedRfcErratum;
 pub mod rustsec;
 pub mod w3c;
 pub mod whatwg;

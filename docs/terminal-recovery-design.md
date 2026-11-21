@@ -1,8 +1,8 @@
-# Exact retained collection recovery under attribution policy 2
+# Exact retained collection recovery
 
 Recovery is private offline maintenance, never an MCP tool. The implementation
-adds schema 19 and retains policy 2. It does not authorize production application,
-source-provider traffic, a generic SQL reset, or publication of unqualified prose.
+added schema 19 under policy 2. Production application and provider traffic
+require separate authorization, and every action selects an exact retained target.
 The failed [91c7bcb7 deployment](../deploy/production/upgrade-91c7bcb7-evidence.md)
 remains failed evidence; these tools do not replay its consumed continuation.
 
@@ -100,7 +100,8 @@ successful publication or readable notices.
 ## RFC and errata boundaries
 
 No proved RFC mapping/compiler defect or positive RFC recovery recipe is currently
-registered. Exact RFC selection is available through a read-only dry-run:
+registered for `recover-collection`. Exact RFC selection is available through a
+read-only dry-run:
 
 ```sh
 devres-server recover-collection dry-run /etc/devres/reader.toml \
@@ -117,9 +118,13 @@ remain blocked. Ordinary due retries and expired claims retain normal writer
 ownership; queue progress alone does not prove their content recovered.
 
 The local [errata evidence validator](rfc-errata-qualification-design.md#local-evidence-validation)
-checks packaging and exact selected bytes for review. Policy 2 remains active;
-complete packaging still has `publication_authorized=false`. No policy 3 promotion,
-new destination admission or source acquisition is implemented by this workflow.
+checks packaging and exact selected bytes for review. Complete packaging still
+has `publication_authorized=false`. The separately reviewed
+[policy-3 member recipe](rfc-errata-qualification-design.md#policy-3-and-rollout)
+uses normal writer startup and fenced attribution publication for RFC 9525
+erratum 8173. It leaves the blocked policy-2 aggregate target verifiable.
+The historical `rustsec-captures-v2` rearm applies only in its matching policy-2
+deployment. On policy 3, current qualification follows ordinary bounded repair.
 
 ## Acceptance
 

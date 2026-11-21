@@ -197,13 +197,15 @@ class CollectorSmokeTests(unittest.TestCase):
         notice_body=('First-party synthetic RustSec fixture notice CC-BY-4.0 GHSA-synthetic-fixture 원문\n'*40)
         notice='https://fixtures.invalid/original\n'+notice_body
         subject = {'provider': 'rustsec', 'namespace': 'source', 'key': 'fixture-source', 'fingerprint': 'blake3:' + '5' * 64}
+        current_epoch = smoke.ATTRIBUTION_POLICY_EPOCH
+        previous_epoch = current_epoch - 1
         class RustsecClient(Client):
             corrupt=False
             def __init__(self):
                 super().__init__()
                 self.notice_pages = []
             def attribution(self):
-                return {'status':'ready', 'policy_epoch':1 if self.corrupt=='outer_epoch' else 2,
+                return {'status':'ready', 'policy_epoch':previous_epoch if self.corrupt=='outer_epoch' else current_epoch,
                         'policy_fingerprint':'wrong' if self.corrupt=='fingerprint' else smoke.ATTRIBUTION_POLICY_FINGERPRINT}
             def tool(self,tool,args,revision):
                 if tool=='packages.crate.advisory_catalog_search':
@@ -224,7 +226,7 @@ class CollectorSmokeTests(unittest.TestCase):
                     if self.corrupt=='no_progress':chunk='';end=start
                     self.notice_pages.append((revision, chunk))
                     return {'contents':[{'uri':notice_uri,'text':chunk,'_meta':{'offset':start,'total_bytes':len(notice.encode())+(1 if self.corrupt=='total' else 0),
-                            'attribution':{'policy_epoch':1 if self.corrupt=='epoch' else 2,'subject':{} if self.corrupt=='subject' else subject,'id':'wrong' if self.corrupt=='id' else notice_uri.rsplit('/',1)[-1]},'next_offset':0 if self.corrupt is True else None if self.corrupt=='premature_final' else end if end<len(notice.encode()) else None}}]}
+                            'attribution':{'policy_epoch':previous_epoch if self.corrupt=='epoch' else current_epoch,'subject':{} if self.corrupt=='subject' else subject,'id':'wrong' if self.corrupt=='id' else notice_uri.rsplit('/',1)[-1]},'next_offset':0 if self.corrupt is True else None if self.corrupt=='premature_final' else end if end<len(notice.encode()) else None}}]}
                 if args.get('uri')==uri:
                     return {'contents':[{'text':'rustsecfixturebody','_meta':{'attribution':self.attribution(),'source_evidence':{'snapshot':{'id':snapshot}}}}, {'text':notice}]}
                 return super().call(method,args,revision)

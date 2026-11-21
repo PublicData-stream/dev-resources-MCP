@@ -1,5 +1,89 @@
 # Operations and acceptance
 
+## Attribution policy 3 and RFC 9525 erratum 8173
+
+The sole writer promotes the global required epoch to 3 during its existing
+owner-fenced startup. Use the same release for the writer, readers and
+maintenance tools. Policy 3 retains the existing storage schema. It preserves
+historical targets and uses ordinary bounded repair to establish current
+qualification under existing budgets. A startup success or completed discovery
+pass alone does not establish current content readiness.
+
+Prepare the private [member evidence bundle](rfc-errata-qualification-design.md#local-evidence-validation)
+for the writer. Retain separate sanitized packaging and sealed archive inspection
+reports. Supply `rfc.erratum_8173_evidence_dir` only to the writer. Keep the
+original manifest bytes, six dependency bodies and export outside repository,
+image, test fixtures and logs. The runtime reads the export from its configured
+archive and the supervised RFC repair lane publishes it. `rfc.enabled` admits
+the existing RFC collector and repair traffic, so include both in activation
+budgeting. The member recipe adds no provider acquisition destination.
+
+### Fixture and clone acceptance
+
+Run the existing PostgreSQL, pinned-edge, and filesystem/S3 minikube fixtures
+with isolated temporary state and no `--live` option. For Codex, use the
+privileged command channel for shared Cargo cache access. The wrapper selects
+private caches by default. Apply the shared cache overrides from
+[local gates](#local-gates) where needed.
+
+```sh
+scripts/with-tmp-state.sh bash -c '
+  set -eu
+  export CARGO_TARGET_DIR=/tmp/rust/target OXIBELT_TARGET_DIR=/tmp/rust/target
+  scripts/test-postgres.sh
+  scripts/test-oxibelt.sh
+  scripts/test-minikube.sh
+  scripts/test-minikube.sh --s3
+'
+```
+
+Use matching pre-promotion database and archive fixtures to compare epoch 2 and
+epoch 3. Cover all nine providers with known ready, capture-fixed records and
+retain only provider names, result codes, identities and timings in the
+comparison. Use `rfc.format_get`, `packages.crate.source_read`,
+`packages.crate.advisory_get`, `mdn.get`, `whatwg.get`, `w3c.get`, `chromium.get`,
+`packages.npm.advisory_get` and `wikipedia.get`. Freeze the request arguments
+before promotion, including `metadata_capture` and `archive_capture` for crate
+source reads. Verify the same content, source/capture or snapshot identity
+and complete notice bytes after requalification. Expect new current generation
+IDs and verify previous notice URIs separately against their historical policy.
+Check that pending, blocked and unsupported selections withhold prose and that
+policy-2 blocked targets remain intact. Fixtures use deterministic synthetic
+records and controlled acquisition, with no production evidence bundle.
+
+Rehearse promotion with a coordinated clone of database and archive, a separate
+writer identity, and staged candidate images. Fence it from production workloads.
+Identify a ready baseline record for every provider and record the exact input
+pins, current generations, failure counts and source budgets. Verify the
+checkpoint and restore on the clone using `verify-storage` for filesystem or
+`verify-object-storage` for S3. Measure elapsed requalification, retries, queue
+admission and capacity within an agreed budget and stop time. Include writer
+restart and exact historical notice readback. Record separately any outstanding
+provider gaps, native CI evidence and authorized live-source checks.
+
+### Production activation and restoration
+
+Obtain separate approval for release and production activation, including the
+requalification traffic budget and a maintenance window informed by the clone.
+Record the exact release and immutable image digests. Stop serving and the old
+writer, take and verify a coordinated database/archive checkpoint, then start
+the sole candidate writer and candidate readers behind the maintenance boundary.
+Check the sealed current epoch and fingerprint from the
+[qualification design](rfc-errata-qualification-design.md#policy-3-and-rollout).
+Keep public traffic gated until the fixed baseline record for each enabled
+provider has current qualification and its previous notice resource verifies. Restore the
+paired checkpoint with the previous binaries if integrity, ownership, budget,
+readiness or time gates fail. Rollback uses that verified pair and avoids editing
+the epoch or resetting historical targets.
+
+Verify `rfc.errata` for RFC 9525 both unpinned and pinned to the reviewed
+snapshot. On the reviewed export, compare all three fields, their citation and
+paged notices without retaining prose in reports. A newer exact export without
+its own approval returns the official URL. Check URL-only neighbors, absence of
+prose in every fallback representation, and the aggregate capture's independent
+qualification. Repeat the checks after opening traffic through the configured
+edge and keep fixture, clone, provider and production evidence separate.
+
 ## Schema 19 and local diagnostic tooling
 
 Schema 19 adds immutable npm job history and recovery admissions plus a separate
@@ -7,7 +91,7 @@ historical recovery queue. Stop readers and writers and preserve a coordinated
 PostgreSQL/archive checkpoint before activating the new writer. Update reader
 SELECT grants for the three new tables and include them in full integrity/restore
 acceptance. Older binaries reject the new schema; rollback requires the matching
-pre-upgrade database/archive backup. Policy 2 remains unchanged. See
+pre-upgrade database/archive backup. Schema 19 originally ran with policy 2. See
 [exact recovery](terminal-recovery-design.md) for private command syntax and
 [local diagnostics](diagnostic-tooling.md) for bounded IPv4 reproduction.
 The [local verification record](recovery-diagnostics-acceptance.md) records completed
@@ -16,12 +100,10 @@ fixture, PostgreSQL, pinned-edge and minikube checks and their operational limit
 ## Attribution policy v2 and shared read admission
 
 Schema 18 adds the sealed, provider-local `devres_attribution_origins` checkpoint
-table. Upgrade the writer, readers and maintenance tools together with readers
-stopped for the owner-fenced schema transition. Normal writer startup promotes
-the required attribution policy to v2 and resets only bounded sweep metadata;
-it does not traverse history or acquire upstream evidence during startup. Old
-binaries reject the new schema/policy. Take a coordinated PostgreSQL/blob backup
-before activation; downgrade requires restoring that matching backup.
+table. The transition required a coordinated upgrade of writer, readers and
+maintenance tools. Its sole-writer startup promoted the required attribution
+policy to v2 and reset bounded sweep metadata. Older binaries rejected the
+new schema and policy. Rollback requires the matching coordinated backup.
 
 Existing v1 targets, generations, notices and RustSec recovery receipts remain
 retained and verifiable. They do not establish v2 readiness. Background discovery
@@ -665,10 +747,11 @@ a previously verified digest through a separately authorized deployment operatio
 
 ### Exact RustSec attribution recovery
 
-`recover-rustsec-attribution` is private offline maintenance. It does not acquire
-provider data, start collection, upgrade schema or publish qualification. Dry-run
-uses a reader connection and accepts active schemas 14 through 19; older schemas
-report that upgrade is required before applying recovery.
+`recover-rustsec-attribution` is private offline maintenance. The commands below
+apply to the matching policy-2 deployment and prepare its exact target for
+ordinary writer repair. On policy 3, use the ordinary bounded repair path and
+verify historical journals with their registered recipes. Dry-run uses a reader
+connection and accepts active schemas 14 through 19 for supported policies.
 
 ```sh
 devres-server recover-rustsec-attribution /etc/devres/reader.toml \
@@ -684,8 +767,8 @@ Select an exact target using private diagnosis. Only current-policy RustSec
 recipe are eligible. Unknown legacy failures, unsupported mappings, missing rights,
 active claims and ready generations are not reset. A retained dependency target
 must reproduce its sealed compiler recipe. The v1 recipe/defaults remain pinned
-to policy 1 for compatibility; current-policy recovery explicitly selects v2.
-Historical v1 recovery journal entries retain their original verifier.
+to policy 1 for compatibility. Historical recovery journal entries retain their
+original verifier.
 
 For a separately authorized operational application, first stop all serving and
 writer participants and preserve the coordinated database/archive backup. Apply

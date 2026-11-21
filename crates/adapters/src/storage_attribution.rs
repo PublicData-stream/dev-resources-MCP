@@ -1,5 +1,9 @@
 //! Owner-fenced attribution state. SQL indexes are checked against sealed payloads.
-use super::{PgBlobStore, capture_metadata_digest, payload_integrity, storage_error};
+use super::{
+    PgBlobStore, capture_metadata_digest, checked_capture_metadata, payload_integrity,
+    storage_error,
+};
+use crate::rfc_erratum_attribution as erratum;
 use async_trait::async_trait;
 use devres_application::attribution::AttributionStore;
 use devres_domain::{Capture, Error, Result, attribution::*};
@@ -26,6 +30,8 @@ const PROVIDERS: &[&str] = &[
 static CLAIM: AtomicU64 = AtomicU64::new(0);
 const TABLE_TARGETS: &str = "devres_attribution_targets";
 const TABLE_GENERATIONS: &str = "devres_attribution_generations";
+const MAX_ERRATA_SNAPSHOT: i64 = 16 * 1024 * 1024;
+const MAX_ERRATA_EXPORT: usize = 64 * 1024 * 1024;
 
 #[path = "storage_attribution_observation.rs"]
 mod observation;
@@ -89,6 +95,73 @@ fn bounded<T: Serialize>(v: &T) -> Result<Value> {
     }
     serde_json::from_slice(&bytes).map_err(|_| invalid())
 }
+
+async fn checked_erratum_capture(conn: &mut PgConnection) -> Result<Capture> {
+    let row = sqlx_core::query::query("SELECT published_order,catalogue_capture,errata_capture,created_at,complete,''::text AS kind,id AS key,CASE WHEN octet_length(data::text)<=$2 THEN data END AS data,data_integrity FROM devres_rfc_snapshots WHERE id=$1")
+        .bind(erratum::SNAPSHOT).bind(MAX_ERRATA_SNAPSHOT)
+        .fetch_optional(&mut *conn).await.map_err(|_| storage_error())?
+        .ok_or_else(|| Error::unavailable("Approved RFC erratum snapshot unavailable."))?;
+    let snapshot = payload_integrity::row("devres_rfc_snapshots", &row)?;
+    if snapshot["id"] != erratum::SNAPSHOT
+        || snapshot["errata_capture"] != erratum::EXPORT_CAPTURE
+        || row
+            .try_get::<Option<String>, _>("errata_capture")
+            .map_err(|_| invalid())?
+            .as_deref()
+            != Some(erratum::EXPORT_CAPTURE)
+    {
+        return Err(invalid());
+    }
+    let row = sqlx_core::query::query("SELECT id,source_key,source_url,body_hash,media_type,retrieved_at,metadata_integrity FROM devres_captures WHERE id=$1")
+        .bind(erratum::EXPORT_CAPTURE).fetch_optional(conn).await.map_err(|_| storage_error())?
+        .ok_or_else(|| Error::unavailable("Approved RFC erratum capture unavailable."))?;
+    let capture =
+        checked_capture_metadata(&row, row.try_get("retrieved_at").map_err(|_| invalid())?)?;
+    erratum::verify_capture(&capture)?;
+    Ok(capture)
+}
+
+impl PgBlobStore {
+    async fn verify_erratum_export(
+        &self,
+        target: &AttributionTarget,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        erratum::verify_target(target)?;
+        let stopping = cancel.child_token();
+        let _stop_on_drop = stopping.drop_guard_ref();
+        let work = async {
+            let capture = {
+                let mut conn = self.pool.acquire().await.map_err(|_| storage_error())?;
+                checked_erratum_capture(&mut conn).await?
+            };
+            let body = self
+                .blob_bounded(&capture.body_hash, MAX_ERRATA_EXPORT, &stopping)
+                .await?;
+            let token = stopping.clone();
+            let target = target.clone();
+            tokio::task::spawn_blocking(move || {
+                erratum::verify_bound_export(&body, &target, || {
+                    if token.is_cancelled() {
+                        return Err(Error::new(
+                            "cancelled",
+                            "RFC erratum capture verification canceled.",
+                        ));
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|_| storage_error())?
+        };
+        tokio::select! {
+            biased;
+            _ = stopping.cancelled() => Err(Error::new("cancelled", "RFC erratum capture verification canceled.")),
+            result = tokio::time::timeout(std::time::Duration::from_secs(40), work) =>
+                result.map_err(|_| Error::capacity("RFC erratum capture verification deadline exceeded."))?,
+        }
+    }
+}
 fn provider(v: &str) -> Result<()> {
     if PROVIDERS.contains(&v) {
         Ok(())
@@ -117,6 +190,9 @@ fn checked_target(v: &AttributionTarget) -> Result<()> {
     bounded(v)?;
     if crate::integrity::canonical_hash(&v.evidence)? != v.subject.fingerprint {
         return Err(invalid());
+    }
+    if v.subject.namespace == erratum::NAMESPACE {
+        erratum::verify_target(v)?;
     }
     Ok(())
 }
@@ -223,6 +299,11 @@ async fn promote_control_for(
     if epoch == required.epoch {
         return Ok(());
     }
+    let previous = registry
+        .iter()
+        .find(|policy| policy.epoch == epoch)
+        .copied()
+        .ok_or_else(invalid)?;
     let rows=sqlx_core::query::query("SELECT provider,data,data_integrity FROM devres_attribution_sweeps ORDER BY provider LIMIT 10").fetch_all(&mut **tx).await.map_err(|_|invalid())?;
     for row in rows {
         let p: String = row.try_get("provider").map_err(|_| invalid())?;
@@ -230,8 +311,9 @@ async fn promote_control_for(
         let _: Sweep = serde_json::from_value(checked("devres_attribution_sweeps", &p, &row)?)
             .map_err(|_| invalid())?;
     }
-    // Only nine small sweep checkpoints reset; retained generations and old jobs
-    // remain sealed and addressable. No corpus backfill occurs in startup.
+    // Only bounded progress checkpoints reset. Retained evidence and jobs remain
+    // addressable; the worker handles requalification under normal source budgets.
+    origins::reset_checkpoints(tx, previous).await?;
     sqlx_core::query::query("DELETE FROM devres_attribution_sweeps")
         .execute(&mut **tx)
         .await
@@ -253,6 +335,9 @@ async fn promote_control_for(
     Ok(())
 }
 pub(super) async fn verify_supported_control(conn: &mut PgConnection) -> Result<()> {
+    active_policy(conn).await.map(|_| ())
+}
+async fn active_policy(conn: &mut PgConnection) -> Result<AttributionPolicyManifest> {
     let row = sqlx_core::query::query(
         "SELECT data,data_integrity FROM devres_attribution_control WHERE singleton",
     )
@@ -260,12 +345,16 @@ pub(super) async fn verify_supported_control(conn: &mut PgConnection) -> Result<
     .await
     .map_err(|_| invalid())?;
     let data = checked("devres_attribution_control", "singleton", &row)?;
-    supported_control(
+    let epoch = supported_control(
         &data,
         ATTRIBUTION_REQUIRED_POLICY,
         ATTRIBUTION_POLICY_MANIFESTS,
     )?;
-    Ok(())
+    ATTRIBUTION_POLICY_MANIFESTS
+        .iter()
+        .find(|policy| policy.epoch == epoch)
+        .copied()
+        .ok_or_else(invalid)
 }
 pub(super) async fn verify_control(conn: &mut PgConnection) -> Result<()> {
     let row = sqlx_core::query::query(
@@ -325,6 +414,8 @@ impl State {
 fn validate_state(value: &State, registry: &[AttributionPolicyManifest]) -> Result<()> {
     checked_target(&value.target)?;
     if !registry.iter().any(|p| p.epoch == value.policy_epoch)
+        || (value.target.subject.namespace == erratum::NAMESPACE
+            && value.policy_epoch != ATTRIBUTION_POLICY_V3.epoch)
         || value.queued_at.is_some_and(|value| value < 0)
         || !matches!(
             value.status.as_str(),
@@ -438,6 +529,12 @@ fn verify_receipts(
     depth: usize,
     budget: &mut usize,
 ) -> Result<()> {
+    if value.subject.namespace == erratum::NAMESPACE {
+        if depth != 0 {
+            return Err(invalid());
+        }
+        return erratum::verify_generation(value);
+    }
     let source_subject = binding(value)?
         .map(|target| target.subject)
         .unwrap_or_else(|| value.subject.clone());
@@ -468,6 +565,9 @@ fn verify_receipts(
         }
         if receipt["kind"] == "retained_subject_binding" {
             continue;
+        }
+        if receipt["kind"] == erratum::RECEIPT_KIND {
+            return Err(invalid());
         }
         let synthetic = receipt["kind"] == "synthetic_fixture_validation";
         if !receipt.is_object()
@@ -767,6 +867,11 @@ pub(super) fn diagnostic_generation(row: &PgRow, target: &DiagnosticTarget) -> R
 impl AttributionStore for PgBlobStore {
     async fn attribution_verify_target(&self, target: &AttributionTarget) -> Result<()> {
         self.fence().await?;
+        if target.subject.namespace == erratum::NAMESPACE {
+            return self
+                .verify_erratum_export(target, &CancellationToken::new())
+                .await;
+        }
         let mut conn = self.pool.acquire().await.map_err(|_| storage_error())?;
         origins::verify_target(&mut conn, target).await
     }
@@ -902,6 +1007,18 @@ impl AttributionStore for PgBlobStore {
             return Err(invalid());
         }
         self.fence().await?;
+        if job.target.subject.namespace == erratum::NAMESPACE {
+            erratum::verify_generation(value)?;
+            self.verify_erratum_export(&job.target, &CancellationToken::new())
+                .await
+                .map_err(|error| {
+                    if error.code == "capacity" {
+                        Error::unavailable("Retained RFC erratum archive verification deferred.")
+                    } else {
+                        error
+                    }
+                })?;
+        }
         let mut owner = self.owner.lock().await;
         verify_control(&mut owner).await?;
         let mut tx = owner.begin().await.map_err(|_| storage_error())?;
@@ -917,7 +1034,18 @@ impl AttributionStore for PgBlobStore {
             .map_err(|_| invalid())?;
             let root = state(&row)?;
             check_claim(&root, job, true)?;
-            origins::verify_target(&mut tx, &root.target).await?;
+            if root.target.subject.namespace == erratum::NAMESPACE {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    checked_erratum_capture(&mut tx),
+                )
+                .await
+                .map_err(|_| {
+                    Error::unavailable("Retained RFC erratum archive verification deferred.")
+                })??;
+            } else {
+                origins::verify_target(&mut tx, &root.target).await?;
+            }
             let entries = publication_entries(&root.target, value, ATTRIBUTION_POLICY_MANIFESTS)?;
             for (target, generation) in entries {
                 let row = sqlx_core::query::query(
@@ -1211,7 +1339,7 @@ fn source_error(error: sqlx_core::error::Error) -> Error {
 
 fn diagnostic_namespace(namespace: &str) -> String {
     let (table, kind) = namespace.split_once('/').unwrap_or((namespace, ""));
-    if table == "source" && kind.is_empty() {
+    if matches!(table, "source" | erratum::NAMESPACE) && kind.is_empty() {
         return table.into();
     }
     if !matches!(
@@ -1739,10 +1867,10 @@ impl PgBlobStore {
         if version < 11 {
             return Ok(());
         }
-        {
+        let policy = {
             let mut owner = self.owner.lock().await;
-            verify_supported_control(&mut owner).await?;
-        }
+            active_policy(&mut owner).await?
+        };
         for table in [
             TABLE_TARGETS,
             TABLE_GENERATIONS,
@@ -1783,9 +1911,13 @@ impl PgBlobStore {
                     match table {
                         TABLE_TARGETS => {
                             let state = state(&row)?;
-                            let mut conn =
-                                self.pool.acquire().await.map_err(|_| storage_error())?;
-                            origins::verify_target(&mut conn, &state.target).await?;
+                            if state.target.subject.namespace == erratum::NAMESPACE {
+                                self.verify_erratum_export(&state.target, cancel).await?;
+                            } else {
+                                let mut conn =
+                                    self.pool.acquire().await.map_err(|_| storage_error())?;
+                                origins::verify_target(&mut conn, &state.target).await?;
+                            }
                             if let Some(id) = state.generation {
                                 let qualified = self.historical_attribution_bundle(&id).await?;
                                 if qualified.generation.subject != state.target.subject
@@ -1852,7 +1984,7 @@ impl PgBlobStore {
             recovery::verify_journal(self, cancel).await?;
         }
         if version >= 18 {
-            self.verify_attribution_origins().await?;
+            self.verify_attribution_origins(policy).await?;
         }
         if version >= 19 {
             let mut owner = self.owner.lock().await;
@@ -1981,6 +2113,25 @@ mod tests {
         forged.notices[0].evidence = json!({});
         assert!(generation(&forged).is_err());
     }
+    #[test]
+    fn erratum_receipt_and_target_are_reserved_for_the_exact_policy_three_member() {
+        let pilot = erratum::pilot_target().unwrap();
+        checked_target(&pilot).unwrap();
+        let mut historical = State::new(pilot.clone(), 0);
+        historical.policy_epoch = ATTRIBUTION_POLICY_V2.epoch;
+        assert!(validate_state(&historical, ATTRIBUTION_POLICY_MANIFESTS).is_err());
+
+        let mut changed = pilot.clone();
+        changed.evidence["member_body"] = json!(crate::integrity::hash(b"different member"));
+        changed.subject.fingerprint = crate::integrity::canonical_hash(&changed.evidence).unwrap();
+        assert!(checked_target(&changed).is_err());
+
+        let synthetic = generation_for(&pilot);
+        assert!(generation(&synthetic).is_err());
+        let mut unrelated = generation_for(&target("foreign-erratum-receipt"));
+        unrelated.receipts[0]["kind"] = json!(erratum::RECEIPT_KIND);
+        assert!(generation(&unrelated).is_err());
+    }
     fn composite(
         child: &AttributionTarget,
         child_generation: &AttributionGeneration,
@@ -2041,8 +2192,8 @@ mod tests {
     #[test]
     fn registered_policy_versions_preserve_history_and_fence_unknown_future() {
         let next = AttributionPolicyManifest {
-            epoch: 3,
-            fingerprint: "fixture-only-policy-v3",
+            epoch: ATTRIBUTION_POLICY_EPOCH + 1,
+            fingerprint: "fixture-only-future-policy",
         };
         let registry = [ATTRIBUTION_REQUIRED_POLICY, next];
         assert_eq!(
@@ -2053,6 +2204,18 @@ mod tests {
             supported_control(&control_for(next), ATTRIBUTION_REQUIRED_POLICY, &registry).is_err()
         );
         assert!(supported_control(&control_for(next), next, ATTRIBUTION_POLICY_MANIFESTS).is_err());
+        for prior in [ATTRIBUTION_POLICY_V1, ATTRIBUTION_POLICY_V2] {
+            assert_eq!(
+                supported_control(
+                    &control_for(prior),
+                    ATTRIBUTION_REQUIRED_POLICY,
+                    ATTRIBUTION_POLICY_MANIFESTS
+                )
+                .unwrap(),
+                prior.epoch
+            );
+            assert!(supported_control(&control(), prior, ATTRIBUTION_POLICY_MANIFESTS).is_err());
+        }
         let prior = generation_for(&target("policy-history"));
         assert!(generation_for_registry(&prior, &registry).is_ok());
         assert_ne!(
@@ -2066,6 +2229,136 @@ mod tests {
         future.receipts[0]["policy_fingerprint"] = json!(next.fingerprint);
         assert!(generation_for_registry(&future, &registry).is_ok());
         assert!(generation(&future).is_err());
+    }
+    #[tokio::test]
+    #[ignore = "requires disposable DEVRES_TEST_DATABASE_URL PostgreSQL"]
+    async fn attribution_storage_policy_three_preserves_ready_policy_two_and_resets_origins() {
+        let base = std::env::var("DEVRES_TEST_DATABASE_URL").unwrap();
+        let admin = sqlx_postgres::PgPool::connect(&base).await.unwrap();
+        let name = format!("devres_attribution_promotion_{}", std::process::id());
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "CREATE DATABASE {name}"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.set_path(&format!("/{name}"));
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let store = PgBlobStore::connect(url.as_str(), root.path())
+            .await
+            .unwrap();
+        let mut owner = store.owner.lock().await;
+        let old = control_for(ATTRIBUTION_POLICY_V2);
+        sqlx_core::query::query(
+            "UPDATE devres_attribution_control SET data=$1,data_integrity=$2 WHERE singleton",
+        )
+        .bind(Json(&old))
+        .bind(
+            payload_integrity::digest("devres_attribution_control", "", "singleton", &old).unwrap(),
+        )
+        .execute(&mut *owner)
+        .await
+        .unwrap();
+        let mut retained = Vec::new();
+        for provider in PROVIDERS {
+            let mut target = target(provider);
+            target.subject.provider = (*provider).into();
+            let mut historical = generation_for(&target);
+            historical.policy_epoch = ATTRIBUTION_POLICY_V2.epoch;
+            historical.policy_fingerprint = ATTRIBUTION_POLICY_V2.fingerprint.into();
+            historical.receipts[0]["policy_epoch"] = json!(historical.policy_epoch);
+            historical.receipts[0]["policy_fingerprint"] = json!(historical.policy_fingerprint);
+            let id = publish_generation(&mut owner, &historical).await.unwrap();
+            let mut state = State::new(target.clone(), 1);
+            state.policy_epoch = historical.policy_epoch;
+            state.status = "ready".into();
+            state.generation = Some(id.clone());
+            save(&mut owner, &state).await.unwrap();
+            retained.push((target, historical, id));
+        }
+        for (fingerprint, expected) in [
+            ("wrong policy", false),
+            (ATTRIBUTION_POLICY_V2.fingerprint, true),
+        ] {
+            let checkpoint = json!({"version":1,"policy_epoch":2,"policy_fingerprint":fingerprint,
+                "recipe":"forward-origins-v2","after":0,"cutoff":null,"frontier":[],"passes":1,"gap":null});
+            sqlx_core::query::query("INSERT INTO devres_attribution_origins VALUES('mdn',$1,$2) ON CONFLICT(provider) DO UPDATE SET data=EXCLUDED.data,data_integrity=EXCLUDED.data_integrity")
+                .bind(Json(&checkpoint)).bind(payload_integrity::digest("devres_attribution_origins", "", "mdn", &checkpoint).unwrap())
+                .execute(&mut *owner).await.unwrap();
+            let mut upgrade = owner.begin().await.unwrap();
+            assert_eq!(promote_control(&mut upgrade).await.is_ok(), expected);
+            if expected {
+                upgrade.commit().await.unwrap();
+            } else {
+                upgrade.rollback().await.unwrap();
+                assert_eq!(
+                    active_policy(&mut owner).await.unwrap(),
+                    ATTRIBUTION_POLICY_V2
+                );
+                let count: i64 = sqlx_core::query_scalar::query_scalar(
+                    "SELECT count(*) FROM devres_attribution_origins",
+                )
+                .fetch_one(&mut *owner)
+                .await
+                .unwrap();
+                assert_eq!(count, 1);
+            }
+        }
+        assert_eq!(
+            active_policy(&mut owner).await.unwrap(),
+            ATTRIBUTION_POLICY_V3
+        );
+        drop(owner);
+        assert!(store.attribution_origin_status().await.unwrap().is_empty());
+        for (target, historical, id) in retained {
+            assert!(
+                store
+                    .attribution_ready(&target.subject)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store.attribution_bundle(&id).await.unwrap().generation,
+                historical
+            );
+            store.attribution_enqueue(&target, 1).await.unwrap();
+            let job = store
+                .attribution_claim(
+                    std::slice::from_ref(&target.subject.provider),
+                    devres_domain::unix_now(),
+                    0,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.target, target);
+            let current = generation_for(&target);
+            store.attribution_complete(&job, &current).await.unwrap();
+            let ready = store
+                .attribution_ready(&target.subject)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(ready.id, id);
+            assert_eq!(ready.generation, current);
+            assert_eq!(
+                store.attribution_bundle(&id).await.unwrap().generation,
+                historical
+            );
+        }
+        store
+            .verify_attribution_storage(&CancellationToken::new())
+            .await
+            .unwrap();
+        drop(store);
+        sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+            "DROP DATABASE {name} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
     }
     #[tokio::test]
     #[ignore = "requires disposable DEVRES_TEST_DATABASE_URL PostgreSQL"]
@@ -3002,8 +3295,8 @@ mod tests {
         .await
         .unwrap();
         let next = AttributionPolicyManifest {
-            epoch: 3,
-            fingerprint: "fixture-only-policy-v3",
+            epoch: ATTRIBUTION_POLICY_EPOCH + 1,
+            fingerprint: "fixture-only-future-policy",
         };
         let registry = [ATTRIBUTION_REQUIRED_POLICY, next];
         let prior_count: i64 = sqlx_core::query_scalar::query_scalar(

@@ -83,6 +83,7 @@ The optional `[rfc]` table defaults to automatic permanent corpus collection:
 | `errata_refresh_secs` | `86400` | Official errata refresh interval |
 | `body_refresh_secs` | `86400` | Conditional representation revalidation interval |
 | `collection_interval_secs` | `1` | Minimum delay between worker iterations; does not increase shared provider limits |
+| `erratum_8173_evidence_dir` | omitted | Private evidence directory for the sole writer to qualify the exact retained RFC 9525 erratum 8173 under policy 3 |
 
 Intervals must be 1..31622400 seconds. Catalogue and errata refresh continue while
 body sweeps are backlogged. A configured interval is a scheduling target rather than
@@ -90,6 +91,16 @@ a freshness guarantee. The shared one-attempt/second HTTPS budget and two-transf
 limit remain in force. Foreground tools remain available when collection is paused.
 Disposable harnesses explicitly set `enabled=false`, including bounded live checks.
 Existing operator configurations that omit `[rfc]` now collect automatically.
+
+Set `erratum_8173_evidence_dir` on the sole writer when enabling the reviewed
+member recipe. Use an owned private directory under `/tmp` with `manifest.json`
+and six private regular dependency files named by their bare BLAKE3 digests.
+The writer verifies a configured bundle before promotion and reads the export
+through its archive during repair. RFC repair requires `rfc.enabled = true`.
+Omit this setting on serving readers and status-only observers. Readers use the
+sealed generation and return verified links when a matching generation is
+unavailable. See the
+[exact evidence contract](rfc-errata-qualification-design.md#local-evidence-validation).
 
 RFC index and errata bodies cap at 64 MiB; each document representation and derived
 text caps at 16 MiB. Catalogue parsing caps at 50,000 RFCs. Search has one 64 MiB

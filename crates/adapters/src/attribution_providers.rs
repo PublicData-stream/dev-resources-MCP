@@ -4,9 +4,10 @@ use crate::bulk::{BulkBroker, BulkRequest, BulkSource};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use devres_application::Fetcher;
 use devres_domain::attribution::{
-    ATTRIBUTION_POLICY_EPOCH, ATTRIBUTION_POLICY_FINGERPRINT, AttributionDisposition,
-    AttributionFailure, AttributionFailureReason, AttributionGeneration, AttributionNotice,
-    AttributionPhase, AttributionSubject, AttributionTarget,
+    ATTRIBUTION_POLICY_EPOCH, ATTRIBUTION_POLICY_FINGERPRINT, ATTRIBUTION_POLICY_MANIFESTS,
+    ATTRIBUTION_POLICY_V2, ATTRIBUTION_POLICY_V3, AttributionDisposition, AttributionFailure,
+    AttributionFailureReason, AttributionGeneration, AttributionNotice, AttributionPhase,
+    AttributionSubject, AttributionTarget,
 };
 use devres_domain::{Error, Result, Validators};
 use futures::StreamExt as _;
@@ -386,6 +387,15 @@ fn inferred_provider(value: &Value) -> Option<&'static str> {
 /// Extract only exact public provenance. Request text, snippets, dependency
 /// inventories, result shapes and audit associations never become repair keys.
 pub fn targets(source: &str, value: &Value) -> Result<Vec<AttributionTarget>> {
+    retained_origin_targets(source, value)
+}
+
+/// Historical witnesses retain the v2 mapping. Policy 3 adds the separately
+/// compiled erratum member recipe and continues using this public source map.
+pub(crate) fn retained_origin_targets(
+    source: &str,
+    value: &Value,
+) -> Result<Vec<AttributionTarget>> {
     if matches!(source, "wikipedia" | "mixed")
         && crate::wikipedia::attribution::is_metadata_only_discovery(value)
     {
@@ -919,13 +929,12 @@ pub fn retained_candidate(
     key: &str,
     data: &Value,
 ) -> Result<Option<AttributionTarget>> {
-    match (policy_epoch, policy_fingerprint) {
-        (1, "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices") => {
-            candidate_v1(source, namespace, key, data)
-        }
-        (2, "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices") => {
-            v2::candidate(source, namespace, key, data)
-        }
+    let policy = ATTRIBUTION_POLICY_MANIFESTS
+        .iter()
+        .find(|policy| policy.epoch == policy_epoch && policy.fingerprint == policy_fingerprint);
+    match policy.map(|policy| policy.epoch) {
+        Some(1) => candidate_v1(source, namespace, key, data),
+        Some(2 | 3) => v2::candidate(source, namespace, key, data),
         _ => Err(Error::integrity("Unknown retained attribution recipe.")),
     }
 }
@@ -937,9 +946,9 @@ pub fn retained_target(
     policy_fingerprint: &str,
     target: &AttributionTarget,
 ) -> Result<Option<AttributionTarget>> {
-    if policy_epoch == 2
-        && policy_fingerprint
-            == "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices"
+    if [ATTRIBUTION_POLICY_V2, ATTRIBUTION_POLICY_V3]
+        .iter()
+        .any(|policy| policy.epoch == policy_epoch && policy.fingerprint == policy_fingerprint)
         && target.evidence.get("origin_witness").is_some()
     {
         let source: AttributionTarget =

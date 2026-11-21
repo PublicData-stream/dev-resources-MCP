@@ -1,6 +1,6 @@
 //! Running-service attribution policy. Source adapters supply evidence, never policy.
 use crate::attribution::AttributionStore;
-use crate::attribution_gate::AttributionGate;
+use crate::attribution_gate::{AttributionGate, RfcErrataMember};
 use async_trait::async_trait;
 use devres_domain::{Error, Result, attribution::*};
 use serde_json::{Value, json};
@@ -16,6 +16,13 @@ use tokio_util::sync::CancellationToken;
 #[async_trait]
 pub trait AttributionAcquirer: Send + Sync {
     fn targets(&self, provider: &str, value: &Value) -> Result<Vec<AttributionTarget>>;
+    /// A reviewed local recipe for the verified member, when one is registered.
+    fn rfc_erratum_target(
+        &self,
+        _member: &RfcErrataMember<'_>,
+    ) -> Result<Option<AttributionTarget>> {
+        Ok(None)
+    }
     async fn repair(
         &self,
         target: &AttributionTarget,
@@ -370,6 +377,20 @@ fn readable(generations: &[QualifiedAttribution]) -> Result<String> {
     Ok(text)
 }
 
+fn ready_attribution(generations: &[QualifiedAttribution]) -> Result<Value> {
+    let notice = readable(generations)?;
+    let uris: Vec<_> = generations
+        .iter()
+        .map(|g| format!("devres://attribution/{}", g.id))
+        .collect();
+    Ok(
+        json!({"status":"ready","policy_epoch":ATTRIBUTION_POLICY_EPOCH,
+        "policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT,
+        "readable_notice":notice,"resource_uri":uris.first(),
+        "resource_uris":uris,"generations":generations.iter().map(public_generation).collect::<Vec<_>>()}),
+    )
+}
+
 #[async_trait]
 impl AttributionGate for AttributionRuntime {
     async fn qualify(&self, provider: &str, value: &Value) -> Result<Value> {
@@ -436,22 +457,32 @@ impl AttributionGate for AttributionRuntime {
                     .with_details(json!({"attribution_status":"unavailable","subjects":subjects})),
             );
         }
-        let notice = readable(&generations)?;
-        let uris: Vec<_> = generations
-            .iter()
-            .map(|g| format!("devres://attribution/{}", g.id))
-            .collect();
         for generation in &generations {
             self.acquirer
                 .ensure_public(&generation.generation.subject)
                 .await?;
         }
-        Ok(
-            json!({"status":"ready","policy_epoch":ATTRIBUTION_POLICY_EPOCH,
-            "policy_fingerprint":ATTRIBUTION_POLICY_FINGERPRINT,
-            "readable_notice":notice,"resource_uri":uris.first(),
-            "resource_uris":uris,"generations":generations.iter().map(public_generation).collect::<Vec<_>>()}),
-        )
+        ready_attribution(&generations)
+    }
+    async fn qualify_rfc_erratum(&self, member: &RfcErrataMember<'_>) -> Result<Option<Value>> {
+        if self.observation.is_some() {
+            return Ok(None);
+        }
+        let Some(target) = self.acquirer.rfc_erratum_target(member)? else {
+            return Ok(None);
+        };
+        let generation = match self.store.attribution_ready(&target.subject).await {
+            Ok(Some(generation)) => generation,
+            Ok(None) => return Ok(None),
+            Err(error) if matches!(error.code.as_str(), "unavailable" | "capacity") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if !current(&generation, &target.subject) {
+            return Ok(None);
+        }
+        ready_attribution(std::slice::from_ref(&generation)).map(Some)
     }
     async fn bundle(&self, id: &str, offset: usize, limit: usize) -> Result<Value> {
         if !devres_domain::valid_content_id(id) || limit == 0 || limit > 65536 {

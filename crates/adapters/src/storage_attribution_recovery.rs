@@ -8,10 +8,7 @@ pub const RUSTSEC_CAPTURE_REPAIR_VERSION: &str = REPAIR_V1;
 pub const RUSTSEC_CAPTURE_REPAIR_VERSION_V2: &str = "rustsec-captures-v2";
 // This recipe's rights-policy identity is immutable. A later active policy or
 // repair implementation must retain this dispatch for the permanent journal.
-const REPAIR_POLICY_V1: AttributionPolicyManifest = AttributionPolicyManifest {
-    epoch: 1,
-    fingerprint: "devres-attribution-v1:exact-reacquisition:member-scopes:readable-notices",
-};
+const REPAIR_POLICY_V1: AttributionPolicyManifest = ATTRIBUTION_POLICY_V1;
 const TABLE: &str = "devres_attribution_recoveries";
 
 pub(crate) const SCHEMA_V17: &str = r#"
@@ -47,10 +44,11 @@ impl Default for RustSecRecoveryOptions {
     }
 }
 impl RustSecRecoveryOptions {
+    /// Preserved selector for the former current-policy v2 recipe.
     pub fn current_policy() -> Self {
         Self {
-            policy_epoch: ATTRIBUTION_POLICY_EPOCH,
-            policy_fingerprint: ATTRIBUTION_POLICY_FINGERPRINT.into(),
+            policy_epoch: ATTRIBUTION_POLICY_V2.epoch,
+            policy_fingerprint: ATTRIBUTION_POLICY_V2.fingerprint.into(),
             repair_version: RUSTSEC_CAPTURE_REPAIR_VERSION_V2.into(),
             ..Self::default()
         }
@@ -134,31 +132,21 @@ fn recipe_policy(
             Ok(REPAIR_POLICY_V1)
         }
         RUSTSEC_CAPTURE_REPAIR_VERSION_V2
-            if epoch == 2
-                && fingerprint
-                    == "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices"
+            if epoch == ATTRIBUTION_POLICY_V2.epoch
+                && fingerprint == ATTRIBUTION_POLICY_V2.fingerprint
                 && known_policy(epoch, fingerprint, registry) =>
         {
-            Ok(AttributionPolicyManifest {
-                epoch: 2,
-                fingerprint: "devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices",
-            })
+            Ok(ATTRIBUTION_POLICY_V2)
         }
         _ => Err(invalid()),
     }
 }
 
-fn eligible(value: &State) -> Result<bool> {
-    if value.policy_epoch != ATTRIBUTION_POLICY_EPOCH {
+fn eligible(value: &State, active: AttributionPolicyManifest) -> Result<bool> {
+    if active != ATTRIBUTION_POLICY_V2 {
         return Ok(false);
     }
-    let policy = recipe_policy(
-        RUSTSEC_CAPTURE_REPAIR_VERSION_V2,
-        ATTRIBUTION_POLICY_EPOCH,
-        ATTRIBUTION_POLICY_FINGERPRINT,
-        ATTRIBUTION_POLICY_MANIFESTS,
-    )?;
-    eligible_v1(value, policy)
+    eligible_v1(value, active)
 }
 
 // Keep both this predicate and the retained v1 compiler when newer recipes are
@@ -197,24 +185,24 @@ fn eligible_v1(value: &State, policy: AttributionPolicyManifest) -> Result<bool>
 }
 
 /// The caller must size-admit the exact SQL row before loading it.
-pub(crate) fn checked_target_summary(row: &PgRow) -> Result<Value> {
+pub(crate) async fn checked_target_summary(conn: &mut PgConnection, row: &PgRow) -> Result<Value> {
     let value = state(row)?;
     let digest: String = row.try_get("data_integrity").map_err(|_| invalid())?;
     let manifest = ATTRIBUTION_POLICY_MANIFESTS
         .iter()
         .find(|policy| policy.epoch == value.policy_epoch)
         .ok_or_else(invalid)?;
-    let recipe = if value.policy_epoch == REPAIR_POLICY_V1.epoch {
-        RUSTSEC_CAPTURE_REPAIR_VERSION
-    } else {
-        RUSTSEC_CAPTURE_REPAIR_VERSION_V2
+    let recipe = match *manifest {
+        ATTRIBUTION_POLICY_V1 => Some(RUSTSEC_CAPTURE_REPAIR_VERSION),
+        ATTRIBUTION_POLICY_V2 => Some(RUSTSEC_CAPTURE_REPAIR_VERSION_V2),
+        _ => None,
     };
     Ok(
         json!({"target_id":row.try_get::<String,_>("id").map_err(|_|invalid())?,
         "subject":value.target.subject,"policy_epoch":value.policy_epoch,
         "policy_fingerprint":manifest.fingerprint,"status":value.status,
         "classification":value.classification,"state_digest":digest,
-        "repair_version":recipe,"eligible":eligible(&value)?}),
+        "repair_version":recipe,"eligible":eligible(&value, active_policy(conn).await?)?}),
     )
 }
 
@@ -366,7 +354,7 @@ async fn recover(
             "RustSec recovery requires a supported active schema.",
         ));
     }
-    verify_control(&mut tx).await?;
+    let active = active_policy(&mut tx).await?;
     let row = load_target(&mut tx, &options.target_id, apply).await?;
     let mut value = state(&row)?;
     if value.target.subject.provider != "rustsec" || value.policy_epoch != options.policy_epoch {
@@ -383,7 +371,7 @@ async fn recover(
         policy_fingerprint: options.policy_fingerprint.clone(),
         repair_version: options.repair_version.clone(),
         state_digest: digest.clone(),
-        eligible: eligible(&value)?,
+        eligible: eligible(&value, active)?,
         outcome: RustSecRecoveryOutcome::Ineligible,
     };
     let journal_id = recovery_id(
@@ -458,7 +446,9 @@ async fn recover(
     value.failure = None;
     value.classification = None;
     save(&mut tx, &value).await?;
-    verify_control(&mut tx).await?;
+    if active_policy(&mut tx).await? != active {
+        return Err(Error::unavailable("RustSec recovery policy changed."));
+    }
     tx.commit().await.map_err(|_| storage_error())?;
     report.outcome = RustSecRecoveryOutcome::Applied;
     report.eligible = false;
@@ -526,6 +516,7 @@ mod tests {
             .pop()
             .unwrap();
         let mut value = State::new(target, 1);
+        value.policy_epoch = ATTRIBUTION_POLICY_V2.epoch;
         value.status = "blocked".into();
         value.attempts = 3;
         value.failure = Some("blocked".into());
@@ -572,26 +563,27 @@ mod tests {
     #[test]
     fn recovery_is_restricted_to_exact_new_recipe_and_known_mapping_blocks() {
         let value = blocked("unit");
-        assert!(eligible(&value).unwrap());
+        assert!(eligible(&value, ATTRIBUTION_POLICY_V2).unwrap());
+        assert!(!eligible(&value, ATTRIBUTION_POLICY_V3).unwrap());
         let mut invalid_priority = value.clone();
         invalid_priority.priority = 255;
         assert!(validate_state(&invalid_priority, ATTRIBUTION_POLICY_MANIFESTS).is_err());
         for status in ["ready", "running", "retry", "pending"] {
             let mut changed = value.clone();
             changed.status = status.into();
-            assert!(!eligible(&changed).unwrap());
+            assert!(!eligible(&changed, ATTRIBUTION_POLICY_V2).unwrap());
         }
         let mut changed = value.clone();
         changed.classification = None;
-        assert!(!eligible(&changed).unwrap());
+        assert!(!eligible(&changed, ATTRIBUTION_POLICY_V2).unwrap());
         changed.classification = Some(AttributionFailure::new(
             AttributionPhase::Qualification,
             AttributionFailureReason::MissingNotice,
             AttributionDisposition::Blocked,
         ));
-        assert!(!eligible(&changed).unwrap());
+        assert!(!eligible(&changed, ATTRIBUTION_POLICY_V2).unwrap());
         let mut options = RustSecRecoveryOptions {
-            target_id: target_id(&value.target.subject).unwrap(),
+            target_id: target_id_at(&value.target.subject, value.policy_epoch).unwrap(),
             ..RustSecRecoveryOptions::current_policy()
         };
         assert!(options.validate(false).is_ok());
@@ -607,6 +599,21 @@ mod tests {
             recovery_id(&options.target_id, 1, "v1").unwrap(),
             recovery_id(&options.target_id, 1, "v2").unwrap()
         );
+    }
+
+    async fn fixture_policy_two(conn: &mut PgConnection) {
+        let data = control_for(ATTRIBUTION_POLICY_V2);
+        sqlx_core::query::query(
+            "UPDATE devres_attribution_control SET data=$1,data_integrity=$2 WHERE singleton",
+        )
+        .bind(Json(&data))
+        .bind(
+            payload_integrity::digest("devres_attribution_control", "", "singleton", &data)
+                .unwrap(),
+        )
+        .execute(conn)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -637,12 +644,13 @@ mod tests {
         ));
         {
             let mut owner = store.owner.lock().await;
+            fixture_policy_two(&mut owner).await;
             save(&mut owner, &original).await.unwrap();
             save(&mut owner, &rollback).await.unwrap();
             save(&mut owner, &unrelated).await.unwrap();
         }
         let mut options = RustSecRecoveryOptions {
-            target_id: target_id(&original.target.subject).unwrap(),
+            target_id: target_id_at(&original.target.subject, original.policy_epoch).unwrap(),
             ..RustSecRecoveryOptions::current_policy()
         };
         // Simulate the immediately preceding active schema without changing targets.
@@ -666,6 +674,16 @@ mod tests {
         let store = PgBlobStore::connect(url.as_str(), root.path())
             .await
             .unwrap();
+        {
+            // Rehearse operations with the historical policy control after upgrading
+            // the disposable schema. The final reopen exercises actual promotion.
+            let mut owner = store.owner.lock().await;
+            assert_eq!(
+                active_policy(&mut owner).await.unwrap(),
+                ATTRIBUTION_POLICY_V3
+            );
+            fixture_policy_two(&mut owner).await;
+        }
         let dry = recover_rustsec_attribution(url.as_str(), &options, false)
             .await
             .unwrap();
@@ -721,14 +739,14 @@ mod tests {
         let journal = checked_recovery(&journal).unwrap();
         assert_eq!(journal.previous_state, bounded(&original).unwrap());
         let other = sqlx_core::query::query("SELECT * FROM devres_attribution_targets WHERE id=$1")
-            .bind(target_id(&unrelated.target.subject).unwrap())
+            .bind(target_id_at(&unrelated.target.subject, unrelated.policy_epoch).unwrap())
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(
             checked(
                 TABLE_TARGETS,
-                &target_id(&unrelated.target.subject).unwrap(),
+                &target_id_at(&unrelated.target.subject, unrelated.policy_epoch).unwrap(),
                 &other
             )
             .unwrap(),
@@ -747,7 +765,7 @@ mod tests {
                 .is_err()
         );
         let rollback_options = RustSecRecoveryOptions {
-            target_id: target_id(&rollback.target.subject).unwrap(),
+            target_id: target_id_at(&rollback.target.subject, rollback.policy_epoch).unwrap(),
             ..RustSecRecoveryOptions::current_policy()
         };
         let dry = recover_rustsec_attribution(url.as_str(), &rollback_options, false)
@@ -798,6 +816,14 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(Some(dry.state_digest), old_token);
+        assert!(
+            !dry.eligible,
+            "epoch three cannot rearm an epoch two target"
+        );
+        let retained = recover_rustsec_attribution(url.as_str(), &options, false)
+            .await
+            .unwrap();
+        assert_eq!(retained.outcome, RustSecRecoveryOutcome::AlreadyApplied);
         // Correct checksums cannot legitimize an impossible historical queue state.
         let journal_row = sqlx_core::query::query("SELECT * FROM devres_attribution_recoveries")
             .fetch_one(&pool)

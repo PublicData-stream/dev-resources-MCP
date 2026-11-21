@@ -347,6 +347,28 @@ async fn main() -> Result<(), ServerError> {
         && !observer)
         || maintenance;
     let is_serving = runtime_role == devres_server::writer_rpc::RuntimeRole::Serve && !maintenance;
+    let reviewed_rfc_erratum = match &config.rfc.erratum_8173_evidence_dir {
+        Some(path) if can_publish && !maintenance => {
+            let path = path.clone();
+            let cancel = CancellationToken::new();
+            let stopping = cancel.clone();
+            let signal = tokio::spawn(async move {
+                shutdown_signal().await;
+                stopping.cancel();
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                devres_adapters::ReviewedRfcErratum::load(&path, &cancel)
+            })
+            .await;
+            signal.abort();
+            let _ = signal.await;
+            Some(result??)
+        }
+        Some(_) if !can_publish => {
+            return Err("RFC erratum evidence directory requires the sole writer.".into());
+        }
+        _ => None,
+    };
     // Other providers' maintenance commands do not acquire Wikipedia content
     // and must not depend on its optional credential mount.
     let wikipedia_network_writer = can_publish && !maintenance;
@@ -637,14 +659,18 @@ async fn main() -> Result<(), ServerError> {
     .filter(|(_, enabled)| *enabled)
     .map(|(name, _)| name.to_owned())
     .collect();
+    let acquirer = devres_adapters::AttributionAdapter::new(broker.clone(), store.clone())
+        .with_wikipedia(store.clone())
+        .with_reviewed_rfc_erratum(reviewed_rfc_erratum);
+    let approved_erratum = acquirer.reviewed_rfc_erratum_target()?;
     let mut attribution = devres_application::attribution_runtime::AttributionRuntime::new(
         store.clone(),
-        Arc::new(
-            devres_adapters::AttributionAdapter::new(broker.clone(), store.clone())
-                .with_wikipedia(store.clone()),
-        ),
+        Arc::new(acquirer),
         enabled_attribution,
     )?;
+    if let Some(target) = approved_erratum {
+        attribution.enqueue_public(&target).await?;
+    }
     if let Some(delegate) = &delegate {
         attribution = attribution.with_delegate(delegate.clone());
     }
