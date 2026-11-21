@@ -604,7 +604,8 @@ mod tests {
         assert!(!report.complete); // Legacy stage-less failure stays explicitly unlinked.
         let value = &report.diagnostics[0];
         assert_eq!(value["commit"]["projection_complete"], false);
-        assert_eq!(value["attribution_target"]["eligible"], true);
+        assert_eq!(value["attribution_target"]["policy_epoch"], 3);
+        assert_eq!(value["attribution_target"]["eligible"], false);
         assert_eq!(
             value["commit"]["projections"][1]["coverage"]["gap_samples"][0]["path"],
             "crates/a/RUSTSEC-0000-0000.toml"
