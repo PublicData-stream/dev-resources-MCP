@@ -6,12 +6,18 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'deploy/production'))
 import cycle6_ce5745e0 as cycle
-from observer_retained_rows import RetainedRowsError, retained_row_manifest
+import rehearse_retained_rows_5a865235 as rehearsal
+from observer_retained_rows import (
+    RETAINED_PARALLEL_PROFILE,
+    RETAINED_PARALLEL_TEMP_BYTES,
+    RetainedRowsError,
+    retained_row_manifest,
+)
 from observer_retained_rows_transform import render_observer_controller
 
 
@@ -37,7 +43,29 @@ class RetainedRowProtocol(unittest.TestCase):
         self.assertEqual(kwargs['timeout'], 270)
         self.assertIn(b'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;', kwargs['data'])
         self.assertIn(b"SET LOCAL transaction_timeout = '240s';", kwargs['data'])
+        self.assertIn(b"SET LOCAL work_mem = '16MB';", kwargs['data'])
+        self.assertIn(b'SET LOCAL max_parallel_workers_per_gather = 0;', kwargs['data'])
         self.assertEqual(self.transport.call_count, 1)
+
+    def test_parallel_profile_only_changes_session_tuning(self):
+        expected = retained_row_manifest(self.transport)
+        serial = self.transport.call_args.kwargs['data']
+        self.transport.reset_mock()
+        self.assertEqual(retained_row_manifest(self.transport, profile=RETAINED_PARALLEL_PROFILE), expected)
+        parallel = self.transport.call_args.kwargs['data']
+        exact_settings = (b"SET LOCAL work_mem = '64MB';\nSET LOCAL temp_file_limit = '1GB';\n"
+                          b"SET LOCAL max_parallel_workers_per_gather = 3;\n"
+                          b"SET LOCAL min_parallel_table_scan_size = 0;\n"
+                          b"SET LOCAL parallel_setup_cost = 0;\nSET LOCAL parallel_tuple_cost = 0;")
+        self.assertEqual(parallel, serial.replace(b"SET LOCAL work_mem = '16MB';\n"
+                                                 b"SET LOCAL temp_file_limit = '1GB';\n"
+                                                 b'SET LOCAL max_parallel_workers_per_gather = 0;', exact_settings))
+        self.transport.assert_called_once()
+
+    def test_unknown_profile_runs_no_query(self):
+        with self.assertRaisesRegex(RetainedRowsError, '^unsupported_retained_row_profile$'):
+            retained_row_manifest(self.transport, profile='unapproved')
+        self.transport.assert_not_called()
 
     def test_rejects_partial_duplicate_and_malformed_frames(self):
         bad_cases = [
@@ -90,6 +118,27 @@ class SuccessorController(unittest.TestCase):
             render_observer_controller(self.frozen.replace('self.change_config(\'observer\', \'observer-config\')', 'pass'))
         with self.assertRaises(ValueError):
             render_observer_controller(self.rendered)
+        with self.assertRaisesRegex(ValueError, '^unsupported_retained_row_profile$'):
+            render_observer_controller(self.frozen, profile='unapproved')
+
+    def test_parallel_profile_requires_explicit_render_opt_in(self):
+        def load_method(source):
+            tree = ast.parse(source)
+            method, = [node for controller in tree.body
+                       if isinstance(controller, ast.ClassDef) and controller.name == 'Controller'
+                       for node in controller.body if isinstance(node, ast.FunctionDef)
+                       and node.name == '_retained_row_manifest']
+            scope = {'retained_row_manifest': Mock(), 'RETAINED_PARALLEL_PROFILE': RETAINED_PARALLEL_PROFILE}
+            exec(compile(ast.Module([method], type_ignores=[]), 'rendered-proof-profile', 'exec'), scope)
+            return scope['_retained_row_manifest'], scope['retained_row_manifest']
+
+        controller = Mock()
+        default, default_proof = load_method(self.rendered)
+        default(controller)
+        default_proof.assert_called_once_with(controller.old.k)
+        opt_in, parallel_proof = load_method(render_observer_controller(self.frozen, profile=RETAINED_PARALLEL_PROFILE))
+        opt_in(controller)
+        parallel_proof.assert_called_once_with(controller.old.k, profile=RETAINED_PARALLEL_PROFILE)
 
     def test_baseline_transport_failure_precedes_observer_mutations(self):
         controller = Mock()
@@ -172,3 +221,25 @@ class SuccessorController(unittest.TestCase):
             withdraw.assert_called_once_with(controller)
             controller.rollback.assert_called_once_with()
             self.assertFalse((controller.root / 'observer-retained-rows-completed.json').exists())
+
+
+class RehearsalProfile(unittest.TestCase):
+    def test_parallel_temp_space_is_in_addition_to_copy_and_reserve(self):
+        copy_bytes = 8 * 1024**3
+        required = rehearsal.RESERVE + copy_bytes + RETAINED_PARALLEL_TEMP_BYTES
+        with patch.object(rehearsal.shutil, 'disk_usage', return_value=Mock(free=required - 1)):
+            with self.assertRaisesRegex(RuntimeError, '^rehearsal_copy_reserve_exceeded$'):
+                rehearsal.require_disk_headroom(copy_bytes)
+        with patch.object(rehearsal.shutil, 'disk_usage', return_value=Mock(free=required)):
+            rehearsal.require_disk_headroom(copy_bytes)
+
+    def test_requires_proven_cpu_memory_and_shared_memory_limits(self):
+        container = 'a' * 64
+        expected = b'6442450944\n400000 100000\n', b'67108864\n'
+        with patch.object(rehearsal, 'run', side_effect=expected):
+            rehearsal.check_proof_limits(container)
+        for limits in ((b'6442450944\n300000 100000\n', expected[1]),
+                       (b'4294967296\n400000 100000\n', expected[1]), (expected[0], b'536870912\n')):
+            with patch.object(rehearsal, 'run', side_effect=limits):
+                with self.assertRaisesRegex(RuntimeError, '^isolated_postgres_proof_limits_mismatch$'):
+                    rehearsal.check_proof_limits(container)

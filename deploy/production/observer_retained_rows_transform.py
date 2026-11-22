@@ -3,6 +3,8 @@
 import ast
 from pathlib import Path
 
+from observer_retained_rows import RETAINED_PARALLEL_PROFILE, RETAINED_SERIAL_PROFILE
+
 
 def _observer_replace(source, before, after):
     if source.count(before) != 1:
@@ -10,8 +12,10 @@ def _observer_replace(source, before, after):
     return source.replace(before, after, 1)
 
 
-def render_observer_controller(source):
+def render_observer_controller(source, *, profile=RETAINED_SERIAL_PROFILE):
     """Transform the reviewed controller shape without changing its frozen input."""
+    if profile not in (RETAINED_SERIAL_PROFILE, RETAINED_PARALLEL_PROFILE):
+        raise ValueError('unsupported_retained_row_profile')
     tree = ast.parse(source)
     methods = [method for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Controller'
                for method in node.body if isinstance(method, ast.FunctionDef)
@@ -20,8 +24,11 @@ def render_observer_controller(source):
         raise ValueError('expected_one_retained_row_manifest')
     method = methods[0]
     lines = source.splitlines(keepends=True)
+    proof_call = 'retained_row_manifest(self.old.k)'
+    if profile == RETAINED_PARALLEL_PROFILE:
+        proof_call = 'retained_row_manifest(self.old.k, profile=RETAINED_PARALLEL_PROFILE)'
     source = (''.join(lines[:method.lineno - 1])
-              + '    def _retained_row_manifest(self):\n        return retained_row_manifest(self.old.k)\n'
+              + f'    def _retained_row_manifest(self):\n        return {proof_call}\n'
               + ''.join(lines[method.end_lineno:]))
 
     source = _observer_replace(source,

@@ -11,6 +11,9 @@ _RETAINED_NAME = re.compile(r'devres_[a-z0-9_]{1,56}', re.ASCII)
 _RETAINED_SHA256 = re.compile(r'[0-9a-f]{64}', re.ASCII)
 _RETAINED_COMMIT = 'retained-rows-committed-v1'
 _RETAINED_BAD_INVENTORY = 'retained-rows-invalid-inventory'
+RETAINED_SERIAL_PROFILE = 'serial'
+RETAINED_PARALLEL_PROFILE = 'parallel-4cpu-6g-v1'
+RETAINED_PARALLEL_TEMP_BYTES = 4 * 1024**3
 
 
 class RetainedRowsError(RuntimeError):
@@ -56,7 +59,25 @@ def table_query(name):
     return _retained_table_query(f'public."{name}"', f"'{name}'")
 
 
-def _retained_sql():
+def _retained_settings(profile):
+    if profile == RETAINED_SERIAL_PROFILE:
+        return """SET LOCAL work_mem = '16MB';
+SET LOCAL temp_file_limit = '1GB';
+SET LOCAL max_parallel_workers_per_gather = 0;"""
+    if profile == RETAINED_PARALLEL_PROFILE:
+        # Three workers plus the leader can each spill up to 1 GiB. Work mem
+        # applies to each sort or hash, so qualify this profile at 4 CPU/6 GiB.
+        # A small heap can carry a large external TOAST working set.
+        return """SET LOCAL work_mem = '64MB';
+SET LOCAL temp_file_limit = '1GB';
+SET LOCAL max_parallel_workers_per_gather = 3;
+SET LOCAL min_parallel_table_scan_size = 0;
+SET LOCAL parallel_setup_cost = 0;
+SET LOCAL parallel_tuple_cost = 0;"""
+    raise RetainedRowsError('unsupported_retained_row_profile')
+
+
+def _retained_sql(*, profile=RETAINED_SERIAL_PROFILE):
     # Generate the per-table commands on the server in the same transaction as
     # the inventory. The psql script submits each command separately via gexec.
     query = _retained_table_query('public.%1$I', '%1$L')
@@ -68,9 +89,7 @@ SET LOCAL transaction_timeout = '240s';
 SET LOCAL lock_timeout = '250ms';
 SET LOCAL search_path = pg_catalog;
 SET LOCAL row_security = off;
-SET LOCAL work_mem = '16MB';
-SET LOCAL temp_file_limit = '1GB';
-SET LOCAL max_parallel_workers_per_gather = 0;
+{_retained_settings(profile)}
 WITH tables AS ({_RETAINED_TABLES})
 SELECT count(*) BETWEEN 1 AND {_RETAINED_MAX_TABLES}
        AND coalesce(bool_and(name COLLATE "C" ~ '^devres_[a-z0-9_]{{1,56}}$'
@@ -153,12 +172,13 @@ def _retained_result(output):
             'row_count': sum(row['rows'] for row in rows), 'sha256': hashlib.sha256(content).hexdigest()}
 
 
-def retained_row_manifest(k):
+def retained_row_manifest(k, *, profile=RETAINED_SERIAL_PROFILE):
     """Read one complete proof via the controller's admitted PostgreSQL exec."""
+    query = _retained_sql(profile=profile)
     try:
         output = k('exec', '-i', 'deployment/postgres', '-c', 'postgres', '--',
                    'psql', '-X', '-qAt', '-U', 'devres_admin', '-d', 'devres',
-                   '-v', 'ON_ERROR_STOP=1', '-f', '-', data=_retained_sql(),
+                   '-v', 'ON_ERROR_STOP=1', '-f', '-', data=query,
                    request_timeout=260, timeout=270)
     except Exception:
         # Transport failures can carry PostgreSQL stderr and input SQL.

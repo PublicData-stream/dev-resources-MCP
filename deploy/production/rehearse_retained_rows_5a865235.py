@@ -13,7 +13,11 @@ import subprocess
 import sys
 import time
 
-from observer_retained_rows import retained_row_manifest
+from observer_retained_rows import (
+    RETAINED_PARALLEL_PROFILE,
+    RETAINED_PARALLEL_TEMP_BYTES,
+    retained_row_manifest,
+)
 
 
 WORK = Path('/tmp/devres-rehearsal-5a865235')
@@ -22,6 +26,9 @@ PG = ('docker.io/library/postgres:18.6-alpine3.24@'
       'sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395')
 CONTAINER = 'devres-5a865235-retained-proof'
 RESERVE = 128 * 1024**3
+CPUS = 4
+MEMORY_BYTES = 6 * 1024**3
+SHM_BYTES = 64 * 1024**2
 POLICY_2 = 'devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices'
 POLICY_3 = ('devres-attribution-v3:verified-forward-origins:member-scopes:'
             'rfc-erratum-8173:readable-notices')
@@ -56,7 +63,8 @@ def validate_workspace():
 def docker_run(entrypoint, mounts):
     args = ['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only',
             '--user', '70:70', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
-            '--cpus', '4', '--memory', '6g', '--pids-limit', '64']
+            '--cpus', str(CPUS), '--memory', str(MEMORY_BYTES), '--shm-size', str(SHM_BYTES),
+            '--pids-limit', '64']
     for mount in mounts:
         args.extend(('--mount', mount))
     return [*args, '--entrypoint', entrypoint]
@@ -117,6 +125,19 @@ def check_identity(container):
     return policy
 
 
+def check_proof_limits(container):
+    limits = run('docker', 'exec', container, 'cat', '/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/cpu.max').split()
+    shm = run('docker', 'inspect', '--type', 'container', '--format', '{{.HostConfig.ShmSize}}', container).strip()
+    if (len(limits) != 3 or not all(value.isdigit() for value in limits) or int(limits[0]) != MEMORY_BYTES
+            or int(limits[2]) <= 0 or int(limits[1]) != CPUS * int(limits[2]) or shm != str(SHM_BYTES).encode()):
+        raise RuntimeError('isolated_postgres_proof_limits_mismatch')
+
+
+def require_disk_headroom(copy_bytes=0):
+    if shutil.disk_usage(WORK).free < RESERVE + copy_bytes + RETAINED_PARALLEL_TEMP_BYTES:
+        raise RuntimeError('rehearsal_copy_reserve_exceeded')
+
+
 def main():
     validate_workspace()
     if len(sys.argv) != 2 or sys.argv[1] not in ('preimage', 'candidate'):
@@ -136,8 +157,7 @@ def main():
         if (source / 'postmaster.pid').exists():
             raise RuntimeError('stopped_candidate_clone_required')
     pg_bytes = int(run('du', '-sx', '-B1', str(source), timeout=60).split()[0])
-    if shutil.disk_usage(WORK).free < RESERVE + pg_bytes:
-        raise RuntimeError('rehearsal_copy_reserve_exceeded')
+    require_disk_headroom(pg_bytes)
 
     scratch.mkdir(mode=0o700)
     data = scratch / 'data'
@@ -156,19 +176,21 @@ def main():
         raise RuntimeError('isolated_container_identity_mismatch')
     try:
         wait_ready(cid)
+        check_proof_limits(cid)
         policy = check_identity(cid)
         if policy != (2 if variant == 'preimage' else 3):
             raise RuntimeError('unexpected_rehearsal_policy')
         values = []
         for cache in ('postgresql-restart', 'repeat', 'repeat'):
+            require_disk_headroom()
             begin = time.monotonic()
-            result = retained_row_manifest(partial(proof_exec, cid))
+            result = retained_row_manifest(partial(proof_exec, cid), profile=RETAINED_PARALLEL_PROFILE)
             values.append({'cache': cache, 'seconds': time.monotonic() - begin,
                            'manifest': result})
         passed = (all(value['seconds'] <= 200 for value in values)
                   and all(value['manifest'] == values[0]['manifest'] for value in values))
         receipt = {'schema': 19, 'policy_epoch': policy, 'runs': values, 'passed': passed,
-                   'os_page_cache': 'uncontrolled'}
+                   'os_page_cache': 'uncontrolled', 'proof_profile': RETAINED_PARALLEL_PROFILE}
     finally:
         run('docker', 'stop', '--time', '15', cid, timeout=30)
     write_receipt(scratch / 'retained-rows.json', receipt)
