@@ -32,11 +32,18 @@ for this baseline.
 
 The current scripts prepare input and rehearse the retained-row proof. Before
 adding launch authority, the rollout still needs the complete approved
-production-scale restore rehearsal, measured time budget for cutover and
-rollback, and exact ready capture and historical notice inputs for each active
-source. The pinned server's normal runtime has source pacing but does not wire
-an enforceable cumulative provider-attempt cap. A time-limited execution under
-existing rates changes that admission condition and requires operator approval.
+production-scale restore rehearsal, the sealed RFC archive evidence, and an
+exact ready capture and historical notice for each active source.
+
+The approved acquisition boundary keeps each existing source rate and uses
+elapsed execution time. Bind the rehearsal's measured requalification and
+restoration times to the launch record. From the two-hour maintenance window,
+reserve the greater of 30 minutes or measured restoration plus 10 minutes.
+Finish private requalification early enough for the public checks and 15-minute
+observation before that reserve starts. Start the acquisition clock when the
+active writer is admitted. The supervisor must stop that writer and confirm
+withdrawal at the cutoff if the acceptance gates remain open. An expired run
+enters the successor's single-restore path.
 
 After admitting the reviewed successor, gate only `devres/backend` with the
 prepared unmatched selector and verify zero EndpointSlice targets. Bind the
