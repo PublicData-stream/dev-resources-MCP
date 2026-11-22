@@ -20,6 +20,7 @@ from rollout_5a865235_render import (
 
 KUBECTL = ('k3s', 'kubectl', '--context=default', '--namespace=devres', '--request-timeout=20s')
 EXPECTED_POLICY = 'devres-attribution-v2:verified-forward-origins:member-scopes:readable-notices'
+PROVIDERS = ('rfc', 'crates', 'rustsec', 'mdn', 'whatwg', 'w3c', 'chromium', 'npm', 'wikipedia')
 # SHA-256 transports the already verified seven-file BLAKE3-pinned writer bundle.
 EVIDENCE_SHA256 = dict(zip(EVIDENCE_FILES, (
     'c3f54cadf1cc2f30e9d205bbc35bb30ed10d16e35f1e5309f0a1ae330d5e80a9',
@@ -76,6 +77,7 @@ def kubectl(*arguments, document=None):
 def production_identity():
     # Read only fixed system/control state. Do not serialize archive identities,
     # store credentials, capture data, or user inputs into the receipt.
+    providers = ', '.join(f"'{provider}'" for provider in PROVIDERS)
     return kubectl('exec', 'deployment/postgres', '-c', 'postgres', '--', 'psql', '-X', '-qAt',
                    '-U', 'devres_admin', '-d', 'devres', '-v', 'ON_ERROR_STOP=1', '-c', f"""
         BEGIN READ ONLY;
@@ -87,6 +89,10 @@ def production_identity():
                 FROM devres_attribution_control WHERE singleton),
             'archive_ready', (SELECT backend = 's3' AND binding IS NOT NULL AND pending_binding IS NULL
                 AND NOT initializing_s3 FROM devres_archive_control WHERE singleton),
+            'providers_without_ready_policy_2', (SELECT coalesce(json_agg(p.provider ORDER BY p.provider), '[]')
+                FROM unnest(ARRAY[{providers}]) AS p(provider) WHERE NOT EXISTS (
+                    SELECT 1 FROM devres_attribution_targets AS t
+                    WHERE t.provider = p.provider AND t.policy_epoch = 2 AND t.status = 'ready')),
             'publication_owners', (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'
                 AND classid = 1835365490 AND objid = 1 AND objsubid = 2 AND granted
                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())));
@@ -109,8 +115,9 @@ def read_baseline():
     matched = kubectl('get', 'pods', '-l', selector, '-o', 'json')['items']
     fail_unless(not matched, 'maintenance_selector_matches_live_pods')
     identity = production_identity()
-    fail_unless(identity == {'schema': 19, 'required_policy': '2', 'fingerprint_ok': True,
-                             'archive_ready': True, 'publication_owners': 1},
+    required = {'schema': 19, 'required_policy': '2', 'fingerprint_ok': True,
+                'archive_ready': True, 'publication_owners': 1}
+    fail_unless(all(identity.get(key) == expected for key, expected in required.items()),
                 'production_storage_baseline_changed')
     return snapshot, identity
 

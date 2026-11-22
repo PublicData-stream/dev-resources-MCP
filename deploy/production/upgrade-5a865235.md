@@ -15,8 +15,10 @@ for this baseline.
    after staging. Stage the private RFC evidence archive separately. Run
    `python3 -EsB rollout_5a865235_preflight.py --evidence-archive WRITER_INPUTS` on
    B130E. It checks the active source images, one publisher, policy 2 and the
-   S3 binding before it runs the Kubernetes server-side dry-run. Its receipt
-   contains hashes only. The renderer changes both corresponding-source URLs and
+   S3 binding before it runs the Kubernetes server-side dry-run. The receipt
+   reports hashes, control state and providers with no ready policy-2 row. The
+   existence of a ready row still needs a fixed-capture and notice readback.
+   The renderer changes both corresponding-source URLs and
    limits the evidence projection to the writer's restricted init container.
 3. Use a verified PostgreSQL 18.6 physical copy in
    `/tmp/devres-rehearsal-5a865235/pgdata`. Its disk-backed mount must be on

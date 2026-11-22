@@ -163,7 +163,7 @@ def main():
         for cache in ('postgresql-restart', 'repeat', 'repeat'):
             begin = time.monotonic()
             result = retained_row_manifest(partial(proof_exec, cid))
-            values.append({'cache': cache, 'seconds': round(time.monotonic() - begin, 3),
+            values.append({'cache': cache, 'seconds': time.monotonic() - begin,
                            'manifest': result})
         passed = (all(value['seconds'] <= 200 for value in values)
                   and all(value['manifest'] == values[0]['manifest'] for value in values))
