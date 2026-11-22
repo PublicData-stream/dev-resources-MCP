@@ -26,6 +26,11 @@ for this baseline.
    `rehearse_retained_rows_5a865235.py` runs `pg_verifybackup`, starts a new
    private working copy with Docker networking disabled, and times the retained
    row proof once after PostgreSQL start and twice again in the same process.
+   It uses `parallel-4cpu-6g-v1` with four CPUs, 6 GiB of cgroup memory and
+   64 MiB of shared memory. Allow an additional 4 GiB of free space on the
+   database volume for the leader and three workers. The successor controller
+   can select this profile after checking the actual PostgreSQL resources and
+   free space.
    Run `candidate` only with a cleanly stopped, separately attested schema 19
    and policy 3 clone in `candidate-pgdata`. These timing receipts supplement
    the paired-checkpoint and full supervisor rehearsal receipts.
@@ -71,3 +76,32 @@ pending after the remote approval gate rejected candidate container execution.
 The live indexed check found no ready policy-2 target for crates, Chromium, or
 npm. The public endpoint remained on the original backend throughout this
 rehearsal.
+
+### Follow-up retained-row proof and source baselines
+
+The schema-19, policy-2 working copy completed the serial diagnostic in
+258.07 seconds. On the same copy, `parallel-4cpu-6g-v1` completed in 68.09,
+73.70, and 68.06 seconds. All four runs returned the same `sha256-row-multiset-v1`
+manifest for 65 tables and 30,471,782 rows. PostgreSQL restarted before the first
+parallel measurement, with the host page cache uncontrolled. The cgroup reached
+its 6 GiB memory limit including page cache, with no OOM events. PostgreSQL
+logged 4,364,181,504 temporary bytes across the three runs. An earlier parallel
+trial with a 256 MiB per-process temporary-file limit failed on a retained table.
+
+Two fixed production requests completed policy-2 qualification through ordinary
+writer admission. Public MCP returned the same pinned sources and the complete
+historic notice resources. Freeze the following arguments for the later comparison.
+
+| Source | Fixed request | Source page SHA-256 | Notice generation | Notice SHA-256 |
+| --- | --- | --- | --- | --- |
+| Cargo | `packages.crate.source_read` for `itoa` `1.0.15`, `src/lib.rs`, limit `1024`, metadata capture `blake3:c5c33a98b5713a6d1c965af1649a63b8a1f272d9d64422de6765b6b8835af8eb`, archive capture `blake3:925e9e9aed72834351c5d02134a76a7e224b2e80e7ff3428e381bd79be978e68` | `e3c9ee51c4cd00ae8634d13ef0bb590ef9822c61a3374cc49422ee15b0f1bc26` | `blake3:55434c0487078e998eb80b2b2b1769958c8f3f07f7478c9ef57d61f453a942f1` | `e654e4672a23ff8044441cf0a32953dd86df71fcb5dfb5250dbb5d3c3831b744` |
+| npm | `packages.npm.advisory_get` for `GHSA-2234-fmw7-43wr`, snapshot `blake3:44632814ca57a87f55cebbf690374546851d3eae9901f4a90b9ed5aef80f3e6f`, representation `source`, limit `1024` | `863f8b3eb953011d2a53577e22d33c37e7e0db54cc4df9749ec6514c237dcdcf` | `blake3:5ea9c43fb109cbda16e4c3140717f4c02b3202dc589b525d2cd3652573f78d0a` | `d7bbd58f853887180f3172f666481485ed17e045c5e55dbe74535640d898ee28` |
+
+Chromium's two retained `site` inventories each had 1,562 members, zero members
+with raw source descriptors, and zero searchable projections. The default view
+was absent. The private diagnostic returned `attempted_payload_unlinked`, and
+the current collector recorded an HTTP 500 during publication acquisition.
+A Chromium baseline still requires a published exact snapshot with a qualified
+source member and notice readback.
+The policy-3 clone, full restore rehearsal, and sealed RFC archive evidence
+remain separate admission gates.
