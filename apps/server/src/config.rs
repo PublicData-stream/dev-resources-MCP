@@ -630,13 +630,18 @@ mod tests {
     }
     #[test]
     fn chromium_configuration_is_automatic_and_has_no_caller_destinations() {
-        let enabled: devres_adapters::chromium::ChromiumConfig = toml::from_str("").unwrap();
-        assert!(enabled.enabled);
-        enabled.validate().unwrap();
-        let paused: devres_adapters::chromium::ChromiumConfig =
-            toml::from_str("enabled=false").unwrap();
-        assert!(!paused.enabled);
-        paused.validate().unwrap();
+        for (input, enabled, chrome_dev_docs_enabled) in [
+            ("", true, true),
+            ("chrome_dev_docs_enabled=true", true, true),
+            ("chrome_dev_docs_enabled=false", true, false),
+            ("enabled=false", false, true),
+            ("enabled=false\nchrome_dev_docs_enabled=false", false, false),
+        ] {
+            let config: devres_adapters::chromium::ChromiumConfig = toml::from_str(input).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.enabled, enabled);
+            assert_eq!(config.chrome_dev_docs_enabled, chrome_dev_docs_enabled);
+        }
         assert!(
             toml::from_str::<devres_adapters::chromium::ChromiumConfig>(
                 "repository='https://private.invalid/source'"

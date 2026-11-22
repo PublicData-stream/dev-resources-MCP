@@ -610,6 +610,13 @@ explicit missing/stale coverage; archived Chrome sources require explicit select
 Reads never initiate source traffic. Default evidence is stale after 24 hours and
 unavailable after seven days, while explicit historical snapshots remain readable.
 
+`chromium.corpus_status` reports `collection_enabled` for supervised Chromium
+collection and `chrome_dev_docs_enabled` for effective supervised Chrome Dev Docs
+collection. The writer publishes the latter as true when both Chromium settings
+are true. A pause clears stale `chrome` collector activity while preserving failure
+history and retained validation times.
+[Chromium configuration](Configuration.md#chromium-defaults)
+
 Generic fetch accepts `chromium:<component>/<path>#<anchor>`. Immutable resources
 use `devres://chromium/<component>/<snapshot>/<representation>/<base64url-path>`.
 Paging, strict input validation, cancellation, and technical/English query semantics

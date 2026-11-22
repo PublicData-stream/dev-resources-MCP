@@ -1891,6 +1891,9 @@ impl ChromiumCorpus {
                 &json!((offset + 1) % COMPONENTS.len()),
             )
             .await?;
+        if selected == "chrome" && !self.config.chrome_dev_docs_enabled {
+            return self.current_complete().await;
+        }
         let host = match selected {
             "chrome" => "developer.chrome.com",
             "chrome-archive" => "api.github.com",
@@ -2364,7 +2367,8 @@ impl ChromiumCorpus {
                 .copied();
             components.insert(component,json!({"selected_snapshot":selected,"validated_at":validated,"missing":selected.is_none(),"historical_only":component=="chrome-archive","collector":{"current":self.collector_status(component,"current").await?,"history":self.collector_status(component,"history").await?},"stale":validated.is_none_or(|v|devres_domain::unix_now().saturating_sub(v)>86400)}));
         }
-        self.store.chromium_set_state("status",&json!({"processor_version":PROCESSOR_VERSION,"classifier_version":chromium_processing::CLASSIFIER_VERSION,"collection_version":COLLECTION_VERSION,"collection_enabled":self.config.enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_components":catalog.as_ref().map_or(0,|c|c.components.len()),"components":components,"statistics":statistics,"snapshots":statistics["snapshots"],"projection_gaps":statistics["projection_gaps"],"index_gaps":statistics["index_gaps"],"gap_scope":"all_retained_snapshot_generations","view":view.as_ref().map(|v|&v.id),"published_components":view.as_ref().map_or(0,|v|v.snapshots.len()),"history_queue_exhausted":self.store.chromium_state(&scheduling_key("history-exhausted")).await?.unwrap_or(json!(false)),"history_gap":"unexposed_migrated_history","failure":self.store.chromium_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes()})).await
+        let chrome_dev_docs_enabled = self.config.enabled && self.config.chrome_dev_docs_enabled;
+        self.store.chromium_set_state("status",&json!({"processor_version":PROCESSOR_VERSION,"classifier_version":chromium_processing::CLASSIFIER_VERSION,"collection_version":COLLECTION_VERSION,"collection_enabled":self.config.enabled,"chrome_dev_docs_enabled":chrome_dev_docs_enabled,"catalog":catalog.as_ref().map(|c|&c.id),"catalog_components":catalog.as_ref().map_or(0,|c|c.components.len()),"components":components,"statistics":statistics,"snapshots":statistics["snapshots"],"projection_gaps":statistics["projection_gaps"],"index_gaps":statistics["index_gaps"],"gap_scope":"all_retained_snapshot_generations","view":view.as_ref().map(|v|&v.id),"published_components":view.as_ref().map_or(0,|v|v.snapshots.len()),"history_queue_exhausted":self.store.chromium_state(&scheduling_key("history-exhausted")).await?.unwrap_or(json!(false)),"history_gap":"unexposed_migrated_history","failure":self.store.chromium_state("failure").await?,"archive_bytes":self.raw.accounted_bytes(),"archive_quota_bytes":self.raw.quota_bytes()})).await
     }
     pub async fn run_current(&self, cancel: CancellationToken) -> Result<()> {
         if let Err(error) = self.recover(cancel.clone()).await {
@@ -2526,6 +2530,11 @@ impl ChromiumCorpus {
         self.freeze(true, cancel).await
     }
     async fn freeze(&self, full: bool, cancel: CancellationToken) -> Result<Value> {
+        if !self.config.chrome_dev_docs_enabled {
+            return Err(Error::invalid(
+                "Chromium freeze requires [chromium].chrome_dev_docs_enabled = true.",
+            ));
+        }
         // A freeze first captures current web bodies. Afterwards resume never
         // refreshes refs, sitemaps or moving publications.
         loop {
@@ -2845,7 +2854,10 @@ mod tests {
         routing::get,
     };
     pub(super) const BSD: &str = "Copyright 2026 Synthetic Authors. Redistribution and use in source and binary forms, with or without modification, are permitted. Neither the name of the authors nor contributors may be used to endorse products. THIS SOFTWARE IS PROVIDED AS IS.";
-    type Routes = Arc<BTreeMap<String, Vec<u8>>>;
+    struct FixtureRoutes {
+        bodies: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
+        requests: std::sync::Mutex<Vec<String>>,
+    }
     fn build_tree(
         files: &BTreeMap<String, Vec<u8>>,
         prefix: &str,
@@ -2945,17 +2957,20 @@ mod tests {
         }
     }
     async fn reply(
-        State(routes): State<Routes>,
+        State(routes): State<Arc<FixtureRoutes>>,
         OriginalUri(uri): OriginalUri,
     ) -> impl IntoResponse {
-        match routes.get(uri.path()) {
+        routes.requests.lock().unwrap().push(uri.path().into());
+        match routes.bodies.lock().unwrap().get(uri.path()) {
             Some(bytes) => (StatusCode::OK, bytes.clone()),
             None => (StatusCode::NOT_FOUND, Vec::new()),
         }
     }
-    #[tokio::test]
-    async fn current_components_and_deleted_document_history_are_local_immutable_evidence() {
-        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+    async fn collection_fixture() -> (
+        Arc<BulkBroker>,
+        Arc<FixtureRoutes>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let main = "a".repeat(40);
         let parent = "b".repeat(40);
         let site = "c".repeat(40);
@@ -3048,22 +3063,33 @@ mod tests {
             )
             .unwrap(),
         );
-        routes.insert("/sitemap.xml".into(),b"<urlset><url><loc>https://developer.chrome.com/docs/fixture</loc></url><url><loc>https://developer.chrome.com/docs/fixture?hl=ko</loc></url><url><loc>https://example.invalid/docs/no</loc></url></urlset>".to_vec());
+        routes.insert("/sitemap.xml".into(),b"<sitemapindex><sitemap><loc>https://developer.chrome.com/sitemap_0_of_2.xml</loc></sitemap></sitemapindex>".to_vec());
+        routes.insert("/sitemap_0_of_2.xml".into(),b"<urlset><url><loc>https://developer.chrome.com/docs/fixture</loc></url><url><loc>https://developer.chrome.com/docs/fixture?hl=ko</loc></url><url><loc>https://example.invalid/docs/no</loc></url></urlset>".to_vec());
         routes.insert("/docs/fixture".into(),b"<main><h1 id=guide>Chrome guide</h1><p>Current synthetic Chrome documentation.</p></main><p class=devsite-license>Except as otherwise noted, the content of this page is licensed under the <a href=https://creativecommons.org/licenses/by/4.0/>Creative Commons Attribution 4.0 License</a>, and code samples are licensed under the Apache 2.0 License.</p>".to_vec());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let routes = Arc::new(FixtureRoutes {
+            bodies: std::sync::Mutex::new(routes),
+            requests: std::sync::Mutex::default(),
+        });
+        let state = routes.clone();
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new()
-                    .fallback(get(reply))
-                    .with_state(Arc::new(routes)),
+                Router::new().fallback(get(reply)).with_state(state),
             )
             .await
             .unwrap();
         });
         let broker =
             Arc::new(BulkBroker::fixture(format!("http://{address}").parse().unwrap()).unwrap());
+        (broker, routes, server)
+    }
+    #[tokio::test]
+    async fn current_components_and_deleted_document_history_are_local_immutable_evidence() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let parent = "b".repeat(40);
+        let (broker, _, server) = collection_fixture().await;
         let (root, store, corpus) = super::super::tests::corpus_fixture(broker.clone()).await;
         let cancel = CancellationToken::new();
         let mut finished = false;
@@ -3242,6 +3268,411 @@ mod tests {
         );
         server.abort();
     }
+
+    #[tokio::test]
+    async fn paused_chrome_keeps_sibling_collection_and_sealed_observations_available() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let (broker, routes, server) = collection_fixture().await;
+        let (root, store, _) = super::super::tests::corpus_fixture(broker.clone()).await;
+        let paused = ChromiumConfig {
+            enabled: true,
+            chrome_dev_docs_enabled: false,
+            min_free_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        };
+        let open = |config: ChromiumConfig| {
+            ChromiumCorpus::new(store.clone(), broker.clone(), root.path(), config).unwrap()
+        };
+        let corpus = open(paused.clone());
+        let cancel = CancellationToken::new();
+        let errors = tokio::time::timeout(Duration::from_secs(2), async {
+            [
+                corpus
+                    .freeze_current_observation(cancel.clone())
+                    .await
+                    .unwrap_err(),
+                corpus.freeze_observation(cancel.clone()).await.unwrap_err(),
+            ]
+        })
+        .await
+        .unwrap();
+        for error in errors {
+            assert_eq!(error.code, "invalid_input");
+            assert!(error.message.contains("chrome_dev_docs_enabled"));
+        }
+        assert_eq!(broker.attempt_count(), 0);
+        assert_eq!(store.chromium_cutoff().await.unwrap(), 0);
+        assert!(
+            store
+                .chromium_migration_state_keys("", 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        corpus.initialize_status().await.unwrap();
+        for _ in 0..32 {
+            assert!(!corpus.collect_current_once(cancel.clone()).await.unwrap());
+        }
+        for (component, revision) in [("src", 'a'), ("site", 'c'), ("chrome-archive", 'd')] {
+            let revision = revision.to_string().repeat(40);
+            let snapshot = corpus
+                .snapshot_for_revision(
+                    component,
+                    component_base(component).unwrap(),
+                    &revision,
+                    "git",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.coverage["usable"], true);
+        }
+        for _ in 0..32 {
+            corpus.collect_history_once(cancel.clone()).await.unwrap();
+        }
+        for (component, namespace) in [
+            ("src", "heads"),
+            ("site", "heads"),
+            ("chrome-archive", "all"),
+        ] {
+            assert!(
+                store
+                    .chromium_state(&state_key(
+                        "observation",
+                        &format!("{component}:{namespace}")
+                    ))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            corpus
+                .snapshot_for_revision(
+                    "src",
+                    component_base("src").unwrap(),
+                    &"b".repeat(40),
+                    "git"
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(chrome_requests(&routes).is_empty());
+        assert!(
+            store
+                .chromium_state(&scheduling_key("web-work"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for kind in ["web-map-jobs", "web-page-jobs"] {
+            assert!(
+                store
+                    .chromium_rows(kind, 0, 1, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let status = corpus.status().await.unwrap();
+        assert_eq!(status["collection_enabled"], true);
+        assert_eq!(status["chrome_dev_docs_enabled"], false);
+        drop(corpus);
+
+        // A tag discovered by the full seal leaves an actual frozen history job to resume.
+        let tagged = "e".repeat(40);
+        {
+            let mut bodies = routes.bodies.lock().unwrap();
+            repository(
+                &mut bodies,
+                "src",
+                &tagged,
+                &[],
+                &[
+                    ("LICENSE", BSD),
+                    ("docs/tagged.md", "# Frozen tagged documentation"),
+                ],
+            );
+            bodies.insert(
+                "/chromium/src/+refs/tags".into(),
+                serde_json::to_vec(&json!({"refs/tags/frozen":{"value":tagged}})).unwrap(),
+            );
+        }
+        let enabled = ChromiumConfig {
+            chrome_dev_docs_enabled: true,
+            ..paused.clone()
+        };
+        let active = open(enabled.clone());
+        active.initialize_status().await.unwrap();
+        assert_eq!(
+            active.status().await.unwrap()["chrome_dev_docs_enabled"],
+            true
+        );
+        let first_freeze_request = routes.requests.lock().unwrap().len();
+        let full = tokio::time::timeout(
+            Duration::from_secs(90),
+            active.freeze_observation(cancel.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            let requests = routes.requests.lock().unwrap();
+            panic!(
+                "fixture freeze timed out after requests {:?}",
+                &requests[first_freeze_request..]
+            );
+        })
+        .unwrap();
+        let current = active
+            .freeze_current_observation(cancel.clone())
+            .await
+            .unwrap();
+        let full_before = active.frozen_status(&full).await.unwrap();
+        let current_before = active.frozen_status(&current).await.unwrap();
+        let view = active.view(None).await.unwrap();
+        let snapshot = active.select("chrome", None, Some(&view.id)).await.unwrap();
+        drop(active);
+
+        let resumed = open(paused);
+        resumed.initialize_status().await.unwrap();
+        let attempts = broker.attempt_count();
+        for (seal, before) in [(&full, &full_before), (&current, &current_before)] {
+            let status = resumed.frozen_status(seal).await.unwrap();
+            assert_eq!(status["frozen_observation"], seal["id"]);
+            assert_eq!(
+                status["current_observation_accounted"],
+                before["current_observation_accounted"]
+            );
+            assert_eq!(
+                status["frozen_observation_complete"],
+                before["frozen_observation_complete"]
+            );
+        }
+        let tagged_snapshot =
+            || resumed.snapshot_for_revision("src", component_base("src").unwrap(), &tagged, "git");
+        assert!(tagged_snapshot().await.unwrap().is_none());
+        assert_eq!(broker.attempt_count(), attempts);
+        let first_resume_request = routes.requests.lock().unwrap().len();
+        let mut exhausted = false;
+        for _ in 0..16 {
+            if resumed.resume_frozen(&full, cancel.clone()).await.unwrap() {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted);
+        let tagged_snapshot = tagged_snapshot().await.unwrap().unwrap();
+        assert!(
+            resumed
+                .member(&tagged_snapshot, "docs/tagged.md")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let expected_commit_path = format!("/chromium/src/+/{tagged}");
+        {
+            let requests = routes.requests.lock().unwrap();
+            let resume_requests = &requests[first_resume_request..];
+            assert_eq!(resume_requests.first(), Some(&expected_commit_path));
+            assert!(
+                resume_requests
+                    .iter()
+                    .all(|path| path.starts_with(&expected_commit_path))
+            );
+        }
+        let attempts = broker.attempt_count();
+        assert_eq!(
+            resumed
+                .select("chrome", None, Some(&view.id))
+                .await
+                .unwrap()
+                .validated_at,
+            snapshot.validated_at
+        );
+        let writer_status = resumed.status().await.unwrap();
+        let reader =
+            ChromiumCorpus::new_reader(store.clone(), broker.clone(), root.path(), enabled.clone())
+                .unwrap();
+        let research = crate::chromium::research::ChromiumResearch::new(Arc::new(reader));
+        let reader_status = research
+            .call("chromium.corpus_status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader_status["chrome_dev_docs_enabled"],
+            writer_status["chrome_dev_docs_enabled"]
+        );
+        assert_eq!(reader_status["components"], writer_status["components"]);
+        assert_eq!(writer_status["chrome_dev_docs_enabled"], false);
+        let retained = research
+            .call(
+                "chromium.get",
+                json!({"component":"chrome","snapshot":snapshot.id,"path":"docs/fixture"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained["license"]["evidence"]["decision"], "approved");
+        assert!(
+            retained["license"]["evidence"]["notice"]
+                .as_str()
+                .unwrap()
+                .contains("Creative Commons Attribution 4.0")
+        );
+        assert!(
+            retained["page"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Current synthetic Chrome documentation.")
+        );
+        assert_eq!(broker.attempt_count(), attempts);
+        assert_eq!(resumed.status().await.unwrap(), writer_status);
+        drop(resumed);
+        let disabled = open(ChromiumConfig {
+            enabled: false,
+            ..enabled
+        });
+        disabled.initialize_status().await.unwrap();
+        let disabled_status = disabled.status().await.unwrap();
+        assert_eq!(disabled_status["collection_enabled"], false);
+        assert_eq!(disabled_status["chrome_dev_docs_enabled"], false);
+        server.abort();
+    }
+
+    fn chrome_requests(routes: &FixtureRoutes) -> Vec<String> {
+        routes
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.starts_with("/sitemap") || path.starts_with("/docs/"))
+            .cloned()
+            .collect()
+    }
+
+    async fn collect_chrome_turn(corpus: &ChromiumCorpus, cancel: &CancellationToken) {
+        corpus
+            .store
+            .chromium_set_state(&scheduling_key("current-offset"), &json!(2))
+            .await
+            .unwrap();
+        corpus.collect_current_once(cancel.clone()).await.unwrap();
+        assert_eq!(
+            corpus
+                .store
+                .chromium_state(&scheduling_key("current-offset"))
+                .await
+                .unwrap(),
+            Some(json!(3))
+        );
+    }
+
+    async fn chrome_web_queues(store: &dyn ChromiumStore) -> Value {
+        let maps = store
+            .chromium_rows("web-map-jobs", 0, 10, None)
+            .await
+            .unwrap();
+        let pages = store
+            .chromium_rows("web-page-jobs", 0, 10, None)
+            .await
+            .unwrap();
+        json!({"maps": maps, "pages": pages})
+    }
+
+    #[tokio::test]
+    async fn paused_chrome_preserves_and_resumes_sitemap_and_page_checkpoints() {
+        let _gate = crate::mdn::index::TEST_GATE.lock().await;
+        let (broker, routes, server) = collection_fixture().await;
+        let (root, store, _) = super::super::tests::corpus_fixture(broker.clone()).await;
+        let open = |chrome_dev_docs_enabled| {
+            ChromiumCorpus::new(
+                store.clone(),
+                broker.clone(),
+                root.path(),
+                ChromiumConfig {
+                    chrome_dev_docs_enabled,
+                    min_free_bytes: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let cancel = CancellationToken::new();
+        let web_work = scheduling_key("web-work");
+        let host_retry = state_key("deferred", "developer.chrome.com");
+        let retry = json!({"retry_at":devres_domain::unix_now() - 1,"status":429});
+        store.chromium_set_state(&host_retry, &retry).await.unwrap();
+        let mut active = open(true);
+        collect_chrome_turn(&active, &cancel).await;
+        let mut expected_requests = vec!["/sitemap.xml"];
+        assert_eq!(chrome_requests(&routes), expected_requests);
+
+        for (next, cursor) in [
+            ("/sitemap_0_of_2.xml", "map_after"),
+            ("/docs/fixture", "page_after"),
+        ] {
+            let checkpoint = store.chromium_state(&web_work).await.unwrap().unwrap();
+            let queues = chrome_web_queues(store.as_ref()).await;
+            let mut diagnostic = active.collector_status("chrome", "current").await.unwrap();
+            diagnostic.fail(
+                &Error::unavailable("Synthetic retained failure."),
+                Phase::SitemapDiscovery,
+                100,
+                Some(200),
+            );
+            diagnostic.active = true;
+            active
+                .save_collector("chrome", "current", &diagnostic)
+                .await
+                .unwrap();
+            drop(active);
+
+            let paused = open(false);
+            paused.initialize_status().await.unwrap();
+            diagnostic.active = false;
+            let persisted = encode(&diagnostic).unwrap();
+            assert_eq!(
+                paused.status().await.unwrap()["components"]["chrome"]["collector"]["current"],
+                persisted
+            );
+            let attempts = broker.attempt_count();
+            collect_chrome_turn(&paused, &cancel).await;
+            assert_eq!(broker.attempt_count(), attempts);
+            assert_eq!(chrome_requests(&routes), expected_requests);
+            assert_eq!(
+                store.chromium_state(&web_work).await.unwrap(),
+                Some(checkpoint.clone())
+            );
+            assert_eq!(chrome_web_queues(store.as_ref()).await, queues);
+            assert_eq!(
+                store.chromium_state(&host_retry).await.unwrap(),
+                Some(retry.clone())
+            );
+            assert_eq!(
+                encode(&paused.collector_status("chrome", "current").await.unwrap()).unwrap(),
+                persisted
+            );
+            drop(paused);
+
+            active = open(true);
+            active.initialize_status().await.unwrap();
+            collect_chrome_turn(&active, &cancel).await;
+            expected_requests.push(next);
+            assert_eq!(chrome_requests(&routes), expected_requests);
+            let advanced = store.chromium_state(&web_work).await.unwrap().unwrap();
+            assert_eq!(advanced["id"], checkpoint["id"]);
+            assert!(advanced[cursor].as_i64().unwrap() > checkpoint[cursor].as_i64().unwrap());
+        }
+        collect_chrome_turn(&active, &cancel).await;
+        assert_eq!(
+            store.chromium_state(&web_work).await.unwrap(),
+            Some(Value::Null)
+        );
+        assert_eq!(chrome_requests(&routes), expected_requests);
+        assert!(active.select("chrome", None, None).await.is_ok());
+        server.abort();
+    }
+
     #[tokio::test]
     async fn interrupted_index_markers_replay_the_exact_pending_batch_without_duplicate_shards() {
         let _gate = crate::mdn::index::TEST_GATE.lock().await;

@@ -439,6 +439,7 @@ available. Disposable configurations explicitly disable the collector.
 | `chromium` field | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Supervised current/history collection |
+| `chrome_dev_docs_enabled` | `true` | Supervised `chrome` sitemap and page collection when `enabled` is also `true` |
 | `catalog_refresh_secs` | `3600` | Catalog validation scheduling target |
 | `ref_refresh_secs` | `3600` | Fixed source ref observation target |
 | `publication_refresh_secs` | `86400` | Moving website inventory/body validation target |
@@ -447,6 +448,23 @@ available. Disposable configurations explicitly disable the collector.
 | `max_processing_workers` | `1` | Processing admission, accepts 1..2 |
 | `min_free_bytes` | `1073741824` | Free-space reserve, minimum 64 MiB |
 | `max_archive_storage_bytes` | omitted | Optional permanent raw-artifact quota |
+
+Use these writer startup settings to pause Chrome Dev Docs while `src`, `site`,
+and `chrome-archive` keep collecting.
+
+```toml
+[chromium]
+enabled = true
+chrome_dev_docs_enabled = false
+```
+
+The pause preserves pending sitemap and page work, cursors, retries, and published
+evidence. Set `chrome_dev_docs_enabled = true` and restart the writer to resume the
+saved work. Retained research, notice reads, and the existing default freshness
+rules still apply. Attribution repair may still revalidate the exact page it needs.
+New current and full freezes require `chrome_dev_docs_enabled = true`. Sealed
+observations can still be verified, and an existing full freeze can still resume
+its historical work.
 
 Intervals accept 1..31,622,400 seconds. A supplied archive quota must be at least the
 free-space reserve. The quota excludes PostgreSQL and derived search data. Exhausted

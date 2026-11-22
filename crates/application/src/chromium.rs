@@ -15,6 +15,7 @@ pub const CHROMIUM_WRITE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub struct ChromiumConfig {
     pub enabled: bool,
+    pub chrome_dev_docs_enabled: bool,
     pub catalog_refresh_secs: u64,
     pub ref_refresh_secs: u64,
     pub publication_refresh_secs: u64,
@@ -28,6 +29,7 @@ impl Default for ChromiumConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            chrome_dev_docs_enabled: true,
             catalog_refresh_secs: 3600,
             ref_refresh_secs: 3600,
             publication_refresh_secs: 86400,
