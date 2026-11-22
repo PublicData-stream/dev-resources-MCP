@@ -56,3 +56,18 @@ protocol and dual IP family public checks and the bounded stability window.
 On a failed admission or acceptance, retain both generations and restore the
 sealed policy 2 preimage. Verify the exact source writer and backend privately
 before reopening the endpoint.
+
+## Rehearsal observed on 2026-11-22
+
+The online PostgreSQL 18.6 physical backup passed `pg_verifybackup`. The
+production-sized policy-2 working copy then failed the complete retained-row
+proof. A read-only observation at 239 seconds showed the proof transaction
+still waiting on `DataFileRead`. The proof process exited 1. A separate isolated
+measurement of `devres_mdn_evidence` hashed 5,407,766 rows in 92.885 seconds.
+
+The Kubernetes server-side dry-run passed. The writer package matched the
+pinned manifest and six dependency digests. Fresh archive inspection remained
+pending after the remote approval gate rejected candidate container execution.
+The live indexed check found no ready policy-2 target for crates, Chromium, or
+npm. The public endpoint remained on the original backend throughout this
+rehearsal.
