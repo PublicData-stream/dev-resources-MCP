@@ -48,6 +48,9 @@ of a running production service.
 The [ce5745e0 procedure](upgrade-ce5745e0.md) qualifies the published npm startup
 readiness mitigation and binds a fresh attempt to the completed fifth-cycle
 withdrawal. It requires a current checkpoint and rehearsal before launch.
+The [5a865235 preparation](upgrade-5a865235.md) starts from an active schema-19
+baseline and exercises the policy-3 rollout's server-side dry-run and isolated
+retained-row timing proof.
 The generic
 renderer and operator below still describe their original pinned release; use
 the reviewed successor procedure for further lifecycle changes.
